@@ -12,11 +12,12 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -789,7 +790,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                     f"{parent_id} is {parent['status']}, so nothing more can be filed "
                     f"under it — file this work order on its own, or open a new feature"
                 )
-        return store.create_work_order(
+        wo = store.create_work_order(
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
@@ -798,6 +799,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
         )
+        # AT CREATION, from the brief the order is actually given — the only moment at
+        # which "this order points at that issue" is a fact rather than an inference.
+        record_issue_references(store, paths[project_name], wo)
+        return wo
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
         # is resolved inside one project database — so say which project was searched
@@ -1718,6 +1723,20 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
         # exactly this (`cli._finding_lines`).
         payload["items"].append({"url": url, "number": issues.issue_number(url),
                                  "title": key, "seat": seat, "withheld": not private})
+        # THE RELATION, beside the event. The event says what this ROUND did; this says
+        # what the ORDER has raised, which is the question `jarvis wo show` could not
+        # answer and which no amount of reading the event could make cheap. `announced`
+        # because `_follow_up_body` has just written that sentence into the issue itself
+        # — the sweep must not comment it a second time.
+        #
+        # `title` here and `key` on the event are DELIBERATELY DIFFERENT STRINGS. The
+        # event carries the finding's own words, which is what the surfaces print beside
+        # it; this row carries WHAT THE TRACKER WAS TOLD, because it is a cache of the
+        # issue as it exists on GitHub and the sweep refreshes it from `gh issue view`.
+        # On a public repository those two are not the same sentence.
+        store.record_issue(url, number=issues.issue_number(url), repo=repo, title=title,
+                           state="OPEN")
+        store.link_issue(url, unit_id, "raised", round_no=n, seat=seat, announced=True)
     return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
 
@@ -1851,6 +1870,220 @@ def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
         if p.get("reason"):
             rnd["reason"] = str(p["reason"])
     return out
+
+
+# -- the issue index: which orders point at which issues, and how many ---------------
+#
+# The relation `filed_follow_ups` could not express. That resolver answers "what did THIS
+# ROUND file", which is a fact about one round; these answer "what has this ORDER raised"
+# and "how many orders have pointed at this issue" — the second of which did not exist at
+# all, and is the priority signal the user asked for. Local, both directions, no network.
+
+#: A `#N` in a brief. Anchored against a preceding word character or slash so a URL's own
+#: fragment and an `abc#1` cannot match — this is the GitHub shorthand, written on purpose.
+ISSUE_MENTION_RE = re.compile(r"(?<![\w/])#([0-9]{1,7})(?![0-9])")
+
+#: SOMETHING ISSUE-URL-SHAPED in a body of prose. `issues.ISSUE_URL_RE` is anchored at
+#: both ends — it answers "is this string a URL", which is the question a write asks —
+#: and cannot scan. This one only FINDS candidates: the host and the repository are left
+#: out of the capture on purpose, because nothing here decides whether a match belongs to
+#: the project. `issue_url_for` decides that, by string equality, for both shapes below.
+ISSUE_LINK_RE = re.compile(
+    r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/([0-9]+)(?![0-9])")
+
+
+def issue_url_for(repo: str, number: int) -> str:
+    """THE ONE DEFINITION of what a project's own issue URL looks like — host included.
+
+    Every path that decides "is this issue ours" compares against this rather than
+    picking fields out of a URL, because a comparison that reads only the owner and the
+    repository accepts `https://attacker.example/<owner>/<repo>/issues/7` as the
+    project's own. That URL then reaches `tracked_issues` under the real repository name
+    and the daemon's sweep points `gh` at a host nobody in this project chose. A brief is
+    not always written by the user (the tracker is public), so the destination of a write
+    must never be derived from prose — only ever compared with a locally-derived one.
+    """
+    return f"https://github.com/{repo}/issues/{number}"
+
+
+def is_own_issue_url(url: str, repo: str, number: int) -> bool:
+    """Case-insensitive because GitHub is; host, owner, repository and number all count."""
+    return (url or "").lower() == issue_url_for(repo, number).lower()
+
+
+def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
+    """Every issue on `repo` that `text` deliberately cites. Conservative by design.
+
+    TWO SHAPES, AND THE SECOND IS DELIBERATELY NARROWER THAN THE FIRST.
+
+    * A FULL ISSUE URL on this project's own repository counts outright: `/issues/N`
+      cannot be anything but an issue, and nobody pastes one by accident. ON THIS
+      PROJECT'S OWN is decided by `is_own_issue_url` — the whole URL, host and all — and
+      what is stored is the URL that check was made against, never the prose's own text.
+    * A BARE `#N` counts only for an issue the project ALREADY TRACKS. `#N` is also how
+      a pull request is written, and the OS cannot tell the two apart without a network
+      call it must not make here — so an unrecognised number is left alone rather than
+      becoming a link to an issue that may not exist. Every issue whose count the user
+      reads is already tracked (the panel filed it, or an order was dispatched at it),
+      so the narrowing costs the signal nothing.
+
+    A passing mention in a result summary is not a citation and never reaches here: the
+    only text this is asked about is the brief the work order was created with.
+    """
+    body = text or ""
+    found: dict[str, None] = {}
+    for match in ISSUE_LINK_RE.finditer(body):
+        number = int(match.group(1))
+        if is_own_issue_url(match.group(0), repo, number):
+            found.setdefault(issue_url_for(repo, number), None)
+    for match in ISSUE_MENTION_RE.finditer(body):
+        url = issue_url_for(repo, int(match.group(1)))
+        if url in known:
+            found.setdefault(url, None)
+    return list(found)
+
+
+def record_issue_references(store: ProjectStore, project_path: Path,
+                            wo: Mapping[str, Any]) -> list[str]:
+    """Link a freshly created work order to the issues its brief points at.
+
+    ONLY ISSUES ON THE PROJECT'S OWN `origin`, which is one rule doing two jobs: it is
+    the locally-derived repository name that `issues.checked_issue_url` will later hold
+    every write to (`kn-2531869c`), and it is what keeps the count a fact about this
+    project's tracker rather than a half-populated view of the whole fleet.
+
+    Never raises: a work order must not fail to be created because a reference could not
+    be recorded.
+    """
+    from . import issues
+
+    repo = follow_up_repo(project_path)
+    if not repo:
+        return []
+    linked: list[str] = []
+    known = {row["issue_url"] for row in store.issue_board()}
+    wanted: list[tuple[str, str]] = []
+    assigned = str(wo.get("issue_url") or "")
+    if assigned and issues_on(assigned, repo):
+        wanted.append((assigned, "assigned"))
+    brief = f"{wo.get('title') or ''}\n{wo.get('description') or ''}"
+    wanted += [(url, "cited") for url in issue_citations(brief, repo, known)]
+    for url, kind in wanted:
+        try:
+            store.record_issue(url, number=issues.issue_number(url), repo=repo)
+            store.link_issue(url, wo["id"], kind)
+        except (ValueError, sqlite3.Error):
+            log.exception("could not link %s to %s", url, wo.get("id"))
+            continue
+        linked.append(url)
+    return linked
+
+
+def issues_on(url: str, repo: str) -> bool:
+    """Is `url` an issue URL on `repo`? The local half of `checked_issue_url`.
+
+    The anchored match is what proves the string is a URL and nothing but a URL; the
+    NUMBER is all that is taken from it, and the rest is decided against
+    `issue_url_for` — see there for why no field of a URL may be trusted on its own.
+    """
+    from .issues import ISSUE_URL_RE
+
+    match = ISSUE_URL_RE.match(url or "")
+    return bool(match) and is_own_issue_url(url, repo, int(match.group(4)))
+
+
+#: What a unit with no linked issue projects. ALWAYS PRESENT, `NO_FOLLOW_UPS`'s rule:
+#: a key that comes and goes renders as silence in Jinja and as a `KeyError` nowhere.
+NO_ISSUES: dict[str, Any] = {"raised": [], "references": []}
+
+
+def issue_index(store: ProjectStore, unit_id: str) -> dict[str, Any]:
+    """Every issue one order raised, and every other issue it points at.
+
+    THE CONSOLIDATED LIST, across every round — which is the thing the per-round
+    fragments could not be. An order judged over four rounds filed its follow-ups in four
+    places and had no total anywhere; wo-61173704 filed fifteen that way.
+
+    `state` is what the sweep last read off GitHub, "" until it has looked once. Cached
+    rather than fetched for `filed_follow_ups`'s reason: `jarvis wo show` must not fail
+    because the tracker is unreachable.
+
+    THE TITLE IS THE FINDING'S OWN WHEREVER THE OS STILL HAS IT. `tracked_issues.title`
+    is a cache of what the issue is CALLED ON GITHUB, which on a public tracker is
+    `Validation follow-up vf-…` and nothing else — a list of fifteen of those tells the
+    reader nothing. The words the seat wrote are on the filing event, they never left the
+    OS, and these surfaces are the user's own. Same rule `cli._finding_lines` already
+    follows for a withheld finding, and the reason the event keeps the finding's title
+    rather than the tracker's.
+    """
+    titles = _filed_titles(store, unit_id)
+    raised, refs = [], []
+    for row in store.issue_links_of(unit_id):
+        (raised if row["kind"] == "raised" else refs).append({
+            "url": row["issue_url"], "number": row["number"] or 0,
+            "title": titles.get(row["issue_url"]) or row["title"] or "",
+            "state": row["state"] or "",
+            "kind": row["kind"], "round": row["round"] or 0,
+            "seat": row["seat"] or ""})
+    return {"raised": raised, "references": refs}
+
+
+def _filed_titles(store: ProjectStore, unit_id: str) -> dict[str, str]:
+    """`{issue url: the finding's own title}` for everything this unit filed.
+
+    Off the events, so it costs a query and no network. Which kind of unit the id names
+    is read off the id, `validation_view`'s idiom.
+    """
+    kind = {"fo_id": unit_id} if unit_id.startswith("fo-") else {"wo_id": unit_id}
+    out: dict[str, str] = {}
+    for payload in filed_follow_ups(store, **kind).values():  # type: ignore[arg-type]
+        for item in payload.get("filed") or []:
+            url, title = str(item.get("url") or ""), str(item.get("title") or "")
+            if url and title:
+                out[url] = title
+    return out
+
+
+def issue_board(store: ProjectStore, limit: int = 50) -> list[dict[str, Any]]:
+    """This project's tracked issues, most-referenced first.
+
+    The ranking the user reads when choosing what to work on next: `refs` counts DISTINCT
+    work orders, so "three separate pieces of work ran into this" is a number rather than
+    a thing to go and count on GitHub.
+
+    OPEN AND UNKNOWN-STATE ISSUES ONLY. A closed issue's reference count is history, and
+    a ranking that carries it is a ranking with nothing to act on at the top.
+    """
+    return [row for row in store.issue_board()
+            if (row.get("state") or "") != "CLOSED"][:limit]
+
+
+def issue_board_across(project_name: str | None = None,
+                       limit: int = 50) -> list[dict[str, Any]]:
+    """`issue_board` for one project or for the whole fleet, ranked across all of them.
+
+    Each row carries its `project`, because an issue number alone does not identify an
+    issue once more than one tracker is in play — and the fleet-wide read is the default
+    for the same reason `jarvis alarms` is: the user is choosing what to work on next,
+    not auditing one project.
+    """
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered "
+                           f"(known: {sorted(paths)})")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in paths.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            out += [{**row, "project": name} for row in issue_board(store, limit=limit)]
+        finally:
+            store.close()
+    out.sort(key=lambda row: (-int(row["refs"]), -int(row["number"] or 0)))
+    return out[:limit]
 
 
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
@@ -2229,6 +2462,21 @@ def unlanded_work(store: ProjectStore, wo: dict[str, Any],
     recorded = store.get_work_order(wo["id"])
     if pr_url or recorded.get("pr_url"):
         return landing.Authored()
+    return authorship(store, wo)
+
+
+def authorship(store: ProjectStore, wo: dict[str, Any]) -> landing.Authored:
+    """What this work order's worktree has produced, asked WITHOUT the pull-request rule.
+
+    `unlanded_work` is the refusal and short-circuits to "nothing" for an order carrying
+    a pull request, which is right for a refusal and wrong for the record: an order that
+    wrote code and landed it behind a PR still wrote code, and INV-PR-RECORDED needs that
+    written down while the worktree still exists to say so. So the two are separated —
+    this reads, `unlanded_work` judges — and no settling pays for two reads.
+    """
+    from . import landing
+
+    recorded = store.get_work_order(wo["id"])
     return landing.authored(landing.worktree_of(store.project_path, recorded))
 
 
@@ -2272,7 +2520,27 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `pr_url` NULL over the fact that a commit existed — so the record afterwards said
     the order had produced nothing. This writes down what was there instead: the branch,
     the count, and the files that were never committed at all.
+
+    **ONCE PER EPISODE, NOT ONCE PER CALLER.** `Daemon.settle_work_order` re-derives an
+    order's ending from the LATEST turn on EVERY tick, so it reaches here again on the
+    tick after a park, over the same done turn, with nothing changed — and an
+    unconditional write would trade "unparks and completes" for a fresh `work_unlanded`
+    and a fresh flag every tick, which is the renotify-on-every-restart shape the
+    invariants module's third rule exists to forbid. `work_unlanded_open` is the episode
+    test and already means exactly this: a park with no `finished`, `abandoned` or
+    `pr_merged` since. A re-delivery writes one of those, so the NEXT park is a new
+    episode and does record again.
+
+    The STATUS is still asserted on the quiet path and the FLAG is deliberately not.
+    `UNLANDED_BLOCKER` is one `true_blockers` re-derives from `work_unlanded_open`, so
+    INV-ATTENTION-MISSING puts it back if it is genuinely missing — and that path honours
+    `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
+    ran `jarvis wo ack` over a parked order must not have the flag raised again by the
+    next tick; that is the same renotify defect wearing the column instead of the event.
     """
+    if store.work_unlanded_open(wo["id"]):
+        store.update_work_order(wo["id"], status="needs_review")
+        return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)
@@ -2892,6 +3160,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     thing being enforced is that the decision is WRITTEN DOWN, not that it is prevented.
     The predicate is `unlanded_work`'s and is deliberately narrow — see Neo question 280.
 
+    **AND IT WRITES DOWN WHAT THE ORDER AUTHORED, on every route including the one that
+    settles cleanly.** That record is what INV-PR-RECORDED reads months later, when the
+    worktree it came from is long gone; the refusal above is what keeps it honest.
+
     **`--abandon` ON AN ALREADY-SETTLED ORDER RECORDS AND STOPS.** It is INV-WORK-LANDED's
     printed remedy, so it is typed months after the work; opening a validation round there
     escalates a session that no longer exists and hands the user a fresh attention item in
@@ -2928,11 +3200,15 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         # exactly as it found it (a `result_summary` saved beside a refusal reads
         # afterwards like a work order that finished), and the abandonment below records
         # what this same read saw rather than re-running git against a tree that has
-        # moved. `unlanded_work` answers "nothing" for a work order carrying a pull
-        # request, so the `--pr` path never touches git at all.
+        # moved.
         stranding = unlanded_work(store, _wo, pr_url or "")
         if stranding.produced and not abandon:
             raise OpsError(unlanded_refusal(wo_id, summary, stranding))
+        # `stranding` is the REFUSAL's reading and is deliberately empty for an order
+        # carrying a pull request; `base` is what says a worktree was actually read. The
+        # record wants the other answer, so the `--pr` path does the look here instead —
+        # once either way. See `authorship` and INV-PR-RECORDED.
+        work = stranding if stranding.base else authorship(store, _wo)
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -2946,13 +3222,14 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         store.add_event(wo_id, "finished",
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
-                         **({"evidence": evidence} if evidence else {})})
+                         **({"evidence": evidence} if evidence else {}),
+                         **({"authored": work.record()} if work.base else {})})
         if abandon:
             # AFTER `finished` and never before: `_abandoned` reads the newer of the two,
             # so an abandonment written first would be superseded by the finish it
             # belongs to and the landing would refuse the very order it just excused.
             store.add_event(wo_id, "abandoned",
-                            {"reason": abandon, **stranding.record()})
+                            {"reason": abandon, **work.record()})
             if _wo["status"] in TERMINAL_STATUSES:
                 # RECORDING A DECISION ABOUT SETTLED WORK IS NOT A DELIVERY. This is the
                 # remedy INV-WORK-LANDED prints, and it is typed against orders that
@@ -3303,6 +3580,70 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
                      "was": wo["status"],
                      **{k: v for k, v in fields.items() if k != "behind"}})
     return {"wo_id": wo["id"], "nudged": True, "attempts": attempt, "gave_up": False}
+
+
+def defer_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
+                    request: dict[str, Any]) -> bool:
+    """Say once that a pending gate is why this repair is not being attempted.
+
+    Issue #469, §3 of
+    docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md. No
+    attempt is spent and no message is queued; this is only the record.
+
+    ONCE PER EPISODE PER REQUEST, because the poll asks every couple of minutes for as
+    long as the review takes — six hours of it, in the issue. The attention the gate
+    deserves is the gate's own, which is already an item when it escalates.
+    """
+    if store.pr_repair_deferred(wo["id"], repair.name, request["id"]):
+        return False
+    store.add_event(wo["id"], repair.event("deferred"), {
+        "pr_url": wo.get("pr_url"), "approval_id": request["id"],
+        "kind": request["kind"],
+        "attempts": store.pr_repair_attempts(wo["id"], repair.name)})
+    return True
+
+
+def rearm_pr_repair(store: ProjectStore, wo: dict[str, Any],
+                    repair: PrRepair) -> int:
+    """Give back a budget spent on turns the worker was never allowed to take.
+
+    Issue #469, §4 of the spec above. Returns the number of attempts refunded, 0 when
+    there is nothing to refund — which is every ordinary give-up, and the answer this
+    must keep giving for a worker that genuinely tried and failed.
+
+    THE THREE CONDITIONS ARE IN THE CHEAPEST ORDER: an episode that has not given up is
+    the overwhelmingly common one and costs a single indexed read to rule out. The last
+    is the real predicate — EVERY nudge went out while a gate was open, so not one of
+    them could reach the conflict. Partial refunds are deliberately not a thing; see the
+    spec for why the whole-budget case is the one worth machinery.
+
+    The caller nudges immediately afterwards, which is what keeps `pr_repair_origin`
+    answering: the fresh attempt re-records the status the repair is taking the work
+    order out of, and the episode is never left open with no nudge in it.
+
+    ONCE PER WORK ORDER PER REPAIR, EVER, and that cap is not derived from the other
+    three conditions — it is the thing that makes a runaway refund impossible to write.
+    The argument that the conditions alone terminate is sound but it is an argument
+    about two predicates in two files agreeing; they disagreed once already (round 1 of
+    this order's review), and the failure mode is invisible: a budget silently restored
+    every episode, attention cleared each time, exactly the unattended burn issue #469
+    is about. The cost of the cap being wrong is one work order asking the user to
+    resolve a conflict by hand, which is where the OS started. Spec §4.
+    """
+    if not store.pr_repair_gave_up(wo["id"], repair.name):
+        return 0
+    if store.events_of_kind(wo["id"], repair.event("rearmed")):
+        return 0
+    if store.pending_approvals(wo["id"]):
+        return 0        # still shut — `Daemon.heal_pull_request`'s guard holds anyway
+    nudges = store.pr_repair_nudges(wo["id"], repair.name)
+    if not nudges or not all(store.gate_open_at(wo["id"], n["ts"]) for n in nudges):
+        return 0
+    store.add_event(wo["id"], repair.event("rearmed"), {
+        "pr_url": wo.get("pr_url"), "attempts": len(nudges)})
+    if wo["attention_reason"] == repair.blocker:
+        store.clear_attention(wo["id"])
+    return len(nudges)
 
 
 def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
@@ -3982,6 +4323,7 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
     try:
         p = budget.pool(store, central, fo)
         spend = budget.feature_spent(store, central, fo)
+        live = budget.feature_in_flight(store, fo)  # display only; see `budget.spent`
         children = [
             {"wo_id": c["id"], "status": c["status"],
              "reserved_usd": c.get("budget_reserved_usd"),
@@ -3995,6 +4337,8 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
             "status": fo["status"], "budget_usd": fo.get("budget_usd"),
             "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
             "spent_usd": spend.total_usd,
+            "in_flight_usd": live,
+            "live_spent_usd": spend.total_usd + live,
             "reserved_usd": p.held_usd if p else None,
             "unreserved_usd": p.unreserved_usd if p else None,
             "children": children}
@@ -4107,6 +4451,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # child's page. Empty for every unit that has never been validated, and it
             # is the emptiness the surfaces branch on — no rounds, no section.
             "validation_rounds": validation_rounds(store, fo_id=fo_id),
+            # The feature's OWN follow-ups — the ones its plan review raised. A child's
+            # are on the child, where the round that raised them is.
+            "issues": issue_index(store, fo_id),
             # Every finding ABOUT this feature, whatever carried it, on the same
             # always-present rule as the rounds — and the rows themselves, exactly as
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
@@ -6196,6 +6543,10 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
         "seq": turn["seq"], "kind": turn["kind"], "state": turn["state"],
         "started_at": turn["started_at"], "ended_at": turn.get("ended_at"),
         "duration_s": duration, "cost_usd": turn.get("cost_usd"),
+        # Which reading billed this turn (`project_store.COST_FROM_*`). The CLI's own
+        # figure and the transcript floor are not the same currency, and a surface that
+        # shows the number owes the reader which one it is (issue #471).
+        "cost_source": turn.get("cost_source"),
         "recorded": u is not None,
         # Which message set this turn going, where one did. It is the join that lets a
         # message on the work order page show what answering it cost.
@@ -7824,6 +8175,10 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
     try:
         cap = budget.ceiling(store, central, wo)
         spend = budget.spent(store, central, wo_id)
+        # The turn in flight, which the enforcement's two queries cannot see and the
+        # reader can (issue #471, Neo question 469). Added for DISPLAY only, and it
+        # never reaches `cap`.
+        live = budget.in_flight(store, wo_id)
         parent_pool = None
         if wo.get("parent_id"):
             try:
@@ -7840,9 +8195,16 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "reserved_usd": wo.get("budget_reserved_usd"),
         "worker_usd": spend.worker_usd, "jarvis_usd": spend.jarvis_usd,
         "spent_usd": spend.total_usd,
+        # RECORDED plus IN FLIGHT, and the two are kept apart rather than merged: one is
+        # the CLI's own figure and governs the ceiling, the other is a list-price
+        # estimate off the live transcript and governs nothing. A surface showing
+        # `live_spent_usd` owes the reader the `~`.
+        "in_flight_usd": live,
+        "live_spent_usd": spend.total_usd + live,
         "cap_usd": cap.cap_usd if cap else None,
         "cap_source": cap.source if cap else None,
         "remaining_usd": cap.remaining_usd if cap else None,
+        "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
     }
 

@@ -92,32 +92,26 @@
 {% endif %}
 {% endmacro %}
 
-{# WHAT THE ROUND FILED RATHER THAN BLOCKED ON. Shown outright rather than folded into
-   the deliberation <details>: an issue is an OUTCOME of the round, not a seat's opinion
-   about it, and it is the half of this feature a reader has to be able to reach from the
-   work order — a follow-up filed into a tracker nobody can find from here is worse than
-   the nit coming back as feedback.
+{# WHAT THIS ROUND COULD NOT FILE, AND ONLY THAT.
 
-   NO SEAT NAME. The seat that raised one is in the issue body and on
-   `jarvis validation show`; this page is read by everyone.
+   THE ISSUES THEMSELVES MOVED OUT, to the consolidated list in `_issues.html`. They were
+   here first, one fragment per round, which is what an order judged four times over got:
+   four lists and no total — wo-61173704 filed fifteen follow-ups that way. A count is the
+   thing a reader wants and it is the one thing a per-round fragment cannot show, so the
+   issues are rendered ONCE for the whole order and this fragment keeps what is genuinely
+   per-round and has nowhere else to live.
 
-   WHAT COULD NOT BE FILED IS SHOWN TOO, and it is the line that matters most: filing
-   crosses a network now, so a finding can be raised and land nowhere, and a reader who
-   is not told never learns it existed.
+   WHAT COULD NOT BE FILED IS THE LINE THAT MATTERS MOST: filing crosses a network, so a
+   finding can be raised and land nowhere, and a reader who is not told never learns it
+   existed. It belongs to the ROUND that tried — the consolidated list is of issues that
+   exist, and a finding that never became one cannot appear there.
 
-   Absent entirely when nothing was filed, which is every round on a fleet that has not
+   Absent entirely when everything was filed, which is every round on a fleet that has not
    turned the panel on. `follow_ups` is nonetheless ALWAYS in the projection — a key that
    came and went would vanish here silently, which is `kn-99e37a4b`'s whole lesson. #}
 {% macro follow_ups(filed) %}
-{% if filed and (filed.filed or filed.dropped or filed.failed) %}
+{% if filed and (filed.dropped or filed.failed) %}
 <div class="sub" style="margin-top:6px">
-  {% if filed.filed %}
-  Filed as follow-ups:
-  {% for i in filed.filed %}
-  <a href="{{ i.url }}" class="mono" rel="noreferrer noopener" target="_blank">{%
-    if i.number %}#{{ i.number }}{% else %}issue{% endif %}</a> {{ i.title }}{{ "," if not loop.last }}
-  {% endfor %}
-  {% endif %}
   {% if filed.dropped %}
   <div>{{ filed.dropped }} further follow-up{{ '' if filed.dropped == 1 else 's' }} went
     over the per-round cap and {{ 'was' if filed.dropped == 1 else 'were' }} not filed.</div>

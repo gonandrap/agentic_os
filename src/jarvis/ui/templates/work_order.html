@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% import "_bill.html" as bill_ui %}
 {% import "_validation.html" as validation_ui %}
+{% import "_issues.html" as issues_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -187,9 +188,20 @@
      which walks transcripts and can fall back to an estimate. #}
   <p class="kv mono" style="margin-bottom:0;">
     {% if cap.cap_usd %}
-      Budget: ${{ '%.2f'|format(cap.spent_usd) }} of ${{ '%.2f'|format(cap.cap_usd) }}
+      {# THE TURN IN FLIGHT IS SHOWN, AND IT IS NOT THE CEILING'S FIGURE. A running
+         turn writes the CLI's own cost only when it ends, so its spend here is a
+         list-price estimate off the live transcript and carries a `~` (issue #471,
+         Neo question 469). Printing the recorded total alone is what put
+         `Budget: $0.00 of $30.00` directly under a bill chip reading `~$3.25`. #}
+      Budget:
+      {%- if cap.in_flight_usd %}
+        <span title="${{ '%.2f'|format(cap.spent_usd) }} recorded from settled turns, plus ~${{ '%.2f'|format(cap.in_flight_usd) }} the turn in flight has spent so far — estimated from its transcript at list prices, because a turn writes the CLI's own figure only when it ends. The ceiling is applied against the recorded figure."
+              >~${{ '%.2f'|format(cap.live_spent_usd) }}</span>
+      {%- else %} ${{ '%.2f'|format(cap.spent_usd) }}
+      {%- endif %} of ${{ '%.2f'|format(cap.cap_usd) }}
       {%- if cap.cap_source == 'feature' %} (its feature's slice){% endif %}
-      {%- if cap.remaining_usd > 0 %} · ${{ '%.2f'|format(cap.remaining_usd) }} left
+      {%- if cap.live_remaining_usd > 0 %} ·
+        {%- if cap.in_flight_usd %} ~{% endif %}${{ '%.2f'|format(cap.live_remaining_usd) }} left
       {%- else %} · spent{% endif %}
       {% if cap.feature_unreserved_usd is not none %}
         · its feature has ${{ '%.2f'|format(cap.feature_unreserved_usd) }} unreserved
@@ -335,6 +347,10 @@
 {# Outside the tabs with the gates and the assumptions: a round that was rejected or
    escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}
+
+{# Below the rounds, because it is what came OUT of them — and once for the whole order
+   rather than once per round, which is the thing the per-round fragment could not be. #}
+{{ issues_ui.unit(issues) }}
 
 {# The three readings of one work order. Everything above stays outside the tabs — an
    ask hidden behind a tab is an ask that does not happen. §6 of

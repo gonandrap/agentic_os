@@ -1094,7 +1094,7 @@ elif argv[:2] == ["issue", "view"]:
     save(rows)
     number = argv[2].rstrip("/").rsplit("/", 1)[-1]
     whole = {"number": int(number) if number.isdigit() else 0,
-             "state": r["state"], "url": argv[2],
+             "state": r["state"], "url": argv[2], "title": r.get("title", ""),
              "labels": [{"name": n} for n in r["labels"]]}
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))

@@ -662,6 +662,10 @@ class Daemon:
                     # a second poll interval for news the OS already has is the gap
                     # issue #240 is about, one step smaller.
                     self.sync_issues(project, store)
+                    # Beside it, on the same cadence and for the same reason: the
+                    # tracker is the surface a person scans when choosing what to pick
+                    # up, and a reference count that lags is one they act on wrongly.
+                    self.sync_issue_references(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -1045,9 +1049,19 @@ class Daemon:
         manager = store.manager_work_order(fo_id)
         if not manager or manager["status"] not in OPEN_STATUSES:
             return
+        from . import ops as ops_mod
+
+        # RECORDS, like `mark_done`, and does not refuse: the feature is over and parking
+        # its manager would put an attention item on a settled feature. A manager is told
+        # it writes no product code, and one that did anyway is exactly what
+        # INV-PR-RECORDED is for — this is the only moment its worktree still exists to
+        # say so.
+        work = ops_mod.authorship(store, manager)
         store.set_status(manager["id"], "completed")
         store.clear_attention(manager["id"])
-        store.add_event(manager["id"], "feature_settled", {"feature_order": fo_id})
+        store.add_event(manager["id"], "feature_settled",
+                        {"feature_order": fo_id,
+                         **({"authored": work.record()} if work.base else {})})
 
     def _close_feature_backlog(self, fo: dict) -> None:
         """A feature order promoted from the backlog closes its item when it lands.
@@ -3718,8 +3732,15 @@ class Daemon:
                     if back == "waiting_pr_merge":
                         store.clear_attention(wo["id"])
             else:
-                store.set_status(wo["id"], "completed")
-                store.clear_attention(wo["id"])
+                # THROUGH `land_finished`, never straight to `completed`. That function
+                # is where "a work order with commits and no pull request may not
+                # complete" lives, and this branch — a turn that ended with a summary
+                # and no `pr_url` — used to be the one route to `completed` that walked
+                # past it. It also unparks: `park_unlanded` leaves `needs_review` behind,
+                # and this ran a tick later and completed the order it had just held.
+                from . import ops as ops_mod
+
+                ops_mod.land_finished(store, fresh)
         elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
@@ -4824,16 +4845,31 @@ class Daemon:
         """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
 
         ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
-        four guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
-        a nudge already queued, a turn already in flight, and a validation round that
-        owns the work order. Spec §3 for why each of the first three would otherwise
-        cost a duplicated turn or silently spend the budget, and §4.1 for the fourth.
+        five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        a nudge already queued, a turn already in flight, a validation round that owns
+        the work order, and a privileged-action gate that would refuse everything the
+        repair needs to run. Spec §3 for why each of the first three would otherwise
+        cost a duplicated turn or silently spend the budget, §4.1 for the fourth, and
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md for
+        the fifth.
         """
         from . import ops
 
         if not wo.get("session_id"):
             return
         if store.queued_messages(wo["id"]) or worker_session.busy(store, wo["id"]):
+            return
+        # A GATE UNDER REVIEW REFUSES THE REPAIR BEFORE IT STARTS (issue #469).
+        # `pending_approvals` and not `open_approvals`: this is the exact predicate
+        # `hooks.pending_turn_block` enforces, which is the code that actually denies
+        # the worker's commands — an `awaiting_case` request blocks the END of a turn,
+        # not the work in it. Deferred, never dropped: nothing is spent, and the tick
+        # after the verdict nudges normally.
+        blocking = store.pending_approvals(wo["id"])
+        if blocking:
+            if ops.defer_pr_repair(store, wo, repair, blocking[0]):
+                log.info("[%s] %s is %s but gate %s is under review — repair deferred",
+                         project.name, wo["id"], what, blocking[0]["id"])
             return
         # THE ROUND MACHINE OWNS THIS SESSION. Keyed off the ROUND, not the status, and
         # that distinction is the whole guard: since issue 212 a round runs while the
@@ -4849,6 +4885,13 @@ class Daemon:
             log.debug("[%s] %s has a validation round open — repair deferred",
                       project.name, wo["id"])
             return
+        # ...and the other half of #469: a budget ALREADY spent that way. Before
+        # nudging, because the refund and the fresh attempt belong to the same tick —
+        # `ops.rearm_pr_repair` says why.
+        refunded = ops.rearm_pr_repair(store, wo, repair)
+        if refunded:
+            log.info("[%s] %s: %s attempts were spent behind a gate the worker could "
+                     "not pass — budget re-armed", project.name, wo["id"], refunded)
         out = ops.nudge_pr_repair(store, wo, repair, **fields)
         if out["gave_up"]:
             log.info("[%s] %s still %s after %s attempts — %s needs the user",
@@ -4963,6 +5006,73 @@ class Daemon:
             if (applied == issues.CLOSED and wo.get("pr_url")
                     and issues.dispatches(wo.get("issue_priority") or "")):
                 self.ensure_release(project, store, wo)
+
+    #: How long a cached issue state is good for. An hour, because nothing the OS does
+    #: depends on it being fresher: it decides whether a reference may be written and how
+    #: a list renders, and an issue a person closed five minutes ago is one the sweep
+    #: leaves alone for at most one more hour.
+    ISSUE_STATE_TTL = 3600
+
+    #: How many issues ONE sweep will re-read. `sync_issues` costs nothing while the
+    #: tracker and the record agree; this one has state that expires, so it needs a
+    #: ceiling of its own — a project whose tracker has grown must not turn one tick into
+    #: a hundred subprocesses. Whatever is left over is the next sweep's, oldest first.
+    ISSUE_REFRESH_PER_SWEEP = 10
+
+    def sync_issue_references(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep each linked issue saying how many work orders have pointed at it.
+
+        `sync_issues`' sibling, one relation out: that one tells the tracker what the OS
+        is DOING about an issue, this one tells it how much the fleet has RUN INTO it.
+        The count is a priority signal the user reads when choosing what to work on next,
+        so it has to be on the issue itself as well as in Jarvis.
+
+        **NOTHING IS WRITTEN TO AN ISSUE WHOSE STATE THE OS HAS NOT READ.** Not a
+        comment, not a label. A closed issue is a decision somebody made, and the rule
+        `issues.apply` holds — the OS does not argue with a human — is only enforceable
+        against a state actually read; "" means not read, and it fails closed.
+
+        Three comparisons, none of which costs anything while they agree: the cached
+        state against its TTL, `unannounced` against zero, and `refs` against
+        `refs_labelled`. A project that has never linked an issue does not even pay the
+        query.
+        """
+        rows = store.issues_to_sync()
+        if not rows:
+            return
+        from . import github, issues
+
+        refreshed = 0
+        for row in rows:
+            url, repo = row["issue_url"], row["repo"]
+            if not repo:
+                continue
+            try:
+                checked = row["checked_at"]
+                if ((checked is None or time.time() - checked > self.ISSUE_STATE_TTL)
+                        and refreshed < self.ISSUE_REFRESH_PER_SWEEP):
+                    issue = issues.view(url, repo)
+                    refreshed += 1
+                    store.record_issue(url, number=issue.number, repo=repo,
+                                       title=issue.title, state=issue.state)
+                    row = {**row, "state": issue.state}
+                if (row.get("state") or "") != "OPEN":
+                    continue
+                for link in store.unannounced_links(url):
+                    issues.comment(url, issues.reference_comment(
+                        link["unit_id"], project.name, link["kind"]), repo)
+                    store.mark_issue_announced(url, link["unit_id"])
+                if int(row["refs"]) != int(row["refs_labelled"]):
+                    issues.set_reference_label(url, int(row["refs"]), repo)
+                    store.record_issue_label(url, int(row["refs"]))
+            except github.GitHubError as e:
+                log.debug("[%s] could not sync references on %s: %s", project.name,
+                          url, e)
+                self._warn_issue_sync_broken(project, store, e)
+                continue
+            except Exception:  # noqa: BLE001 — one issue must not stall the rest
+                log.exception("[%s] syncing references on %s failed", project.name, url)
+                continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
     #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in

@@ -819,6 +819,9 @@ def create_app() -> FastAPI:
             # Same lifetime, same reason: the note reads this work order's last turn.
             pauses = {wo["id"]: invariants.pause_note(store, wo) for wo in wos}
             pauses = {k: v for k, v in pauses.items() if v}
+            # Inside the store's lifetime like every other read on this page. Empty,
+            # and therefore invisible, for a project that has never linked an issue.
+            issue_board = ops.issue_board(store)
             visible_counts = store.status_counts()
             all_counts = store.status_counts(include_hidden=True)
             counts = all_counts if show_hidden else visible_counts
@@ -844,6 +847,7 @@ def create_app() -> FastAPI:
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features, fo_settled=fo_settled,
+                      issue_board=issue_board,
                       fo_revealed=fo_revealed)
 
     @app.get("/fo/{name}/{fo_id}", response_class=HTMLResponse)
@@ -869,6 +873,9 @@ def create_app() -> FastAPI:
             store.close()
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
                       cap=ops.feature_order_budget(fo_id, detail["project"]),
+                      # Already on `detail` for `jarvis fo show`; passed separately so
+                      # the template reads the same name on both pages.
+                      issues=detail["issues"],
                       validation=validation, error=error)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
@@ -936,6 +943,8 @@ def create_app() -> FastAPI:
             # disagree about the same work order once before (PR 65).
             label = invariants.status_label(store, wo, _fleet_if_pending(wo))
             validation = ops.validation_detail(store, wo_id=wo_id)
+            # THE WHOLE ORDER'S LIST, not one round's. See `_issues.html`.
+            issue_index = ops.issue_index(store, wo_id)
             # None for every order the automatic merge has never touched, which is what
             # keeps the line off the page entirely rather than rendering "off" forever.
             auto_merge = ops.automerge_state(store, wo)
@@ -974,6 +983,7 @@ def create_app() -> FastAPI:
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,
+                      issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
