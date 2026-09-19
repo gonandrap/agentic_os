@@ -324,16 +324,22 @@ class NeoStore:
                 (max_attempts, cutoff),
             ).fetchall()
         ]
+        # NO `retry_after` here, unlike `release_claim`. The backoff exists so a unit
+        # returned to a queue drained every few seconds is not re-claimed instantly
+        # (issue #235) — and this path is already gated on `older_than`, fifteen minutes
+        # of waiting the question has ALREADY served. Another minute on top delays a
+        # rescue that is overdue, and `reclaim_stale_alarms` re-queues bare for the same
+        # reason. The stale cutoff IS the backoff.
         requeued = [
             int(r["id"])
             for r in self.conn.execute(
                 """UPDATE questions
                       SET status='queued', attempts=attempts+1, claimed_at=NULL,
-                          retry_after=?
+                          retry_after=NULL
                     WHERE status='answering' AND attempts < ?
                       AND COALESCE(claimed_at, ts) < ?
                 RETURNING id""",
-                (db.now() + RETRY_BACKOFF_SECONDS[0], max_attempts, cutoff),
+                (max_attempts, cutoff),
             ).fetchall()
         ]
         return {"requeued": requeued, "failed": failed}

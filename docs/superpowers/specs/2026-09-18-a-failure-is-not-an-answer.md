@@ -34,6 +34,12 @@ writes a `retry_after` alongside the attempt, and every claim query honours it.
 A **usage-limit refusal** is the exception in the other direction: it states when it ends,
 so it is held until that moment and spends no attempt at all.
 
+The two `reclaim_stale*` paths are the other exception, and they write no backoff: a row
+only qualifies there after fifteen minutes stranded in `answering`/`reviewing`, so the
+stale cutoff already IS the delay. Adding one on top only postpones a rescue that is
+overdue — and it cost `neo_tick`'s rescue-and-answer-in-one-tick guarantee, which is what
+caught it.
+
 ## 2. Neo's queue — the case that produced the ruling
 
 Question 388 reached the user as an escalation. Neo's `claude -p` call had failed with
