@@ -1236,6 +1236,13 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
 #: sits an order of magnitude clear of both (issue #470).
 CALL_COVER_SLACK = 1.10
 
+#: ...plus a flat per-turn allowance, because that gap is not proportional. Measured on
+#: the four longest healthy orders here, the part of a turn no transcript contains is
+#: ~0.38M and is almost entirely cache_read — 361,687 / 364,806 / 365,618 / 366,399 on
+#: turns of 2.7M to 4.1M, each with no subagent. A multiplicative slack alone therefore
+#: fails a short turn and passes a long one for the same absolute residue.
+CALL_COVER_RESIDUE = 500_000
+
 
 def _check_calls(payload: dict[str, Any]) -> list[str]:
     """Per-call rows are a PARTITION of their turn: they may not exceed it, and — with
@@ -1261,7 +1268,9 @@ def _check_calls(payload: dict[str, Any]) -> list[str]:
     rows = payload.get("turn_rows") or []
     for row in rows:
         cover = row.get("calls_cover")
-        if not cover:
+        # A turn with no result JSON yet — one in flight — has no figure of its own to
+        # exceed, and its calls are in the transcript the moment the worker makes them.
+        if not cover or not row.get("recorded"):
             continue
         for cls in usage_mod.TOKEN_CLASSES:
             if cover[cls] > (row.get(cls) or 0):
@@ -1276,7 +1285,7 @@ def _check_calls(payload: dict[str, Any]) -> list[str]:
         inside = (row["calls_cover"]["total"]
                   + sum(subs.get(cls, 0) for cls in usage_mod.TOKEN_CLASSES))
         mine = sum(row.get(cls) or 0 for cls in usage_mod.TOKEN_CLASSES)
-        if inside and mine > inside * CALL_COVER_SLACK:
+        if inside and mine > inside * CALL_COVER_SLACK + CALL_COVER_RESIDUE:
             problems.append(
                 f"turn {row['seq']}: it claims {mine} tokens but everything inside it — "
                 f"{row['calls_cover']['total']} across its API calls and "

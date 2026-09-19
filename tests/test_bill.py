@@ -193,16 +193,24 @@ def test_a_call_older_than_the_first_turn_is_shown_outside_the_turns(store, wo):
 
 def test_a_running_turn_is_called_running_not_lost(store, wo, transcripts):
     """A turn writes its result JSON when it ends. Until then its spend is the
-    transcript's, and calling that "gone" would read as data loss on every live page."""
+    transcript's, and calling that "gone" would read as data loss on every live page.
+
+    It has no figure of its own yet either, so its calls have nothing to be compared
+    against — asked anyway, every order with a worker typing reported itself unbalanced.
+    """
     give_session(store, wo["id"], "sess-live")
-    transcripts("sess-live", [assistant_row("m1", write=100_000, out=5_000)])
-    store.create_turn(wo["id"], kind="dispatch", prompt="p")
+    transcripts("sess-live", [assistant_row("m1", write=100_000, out=5_000, at=1_005)])
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (1_000.0, turn["id"]))
+    store.conn.commit()
 
     b = ops.bill(wo["id"])
     labels = [leaf["label"] for leaf in leaves({"children": b["actors"]})]
 
     assert any("still running" in label for label in labels)
     assert not any("no result JSON left" in label for label in labels)
+    assert b["checks"]["balanced"], b["checks"]["problems"]
 
 
 # -- the agents: a partition, never an addition ---------------------------------------
@@ -440,20 +448,26 @@ def test_a_turn_bigger_than_everything_inside_it_fails_the_checks(store, wo,
     asked whether the calls exceeded the turn. Both of the contradictions the defect
     left in plain sight — a per-call table summing to a quarter of the headline, and an
     agent view giving all of it to a lead agent with no subagents — are this one check.
+
+    At a real turn's magnitude, deliberately: what the check allows is `CALL_COVER_SLACK`
+    plus `CALL_COVER_RESIDUE`, so a fixture of a few thousand tokens would pass however
+    it was inflated, and would guard nothing.
     """
     give_session(store, wo["id"], "sess-inflated")
     first = add_turn(store, wo["id"], dict(recorded_usage(1.0), usage_v=3, input=0,
-                                           cache_write=2_000, cache_read=1_000,
-                                           output=100, cache_1h=0, cache_5m=2_000))
+                                           cache_write=200_000, cache_read=1_000_000,
+                                           output=10_000, cache_1h=0,
+                                           cache_5m=200_000))
     at(store, first["id"], 1_100, 1_190)
     # Turn 2 reports turn 1's spend as well as its own — the version-2 reading.
     second = add_turn(store, wo["id"], dict(recorded_usage(2.5), usage_v=3, input=0,
-                                            cache_write=2_500, cache_read=5_000,
-                                            output=160, cache_1h=0, cache_5m=2_500))
+                                            cache_write=250_000, cache_read=5_000_000,
+                                            output=16_000, cache_1h=0,
+                                            cache_5m=250_000))
     at(store, second["id"], 1_200, 1_290)
     transcripts("sess-inflated", [
-        assistant_row("m1", write=2_000, read=1_000, out=100, at=1_105),
-        assistant_row("m2", write=500, read=4_000, out=60, at=1_205),
+        assistant_row("m1", write=200_000, read=1_000_000, out=10_000, at=1_105),
+        assistant_row("m2", write=50_000, read=4_000_000, out=6_000, at=1_205),
     ])
 
     b = ops.bill(wo["id"])
