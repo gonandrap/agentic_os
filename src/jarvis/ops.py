@@ -6,9 +6,11 @@ Every mutation of the OS goes through here, so all surfaces behave identically.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -190,22 +192,24 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
 
-    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` shell
-    out to git, so the daemon rations them to its own cadence and this does not.
-    INV-WORK-LANDED is the one that matters — "what has this fleet produced that is not
-    on the default branch" has no other home, and the audit that first answered it
-    (GitHub issue #232, six stranded work orders) was a one-off done by hand.
+    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` walk
+    every completed order a project has ever had, so the daemon rations them to its own
+    cadence and this does not. INV-WORK-LANDED is the one that matters — "what has this
+    fleet delivered that nobody merged" has no other home, and the audit that first
+    answered it (GitHub issue #232, six stranded work orders) was a one-off done by hand.
 
-    It also pays full price for it without `repair`, and answers LESS. INV-WORK-LANDED
-    caches its settled verdicts as a timeline event, and a read-only run has no timeline
-    to write to, so the default `jarvis doctor` re-reads git for every completed work
-    order every single time — the cache is populated by the daemon's hourly sweep and by
-    `--repair`, never by a plain run. The same rule costs it the coverage verdict
-    outright: refreshing the default branch writes to the repository, so a plain run does
-    not (`landing.refresh_base(allow_network=False)`) and will not condemn a branch
-    against a ref it could not bring up to date — it reports stranded work through the
-    rungs that read no base, and `unknown` where the content test would have answered.
-    Read-only is worth more than either: see `check_work_lands`.
+    `repair` no longer changes that answer. It used to: the check kept a cache of settled
+    verdicts as a timeline event and refreshed the default branch it measured against,
+    and a read-only run could do neither, so a plain `jarvis doctor` paid a per-file git
+    walk every time AND withheld the content verdict. Since the check began judging the
+    PULL REQUEST it is a pure timeline read with nothing to write and no ref to be stale
+    — what it cannot do is ASK GITHUB, and that round trip is the daemon's
+    (`Daemon.refresh_landings`). So a plain run and a repairing one say the same
+    thing. On a project the daemon has never swept both say the same thing too, and it is
+    not silence: `INV-LANDING-AUDIT-FRESH` names how many pull requests the audit has no
+    current answer for. Until review round 1 of wo-16a488ee it WAS silence, so this
+    command printed "all OS invariants hold" over an audit that had no data — a lie that
+    is worse than any false positive, because nothing shows it happening.
 
     `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
     and keeps the per-project ones. The scheduler's daily run passes it for every project
@@ -260,7 +264,8 @@ def run_doctor(project: str | None = None, repair: bool = False,
         try:
             # `slow=True` unconditionally: INV-WORK-LANDED is the whole reason issue
             # #232 asked for a report, and a human who typed `jarvis doctor` is waiting
-            # for its answer. The daemon is the caller that has to ration it.
+            # for its answer. The daemon is the caller that has to ration it — it walks
+            # the whole settled backlog, which no other check here does.
             found = check_project(store, repair=repair, slow=True)
         finally:
             store.close()
@@ -1509,6 +1514,50 @@ def follow_up_key(title: Any) -> str:
     return " ".join(str(title or "").split())
 
 
+#: The token that identifies one finding in BOTH published title shapes, and therefore
+#: the thing the dedupe survives a privacy flip on. `vf` for validation follow-up.
+#: Anchored to eight hex characters so a person's own issue cannot accidentally carry one.
+FOLLOW_UP_TOKEN_RE = re.compile(r"\bvf-[0-9a-f]{8}\b")
+
+#: What a withheld follow-up is called on a tracker the OS could not establish is private.
+#: Carries no word any model wrote — the digest is derived from the finding's title, and a
+#: digest is not the text (spec §9).
+WITHHELD_TITLE = "Validation follow-up"
+
+
+def follow_up_digest(title: Any) -> str:
+    """The stable per-finding token, derived from `follow_up_key(title)` and nothing else.
+
+    That derivation is the whole trap-avoidance: the SAME finding gets the same token in
+    the full shape and in the withheld one, so a unit whose round 1 filed against a
+    private repository and whose round 2 reads public still dedupes (spec §9).
+
+    sha256 rather than `hash()`, which is salted per process and would make the token a
+    different string on every daemon restart.
+    """
+    return "vf-" + hashlib.sha256(follow_up_key(title).encode()).hexdigest()[:8]
+
+
+def follow_up_token(title: Any) -> str:
+    """The token carried by a title already on the tracker, or "" if it carries none.
+
+    "" IS THE PRE-CHANGE ISSUE — every follow-up filed before spec §9 landed is a bare
+    finding title — and the caller falls back to `follow_up_key` for exactly those.
+    """
+    m = FOLLOW_UP_TOKEN_RE.search(str(title or ""))
+    return m.group(0) if m else ""
+
+
+def follow_up_title(key: str, digest: str, *, private: bool) -> str:
+    """What the issue is called on the tracker. Both shapes carry the digest.
+
+    The private shape keeps the finding's own title, which is what makes a tracker full
+    of them readable; the public one has nothing but the token, because a title a seat
+    wrote is model prose like any other.
+    """
+    return f"{key} [{digest}]" if private else f"{WITHHELD_TITLE} {digest}"
+
+
 def follow_up_repo(project_path: Path) -> str:
     """`owner/name` of the repository a follow-up for this project belongs on, or "".
 
@@ -1560,6 +1609,10 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     `daemon.REVIEW_FEEDBACK` and then `bus.render` each re-frame — every sentence added
     there pushes the instructions that matter off the bottom.
 
+    **THE SEAT'S WORDS GO OUT ONLY TO A TRACKER SHOWN TO BE PRIVATE** (spec §9). Anywhere
+    else the issue carries the classification and a pointer at the record, and never the
+    finding itself — including its title, which is a seat's sentence like any other.
+
     **A FAILURE IS COUNTED, NEVER SWALLOWED.** Filing crosses a network now, so it can
     fail in a way the backlog insert this replaced could not: no `origin`, no `gh`, no
     credentials, a rate limit. Each such finding lands in `failed`, which reaches the
@@ -1598,8 +1651,18 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     try:
         # ONE round trip for the dedupe, whatever the cap — see `issues.follow_ups_filed`
         # for why it must read `--state all`.
-        already = {follow_up_key(r.get("title"))
-                   for r in issues.follow_ups_filed(repo, unit_id)}
+        #
+        # TWO KEYS PER FILED ISSUE, AND THE SECOND IS WHAT SURVIVES A PRIVACY FLIP. The
+        # title's SHAPE now depends on an answer that can change between rounds (spec
+        # §9), so a dedupe on the title alone re-files every follow-up this unit has,
+        # every round, for ever, the first time the privacy read answers differently.
+        # The digest token is identical in both shapes; the plain key is the fallback
+        # for every issue filed before §9 landed, which carries no token.
+        already, already_keys = set(), set()
+        for row in issues.follow_ups_filed(repo, unit_id):
+            already.add(follow_up_token(row.get("title")))
+            already_keys.add(follow_up_key(row.get("title")))
+        already.discard("")
     except GitHubError as e:
         # The tracker could not be READ, so nothing may be written: filing blind would
         # duplicate every follow-up this unit already has.
@@ -1620,26 +1683,41 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     # findings there are, and the per-finding network calls are the creates below, which
     # the cap still bounds. So "cap before the network" is satisfied where it actually
     # mattered.
-    fresh = [f for f in pending if follow_up_key(f.get("title")) not in already]
+    fresh = [f for f in pending
+             if follow_up_digest(f.get("title")) not in already
+             and follow_up_key(f.get("title")) not in already_keys]
     cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
     payload["dropped"] = max(0, len(fresh) - cap)
+    if not fresh[:cap]:
+        return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
+    # WHETHER A SEAT'S WORDS MAY LEAVE THE MACHINE AT ALL, asked ONCE per round and only
+    # when there is something to file (spec §9). It fails closed: anything but a positive
+    # "this repository is private" withholds the finding text, and the issue carries the
+    # classification alone.
+    private = issues.repo_is_private(repo)
     pr_url = str(round_row.get("pr_url") or "")
     for finding in fresh[:cap]:
-        title = follow_up_key(finding.get("title"))
+        key = follow_up_key(finding.get("title"))
         seat = str(finding.get("seat") or "")
+        title = follow_up_title(key, follow_up_digest(key), private=private)
+        body = (_follow_up_body(finding, unit_id=unit_id, round_no=n, pr_url=pr_url,
+                                seat=seat) if private
+                else _withheld_body(unit_id=unit_id, round_no=n, pr_url=pr_url,
+                                    seat=seat, repo=repo))
         try:
-            url = issues.file_follow_up(
-                repo, title,
-                _follow_up_body(finding, unit_id=unit_id, round_no=n, pr_url=pr_url,
-                                seat=seat))
+            url = issues.file_follow_up(repo, title, body)
         except GitHubError as e:
             log.info("[%s] %s: filing %r on %s failed: %s",
                      project.name, unit_id, title, repo, e)
             payload["failed"] += 1
             continue
+        # `title` ON THE EVENT IS THE FINDING'S OWN, never what the tracker was told. The
+        # record is internal — it is where a withheld finding is READ FROM — and the
+        # surfaces that print a filed issue beside the finding that caused it key on
+        # exactly this (`cli._finding_lines`).
         payload["items"].append({"url": url, "number": issues.issue_number(url),
-                                 "title": title, "seat": seat})
+                                 "title": key, "seat": seat, "withheld": not private})
     return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
 
@@ -1673,9 +1751,47 @@ def _record_filing(store: ProjectStore, payload: dict[str, Any], *,
     return payload
 
 
+def _withheld_body(*, unit_id: str, round_no: int, pr_url: str, seat: str,
+                   repo: str) -> str:
+    """The issue body when the OS could not establish the tracker is private.
+
+    NOT ONE WORD A MODEL WROTE — spec §9, carrying over §8 of
+    docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md: the finding was written
+    by a seat that does not know it will be published, to a tracker that indexes and
+    caches whether or not the issue is later deleted, with nobody reading it in between.
+    A credential a seat noticed in a fixture is precisely the remark it files rather than
+    blocks on, so the text this feature newly publishes is enriched for the text that
+    must not be.
+
+    WITHHOLD, DO NOT DROP (`kn-bfbb2a3a`). The unit, the round and the seat are a
+    CLASSIFICATION rather than the secret, and an issue that looks empty by accident is
+    worse than one that says why it is empty — so the body carries the exact command that
+    reads the finding on the internal record. Same shape as §8's own comments: ids, a
+    link, and a pointer.
+    """
+    lines = [
+        f"The Jarvis validation panel raised a non-blocking finding on `{unit_id}`.",
+        "",
+        f"**The finding text is held on the internal record.** `{repo}` is not a "
+        f"repository this OS could establish is private, and a review model's own words "
+        f"are not published to a tracker that may be public.",
+        "",
+        f"Read it with `jarvis validation show {unit_id}`.",
+        "",
+        "---",
+        f"Round {round_no} of `{unit_id}`, raised by the `{seat or 'panel'}` seat as a "
+        f"follow-up rather than a blocker — the review judged the work shippable "
+        f"without it.",
+    ]
+    if pr_url:
+        lines.append(f"Pull request: {pr_url}")
+    return "\n".join(lines)
+
+
 def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
                     pr_url: str, seat: str) -> str:
-    """The issue body: the finding's own detail, then where it came from.
+    """The issue body ON A PRIVATE TRACKER: the finding's own detail, then where it came
+    from. `_withheld_body` above is what a public or unestablished one gets (spec §9).
 
     THE SEAT IS NAMED HERE, and this is one of the two places it may be (the other is
     `jarvis validation show`). Deliberation never reaches the submitter, but the tracker
@@ -2129,6 +2245,37 @@ def authorship(store: ProjectStore, wo: dict[str, Any]) -> landing.Authored:
 
     recorded = store.get_work_order(wo["id"])
     return landing.authored(landing.worktree_of(store.project_path, recorded))
+
+
+def unmerged_pull_request(store: ProjectStore, wo_id: str) -> str:
+    """This order's recorded pull request, unless the record says it merged. "" if it did.
+
+    The other half of `unlanded_work`, and the reason `jarvis wo done` can clear an
+    INV-WORK-LANDED alert at all. `unlanded_work` reads the WORKTREE; that check reads the
+    PULL REQUEST, and the two disagree the moment a worktree is cleaned up — which is
+    every order old enough for the check to be complaining about it. Measured on the live
+    `jarvis_os` records on 2026-09-18: five of the eight alerted orders had no worktree on
+    disk, so `jarvis wo done` wrote no `work_unlanded` event, so the exclusion the check
+    looks for was never recorded and the same alert came back on the next sweep. An alert
+    whose printed remedy does nothing is how a checker gets switched off.
+
+    "The record says it merged" is a `pr_merged` event or a settled `landing_seen` — never
+    a round trip, because this runs inside a CLI command the user is waiting on. Nothing
+    having looked yet reads as unmerged, which over-records rather than under-records: a
+    `work_unlanded` event about a pull request that turns out to have merged excuses an
+    order the check was already silent about, and `work_unlanded_open`'s episode
+    arithmetic retires it the moment a `pr_merged` lands anyway.
+    """
+    from . import landing
+
+    pr_url = str(store.get_work_order(wo_id).get("pr_url") or "")
+    if not pr_url or store.events_of_kind(wo_id, "pr_merged"):
+        return ""
+    seen = store.events_of_kind(wo_id, "landing_seen")
+    if seen and not landing.from_record(
+            wo_id, db.from_json(seen[-1]["payload"], {})).unsettled:
+        return ""
+    return pr_url
 
 
 def park_unlanded(store: ProjectStore, wo: dict[str, Any],
@@ -2784,6 +2931,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     settles cleanly.** That record is what INV-PR-RECORDED reads months later, when the
     worktree it came from is long gone; the refusal above is what keeps it honest.
 
+    **`--abandon` ON AN ALREADY-SETTLED ORDER RECORDS AND STOPS.** It is INV-WORK-LANDED's
+    printed remedy, so it is typed months after the work; opening a validation round there
+    escalates a session that no longer exists and hands the user a fresh attention item in
+    exchange for the one they just cleared. See the branch below.
+
     An open gate request outranks all of it, and this is the third enforcement point of
     docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: declaring yourself done is
     the one route around a gate that neither the Stop hold nor the narrowed tool surface
@@ -2845,6 +2997,18 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # belongs to and the landing would refuse the very order it just excused.
             store.add_event(wo_id, "abandoned",
                             {"reason": abandon, **work.record()})
+            if _wo["status"] in TERMINAL_STATUSES:
+                # RECORDING A DECISION ABOUT SETTLED WORK IS NOT A DELIVERY. This is the
+                # remedy INV-WORK-LANDED prints, and it is typed against orders that
+                # settled weeks ago — so everything below would fire on work nobody is
+                # doing: a validation round opens over a session that is gone, the panel
+                # answers "this submission changes no files", the order is escalated to
+                # `needs_review` and an attention item appears. That happened to
+                # `wo-5eedc84d` on 2026-09-18, which is how this was found: the user
+                # cleared one alert and got a different one back. The abandonment is
+                # written above, `work_abandoned` reads it, the alert is clear; a settled
+                # order's status is not this command's to move.
+                return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
         if cfg is not None and cfg.enabled:
             submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
         # ...and the status is the JOIN's to decide, not this branch's.
@@ -2881,6 +3045,12 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     them with no way to close the work order at all. What issue #232 actually asks for
     is that the evidence stop being written over in silence, so the event goes on the
     record and the status does not change.
+
+    **"UNLANDED" IS THE WORKTREE *OR* THE PULL REQUEST**, and it used to be only the
+    first. `unlanded_work` answers "nothing" for any order carrying a `pr_url`, so this
+    wrote no event for exactly the population INV-WORK-LANDED now checks — the remedy the
+    user was told to type recorded nothing, and the alert came back an hour later. See
+    `unmerged_pull_request`.
     """
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
@@ -2892,10 +3062,12 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
                 f"{wo_id}` to accept, or `--reject` to send it back."
             )
         stranding = unlanded_work(store, wo)
-        if stranding.produced and not store.work_abandoned(wo_id):
+        unmerged = unmerged_pull_request(store, wo_id)
+        if (stranding.produced or unmerged) and not store.work_abandoned(wo_id):
             store.add_event(wo_id, "work_unlanded",
-                            {**stranding.record(), "was": wo["status"],
-                             "closed_by": "marked_done"})
+                            {**stranding.record(),
+                             **({"pr_url": unmerged} if unmerged else {}),
+                             "was": wo["status"], "closed_by": "marked_done"})
         stopped = close_out(store, wo, "marked_done", why="work order marked done")
     finally:
         store.close()
@@ -2964,10 +3136,11 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     `head_oid` is the sha that merged, and it goes on the event because THE EVENT IS THE
     ONLY PLACE IT CAN LIVE. `pr_state` is stale by construction with one permitted reader
     (kn-dbc4971d), and asking GitHub again months later is a round trip per settled work
-    order; a fact recorded when it was true is neither. It is what lets the landing sweep
-    answer issue #232's Mode C exactly — commits the branch grew AFTER the merge — rather
-    than falling back to the content heuristic. Empty for every work order that merged
-    before this shipped, which is exactly why that fallback exists.
+    order; a fact recorded when it was true is neither. It answered issue #232's Mode C
+    exactly — commits the branch grew AFTER the merge — until the user narrowed
+    INV-WORK-LANDED to the pull request on 2026-09-18, and NOTHING READS IT NOW. It stays
+    because a merge whose commit is not written down anywhere is a hole in the record,
+    and this is the one path that knows it.
 
     `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
     above cutting the other way. A merge the OS performed itself is indistinguishable
@@ -6518,7 +6691,7 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import inspection
+    from . import holds, inspection
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -6538,11 +6711,16 @@ def inspect_report(target: str, project: str | None = None, *,
             configs[project_name] = replace(cfg, **overrides) if overrides else cfg
         return configs[project_name]
 
-    def unit(project_name: str, wo: dict[str, Any]) -> dict[str, Any]:
+    def unit(project_name: str, wo: dict[str, Any],
+             store: ProjectStore) -> dict[str, Any]:
         session = wo.get("session_id") or ""
         cfg = settings(project_name)
-        anatomy = (inspection.read_session(session, cfg, index=index) if session
-                   else inspection.Anatomy(session_id="",
+        # The OS's own record of what it was holding this order for, so the report can
+        # state both clocks and name the difference (`holds`). Two indexed reads.
+        spans = holds.held(store, wo["id"])
+        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans)
+                   if session
+                   else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,
                                            join_floor=cfg.report_join_floor))
         payload = anatomy.as_dict()
@@ -6553,11 +6731,16 @@ def inspect_report(target: str, project: str | None = None, *,
     try:
         name, path, fo = find_feature_order(target, project)
     except OpsError:
-        name, _wo_path, wo = find_work_order(target, project)
+        name, wo_path, wo = find_work_order(target, project)
         cfg = settings(name)
+        store = ProjectStore(wo_path)
+        try:
+            payload = unit(name, wo, store)
+        finally:
+            store.close()
         return {"scope": wo["id"], "title": wo["title"],
                 "write_floor": cfg.report_write_floor,
-                "join_floor": cfg.report_join_floor, "units": [unit(name, wo)]}
+                "join_floor": cfg.report_join_floor, "units": [payload]}
 
     store = ProjectStore(path)
     try:
@@ -6565,10 +6748,11 @@ def inspect_report(target: str, project: str | None = None, *,
         planner_id = fo.get("plan_wo_id")
         if planner_id:
             try:
-                units.append(unit(name, store.get_work_order(planner_id)))
+                units.append(unit(name, store.get_work_order(planner_id), store))
             except KeyError:
                 pass
-        units.extend(unit(name, child) for child in store.feature_children(fo["id"]))
+        units.extend(unit(name, child, store)
+                     for child in store.feature_children(fo["id"]))
     finally:
         store.close()
     cfg = settings(name)

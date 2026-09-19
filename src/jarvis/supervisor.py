@@ -322,15 +322,25 @@ def _what_it_is(wo: dict[str, Any]) -> str:
     return "an ordinary work order" + (f", a child{belongs}" if parent else "")
 
 
-def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
-    """The per-turn split — `live_alarms`' own read, re-rendered. No model call."""
-    from . import inspection
+def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
+                   pstore: Any = None) -> list[str]:
+    """The per-turn split — `live_alarms`' own read, re-rendered. No model call.
+
+    THE HOLDS COME WITH IT, and this is the surface where leaving them out costs the
+    most: the reader is a model deciding whether to spend the user's attention, and a
+    turn reported as 18,510 seconds of wall clock with no mention that 14,364 of them
+    were a spent usage window is the OS asking for a judgement on a condition it created
+    itself. `pstore` is optional only so a caller without one degrades to the old lines
+    rather than raising inside an evidence packet.
+    """
+    from . import holds, inspection
 
     session_id = wo.get("session_id") or ""
     if not session_id:
         return ["(the work order has no session)"]
+    spans = holds.held(pstore, wo["id"]) if pstore is not None else []
     try:
-        anatomy = inspection.read_session(session_id, inspect_cfg)
+        anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans)
     except OSError:
         return ["(the session transcript could not be read)"]
     if not anatomy.found:
@@ -346,8 +356,18 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any) -> list[str]:
         split = ", ".join(f"{getattr(turn, part):.0f}s {part}"
                           for part in inspection.PARTS)
         stalled = "" if turn.observed else "NO API CALL WAS EVER MADE — it cost nothing. "
+        # Said BEFORE the split, like `stalled` above and for its reason: it changes what
+        # every number after it means, and a judge that reads it last has already decided.
+        # Only where the two clocks differ — a line saying "120s wall, 120s active" on
+        # every unheld turn is the noise that gets the held one skimmed past.
+        held_by = turn.held_by()
+        for cause, seconds in held_by.items():
+            stalled += (f"{seconds:.0f}s of this turn was HELD by "
+                        f"{holds.HOLD_CAUSES.get(cause, cause)} — the OS was not "
+                        f"permitting it to run and nothing was being spent. ")
+        active = f" ({turn.active:.0f}s of it active)" if held_by else ""
         lines.append(
-            f"- turn {turn.seq}: {stalled}{turn.wall:.0f}s wall ({split}), "
+            f"- turn {turn.seq}: {stalled}{turn.wall:.0f}s wall{active} ({split}), "
             f"{len(turn.calls)} API call{'' if len(turn.calls) == 1 else 's'} costing "
             f"{spend.total_tokens:,} tokens / ${spend.list_cost_usd:.2f}, "
             f"context peak {turn.context_peak:,}")
@@ -568,7 +588,7 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
         sections.append(["# The session, turn by turn",
-                         *_session_lines(row, inspect_cfg)])
+                         *_session_lines(row, inspect_cfg, pstore)])
         sections.append(_said_lines(pstore, row["id"], cfg))
 
     # Whole sections, never a mid-line cut: half a cache-write line reads as a fact.
@@ -644,13 +664,25 @@ def _failed_verdict(raw: str, reason_chars: int) -> dict[str, Any]:
             "reason": f"{UNREADABLE_PREFIX}{(raw or '')[:reason_chars]}"}
 
 
+#: `verdict_reason` on an alarm nobody could put to a model — `neo_store.UNREACHABLE_PREFIX`
+#: one layer down, and the string `_apply` keys the retry off.
+UNREACHABLE_PREFIX = "the supervisor could not be reached: "
+
+
 def _transport_failure(exc: Exception, reason_chars: int) -> dict[str, Any]:
     """A call that never happened, which `structured.request`'s `on_invalid` does NOT
     cover — `ClaudeCliError` propagates untouched by design (kn-9b18a8eb). Without this
-    the review raises out of the daemon's own thread pool."""
-    return {"decision": "escalate", "note": "", "question": "", "remedy": "",
-            "argument": "", "failed": True,
-            "reason": f"the supervisor could not be reached: {str(exc)[:reason_chars]}"}
+    the review raises out of the daemon's own thread pool.
+
+    `decision` IS EMPTY, not `escalate`. Its sibling `_failed_verdict` names one because a
+    reply nobody could read still has to fail toward the user; nothing decided this one at
+    all, and a `decision` key that reads `escalate` is a judgement in the record that no
+    model made. `_apply` routes on `unreachable` before it reads either — spec
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.
+    """
+    return {"decision": "", "note": "", "question": "", "remedy": "",
+            "argument": "", "failed": True, "unreachable": True,
+            "reason": f"{UNREACHABLE_PREFIX}{str(exc)[:reason_chars]}"}
 
 
 def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
@@ -947,6 +979,16 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
 
     alarm_id = alarm["id"]
     decided = db.now()
+    if verdict.get("unreachable"):
+        # NOT `failed`: nobody judged this, so the alarm goes back on the queue with the
+        # attempt spent rather than out of it. `failed` at attempts=0 is what left every
+        # unreachable alarm permanently unjudged — `NeoStore.release_claim`'s defect, one
+        # queue along.
+        outcome = pstore.release_alarm_claim(alarm_id, verdict["reason"],
+                                             cfg.max_review_attempts)
+        log.warning("supervisor could not be reached for %s (%s): %s",
+                    alarm_id, outcome, verdict["reason"])
+        return
     if verdict["failed"]:
         pstore.update_alarm(alarm_id, status="failed",
                             verdict_reason=verdict["reason"], decided_at=decided)

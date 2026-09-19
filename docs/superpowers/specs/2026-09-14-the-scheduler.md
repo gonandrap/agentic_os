@@ -150,11 +150,13 @@ that usually says nothing is exactly the alarm nobody reads.*
 `schedule.DOCTOR_JOB`. It runs `jarvis doctor <project> --repair`, then triages.
 
 **`--repair`, not read-only.** The daemon already applies these same repairs on every
-reconcile tick, so the daily run repairs nothing the OS would not have. And a read-only
-run pays full price for INV-WORK-LANDED — its cache of settled verdicts is a timeline
-write, so a plain run re-reads git for every completed work order every time
-(`ops.run_doctor`). Repairing is both cheaper and consistent with what is already
-happening hourly.
+reconcile tick, so the daily run repairs nothing the OS would not have, and repairing is
+consistent with what is already happening hourly.
+
+> Superseded 2026-09-18 (wo-16a488ee): the second half of this argument used to be that a
+> read-only run pays full price for INV-WORK-LANDED, because its cache of settled verdicts
+> was a timeline write a plain run could not make. That check no longer measures content
+> and keeps no cache, so `repair` changes nothing about its cost or its answer.
 
 **`--skip-os` everywhere but one project.** `run_doctor` runs `check_os` regardless of
 `--project` on purpose: a fleet scoped to one project still wants to know its dashboard is

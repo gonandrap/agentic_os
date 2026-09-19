@@ -302,22 +302,18 @@ def test_an_escalate_verdict_records_the_intent_and_leaves_the_flag_up(
 # -- the three failure shapes, and none of them is an ack ------------------------------
 
 
-@pytest.mark.parametrize("token,expected_reason", [
-    ("FORCE_SUPERVISOR_GARBAGE", supervisor.UNREADABLE_PREFIX),
-    ("FORCE_SUPERVISOR_FAIL", "could not be reached"),
-    ("FORCE_SUPERVISOR_NO_DECISION", supervisor.UNREADABLE_PREFIX),
+@pytest.mark.parametrize("token", [
+    "FORCE_SUPERVISOR_GARBAGE",
+    "FORCE_SUPERVISOR_NO_DECISION",
 ])
-def test_every_failure_leaves_the_alarm_unresolved_with_the_flag_up(
-        started, catalog_file, monkeypatch, tmp_path, token, expected_reason):
-    """THREE SHAPES ARRIVING BY TWO ROUTES, and that is the reason all three are here.
-
-    Unreadable output and a well-formed object with no `decision` come back through
-    `structured.request`'s `on_invalid`; a transport error does NOT — `ClaudeCliError`
-    propagates untouched by design, because a call that never happened is not invalid
-    output (kn-9b18a8eb). A fail-safe built on `on_invalid` alone raises out of the
-    daemon's own thread pool on the middle case.
+def test_an_unreadable_reply_leaves_the_alarm_unresolved_with_the_flag_up(
+        started, catalog_file, monkeypatch, tmp_path, token):
+    """A MODEL THAT REPLIED, UNUSABLY. Both shapes come back through
+    `structured.request`'s `on_invalid` (kn-9b18a8eb).
 
     An ack would be the worst possible default here: it makes a burning turn invisible.
+    The transport case is its own test below — it is NOT this, because the call never
+    happened, and `failed` would spend the alarm on a blip.
     """
     _enable(catalog_file)
     daemon = started()
@@ -328,10 +324,42 @@ def test_every_failure_leaves_the_alarm_unresolved_with_the_flag_up(
     alarm = _alarm(wo_id)
     assert alarm["status"] == "failed"
     assert alarm["verdict"] is None
-    assert expected_reason in alarm["verdict_reason"]
+    assert supervisor.UNREADABLE_PREFIX in alarm["verdict_reason"]
 
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
+        assert store.get_work_order(wo_id)["needs_attention"] == 1
+        assert store.events_of_kind(wo_id, "alarm_reviewed") == []
+    finally:
+        store.close()
+
+
+def test_an_unreachable_supervisor_requeues_the_alarm_rather_than_failing_it(
+        started, catalog_file, monkeypatch, tmp_path):
+    """A CALL THAT NEVER HAPPENED. `ClaudeCliError` propagates untouched by design, and
+    what the rescue does with it is now the whole point: nobody judged the alarm, so it
+    goes back on the supervisor's queue with the attempt spent rather than out of it.
+
+    `failed` at attempts=0 — what this used to assert — left every alarm the transport
+    could not reach permanently unjudged. Spec
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §4.
+    """
+    _enable(catalog_file)
+    daemon = started()
+    wo_id = _burning(daemon, monkeypatch, tmp_path,
+                     description="FORCE_SUPERVISOR_FAIL")
+
+    _drain(daemon)  # in particular: this does not raise
+
+    alarm = _alarm(wo_id)
+    assert alarm["status"] == "raised", "a transport fault spent the alarm"
+    assert alarm["attempts"] == 1, "the retry machinery was bypassed, not spent"
+    assert alarm["verdict"] is None, "a call that never happened recorded a verdict"
+    assert "could not be reached" in alarm["verdict_reason"]
+
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        # The flag is still up — the RAISE put it there and nothing here takes it down.
         assert store.get_work_order(wo_id)["needs_attention"] == 1
         assert store.events_of_kind(wo_id, "alarm_reviewed") == []
     finally:
@@ -952,8 +980,9 @@ def test_the_transcript_is_read_for_a_work_order_and_never_for_a_feature(
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
     reads: list[str] = []
     real = inspection.read_session
-    monkeypatch.setattr(inspection, "read_session",
-                        lambda sid, cfg=None: (reads.append(sid), real(sid, cfg))[1])
+    monkeypatch.setattr(
+        inspection, "read_session",
+        lambda sid, cfg=None, **kw: (reads.append(sid), real(sid, cfg, **kw))[1])
 
     inspect_cfg = daemon.catalog.projects[0].inspect
     store = ProjectStore(project)

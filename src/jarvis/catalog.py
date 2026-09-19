@@ -256,6 +256,71 @@ DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES = 50
 DEFAULT_CACHE_HEALTH_PREFIX_SHARE = 0.45
 
 
+# -- COMPACTION AT AN EXPIRED BOUNDARY ------------------------------------------------
+#
+# The third remedy for the re-write tax, and the only one that acts at the moment the
+# cost is about to be paid. `DEFAULT_AUTOCOMPACT_WINDOW` bounds how large a conversation
+# may GROW; the one-hour write (`usage.TTL_BREAK_EVEN`) buys a longer entry for every
+# token; this compacts a conversation whose entry has ALREADY expired, before the next
+# prompt re-sends it. Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md.
+#
+# WHY IT PAYS, measured live on 2026-09-18 with a paired probe over a 293,377-token
+# conversation (both arms forked from one base, both past the write TTL):
+#
+#   no compaction   294,007 tokens re-sent as a cache WRITE at 1.25x   $1.853
+#   /compact then   282,595 tokens re-sent as PLAIN INPUT at 1.0x      $1.621
+#   the same prompt 28,156-token context (15,380 written, 12,776 read) $0.128
+#
+# Two effects, and the second is much the larger. The re-send itself gets 20% cheaper
+# because the CLI does not cache-write a compaction call. And the conversation that
+# every later call in that turn re-reads collapses from 293k to 28k — the transcript's
+# own `compact_boundary` record puts it at 293,382 tokens in and 4,697 out, the rest of
+# the 28k being the static head every call carries anyway.
+
+#: Output tokens one compaction produces. MEASURED on the probe above (8,052 for a
+#: 293k conversation; 3,336 for a 26k one), and it is the dominant cost of compacting a
+#: SMALL conversation — output is 5x input at Opus list, so a summary that saves
+#: nothing still costs ~$0.20. The whole reason there is a floor at all.
+COMPACT_SUMMARY_OUTPUT = 8_052
+
+#: What a session's context weighs on the call AFTER a compaction, in tokens. Measured
+#: at 28,156 from a 293k conversation and 26,866 from a 26k one — near enough constant
+#: across an 11x range of inputs, because what survives is the static head plus a
+#: summary whose size is set by the summarisation prompt rather than by what it
+#: summarises (4,697 and 4,078 tokens respectively, per the transcript's own
+#: `compact_boundary` row). That near-constancy is what makes the break-even below a
+#: function of one variable.
+COMPACT_CONTEXT = 28_156
+
+#: …of which this much is a cache WRITE on that call; the remainder is the static head,
+#: served as a read. Split out because the two are priced 12.5x apart.
+COMPACT_FIRST_WRITE = 15_380
+
+#: THE FLOOR: the smallest context worth compacting, in tokens. Below it the re-write
+#: is cheaper than the compaction call, so the OS lets the boundary go cold and pays it.
+#:
+#: MEASURED, not chosen — `scripts/compaction_cohort.py` prices every TTL-expired
+#: boundary in the fleet's own transcripts under the model above and reports the net
+#: saving by context band. Over the 30 days to 2026-09-19, 414 such boundaries:
+#:
+#:     25k-50k     33% of boundaries net-positive, median -$0.14
+#:     50k-100k    60% net-positive, median +$0.06 to +$0.36, worst -$0.21
+#:     100k-150k   80% net-positive, median +$0.39
+#:     150k-200k   94%,  200k+  100% net-positive, median +$1.11
+#:
+#: 100,000 is the lowest band where four boundaries in five pay. It is set where the
+#: MAJORITY flips rather than where the MEAN does, because this fires unattended on
+#: every work order: everything under it is worth $13.15 of a $552 saving, and half of
+#: those boundaries would have lost money. Buying 2.4% of the benefit back would mean
+#: being wrong about half the small cases, unsupervised, for ever.
+DEFAULT_COMPACT_MIN_CONTEXT: int | None = 100_000
+
+#: Guard rail on the above, for the reason `DEFAULT_COLD_PREFIX_FLOOR_MAX` is one: a
+#: fleet may move the floor, and a typo that moved it to 600 would compact every
+#: boundary in sight at a loss.
+COMPACT_MIN_CONTEXT_MIN = 10_000
+
+
 _MISSING = object()
 
 
@@ -448,10 +513,21 @@ DEFAULT_INSPECT_REPORT_JOIN_FLOOR = 30
 #: there to identify the prompt rather than to reproduce it.
 DEFAULT_INSPECT_QUOTE_CHARS = 140
 
-#: A turn still running after this long is burning money now. p95 of a turn's ACTIVE time
-#: is 59 minutes, so this fires on 16% of work orders — and it sits well below
-#: `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact: hung, not
-#: expensive.
+#: A turn still running after this long is burning money now.
+#:
+#: MEASURED IN ACTIVE TIME, NOT WALL CLOCK (`holds`, and the user's ruling of
+#: 2026-09-18): wall clock minus every interval the OS's own record says the order was
+#: held. A turn that spans a spent usage window is not slow, it is obeying, and an alarm
+#: that cannot tell those apart teaches the user to ignore alarms.
+#:
+#: SIXTY SURVIVES THE CHANGE OF CLOCK, and was re-measured rather than carried over. Over
+#: this fleet's 674 transcript turns on 2026-09-18 (307 of them held for something), an
+#: hour fires on 22.7% of turns by wall clock and 13.8% by active time — so moving the
+#: denominator removes two of every five alarms without touching a turn that genuinely
+#: worked for an hour. Raising it as well would silence the ones the user does want: the
+#: false alarms were the held ones, and they are gone by construction now. It still sits
+#: well below `worker_session.TURN_STALL_SECONDS` (6h), which reports a different fact:
+#: hung, not expensive.
 DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 
 #: A turn that has been open this long WITHOUT MAKING A SINGLE API CALL. Not a spend
@@ -463,11 +539,24 @@ DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 #: `DEFAULT_INSPECT_ALARM_TURN_MINUTES` on purpose — a stall must be named a stall before
 #: the long-turn alarm's hour is up, or the first thing the user hears about it is a claim
 #: about money.
+#:
+#: ALSO IN ACTIVE TIME now, for the reason above it: "the work never started" is a claim
+#: about the work, and a turn the OS was holding had not been allowed to start one. The
+#: change only makes this stricter, so the number stands — re-measured on 2026-09-18 over
+#: the same 674 turns, the p99 time to first call is 80 seconds and the worst is 177, so
+#: fifteen minutes is still two orders of magnitude outside a slow start.
 DEFAULT_INSPECT_ALARM_STALLED_MINUTES = 15
 
 #: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
 #: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
 #: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
+#:
+#: STAYS ON THE WALL CLOCK while the two above moved to active time, and that is the
+#: whole point of deciding per threshold rather than sweeping the file. What this
+#: measures is a cache entry ageing out, and the entry expires in real seconds whether
+#: or not the OS was allowing the order to work. It is also a JOIN — the lead agent
+#: waiting on its own subagent — which is the order's own choice and the one wait the
+#: user's ruling explicitly kept on the books.
 DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
 
 #: One call re-sending this much of the conversation. p95 of the largest re-write per work
@@ -481,12 +570,28 @@ DEFAULT_INSPECT_ALARM_WRITE_TOKENS = 300_000
 #: going to happen to this at all". An hour rather than minutes because the ordinary
 #: settlement path moves a finished turn within one reconcile tick, so anything still
 #: sitting here an hour later is not slow, it is stopped — wo-a4bd6958 sat 7h13m.
+#:
+#: IN ACTIVE TIME TOO, which for a stopped order means "an hour in which nothing was
+#: holding it". `parked_reason` already refused to flag most held orders, but by an
+#: inventory (`SPOKEN_FOR_WAITS`) rather than by a clock — so a hold with no matching
+#: entry in that tuple still cost the user a line. Subtracting the recorded holds makes
+#: the refusal follow from the measurement instead of from a list someone has to keep
+#: complete. The hour is unchanged: it was always a claim about how long a silence has
+#: to run before it means something, and taking the OS's own waiting out of that silence
+#: only makes the claim truer.
 DEFAULT_INSPECT_ALARM_PARKED_MINUTES = 60
 
 # -- the AGGREGATE half of the re-write tax. Everything above judges one live turn;
 # these five judge a PROJECT over a cohort window of settled orders, which is the
 # standing condition no surface raised (issue 164 item 1, finding 1 of
 # docs/superpowers/findings/2026-08-30-where-the-800-dollars-went.md).
+#
+# NONE OF THESE FIVE — NOR THE TWO `cache_1h` ONES BELOW — MOVES TO ACTIVE TIME, and that
+# is a decision rather than an oversight. Every one of them judges a count of TOKENS or a
+# share of a BILL; there is no duration in any numerator for a hold to come out of. The
+# `_window_days` figures are calendar time and stay calendar time: they choose which
+# settled orders are in the cohort, and an order that spent four hours held was still
+# settled last Tuesday.
 
 #: The cohort window, in days. NOT ALL HISTORY, and that is the point (kn-1449447a (5)):
 #: the split between the two causes is drifting, and an average over everything ever
@@ -963,6 +1068,11 @@ class OsConfig:
     cache_health_min_orders: int = DEFAULT_CACHE_HEALTH_MIN_ORDERS
     cache_health_min_boundaries: int = DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES
     cache_health_prefix_share: float = DEFAULT_CACHE_HEALTH_PREFIX_SHARE
+    #: The smallest context the OS will compact past an expired cache, or None to never
+    #: compact. Fleet-wide for `DEFAULT_CACHE_HEALTH_WINDOW_DAYS`' reason and one more:
+    #: the break-even is a property of the prompt cache's prices, which no project has
+    #: its own copy of. See DEFAULT_COMPACT_MIN_CONTEXT.
+    compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1026,6 +1136,34 @@ def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
         raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
                    f"(os.cold_prefix_floor_max)")
     return floor, ceiling
+
+
+def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
+    """`os.compact_min_context`, validated at boot. An explicit null means "never".
+
+    Absent and null differ here exactly as they do for the autocompact window, and for
+    the same reason: silence inherits the measured default, and switching a cost control
+    off has to be said out loud. Null is the ONLY off switch — there is deliberately no
+    `enabled` flag and no per-order opt-in, because an automatic remedy nobody has to
+    remember is the whole point (the pinned self-healing learning).
+
+    The floor under the floor is `COMPACT_MIN_CONTEXT_MIN`: below it the compaction
+    costs more than the re-write it replaces on every boundary the fleet has ever
+    recorded, so a value there is a typo rather than a policy.
+    """
+    value = os_raw.get("compact_min_context", _MISSING)
+    if value is _MISSING:
+        return DEFAULT_COMPACT_MIN_CONTEXT
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err(f"os.compact_min_context must be a whole number of tokens or null, "
+                   f"got {value!r}")
+    if value < COMPACT_MIN_CONTEXT_MIN:
+        raise _err(f"os.compact_min_context {value} is below "
+                   f"{COMPACT_MIN_CONTEXT_MIN}, where compacting costs more than the "
+                   f"re-write it replaces (use null to switch compaction off)")
+    return value
 
 
 def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
@@ -1558,6 +1696,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_min_orders=health_orders,
         cache_health_min_boundaries=health_bounds,
         cache_health_prefix_share=health_prefix,
+        compact_min_context=_compact_min_context_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

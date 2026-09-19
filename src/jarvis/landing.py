@@ -9,81 +9,77 @@ instead, and it answers it at two very different distances.
 ## Two questions, two costs, and they must not be confused
 
 **`authored()` is the settle-time predicate.** Has this work order's worktree produced
-anything — commits over its merge base, or uncommitted files? Exact, local, two `git`
+anything — commits over its merge base, or uncommitted files? Exact, local, three `git`
 invocations, no network, no heuristic. It runs on every `jarvis wo finish`, so it is
 allowed to cost nothing and allowed to be certain. It is what makes `ops.finish` and
 `ops.review_work_order` refuse to settle over work nobody has undertaken to land
 (docs/superpowers/specs/2026-09-13-a-finished-order-proves-its-code-landed.md §2).
 
-**`assess()` is the audit.** Is what this order produced ON the default branch, months
-later, for an order that settled long ago? That question has no exact answer in this
-repository, for the reason §3 of the spec gives and the next section restates, so
-`assess` is a ladder of tests from exact to heuristic and reports which rung answered.
-It costs a `git` call per touched file, so it runs on `jarvis doctor`'s own slow cadence
-and never on a worker's critical path.
+**`judge()` is the audit.** Months later, for an order that settled long ago: did this
+work order's pull request land? That is one question about one artifact — the pull
+request the order recorded — and it is answered from what GitHub said about it, never
+from the content of the repository.
 
-## THE REPOSITORY SQUASH-MERGES, WHICH KILLS EVERY OBVIOUS TEST
+## THE AUDIT ASKS ABOUT THE PULL REQUEST. IT USED TO MEASURE THE DIFF, AND IT WAS WRONG
 
-A squash merge replays a branch's whole diff as ONE new commit with a new sha. So:
+Until 2026-09-18 this module answered by CONTENT: what fraction of the lines a branch
+added can still be found in the default branch's current copy of the same file. The
+reasoning was that a squash merge destroys every obvious test — commit reachability, the
+ahead-count and patch-ids all report the ~96 branches that landed as unmerged — so
+content is the only thing that survives it.
 
-- commit reachability (`git merge-base --is-ancestor`) reports EVERY branch in the fleet
-  as unmerged, including the ~96 that landed;
-- `git rev-list --count base..branch` (the "ahead" count) says the same;
-- `git cherry` / patch-ids do not survive the squash either.
+Content survives a squash. It does not survive a REFACTOR. Run live against the
+`jarvis_os` records, INV-WORK-LANDED named seven completed orders as unlanded and five of
+them were false positives: three had merged months earlier and been rewritten since
+(scoring 44%, 31% and 72%), one had its file renamed and read as "missing entirely", and
+one was measured against a pull request the work order had recorded while a NEWER pull
+request on the same branch was the live one. Four distinct defects, every one of them
+downstream of measuring content instead of asking about the pull request.
 
-A checker built on any of those flags everything, which is worse than flagging nothing:
-it gets switched off within a day and the sixth stranded order becomes the seventh.
+So the user narrowed the invariant, on 2026-09-18, after reading that report: *"checking
+branches for which no PR were created shouldn't be checked by the invariant, instead,
+should be rejected during the validation. The invariant only should focus on making sure
+that the PR for that order has landed in main if the order is completed."*
 
-The test that DOES survive a squash is CONTENT. If a branch landed, the lines it added
-are in the default branch's files; if it did not, they are nowhere. `_coverage` measures
-exactly that — what fraction of the significant lines this branch added can be found in
-the default branch's copy of the same file — and `LANDED_COVERAGE` / `STRANDED_COVERAGE`
-are the two thresholds it is read against. They are not guesses: they were measured
-against all 180-odd branches of this repository before they were written down, and
-`docs/.../§4` carries the distribution. The stranded population topped out at 0.12 and
-the landed population bottomed out at 0.79.
+**The scope is now completed orders that HAVE a pull request, and the predicate is that
+pull request's state.** Merged is the answer — no line arithmetic, no coverage score, no
+missing-file list. Open says the work is delivered and waiting on a merge. Closed
+unmerged says it was delivered and refused. No pull request at all is OUT OF SCOPE and
+silent: whether an order should have produced one is validation's question, asked while
+the work is still live, not an audit's months afterwards.
 
-The commit-subject test the original audit used — does the default branch carry a commit
-whose subject starts with `[<wo-id>]` — is here too, but only as a corroborating rung,
-never alone. It is a FALSE-NEGATIVE MACHINE: only 96 of this repository's 173 default-
-branch commits carry that prefix at all, because the convention postdates half of them,
-so an order that landed before it existed looks stranded to a checker that trusts it.
+**What that gives up, deliberately.** A completed order whose only product sits as a WIP
+commit on a branch nobody ever opened a pull request for is now reported by nothing here
+— `wo-5a6b2d6d`, a config-console design document on `rescue/wo-5a6b2d6d`, is the live
+example. The user accepts that, because the place to catch it is the validation round
+that let the order settle.
 
-## The negative controls are half the value
+## `pr_url` IS THE POPULATION FILTER, AND ANOTHER INVARIANT IS WHAT MAKES IT TRUSTWORTHY
 
-Most work orders produce no code at all: a planner whose deliverable is a plan, a
-knowledge-base write, an investigation, a release. The audit found 60 such orders among
-89 candidates — a check without that exclusion has a 67% false-positive rate. The
-exclusion here is not a list of work-order kinds to skip, which would rot the first time
-somebody invents a kind; it is derived from the same fact everything else is: a branch
-with no commits over its base and a clean worktree produced nothing, so there is nothing
-to land, so `NOT_PRODUCED`. A category list would also be wrong — an investigation that
-does commit a script HAS produced something.
+`pr_url` is what a worker typed at `jarvis wo finish --pr`, once, so it is only as good
+as that habit — and in the production records it is not good: NULL on `wo-5eedc84d`,
+which merged pull request #42 all along, and on `wo-cd73c537` it names a merged #81 while
+#116 carries the rest of that order's work and is open.
 
-## THE DEFAULT BRANCH IS A REMOTE-TRACKING REF, AND NOTHING ELSE EVER MOVES IT
+That is a REAL defect and it is deliberately not fixed here. The user's second ruling,
+2026-09-18: *"If there is any code change made in an order, then pr_url must not be
+empty, and the invariant should rely on that pr_url to check the change lands on main
+once the order gets completed."* So the column is made trustworthy at its source, by
+INV-PR-RECORDED (work order `wo-2005a89b`), which refuses to let an order that wrote code
+settle without one; and this audit reads it and judges THAT pull request. Two checks, one
+chain, neither of them re-deriving the other's half:
 
-`base_ref` resolves to `origin/main`, and a merge is detected over the NETWORK — the
-poll asks `gh`, GitHub says MERGED, and the work order completes while that local ref
-still points at the commit before the squash. The content test then looks for the
-branch's lines in a copy of the file that predates the merge, scores near zero and
-reports `STRANDED`, every hour, until a human happens to fetch in that checkout (issue
-#271: one false positive per merge, on the checker whose docstring above says a checker
-that flags everything gets switched off within a day).
+- **no `pr_url` -> out of scope here, silent.** Not an unknown and not a shrug. Whether an
+  order should have had one is INV-PR-RECORDED's question, asked while the work is live.
+- **a `pr_url` that names the wrong pull request** — the `wo-cd73c537` shape — is also
+  INV-PR-RECORDED's. This module judges the pull request the order recorded and says so;
+  it does not go looking for a better one.
 
-So `refresh_base` moves it, and `assess` will not condemn a branch off a ref nobody
-refreshed: with `base_current=False` a verdict that rests on lines NOT FOUND becomes
-`UNKNOWN` at the `stale-base` rung. The two halves are not interchangeable — the refresh
-alone still condemns a branch whenever a fetch fails, and the guard alone would turn the
-false positive into a permanent blind spot, since `UNKNOWN` is never cached and a fleet
-where nobody fetches would never confirm a landing again.
-
-Absence is what staleness breaks, never presence: lines FOUND on an out-of-date default
-branch are on the up-to-date one too, because a branch only grows. So the guard is keyed
-on the EVIDENCE and not on the verdict's name, which cannot carry the difference —
-`PARTIAL` is reached both from a middling score (absence, withheld) and from a full score
-beside a dirty worktree (presence plus a fact about the worktree, kept). `LANDED`,
-`merged-tail` and `pull-request-open` are left alone for the same reason: the first is
-monotonic and the other two never read the base at all.
+The state of that pull request reaches the timeline as a `landing_seen` event, written by
+`Daemon.refresh_landings` — the half with a network. `judge` reads that event and nothing
+else, and an order it has no CURRENT event for (`FRESH_FOR_SECONDS`) is counted and
+reported as unread by `INV-LANDING-AUDIT-FRESH` rather than passed over: an audit with no
+data must not render as a clean bill of health.
 
 ## Why this module imports almost nothing
 
@@ -93,8 +89,8 @@ that has nothing to do with the question. The standard library; `evidence` for t
 pinned merge-base ladder (`evidence.base_ref`) and its `ProjectSpec` stand-in, never a
 second copy of either; and `worker_session` for the pure path helper that knows where a
 worktree lives — the same two-module set `evidence` itself is held to. No store, no
-catalog, no `gh`. What GitHub says about a pull request is passed IN by the caller that
-already asked: see `assess`.
+catalog, and above all NO `gh`: what GitHub says about a pull request is passed in by the
+caller that already asked.
 """
 
 from __future__ import annotations
@@ -104,74 +100,58 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from . import worker_session
 from .evidence import ProjectRef, base_ref
 
 log = logging.getLogger("jarvis.landing")
 
-#: At or above this fraction of its added lines present in the default branch, a branch
-#: landed. At or below `STRANDED_COVERAGE`, it did not. Between them is `PARTIAL`, which
-#: is a real answer and not a shrug: it is the exact shape of issue #232's Mode C, where
-#: a first pull request merged and the work that came after it did not.
+#: Verdicts. Every one of them is a statement about a PULL REQUEST, which is why none of
+#: the old content vocabulary survived: `stranded`, `partial` and `unknown` were shapes
+#: of a measurement, and there is no measurement here any more.
 #:
-#: MEASURED, not chosen. Across every branch in this repository the two populations
-#: separate with a gap either side of 0.5 — see the module docstring. The thresholds sit
-#: well inside that gap rather than on its edges, so a branch has to move a long way
-#: before its verdict changes.
-LANDED_COVERAGE = 0.75
-STRANDED_COVERAGE = 0.25
-
-#: How long one refresh of the default branch may take before it is abandoned. It is a
-#: single ref with no tags, so this is generous rather than tight; what it is really
-#: sized against is a daemon tick, which must not be held open by an unreachable remote.
-#: Timing out is not an error here — it is `base_current=False`, which is `UNKNOWN`.
-FETCH_TIMEOUT_SECONDS = 20
-
-#: A line has to be long enough and wordy enough that finding it in another file means
-#: something. `}`, `"""`, `return`, a blank line and a lone bracket all appear in every
-#: Python file ever written, so counting them as "present on the default branch" would
-#: drag every branch's coverage towards 1.0 — the direction that HIDES a strand.
-SIGNIFICANT_CHARS = 12
-
-#: Verdicts. `UNKNOWN` is deliberately distinct from `STRANDED`: "I could not tell"
-#: and "this work is not on the default branch" are different things to put in front of
-#: a user, and collapsing them is how a report earns its reputation for crying wolf.
+#: `NO_PULL_REQUEST` is not a shrug and not an unknown — it is this invariant saying the
+#: question is not its to ask. See the module docstring on what that gives up.
 LANDED = "landed"
-STRANDED = "stranded"
-PARTIAL = "partial"
-NOT_PRODUCED = "not-produced"
-UNKNOWN = "unknown"
+AWAITING_MERGE = "awaiting-merge"
+REFUSED = "refused"
+NO_PULL_REQUEST = "no-pull-request"
 
-#: Verdicts that mean a human owes this work order a decision.
-UNSETTLED_VERDICTS = (STRANDED, PARTIAL)
+#: Verdicts that mean a human owes this work order a decision. `REFUSED` is one of them
+#: for a reason worth spelling out: a closed pull request is a decision somebody ALREADY
+#: took, but they took it on GitHub, where the work order cannot see it — so the order is
+#: still claiming `completed` over work nothing landed.
+UNSETTLED_VERDICTS = (AWAITING_MERGE, REFUSED)
 
-#: Verdicts that will never change and may therefore be CACHED: a completed work order's
-#: branch has stopped moving, and content on the default branch stays on it. `UNKNOWN` is
-#: pointedly not here — it is the answer that a later push or a repaired remote fixes.
-SETTLED_VERDICTS = (LANDED, NOT_PRODUCED)
+#: How long a reading of a pull request stands before it is stale — a week. It lives HERE
+#: rather than beside the daemon's cadences because BOTH halves need it and they must not
+#: disagree: `Daemon.refresh_landings` re-asks past it, and `invariants.check_work_lands`
+#: reports that it has no current answer past it. Two copies of this number would let the
+#: audit go quiet at exactly the moment it stopped knowing anything.
+#:
+#: Not "for ever", which is what a MERGED answer looks like it could be: `landed` is the
+#: verdict that SILENCES the check, so the one answer nobody would re-read is the one that
+#: would hide a revert. A week is far inside the window that matters — the orders GitHub
+#: issue #232 found had been unmerged for seven — and costs a mature project a handful of
+#: round trips a day.
+FRESH_FOR_SECONDS = 7 * 24 * 3600
 
-#: The userinfo of a URL — `scheme://user:password@host` — which is the only place a
-#: credential appears in anything git prints. See `_scrub`.
+#: How many work orders one landing sweep may ask GitHub about. The cap is about the
+#: TICK, not about the day: a project with two hundred completed orders and a cold
+#: timeline would otherwise spend two hundred round trips inside one tick, and the daemon
+#: has everything else to do. At this size a cold project fills in over about eight hourly
+#: sweeps and a warm one never touches the cap.
+#:
+#: Here rather than beside the daemon's cadences for `FRESH_FOR_SECONDS`' reason: the
+#: audit quotes it when it reports how much it has not read yet, so a reader can tell "the
+#: backlog is draining" from "the daemon is dead".
+REFRESH_PER_SWEEP = 25
+
+#: URL userinfo — `https://x-access-token:TOKEN@github.com/…` — which is the ONLY place
+#: a credential appears in git's text, so one pattern covers it rather than a list of
+#: message shapes. See `_scrub`.
 _CREDENTIALS_RE = re.compile(r"://[^/\s@]+@")
-
-#: What a failed fetch was about, and the phrases that say so. An allowlist over text the
-#: REMOTE controls — see `_cause`. Lower-cased needles; first match wins, so the order is
-#: the specific before the general ("not found" would otherwise claim an auth failure
-#: whose message happens to mention a missing branch).
-_FETCH_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("the remote refused our credentials",
-     ("authentication failed", "could not read username", "could not read password",
-      "permission denied", "invalid username or password", "access denied",
-      "terminal prompts disabled")),
-    ("the remote could not be reached",
-     ("could not resolve host", "failed to connect", "connection refused",
-      "connection timed out", "network is unreachable", "operation timed out",
-      "no route to host", "ssl certificate problem")),
-    ("the remote has no such repository or ref",
-     ("repository not found", "does not appear to be a git repository",
-      "couldn't find remote ref", "not our ref", "remote branch")),
-)
 
 #: A GitHub pull-request URL sitting in prose. Mode A of issue #232: four work orders
 #: finished with a summary that NAMED a draft pull request and passed no `--pr`, so
@@ -299,11 +279,10 @@ def latest_authorship(events: list[tuple[float, dict[str, object]]]) -> Authored
 def worktree_of(project_path: Path, wo: dict[str, object]) -> Path | None:
     """Where this work order's worktree lives, or None if it is not on disk.
 
-    One line, and it exists so that the two callers of this module — `ops.finish` and
-    `invariants.check_work_lands` — do not each assemble `worker_session.worktree_path`'s
-    `ProjectSpec` stand-in for themselves. Three copies of a two-attribute shim is how two
-    checks end up disagreeing about where a work order's code is, which would be a
-    peculiar bug for THIS module to have.
+    One line, and it exists so that the callers of this module do not each assemble
+    `worker_session.worktree_path`'s `ProjectSpec` stand-in for themselves. Three copies
+    of a two-attribute shim is how two checks end up disagreeing about where a work
+    order's code is, which would be a peculiar bug for THIS module to have.
     """
     # type: ignore — `ProjectRef` carries the one attribute that helper reads.
     return worker_session.worktree_path(ProjectRef(project_path), wo)  # type: ignore[arg-type]
@@ -316,8 +295,7 @@ def authored(worktree: Path | None) -> Authored:
     to compare against, a command that errored — comes back as `unreadable` with
     `produced` False, because this is the predicate a refusal is built on: a work order
     must never be unable to finish because the OS could not run `git`. The failure still
-    goes in the log (`_git`), and an `unreadable` settling is not silent either — it is
-    the one shape `assess` will look at again later.
+    goes in the log (`_git`).
     """
     if worktree is None or not worktree.is_dir():
         return Authored(unreadable="no worktree on disk")
@@ -330,10 +308,10 @@ def authored(worktree: Path | None) -> Authored:
     branch = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD")
     count = _git(worktree, "rev-list", "--count", f"{base}..HEAD")
     # `--porcelain` lists untracked files too, and it must: a worker that wrote a new
-    # module and never `git add`ed it has produced exactly the thing this exists to
-    # catch. `--untracked-files=all` because the default COLLAPSES an untracked
-    # directory to one entry — a worker that wrote a whole new package would report as
-    # `src/`, and the refusal would say "1 uncommitted file" about forty.
+    # module and never staged it has produced exactly the thing this exists to catch.
+    # `--untracked-files=all` because the default COLLAPSES an untracked directory to one
+    # entry — a worker that wrote a whole new package would report as `src/`, and the
+    # refusal would say "1 uncommitted file" about forty.
     status = _git(worktree, "status", "--porcelain", "--untracked-files=all")
     if branch is None or count is None or status is None:
         return Authored(unreadable="git could not read the worktree")
@@ -345,414 +323,103 @@ def authored(worktree: Path | None) -> Authored:
 
 @dataclass(frozen=True)
 class Landing:
-    """The audit's verdict on one work order, with the rung that produced it.
+    """The audit's verdict on one work order, and the pull request behind it.
 
-    `rung` is not decoration. A `STRANDED` from `pull-request-open` is a fact GitHub
-    stated; one from `coverage` is a measurement with thresholds behind it, and a user
-    deciding whether to go and look is entitled to know which they are reading.
+    `pr_url` is the pull request the verdict is ABOUT, and it is always the one the work
+    order recorded — never one this module went looking for. See the module docstring on
+    why that is a layering decision and not an oversight.
     """
 
     wo_id: str
     verdict: str
-    rung: str
     detail: str
-    ref: str = ""
-    base: str = ""
     pr_url: str = ""
-    coverage: float = -1.0
-    added_lines: int = 0
-    #: Files this branch ADDED that do not exist on the default branch at all. The
-    #: sharpest single line a report can show: "src/jarvis/launcher.py is nowhere".
-    missing_files: tuple[str, ...] = ()
-    tail_commits: int = 0
-    dirty: tuple[str, ...] = ()
+    #: GitHub's own enum as `github.PullRequest` reports it: OPEN, MERGED or CLOSED.
+    pr_state: str = ""
 
     @property
     def unsettled(self) -> bool:
         return self.verdict in UNSETTLED_VERDICTS
 
+    def record(self) -> dict[str, object]:
+        """This, as a `landing_seen` payload. `from_record` is the other half."""
+        return {"verdict": self.verdict, "detail": self.detail, "pr_url": self.pr_url,
+                "pr_state": self.pr_state}
 
-def refresh_base(repo: Path, *, allow_network: bool = True) -> bool:
-    """Bring the default branch up to date, and say whether it may be measured against.
 
-    The answer to `assess`'s `base_current`, and the ONLY thing in the OS that moves a
-    remote-tracking ref. Call it once per sweep, never once per work order: it is a
-    round trip, and the ref it updates is shared by every order in the project.
+def from_record(wo_id: str, payload: dict[str, Any]) -> Landing:
+    """A `landing_seen` payload read back. The inverse of `Landing.record`.
 
-    True means the base holds everything the remote does, by one of two routes:
-
-    * there is nothing to be behind — the ladder landed on a LOCAL branch AND the clone
-      has no remotes at all, so its own default branch is authoritative;
-    * the fetch ran and exited 0.
-
-    False is every other outcome — no default branch at all, a ref that could not be
-    named, a local default branch in a clone that DOES have a remote (nothing can refresh
-    that, and it can be months old), `allow_network=False`, a remote that could not be
-    reached, a fetch that timed out — and none of them is an error.
-    It is the input that makes `assess` answer `UNKNOWN` instead of condemning a branch
-    on the strength of a ref nobody refreshed.
-
-    `allow_network=False` is the read-only path: `check_project(repair=False)`, the
-    `jarvis doctor` a human types without `--repair`. A fetch writes to the repository,
-    and "read-only unless you asked for repair" is a promise `ops.run_doctor` makes in
-    print. The cost is that a read-only doctor cannot report `STRANDED` by coverage, only
-    by the rungs that read no base; the daemon's hourly sweep is what refreshes the ref
-    and reports.
+    Defensive about every field, because this crosses a JSON round trip and an event
+    written by an older release is a shape nobody can change afterwards. An unreadable
+    payload becomes `NO_PULL_REQUEST` — the silent verdict — for the module docstring's
+    reason: this audit errs towards saying nothing, never towards a complaint it cannot
+    substantiate.
     """
-    ref = base_ref(repo)
-    if not ref:
-        return False
-    full = (_git(repo, "rev-parse", "--symbolic-full-name", ref) or "").strip()
-    if not full:
-        # The ref could not be named. Nothing is claimed about a ref that could not be
-        # read at all — this is the `_git`-failed case, and it is False for `_git`'s own
-        # reason: an error must never arrive somewhere as a fact.
-        return False
-    if not full.startswith("refs/remotes/"):
-        # Rung 3: the ladder landed on a LOCAL branch, which this cannot refresh — a
-        # fetch updates `refs/remotes/...` and would not move it. So it is trustworthy
-        # only when there is nothing it could be behind, and that is a question about
-        # the CLONE, not about the ref: a single-branch clone of another branch has an
-        # `origin` and still lands here, and its local `main` can be months old.
-        return not (_git(repo, "remote") or "").split()
-    remote, _, branch = full[len("refs/remotes/"):].partition("/")
-    if not (remote and branch) or remote.startswith("-") or branch.startswith("-"):
-        # A leading `-` is read by `git fetch` as an option rather than a remote. It takes
-        # write access to `.git/config` to arrange and there is no shell here, so this is
-        # argument confusion rather than injection — and it costs one line to not have.
-        return False
-    return allow_network and _fetch(repo, remote, branch)
+    verdict = str(payload.get("verdict") or "")
+    if verdict not in (LANDED, AWAITING_MERGE, REFUSED, NO_PULL_REQUEST):
+        return Landing(wo_id, NO_PULL_REQUEST,
+                       detail=f"unreadable landing record ({payload!r})")
+    return Landing(wo_id, verdict, detail=str(payload.get("detail") or ""),
+                   pr_url=str(payload.get("pr_url") or ""),
+                   pr_state=str(payload.get("pr_state") or ""))
 
 
-def assess(repo: Path, wo_id: str, *, worktree: Path | None = None,
-           pr_url: str = "", pr_merged: bool | None = None,
-           pr_head_oid: str = "", base_current: bool = False) -> Landing:
-    """Is this work order's code on the default branch? A ladder, exact rungs first.
+def judge(wo_id: str, pr_url: str, state: str) -> Landing:
+    """Did this work order's recorded pull request land? `state` is what GitHub said.
 
-    `pr_merged` and `pr_head_oid` are what GitHub said, passed IN — this module does not
-    call `gh`, for the reason the module docstring gives. `pr_merged` is None when
-    nobody asked or nobody could answer, which is NOT the same as False and is why the
-    open-pull-request rung tests `is False` rather than `not`.
+    One pull request, one state, no arithmetic. `state` is `github.PullRequest.state`,
+    fetched by the caller — this module never asks for it itself, for the reason the
+    module docstring gives.
 
-    The rungs, and each one only runs because the one above it could not answer:
-
-    1. `not-produced` — the branch carries nothing over its base and the worktree is
-       clean. The exclusion that keeps 60 planner and investigation orders out of the
-       report; see the module docstring for why it is derived rather than listed.
-    2. `pull-request-open` — there is a pull request and GitHub says it has not merged.
-       Nothing to measure: the work is delivered and refused or forgotten.
-    3. `merged-tail` — the pull request merged, and the branch carries commits AFTER the
-       sha GitHub merged, or files never committed at all. Issue #232's Mode C, which is
-       invisible to any audit keyed on `pr_url` because these orders HAVE one and it
-       points at a pull request that DID merge. Skipped for every `pr_merged` event
-       written before this change, which carries no `head_oid` and is not backfilled —
-       those fall through to `coverage`, which still reports Mode C. Spec §7.
-    4. `coverage` — the content test. See the module docstring.
-    5. `subject` — the corroborating rung, reached only when the branch added no
-       significant lines at all (a pure deletion, a rename, a config tweak). Absence of
-       a `[<wo-id>]` commit is NOT evidence here, so a miss ends at `unknown`.
-
-    `base_current` is `refresh_base`'s answer and DEFAULTS TO FALSE, because the ref this
-    measures against is a remote-tracking one that nothing moves on its own: a caller
-    that has not refreshed it has not earned a condemnation, and a default of True would
-    hand one to every caller written after this. False demotes the `coverage` rung's
-    verdicts that rest on lines NOT FOUND — every `STRANDED`, and the `PARTIAL` of a
-    middling score — to `UNKNOWN` at `stale-base`. Nothing else moves, the dirty-worktree
-    `PARTIAL` included; see the module docstring on why presence survives staleness.
-
-    A sixth rung, `unreadable`, is not part of that sequence: it is what a `git` command
-    that ERRORED produces, at whichever rung it errored on. `_git` keeps that distinct
-    from an empty result precisely so it can arrive here as `unknown` — which is
-    re-derived every sweep — instead of as `stranded` or as a cached `not-produced`.
+    - **MERGED** -> `LANDED`. Merged is the answer. Nothing is measured against it: the
+      whole point of the 2026-09-18 rewrite is that a merged pull request stays merged
+      however far the default branch is refactored afterwards.
+    - **OPEN** -> `AWAITING_MERGE`. The work is delivered and waiting on a merge, which
+      is a different sentence from "stranded" and the remedy differs with it.
+    - **CLOSED**, or anything else GitHub says -> `REFUSED`. Delivered, and somebody said
+      no on GitHub where the work order cannot see it. An unrecognised state lands here
+      rather than in silence: a state this module does not know is a reason to look.
+    - **no `pr_url`** -> `NO_PULL_REQUEST`, out of scope and silent. INV-PR-RECORDED's
+      question, not this one's.
     """
-    ref = _ref_for(repo, wo_id, worktree)
-    base = base_ref(repo)
-    if not (ref and base):
-        return Landing(wo_id, UNKNOWN, "no-ref", pr_url=pr_url,
-                       detail="no branch of this work order and no default branch to "
-                              "compare it against")
-
-    dirty = authored(worktree).dirty
-    commits = _count(repo, f"{base}..{ref}")
-    if commits is None:
-        # NOT `NOT_PRODUCED`. That verdict is settled and cached, so a `rev-list` that
-        # errored would drop this work order out of the audit for ever; `unknown` is
-        # re-derived every sweep, which is what a transient failure deserves.
-        return Landing(wo_id, UNKNOWN, "unreadable", ref=ref, base=base, pr_url=pr_url,
-                       detail=f"could not count what `{ref}` carries over `{base}` — "
-                              f"see the jarvis.landing log")
-    if not commits and not dirty:
-        return Landing(wo_id, NOT_PRODUCED, "no-commits", ref=ref, base=base,
-                       pr_url=pr_url,
-                       detail=f"`{ref}` carries nothing over `{base}` and its worktree "
-                              f"is clean — this work order produced no code")
-
-    if pr_url and pr_merged is False:
-        return Landing(wo_id, STRANDED, "pull-request-open", ref=ref, base=base,
-                       pr_url=pr_url, dirty=dirty,
-                       detail=f"{commits} commit(s) on `{ref}` behind a pull request "
-                              f"that has not merged: {pr_url}")
-
-    if pr_merged and pr_head_oid:
-        # A failed count here is usually a KNOWN shape — the merged sha was never fetched
-        # into this clone — and it only costs the exact rung, so it falls through to
-        # `coverage` rather than answering `unknown`. Coverage still catches Mode C from
-        # the other side, through `dirty`, and an `unknown` would be a worse answer than
-        # a measured one.
-        tail = _count(repo, f"{pr_head_oid}..{ref}") or 0
-        if tail or dirty:
-            return Landing(wo_id, STRANDED, "merged-tail", ref=ref, base=base,
-                           pr_url=pr_url, tail_commits=tail, dirty=dirty,
-                           detail=f"{pr_url} merged, but `{ref}` carries {tail} "
-                                  f"commit(s) and {len(dirty)} uncommitted file(s) "
-                                  f"after the sha that merged")
-
-    measured = _coverage(repo, base, ref)
-    if measured is None:
-        # The one that would otherwise "flag everything": a failed `ls-tree`, `diff` or
-        # `show` scores 0, and 0 is `STRANDED`.
-        return Landing(wo_id, UNKNOWN, "unreadable", ref=ref, base=base, pr_url=pr_url,
-                       dirty=dirty,
-                       detail=f"could not read what `{ref}` added or what `{base}` "
-                              f"holds — see the jarvis.landing log")
-    present, total, missing = measured
-    if not total:
-        # Nothing significant was added, so there is nothing to look for. The subject
-        # rung is all that is left, and it may only CONFIRM.
-        if _subject_landed(repo, base, wo_id):
-            return Landing(wo_id, LANDED, "subject", ref=ref, base=base, pr_url=pr_url,
-                           detail=f"`{base}` carries a commit titled [{wo_id}]")
-        return Landing(wo_id, UNKNOWN, "subject", ref=ref, base=base, pr_url=pr_url,
-                       dirty=dirty,
-                       detail=f"`{ref}` added no lines that could be looked for on "
-                              f"`{base}`, and no commit there is titled [{wo_id}]")
-
-    cov = present / total
-    verdict = (LANDED if cov >= LANDED_COVERAGE else
-               STRANDED if cov <= STRANDED_COVERAGE else PARTIAL)
-    # Keyed on the EVIDENCE, not on the verdict's name — the distinction the stale-base
-    # branch below turns on, and one the name cannot carry: `PARTIAL` is reached from two
-    # different facts and only one of them reads absence off the base.
-    reads_absence = cov < LANDED_COVERAGE
-    # `==`, never `is`: the verdicts are plain strings, and identity holds here only
-    # because `verdict` is bound to this module's own constant. The day it arrives from
-    # an event payload or any other round trip, `is` goes quietly False and this branch —
-    # the one that catches Mode C without a pull request to key on — is dead code.
-    if verdict == LANDED and dirty:
-        # The branch landed and the worktree still holds work that never left it. Mode C
-        # again, arrived at without a pull request to key on.
-        verdict, cov_note = PARTIAL, " but its worktree still holds uncommitted work"
-    else:
-        cov_note = ""
-    if reads_absence and not base_current:
-        # Issue #271. A low score off a ref nobody refreshed is not evidence of anything:
-        # the merge that landed this branch may already be on the remote's default branch
-        # and simply not in this clone yet. `UNKNOWN` is re-derived every sweep, so the
-        # answer arrives of its own accord as soon as a refresh succeeds. `missing_files`
-        # is dropped on the way: "this file is nowhere" is exactly the claim a base that
-        # may predate the merge cannot support.
-        #
-        # NOT `verdict != LANDED`, which is the same test everywhere except the one place
-        # it matters: the `PARTIAL` above rests on a dirty WORKTREE beside a full score,
-        # and nothing about the base's age touches either half of that. Demoting it would
-        # break this module's own rule one line after stating it, and would print "only
-        # 145/145 (100%)" at whoever was holding the report.
-        return Landing(wo_id, UNKNOWN, "stale-base", ref=ref, base=base, pr_url=pr_url,
-                       coverage=cov, added_lines=total, dirty=dirty,
-                       detail=f"`{base}` was not refreshed, so it may predate the merge "
-                              f"that landed `{ref}`: the {present}/{total} of its added "
-                              f"lines found there ({cov:.0%}) proves nothing either way")
-    return Landing(wo_id, verdict, "coverage", ref=ref, base=base, pr_url=pr_url,
-                   coverage=cov, added_lines=total, missing_files=missing, dirty=dirty,
-                   detail=f"{present}/{total} of the lines `{ref}` added are on "
-                          f"`{base}` ({cov:.0%}){cov_note}"
-                          + (f"; {len(missing)} added file(s) are missing entirely, "
-                             f"first is {missing[0]}" if missing else ""))
+    pr_url = (pr_url or "").strip()
+    state = (state or "").strip().upper()
+    if not pr_url:
+        return Landing(wo_id, NO_PULL_REQUEST,
+                       detail="this work order recorded no pull request")
+    if state == "MERGED":
+        return Landing(wo_id, LANDED, pr_url=pr_url, pr_state=state,
+                       detail=f"{pr_url} merged")
+    if state == "OPEN":
+        return Landing(wo_id, AWAITING_MERGE, pr_url=pr_url, pr_state=state,
+                       detail=f"the work is delivered and waiting on a merge: {pr_url} "
+                              f"is still open")
+    return Landing(wo_id, REFUSED, pr_url=pr_url, pr_state=state or "UNKNOWN",
+                   detail=f"the work was delivered and refused: {pr_url} was closed "
+                          f"without merging")
 
 
 # --------------------------------------------------------------------------- internals
 
-def _ref_for(repo: Path, wo_id: str, worktree: Path | None) -> str:
-    """The branch this work order's code is on, or "".
-
-    The worktree's own HEAD first, because it is the only answer that cannot be wrong.
-    Failing that — and the worktree is usually gone by the time anyone audits — every
-    branch name containing the work-order id, which covers all three shapes this fleet
-    has produced: `worktree-wo-x`, `wo-x-some-slug` and `rescue/wo-x`.
-
-    A REMOTE ref beats a local one, because a local branch can be behind what was
-    actually pushed and it is the PUSHED work this module is asked about. That ordering
-    is two separate queries and not one sorted list: `git for-each-ref` sorts by FULL
-    refname, so `refs/heads/...` comes out ahead of `refs/remotes/...` and taking the
-    first match would pick the local branch every time both exist — the stale one this
-    paragraph exists to avoid. kn-47004b56: a rule written down is not a rule applied.
-    """
-    if worktree is not None and worktree.is_dir():
-        head = _git(worktree, "rev-parse", "--abbrev-ref", "HEAD") or ""
-        if head.strip() and head.strip() != "HEAD":
-            return head.strip()
-    for pattern in ("refs/remotes/", "refs/heads/"):
-        names = (_git(repo, "for-each-ref", "--format=%(refname:short)", pattern)
-                 or "").split()
-        matches = [n for n in names if wo_id in n]
-        if matches:
-            return matches[0]
-    return ""
-
-
-def _count(repo: Path, rev_range: str) -> int | None:
-    """Commits in `rev_range`, or None if git could not answer.
-
-    None is NOT zero. Zero means "this branch carries nothing", which `assess` reads as
-    `NOT_PRODUCED` — a settled verdict that `invariants.check_work_lands` caches and never
-    recomputes. Letting a failed `rev-list` arrive there would drop a work order out of the
-    audit permanently on the strength of a command that errored.
-    """
-    out = _git(repo, "rev-list", "--count", rev_range)
-    if out is None:
-        return None
-    return int(out.strip()) if out.strip().isdigit() else 0
-
-
-def _significant(line: str) -> bool:
-    """Is this line worth looking for on the default branch? See `SIGNIFICANT_CHARS`."""
-    text = line.strip()
-    return len(text) >= SIGNIFICANT_CHARS and any(c.isalnum() for c in text)
-
-
-def _coverage(repo: Path, base: str, ref: str
-              ) -> tuple[int, int, tuple[str, ...]] | None:
-    """(lines found on `base`, lines looked for, files added that `base` lacks entirely).
-
-    None if any `git` call failed — see `_git`. Scoring 0 off a command that errored is
-    the single most damaging thing this module could do, since 0 reads as `STRANDED`.
-
-    Per FILE, never across the tree: a line is "present" only in the default branch's
-    copy of the file the branch put it in. Searching the whole tree instead would score
-    a moved import as landed work.
-
-    The diff is `base...ref` — three dots, the MERGE BASE — so a branch cut months ago
-    is measured against what it changed, not against everything `base` has done since.
-    """
-    changed = _git(repo, "diff", "--name-only", f"{base}...{ref}")
-    tree = _git(repo, "ls-tree", "-r", "--name-only", base)
-    if changed is None or tree is None:
-        return None
-    names = changed.split()
-    if not names:
-        return 0, 0, ()
-    on_base = set(tree.split())
-    present = total = 0
-    missing: list[str] = []
-    for name in names:
-        diff = _git(repo, "diff", f"{base}...{ref}", "--", name)
-        if diff is None:
-            return None
-        added = [line[1:] for line in diff.splitlines()
-                 if line.startswith("+") and not line.startswith("+++")
-                 and _significant(line[1:])]
-        absent = name not in on_base
-        if absent:
-            missing.append(name)
-        if not added:
-            continue
-        total += len(added)
-        if absent:
-            # `ls-tree` already said this file is not on `base`, so `git show base:name`
-            # would fail for a KNOWN reason and none of these lines can be found. That is
-            # the distinction `_git` exists to keep: an absence proved by another command,
-            # not a failure read as one.
-            continue
-        blob = _git(repo, "show", f"{base}:{name}")
-        if blob is None:
-            return None
-        present += sum(1 for line in added if line.strip() in blob)
-    return present, total, tuple(missing)
-
-
-def _subject_landed(repo: Path, base: str, wo_id: str) -> bool:
-    """Does `base` carry a commit whose subject starts with `[<wo-id>]`?
-
-    The convention every worker's pull-request title is held to, which a squash merge
-    carries onto the default branch verbatim. CONFIRMS ONLY — see the module docstring
-    on why its absence proves nothing, which is also why a failed `git log` may be False
-    here and nowhere else: the rung's only outputs are `LANDED` and `UNKNOWN`, so losing
-    it costs a confirmation and cannot manufacture a complaint.
-    """
-    return any(line.startswith(f"[{wo_id}]")
-               for line in (_git(repo, "log", "--format=%s", base) or "").splitlines())
-
-
-def _fetch(repo: Path, remote: str, branch: str) -> bool:
-    """Update `refs/remotes/<remote>/<branch>` from the network. True if it worked.
-
-    THE ONE COMMAND IN THIS MODULE THAT WRITES, and the only one that leaves the machine,
-    which is why it is not `_git`: that helper is documented read-only and its callers
-    read its output as data, while this one is called for its effect and answers a
-    yes/no. Everything it does is narrowed on purpose — ONE explicit refspec so a
-    single-branch clone is updated too and no other ref moves, `--no-tags` so a busy
-    repository's tag list is not dragged across per sweep, `--quiet`, and a timeout,
-    because an unreachable remote must not hold a daemon tick open.
-
-    Never raises. A failure here is `base_current=False`, which is `UNKNOWN` — the
-    verdict that costs a sweep its answer and never a branch its reputation.
-
-    **IT DOES NOT QUOTE THE REMOTE.** A failing fetch prints the remote URL back at you —
-    "fatal: Authentication failed for 'https://x-access-token:<token>@github.com/…'" — so
-    a project whose `origin` carries a token in its URL would write that token into the
-    daemon's log once an hour, for ever, and daemon text leaves this machine through
-    alarms and `jarvis bug report`. Scrubbing that message would be a denylist over text
-    the remote controls; `_cause` is an allowlist instead, and it is the only thing about
-    the failure that reaches a warning. The message itself is kept for whoever is
-    debugging, at DEBUG, and scrubbed even there.
-    """
-    spec = f"+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
-    try:
-        proc = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "--no-tags",
-                               remote, spec], capture_output=True, text=True,
-                              errors="replace", check=False,
-                              timeout=FETCH_TIMEOUT_SECONDS)
-    except (OSError, subprocess.SubprocessError) as exc:
-        # Python's own text about a command whose argv holds a remote NAME, never a URL.
-        # Scrubbed regardless: this is the branch nobody re-reads before adding to it.
-        log.warning("could not refresh %s in %s: %s", spec, repo,
-                    _scrub(str(exc))[:200])
-        return False
-    if proc.returncode != 0:
-        log.warning("refreshing %s in %s exited %d: %s", spec, repo, proc.returncode,
-                    _cause(proc.stderr))
-        log.debug("refreshing %s in %s said: %s", spec, repo,
-                  _scrub(proc.stderr.strip())[:500])
-        return False
-    return True
-
-
-def _cause(stderr: str) -> str:
-    """What a failed fetch was ABOUT, in this module's own words.
-
-    An ALLOWLIST, and that is the whole point: `_fetch`'s message is the one text here a
-    remote controls, so nothing of it is repeated — a phrase is recognised and a fixed
-    string of ours is logged. A scrub is a denylist and only removes the leak somebody
-    already thought of; this cannot leak whatever a future host decides to print.
-
-    The four causes are the ones that change what a reader does — fix the credentials,
-    fix the URL, wait, look harder — which is what a warning is for. "an unrecognised
-    error" is a real answer and not a shrug: it says the sweep is not measuring, and the
-    message behind it is one `--debug` away.
-    """
-    low = stderr.lower()
-    for cause, needles in _FETCH_CAUSES:
-        if any(needle in low for needle in needles):
-            return cause
-    return "an unrecognised error"
-
-
 def _scrub(text: str) -> str:
-    """`text` with any URL userinfo replaced, for anything of the remote's that is kept.
+    """`text` with any URL userinfo replaced. Every log line carrying git's stderr uses it.
 
-    Credentials only ever appear as userinfo, which is why one pattern covers it rather
-    than a list of message shapes. Second line of defence only — what reaches a WARNING
-    is `_cause`, which repeats nothing.
+    **KEPT AFTER THE CODE THAT MOTIVATED IT WAS DELETED, DELIBERATELY.** It arrived with
+    `landing._fetch` (kn-4bba177d): git quotes the remote URL back on failure —
+    `fatal: Authentication failed for https://x-access-token:TOKEN@github.com/...` — so
+    any line carrying fetch stderr writes a token into the daemon log for every project
+    whose `origin` embeds one. Truncating to 200 characters does not help: the URL is on
+    the FIRST line. `_fetch` went with the content machinery on 2026-09-18 and no caller
+    of `_git` touches a remote today, which is exactly the argument for keeping this
+    rather than dropping it — the guard is four lines, the next remote-touching caller
+    will not think about it, and it was the fleet's ONLY credential scrub.
+
+    One pattern, because credentials only ever appear as userinfo.
+
+    NOTE for whoever tests the next leak: git SELF-redacts on a connection failure and
+    does NOT on an authentication failure, so an offline end-to-end test cannot reach the
+    leaking message. Pair it with a unit assertion against the verbatim string.
     """
     return _CREDENTIALS_RE.sub("://<redacted>@", text)
 
@@ -765,22 +432,23 @@ def _git(repo: Path, *args: str) -> str | None:
     git at all must produce a thin answer rather than an exception that strands it.
 
     But it does not return "" for a failure either, because every caller here reads the
-    output as DATA and "" is a meaningful datum: no commits ahead, no files changed, the
-    lines are nowhere on the default branch. A transient failure smuggled in as "" makes
-    `_coverage` score 0 and report `STRANDED` — "flags everything" (module docstring)
-    arriving by the back door — and makes `_count` report `NOT_PRODUCED`, which is cached
-    for ever. So the failure is a separate value the callers have to handle, and it is
-    logged: this module is otherwise silent by design, and a fleet-wide audit that quietly
-    stopped working would look exactly like a fleet with nothing stranded.
+    output as DATA and "" is a meaningful datum: no commits ahead, nothing uncommitted. A
+    transient failure smuggled in as "" would make `authored` report `produced=False` and
+    let a settling strand real work. So the failure is a separate value the caller has to
+    handle, and it is logged: this module is otherwise silent by design, and a check that
+    quietly stopped working would look exactly like a fleet with nothing stranded.
     """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", check=False)
     except OSError as exc:
-        log.warning("git %s in %s could not run: %s", " ".join(args), repo, exc)
+        log.warning("git %s in %s could not run: %s", " ".join(args), repo,
+                    _scrub(str(exc)))
         return None
     if proc.returncode != 0:
+        # `_scrub` BEFORE the truncation and not after: a token sits in the URL on the
+        # first line, so slicing to 200 characters keeps it rather than cutting it off.
         log.warning("git %s in %s exited %d: %s", " ".join(args), repo,
-                    proc.returncode, proc.stderr.strip()[:200])
+                    proc.returncode, _scrub(proc.stderr.strip())[:200])
         return None
     return proc.stdout

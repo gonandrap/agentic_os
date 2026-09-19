@@ -140,6 +140,15 @@ opposite of what is true. kn-eafe383a is this exact bug one level over.
 
 ## 7. The standing report
 
+> **SUPERSEDED on 2026-09-18 by
+> `2026-09-18-the-landing-invariant-judges-the-pull-request.md`.** Everything in this
+> section below the first paragraph describes the CONTENT test — the coverage ladder, the
+> `merged-tail` and `subject` rungs, the `base_current` guard and the `landing_checked`
+> cache — and none of it exists any more. It was measured live against the `jarvis_os`
+> records and five of its seven findings were false positives. Kept as the record of what
+> was built and why; read the newer spec for what runs. Sections 1-6 are unaffected:
+> `authored()` and the settle-time refusals are untouched.
+
 `INV-WORK-LANDED` sweeps `completed` work orders, hidden ones included (hiding drops a
 record from listings; it does not mean the record may go on saying something untrue).
 

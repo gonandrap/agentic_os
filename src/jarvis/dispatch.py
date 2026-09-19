@@ -11,7 +11,7 @@ from typing import Any
 from . import claude_cli
 from .catalog import OsConfig, ProjectSpec
 from .central_store import CentralStore, KnowledgeBrief
-from .project_store import ProjectStore
+from .project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
 
 
 def _worker_path() -> str:
@@ -840,17 +840,30 @@ def dispatch_work_order(
         budget.escalate(store, wo, e.exhausted)
         return store.get_work_order(wo["id"])
     except claude_cli.ClaudeCliError as e:
-        store.set_status(wo["id"], "failed")
-        store.flag_attention(wo["id"], f"dispatch failed: {e}")
-        store.add_notification(
-            title=f"Dispatch failed for {wo['id']}",
-            body=str(e),
-            level="warning",
-            wo_id=wo["id"],
-            source="jarvisd",
-        )
+        # A TURN THAT COULD NOT BE LAUNCHED IS NOT A WORK ORDER THAT FAILED. `failed` at
+        # attempts=0 turned a blip in the transport into a terminal state and asked the
+        # user to look at a work order nothing was wrong with — spec
+        # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §5. Back to
+        # `pending` behind a backoff; only the ceiling is terminal, and it says why.
+        outcome = store.release_dispatch_claim(wo["id"], str(e))
+        store.add_event(wo["id"], "dispatch_failed",
+                        {"error": str(e)[:500], "outcome": outcome})
+        if outcome == "failed":
+            store.flag_attention(
+                wo["id"],
+                f"could not be dispatched after {MAX_DISPATCH_ATTEMPTS} attempts — "
+                f"`claude` was unreachable every time, so no turn ever ran: {e}")
+            store.add_notification(
+                title=f"Dispatch failed for {wo['id']}",
+                body=f"`claude` could not be reached {MAX_DISPATCH_ATTEMPTS} times in "
+                     f"a row. No turn has run.\n\n{e}",
+                level="warning",
+                wo_id=wo["id"],
+                source="jarvisd",
+            )
         raise
 
+    store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
         "worktree": wo["id"],

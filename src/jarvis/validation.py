@@ -870,8 +870,9 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
             # rather than stalling the round, and the row says `failed` rather than
             # `abstained` — a seat that CANNOT run is not one that timed out.
             log.error("validation seat %s cannot run: %s", seat, e)
+            # `unavailable`: `panel._round`'s marker, for its reason. See `seats.Opinion`.
             missing.append(seats.Opinion(seat=seat, raw=str(e), status="failed",
-                                         replied=False))
+                                         replied=False, unavailable=True))
 
     models = {seat: seat_model(seat, cfg) for seat in prompts}
     # WITHOUT THIS THE ROUND STILL PAYS FIVE WRITES. `run_blind` submits every seat
@@ -898,6 +899,16 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         # could pass work nothing judged, which is the one outcome this feature cannot
         # produce. Not a transport failure either — the calls happened and the round is a
         # real one — so a human is asked instead.
+        #
+        # UNLESS THE ACCOUNT'S WINDOW IS WHY, which is GitHub issue #235: the panel was
+        # not down, it was refused, and the refusal names the moment it lifts. Raising
+        # hands the round to `Daemon._validation_held`, which waits that moment out; the
+        # escalation below would spend the user's attention on a fact that unspends
+        # itself. Tested for LAST because a seat refused by the window still abstains, so
+        # the `replied` gate above is what tells "refused" from "answered anyway".
+        refusal = next((op.refused for op in opinions if op.refused is not None), None)
+        if refusal is not None:
+            raise claude_cli.UsageLimitError(refusal)
         return _out("escalated", "nobody could be reached to review this submission, so "
                                  "the work has not been judged.", opinions,
                     round_no=round_no)

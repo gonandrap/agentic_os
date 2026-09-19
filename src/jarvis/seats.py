@@ -157,6 +157,22 @@ class Opinion:
     #: rather than written where it is produced: `_run_seat` runs on a pool thread and
     #: touches no database. The caller persists it on its own thread with the rest.
     usage: dict[str, Any] | None = None
+    #: The account's window was spent and this seat was never asked. Set only on an
+    #: abstention, and carried rather than raised because one refused seat must not take
+    #: down a panel the other four answered: it is the CALLER that decides whether the
+    #: round can be judged without it (`validation.decide`, GitHub issue #235).
+    refused: claude_cli.UsageLimit | None = None
+    #: NO DEFINITION FOR THIS SEAT SHIPS IN THIS BUILD — the `SeatError` construction
+    #: sites in `panel._round` and `validation._run_seats`, and nowhere else.
+    #:
+    #: A SENTINEL RATHER THAN THE STATUS STRING, and that is the whole point of it. Two
+    #: unrelated facts are both recorded `status='failed'` — this one, and a seat that
+    #: replied with output nobody could parse — so any caller distinguishing them by that
+    #: word is one `except` clause away from being silently wrong.
+    #: `panel.unreachable_veto_seats` is the caller that must not be: it asks whether a
+    #: seat was REACHED (`replied`), and needs this to tell "never reached, and a retry
+    #: would fix it" from "never reached, and no retry ever will".
+    unavailable: bool = False
 
     @property
     def data(self) -> dict[str, Any] | None:
@@ -197,7 +213,8 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
     except claude_cli.ClaudeCliError as e:
         log.warning("seat %s abstained: %s", seat, e)
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
-                       latency_ms=elapsed(), replied=False)
+                       latency_ms=elapsed(), replied=False,
+                       refused=getattr(e, "limit", None))
     raw, usage = result.text, result.usage
     data = structured.parse_json_object(raw)
     if not isinstance(data, dict):

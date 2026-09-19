@@ -115,11 +115,40 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
     except subprocess.TimeoutExpired as e:
         raise ClaudeCliError(f"`claude {' '.join(args[:3])}...` timed out after {timeout}s") from e
     if proc.returncode != 0:
-        raise ClaudeCliError(
-            f"claude {' '.join(args[:4])}... failed (rc={proc.returncode}): "
-            f"{proc.stderr.strip()[:500] or proc.stdout.strip()[:500]}"
-        )
+        raise _cli_failure(args, proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout
+
+
+def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCliError:
+    """The exception a non-zero `claude` exit deserves, CLASSIFIED and untruncated.
+
+    THE ENVELOPE'S OWN `result` IS READ BEFORE ANYTHING IS CUT, and GitHub issue #235 is
+    why. A usage-limit refusal exits rc=1 with the refusal in the result JSON's `result`
+    field, and truncating raw stdout to 500 chars severed it at exactly the byte that
+    field begins — every validation seat on 2026-09-13 stored `…"speed":"standard"},"`
+    and the cause was unrecoverable. Reading the field first both keeps the message and
+    is what lets `usage_limit` below see the refusal at all.
+
+    `stderr` still wins over raw stdout for everything that is not a result envelope:
+    that is where `claude --version` and `claude agents --json` put their complaints.
+    """
+    detail = _result_field(stdout) or stderr.strip() or stdout.strip()
+    limit = usage_limit(detail)
+    if limit is not None:
+        return UsageLimitError(limit)
+    return ClaudeCliError(
+        f"claude {' '.join(args[:4])}... failed (rc={rc}): {detail[:500]}")
+
+
+def _result_field(stdout: str) -> str:
+    """`result` out of an `--output-format json` envelope, or "" for anything else."""
+    try:
+        data = json.loads(stdout)
+    except ValueError:  # JSONDecodeError is a subclass; plain text is the common case
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("result") or "").strip()
 
 
 # Claude Code's session-state vocabulary, as emitted by `claude agents --json` and by
@@ -463,6 +492,27 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+#: The prompt that compacts a resumed session, and the whole of the transport for it.
+#: There is no `--compact` flag: `/compact` is a LOCAL command the CLI declares
+#: `supportsNonInteractive: true`, so it runs under `-p --resume` like any other prompt
+#: and returns a normal result envelope with an empty `result`.
+#:
+#: FOUR MEASURED PROPERTIES, verified on 2.1.277 on 2026-09-18 (the probe and its
+#: numbers: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md):
+#:
+#:  * the session id does not move — the summary is written into the same transcript,
+#:    behind a `compact_boundary` system row (`usage.compaction_stamps`);
+#:  * the call is charged as PLAIN INPUT, not as a cache write, so at an already-cold
+#:    boundary it re-sends the conversation at 1.0x where the next prompt would have
+#:    re-sent it at 1.25x;
+#:  * it writes no assistant message, so `usage.read_session` — and therefore the bill
+#:    and every cache-health check — cannot see what it cost. That is why
+#:    `worker_session._reap` records it in `agent_usage` instead;
+#:  * it is idempotent enough to retry: compacting an already-compacted conversation
+#:    summarises a summary, which is cheap and loses little.
+COMPACT_PROMPT = "/compact"
+
+
 def turn_args(
     prompt: str,
     session_id: str,
@@ -712,6 +762,20 @@ class UsageLimit:
 
     message: str
     reset_at: float | None
+
+
+class UsageLimitError(ClaudeCliError):
+    """`claude` refused the call outright: the account's usage window is spent.
+
+    A `ClaudeCliError` subclass, so every caller that already catches one keeps working
+    unchanged; what it adds is `limit`, and with it the moment the window reopens. That
+    is the whole difference between a fault to retry in seconds and a window to wait out
+    for hours — see `Daemon._validation_held` (GitHub issue #235).
+    """
+
+    def __init__(self, limit: UsageLimit) -> None:
+        super().__init__(limit.message)
+        self.limit = limit
 
 
 #: The legacy shape, and the only one that states the moment unambiguously:

@@ -315,3 +315,130 @@ def test_an_already_bootstrapped_project_is_regenerated_by_the_bump(project):
     bootstrap_project(spec(project))
 
     assert "--evidence" in op.read_text()
+
+
+# -- issue 279: the OS must not dirty a tree it never commits to ----------------------
+
+
+def _commit_all(path):
+    """Make the fixture repo actually OWN its files — `make_git_project` only inits."""
+    import subprocess
+
+    for args in (["add", "-A"],
+                 ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]):
+        subprocess.run(["git", "-C", str(path), *args], check=True)
+
+
+def _restamp(op, version):
+    """Rewrite the version marker in place, simulating a repo left behind by a bump."""
+    from jarvis.bootstrap import TEMPLATE_VERSION
+
+    op.write_text(op.read_text().replace(f"template v{TEMPLATE_VERSION}",
+                                         f"template v{version}"))
+
+
+def test_regenerating_an_unchanged_operation_md_writes_nothing(project):
+    """The loop's first half: a second bootstrap must not rewrite an identical file.
+
+    The old check matched `template vN` in the first line, so staleness was decided by
+    a proxy for the content rather than by the content. Comparing the render is exact.
+    """
+    bootstrap_project(spec(project))
+    op = project / "OPERATION.md"
+    before = op.stat().st_mtime_ns
+
+    report = bootstrap_project(spec(project))
+
+    assert "OPERATION.md already up to date" in report.actions
+    assert op.stat().st_mtime_ns == before, "rewrote a file it did not need to touch"
+
+
+def test_a_stale_gates_section_is_regenerated_under_an_unchanged_version(project):
+    """The proxy was wrong in the other direction too: a gates section that no longer
+    matched the catalog was frozen in place because the first line still named the
+    current template version (kn-12153552)."""
+    from jarvis.gates import GateConfig
+
+    bootstrap_project(spec(project))
+    assert "gated, not forbidden" not in (project / "OPERATION.md").read_text()
+
+    bootstrap_project(spec(project, gates=GateConfig(enabled=frozenset({"release"}))))
+
+    assert "gated, not forbidden" in (project / "OPERATION.md").read_text()
+
+
+def test_a_committed_operation_md_is_never_overwritten(project):
+    """The invariant that terminates the loop: the OS never commits, so writing over a
+    tracked file leaves the tree dirty for ever and `git pull --ff-only` refuses before
+    every release. Drift is reported for a human instead."""
+    bootstrap_project(spec(project))
+    op = project / "OPERATION.md"
+    _restamp(op, 3)
+    _commit_all(project)
+    stale = op.read_text()
+
+    report = bootstrap_project(spec(project))
+
+    assert op.read_text() == stale, "overwrote a file the repository owns"
+    assert any("does not overwrite files the repository owns" in w
+               for w in report.warnings), report.warnings
+    assert any("template v3" in w for w in report.warnings), report.warnings
+
+
+def test_force_config_regenerates_a_committed_operation_md(project):
+    """The escape hatch the warning names — without it a maintainer who bumps
+    TEMPLATE_VERSION has no supported way to produce the new committed render."""
+    from jarvis.bootstrap import TEMPLATE_VERSION
+
+    bootstrap_project(spec(project))
+    op = project / "OPERATION.md"
+    _restamp(op, 3)
+    _commit_all(project)
+
+    report = bootstrap_project(spec(project), force_config=True)
+
+    assert f"template v{TEMPLATE_VERSION}" in op.read_text().split("\n", 1)[0]
+    assert not any("repository owns" in w for w in report.warnings)
+
+
+def test_an_untracked_operation_md_is_still_refreshed(project):
+    """The rule is about ownership, not staleness: a project that does not commit its
+    contract keeps getting it refreshed."""
+    from jarvis.bootstrap import TEMPLATE_VERSION
+
+    bootstrap_project(spec(project))
+    op = project / "OPERATION.md"
+    _restamp(op, 3)
+
+    bootstrap_project(spec(project))
+
+    assert f"template v{TEMPLATE_VERSION}" in op.read_text().split("\n", 1)[0]
+
+
+def test_this_repos_committed_operation_md_matches_its_generator():
+    """The drift that made issue 279: the committed contract sat at template v7 while
+    the generator rendered v11, so every `jarvis start` rewrote it and nothing ever
+    committed the result. With the write now refused on a tracked file, a forgotten
+    regeneration would instead freeze this repo's own contract four versions behind —
+    so the committed bytes are pinned here, and a TEMPLATE_VERSION bump that does not
+    ship the regenerated file fails in CI rather than in production.
+
+    The gate list is this project's catalog answer, duplicated because the catalog is
+    untracked (kn-12153552). Regenerate with `jarvis adopt . --force-config`.
+    """
+    from pathlib import Path
+
+    from jarvis.bootstrap import operation_specifics, render_operation_md
+    from jarvis.gates import GateConfig
+
+    root = Path(__file__).resolve().parent.parent
+    committed = (root / "OPERATION.md").read_text()
+    rendered = render_operation_md(
+        ProjectSpec(name="jarvis_os", path=root,
+                    gates=GateConfig(enabled=frozenset(
+                        {"pr_merge", "release", "service_restart"}))),
+        operation_specifics(committed))
+
+    assert committed == rendered, (
+        "this repo's committed OPERATION.md is not what the generator produces — "
+        "run `jarvis adopt . --force-config` and commit the result")

@@ -14,7 +14,7 @@ from jarvis import ops
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import NeoStore
+from jarvis.neo_store import MAX_ANSWER_ATTEMPTS, UNREACHABLE_PREFIX, NeoStore
 from jarvis.project_store import ProjectStore
 
 scenario = pytest.mark.scenario
@@ -51,11 +51,16 @@ def question_of(call):
 
 # -- 1. no question is ever lost ---------------------------------------------------
 
+# EVERY CASE HERE IS A MODEL THAT REPLIED. A model that was never reached has its own
+# scenario below, because its arc spans several drains rather than one: it is retried
+# first and only becomes the user's once the retries are genuinely spent (spec
+# docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2). Folding it back in
+# here would re-assert the defect that spec exists to fix — a crash terminal at attempt
+# zero, dressed as a judgement.
 OUTCOME_BATTERY = [
     ("plain question gets answered and delivered", "which linter?", "answered"),
     ("model-declined question escalates", "FORCE_ESCALATE: delete prod db?", "escalated"),
     ("unparseable model output escalates, never delivers", "FORCE_GARBAGE: schema?", "escalated"),
-    ("failed model call surfaces as failed, not silence", "FORCE_FAIL: anyone?", "failed"),
 ]
 
 
@@ -85,6 +90,72 @@ def test_question_outcomes(daemon, project, name, question, expected):
             assert any(a.get("neo_question_id") == qid for a in st["attention"])
     finally:
         store.close()
+
+
+@scenario("neo/no-question-lost",
+          "a model that was never reached is retried, then surfaced as unreachable")
+def test_an_unreachable_model_is_retried_before_it_is_surfaced(daemon, project):
+    """The promise this scenario makes, restated for a call that never happened.
+
+    'Never lost' and 'terminal at the first failure' are not the same thing, and Neo
+    question 388 is what the difference cost: a crash was written as a verdict and
+    reached the user as an escalation Neo had never made. The question must survive
+    every retry still answerable, stay off the user's plate while it does, and only
+    then become visible — as UNREACHABLE, never as a judgement.
+    """
+    wo = dispatched_wo(daemon)
+    qid = ops.ask_question(wo["id"], "FORCE_FAIL: anyone?")["question_id"]
+
+    for attempt in range(1, MAX_ANSWER_ATTEMPTS + 1):
+        _clear_retry_hold(qid)
+        daemon._neo_drain()                                        # noqa: SLF001
+        neo = NeoStore()
+        try:
+            q = neo.get(qid)
+        finally:
+            neo.close()
+        assert q["status"] == "queued", f"given up on attempt {attempt}"
+        assert q["attempts"] == attempt, "the retry machinery was bypassed, not spent"
+        assert q["answer"] is None, "a call that never happened produced an answer"
+        assert not ops.os_status()["attention"], (
+            f"the user was asked on attempt {attempt}, before the retries were spent"
+        )
+
+    _clear_retry_hold(qid)
+    daemon._neo_drain()                                            # noqa: SLF001
+
+    neo = NeoStore()
+    try:
+        q = neo.get(qid)
+    finally:
+        neo.close()
+    assert q["status"] == "failed", "the retries were spent and nobody was told"
+    assert q["answer"] is None
+    assert UNREACHABLE_PREFIX in q["answer_reason"], (
+        "the surfaced item must say it was unreachable, not that it was escalated"
+    )
+
+    store = ProjectStore(project)
+    try:
+        assert not [m for m in store.queued_messages(wo["id"])
+                    if m["content"].startswith(neo_mod.ANSWER_PREFIX)], (
+            "a fabricated verdict reached the worker"
+        )
+    finally:
+        store.close()
+    assert any(a.get("neo_question_id") == qid
+               for a in ops.os_status()["attention"]), (
+        "the question exhausted its retries and never became visible"
+    )
+
+
+def _clear_retry_hold(qid: int) -> None:
+    """Skip the backoff the OS puts between retries, so the eval does not sleep."""
+    neo = NeoStore()
+    try:
+        neo.clear_retry_hold(qid)
+    finally:
+        neo.close()
 
 
 @scenario("neo/no-question-lost", "asking parks the worker quietly (no user attention)")

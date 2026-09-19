@@ -277,7 +277,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("start", help="start the OS: bootstrap projects + run the daemon")
     sp.add_argument("--catalog", required=True, help="path to the project catalog JSON")
     sp.add_argument("--force-config", action="store_true",
-                    help="overwrite manually-edited injected settings")
+                    help="overwrite manually-edited injected settings, and a committed "
+                         "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--foreground", action="store_true", help="run the daemon in-process")
     sp.add_argument("--poll-interval", type=float, default=5.0)
 
@@ -375,7 +376,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("path", help="project directory")
     sp.add_argument("--name", help="project name (default: directory name)")
     sp.add_argument("--catalog", help="catalog to take overrides/defaults from")
-    sp.add_argument("--force-config", action="store_true")
+    sp.add_argument("--force-config", action="store_true",
+                    help="overwrite manually-edited injected settings, and a committed "
+                         "OPERATION.md the generator would otherwise leave alone")
     sp.add_argument("--dry-run", action="store_true")
 
     # work orders -------------------------------------------------------------------
@@ -1038,9 +1041,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"\n📥 inbox: {st['inbox']['unacked']} unacked"
               f" ({st['inbox']['critical']} critical) — `jarvis inbox list`")
     neo = st.get("neo", {})
-    if neo.get("queued") or neo.get("unreviewed") or neo.get("escalated"):
+    if (neo.get("queued") or neo.get("unreviewed") or neo.get("escalated")
+            or neo.get("failed")):
+        # `unreachable` is its own clause and never folded into `escalated`. An
+        # escalation is a judgement Neo made; an unreachable question is one nobody
+        # made, and the whole of what question 388 cost the user was being unable to
+        # tell which they were looking at.
+        unreachable = (f"{neo['failed']} unreachable (NOT judged), "
+                       if neo.get("failed") else "")
         print(f"\n🕶 neo: {neo.get('queued', 0)} queued, "
-              f"{neo.get('escalated', 0)} escalated to you, "
+              f"{neo.get('escalated', 0)} escalated to you, {unreachable}"
               f"{neo.get('unreviewed', 0)} answers awaiting your review — `jarvis neo list`")
     if args.attention:
         return 0
@@ -1497,11 +1507,34 @@ NO_CALL_FLAG = "NO API CALL"
 
 
 def _print_partition(unit: dict[str, Any]) -> None:
+    """The headline: both clocks, then how the wall one divides.
+
+    WALL FIRST AND NEVER DROPPED — it is the answer to "how long did this take in the
+    real world", which is the question that started this. `active` is beside it because
+    the two differ by hours on a held order, and the lines under them say who took the
+    difference, which is the sentence that makes six hours and fourteen minutes of work
+    a fact about the fleet rather than an accusation about the worker.
+    """
     part, share = unit["partition"], unit["share"]
-    print(f"  wall clock {_mins(part['wall'])}, peak context {_tok(unit['context_peak'])}")
+    held = part.get("held", 0.0)
+    clocks = f"  wall clock {_mins(part['wall'])}"
+    if held:
+        clocks += f" · active {_mins(part.get('active', part['wall']))}"
+    print(f"{clocks}, peak context {_tok(unit['context_peak'])}")
+    causes = unit.get("hold_causes") or {}
+    for cause, seconds in (unit.get("held_by") or {}).items():
+        print(f"    {seconds / part['wall'] * 100:>4.0f}%  {_mins(seconds):>8}  "
+              f"HELD by {causes.get(cause, cause)}")
     for name in PART_LABELS:
         print(f"    {share[name] * 100:>4.0f}%  {_mins(part[name]):>8}  "
               f"{PART_LABELS[name]}")
+    if held:
+        # THE RESIDUAL, AND IT IS THE POINT OF SPLITTING THE CLOCK. `idle` above is the
+        # whole gap between turns; this is what is left of it once the OS's own waiting
+        # is named. A big number here is a defect, and a small one is the report saying
+        # the hours were a hold and nothing was wasted.
+        print(f"    {'':>4}  {_mins(part.get('unexplained', 0.0)):>8}  "
+              f"of that idle, nothing on record was holding it")
 
 
 def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
@@ -1530,6 +1563,7 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
 
     print()
+    causes = unit.get("hold_causes") or {}
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
@@ -1539,6 +1573,14 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
               f"{flag:<{len(NO_CALL_FLAG)}}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
+        # The second clock only where the two differ, on its own line and naming the
+        # cause. Most turns are not held, and an `active` column that repeated `wall`
+        # nine times out of ten would train the eye to stop reading it.
+        held_by = turn.get("held_by") or {}
+        if held_by:
+            named = ", ".join(f"{_mins(sec)} by {causes.get(c, c)}"
+                              for c, sec in held_by.items())
+            print(f"           · {_mins(turn['active'])} active — held {named}")
         for trigger in turn["triggers"]:
             print(f"           ↳ {trigger['quote']}")
 
@@ -2888,11 +2930,17 @@ def cmd_neo(args: argparse.Namespace) -> int:
         else:
             icon = {"queued": "⏳", "answering": "🤔", "answered": "💬",
                     "escalated": "🙋", "failed": "❌"}
+            # `failed` RENDERS AS `unreachable`, because that is what it means: Neo was
+            # never reached and judged nothing. The stored word is the status, the
+            # printed word is the fact — see `neo_store.UNREACHABLE_PREFIX`.
+            label = {"failed": "unreachable — NOT judged"}
             for q in qs:
                 review = f" [{q['review_status']}]" if q["status"] == "answered" else ""
+                held = (" · retrying" if q["status"] == "queued"
+                        and (q.get("attempts") or 0) else "")
                 print(f"{icon.get(q['status'], '•')} #{q['id']} [{q['project']}] "
-                      f"{q['wo_id']} ({q['status']}{review}, {_age(q['ts'])}) "
-                      f"{q['question'][:80]}")
+                      f"{q['wo_id']} ({label.get(q['status'], q['status'])}{review}"
+                      f"{held}, {_age(q['ts'])}) {q['question'][:80]}")
             if not qs:
                 print("nothing pending for Neo ✨")
     elif args.neo_cmd == "show":

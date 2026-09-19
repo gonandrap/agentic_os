@@ -30,6 +30,15 @@ CALLER named — so a URL out of the record still cannot redirect a write, which
 whole of what `github.UntrustedPullRequest` spells out. What changed is who names the
 repository, not whether one is checked.
 
+## What may be published on one
+
+A second question, and it is not the same as which repository: `repo_is_private` is the
+allowlist a validation follow-up's TEXT is held to. No prose a model wrote goes to a
+tracker the OS could not establish is private — the rule §8 of
+docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md states for the OS's own
+tracker, applied to the project's (spec §9 of
+docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
+
 ## Desired state, not a sequence of pokes
 
 The OS never fires "label it now" at GitHub and hopes. `desired_state` turns a work
@@ -71,7 +80,13 @@ ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
                # validation follow-up; `issue list` is the READ that dedupes it, and it
                # is here rather than in `github.py` because that module may build no
                # command against a repository it was not given by `origin`.
-               ("issue", "create"), ("issue", "list"))
+               ("issue", "create"), ("issue", "list"),
+               # A READ, in a list that is otherwise writes — same shape as
+               # `("issue", "list")` above. It is here rather than in `github.py` for
+               # that module's own reason: it may build no command against a repository
+               # it was not given by `origin`. `repo_is_private` is what decides whether
+               # a seat's words may be published at all.
+               ("repo", "view"))
 
 #: One round trip against GitHub's API. Same budget as `github.GH_TIMEOUT`, and for the
 #: same reason: the daemon's reconcile tick must not block on a network problem.
@@ -425,6 +440,34 @@ FOLLOW_UP_LABEL = "validation follow-up"
 #: green so the two read apart at a glance on a tracker carrying both.
 FOLLOW_UP_COLOUR = "c5def5"
 FOLLOW_UP_DESCRIPTION = "Raised by the Jarvis validation panel; not a blocker."
+
+
+def repo_is_private(repo: str) -> bool:
+    """True only when GitHub SAID this repository is private; False on any doubt.
+
+    THE ALLOWLIST THE FILING RESTS ON. A follow-up carries a seat's own prose, written by
+    a model that does not know it will be published, and §8 of
+    docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md forbids publishing that
+    to a public tracker. So the text goes out only where the OS has POSITIVELY
+    established the destination is private, and every other answer — `gh` missing, a
+    refusal, a timeout, a repository this installation cannot read, output that will not
+    parse — reaches the same branch as "public". "Unknown" is not a third case.
+
+    NOT CACHED. A repository flipped private-to-public between rounds must be seen; one
+    round trip per round is the same budget the dedupe read already spends.
+
+    THE REPOSITORY IS POSITIONAL: `gh repo view` has no `--repo` flag (gh 2.86), unlike
+    every other command in this module. `checked_repo` is therefore load-bearing twice
+    over — it is what stops the name being read as a flag.
+    """
+    try:
+        stdout = _run(["repo", "view", checked_repo(repo), "--json", "isPrivate"],
+                      url=repo)
+        return json.loads(stdout or "").get("isPrivate") is True
+    except Exception as e:  # noqa: BLE001 — every failure has the same safe answer
+        log.info("could not establish whether %s is private (%s) — treating it as "
+                 "public, so no finding text is published there", repo, e)
+        return False
 
 
 def file_follow_up(repo: str, title: str, body: str) -> str:

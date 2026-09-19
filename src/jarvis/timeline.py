@@ -227,6 +227,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('attempts')} {what} retries: {p.get('error') or ''}")
     if kind == "turn_cancelled":
         return "Worker turn cancelled", ""
+    # A SIGNAL AND NOT PLUMBING, unlike `turn_started`/`turn_ended` beside it. The OS
+    # spent a model call on the conversation rather than on the work, and it dropped
+    # detail the worker had: that is a thing that happened TO this work order, and the
+    # pinned self-healing learning asks for it to be provable rather than asserted.
+    if kind == "compacting":
+        return "Compacting the conversation", p.get("reason") or ""
+    if kind == "compacted":
+        # `ok` is absent on the hook's own event (`hooks.note_compaction`), which only
+        # ever fires for a compaction that already happened — so missing means true.
+        if p.get("ok") is False:
+            # The conversation is INTACT and the next prompt still pays the re-write.
+            # Saying "compacted" here would put a saving on the record that the bill
+            # will not show.
+            return "Compaction failed", str(p.get("error") or "")
+        before, after = p.get("before"), p.get("after")
+        if isinstance(before, int) and isinstance(after, int) and before:
+            return ("Conversation compacted",
+                    f"{before:,} tokens summarised to {after:,}")
+        return "Conversation compacted", ""
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "cost_alarm":
@@ -465,10 +484,28 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_failed":
         # A FIFTH kind, and the one most easily misread: nothing judged the work here.
         # A reader who takes this for a rejection goes looking for something to fix that
-        # nobody ever asked for, so the two causes get two different sentences.
+        # nobody ever asked for, so each cause gets a sentence of its own.
         if p.get("cause") == "no_validator":
             return ("Validation skipped — no validator was configured",
                     p.get("reason") or "")
+        if p.get("cause") == "ci_pending":  # project_store.VALIDATION_CI_CAUSE
+            # A FOURTH cause, and the most ordinary thing on this list: the pull request
+            # was submitted and GitHub has not finished running the checks the panel
+            # judges the declared evidence against. Nothing is wrong and nobody is
+            # needed. The line names the checks rather than the moment — unlike the
+            # usage window below, CI does not say when it will be done, and "waiting for
+            # unit (3.11)" is what a reader can go and look at.
+            waiting = ", ".join(str(c) for c in (p.get("pending") or ()))
+            return ("Validation waiting for CI",
+                    f"still running: {waiting}" if waiting else "")
+        if p.get("cause") == "usage_limit":  # project_store.VALIDATION_HELD_CAUSE
+            # A THIRD cause, and the one a reader must not take for either of the others:
+            # nothing is wrong, nobody is needed, and the round goes again by itself. The
+            # moment is the whole content of the line (GitHub issue #235).
+            when = _clock(p.get("reopens_at"))
+            return ("Validation held — the Claude usage window is spent",
+                    (f"resuming by itself at {when}" if when else "")
+                    + (f" · {p.get('error')}" if p.get("error") else ""))
         attempt = p.get("attempt")
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt

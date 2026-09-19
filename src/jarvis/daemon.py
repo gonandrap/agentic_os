@@ -23,8 +23,13 @@ Every RETRY_EVERY_TICKS ticks it additionally:
 
 Every PR_POLL_EVERY_TICKS ticks it additionally:
   6. asks GitHub what happened to the pull requests its work orders are parked behind,
-     and ends the ones that were merged — the only step that leaves the machine, and
-     the reason a merge does not need a `jarvis wo done` after it
+     and ends the ones that were merged — the reason a merge does not need a
+     `jarvis wo done` after it
+
+Every LANDING_SWEEP_EVERY_TICKS ticks it additionally:
+  7b. asks GitHub what became of the pull request a COMPLETED order recorded, and writes
+     the answer to the timeline — the other thing that leaves the machine, and what
+     INV-WORK-LANDED reads so that the invariants themselves never call `gh`
 
 Every RECONCILE_EVERY_TICKS ticks it additionally:
   7. tracks the sessions the user *injected* (`jarvis wo inject`) — the only step that
@@ -49,7 +54,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import bugreport, bus, claude_cli, db, fleet, inspection, worker_session
+from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection,
+               worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -60,14 +66,18 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
+    MAX_MESSAGE_DELIVERY_ATTEMPTS,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_CI_CAUSE,
+    VALIDATION_HELD_CAUSE,
     ProjectStore,
     resume_spends_slot,
+    validation_hold_until,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -78,8 +88,8 @@ log = logging.getLogger("jarvisd")
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
-#: interval. Its own cadence rather than the reconcile one because it is the only step
-#: that leaves the machine: one `gh` subprocess per parked work order per poll. Two
+#: interval. Its own cadence rather than the reconcile one because it leaves the machine:
+#: one `gh` subprocess per parked work order per poll. Two
 #: minutes is well inside what a user perceives as "it noticed my merge", and a fleet
 #: with five PRs parked spends ~150 calls/hour against `gh`'s 5000/hour authenticated
 #: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
@@ -119,19 +129,18 @@ PR_POLL_STATUSES = PR_REPAIR_STATUSES
 #: costing a sixth of what checking every tick would.
 RETRY_EVERY_TICKS = 2
 
-#: Sweep for completed work orders whose code never reached the default branch every N
-#: ticks — an hour at the default 5s interval. Its own cadence for `PR_POLL_EVERY_TICKS`'
-#: reason one step removed: it does not leave the machine, but it is the only check that
-#: shells out, at a `git` invocation per touched file of every completed order whose
-#: verdict is not already cached. An hour is far inside the window that matters — the
-#: orders GitHub issue #232 found had been stranded for SEVEN WEEKS — and a settled
-#: verdict is recorded once and never recomputed, so a mature project's steady-state cost
-#: is the orders nobody has landed yet, which is the number this exists to drive to zero.
+#: Sweep for completed work orders whose pull request never merged every N ticks — an
+#: hour at the default 5s interval. Its own cadence for `PR_POLL_EVERY_TICKS`' reason and
+#: one of its own: `refresh_landings` leaves the machine, and the check that reads it
+#: walks every completed order the project has ever had, which no other invariant does.
+#: An hour is far inside the window that matters — the orders GitHub issue #232 found had
+#: been unmerged for SEVEN WEEKS — and a settled reading stands for
+#: `landing.FRESH_FOR_SECONDS`, so a mature project's steady-state cost is the orders
+#: nobody has merged yet, which is the number this exists to drive to zero.
 #:
-#: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside
-#: `check_invariants`, which only runs on the reconcile tick, so a cadence that did not
-#: line up would silently sweep at some beat frequency of the two. 720 % 6 == 0, and both
-#: fire on tick 721.
+#: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside the reconcile
+#: block, so a cadence that did not line up would silently sweep at some beat frequency
+#: of the two. 720 % 6 == 0, and both fire on tick 721.
 LANDING_SWEEP_EVERY_TICKS = 720
 
 #: Look at the scheduler's clock every N ticks — a minute at the default 5s interval. Its
@@ -221,6 +230,23 @@ code or new evidence will end the review."""
 #: park a work order in `validating` with nobody watching, which is the exact silent
 #: stall this feature exists to remove.
 VALIDATION_OUTAGE_LIMIT = 3
+
+#: How long to wait before asking GitHub again whether the checks have finished. One
+#: minute, not one tick: the tick is 5 seconds and the answer changes on CI's clock, so
+#: re-asking every tick would spend a `gh pr view` per 5 seconds per parked order to
+#: learn nothing. Each re-ask is one read; the seats — the expensive part — are not
+#: reached while the hold stands.
+CI_HOLD_RECHECK_SECONDS = 60.0
+
+#: How long the OS waits for CI in total before judging anyway, measured from the moment
+#: the round opened. A ceiling and NOT a timeout in the failure sense: when it lapses the
+#: round is judged on what GitHub has actually reported, and the tester seat already
+#: knows how to read "nothing reported" — `validator-seats/tester.md` tells it to say so
+#: rather than infer a pass. That is the fail-SAFE direction. Waiting for ever is not: a
+#: workflow that never reports would park the work order in `validating` with nobody
+#: watching, which is the silent stall `VALIDATION_OUTAGE_LIMIT` exists to prevent one
+#: authority along. Forty-five minutes is CI's ~20-minute suite with room for a queue.
+CI_HOLD_DEADLINE_SECONDS = 45.0 * 60.0
 
 #: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
 #: nothing judged this work, so there is nothing for its author to fix, and the reason
@@ -338,9 +364,6 @@ class Daemon:
         # The validator seam (see `_validator`). None means "ask the catalog"; tests
         # inject a callable here, exactly as `release_runner` injects systemd.
         self.validator: Validator | None = None
-        # Invariant violations already reported this run, so a standing problem is
-        # surfaced once instead of every tick. Keyed by (invariant, wo_id).
-        self.reported_violations: set[tuple[str, str | None]] = set()
         # Projects already warned that their pull requests cannot be polled (no `gh`, no
         # credentials, an unreachable host). Same idea: say it once, not every 2 minutes
         # forever. Reset by restarting the daemon, which is also what fixes it.
@@ -611,12 +634,12 @@ class Daemon:
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
-                self.validation_tick(project, store)
+                self.validation_tick(project, store, state)
                 # Beside its twin and for the same reason: an envelope a feature round
                 # posted on an earlier tick has already gone out to the manager above,
                 # so the feature it rejected has left `validating` and is not looked at
                 # again here. Both machines share one thread and one in-flight set.
-                self.feature_validation_tick(project, store)
+                self.feature_validation_tick(project, store, state)
                 # Before dispatch, not after: a planner filed this tick is an ordinary
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
@@ -670,6 +693,11 @@ class Daemon:
                     # a person, so the thing it saves is measured in the user's hours.
                     # It only ASKS — the ruling lands through the Neo drain below.
                     self.auto_review(project, store)
+                    # Immediately before the check that reads it, in the same tick: the
+                    # landing invariant is a pure timeline read, and this is the only
+                    # thing that puts a pull-request fact on that timeline.
+                    if sweep_landings:
+                        self.refresh_landings(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                 self.central.touch_project(project.name)
@@ -1260,7 +1288,9 @@ class Daemon:
         somebody is already waiting on before it goes to new work.
         """
         pending: dict[str, list[dict[str, Any]]] = {}
-        for msg in store.queued_messages():  # chronological, so the joins stay in order
+        # `deliverable_`, not `queued_`: a message whose last delivery attempt failed is
+        # held by its backoff and is not offered again until it is due.
+        for msg in store.deliverable_messages():  # chronological, so joins stay in order
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
@@ -1313,8 +1343,14 @@ class Daemon:
 
     # -- 3b. the validation round machine (see the validation-panel design) -----------
 
-    def validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def validation_tick(self, project: ProjectSpec, store: ProjectStore,
+                        state: fleet.Fleet | None = None) -> None:
         """Judge every work order with an open round, off this thread.
+
+        `state` IS THE TICK'S ONE FLEET READING, and only its outage half is read here —
+        never `blocked()`. A seat is not a worker turn and does not count against
+        `max_in_flight`, but it is refused by the very same account-wide window, so the
+        cap must not hold the panel and the outage must (GitHub issue #235).
 
         THE KILL SWITCH IS NOT CHECKED HERE, and that is the point of the whole design:
         `os.validation.enabled` gates OPENING a round (`ops.finish`) and never settling
@@ -1333,12 +1369,24 @@ class Daemon:
         `statuses=("validating",)` — what this used to ask for — could not see one, which
         is the whole of why validation waited on the user.
         """
+        if state is not None and state.shut():
+            # Nothing would be judged; every seat would be refused free and instantly,
+            # and the round would only have to be held anyway. Held BEFORE the first
+            # refusal rather than after it, the way `dispatch_pending` holds a worker.
+            return
         for wo in store.work_orders_awaiting_validation():
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
+                continue
+            # This round met a window of its own, and the refusal named when it lifts.
+            # `failed` is RUNNABLE, so without this the same closed window is walked into
+            # every tick — which is how `VALIDATION_OUTAGE_LIMIT` used to be spent in
+            # fifteen seconds against an eleven-hour outage (`_validation_held`).
+            if validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
+                                     int(round_row["round"])) > time.time():
                 continue
             self.validating.add(wo_id)
             future = self.validate_pool.submit(
@@ -1397,6 +1445,28 @@ class Daemon:
             # for a worktree packet, which never auto-merges — spec 2026-09-14 §5.2.
             store.set_validation_head(round_id, evidence_mod.judged_head(packet))
 
+            # WAIT FOR CI RATHER THAN FOR THE WORKER TO PROVE THE SUITE ITSELF. Workers
+            # are told to run the TARGETED tests and cite CI for the whole suite (the
+            # user's ruling, 2026-09-18; kn-356c724b), because the full suite takes ~21
+            # minutes and a worker turn is one API conversation with a 5-minute prompt
+            # cache — so a local suite run guarantees the entire conversation is re-sent
+            # at the cache-WRITE rate on the next call. Somebody still has to wait for
+            # the real suite, and the OS is the cheap place: nothing is billed while a
+            # round is held, and the seats are not reached.
+            #
+            # BEFORE the validator and AFTER the head, deliberately. The head is a fact
+            # about the packet whatever happens next, and recording it is what lets a
+            # held round say which commit it was holding on. The seats are the expensive
+            # part and there is nothing for them to read yet: `tester.md` judges the
+            # declared evidence against the check runs, so judging now would judge every
+            # submission against an empty check list.
+            pending = evidence_mod.ci_pending(packet)
+            if pending and time.time() < float(round_row["ts"]) + CI_HOLD_DEADLINE_SECONDS:
+                self._validation_ci_held(store, wo, round_id, n, pending)
+                log.info("[%s] %s: round %d held for CI (%s)",
+                         project.name, wo_id, n, ", ".join(pending))
+                return
+
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
             if validator is None:
@@ -1453,6 +1523,13 @@ class Daemon:
 
             try:
                 verdict = validator(store, dict(round_row), packet)
+            except claude_cli.UsageLimitError as e:
+                # BEFORE the generic outage below, and that ordering is the fix: a spent
+                # window is not a transport fault and must not spend its budget.
+                self._validation_held(store, wo, round_id, n, e.limit)
+                log.info("[%s] %s: round %d held until the usage window reopens",
+                         project.name, wo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._validation_outage(store, wo, round_id, n, e)
                 return
@@ -1662,6 +1739,73 @@ class Daemon:
             source="validation",
         )
 
+    @staticmethod
+    def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                         limit: claude_cli.UsageLimit) -> None:
+        """The account's window is spent. WAIT IT OUT — this costs no outage attempt.
+
+        The transport budget above is sized for a blip and is spent on CONSECUTIVE TICKS,
+        so at a 5s tick all three attempts and the terminal escalation behind them landed
+        inside fifteen seconds — against an outage the inbox had already measured at 11.2
+        hours (GitHub issue #235, wo-752eced8 round 3). A usage limit is the one failure
+        that states when it ends, so there is nothing to guess and nothing to ration.
+
+        The round is closed `failed` for the same reason `_validation_outage` closes it
+        that way — it is `RUNNABLE`, and `counted_validation_rounds` ignores it, so the
+        submitter spends nothing and the next tick owns the same round again. What is new
+        is `reopens_at` on the event: `validation_tick` reads it back and does not
+        re-submit until it has passed, which is the same contract `dispatch_pending`
+        already honours for a worker turn.
+
+        WORK ORDERS ALREADY ESCALATED BY A PAST WINDOW ARE NOT REOPENED (Neo, question
+        390). Their escalation reached the inbox and flagged attention, so the user has
+        seen it, and re-judging behind their back could land and auto-merge a pull request
+        nobody asked for. The recovery is one command, on demand:
+
+            jarvis validation force <wo-id> --reason "held by a usage window, see #235"
+        """
+        from .invariants import usage_hold_note
+
+        reopens = limit.reset_at or (time.time()
+                                     + worker_session.RATE_LIMIT_FALLBACK_DELAY)
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                         "reopens_at": reopens, "error": limit.message[:500]})
+
+    @staticmethod
+    def _validation_ci_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                            pending: tuple[str, ...]) -> None:
+        """GitHub has not finished running the checks. WAIT — this costs no outage attempt.
+
+        `_validation_held`'s twin in every mechanical respect, and read that one first:
+        the round is closed `failed` because `failed` is `RUNNABLE` and
+        `counted_validation_rounds` ignores it, so the submitter spends no round number
+        waiting for CI and the next tick owns the same round again. `reopens_at` is what
+        `validation_tick` reads back through `validation_hold_until`.
+
+        THE CAUSE IS ITS OWN (`VALIDATION_CI_CAUSE`) even though the behaviour is
+        identical, because the two holds are different facts and the timeline is read by
+        people: "the account's window is spent" and "CI is still running" must not render
+        as the same sentence. `VALIDATION_HOLDING_CAUSES` is where the shared behaviour
+        lives, so adding this cause did not fork the rule.
+
+        NO ATTENTION FLAG and no inbox row. A round waiting for the checks it was always
+        going to be judged against is the system working, exactly as a round in flight
+        is — `submit_for_validation` clears attention for the same reason. The wait is
+        bounded by `CI_HOLD_DEADLINE_SECONDS` at the call site, so silence here can never
+        become a stall nobody sees.
+        """
+        reopens = time.time() + CI_HOLD_RECHECK_SECONDS
+        names = ", ".join(pending[:6]) + (" …" if len(pending) > 6 else "")
+        store.close_validation_round(
+            round_id, "failed",
+            f"waiting for GitHub to finish the checks on this pull request before "
+            f"judging it: {names}")
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": n, "cause": VALIDATION_CI_CAUSE,
+                         "reopens_at": reopens, "pending": list(pending)})
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -1748,8 +1892,11 @@ class Daemon:
 
     # -- 3c. the same machine, one level up: feature orders ---------------------------
 
-    def feature_validation_tick(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def feature_validation_tick(self, project: ProjectSpec, store: ProjectStore,
+                                state: fleet.Fleet | None = None) -> None:
         """Judge every FEATURE order parked in `validating`, off this thread.
+
+        `state` is read exactly as `validation_tick` reads it — the outage half only.
 
         The twin of `validation_tick`, and it does not read the kill switch either, for
         the same reason: `enabled` and `feature_units` gate opening a round and never
@@ -1762,6 +1909,10 @@ class Daemon:
         kind, so a `wo-` key and an `fo-` key cannot collide, and one set means one pool
         and one re-entrancy rule to reason about instead of two.
         """
+        from . import ops
+
+        if state is not None and state.shut():
+            return  # see `validation_tick`: every seat would be refused, free and instantly
         for fo in store.list_feature_orders(statuses=("validating",)):
             fo_id = fo["id"]
             if fo_id in self.validating:
@@ -1775,6 +1926,10 @@ class Daemon:
                 continue
             if round_row["outcome"] not in ("pending", "failed"):
                 continue  # already judged — settlement is what moves it, not a re-run
+            if validation_hold_until(
+                    ops.feature_events_of_kind(store, fo_id, "validation_failed"),
+                    int(round_row["round"])) > time.time():
+                continue  # this round met a window of its own (`_feature_held`)
             self.validating.add(fo_id)
             future = self.validate_pool.submit(
                 self._validate_feature, project, fo_id, int(round_row["id"]))
@@ -1892,6 +2047,13 @@ class Daemon:
 
             try:
                 verdict = validator(store, dict(round_row), packet)
+            except claude_cli.UsageLimitError as e:
+                # Held, not spent — the work-order twin's reasoning verbatim
+                # (`_validation_held`), and the two settle paths stay identical.
+                self._feature_held(store, fo, round_id, n, e.limit)
+                log.info("[%s] feature %s: round %d held until the window reopens",
+                         project.name, fo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -2028,6 +2190,35 @@ class Daemon:
             body=escalation_body(reason), level="warning", source="validation",
         )
 
+    @staticmethod
+    def _feature_held(store: ProjectStore, fo: dict, round_id: int, n: int,
+                      limit: claude_cli.UsageLimit) -> None:
+        """`_validation_held` for a feature round — read that one; this is its twin.
+
+        The only difference is the carrier: these events live on the MANAGER's timeline
+        (`ops.feature_event`), because `wo_events.wo_id` is a foreign key into
+        `work_orders`. `feature_validation_tick` reads them back through
+        `ops.feature_events_of_kind` and waits the same moment out.
+
+        NO `not recorded` BACKSTOP, unlike the outage beside it, and the difference is
+        deliberate: that one escalates when the event cannot be written, because its
+        budget is counted FROM the events and an uncountable budget retries for ever.
+        This holds on a moment rather than a count, so an unwritten event costs one round
+        an unnecessary retry on the next tick — which is where it started — and never a
+        silent stall.
+        """
+        from . import ops
+        from .invariants import usage_hold_note
+
+        fo_id = fo["id"]
+        reopens = limit.reset_at or (time.time()
+                                     + worker_session.RATE_LIMIT_FALLBACK_DELAY)
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        ops.feature_event(store, fo_id, "validation_failed",
+                          {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                           "reopens_at": reopens, "error": limit.message[:500],
+                           "feature_order": fo_id})
+
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
         """The validator could not be reached. A transport failure, NOT a verdict.
@@ -2064,9 +2255,45 @@ class Daemon:
                 f"the review could not be run: the validator was unreachable "
                 f"{outages} times in a row. Nobody has judged the work.")
 
+    def _compacted_first(self, project: ProjectSpec, store: ProjectStore,
+                         wo: dict) -> bool:
+        """Spend this work order's turn on a `/compact` instead of on the message?
+
+        True when a compaction was launched, and then the caller must leave the queue
+        alone: the message goes out on the tick after it settles, which is inside the
+        cache TTL and against a conversation an order of magnitude smaller.
+
+        NEVER AT THE COST OF THE MESSAGE. A compaction that cannot be launched is not a
+        reason to hold a worker's next prompt — the boundary was going to be paid for
+        anyway, and paying it is strictly better than a work order that stops moving —
+        so every failure here returns False and the delivery proceeds exactly as it
+        did before this shipped.
+        """
+        try:
+            due = worker_session.compaction_due(
+                store, wo, self.catalog.os.compact_min_context)
+            if due is None:
+                return False
+            turn = worker_session.compact(store, project, wo, due)
+        except budget_mod.BudgetExhausted:
+            return False  # `_deliver` raises and escalates on the same call; let it
+        except Exception:  # noqa: BLE001 — a saving must never cost a delivery
+            log.exception("[%s] could not compact %s before its next prompt",
+                          project.name, wo["id"])
+            return False
+        log.info("[%s] compacting %s before its next prompt (turn %s): %s",
+                 project.name, wo["id"], turn["seq"], due.why)
+        return True
+
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
         ids = [m["id"] for m in msgs]
+        # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
+        # them has happened yet — and the next tick delivers them into a conversation
+        # that is both summarised and warm again. Deliberately before the `delivering`
+        # event, so the record does not claim a delivery that a compaction preempted.
+        if self._compacted_first(project, store, wo):
+            return
         log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
         store.add_event(wo["id"], "delivering", {"msg_ids": ids})
         # A blank line between messages and nothing else. Anything framing them — a
@@ -2082,10 +2309,21 @@ class Daemon:
             budget_mod.escalate(store, wo, e.exhausted)
             return
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
-            for msg_id in ids:
-                store.mark_message(msg_id, "failed")
-            store.flag_attention(wo["id"], f"message delivery failed: {e}")
+            # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
+            # and only surfaced once the retries are genuinely gone — spec
+            # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §6.
+            outcomes = {store.record_delivery_failure(msg_id, str(e)) for msg_id in ids}
+            log.error("[%s] delivery of message(s) %s failed (%s): %s", project.name,
+                      ids, "/".join(sorted(outcomes)), e)
+            store.add_event(wo["id"], "delivery_failed",
+                            {"msg_ids": ids, "error": str(e)[:500],
+                             "outcome": "failed" if "failed" in outcomes else "queued"})
+            if "failed" in outcomes:
+                store.flag_attention(
+                    wo["id"],
+                    f"a message could not be delivered to this work order after "
+                    f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
+                    f"received it: {e}")
             return
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
@@ -2214,10 +2452,40 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
+        def unreachable(q: dict, detail: str) -> None:
+            """Neo's retries are spent. SAY SO — do not dress it as an escalation.
+
+            No per-kind branch, and that is the difference from `deliver`: there is no
+            verdict to apply, so the gate stays shut, the plan stays unreviewed and the
+            worker is told nothing. The only thing that happens is the user finding out
+            that nobody judged their question.
+            """
+            head = q["question"].strip().splitlines()[0][:200]
+            central.add_inbox(
+                project=q["project"], level="warning",
+                title=f"Neo could not be reached for a question from {q['wo_id']}",
+                body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
+                     f"every time it was tried. This is not an escalation: Neo made no "
+                     f"decision.\nLast error: {detail[:200]}\n"
+                     f"Read it in full: jarvis neo show {q['id']}\n"
+                     f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                wo_id=q["wo_id"],
+            )
+            ppath = paths.get(q["project"])
+            if ppath and ppath.is_dir():
+                pstore = ProjectStore(ppath)
+                try:
+                    pstore.flag_attention(
+                        q["wo_id"],
+                        invariants.neo_question_blocker({**q, "status": "failed"}))
+                finally:
+                    pstore.close()
+
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
+                unreachable=unreachable,
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -3015,11 +3283,22 @@ class Daemon:
         other step here trusts that its writes stuck; this is the only one that checks.
         Repairs are recorded on the work order's timeline so a self-healed inconsistency
         is visible rather than silently papered over, and each distinct violation is
-        reported once per daemon run.
+        reported ONCE FOR AS LONG AS IT STANDS — `store.open_violation_report`, which is
+        a table rather than a set on this object because the set died with the process
+        and every release therefore re-announced the whole standing set to Telegram.
 
         `sweep_landings` adds `invariants.SLOW_INVARIANTS` — the checks that shell out —
         on `LANDING_SWEEP_EVERY_TICKS`. `jarvis doctor` runs them every time; the daemon
         cannot, which is the whole reason the flag exists.
+
+        THAT FLAG IS ALSO WHY A REPORT IS ONLY CLOSED ON A SWEEP TICK. A violation that
+        is gone must be forgotten, or the recurrence never reaches the user — but on the
+        719 ticks in 720 that run only the fast checks, INV-WORK-LANDED is absent because
+        nobody looked, not because it was fixed. Closing on that absence would re-announce
+        the whole batch hourly, which is the reported bug with a slower clock. Cost of the
+        choice: a violation fixed just after a sweep stays open for up to an hour, so a
+        fix-and-recur inside that window is announced late rather than twice. Silence is
+        the failure mode this exists to buy (Neo, question 419).
         """
         from .invariants import check_project
 
@@ -3029,10 +3308,15 @@ class Daemon:
             log.exception("[%s] invariant check failed", project.name)
             return
 
+        if sweep_landings:
+            for invariant, wo_id in store.close_violation_reports(
+                    v.key for v in violations):
+                log.info("[%s] %s%s no longer violated", project.name,
+                         f"{wo_id}: " if wo_id else "", invariant)
+
         for v in violations:
-            if v.key in self.reported_violations:
+            if not store.open_violation_report(v.invariant, v.wo_id):
                 continue
-            self.reported_violations.add(v.key)
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
                 store.add_event(v.wo_id, "invariant", {
@@ -3086,9 +3370,13 @@ class Daemon:
             if turn is None or turn["state"] != "running":
                 continue
             try:
-                raised = inspection.live_alarms(session_id, cfg, wo_id=wo["id"],
-                                                now=now, index=index,
-                                                dispatched=turn["started_at"])
+                raised = inspection.live_alarms(
+                    session_id, cfg, wo_id=wo["id"], now=now, index=index,
+                    dispatched=turn["started_at"],
+                    # What the OS was itself holding this order for, so a threshold
+                    # judges the time it could work rather than the time that passed.
+                    # Two indexed reads, no model — `holds.held`.
+                    spans=holds.held(store, wo["id"], now=now))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}
@@ -3264,7 +3552,7 @@ class Daemon:
         order*. The second half is the settlement logic that used to compare against
         `claude agents --json`, reading a row Jarvis owns instead of a roster it does not.
         """
-        for turn in worker_session.poll(store):
+        for turn in worker_session.poll(store, project.name):
             log.info("[%s] turn %s of %s ended: %s", project.name, turn["seq"],
                      turn["wo_id"], turn["state"])
         # `idle` is in the sweep, and it is what MIGRATES the managers this release
@@ -3737,6 +4025,90 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def refresh_landings(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Ask GitHub what became of the pull request each COMPLETED order recorded.
+
+        The other half of INV-WORK-LANDED, and the half that has a network. That check is
+        a pure timeline read by design (`invariants.check_work_lands`); this is what puts
+        the fact on the timeline for it, as a `landing_seen` event.
+
+        **IT READS `pr_url` AND NOTHING ELSE**, per the user's 2026-09-18 ruling. An order
+        with no `pr_url` is skipped without a round trip: whether it should have had one is
+        INV-PR-RECORDED's question (`wo-2005a89b`), and the chain is written out in
+        `landing`'s module docstring and in `invariants.check_work_lands`. So this does not
+        go looking for branches, does not list a repository's pull requests, and cannot
+        report on a pull request the work order never claimed.
+
+        **WHY IT HAS TO ASK AT ALL, RATHER THAN READ THE TIMELINE.** `Daemon.poll_pull_
+        requests` writes `pr_merged` only while an order is parked in `waiting_pr_merge`.
+        An order that reached `completed` any other way — reviewed, marked done, finished
+        before that poll existed — has a `pr_url` and no event about it, which is most of
+        the live records. Inferring "no `pr_merged` event" as "did not merge" would
+        reproduce the false positives this rewrite removed.
+
+        **IT COSTS ONE `gh pr view` PER ORDER, BOUNDED THREE WAYS.** By cadence:
+        `LANDING_SWEEP_EVERY_TICKS`, an hour. By `landing.FRESH_FOR_SECONDS`, which stops
+        a settled order being re-asked every sweep for ever. And by
+        `landing.REFRESH_PER_SWEEP`, which caps how many orders one sweep may ask about —
+        a project with two hundred completed orders and a cold timeline would otherwise
+        spend two hundred round trips inside a single tick. It fills in over a few sweeps
+        instead, newest first, which is `list_work_orders`' own order and the right one: a
+        recently completed order is the one a merge is still plausibly coming for.
+
+        A `gh` that cannot answer leaves the previous record standing, so a broken poll
+        makes the sweep stale rather than wrong. It reports through
+        `_warn_pr_poll_broken`, whose wording is the merge poll's — one broken `gh` is one
+        fact, and the poll runs thirty times more often, so it is always the one that says
+        it first.
+        """
+        from . import github, landing
+
+        candidates = [wo for wo in store.list_work_orders(
+            statuses=("completed",), include_hidden=True)
+            if wo.get("pr_url") and not (
+                store.work_abandoned(wo["id"])
+                or store.work_unlanded_open(wo["id"], closed_by="marked_done"))]
+        stale = [wo for wo in candidates if self._needs_landing_refresh(store, wo["id"])]
+        for wo in stale[:landing.REFRESH_PER_SWEEP]:
+            wo_id = wo["id"]
+            try:
+                pr = github.pr_view(str(wo["pr_url"]), cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not read the pull request of %s: %s", project.name,
+                          wo_id, e)
+                self._warn_pr_poll_broken(project, store, e)
+                # Continue, unlike the branch sweep this replaced: here each order asks
+                # about a DIFFERENT url, and one unreadable pull request (deleted repo,
+                # moved fork) is a fact about that url rather than about `gh`. A `gh` that
+                # is broken outright fails every order the same way, and the warning above
+                # is deduplicated, so the noise is bounded either way.
+                continue
+            except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] refreshing the landing of %s failed", project.name,
+                              wo_id)
+                continue
+            found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
+            store.add_event(wo_id, "landing_seen", found.record())
+            log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
+
+    def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:
+        """Is this completed order's landing record missing or old enough to re-ask?
+
+        Never read -> yes. Recorded as unsettled -> yes, every sweep: an open pull request
+        is the one that changes. Recorded as settled -> only past
+        `landing.FRESH_FOR_SECONDS`; see `refresh_landings` on why "settled" is not "for
+        ever" here.
+        """
+        from . import landing
+
+        seen = store.events_of_kind(wo_id, "landing_seen")
+        if not seen:
+            return True
+        latest = seen[-1]
+        if landing.from_record(wo_id, db.from_json(latest["payload"], {})).unsettled:
+            return True
+        return db.now() - float(latest["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS
 
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                    pr: Any, *, record_only: bool = False) -> None:

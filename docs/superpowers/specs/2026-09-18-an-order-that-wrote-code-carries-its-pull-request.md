@@ -109,8 +109,11 @@ Collapsing them would let an unreadable settling read afterwards as an exonerati
   up on upgrade.
 - **A STALE `pr_url` is out of scope.** wo-cd73c537 records a merged #81 while #116 is
   open. This predicate asks whether an identifier is PRESENT — a fact the record holds.
-  Asking whether it is CURRENT is a `gh` round trip per settled order and belongs to
-  `Daemon.discover_pull_requests` (wo-16a488ee). Filed as `bl-2aabaee8`.
+  Asking whether it is CURRENT is a `gh` round trip per settled order and belongs with
+  the daemon polls that already have a network. wo-16a488ee has since landed as
+  `Daemon.refresh_landings`, which reads `pr_url` and nothing else by the same ruling —
+  so neither it nor `Daemon.poll_pull_requests` looks for a branch's live pull request,
+  and the gap is still open. Filed as `bl-2aabaee8`.
 - **Not repairable.** An empty `pr_url` has two resolutions — find the pull request that
   exists, or record that none ever will — and nothing in the database distinguishes them.
   Discovery is what closes the gap, and it is the daemon's.

@@ -765,6 +765,21 @@ elif "-p" in argv and "--resume" not in argv:
         # of them at once. A degradation test needs to fail exactly one.
         if seat in [s for s in os.environ.get("FAKE_SEAT_FAIL", "").split(",") if s]:
             sys.stderr.write(f"seat {seat} failed (test-forced)\n"); sys.exit(1)
+        # THE USAGE LIMIT, PER SEAT, and it is a different refusal from the line above:
+        # the CLI never reached the API, and the reply NAMES WHEN THE WINDOW REOPENS.
+        # Emitted in the result-JSON shape `claude_cli.usage_limit` parses, so the test
+        # drives the real classifier into a real `UsageLimitError` and a real
+        # `Opinion.refused` — a hand-set `refused` would prove nothing about that chain.
+        if seat in [s for s in os.environ.get("FAKE_SEAT_REFUSE", "").split(",") if s]:
+            reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                                   "11:50pm (America/Los_Angeles)")
+            print(json.dumps({
+                "type": "result", "subtype": "success", "is_error": True,
+                "num_turns": 1, "total_cost_usd": 0, "duration_api_ms": 0,
+                "terminal_reason": "api_error", "api_error_status": 429,
+                "result": "You've hit your session limit · resets " + reset,
+            }))
+            sys.exit(1)
         if "FORCE_SEAT_GARBAGE" in prompt and seat == "premise":
             emit_headless("the premise here is, well, hard to say")
             sys.exit(0)
@@ -1105,6 +1120,27 @@ elif argv[:2] == ["issue", "close"]:
     if "--comment" in argv:
         r.setdefault("comments", []).append(argv[argv.index("--comment") + 1])
     save(rows)
+elif argv[:2] == ["repo", "view"]:
+    # THE PRIVACY READ that decides whether a validation follow-up may carry the seat's
+    # own words (spec §9 of 2026-09-15-the-panel-blocks-on-blockers.md).
+    #
+    # ITS OWN FAILURE SWITCHES, not FAKE_GH_FAIL: that one fails every call, so the round
+    # never reaches the dedupe read and files nothing at all — and a test asserting the
+    # WITHHELD shape would pass on a machine that published nothing because it published
+    # nothing. The fail-closed case needs this read alone to break while the filing runs.
+    if os.environ.get("FAKE_GH_REPO_VIEW_FAIL"):
+        sys.stderr.write(os.environ["FAKE_GH_REPO_VIEW_FAIL"] + "\n")
+        sys.exit(1)
+    if os.environ.get("FAKE_GH_REPO_VIEW_GARBAGE"):
+        print(os.environ["FAKE_GH_REPO_VIEW_GARBAGE"])
+        sys.exit(0)
+    # DEFAULT PRIVATE, so a test about the FILING exercises the full-content shape rather
+    # than the withheld one by accident. The public default is the production truth and
+    # every test that cares names it.
+    whole = {"isPrivate": os.environ.get("FAKE_GH_PRIVATE", "1") == "1",
+             "nameWithOwner": argv[2] if len(argv) > 2 else ""}
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))
 elif argv[:2] == ["label", "create"]:
     known = labels()
     if argv[2] in known:
@@ -1473,6 +1509,30 @@ def fake_gh(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
             return issue_url
 
+        def set_private(self, private: bool) -> None:
+            """What `gh repo view --json isPrivate` answers for every repository.
+
+            The fake defaults to PRIVATE so a test about the filing exercises the shape
+            that carries the finding's own words; `set_private(False)` is the production
+            truth for an open-source tracker, and the case the withholding exists for.
+            """
+            monkeypatch.setenv("FAKE_GH_PRIVATE", "1" if private else "0")
+
+        def fail_privacy_read(self, message: str = "gh: HTTP 502") -> None:
+            """Fail `gh repo view` and NOTHING else — `fail_merge`'s rationale exactly.
+
+            `fail()` would break the dedupe read too, so the round files nothing and an
+            assertion about the WITHHELD shape passes on a machine that published nothing
+            at all. The fail-closed branch is only visible when the filing still runs.
+            """
+            monkeypatch.setenv("FAKE_GH_REPO_VIEW_FAIL", message)
+
+        def garble_privacy_read(self, text: str = "not json at all") -> None:
+            """Answer the privacy read with something that will not parse — a `gh`
+            printing a warning, an API shape that moved. Exit 0, so it is a different
+            path from `fail_privacy_read` and needs its own test."""
+            monkeypatch.setenv("FAKE_GH_REPO_VIEW_GARBAGE", text)
+
         def set_labels(self, names: list[str]) -> None:
             """Which labels the repository already has. `--add-label` refuses everything
             else, exactly as real `gh` does."""
@@ -1737,6 +1797,20 @@ def fake_claude(tmp_path, monkeypatch):
             """
             env = "FAKE_SEAT_FAIL" if roster == "neo" else "FAKE_VALIDATION_SEAT_FAIL"
             monkeypatch.setenv(env, ",".join(seats))
+
+        def refuse_seat(self, *seats: str,
+                        reset: str = "11:50pm (America/Los_Angeles)") -> None:
+            """Refuse the named Neo panel seats for the USAGE LIMIT, resetting at `reset`.
+
+            `fail_seat`'s sibling, and the distinction is the one the whole retry ladder
+            turns on: a seat that FAILED is a fault to retry in seconds, a seat that was
+            REFUSED names the moment its window reopens and must be waited out instead
+            (GitHub issue #235). The fake emits the real result-JSON shape, so what the
+            test exercises is `claude_cli.usage_limit` and `Opinion.refused` rather than
+            a stand-in for them.
+            """
+            monkeypatch.setenv("FAKE_SEAT_REFUSE", ",".join(seats))
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
 
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
@@ -2004,3 +2078,134 @@ def catalog_file(tmp_path, project):
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(data))
     return path
+
+
+# -- the transport fault harness ---------------------------------------------------
+#
+# Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §8. One named
+# fault per shape the transport is known to fail in, so every rescue path in the OS is
+# driven through the same list rather than each test inventing its own exception.
+
+#: The exact production shape behind Neo question 388: rc=1, zero tokens in and out,
+#: `duration_api_ms` 0, `total_cost_usd` 0 — a launch that never reached the API.
+RC1_EMPTY = "rc1_empty"
+TIMEOUT = "timeout"
+EMPTY_STDOUT = "empty_stdout"
+MALFORMED_JSON = "malformed_json"
+USAGE_LIMIT = "usage_limit"
+MID_STREAM_DISCONNECT = "mid_stream_disconnect"
+
+#: Faults where the model was NEVER REACHED. Every one of these must leave the unit of
+#: work pending and retryable, and must decide nothing.
+TRANSPORT_FAULTS = (RC1_EMPTY, TIMEOUT, EMPTY_STDOUT, MID_STREAM_DISCONNECT)
+
+#: ...and the two kinds that are NOT transport faults, kept beside them because a rescue
+#: that cannot tell them apart is the defect this harness exists to catch.
+#:
+#: `MALFORMED_JSON` is a model that REPLIED, unusably: the OS's unparseable-output rules
+#: own it, not the retry ladder. `USAGE_LIMIT` is a refusal that states when it lifts, so
+#: it is waited out and spends no attempt (GitHub issue #235).
+REPLY_FAULTS = (MALFORMED_JSON,)
+REFUSAL_FAULTS = (USAGE_LIMIT,)
+
+ALL_FAULTS = TRANSPORT_FAULTS + REPLY_FAULTS + REFUSAL_FAULTS
+
+
+def raise_fault(fault: str, reset_at: float | None = None) -> None:
+    """Raise what `claude_cli` raises for `fault`; return for a fault that is a reply.
+
+    `MALFORMED_JSON` returns rather than raising: the call SUCCEEDED and the reply is
+    what is wrong with it, so a transport that raised there would model the wrong
+    failure. `fault_text` is what such a call returns instead.
+    """
+    from . import claude_cli
+
+    if fault == RC1_EMPTY:
+        raise claude_cli.ClaudeCliError(
+            "`claude -p` exited 1 with no output (0 tokens in, 0 out)")
+    if fault == TIMEOUT:
+        raise claude_cli.ClaudeCliError("`claude -p ...` timed out after 300s")
+    if fault == EMPTY_STDOUT:
+        raise claude_cli.ClaudeCliError("`claude -p` produced no output at all")
+    if fault == MID_STREAM_DISCONNECT:
+        raise claude_cli.ClaudeCliError(
+            "connection reset by peer after 1421 bytes of stream")
+    if fault == USAGE_LIMIT:
+        raise claude_cli.UsageLimitError(claude_cli.UsageLimit(
+            message="Claude AI usage limit reached", reset_at=reset_at))
+    if fault == MALFORMED_JSON:
+        return
+    raise AssertionError(f"no such transport fault: {fault!r}")
+
+
+def fault_text(fault: str) -> str:
+    """What a call returns for a fault that produced output rather than an exception."""
+    assert fault in REPLY_FAULTS, fault
+    return '{"escalate": false, "answer": "trunc'
+
+
+def faulty_transport(fault: str, succeed_after: int | None = None,
+                     reply: str = "", reset_at: float | None = None) -> Any:
+    """A `claude_cli.run_headless_result` stand-in that fails with `fault`.
+
+    `succeed_after` is what proves a retry is a retry: after that many calls the
+    transport recovers and returns `reply`, so a test can assert the eventual answer is
+    the REAL one rather than a fallback that happened to look plausible.
+    """
+    from . import claude_cli
+
+    def call(*_args: Any, **_kwargs: Any) -> Any:
+        call.calls += 1                                  # type: ignore[attr-defined]
+        if succeed_after is not None and call.calls > succeed_after:  # type: ignore[attr-defined]
+            return claude_cli.HeadlessResult(text=reply, model="test-model")
+        raise_fault(fault, reset_at)
+        return claude_cli.HeadlessResult(text=fault_text(fault), model="test-model")
+
+    call.calls = 0                                       # type: ignore[attr-defined]
+    return call
+
+
+class FaultyAnswerer:
+    """A `neo.drain_queue(answer=...)` stand-in — the seam the drain's rescue is reached
+    through. `succeed_after` recovers as `faulty_transport` does."""
+
+    def __init__(self, fault: str, succeed_after: int | None = None,
+                 verdict: dict[str, Any] | None = None,
+                 reset_at: float | None = None) -> None:
+        self.fault = fault
+        self.succeed_after = succeed_after
+        self.verdict = verdict or {
+            "escalate": False, "answer": "the real answer", "reason": "because",
+            "verdict": "approved", "approve": True, "dispatch": None}
+        self.reset_at = reset_at
+        self.calls = 0
+
+    def __call__(self, _store: Any, _q: dict[str, Any], *_a: Any,
+                 **_k: Any) -> dict[str, Any]:
+        self.calls += 1
+        if self.succeed_after is not None and self.calls > self.succeed_after:
+            return dict(self.verdict)
+        raise_fault(self.fault, self.reset_at)
+        raise AssertionError(f"{self.fault} did not raise")
+
+
+class Recorder:
+    """A `deliver`/`unreachable` hook that records its calls. Empty IS the assertion.
+
+    ALWAYS TRUTHY, and that is not a detail: every call site guards with `if deliver:`,
+    so a recorder that went falsy when empty would silently disable the very hook the
+    test is asserting about — and the assertion would pass for the wrong reason.
+    Ask `len(recorder)` or `recorder.calls`, never `if recorder`.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def __call__(self, *args: Any) -> None:
+        self.calls.append(args)
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+    def __bool__(self) -> bool:
+        return True

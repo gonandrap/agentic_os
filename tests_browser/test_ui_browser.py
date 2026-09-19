@@ -797,3 +797,41 @@ def test_a_fresh_fleet_is_not_warned_about_an_edit_nobody_made(page, server, pro
     body = page.locator("body").inner_text()
     assert "no version recorded yet" in body
     assert "edited outside Jarvis" not in body
+
+
+def test_a_budget_typed_at_creation_reaches_the_order(page, server, project):
+    form = "form[action='/wo/create']"
+    page.goto(server)
+    page.select_option(f"{form} select[name='project']", "proj_a")
+    page.fill(f"{form} input[name='title']", "capped from the browser")
+    page.fill(f"{form} input[name='budget']", "$12.50")
+    page.click(f"{form} button")
+
+    store = ProjectStore(project)
+    try:
+        wo_id = store.list_work_orders()[0]["id"]
+    finally:
+        store.close()
+    assert ops.work_order_budget(wo_id)["budget_usd"] == 12.5
+
+
+def test_a_typo_in_the_budget_box_never_costs_the_description(page, server, project):
+    """The whole reason the box carries a `pattern` (Neo, q418): the server-side refusal
+    is a redirect, and a redirect takes the typed description with it. Only a browser
+    can show that the submit never happens — `parse_amount` is still the authority."""
+    form = "form[action='/wo/create']"
+    page.goto(server)
+    page.select_option(f"{form} select[name='project']", "proj_a")
+    page.fill(f"{form} input[name='title']", "capped from the browser")
+    page.fill(f"{form} textarea[name='description']", "context I do not want to retype")
+    page.fill(f"{form} input[name='budget']", "twelve fifty")
+    page.click(f"{form} button")
+
+    assert page.url.rstrip("/") == server.rstrip("/"), "the browser let the typo through"
+    assert page.input_value(f"{form} textarea[name='description']") == (
+        "context I do not want to retype")
+    store = ProjectStore(project)
+    try:
+        assert store.list_work_orders() == []
+    finally:
+        store.close()

@@ -401,6 +401,81 @@ def test_the_daemon_reports_a_standing_violation_once(project, catalog_file):
     assert len(notes) == 1
 
 
+def _invariant_notes(store: ProjectStore) -> list[dict]:
+    return [n for n in store.unrouted_notifications() if n["source"] == "invariants"]
+
+
+def _switchable(on: dict) -> tuple:
+    """An invariant whose violation the test turns on and off, carrying NO work order —
+    the INV-HEALTH-SWEEP-MUTE shape, which has no timeline to remember anything on."""
+    def check(store):
+        if on["broken"]:
+            yield invariants.Violation(invariant="INV-FAKE", detail="still broken")
+    return (check,)
+
+
+def _daemon(catalog_file):
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    catalog = load_catalog(catalog_file)
+    return Daemon(catalog), catalog.projects[0]
+
+
+def test_a_standing_violation_is_not_re_announced_after_a_restart(
+        project, catalog_file, monkeypatch):
+    """The reported bug: every release restarted jarvis.service and the whole standing
+    unrepaired set went to Telegram again."""
+    on = {"broken": True}
+    monkeypatch.setattr(invariants, "INVARIANTS", _switchable(on))
+    store = ProjectStore(project)
+
+    first, spec = _daemon(catalog_file)
+    first.check_invariants(spec, store)
+    second, spec = _daemon(catalog_file)          # `shipit` restarted the daemon
+    second.check_invariants(spec, store)
+
+    assert len(_invariant_notes(store)) == 1
+    assert [(r["invariant"], r["wo_id"], r["seen"]) for r in store.violation_reports()] \
+        == [("INV-FAKE", "", 2)]
+
+
+def test_a_violation_that_clears_and_returns_is_announced_again(
+        project, catalog_file, monkeypatch):
+    on = {"broken": True}
+    monkeypatch.setattr(invariants, "INVARIANTS", _switchable(on))
+    store = ProjectStore(project)
+    daemon, spec = _daemon(catalog_file)
+
+    daemon.check_invariants(spec, store, sweep_landings=True)
+    on["broken"] = False
+    daemon.check_invariants(spec, store, sweep_landings=True)
+    assert store.violation_reports() == []
+    on["broken"] = True
+    daemon.check_invariants(spec, store, sweep_landings=True)
+
+    assert len(_invariant_notes(store)) == 2
+
+
+def test_a_fast_tick_never_forgets_a_violation_it_did_not_look_for(
+        project, catalog_file, monkeypatch):
+    """Absence on a tick that ran only the fast checks means "nobody looked", not
+    "fixed" — `LANDING_SWEEP_EVERY_TICKS` is 720, so closing on it would re-announce
+    INV-WORK-LANDED hourly: the bug with a slower clock."""
+    on = {"broken": True}
+    monkeypatch.setattr(invariants, "INVARIANTS", _switchable(on))
+    store = ProjectStore(project)
+    daemon, spec = _daemon(catalog_file)
+
+    daemon.check_invariants(spec, store, sweep_landings=True)
+    on["broken"] = False
+    daemon.check_invariants(spec, store)          # the other 719 ticks
+    on["broken"] = True
+    daemon.check_invariants(spec, store)
+
+    assert len(_invariant_notes(store)) == 1
+
+
 def test_doctor_reports_without_touching_state(project, catalog_file, capsys):
     store = ProjectStore(project)
     wo = _settled_with_assumptions(store)
