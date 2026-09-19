@@ -21,6 +21,7 @@ user as an attention item.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from . import claude_cli, structured
@@ -363,13 +364,19 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 deliver: Any = None, max_questions: int = 50,
-                answer: Any = None) -> list[dict[str, Any]]:
+                answer: Any = None, unreachable: Any = None) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back.
 
     `deliver(question, verdict)` is called per question with the outcome — the
     daemon uses it to route answers to workers and escalations to the user. The
     drain is sequential BY DESIGN: ordering + tight spacing keep Neo's shared
     prompt prefix warm in the Anthropic cache.
+
+    `unreachable(question, detail)` is the OTHER outcome, and it is a SEPARATE HOOK
+    rather than a flag on a verdict because there is no verdict: nothing was decided, so
+    there is nothing for `deliver`'s per-kind branches to apply. Fired only once the
+    retries are genuinely spent — spec
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
 
     `answer(store, question, model, learnings_limit) -> verdict` is HOW a question gets
     answered, defaulting to `answer_question` — one headless call, one agent. It is the
@@ -391,14 +398,27 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             break
         try:
             verdict = answer(store, q, model, learnings_limit)
+        except claude_cli.UsageLimitError as e:
+            # BEFORE the generic outage below, and the ordering is the fix: a spent
+            # window is not a transport fault and must not spend a retry (issue #235).
+            from .worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+            reopens = e.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+            store.hold_claim(q["id"], e.limit.message, reopens)
+            log.info("neo question %s held until the usage window reopens", q["id"])
+            results.append({"question": q, "verdict": None, "outcome": "held"})
+            continue
         except claude_cli.ClaudeCliError as e:
-            log.error("neo failed answering question %s: %s", q["id"], e)
-            store.mark(q["id"], "failed", reason=str(e))
-            verdict = {"escalate": True, "answer": "", "reason": f"neo call failed: {e}",
-                       "failed": True}
-            if deliver:
-                deliver(q, verdict)
-            results.append({"question": q, "verdict": verdict})
+            # A CALL THAT NEVER HAPPENED IS NOT A VERDICT. No `mark("failed")`, no
+            # synthesised `{escalate: True}` and no `deliver` — question 388 reached the
+            # user as an escalation Neo had never made, because all three were here. The
+            # claim goes back so the retry path that already exists owns the row.
+            outcome = store.release_claim(q["id"], str(e))
+            log.error("neo could not be reached for question %s (%s): %s",
+                      q["id"], outcome, e)
+            if outcome == "unreachable" and unreachable:
+                unreachable(q, str(e))
+            results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         if verdict["escalate"]:
             store.mark(q["id"], "escalated", reason=verdict["reason"])
@@ -416,7 +436,8 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             log.info("neo answered question %s (%s)", q["id"], q.get("kind") or "question")
         if deliver:
             deliver(q, verdict)
-        results.append({"question": q, "verdict": verdict})
+        results.append({"question": q, "verdict": verdict,
+                        "outcome": "escalated" if verdict["escalate"] else "answered"})
     return results
 
 

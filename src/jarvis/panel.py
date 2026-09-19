@@ -347,6 +347,24 @@ def _unresolvable(data: dict[str, Any]) -> bool:
     return str(data.get("contradiction") or "").strip().lower() == "unresolvable"
 
 
+def unreachable_veto_seats(opinions: Sequence[Opinion],
+                           roster: Sequence[str]) -> list[str]:
+    """Seats that could have forced an escalation and were never reached, in roster order.
+
+    `abstained` ONLY, and the exclusion is the point. A seat with no definition in this
+    build is recorded `failed` by `_round` and is not in here: it was never reached and it
+    never will be, so treating it as a transport fault would re-queue every question to
+    exhaustion and put an unanswerable one in front of the user on a cadence. A seat that
+    replied with something unusable is not in here either — it was reached, and silence is
+    what this asks about, not sense.
+    """
+    by_seat = {op.seat: op for op in opinions}
+    return [seat for seat in roster
+            if seat in FORCES_ESCALATE
+            and (op := by_seat.get(seat)) is not None
+            and op.status == "abstained"]
+
+
 def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
     """The veto table. Returns the outcome the seats FORCED, or None for "let the chair
     synthesise".
@@ -466,6 +484,19 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     rest = [s for s in roster if s != "premise"]
     if rest:
         opinions = [*opinions, *_round(store, q, cfg, rest, record)]
+
+    silent = unreachable_veto_seats(opinions, roster)
+    if silent:
+        # A VETO SEAT NOBODY HEARD FROM SHRINKS THE QUORUM SILENTLY. Its silence produces
+        # no signal in `arbitrate`, so the chair would go on to synthesise a verdict the
+        # full panel might have blocked — an approval nobody with the blast radius in
+        # front of them ever saw. There is no verdict without these seats, so this is a
+        # transport failure: `drain_queue` re-queues the question and tries again.
+        # Ruled by the user via Neo, question 436; spec
+        # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §3.
+        raise claude_cli.ClaudeCliError(
+            f"the panel could not reach {', '.join(silent)} — "
+            f"no verdict can be taken without every seat that may veto one")
 
     forced = arbitrate([{"seat": op.seat, "status": op.status, "reply": op.raw}
                         for op in opinions])

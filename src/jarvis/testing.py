@@ -2004,3 +2004,134 @@ def catalog_file(tmp_path, project):
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(data))
     return path
+
+
+# -- the transport fault harness ---------------------------------------------------
+#
+# Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §8. One named
+# fault per shape the transport is known to fail in, so every rescue path in the OS is
+# driven through the same list rather than each test inventing its own exception.
+
+#: The exact production shape behind Neo question 388: rc=1, zero tokens in and out,
+#: `duration_api_ms` 0, `total_cost_usd` 0 — a launch that never reached the API.
+RC1_EMPTY = "rc1_empty"
+TIMEOUT = "timeout"
+EMPTY_STDOUT = "empty_stdout"
+MALFORMED_JSON = "malformed_json"
+USAGE_LIMIT = "usage_limit"
+MID_STREAM_DISCONNECT = "mid_stream_disconnect"
+
+#: Faults where the model was NEVER REACHED. Every one of these must leave the unit of
+#: work pending and retryable, and must decide nothing.
+TRANSPORT_FAULTS = (RC1_EMPTY, TIMEOUT, EMPTY_STDOUT, MID_STREAM_DISCONNECT)
+
+#: ...and the two kinds that are NOT transport faults, kept beside them because a rescue
+#: that cannot tell them apart is the defect this harness exists to catch.
+#:
+#: `MALFORMED_JSON` is a model that REPLIED, unusably: the OS's unparseable-output rules
+#: own it, not the retry ladder. `USAGE_LIMIT` is a refusal that states when it lifts, so
+#: it is waited out and spends no attempt (GitHub issue #235).
+REPLY_FAULTS = (MALFORMED_JSON,)
+REFUSAL_FAULTS = (USAGE_LIMIT,)
+
+ALL_FAULTS = TRANSPORT_FAULTS + REPLY_FAULTS + REFUSAL_FAULTS
+
+
+def raise_fault(fault: str, reset_at: float | None = None) -> None:
+    """Raise what `claude_cli` raises for `fault`; return for a fault that is a reply.
+
+    `MALFORMED_JSON` returns rather than raising: the call SUCCEEDED and the reply is
+    what is wrong with it, so a transport that raised there would model the wrong
+    failure. `fault_text` is what such a call returns instead.
+    """
+    from . import claude_cli
+
+    if fault == RC1_EMPTY:
+        raise claude_cli.ClaudeCliError(
+            "`claude -p` exited 1 with no output (0 tokens in, 0 out)")
+    if fault == TIMEOUT:
+        raise claude_cli.ClaudeCliError("`claude -p ...` timed out after 300s")
+    if fault == EMPTY_STDOUT:
+        raise claude_cli.ClaudeCliError("`claude -p` produced no output at all")
+    if fault == MID_STREAM_DISCONNECT:
+        raise claude_cli.ClaudeCliError(
+            "connection reset by peer after 1421 bytes of stream")
+    if fault == USAGE_LIMIT:
+        raise claude_cli.UsageLimitError(claude_cli.UsageLimit(
+            message="Claude AI usage limit reached", reset_at=reset_at))
+    if fault == MALFORMED_JSON:
+        return
+    raise AssertionError(f"no such transport fault: {fault!r}")
+
+
+def fault_text(fault: str) -> str:
+    """What a call returns for a fault that produced output rather than an exception."""
+    assert fault in REPLY_FAULTS, fault
+    return '{"escalate": false, "answer": "trunc'
+
+
+def faulty_transport(fault: str, succeed_after: int | None = None,
+                     reply: str = "", reset_at: float | None = None) -> Any:
+    """A `claude_cli.run_headless_result` stand-in that fails with `fault`.
+
+    `succeed_after` is what proves a retry is a retry: after that many calls the
+    transport recovers and returns `reply`, so a test can assert the eventual answer is
+    the REAL one rather than a fallback that happened to look plausible.
+    """
+    from . import claude_cli
+
+    def call(*_args: Any, **_kwargs: Any) -> Any:
+        call.calls += 1                                  # type: ignore[attr-defined]
+        if succeed_after is not None and call.calls > succeed_after:  # type: ignore[attr-defined]
+            return claude_cli.HeadlessResult(text=reply, model="test-model")
+        raise_fault(fault, reset_at)
+        return claude_cli.HeadlessResult(text=fault_text(fault), model="test-model")
+
+    call.calls = 0                                       # type: ignore[attr-defined]
+    return call
+
+
+class FaultyAnswerer:
+    """A `neo.drain_queue(answer=...)` stand-in — the seam the drain's rescue is reached
+    through. `succeed_after` recovers as `faulty_transport` does."""
+
+    def __init__(self, fault: str, succeed_after: int | None = None,
+                 verdict: dict[str, Any] | None = None,
+                 reset_at: float | None = None) -> None:
+        self.fault = fault
+        self.succeed_after = succeed_after
+        self.verdict = verdict or {
+            "escalate": False, "answer": "the real answer", "reason": "because",
+            "verdict": "approved", "approve": True, "dispatch": None}
+        self.reset_at = reset_at
+        self.calls = 0
+
+    def __call__(self, _store: Any, _q: dict[str, Any], *_a: Any,
+                 **_k: Any) -> dict[str, Any]:
+        self.calls += 1
+        if self.succeed_after is not None and self.calls > self.succeed_after:
+            return dict(self.verdict)
+        raise_fault(self.fault, self.reset_at)
+        raise AssertionError(f"{self.fault} did not raise")
+
+
+class Recorder:
+    """A `deliver`/`unreachable` hook that records its calls. Empty IS the assertion.
+
+    ALWAYS TRUTHY, and that is not a detail: every call site guards with `if deliver:`,
+    so a recorder that went falsy when empty would silently disable the very hook the
+    test is asserting about — and the assertion would pass for the wrong reason.
+    Ask `len(recorder)` or `recorder.calls`, never `if recorder`.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    def __call__(self, *args: Any) -> None:
+        self.calls.append(args)
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+    def __bool__(self) -> bool:
+        return True

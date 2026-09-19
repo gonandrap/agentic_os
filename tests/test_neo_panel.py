@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 
+from jarvis import claude_cli
 from jarvis import neo as neo_mod
 from jarvis import ops, panel
 from jarvis.bootstrap import ASSETS
@@ -760,20 +761,45 @@ def test_each_seat_runs_on_its_own_model_and_the_rest_fall_back_to_the_fleet_def
 def test_a_failed_seat_abstains_and_the_panel_proceeds_without_it(store, fake_claude):
     """A Neo outage must never become a fleet stall. Unlike the premise seat — which
     ROUTES, so its silence leaves nothing to route on and falls back to the single agent —
-    a seat in the middle of the round is simply absent, and absence is not consent."""
-    fake_claude.fail_seat("blast")
+    a seat in the middle of the round is simply absent, and absence is not consent.
+
+    `taste`, and it has to be `taste`: it is the one seat in the roster that can force
+    nothing, so losing it costs the decision no authority. A seat that could have VETOED
+    is a different case and is no longer allowed to be absent — see the test below and
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §3.
+    """
+    fake_claude.fail_seat("taste")
     q = claim(store, "which delimiter?")
 
     result = panel.decide(store, q, full())
 
     rows = {r["seat"]: r["status"] for r in store.opinions(q["id"])}
-    assert rows == {"premise": "ok", "record": "ok", "blast": "abstained",
-                    "taste": "ok", "chair": "ok"}
+    assert rows == {"premise": "ok", "record": "ok", "blast": "ok",
+                    "taste": "abstained", "chair": "ok"}
     assert any(seat_of(c) == "chair" for c in headless(fake_claude)), (
         "the chair still ran; an abstaining seat is not a forced outcome"
     )
     assert result["escalate"] is False
     assert result["panel"]["route"] == "panel"
+
+
+def test_an_unreachable_veto_seat_takes_no_verdict_at_all(store, fake_claude):
+    """The user's ruling via Neo, question 436: a silent veto seat is a shrunken quorum.
+
+    `blast` owns the blast radius. Unreached, it cannot exercise its veto, so the chair
+    would synthesise a verdict the full panel might have blocked. There is no verdict
+    without it: `decide` raises, and `drain_queue` re-queues the question rather than
+    letting anything downstream act on a decision four seats short.
+    """
+    fake_claude.fail_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    with pytest.raises(claude_cli.ClaudeCliError, match="could not reach blast"):
+        panel.decide(store, q, full())
+
+    assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}, (
+        "the chair was asked to synthesise without the seat that may veto"
+    )
 
 
 # -- arbitration, end to end through `decide` ----------------------------------------------

@@ -60,6 +60,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
+    MAX_MESSAGE_DELIVERY_ATTEMPTS,
     OPEN_STATUSES,
     PRE_APPROVED_KEY,
     RETRY_SWEEP_STATUSES,
@@ -1249,7 +1250,9 @@ class Daemon:
         somebody is already waiting on before it goes to new work.
         """
         pending: dict[str, list[dict[str, Any]]] = {}
-        for msg in store.queued_messages():  # chronological, so the joins stay in order
+        # `deliverable_`, not `queued_`: a message whose last delivery attempt failed is
+        # held by its backoff and is not offered again until it is due.
+        for msg in store.deliverable_messages():  # chronological, so joins stay in order
             try:
                 wo = store.get_work_order(msg["wo_id"])
             except KeyError:
@@ -2177,10 +2180,21 @@ class Daemon:
             budget_mod.escalate(store, wo, e.exhausted)
             return
         except claude_cli.ClaudeCliError as e:
-            log.error("[%s] delivery of message(s) %s failed: %s", project.name, ids, e)
-            for msg_id in ids:
-                store.mark_message(msg_id, "failed")
-            store.flag_attention(wo["id"], f"message delivery failed: {e}")
+            # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
+            # and only surfaced once the retries are genuinely gone — spec
+            # docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §6.
+            outcomes = {store.record_delivery_failure(msg_id, str(e)) for msg_id in ids}
+            log.error("[%s] delivery of message(s) %s failed (%s): %s", project.name,
+                      ids, "/".join(sorted(outcomes)), e)
+            store.add_event(wo["id"], "delivery_failed",
+                            {"msg_ids": ids, "error": str(e)[:500],
+                             "outcome": "failed" if "failed" in outcomes else "queued"})
+            if "failed" in outcomes:
+                store.flag_attention(
+                    wo["id"],
+                    f"a message could not be delivered to this work order after "
+                    f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
+                    f"received it: {e}")
             return
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
@@ -2309,10 +2323,40 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
+        def unreachable(q: dict, detail: str) -> None:
+            """Neo's retries are spent. SAY SO — do not dress it as an escalation.
+
+            No per-kind branch, and that is the difference from `deliver`: there is no
+            verdict to apply, so the gate stays shut, the plan stays unreviewed and the
+            worker is told nothing. The only thing that happens is the user finding out
+            that nobody judged their question.
+            """
+            head = q["question"].strip().splitlines()[0][:200]
+            central.add_inbox(
+                project=q["project"], level="warning",
+                title=f"Neo could not be reached for a question from {q['wo_id']}",
+                body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
+                     f"every time it was tried. This is not an escalation: Neo made no "
+                     f"decision.\nLast error: {detail[:200]}\n"
+                     f"Read it in full: jarvis neo show {q['id']}\n"
+                     f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                wo_id=q["wo_id"],
+            )
+            ppath = paths.get(q["project"])
+            if ppath and ppath.is_dir():
+                pstore = ProjectStore(ppath)
+                try:
+                    pstore.flag_attention(
+                        q["wo_id"],
+                        invariants.neo_question_blocker({**q, "status": "failed"}))
+                finally:
+                    pstore.close()
+
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
+                unreachable=unreachable,
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))

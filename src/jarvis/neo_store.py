@@ -113,6 +113,28 @@ STALE_ANSWERING_SECONDS = 900
 # only status the existing surfaces already render as attention.
 MAX_ANSWER_ATTEMPTS = 3
 
+#: `answer_reason` on a question nobody could put to a model. THE WORD THE SURFACES READ:
+#: `failed` is one status covering two facts, and this prefix is what tells "Neo was never
+#: reached" from "Neo was reached and could not settle it" wherever only the reason is to
+#: hand. Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
+UNREACHABLE_PREFIX = "neo could not be reached: "
+
+#: How long a question held back by a transport failure waits before it may be claimed
+#: again, indexed by how many attempts it has already spent.
+#:
+#: WITHOUT A BACKOFF THE RETRIES ARE NOT RETRIES. `Daemon.neo_tick` drains on every tick,
+#: so an un-delayed re-queue spends the whole ceiling inside three tick intervals and the
+#: question reaches the user seconds after the outage began — GitHub issue #235's mistake,
+#: which the validation panel already learned once (`Daemon._validation_held`). An outage
+#: measured in hours needs a ladder measured in minutes.
+RETRY_BACKOFF_SECONDS = (60.0, 300.0, 900.0)
+
+
+def retry_delay(attempts: int) -> float:
+    """Seconds to hold a question that has already spent `attempts` attempts."""
+    return RETRY_BACKOFF_SECONDS[min(max(attempts, 0), len(RETRY_BACKOFF_SECONDS) - 1)]
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -172,6 +194,10 @@ ADDED_COLUMNS = {
         # exists for, so they must not be exempt from it.
         "attempts": "INTEGER NOT NULL DEFAULT 0",
         "claimed_at": "REAL",
+        # Transport backoff (`release_claim`). NULL — every row that predates this, and
+        # every row that has never failed — reads as "claimable now", which is what
+        # `claim_next`'s COALESCE says.
+        "retry_after": "REAL",
         # The dashboard's shortened rendering of an over-long question, as JSON — see
         # `jarvis.digest`. NULL means "never attempted", which is what every row that
         # predates this feature is, and what the daemon looks for. It is a DISPLAY
@@ -249,12 +275,14 @@ class NeoStore:
     def claim_next(self) -> dict[str, Any] | None:
         """Atomically claim the OLDEST queued question (FIFO — answering in order
         keeps Neo's shared prompt prefix warm in the Anthropic cache)."""
+        now = db.now()
         cur = self.conn.execute(
             """UPDATE questions SET status='answering', claimed_at=?
                WHERE id = (SELECT id FROM questions WHERE status='queued'
+                             AND COALESCE(retry_after, 0) <= ?
                            ORDER BY ts LIMIT 1)
                RETURNING *""",
-            (db.now(),),
+            (now, now),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -287,8 +315,9 @@ class NeoStore:
             for r in self.conn.execute(
                 """UPDATE questions
                       SET status='failed',
-                          answer_reason='neo never answered: stranded in answering after '
-                                        || attempts || ' reclaim attempt(s)'
+                          answer_reason='neo could not be reached: stranded in '
+                                        || 'answering after ' || attempts
+                                        || ' reclaim attempt(s) — nobody has judged this'
                     WHERE status='answering' AND attempts >= ?
                       AND COALESCE(claimed_at, ts) < ?
                 RETURNING id""",
@@ -299,14 +328,70 @@ class NeoStore:
             int(r["id"])
             for r in self.conn.execute(
                 """UPDATE questions
-                      SET status='queued', attempts=attempts+1, claimed_at=NULL
+                      SET status='queued', attempts=attempts+1, claimed_at=NULL,
+                          retry_after=?
                     WHERE status='answering' AND attempts < ?
                       AND COALESCE(claimed_at, ts) < ?
                 RETURNING id""",
-                (max_attempts, cutoff),
+                (db.now() + RETRY_BACKOFF_SECONDS[0], max_attempts, cutoff),
             ).fetchall()
         ]
         return {"requeued": requeued, "failed": failed}
+
+    def clear_retry_hold(self, question_id: int) -> None:
+        """Make a held question claimable NOW — the user asking again is not a retry."""
+        self.conn.execute("UPDATE questions SET retry_after=NULL WHERE id=?",
+                          (question_id,))
+
+    def hold_claim(self, question_id: int, detail: str, reopens_at: float) -> str:
+        """Park a claimed question until a stated moment, SPENDING NO ATTEMPT.
+
+        The usage limit is the one failure that says when it ends, so there is nothing to
+        guess and nothing to ration — `Daemon._validation_held`'s reasoning, and issue
+        #235's: a three-strike ladder sized for a blip retired a round in fifteen seconds
+        against an outage the inbox had measured at 11.2 hours. Always `"queued"`: a
+        window that will reopen is never a reason to ask the user anything.
+        """
+        self.conn.execute(
+            "UPDATE questions SET status='queued', claimed_at=NULL, retry_after=?, "
+            "answer_reason=? WHERE id=?",
+            (reopens_at, f"{UNREACHABLE_PREFIX}{detail}", question_id))
+        return "queued"
+
+    def release_claim(self, question_id: int, detail: str,
+                      max_attempts: int = MAX_ANSWER_ATTEMPTS) -> str:
+        """Hand a claimed question back after a call that produced NO ANSWER AT ALL.
+
+        `reclaim_stale`'s decision, taken at the moment of the failure instead of fifteen
+        minutes later: a transport fault is knowable the instant it happens, and waiting
+        for the stale sweep to notice would park the worker that asked for a quarter of an
+        hour per attempt. The two must agree, so the statuses, the ceiling and the
+        give-up-before-requeue ordering are all the same here.
+
+        Returns `"queued"` (retryable, `attempts` incremented) or `"unreachable"` (the
+        retries are genuinely spent and the row is `failed`, for the user).
+
+        THIS IS THE WHOLE OF THE FIX FOR QUESTION 388. What it replaces wrote `failed` at
+        `attempts=0` and synthesised an escalation from the crash — spec
+        docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
+        """
+        q = self.get(question_id)
+        if q is None:
+            return "unreachable"
+        attempts = int(q["attempts"] or 0)
+        reason = f"{UNREACHABLE_PREFIX}{detail}"
+        if attempts >= max_attempts:
+            self.conn.execute(
+                "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=? "
+                "WHERE id=?",
+                (f"{reason} (after {attempts} retries — nobody has judged this)",
+                 question_id))
+            return "unreachable"
+        self.conn.execute(
+            "UPDATE questions SET status='queued', attempts=attempts+1, claimed_at=NULL, "
+            "retry_after=?, answer_reason=? WHERE id=?",
+            (db.now() + retry_delay(attempts), reason, question_id))
+        return "queued"
 
     def record_answer(self, question_id: int, answer: str, answered_by: str = "neo",
                       reason: str = "") -> None:
