@@ -484,10 +484,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_failed":
         # A FIFTH kind, and the one most easily misread: nothing judged the work here.
         # A reader who takes this for a rejection goes looking for something to fix that
-        # nobody ever asked for, so the two causes get two different sentences.
+        # nobody ever asked for, so each cause gets a sentence of its own.
         if p.get("cause") == "no_validator":
             return ("Validation skipped — no validator was configured",
                     p.get("reason") or "")
+        if p.get("cause") == "ci_pending":  # project_store.VALIDATION_CI_CAUSE
+            # A FOURTH cause, and the most ordinary thing on this list: the pull request
+            # was submitted and GitHub has not finished running the checks the panel
+            # judges the declared evidence against. Nothing is wrong and nobody is
+            # needed. The line names the checks rather than the moment — unlike the
+            # usage window below, CI does not say when it will be done, and "waiting for
+            # unit (3.11)" is what a reader can go and look at.
+            waiting = ", ".join(str(c) for c in (p.get("pending") or ()))
+            return ("Validation waiting for CI",
+                    f"still running: {waiting}" if waiting else "")
         if p.get("cause") == "usage_limit":  # project_store.VALIDATION_HELD_CAUSE
             # A THIRD cause, and the one a reader must not take for either of the others:
             # nothing is wrong, nobody is needed, and the round goes again by itself. The

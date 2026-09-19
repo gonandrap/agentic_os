@@ -73,6 +73,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
     ProjectStore,
     resume_spends_slot,
@@ -229,6 +230,23 @@ code or new evidence will end the review."""
 #: park a work order in `validating` with nobody watching, which is the exact silent
 #: stall this feature exists to remove.
 VALIDATION_OUTAGE_LIMIT = 3
+
+#: How long to wait before asking GitHub again whether the checks have finished. One
+#: minute, not one tick: the tick is 5 seconds and the answer changes on CI's clock, so
+#: re-asking every tick would spend a `gh pr view` per 5 seconds per parked order to
+#: learn nothing. Each re-ask is one read; the seats — the expensive part — are not
+#: reached while the hold stands.
+CI_HOLD_RECHECK_SECONDS = 60.0
+
+#: How long the OS waits for CI in total before judging anyway, measured from the moment
+#: the round opened. A ceiling and NOT a timeout in the failure sense: when it lapses the
+#: round is judged on what GitHub has actually reported, and the tester seat already
+#: knows how to read "nothing reported" — `validator-seats/tester.md` tells it to say so
+#: rather than infer a pass. That is the fail-SAFE direction. Waiting for ever is not: a
+#: workflow that never reports would park the work order in `validating` with nobody
+#: watching, which is the silent stall `VALIDATION_OUTAGE_LIMIT` exists to prevent one
+#: authority along. Forty-five minutes is CI's ~20-minute suite with room for a queue.
+CI_HOLD_DEADLINE_SECONDS = 45.0 * 60.0
 
 #: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
 #: nothing judged this work, so there is nothing for its author to fix, and the reason
@@ -1417,6 +1435,28 @@ class Daemon:
             # for a worktree packet, which never auto-merges — spec 2026-09-14 §5.2.
             store.set_validation_head(round_id, evidence_mod.judged_head(packet))
 
+            # WAIT FOR CI RATHER THAN FOR THE WORKER TO PROVE THE SUITE ITSELF. Workers
+            # are told to run the TARGETED tests and cite CI for the whole suite (the
+            # user's ruling, 2026-09-18; kn-356c724b), because the full suite takes ~21
+            # minutes and a worker turn is one API conversation with a 5-minute prompt
+            # cache — so a local suite run guarantees the entire conversation is re-sent
+            # at the cache-WRITE rate on the next call. Somebody still has to wait for
+            # the real suite, and the OS is the cheap place: nothing is billed while a
+            # round is held, and the seats are not reached.
+            #
+            # BEFORE the validator and AFTER the head, deliberately. The head is a fact
+            # about the packet whatever happens next, and recording it is what lets a
+            # held round say which commit it was holding on. The seats are the expensive
+            # part and there is nothing for them to read yet: `tester.md` judges the
+            # declared evidence against the check runs, so judging now would judge every
+            # submission against an empty check list.
+            pending = evidence_mod.ci_pending(packet)
+            if pending and time.time() < float(round_row["ts"]) + CI_HOLD_DEADLINE_SECONDS:
+                self._validation_ci_held(store, wo, round_id, n, pending)
+                log.info("[%s] %s: round %d held for CI (%s)",
+                         project.name, wo_id, n, ", ".join(pending))
+                return
+
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
             if validator is None:
@@ -1722,6 +1762,39 @@ class Daemon:
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_HELD_CAUSE,
                          "reopens_at": reopens, "error": limit.message[:500]})
+
+    @staticmethod
+    def _validation_ci_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                            pending: tuple[str, ...]) -> None:
+        """GitHub has not finished running the checks. WAIT — this costs no outage attempt.
+
+        `_validation_held`'s twin in every mechanical respect, and read that one first:
+        the round is closed `failed` because `failed` is `RUNNABLE` and
+        `counted_validation_rounds` ignores it, so the submitter spends no round number
+        waiting for CI and the next tick owns the same round again. `reopens_at` is what
+        `validation_tick` reads back through `validation_hold_until`.
+
+        THE CAUSE IS ITS OWN (`VALIDATION_CI_CAUSE`) even though the behaviour is
+        identical, because the two holds are different facts and the timeline is read by
+        people: "the account's window is spent" and "CI is still running" must not render
+        as the same sentence. `VALIDATION_HOLDING_CAUSES` is where the shared behaviour
+        lives, so adding this cause did not fork the rule.
+
+        NO ATTENTION FLAG and no inbox row. A round waiting for the checks it was always
+        going to be judged against is the system working, exactly as a round in flight
+        is — `submit_for_validation` clears attention for the same reason. The wait is
+        bounded by `CI_HOLD_DEADLINE_SECONDS` at the call site, so silence here can never
+        become a stall nobody sees.
+        """
+        reopens = time.time() + CI_HOLD_RECHECK_SECONDS
+        names = ", ".join(pending[:6]) + (" …" if len(pending) > 6 else "")
+        store.close_validation_round(
+            round_id, "failed",
+            f"waiting for GitHub to finish the checks on this pull request before "
+            f"judging it: {names}")
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": n, "cause": VALIDATION_CI_CAUSE,
+                         "reopens_at": reopens, "pending": list(pending)})
 
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
