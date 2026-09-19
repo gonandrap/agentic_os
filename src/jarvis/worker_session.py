@@ -51,7 +51,7 @@ from typing import Any
 
 from . import budget, claude_cli, systemd_units, usage
 from .catalog import ProjectSpec
-from .project_store import COMPACT_TURN, ProjectStore
+from .project_store import COMPACT_TURN, COST_FROM_TRANSCRIPT, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
@@ -657,7 +657,11 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
         if auth:
             payload |= {"reason": PAUSE_AUTH}
         store.add_event(wo_id, "turn_paused" if auth else "turn_failed", payload)
-        return store.finish_turn(turn["id"], "failed", error=error)
+        # The envelope is what `cost_usd` normally comes from and there is none, so the
+        # transcript answers instead. Without this the turn is billed $0.00 for ever.
+        cost = lost_turn_cost(store, wo_id, turn)
+        return store.finish_turn(turn["id"], "failed", error=error, cost_usd=cost,
+                                 cost_source=COST_FROM_TRANSCRIPT)
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
     usage_json = json.dumps(result.usage) if result.usage else None
@@ -761,6 +765,35 @@ def _last_assistant_message(store: ProjectStore, wo_id: str,
 #: What the OS used to say about EVERY turn that died this way, and all it could say.
 #: Kept as the last resort only.
 NO_RESULT = "the turn's process ended without writing a result"
+
+
+def lost_turn_cost(store: ProjectStore, wo_id: str,
+                   turn: dict[str, Any]) -> float | None:
+    """What a turn spent, when the CLI never got to say — read off the transcript.
+
+    THE MONEY IS REAL AND THE ENVELOPE IS NOT THE ONLY RECORD OF IT. `finish_turn` SETs
+    `cost_usd`, so a settle that omits it writes NULL and `budget.spent` bills the turn
+    nothing for ever; a turn killed by a reboot, an OOM, a machine bounce or a cancel is
+    exactly the turn that ran long enough to be expensive (issue #471).
+
+    A FLOOR — list prices, lead agent only (`usage.cost_between` says why) — and
+    `project_store.COST_FROM_TRANSCRIPT` is what the caller stamps the row with. None
+    when there is no session, no transcript or nothing inside the window, which is the
+    honest answer for a turn that died before its first API call and leaves the column
+    NULL rather than asserting a zero.
+    """
+    try:
+        session_id = store.get_work_order(wo_id).get("session_id")
+    except KeyError:
+        return None  # cancelled on its way to being deleted
+    if not session_id:
+        return None
+    try:
+        cost = usage.cost_between(session_id, turn["started_at"],
+                                  turn.get("ended_at") or time.time())
+    except OSError:
+        return None
+    return cost or None
 
 
 def _transcript_error(store: ProjectStore, wo_id: str,
@@ -1210,8 +1243,12 @@ def cancel(store: ProjectStore, wo_id: str) -> dict[str, Any]:
     unit = turn.get("unit")
     stopped_unit = systemd_units.stop_unit(unit) if unit else False
     killed = claude_cli.kill_process_group(turn["pid"]) or stopped_unit
+    # A cancelled turn wrote no envelope and spent what it spent; same fallback as the
+    # reap path, for the same reason.
     store.finish_turn(turn["id"], "failed",
-                      error="cancelled" if killed else "cancelled (process already gone)")
+                      error="cancelled" if killed else "cancelled (process already gone)",
+                      cost_usd=lost_turn_cost(store, wo_id, turn),
+                      cost_source=COST_FROM_TRANSCRIPT)
     store.add_event(wo_id, "turn_cancelled", {"seq": turn["seq"], "pid": turn["pid"],
                                               "unit": unit, "killed": killed})
     return {"stopped": killed, "pid": turn["pid"], "unit": unit, "seq": turn["seq"]}

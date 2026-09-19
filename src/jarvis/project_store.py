@@ -290,6 +290,13 @@ TURN_KINDS = ("dispatch", "message", "compact")
 #: the worker's, so it is never recorded as an agent reply and never shown as one.
 COMPACT_TURN = "compact"
 
+#: Where a turn's `cost_usd` came from — see the `wo_turns.cost_source` comment. The
+#: two are not the same currency: one is the CLI's own figure, the other a list-price
+#: floor read off the transcript, and a surface that adds them owes the reader the
+#: distinction (kn-e6bb1166's ruling).
+COST_FROM_ENVELOPE = "envelope"
+COST_FROM_TRANSCRIPT = "transcript"
+
 
 def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
     """Would starting a turn on this work order NOW take a `max_concurrent` slot it is
@@ -770,6 +777,13 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     result TEXT,                            -- the turn's final assistant message
     error TEXT,
     cost_usd REAL,
+    -- WHICH READING WROTE `cost_usd`. 'envelope' is the CLI's own `total_cost_usd`;
+    -- 'transcript' is `usage.cost_between`, the floor derived from the session
+    -- transcript for a turn whose envelope never arrived (issue #471). NULL alongside
+    -- a cost is a row written before this column existed, and reads as 'envelope' —
+    -- the only source there was. NULL with no cost is a turn that spent nothing on
+    -- record.
+    cost_source TEXT,
     num_turns INTEGER,
     -- The turn's exact accounting, compacted from the result JSON the `claude` CLI
     -- wrote to `outfile` (see claude_cli.derive_turn_usage): cost, tokens by class
@@ -980,6 +994,9 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. NULL on every row written before turns moved into
         # their own units, which reads correctly as "the direct transport".
         "unit": "TEXT",
+        # See the CREATE TABLE comment. NULL on every row written before the transcript
+        # fallback existed, which reads correctly as "the CLI's own figure".
+        "cost_source": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
@@ -2884,21 +2901,44 @@ class ProjectStore:
                     num_turns: int | None = None,
                     usage_json: str | None = None,
                     terminal_reason: str | None = None,
-                    api_error_status: int | None = None) -> dict[str, Any]:
+                    api_error_status: int | None = None,
+                    cost_source: str | None = None) -> dict[str, Any]:
+        """Settle one turn. EVERY CALLER OWES A `cost_usd`, including the failures.
+
+        This SETs the column rather than coalescing into it, so a caller that omits the
+        cost writes NULL over whatever was there and `budget.spent` — which is
+        `SUM(cost_usd)` — bills the turn nothing for ever (issue #471). A turn that ran
+        long enough to be killed spent real money; the caller with nothing from the CLI
+        falls back to the transcript (`worker_session.lost_turn_cost`) rather than
+        leaving the argument off.
+        """
         assert state in ("done", "failed"), state
+        assert cost_source in (None, COST_FROM_ENVELOPE, COST_FROM_TRANSCRIPT), \
+            cost_source
         self.conn.execute(
             """UPDATE wo_turns SET state=?, ended_at=?, result=?, error=?, cost_usd=?,
-                                   num_turns=?, usage_json=?, terminal_reason=?,
-                                   api_error_status=? WHERE id=?""",
-            (state, db.now(), result, error, cost_usd, num_turns, usage_json,
-             terminal_reason or None, api_error_status, turn_id),
+                                   cost_source=?, num_turns=?, usage_json=?,
+                                   terminal_reason=?, api_error_status=? WHERE id=?""",
+            (state, db.now(), result, error, cost_usd,
+             (cost_source or COST_FROM_ENVELOPE) if cost_usd is not None else None,
+             num_turns, usage_json, terminal_reason or None, api_error_status, turn_id),
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
 
     def set_turn_usage(self, turn_id: int, usage_json: str) -> None:
-        """Backfill a settled turn's recorded usage (parsed late from its outfile)."""
-        self.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
-                          (usage_json, turn_id))
+        """Backfill a settled turn's recorded usage (parsed late from its outfile).
+
+        THE COST RIDES WITH IT. The envelope this re-reads carries `total_cost_usd`, and
+        repairing `usage_json` alone left rows that knew what they cost and were still
+        summed as $0.00 by the one query the enforcement runs (issue #471). Coalesced
+        rather than set: a row whose cost is already known must not be nulled by an
+        envelope that lost the field.
+        """
+        cost = (db.from_json(usage_json, None) or {}).get("total_cost_usd")
+        self.conn.execute(
+            "UPDATE wo_turns SET usage_json=?, cost_usd=COALESCE(?, cost_usd), "
+            "cost_source=CASE WHEN ? IS NULL THEN cost_source ELSE ? END WHERE id=?",
+            (usage_json, cost, cost, COST_FROM_ENVELOPE, turn_id))
 
     def latest_turn(self, wo_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(

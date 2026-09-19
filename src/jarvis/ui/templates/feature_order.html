@@ -37,7 +37,12 @@
 <div class="panel"><div class="row">
   <div class="grow mono">
     {% if cap.budget_usd %}
-      Budget: ${{ '%.2f'|format(cap.spent_usd) }} of ${{ '%.2f'|format(cap.budget_usd) }}
+      {# `~` when a child is mid-turn: that spend is a list-price estimate off the live
+         transcript, the same reading the work-order page shows (issue #471). #}
+      Budget:
+      {%- if cap.in_flight_usd %} ~${{ '%.2f'|format(cap.live_spent_usd) }}
+      {%- else %} ${{ '%.2f'|format(cap.spent_usd) }}
+      {%- endif %} of ${{ '%.2f'|format(cap.budget_usd) }}
       across the planner and every child
       · ${{ '%.2f'|format(cap.unreserved_usd) }} unreserved
       {%- if cap.reserved_usd %} · ${{ '%.2f'|format(cap.reserved_usd) }} promised to
