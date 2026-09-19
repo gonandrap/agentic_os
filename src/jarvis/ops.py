@@ -2517,6 +2517,111 @@ def force_validation(wo_id: str, *, reason: str,
         store.close()
 
 
+#: The `forced_reason` an OS-forced round carries. It names BOTH commits, because the
+#: sentence has to answer "why is there another round on this?" on its own, wherever it
+#: is read — `jarvis validation show` renders it beside the verdict it caused.
+REJUDGE_FORCED_REASON = ("the OS re-judged this itself: round {n} passed on {judged}, "
+                         "and the head of the pull request is now {head} — nothing "
+                         "merges a commit no round has read")
+
+#: `validation_forced.by` for a round no person asked for. Absent means the person, which
+#: is every row written before this existed and every `jarvis validation force` since.
+REJUDGE_BY_OS = "os"
+
+
+def rejudged_heads(store: ProjectStore, wo_id: str, *, declined: bool = False
+                   ) -> set[str]:
+    """The head commits the OS has already re-judged — or, with `declined`, the ones it
+    has already refused to.
+
+    THE DEDUPE, keyed on the COMMIT rather than on "has this ever happened" —
+    `Daemon._note_automerge_held`'s key shape and kn-089de524's rule. A parked pull
+    request is polled every couple of minutes, so a key that saturates would either spend
+    a round per tick or stop re-judging a branch that genuinely moved again.
+
+    TWO SETS AND NOT ONE, because they answer different questions and only one of them is
+    permanent. A commit the OS has judged is judged for ever; a commit it DECLINED to
+    judge was declined against a round budget, and the user may raise that budget — so
+    the decline suppresses the repeated event and never the remedy.
+    """
+    seen = set()
+    if declined:
+        for event in store.events_of_kind(wo_id, invariants.REJUDGE_DECLINED_EVENT):
+            seen.add(str(db.from_json(event["payload"], {}).get("head_sha") or ""))
+    else:
+        for event in store.events_of_kind(wo_id, "validation_forced"):
+            payload = db.from_json(event["payload"], {})
+            if str(payload.get("by") or "") == REJUDGE_BY_OS:
+                seen.add(str(payload.get("head_sha") or ""))
+    seen.discard("")
+    return seen
+
+
+def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, Any], *,
+                       project: str, cfg: Any,
+                       decision: Any) -> dict[str, Any] | None:
+    """The OS re-opening a round on a pull request whose head moved out from under its
+    verdict. `force_validation`'s act, with a machine for an operator.
+
+    Spec docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md; the guards
+    are its section 3 and the caller owns the two that need a `PullRequest`. Returns what
+    happened — a round, or a decline — or None when a guard said not now, which is the
+    overwhelmingly common answer and writes nothing.
+
+    **IT GOES THROUGH `submit_for_validation` AND `force_validation_refusal`, NOT PAST
+    THEM.** A second definition of "may a round be opened here" is a rule that holds by
+    luck (`force_validation_refusal`'s own note), and the whole point of the round this
+    opens is that it is indistinguishable from the one a person forces except in who
+    asked for it.
+
+    **THE LAST ROUND IS THE USER'S.** `max_rounds` is where a rejection stops going back
+    to a worker and starts going to the user, and on a parked order there is no worker
+    left — so a machine that spent the final round would hand the user an escalation
+    instead of a decision they could have made with a round in hand. Declining is
+    recorded rather than silent: `invariants.SHA_MOVED_BLOCKER` is derived from it. And
+    it is not final: raising `max_rounds` makes the next tick re-judge the same commit,
+    so the user's remedy for the one stall this cannot heal is a config change rather
+    than a command they have to remember to run.
+    """
+    from . import worker_session
+
+    wo_id = str(wo["id"])
+    head = str(getattr(decision, "head_sha", "") or "")
+    # No head to bind a verdict to — `gh` could not read one this tick. Nothing is
+    # recorded: the dedupe key would be empty and would then swallow the real head.
+    if not head or head in rejudged_heads(store, wo_id):
+        return None
+    if worker_session.busy(store, wo_id) or store.queued_messages(wo_id):
+        return None
+    if force_validation_refusal(store, wo, project=project, cfg=cfg) is not None:
+        return None
+    judged = str(getattr(decision, "judged_sha", "") or "")
+    round_n = int(getattr(decision, "round_n", 0) or 0)
+    nxt = store.counted_validation_rounds(wo_id=wo_id) + 1
+    if nxt >= int(cfg.max_rounds):
+        if head in rejudged_heads(store, wo_id, declined=True):
+            return None                 # said once per commit, not once per tick
+        store.add_event(wo_id, invariants.REJUDGE_DECLINED_EVENT,
+                        {"head_sha": head, "judged_sha": judged, "round": round_n,
+                         "next_round": nxt, "max_rounds": int(cfg.max_rounds)})
+        return {"wo_id": wo_id, "declined": True, "head_sha": head,
+                "judged_sha": judged, "next_round": nxt,
+                "max_rounds": int(cfg.max_rounds)}
+    was = str(wo["status"] or "")
+    reason = REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                          head=head[:10])
+    round_row = submit_for_validation(store, project_path, wo,
+                                      declared=declared_evidence(store, wo_id),
+                                      cfg=cfg, forced_reason=reason)
+    store.add_event(wo_id, "validation_forced",
+                    {"round": round_row["round"], "round_id": round_row["id"],
+                     "reason": reason, "was": was, "by": REJUDGE_BY_OS,
+                     "head_sha": head, "judged_sha": judged})
+    return {"wo_id": wo_id, "declined": False, "round": round_row["round"],
+            "round_id": round_row["id"], "head_sha": head, "judged_sha": judged,
+            "reason": reason, "was": was}
+
+
 def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: str,
                            held: dict[str, Any] | None) -> dict[str, Any] | None:
     """What the work-order page's "re-judge this pull request" control shows, or None.

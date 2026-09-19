@@ -4198,12 +4198,17 @@ class Daemon:
         # slip a new round between the two and produce the pair (passed, no head), whose
         # hold is deduped for ever on a reason that was never true.
         round_row = store.latest_validation_round(wo_id=wo_id)
+        pending = bool(store.pending_assumptions(wo_id))
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
-            pending_assumptions=bool(store.pending_assumptions(wo_id)))
+            pending_assumptions=pending)
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
+            if (not record_only and decision.code == automerge.HELD_SHA_MOVED
+                    and automerge.only_the_head_moved(round_row, wo, pr, cfg,
+                                                      pending_assumptions=pending)):
+                self._rejudge_moved_head(project, store, wo, decision)
             return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
@@ -4552,6 +4557,37 @@ class Daemon:
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
             wo_id=wo["id"])
+
+    def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
+                            wo: dict, decision: Any) -> None:
+        """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
+
+        The policy is `ops.rejudge_moved_head` and lives there, testable without a
+        daemon; this is the logging and the guarantee that a failure here leaves the pull
+        request exactly where it was. Spec
+        docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md.
+
+        The caller has already established the two facts that need a `PullRequest`: this
+        hold is `sha_moved`, and it is the ONLY thing left holding the merge.
+        """
+        from . import ops
+
+        try:
+            out = ops.rejudge_moved_head(store, project.path, wo, project=project.name,
+                                         cfg=project.validation, decision=decision)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not re-judge %s", project.name, wo["id"])
+            return
+        if out is None:
+            return
+        if out["declined"]:
+            log.info("[%s] %s: the head moved to %s and round %s would be the last — "
+                     "leaving it for the user", project.name, wo["id"],
+                     out["head_sha"][:10], out["next_round"])
+        else:
+            log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
+                     project.name, wo["id"], out["judged_sha"][:10],
+                     out["head_sha"][:10], out["round"])
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:

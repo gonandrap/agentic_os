@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import budget, db, worker_session
+# A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
+from .automerge import HELD_SHA_MOVED
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -240,6 +242,26 @@ PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could
 PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
                       (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER))
 
+#: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the
+#: round it would open is the one that reaches `validation.max_rounds`, and that last
+#: round belongs to the user (spec
+#: docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md section 4).
+REJUDGE_DECLINED_EVENT = "validation_rejudge_declined"
+
+#: What a work order says when its pull request is green and mergeable, its verdict names
+#: an older commit, and the OS has run out of rounds to bind a new one with. THE ONLY
+#: `sha_moved` STALL THAT REACHES THE USER: every other one the OS now re-judges itself,
+#: silently, which is why a held auto-merge is still deliberately not an attention item
+#: (`Daemon._note_automerge_held`).
+#:
+#: Re-derived below from the timeline rather than raised where the decline is written —
+#: kn-089de524: a flag written on a reconciler's path re-raises itself every tick and
+#: overwrites `jarvis wo ack`.
+SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds are left "
+                     "to bind a new one — merge it yourself, re-judge it "
+                     "(`jarvis validation force`), or give it another round "
+                     "(`validation.max_rounds`) and the OS re-judges it itself")
+
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
 #: left to try, and only the user can say whether the work is good enough or the
@@ -410,6 +432,41 @@ DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 # -- the derivation everything else is checked against ------------------------------
 
 
+def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this order parked on a head the OS declined to re-judge, and still on it?
+
+    TWO FACTS, and the second is what keeps this from sticking: the OS recorded a decline
+    for some commit, and the newest automatic-merge hold is still `sha_moved` on THAT
+    commit. A branch that moves again clears the flag by itself — the next tick either
+    re-judges the new head (the budget is only spent for the round it counted) or
+    declines afresh and raises this again against the new commit.
+
+    Derived, never stored. `ops.rejudge_moved_head` writes the decline;
+    INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
+    `acknowledged_blockers` (kn-089de524).
+    """
+    declined = store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+    if not declined:
+        return False
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if not held:
+        return False
+    newest = db.from_json(held[-1]["payload"], {})
+    if str(newest.get("code") or "") != HELD_SHA_MOVED:
+        return False
+    head = str(newest.get("head_sha") or "")
+    if not head or not any(
+            str(db.from_json(e["payload"], {}).get("head_sha") or "") == head
+            for e in declined):
+        return False
+    # ...AND NOTHING HAS BOUND A VERDICT TO THAT COMMIT SINCE. A hold is only written
+    # when the merge is declined, so an armed one writes nothing and the newest hold
+    # goes on describing a stall that is over — the user forces the round the machine
+    # left them, it passes, and this would still be flagging them about it.
+    return store.validated_head(
+        store.latest_validation_round(wo_id=wo["id"])) != head
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone.
@@ -530,6 +587,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         for repair, blocker in PR_REPAIR_BLOCKERS:
             if store.pr_repair_attempts(wo["id"], repair) >= PR_REPAIR_MAX_ATTEMPTS:
                 blockers.append(blocker)
+    # A PULL REQUEST THE OS CANNOT RE-JUDGE. The head moved past the verdict and the
+    # round budget is spent, so the one remedy left is a person's — the spec's section 4,
+    # and the ONLY `sha_moved` case that reaches this list. Gated on the status so no
+    # other work order pays for the two reads.
+    if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
+        blockers.append(SHA_MOVED_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the

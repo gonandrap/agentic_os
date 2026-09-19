@@ -785,7 +785,10 @@ def test_a_push_after_the_approval_stops_the_merge_dead(started, project, fake_g
     poll(started, store)
 
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
-    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+    # ...and the order is now BEING JUDGED on the commit that was pushed, rather than
+    # merged on the strength of a verdict about the one before it. Issue #493: the
+    # approval and the pass are both about `JUDGED`, so the only way out is a round.
+    assert store.get_work_order(wo["id"])["status"] == "validating"
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert len(held) == 1
     from jarvis import db
@@ -1169,8 +1172,11 @@ def test_a_user_merging_by_hand_is_unaffected_and_still_completes_the_order(
     """Requirement 2, end to end. The mechanism gates the MACHINE; the person merges any
     pull request at any moment and the existing poll notices, exactly as it always did."""
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
-    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
-                   head_oid=PUSHED)
+    # The new head's build is still RUNNING, which is what keeps the OS from re-judging
+    # it here (issue #493, spec §3 guard 2) — a moved head whose pull request is green
+    # and clean is re-judged, and that has its own tests below. The claim under test is
+    # about the person's merge, and it must hold whatever the machine is doing.
+    fake_gh.set_pr(PR, "OPEN", checks=[], merge_state="CLEAN", head_oid=PUSHED)
     poll(started, store)                       # held: the head moved
     fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-14T10:00:00Z", head_oid=PUSHED)
 
