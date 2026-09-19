@@ -256,6 +256,71 @@ DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES = 50
 DEFAULT_CACHE_HEALTH_PREFIX_SHARE = 0.45
 
 
+# -- COMPACTION AT AN EXPIRED BOUNDARY ------------------------------------------------
+#
+# The third remedy for the re-write tax, and the only one that acts at the moment the
+# cost is about to be paid. `DEFAULT_AUTOCOMPACT_WINDOW` bounds how large a conversation
+# may GROW; the one-hour write (`usage.TTL_BREAK_EVEN`) buys a longer entry for every
+# token; this compacts a conversation whose entry has ALREADY expired, before the next
+# prompt re-sends it. Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md.
+#
+# WHY IT PAYS, measured live on 2026-09-18 with a paired probe over a 293,377-token
+# conversation (both arms forked from one base, both past the write TTL):
+#
+#   no compaction   294,007 tokens re-sent as a cache WRITE at 1.25x   $1.853
+#   /compact then   282,595 tokens re-sent as PLAIN INPUT at 1.0x      $1.621
+#   the same prompt 28,156-token context (15,380 written, 12,776 read) $0.128
+#
+# Two effects, and the second is much the larger. The re-send itself gets 20% cheaper
+# because the CLI does not cache-write a compaction call. And the conversation that
+# every later call in that turn re-reads collapses from 293k to 28k — the transcript's
+# own `compact_boundary` record puts it at 293,382 tokens in and 4,697 out, the rest of
+# the 28k being the static head every call carries anyway.
+
+#: Output tokens one compaction produces. MEASURED on the probe above (8,052 for a
+#: 293k conversation; 3,336 for a 26k one), and it is the dominant cost of compacting a
+#: SMALL conversation — output is 5x input at Opus list, so a summary that saves
+#: nothing still costs ~$0.20. The whole reason there is a floor at all.
+COMPACT_SUMMARY_OUTPUT = 8_052
+
+#: What a session's context weighs on the call AFTER a compaction, in tokens. Measured
+#: at 28,156 from a 293k conversation and 26,866 from a 26k one — near enough constant
+#: across an 11x range of inputs, because what survives is the static head plus a
+#: summary whose size is set by the summarisation prompt rather than by what it
+#: summarises (4,697 and 4,078 tokens respectively, per the transcript's own
+#: `compact_boundary` row). That near-constancy is what makes the break-even below a
+#: function of one variable.
+COMPACT_CONTEXT = 28_156
+
+#: …of which this much is a cache WRITE on that call; the remainder is the static head,
+#: served as a read. Split out because the two are priced 12.5x apart.
+COMPACT_FIRST_WRITE = 15_380
+
+#: THE FLOOR: the smallest context worth compacting, in tokens. Below it the re-write
+#: is cheaper than the compaction call, so the OS lets the boundary go cold and pays it.
+#:
+#: MEASURED, not chosen — `scripts/compaction_cohort.py` prices every TTL-expired
+#: boundary in the fleet's own transcripts under the model above and reports the net
+#: saving by context band. Over the 30 days to 2026-09-19, 414 such boundaries:
+#:
+#:     25k-50k     33% of boundaries net-positive, median -$0.14
+#:     50k-100k    60% net-positive, median +$0.06 to +$0.36, worst -$0.21
+#:     100k-150k   80% net-positive, median +$0.39
+#:     150k-200k   94%,  200k+  100% net-positive, median +$1.11
+#:
+#: 100,000 is the lowest band where four boundaries in five pay. It is set where the
+#: MAJORITY flips rather than where the MEAN does, because this fires unattended on
+#: every work order: everything under it is worth $13.15 of a $552 saving, and half of
+#: those boundaries would have lost money. Buying 2.4% of the benefit back would mean
+#: being wrong about half the small cases, unsupervised, for ever.
+DEFAULT_COMPACT_MIN_CONTEXT: int | None = 100_000
+
+#: Guard rail on the above, for the reason `DEFAULT_COLD_PREFIX_FLOOR_MAX` is one: a
+#: fleet may move the floor, and a typo that moved it to 600 would compact every
+#: boundary in sight at a loss.
+COMPACT_MIN_CONTEXT_MIN = 10_000
+
+
 _MISSING = object()
 
 
@@ -963,6 +1028,11 @@ class OsConfig:
     cache_health_min_orders: int = DEFAULT_CACHE_HEALTH_MIN_ORDERS
     cache_health_min_boundaries: int = DEFAULT_CACHE_HEALTH_MIN_BOUNDARIES
     cache_health_prefix_share: float = DEFAULT_CACHE_HEALTH_PREFIX_SHARE
+    #: The smallest context the OS will compact past an expired cache, or None to never
+    #: compact. Fleet-wide for `DEFAULT_CACHE_HEALTH_WINDOW_DAYS`' reason and one more:
+    #: the break-even is a property of the prompt cache's prices, which no project has
+    #: its own copy of. See DEFAULT_COMPACT_MIN_CONTEXT.
+    compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1026,6 +1096,34 @@ def _cold_prefix_floor_or_err(os_raw: dict[str, Any]) -> tuple[int, int]:
         raise _err(f"os.cold_prefix_floor {floor} out of range 0-{ceiling} "
                    f"(os.cold_prefix_floor_max)")
     return floor, ceiling
+
+
+def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
+    """`os.compact_min_context`, validated at boot. An explicit null means "never".
+
+    Absent and null differ here exactly as they do for the autocompact window, and for
+    the same reason: silence inherits the measured default, and switching a cost control
+    off has to be said out loud. Null is the ONLY off switch — there is deliberately no
+    `enabled` flag and no per-order opt-in, because an automatic remedy nobody has to
+    remember is the whole point (the pinned self-healing learning).
+
+    The floor under the floor is `COMPACT_MIN_CONTEXT_MIN`: below it the compaction
+    costs more than the re-write it replaces on every boundary the fleet has ever
+    recorded, so a value there is a typo rather than a policy.
+    """
+    value = os_raw.get("compact_min_context", _MISSING)
+    if value is _MISSING:
+        return DEFAULT_COMPACT_MIN_CONTEXT
+    if value is None or value is False:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err(f"os.compact_min_context must be a whole number of tokens or null, "
+                   f"got {value!r}")
+    if value < COMPACT_MIN_CONTEXT_MIN:
+        raise _err(f"os.compact_min_context {value} is below "
+                   f"{COMPACT_MIN_CONTEXT_MIN}, where compacting costs more than the "
+                   f"re-write it replaces (use null to switch compaction off)")
+    return value
 
 
 def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
@@ -1558,6 +1656,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_min_orders=health_orders,
         cache_health_min_boundaries=health_bounds,
         cache_health_prefix_share=health_prefix,
+        compact_min_context=_compact_min_context_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

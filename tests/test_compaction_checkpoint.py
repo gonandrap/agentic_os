@@ -67,6 +67,21 @@ def test_precompact_arms_the_flag_and_records_that_it_happened(wo, project):
         f"events were {kinds}")
 
 
+def test_a_compaction_the_os_asked_for_is_not_written_down_twice(wo, project):
+    """`manual` in a headless worker means Jarvis sent `/compact`, and the reaper
+    already records that one with what it achieved — see `note_compaction`. The FLAG
+    is still armed, which is the half the worker depends on."""
+    handle_hook(pre_compact(trigger="manual"), env(project, wo["id"]))
+
+    assert compaction_flag(project, wo["id"]).exists()
+    store = ProjectStore(project)
+    try:
+        kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    finally:
+        store.close()
+    assert "compacted" not in kinds
+
+
 def test_an_interactive_session_is_not_managed(project):
     """No JARVIS_WO_ID means a session the user started; Jarvis does not touch it."""
     assert handle_hook(pre_compact(), {"JARVIS_PROJECT_PATH": str(project)}) is None

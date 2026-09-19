@@ -51,7 +51,7 @@ from typing import Any
 
 from . import budget, claude_cli, systemd_units, usage
 from .catalog import ProjectSpec
-from .project_store import ProjectStore
+from .project_store import COMPACT_TURN, ProjectStore
 
 log = logging.getLogger("jarvisd")
 
@@ -350,6 +350,164 @@ def send(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], text: st
                    worktree=None, cwd=cwd, msg_id=msg_id)
 
 
+# -- compaction: the one boundary the OS pays for on purpose --------------------------
+#
+# A turn boundary past the prompt cache's write TTL re-sends the WHOLE conversation at
+# the 1.25x cache-write rate — 5.9M tokens across two work orders in one afternoon on
+# 2026-09-18, which is what this exists for. The conversation is going to be re-sent
+# either way; what the OS chooses is WHAT gets re-sent. Compacting first replaces it
+# with a summary, and does so at the plain-input rate, because the CLI does not
+# cache-write a compaction call (`claude_cli.COMPACT_PROMPT` lists what was measured).
+#
+# IT IS ONLY EVER CHEAPER AT A COLD BOUNDARY, and that asymmetry is the whole trigger.
+# At a WARM one the next prompt would have READ the conversation at 0.1x, so compacting
+# would pay 1.0x for tokens about to cost a tenth of that — 10x worse, on every turn.
+# Past the TTL that read was never on offer.
+#
+# Automatic and unconditional above the floor: no flag, no per-order opt-in, and the
+# timeline says what it did and why (the pinned self-healing learning).
+# Spec: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md.
+
+
+@dataclass(frozen=True)
+class Compaction:
+    """Why the OS is about to compact this conversation before its next prompt."""
+
+    #: Seconds since the previous turn ENDED, which is a LOWER bound on the age of the
+    #: cache entry: the entry was last touched by that turn's final API call, which is
+    #: strictly earlier than the moment its process exited. Bounding it from below is
+    #: what lets this be decided without reading the transcript — the error is always in
+    #: the direction of compacting LESS often than the bill would justify.
+    age: float
+    #: The conversation's size, from the last turn's own usage envelope.
+    context: int
+
+    @property
+    def why(self) -> str:
+        return (f"the prompt cache expired {int(self.age // 60)}m ago and the "
+                f"conversation is {self.context:,} tokens — re-sending it would cost "
+                f"more than summarising it")
+
+
+def turn_context(turn: dict[str, Any] | None) -> int:
+    """How large the conversation was at the end of a turn, or 0 if unrecorded.
+
+    `context_peak` off the stored usage envelope, so it survives the result file being
+    pruned. 0 for a turn reaped before the column existed, and 0 means "do not compact":
+    an unmeasured conversation is not evidence of a large one.
+    """
+    from . import db
+
+    envelope = db.from_json((turn or {}).get("usage_json"), None)
+    return int(envelope.get("context_peak") or 0) if isinstance(envelope, dict) else 0
+
+
+def compaction_due(store: ProjectStore, wo: dict[str, Any],
+                   min_context: int | None,
+                   now: float | None = None) -> Compaction | None:
+    """Should the OS compact before this work order's next prompt goes out?
+
+    THE EXCLUSIONS, and each is the answer to a way this could cost more than it saves:
+
+    * `min_context` is None — the fleet has switched compaction off
+      (`os.compact_min_context`), the only way to.
+    * No turn on record. There is no conversation yet, so there is nothing to summarise
+      and the opening prompt writes the cache rather than re-writing it.
+    * The last turn is ITSELF a compaction. Nothing has been added since, so a second
+      one would summarise a summary for no reason — and if that one failed, compacting
+      again is the loop rather than the fix.
+    * A turn is in flight. A compaction is a boundary act and must never land in the
+      middle of a turn, because what it discards is what that turn is holding in its
+      head. (`Daemon.deliver_messages` would not have got here — `delivery_hold` stops
+      it first — but the decision must not depend on the caller having checked.)
+    * The gap is inside the write TTL. The entry is alive and the next prompt will READ
+      it at a tenth of what compacting would cost.
+    * The conversation is under the floor. Below it the summary's own output tokens
+      cost more than the re-write they replace — measured, see
+      `catalog.DEFAULT_COMPACT_MIN_CONTEXT`.
+
+    NOT DECIDED HERE, and deliberately: a turn the OS is RELAUNCHING is never compacted
+    before (`Daemon.retry_paused_turns` never calls this). Two reasons, either enough.
+    A relaunch that continues an interrupted turn tells the worker "the conversation
+    above is intact and is where you left off" (`_nudge`), which a compaction would
+    make false. And the pause itself is re-derived from the LATEST turn every time it
+    is read (`turn_pause`), so inserting a compact turn behind a paused one would erase
+    the pause and strand the relaunch it was waiting for.
+    """
+    if min_context is None:
+        return None
+    turn = store.latest_turn(wo["id"])
+    if turn is None or turn["kind"] == COMPACT_TURN or turn["state"] == "running":
+        return None
+    ended = turn.get("ended_at")
+    if not ended:
+        return None
+    age = (time.time() if now is None else now) - ended
+    if age < usage.WRITE_TTL_SECONDS:
+        return None
+    context = turn_context(turn)
+    if context < min_context:
+        return None
+    return Compaction(age=age, context=context)
+
+
+def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+            due: Compaction) -> dict[str, Any]:
+    """Summarise the conversation, as a turn of its own, before the next prompt.
+
+    A turn rather than a blocking call inside the delivery pass: compacting a 300k
+    conversation takes ~30 seconds, the daemon's reconcile loop cannot stop for that,
+    and the existing poll/reap machinery already knows how to wait for a `claude -p`
+    that is out. The queued message stays QUEUED and goes out on the tick after this
+    settles, into a session whose cache is warm again.
+    """
+    _release_background_owner(store, wo)
+    cwd = worktree_path(project, wo) or project.path
+    store.add_event(wo["id"], "compacting", {
+        "reason": due.why, "context": due.context, "idle_seconds": round(due.age),
+    })
+    return _launch(store, project, wo, claude_cli.COMPACT_PROMPT, kind=COMPACT_TURN,
+                   resume=True, worktree=None, cwd=cwd)
+
+
+def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
+                       turn: dict[str, Any], result: claude_cli.TurnResult) -> None:
+    """Put the compaction's outcome on the timeline and its cost on the bill.
+
+    THE COST HAS TO BE WRITTEN DOWN HERE OR IT IS LOST. A compaction makes a full-sized
+    API call and writes no assistant message, so `usage.read_session` — the worker half
+    of every cost surface — cannot see it (`claude_cli.COMPACT_PROMPT`). Recorded in
+    `agent_usage` instead, which is where the OS's own spend on a work order already
+    goes: without this the saving would be reported gross, and a net figure that hides
+    the cost of the remedy is the one thing this feature must not produce.
+    """
+    from . import agent_usage
+
+    session_id = str(store.get_work_order(wo_id).get("session_id") or "")
+    agent_usage.record(agent_usage.COMPACTION, usage=result.usage, project=project_name,
+                       wo_id=wo_id, label=f"turn {turn['seq']}",
+                       model=wo_model(store, wo_id), session_id=session_id,
+                       ok=result.ok)
+    try:
+        done = usage.last_compaction(session_id, since=turn["started_at"])
+    except OSError:
+        done = None
+    store.add_event(wo_id, "compacted", {
+        "seq": turn["seq"],
+        # The CLI's own measurement of what it achieved, not an estimate of ours.
+        "before": (done or {}).get("pre"),
+        "after": (done or {}).get("post"),
+        "cost_usd": result.cost_usd,
+    })
+
+
+def wo_model(store: ProjectStore, wo_id: str) -> str:
+    try:
+        return str(store.get_work_order(wo_id).get("model") or "")
+    except KeyError:
+        return ""
+
+
 def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], prompt: str,
             kind: str, resume: bool, worktree: str | None, cwd: Path,
             msg_id: int | None = None) -> dict[str, Any]:
@@ -438,7 +596,7 @@ def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:
     store.update_work_order(wo["id"], job_id=None)
 
 
-def poll(store: ProjectStore) -> list[dict[str, Any]]:
+def poll(store: ProjectStore, project_name: str = "") -> list[dict[str, Any]]:
     """Reap every turn whose process has ended. Returns the turns that just settled.
 
     Turn-level only: this decides whether a *turn* finished and records what it said.
@@ -453,7 +611,7 @@ def poll(store: ProjectStore) -> list[dict[str, Any]]:
             continue  # spawned this instant; the pid write has not landed yet
         if _unit_still_running(turn):
             continue
-        settled.append(_reap(store, turn))
+        settled.append(_reap(store, turn, project_name))
     return settled
 
 
@@ -471,7 +629,8 @@ def _unit_still_running(turn: dict[str, Any]) -> bool:
     return bool(unit) and turn["pid"] is None and systemd_units.unit_active(unit)
 
 
-def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
+def _reap(store: ProjectStore, turn: dict[str, Any],
+          project_name: str = "") -> dict[str, Any]:
     wo_id = turn["wo_id"]
     result = claude_cli.read_turn_result(Path(turn["outfile"]),
                                          Path(turn["errfile"]) if turn["errfile"] else None)
@@ -534,12 +693,26 @@ def _reap(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any]:
         store.add_event(
             wo_id, "turn_paused" if auth or limit or transient else "turn_failed",
             payload)
+        if turn["kind"] == COMPACT_TURN:
+            # A compaction that died still spent what it spent, and the same argument
+            # applies: nothing downstream can see it unless it is written here.
+            _record_compaction(store, project_name, wo_id, turn, result)
         return store.finish_turn(turn["id"], "failed", error=result.error,
                                  result=result.result or None,
                                  cost_usd=result.cost_usd, num_turns=result.num_turns,
                                  usage_json=usage_json,
                                  terminal_reason=result.terminal_reason,
                                  api_error_status=result.api_error_status)
+
+    if turn["kind"] == COMPACT_TURN:
+        # NOT A REPLY, AND NOT THE WORKER'S. `/compact` returns an empty `result`, and
+        # the fallback below would hand back the summary the CLI wrote — recording it
+        # would put a message the worker never sent into the work order's record, and
+        # `record_agent_reply` is what the dashboard, the digest and `wo show` read.
+        _record_compaction(store, project_name, wo_id, turn, result)
+        return store.finish_turn(turn["id"], "done", result="",
+                                 cost_usd=result.cost_usd,
+                                 num_turns=result.num_turns, usage_json=usage_json)
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
     if reply:
@@ -932,7 +1105,12 @@ def retry(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     # Both halves are required. A turn can bill API time and still leave no session to
     # resume (the opening turn, dying before the transcript lands), and nudging a
     # conversation that does not exist would open one whose entire content is the nudge.
-    prompt = _nudge(pause) if started and _reached_model(turn) else turn["prompt"]
+    # A COMPACTION IS ALWAYS RE-SENT VERBATIM, whatever it reached. `/compact` is a
+    # command and not a conversation, so the nudge below — prose addressed to a worker
+    # mid-task — would land in the transcript as a user message asking nobody to
+    # continue nothing. Re-running it is safe: at worst it summarises a summary.
+    nudge = started and _reached_model(turn) and turn["kind"] != COMPACT_TURN
+    prompt = _nudge(pause) if nudge else turn["prompt"]
     return _launch(
         store, project, wo, prompt, kind=turn["kind"], resume=started,
         worktree=None if tree or turn["kind"] != "dispatch" else wo.get("worktree"),

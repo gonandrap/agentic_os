@@ -1027,11 +1027,24 @@ def compaction_flag(root: Path, wo_id: str) -> Path:
 
 def note_compaction(payload: dict[str, Any], root: Path,
                     store: ProjectStore, wo_id: str) -> None:
-    """PreCompact: record that it happened and arm the re-assertion."""
-    store.add_event(wo_id, "compacted", {
-        "trigger": payload.get("trigger"),
-        "custom_instructions": payload.get("custom_instructions") or None,
-    })
+    """PreCompact: record that it happened and arm the re-assertion.
+
+    THE FLAG IS ARMED WHICHEVER WAY THE COMPACTION CAME, and that is the half that
+    matters: a worker resumed after the OS compacted for it (`worker_session.compact`)
+    needs its identifiers re-asserted exactly as much as one Claude Code compacted
+    mid-turn — more so, since a `/compact` turn does no tool call of its own and the
+    brief therefore lands at the start of the NEXT turn.
+
+    The EVENT is only written for a compaction the OS did not ask for. A headless
+    worker cannot type `/compact`, so `manual` here means Jarvis sent it, and
+    `worker_session._record_compaction` already writes that one — with what it achieved
+    and what it cost, which this side cannot see.
+    """
+    if payload.get("trigger") != "manual":
+        store.add_event(wo_id, "compacted", {
+            "trigger": payload.get("trigger"),
+            "custom_instructions": payload.get("custom_instructions") or None,
+        })
     flag = compaction_flag(root, wo_id)
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.write_text(payload.get("trigger") or "auto")

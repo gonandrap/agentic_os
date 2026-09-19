@@ -226,8 +226,17 @@ class Usage:
     #: addend). `rewrite_ttl_excess` applies the ratio and IS a partition.
     rewrite_ttl_write: int = 0
     rewrite_prefix_write: int = 0
-    #: How many of `resume_boundaries` were the TTL expiring. The rest moved the prefix.
+    #: THE THIRD CAUSE, AND THE ONLY ONE THE OS CHOOSES TO PAY. A boundary the OS
+    #: compacted across (`worker_session.compact`) re-writes the summary, and it does so
+    #: seconds after the compaction call with the static head still served — which is
+    #: the exact shape of a PREFIX MISS. Counted separately or the remedy would read as
+    #: the defect it was bought to avoid, and `invariants.check_prefix_stable` would
+    #: report the prefix drifting on a fleet whose prefix had not moved.
+    rewrite_compact_write: int = 0
+    #: How many of `resume_boundaries` were the TTL expiring, and how many the OS
+    #: compacted across. The rest moved the prefix.
     boundaries_ttl: int = 0
+    boundaries_compact: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -268,7 +277,10 @@ class Usage:
             resume_boundaries=self.resume_boundaries + other.resume_boundaries,
             rewrite_ttl_write=self.rewrite_ttl_write + other.rewrite_ttl_write,
             rewrite_prefix_write=self.rewrite_prefix_write + other.rewrite_prefix_write,
+            rewrite_compact_write=(self.rewrite_compact_write
+                                   + other.rewrite_compact_write),
             boundaries_ttl=self.boundaries_ttl + other.boundaries_ttl,
+            boundaries_compact=self.boundaries_compact + other.boundaries_compact,
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -313,8 +325,14 @@ class Usage:
 
         None when no boundary was classified — an honest 'not measured', which the
         renderers must not print as 0% (that would read as a finding).
+
+        A compacted boundary is in the DENOMINATOR and not the numerator: it is a
+        re-write that happened, so leaving it out would shrink the tax rather than
+        attribute it — but no longer a TTL one, because the OS chose to pay it in
+        exchange for a smaller conversation.
         """
-        seen = self.rewrite_ttl_write + self.rewrite_prefix_write
+        seen = (self.rewrite_ttl_write + self.rewrite_prefix_write
+                + self.rewrite_compact_write)
         return self.rewrite_ttl_write / seen if seen else None
 
     @property
@@ -347,6 +365,8 @@ class Usage:
             "rewrite_ttl_share": self.rewrite_ttl_share,
             "rewrite_ttl_excess": self.rewrite_ttl_excess,
             "boundaries_ttl": self.boundaries_ttl,
+            "boundaries_compact": self.boundaries_compact,
+            "rewrite_compact_write": self.rewrite_compact_write,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
             "cost_by_model": {m: round(c, 2) for m, c in self.cost_by_model.items()},
@@ -711,10 +731,64 @@ def session_calls(session_id: str, root: Path | None = None,
     return calls
 
 
+def compactions_in(path: Path | str) -> list[dict[str, Any]]:
+    """Every compaction in one transcript, oldest first, with what it did.
+
+    Claude Code writes a `system` row with `subtype: "compact_boundary"` at the moment
+    it compacts, carrying `compactMetadata`: `trigger` (`manual` for the `/compact` the
+    OS sends, `auto` for the window in `catalog.DEFAULT_AUTOCOMPACT_WINDOW`),
+    `preTokens` and `postTokens`. The compaction's own API CALL writes no assistant
+    message, so this row is the only trace of it in the file — `_assistant_messages`
+    cannot see one, and neither can any of the arithmetic built on it.
+
+    `preTokens`/`postTokens` are the CLI's own measurement of what the compaction
+    achieved (293,382 -> 4,697 on the probe that set `catalog.COMPACT_CONTEXT`), which
+    is what lets `worker_session` put a provable number on the timeline rather than an
+    assertion that it helped.
+
+    Both triggers are returned. What a later boundary needs to know is that the
+    conversation was REPLACED, and that is equally true whichever of the two did it.
+    """
+    found = []
+    for row in rows(path, '"compact_boundary"'):
+        if row.get("type") != "system" or row.get("subtype") != "compact_boundary":
+            continue
+        when = parse_stamp(row.get("timestamp"))
+        meta = row.get("compactMetadata")
+        if not when or not isinstance(meta, dict):
+            continue
+        found.append({"ts": when, "trigger": str(meta.get("trigger") or ""),
+                      "pre": int(meta.get("preTokens") or 0),
+                      "post": int(meta.get("postTokens") or 0)})
+    return sorted(found, key=lambda c: c["ts"])
+
+
+def compaction_stamps(path: Path | str) -> list[float]:
+    """When each compaction happened in one transcript, oldest first."""
+    return [c["ts"] for c in compactions_in(path)]
+
+
+def last_compaction(session_id: str, *, since: float = 0.0,
+                    root: Path | None = None,
+                    index: dict[str, list[Path]] | None = None) -> dict[str, Any] | None:
+    """The most recent compaction in a session, or None if it has never been compacted.
+
+    `since` bounds it to one turn, for `said_in_session`'s reason: a session outlives
+    the turn asking about it, and the caller wants the compaction IT just paid for.
+    """
+    if index is None:
+        index = index_sessions(root)
+    found: list[dict[str, Any]] = []
+    for path in sorted(index.get(session_id) or []):
+        found.extend(c for c in compactions_in(path) if c["ts"] >= since)
+    return max(found, key=lambda c: c["ts"]) if found else None
+
+
 def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
     messages = _assistant_messages(path)
     if not messages:
         return Usage()
+    compactions = compaction_stamps(path)
     usage = Usage(messages=len(messages))
     previous_read: int | None = None
     previous_ts: float | None = None
@@ -749,7 +823,13 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
             gap = (ts - previous_ts) if (ts and previous_ts) else None
             expired = (gap is not None and gap >= WRITE_TTL_SECONDS
                        and read <= cold_prefix_floor)
-            if expired:
+            # Tested FIRST: a compacted boundary reads the static head seconds after
+            # the summary landed, which is indistinguishable from a prefix miss by the
+            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
+            if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
+                usage.rewrite_compact_write += write
+                usage.boundaries_compact += 1
+            elif expired:
                 usage.rewrite_ttl_write += write
                 usage.boundaries_ttl += 1
             else:

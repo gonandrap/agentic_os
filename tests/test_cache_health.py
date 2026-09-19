@@ -50,7 +50,8 @@ def store(started):
 
 
 def _seal(store, *, cache_write, ttl_write, prefix_write, boundaries=BOUNDARIES_EACH,
-          ttl_boundaries=2, age_days=1.0, version=3):
+          ttl_boundaries=2, compact_write=0, compact_boundaries=0, age_days=1.0,
+          version=4):
     """One settled order with a frozen bill, as `bill._worker_extras` writes it.
 
     `version=2` is a bill sealed before the raw split existed. It is NOT a zero: the
@@ -76,6 +77,9 @@ def _seal(store, *, cache_write, ttl_write, prefix_write, boundaries=BOUNDARIES_
     if version >= 3:
         rewrite |= {"ttl_write": ttl_write, "prefix_write": prefix_write,
                     "cache_write": cache_write}
+    if version >= 4:
+        rewrite |= {"compact_write": compact_write,
+                    "compact_boundaries": compact_boundaries}
     payload = {"payload_v": version, "total": {"cost": {"list_usd": 10.0}},
                "rewrite": rewrite}
     store.seal_bill(wo["id"], json.dumps(payload), at=db.now() - age_days * DAY)
