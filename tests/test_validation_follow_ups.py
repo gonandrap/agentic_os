@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -89,6 +90,17 @@ def filed(tracker) -> list[dict]:
         tracker.issues.items(), key=lambda kv: int(kv[0].rsplit("/", 1)[-1]))]
 
 
+#: The per-finding digest every published title carries, in both shapes (spec §9). Its
+#: exact wording is pinned once, by `test_the_private_title_carries_the_token`; the tests
+#: below are about WHICH findings were filed, so they read the title with it removed.
+TOKEN = re.compile(r"\s*\[vf-[0-9a-f]{8}\]$")
+
+
+def titles(tracker) -> list[str]:
+    """Every filed issue's title without its digest token, oldest first."""
+    return [TOKEN.sub("", r["title"]) for r in filed(tracker)]
+
+
 def sent(fleet, wo_id: str) -> str:  # noqa: F811
     """Everything the submitter has been told. `user_to_agent` only: the worker's own
     turns land in the same table in the other direction."""
@@ -137,7 +149,7 @@ def test_a_rejected_round_files_an_issue_and_still_sends_back_its_blockers(fleet
     fleet.tick()  # deliver the feedback
 
     rows = filed(tracker)
-    assert [r["title"] for r in rows] == ["Name the retry budget in the docstring"]
+    assert titles(tracker) == ["Name the retry budget in the docstring"]
     assert rows[0]["url"].startswith(SERIES)
     told = sent(fleet, wo["id"])
     assert "the new branch has no test" in told
@@ -166,7 +178,7 @@ def test_a_passed_round_files_its_follow_ups_too(fleet, tracker):
     rebuild the treadmill in miniature."""
     wo = judged(fleet, "passed", "Fold the two parsers into one")
 
-    assert [r["title"] for r in filed(tracker)] == ["Fold the two parsers into one"]
+    assert titles(tracker) == ["Fold the two parsers into one"]
     store = fleet.store()
     try:
         assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
@@ -273,7 +285,7 @@ def test_round_two_re_raising_round_ones_nit_files_it_once(fleet, tracker):
                verdict("rejected", "Name the retry budget", reason="no test"),
                verdict("passed", "Name the retry budget"))
 
-    assert [r["title"] for r in filed(tracker)] == ["Name the retry budget"]
+    assert titles(tracker) == ["Name the retry budget"]
 
 
 def test_the_title_is_matched_after_whitespace_is_collapsed(fleet, tracker):
@@ -283,7 +295,7 @@ def test_the_title_is_matched_after_whitespace_is_collapsed(fleet, tracker):
                verdict("rejected", "Name the retry budget", reason="no test"),
                verdict("passed", "  Name   the\n  retry budget  "))
 
-    assert [r["title"] for r in filed(tracker)] == ["Name the retry budget"]
+    assert titles(tracker) == ["Name the retry budget"]
 
 
 def test_an_issue_the_user_has_since_closed_is_still_not_re_filed(fleet, tracker):
@@ -325,8 +337,7 @@ def test_the_dedupe_reads_only_this_units_follow_ups(fleet, tracker):
                       body="I noticed this myself", labels=[])
     judged(fleet, "passed", "Name the retry budget")
 
-    titles = [r["title"] for r in filed(tracker)]
-    assert titles.count("Name the retry budget") == 2, (
+    assert titles(tracker).count("Name the retry budget") == 2, (
         "a human's issue suppressed the panel's, or vice versa")
 
 
@@ -342,7 +353,7 @@ def test_the_same_title_twice_in_one_round_is_one_issue(fleet, tracker):
     finish(fleet, wo["id"])
     fleet.drain()
 
-    assert [r["title"] for r in filed(tracker)] == ["Name the retry budget"]
+    assert titles(tracker) == ["Name the retry budget"]
 
 
 # -- 3. the cap ------------------------------------------------------------------------
@@ -358,7 +369,7 @@ def test_only_five_follow_ups_are_filed_per_round_and_the_rest_are_counted(fleet
     is a few near-duplicate issues a user closes, not a tracker nobody can read."""
     wo = judged(fleet, "passed", *SIX)
 
-    assert [r["title"] for r in filed(tracker)] == list(SIX[:5])
+    assert titles(tracker) == list(SIX[:5])
     assert payload(fleet, wo["id"])["dropped"] == 1
 
 
@@ -380,7 +391,7 @@ def test_the_cap_is_a_per_project_setting(fleet, tracker):
     fleet.reconfigure(max_follow_ups=9, project_validation={"max_follow_ups": 2})
     judged(fleet, "passed", *SIX)
 
-    assert [r["title"] for r in filed(tracker)] == ["one", "two"]
+    assert titles(tracker) == ["one", "two"]
 
 
 def test_a_dropped_finding_is_filed_by_a_later_round(fleet, tracker):
@@ -391,7 +402,7 @@ def test_a_dropped_finding_is_filed_by_a_later_round(fleet, tracker):
                verdict("rejected", "one", "two", "three", reason="no test"),
                verdict("passed", "one", "two", "three"), max_follow_ups=2)
 
-    assert [r["title"] for r in filed(tracker)] == ["one", "two", "three"]
+    assert titles(tracker) == ["one", "two", "three"]
 
 
 # -- 4. what cannot be filed, and is therefore counted ---------------------------------
@@ -845,3 +856,196 @@ def test_nothing_reaches_the_projects_backlog_any_more(fleet, tracker):
     finally:
         central.close()
     assert filed(tracker), "the fixture filed nothing, so the claim is vacuous"
+
+
+# -- 9. what may leave the machine -----------------------------------------------------
+#
+# Spec §9 of docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md, carrying
+# over §8 of docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md: NO MODEL PROSE
+# IS EVER PUBLISHED. The seat's words go out only where the OS has POSITIVELY established
+# the tracker is private; public and "could not tell" reach the same branch.
+
+#: The two shapes that make the leak test about something real rather than about a word:
+#: a credential quoted back by a seat, and an absolute path off the machine the panel ran
+#: on. Both are exactly the kind of remark a reviewer files rather than blocks on.
+CREDENTIAL = "sk-live-9f3a2b7c1d4e5f60"
+INTERNAL_PATH = "/srv/" + "jarvis-prod/checkouts/acme/secrets/fixtures/tokens.json"
+LEAKY_DETAIL = (f"the fixture at {INTERNAL_PATH} still carries what looks like a live "
+                f"token, {CREDENTIAL} — rotate it when convenient")
+
+#: Substrings, not only the whole strings (`kn-bfbb2a3a`): a body that published half the
+#: token, or the directory without the file, has published it.
+DISTINCTIVE = ("sk-live-9f3a2b7c", "9f3a2b7c1d4e5f60", "jarvis-prod",
+               "secrets/fixtures", "tokens.json", "rotate it when convenient")
+
+
+def leaky(seat: str = "security") -> dict:
+    """One finding whose detail and title both carry text that must not be published."""
+    return {"seat": seat, "round": 1,
+            "title": f"Rotate the credential in {INTERNAL_PATH}",
+            "detail": LEAKY_DETAIL}
+
+
+def _judge_leaky(fleet) -> dict:  # noqa: F811
+    fleet.daemon.validator = Validator(
+        {"outcome": "passed", "reason": "", "seats": _seats("pass"),
+         "follow_ups": [leaky()]})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+    return wo
+
+
+def _everything_gh_was_told(tracker) -> str:
+    """Every argument and every byte of stdin of every `gh` call the test made.
+
+    READ OFF THE RECORDED CALLS, never off a return value: what leaked is what reached
+    the process, and a body assembled safely and then handed to the wrong call is still
+    published.
+    """
+    return "\n".join(" ".join(c["argv"]) + "\n" + (c["stdin"] or "")
+                     for c in tracker.calls)
+
+
+def test_a_public_tracker_is_told_no_word_the_seat_wrote(fleet, tracker):
+    """THE LEAK TEST. A finding quoting a credential and an absolute internal path, filed
+    against a repository the privacy read reports PUBLIC: no part of either reaches `gh`.
+
+    Paired with the control below — a filer that withheld everything, or that broke and
+    filed nothing at all, passes this one on its own."""
+    tracker.set_private(False)
+    wo = _judge_leaky(fleet)
+
+    told = _everything_gh_was_told(tracker)
+    assert CREDENTIAL not in told and INTERNAL_PATH not in told
+    assert LEAKY_DETAIL not in told
+    for fragment in DISTINCTIVE:
+        assert fragment not in told, f"{fragment!r} was published"
+
+    # WITHHELD, NOT DROPPED: the issue exists, says why it is bare, and names the command
+    # that reads the finding on the record that still holds it in full.
+    row = filed(tracker)[0]
+    digest = ops.follow_up_digest(leaky()["title"])
+    assert row["title"] == f"Validation follow-up {digest}"
+    assert f"jarvis validation show {wo['id']}" in row["body"]
+    assert "held on the internal record" in row["body"]
+    assert "`security` seat" in row["body"] and "Round 1" in row["body"]
+    item = payload(fleet, wo["id"])["items"][0]
+    assert item["withheld"] is True
+    assert item["title"] == ops.follow_up_key(leaky()["title"]), (
+        "the internal record lost the finding it filed")
+
+
+def test_a_private_tracker_still_gets_the_finding_in_full(fleet, tracker):
+    """THE CONTROL, on the identical finding. `set_private(True)` is the fixture's own
+    default and is named here anyway: the claim is about what the privacy read ANSWERED,
+    not about what the fixture happened to be left at."""
+    tracker.set_private(True)
+    wo = _judge_leaky(fleet)
+
+    row = filed(tracker)[0]
+    assert LEAKY_DETAIL in row["body"], "the private branch withheld the finding"
+    assert row["title"].startswith(f"Rotate the credential in {INTERNAL_PATH}")
+    assert "`security` seat" in row["body"] and wo["id"] in row["body"]
+
+
+@pytest.mark.parametrize("break_it", ["fail_privacy_read", "garble_privacy_read"])
+def test_a_privacy_read_that_does_not_answer_withholds_the_finding(fleet, tracker,
+                                                                   break_it):
+    """FAIL CLOSED, pinned on both ways of not answering: a `gh` that RAISES and a `gh`
+    that exits 0 with something unparseable. Different code paths — `_run` raises for one
+    and `json.loads` for the other — and one `except` is what is being verified, so the
+    plain-public case above cannot stand in for either.
+
+    ONLY the privacy read is broken. `fail()` would take the dedupe read down too, the
+    round would file nothing at all, and every assertion here would pass for that reason
+    instead of for this one."""
+    getattr(tracker, break_it)()
+    wo = _judge_leaky(fleet)
+
+    told = _everything_gh_was_told(tracker)
+    for fragment in (CREDENTIAL, INTERNAL_PATH, *DISTINCTIVE):
+        assert fragment not in told, f"{fragment!r} was published on an unknown tracker"
+    assert filed(tracker)[0]["title"].startswith("Validation follow-up vf-")
+    assert payload(fleet, wo["id"])["items"][0]["withheld"] is True
+
+
+def test_the_private_title_carries_the_token_the_public_one_dedupes_on(fleet, tracker):
+    """The digest is derived from `follow_up_key(title)` and NOTHING ELSE, so the same
+    finding carries the same token in both shapes. That is what the dedupe survives a
+    privacy flip on, and it is pinned here rather than inside the flip test so a change
+    to the derivation fails in one obvious place."""
+    judged(fleet, "passed", "Name the retry budget")
+
+    digest = ops.follow_up_digest("  Name the   retry budget ")
+    assert digest == ops.follow_up_digest("Name the retry budget")
+    assert filed(tracker)[0]["title"] == f"Name the retry budget [{digest}]"
+    assert ops.follow_up_token(filed(tracker)[0]["title"]) == digest
+    assert ops.follow_up_token("Name the retry budget") == "", (
+        "a pre-§9 title must report no token, or the fallback never runs")
+
+
+def test_the_dedupe_survives_the_tracker_turning_public_between_rounds(fleet, tracker):
+    """THE TRAP THIS FEATURE WOULD OTHERWISE SET. Round 1 files A on a private tracker
+    under its own title; round 2 reads the repository as public, re-raises A and adds B.
+    A dedupe on the published title stops matching there and re-files A on every round
+    from then on, for ever.
+
+    Asserted by IDENTITY — which titles, carrying which tokens — because "two issues" is
+    equally what a filer that lost A and filed B twice would leave behind."""
+    fleet.reconfigure(max_rounds=9)
+    a, b = "Name the retry budget", "Fold the two parsers into one"
+    validator = Validator(verdict("rejected", a, reason="no test"),
+                          verdict("passed", a, b))
+    fleet.daemon.validator = validator
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+    assert titles(tracker) == [a], "round 1 did not file the private shape"
+
+    tracker.set_private(False)          # the repository is flipped open between rounds
+    fleet.tick()
+    fleet.change(wo["id"], "print('one')\nprint('two')\n")
+    finish(fleet, wo["id"], summary="fixed")
+    fleet.drain()
+    assert [c["round"] for c in validator.calls] == [1, 2], "round 2 never ran"
+
+    assert [r["title"] for r in filed(tracker)] == [
+        f"{a} [{ops.follow_up_digest(a)}]",             # round 1's, NOT filed again
+        f"Validation follow-up {ops.follow_up_digest(b)}",
+    ], "the flip re-filed a follow-up, or lost one"
+    assert wo["id"] in filed(tracker)[1]["body"]
+
+
+def test_a_follow_up_filed_before_this_shipped_is_not_filed_again(fleet, tracker):
+    """The other half of the same trap: every issue already on a tracker was filed under
+    a bare finding title and carries no token at all, so the dedupe falls back to the
+    plain key. Without that fallback this change re-files the fleet's entire standing
+    backlog of follow-ups on the next round each unit runs.
+
+    The pre-change issue is made by filing one and then rewriting its title to the shape
+    §9 replaced — so the unit id in its body is this unit's, which is what the dedupe's
+    search matches on."""
+    fleet.reconfigure(max_rounds=9)
+    a = "Name the retry budget"
+    validator = Validator(verdict("rejected", a, reason="no test"),
+                          verdict("passed", a))
+    fleet.daemon.validator = validator
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+    old = filed(tracker)[0]
+    tracker.add_issue(old["url"], title=a, body=old["body"], labels=old["labels"])
+
+    fleet.tick()
+    fleet.change(wo["id"], "print('one')\nprint('two')\n")
+    finish(fleet, wo["id"], summary="fixed")
+    fleet.drain()
+    assert [c["round"] for c in validator.calls] == [1, 2], "round 2 never ran"
+
+    assert [r["title"] for r in filed(tracker)] == [a], (
+        "a follow-up filed before the token existed was filed a second time")
+    assert wo["id"] in old["body"]

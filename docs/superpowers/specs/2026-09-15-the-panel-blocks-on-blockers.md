@@ -970,6 +970,76 @@ order; the production-corpus replay the eval has always deferred; and any change
 
 ---
 
+## 9. What a follow-up may publish (wo-069d758e)
+
+**The rule this section applies is not new here.** §8 of
+`docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md` states it for the OS's own
+tracker — NO MODEL PROSE IS EVER PUBLISHED — and spells out the reasoning: the text is written
+by a model that does not know it will be published, to a tracker that is public and that
+indexes and caches whether or not the issue is later deleted, with nobody reading it in
+between. §4 moved the destination to the project's own tracker (user ruling, 2026-09-16) and
+did not carry the rule with it, so `_follow_up_body` published the seat's raw `detail` and
+`file_validation_follow_ups` passed the seat's raw `title` as `--title`.
+
+The exposure is **enriched by this feature rather than incidental to it**: "the fixture at
+/… still carries what looks like a live token, sk-…" is exactly the remark §3 tells a seat to
+file instead of blocking on.
+
+### 9.1 The rule
+
+**Withhold by default; publish the finding text only where the OS has POSITIVELY established
+the tracker is private.** `issues.repo_is_private` reads `gh repo view <repo> --json
+isPrivate` once per round and **fails closed**: a refusal, a missing `gh`, a timeout, an
+unparseable answer and a repository this installation cannot read all return `False`. *Unknown*
+and *public* are the same branch, not three. It is not cached — a repository flipped
+private-to-public between rounds must be seen — and one round trip per round is the budget the
+dedupe read already spends.
+
+* **Private** — unchanged: the seat's `detail` in full, the provenance footer, the finding's
+  own title, and §4.2's deliberate naming of the seat.
+* **Public or unknown** — the issue carries no word a model wrote. The title is
+  `Validation follow-up vf-<digest>`; the body carries the unit id, the round, the seat, the
+  pull request link and the exact command that reads the finding on the internal record
+  (`jarvis validation show <unit-id>`), and says plainly that the text is withheld because the
+  tracker is public. That is §8's own shape for its closing and triage comments, reused rather
+  than reinvented. **Withhold, do not drop** (`kn-bfbb2a3a`): the seat, the round and the unit
+  are a classification, not the secret, and an issue that looks empty by accident is worse than
+  one that explains itself.
+
+Note the internal record is untouched: the filing event stores the finding's OWN title, which
+is what `jarvis validation show` and the dashboard key the issue link on.
+
+### 9.2 The dedupe, which the title shape would otherwise break
+
+`file_validation_follow_ups` deduped by comparing the finding's title against the titles
+already on the tracker. Make the published title depend on an answer that can change between
+rounds and that comparison stops matching — so **every already-filed follow-up is filed again,
+every round, for ever**. Two inputs produce it: a repository private in round 1 and public in
+round 2 (or one privacy read that simply failed), and every follow-up filed before this landed.
+
+So a **per-finding digest token appears in BOTH shapes** — `<title> [vf-a1b2c3d4]` and
+`Validation follow-up vf-a1b2c3d4` — derived from `follow_up_key(title)` and nothing else, and
+therefore identical across the flip. The dedupe compares tokens, falling back to the old
+title-key comparison for a row that carries none, which is exactly the pre-change issue.
+
+### 9.3 The two options refused
+
+* **Refuse to file at all to a non-private tracker.** It silently disables this feature on
+  `jarvis_os` itself, and it reverses the 2026-09-16 ruling that follow-ups belong on the
+  project's own tracker (`kn-2531869c`).
+* **Redact before the create.** A blocklist over model prose: it catches the credential shapes
+  someone thought of and not internal hostnames, customer names or quoted proprietary code.
+  §8's rule exists precisely because blocklists on model prose fail. A positive "this
+  destination is private" check is the only one of the three that is an allowlist.
+
+### 9.4 What this does not touch
+
+Nothing that decides a verdict: `validation.decide`, `arbitrate`, the seat markdown, the
+`tester`/`security` veto, `automerge.decide`, `validation.max_rounds`. This changes what text
+leaves the machine and nothing about what the panel judges.
+
+---
+
 ## Agent profile
 
 You are a **Jarvis OS core engineer** working on one piece of the validation panel's correction

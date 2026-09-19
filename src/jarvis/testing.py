@@ -1105,6 +1105,27 @@ elif argv[:2] == ["issue", "close"]:
     if "--comment" in argv:
         r.setdefault("comments", []).append(argv[argv.index("--comment") + 1])
     save(rows)
+elif argv[:2] == ["repo", "view"]:
+    # THE PRIVACY READ that decides whether a validation follow-up may carry the seat's
+    # own words (spec §9 of 2026-09-15-the-panel-blocks-on-blockers.md).
+    #
+    # ITS OWN FAILURE SWITCHES, not FAKE_GH_FAIL: that one fails every call, so the round
+    # never reaches the dedupe read and files nothing at all — and a test asserting the
+    # WITHHELD shape would pass on a machine that published nothing because it published
+    # nothing. The fail-closed case needs this read alone to break while the filing runs.
+    if os.environ.get("FAKE_GH_REPO_VIEW_FAIL"):
+        sys.stderr.write(os.environ["FAKE_GH_REPO_VIEW_FAIL"] + "\n")
+        sys.exit(1)
+    if os.environ.get("FAKE_GH_REPO_VIEW_GARBAGE"):
+        print(os.environ["FAKE_GH_REPO_VIEW_GARBAGE"])
+        sys.exit(0)
+    # DEFAULT PRIVATE, so a test about the FILING exercises the full-content shape rather
+    # than the withheld one by accident. The public default is the production truth and
+    # every test that cares names it.
+    whole = {"isPrivate": os.environ.get("FAKE_GH_PRIVATE", "1") == "1",
+             "nameWithOwner": argv[2] if len(argv) > 2 else ""}
+    fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
+    print(json.dumps({k: v for k, v in whole.items() if not fields or k in fields}))
 elif argv[:2] == ["label", "create"]:
     known = labels()
     if argv[2] in known:
@@ -1472,6 +1493,30 @@ def fake_gh(tmp_path, monkeypatch):
             move."""
             monkeypatch.setenv("FAKE_GH_ISSUE_URL", issue_url)
             return issue_url
+
+        def set_private(self, private: bool) -> None:
+            """What `gh repo view --json isPrivate` answers for every repository.
+
+            The fake defaults to PRIVATE so a test about the filing exercises the shape
+            that carries the finding's own words; `set_private(False)` is the production
+            truth for an open-source tracker, and the case the withholding exists for.
+            """
+            monkeypatch.setenv("FAKE_GH_PRIVATE", "1" if private else "0")
+
+        def fail_privacy_read(self, message: str = "gh: HTTP 502") -> None:
+            """Fail `gh repo view` and NOTHING else — `fail_merge`'s rationale exactly.
+
+            `fail()` would break the dedupe read too, so the round files nothing and an
+            assertion about the WITHHELD shape passes on a machine that published nothing
+            at all. The fail-closed branch is only visible when the filing still runs.
+            """
+            monkeypatch.setenv("FAKE_GH_REPO_VIEW_FAIL", message)
+
+        def garble_privacy_read(self, text: str = "not json at all") -> None:
+            """Answer the privacy read with something that will not parse — a `gh`
+            printing a warning, an API shape that moved. Exit 0, so it is a different
+            path from `fail_privacy_read` and needs its own test."""
+            monkeypatch.setenv("FAKE_GH_REPO_VIEW_GARBAGE", text)
 
         def set_labels(self, names: list[str]) -> None:
             """Which labels the repository already has. `--add-label` refuses everything
