@@ -2318,6 +2318,83 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         )
 
 
+def check_pull_request_recorded(store: ProjectStore) -> Iterator[Violation]:
+    """INV-PR-RECORDED — a settled work order that wrote code must carry its pull request.
+
+    THE GUARANTEE INV-WORK-LANDED RESTS ON. That check judges the recorded pull request
+    and nothing else, which is only safe if something else holds `pr_url` populated for
+    every order that produced code; this is that something. The two read as a chain: this
+    one says the identifier exists, that one says the work behind it reached the default
+    branch. Ruled by the user on 2026-09-18 — "if there is any code change made in an
+    order, then pr_url must not be empty, and the invariant should rely on that pr_url"
+    (docs/superpowers/specs/2026-09-18-an-order-that-wrote-code-carries-its-pull-request.md).
+
+    **THE POPULATION COMES OFF THE TIMELINE, NEVER OFF THE REPOSITORY** (Neo question
+    429). Every settlement route now writes what the order authored onto the event it
+    already writes — `ops.finish`, `ops.park_unlanded`, `finish --abandon`,
+    `Daemon._close_feature_manager` — because `landing.authored` is exact only while the
+    worktree exists, and a worktree is gone long before anyone audits. So this is a pure
+    SQL-and-JSON read, cheap enough for `INVARIANTS` rather than `SLOW_INVARIANTS`, and
+    it never asks git or `gh` anything.
+
+    The price is that it is STRUCTURALLY SILENT on anything settled before it shipped:
+    `wo-5a6b2d6d` — a planner that completed over a WIP commit on `rescue/wo-5a6b2d6d`
+    with no pull request, ever — carries no such record and is reported by nothing. The
+    user accepted that explicitly; those orders are being closed by hand, and this exists
+    to stop the next one. `landing.authored_in` keeps "nobody looked" distinct from
+    "produced nothing" so the silence is a known gap rather than an exoneration.
+
+    Three exemptions, each a decision somebody WROTE DOWN, and all three lapse the same
+    way — `work_abandoned`'s episode arithmetic retires a decision the moment the work is
+    delivered again:
+
+    * a recorded `pr_url`, which is the whole point;
+    * `finish --abandon`, the worker saying this is deliberately not being landed;
+    * `jarvis wo done`, whose `work_unlanded {closed_by: marked_done}` is the user's own
+      decision and the documented exit for a pull request that will never merge (Neo
+      question 430; `ops.mark_done` records rather than refusing, and always has).
+
+    **THE STALE `pr_url` IS OUT OF SCOPE**, and deliberately: `wo-cd73c537` records #81,
+    which merged, while #116 carries the rest of its work and is open. This predicate
+    asks whether an identifier is PRESENT, which is a fact the record holds; asking
+    whether it is CURRENT is a `gh` round trip per settled order and belongs with the
+    daemon polls that already have a network — and NEITHER OF THEM DOES IT TODAY:
+    `Daemon.poll_pull_requests` asks about the pull request an order is parked behind,
+    `Daemon.refresh_landings` about the one it recorded, and both read `pr_url` rather
+    than looking for a branch's live pull request. Filed as `bl-2aabaee8`.
+
+    Not repairable. An empty `pr_url` has two resolutions — find the pull request that
+    exists, or record that none ever will — and nothing in the database distinguishes
+    them. Discovery is what closes the gap once it can write back, and it is the daemon's.
+    """
+    from . import landing
+
+    for wo in store.list_work_orders(statuses=("completed",), include_hidden=True):
+        wo_id = wo["id"]
+        if wo.get("pr_url"):
+            continue
+        if store.work_abandoned(wo_id) or store.work_unlanded_open(
+                wo_id, closed_by="marked_done"):
+            continue
+        work = landing.latest_authorship(
+            [(float(e["ts"]), db.from_json(e["payload"], {}))
+             for kind in landing.SETTLEMENT_EVENTS
+             for e in store.events_of_kind(wo_id, kind)])
+        if work is None or not work.produced:
+            continue  # nobody looked, or it wrote nothing — see the docstring on both
+        yield Violation(
+            invariant="INV-PR-RECORDED",
+            wo_id=wo_id,
+            detail=(f"completed over {work.describe()} with no pull request recorded, "
+                    f"so nothing can say whether that work reached "
+                    f"`{work.base or 'the default branch'}`. Record the pull request "
+                    f"with `jarvis wo finish {wo_id} --summary \"...\" --pr <url>`, or "
+                    f"the decision to drop it with `--abandon \"<why>\"`."),
+            context={"branch": work.branch, "base": work.base,
+                     "commits": work.commits, "dirty": list(work.dirty[:10])},
+        )
+
+
 def check_manager_slots(store: ProjectStore) -> Iterator[Violation]:
     """INV-MANAGER-SLOTS — a project manager order must not spend a concurrency slot.
 
@@ -3177,6 +3254,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # same `true_blockers[0]`, so the flag goes up once
     check_blocked_work_is_surfaced,
     check_attention_has_reason,
+    check_pull_request_recorded,   # order-free: a pure timeline read that repairs
+                                   # nothing and touches no flag. NOT a SLOW_INVARIANT —
+                                   # it asks the record, never the repository
     check_manager_slots,           # a canary, not a state check: it repairs nothing and
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,

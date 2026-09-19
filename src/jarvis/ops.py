@@ -2229,6 +2229,21 @@ def unlanded_work(store: ProjectStore, wo: dict[str, Any],
     recorded = store.get_work_order(wo["id"])
     if pr_url or recorded.get("pr_url"):
         return landing.Authored()
+    return authorship(store, wo)
+
+
+def authorship(store: ProjectStore, wo: dict[str, Any]) -> landing.Authored:
+    """What this work order's worktree has produced, asked WITHOUT the pull-request rule.
+
+    `unlanded_work` is the refusal and short-circuits to "nothing" for an order carrying
+    a pull request, which is right for a refusal and wrong for the record: an order that
+    wrote code and landed it behind a PR still wrote code, and INV-PR-RECORDED needs that
+    written down while the worktree still exists to say so. So the two are separated —
+    this reads, `unlanded_work` judges — and no settling pays for two reads.
+    """
+    from . import landing
+
+    recorded = store.get_work_order(wo["id"])
     return landing.authored(landing.worktree_of(store.project_path, recorded))
 
 
@@ -2272,7 +2287,27 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `pr_url` NULL over the fact that a commit existed — so the record afterwards said
     the order had produced nothing. This writes down what was there instead: the branch,
     the count, and the files that were never committed at all.
+
+    **ONCE PER EPISODE, NOT ONCE PER CALLER.** `Daemon.settle_work_order` re-derives an
+    order's ending from the LATEST turn on EVERY tick, so it reaches here again on the
+    tick after a park, over the same done turn, with nothing changed — and an
+    unconditional write would trade "unparks and completes" for a fresh `work_unlanded`
+    and a fresh flag every tick, which is the renotify-on-every-restart shape the
+    invariants module's third rule exists to forbid. `work_unlanded_open` is the episode
+    test and already means exactly this: a park with no `finished`, `abandoned` or
+    `pr_merged` since. A re-delivery writes one of those, so the NEXT park is a new
+    episode and does record again.
+
+    The STATUS is still asserted on the quiet path and the FLAG is deliberately not.
+    `UNLANDED_BLOCKER` is one `true_blockers` re-derives from `work_unlanded_open`, so
+    INV-ATTENTION-MISSING puts it back if it is genuinely missing — and that path honours
+    `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
+    ran `jarvis wo ack` over a parked order must not have the flag raised again by the
+    next tick; that is the same renotify defect wearing the column instead of the event.
     """
+    if store.work_unlanded_open(wo["id"]):
+        store.update_work_order(wo["id"], status="needs_review")
+        return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
     store.flag_attention(wo["id"], UNLANDED_BLOCKER)
@@ -2892,6 +2927,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     thing being enforced is that the decision is WRITTEN DOWN, not that it is prevented.
     The predicate is `unlanded_work`'s and is deliberately narrow — see Neo question 280.
 
+    **AND IT WRITES DOWN WHAT THE ORDER AUTHORED, on every route including the one that
+    settles cleanly.** That record is what INV-PR-RECORDED reads months later, when the
+    worktree it came from is long gone; the refusal above is what keeps it honest.
+
     **`--abandon` ON AN ALREADY-SETTLED ORDER RECORDS AND STOPS.** It is INV-WORK-LANDED's
     printed remedy, so it is typed months after the work; opening a validation round there
     escalates a session that no longer exists and hands the user a fresh attention item in
@@ -2928,11 +2967,15 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         # exactly as it found it (a `result_summary` saved beside a refusal reads
         # afterwards like a work order that finished), and the abandonment below records
         # what this same read saw rather than re-running git against a tree that has
-        # moved. `unlanded_work` answers "nothing" for a work order carrying a pull
-        # request, so the `--pr` path never touches git at all.
+        # moved.
         stranding = unlanded_work(store, _wo, pr_url or "")
         if stranding.produced and not abandon:
             raise OpsError(unlanded_refusal(wo_id, summary, stranding))
+        # `stranding` is the REFUSAL's reading and is deliberately empty for an order
+        # carrying a pull request; `base` is what says a worktree was actually read. The
+        # record wants the other answer, so the `--pr` path does the look here instead —
+        # once either way. See `authorship` and INV-PR-RECORDED.
+        work = stranding if stranding.base else authorship(store, _wo)
         fields: dict[str, Any] = {"result_summary": summary}
         if pr_url:
             fields["pr_url"] = pr_url
@@ -2946,13 +2989,14 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         store.add_event(wo_id, "finished",
                         {"summary": summary,
                          **({"pr_url": pr_url} if pr_url else {}),
-                         **({"evidence": evidence} if evidence else {})})
+                         **({"evidence": evidence} if evidence else {}),
+                         **({"authored": work.record()} if work.base else {})})
         if abandon:
             # AFTER `finished` and never before: `_abandoned` reads the newer of the two,
             # so an abandonment written first would be superseded by the finish it
             # belongs to and the landing would refuse the very order it just excused.
             store.add_event(wo_id, "abandoned",
-                            {"reason": abandon, **stranding.record()})
+                            {"reason": abandon, **work.record()})
             if _wo["status"] in TERMINAL_STATUSES:
                 # RECORDING A DECISION ABOUT SETTLED WORK IS NOT A DELIVERY. This is the
                 # remedy INV-WORK-LANDED prints, and it is typed against orders that
