@@ -1112,6 +1112,13 @@ ADDED_COLUMNS = {
         # WHY a row landed in `expired`: 'lapsed', 'superseded' or 'abandoned' — only the
         # last is worth counting. Spec 2026-09-12 §4, §5.
         "closed_as": "TEXT NOT NULL DEFAULT ''",
+        # WHEN THIS REQUEST STARTED REFUSING THE WORKER'S COMMANDS — the moment it went
+        # `pending`, which `ts` does not record for one filed `awaiting_case` and `status`
+        # cannot recover once it is decided. NULL means never: a request nobody ever
+        # argued blocked nothing (`hooks.pending_turn_block` reads `pending` and only
+        # `pending`). The one reader is `gate_open_at`; §4 of
+        # docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
+        "pending_at": "REAL",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -1237,6 +1244,23 @@ class ProjectStore:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self._backfill_alarms()
         self._backfill_abandoned_gates()
+        self._backfill_pending_at()
+
+    def _backfill_pending_at(self) -> None:
+        """Give historical rows the best `pending_at` the record can support. Spec §4.
+
+        `ts` is the filing time, so it is exact for every row filed straight into
+        `pending` (the default, and every gate a worker trips) and early by the arguing
+        time for one that was held first. Two shapes are left NULL because they provably
+        never refused anyone: a request still `awaiting_case`, and one abandoned unargued.
+        Idempotent — it only ever fills a NULL.
+        """
+        self.conn.execute(
+            """UPDATE approvals SET pending_at = ts
+               WHERE pending_at IS NULL AND status != 'awaiting_case'
+                 AND closed_as != 'abandoned'"""
+        )
+        self.conn.commit()
 
     #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
     #: A prefix because the minute count varies per project; nothing else ever wrote it,
@@ -2662,7 +2686,7 @@ class ProjectStore:
         return found
 
     def _this_episode(self, wo_id: str, repair: str, kind: str) -> list[dict[str, Any]]:
-        """Events of `kind` since the last `pr_<repair>_cleared` — this EPISODE's.
+        """Events of `kind` since this EPISODE began — the last clear or re-arm.
 
         Repair state is derived from the timeline rather than kept in columns; the clear
         is the budget reset. See §4 of
@@ -2672,17 +2696,51 @@ class ProjectStore:
         because a store may not import `ops`. The two episodes are counted APART on
         purpose: a branch that conflicted twice last week has spent nothing of the red
         build's budget, and they are different problems with different fixes.
+
+        TWO EVENTS OPEN A FRESH EPISODE, not one. `pr_<repair>_rearmed` is the budget
+        given back because the attempts were never made — the worker was refused by a
+        pending gate before it could read the conflict (issue #469, §4 and §6 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md). It
+        moves the boundary here rather than at each caller so that the attempt count,
+        the give-up and the origin all reset together and cannot disagree about which
+        episode is current.
+
+        The second read happens only once there is something to count: a pull request
+        that has never been nudged returns above it, which is what keeps the green case
+        at the cost `test_a_green_pull_request_costs_one_call_three_reads_and_no_write`
+        pins.
         """
         rows = self.events_of_kind(wo_id, kind)
         if not rows:
             return []
-        cleared = self.events_of_kind(wo_id, f"pr_{repair}_cleared")
-        since = cleared[-1]["ts"] if cleared else 0.0
+        opened = (self.events_of_kind(wo_id, f"pr_{repair}_cleared")
+                  + self.events_of_kind(wo_id, f"pr_{repair}_rearmed"))
+        since = max((e["ts"] for e in opened), default=0.0)
         return [r for r in rows if r["ts"] > since]
+
+    def pr_repair_nudges(self, wo_id: str, repair: str) -> list[dict[str, Any]]:
+        """Every ask of this episode, oldest first — the attempts themselves.
+
+        `pr_repair_attempts` is the count; this is what `ops.rearm_pr_repair` needs
+        instead, because WHEN each one went out is what says whether the worker was
+        allowed to act on it (issue #469).
+        """
+        return self._this_episode(wo_id, repair, f"pr_{repair}_nudged")
 
     def pr_repair_attempts(self, wo_id: str, repair: str) -> int:
         """How many times the OS has asked this worker to fix the SAME thing."""
-        return len(self._this_episode(wo_id, repair, f"pr_{repair}_nudged"))
+        return len(self.pr_repair_nudges(wo_id, repair))
+
+    def pr_repair_deferred(self, wo_id: str, repair: str, approval_id: int) -> bool:
+        """Has this episode already recorded that THIS gate is holding the repair up?
+
+        The dedupe behind `ops.defer_pr_repair`: the poll asks every tick for as long as
+        the review takes, and the timeline must carry the fact once, not once per tick.
+        """
+        for event in self._this_episode(wo_id, repair, f"pr_{repair}_deferred"):
+            if (db.from_json(event["payload"], {}) or {}).get("approval_id") == approval_id:
+                return True
+        return False
 
     def pr_repair_gave_up(self, wo_id: str, repair: str) -> bool:
         """Has the OS already stopped trying on this episode and said so?
@@ -3629,12 +3687,16 @@ class ProjectStore:
                      agent_type: str | None = None,
                      status: str = "pending",
                      contested: bool = False) -> dict[str, Any]:
+        now = db.now()
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses, agent_type, status, contested)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
-             agent_type, status, int(contested)),
+                                      evidence, max_uses, agent_type, status, contested,
+                                      pending_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            # `pending_at` iff it is pending from birth: an `awaiting_case` row gets one
+            # in `start_review` or never at all.
+            (wo_id, now, kind, command, matched, justification, evidence, max_uses,
+             agent_type, status, int(contested), now if status == "pending" else None),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -3656,8 +3718,9 @@ class ProjectStore:
         """Link the reviewer's question and open the request to review. See
         `gates.queue_for_review` — the one transition out of `awaiting_case`."""
         self.conn.execute(
-            "UPDATE approvals SET neo_question_id=?, status='pending' WHERE id=?",
-            (question_id, approval_id),
+            """UPDATE approvals SET neo_question_id=?, status='pending',
+                                    pending_at=COALESCE(pending_at, ?) WHERE id=?""",
+            (question_id, db.now(), approval_id),
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
@@ -3873,6 +3936,32 @@ class ProjectStore:
         Named once so a seventh status cannot reach one of them and not the other.
         """
         return self.pending_approvals(wo_id) + self.held_approvals(wo_id)
+
+    def gate_open_at(self, wo_id: str, ts: float) -> bool:
+        """Was a privileged-action gate REFUSING THIS WORKER'S COMMANDS at `ts`?
+
+        The historical form of `pending_approvals`, and it exists for one caller:
+        `ops.rearm_pr_repair` asking whether a repair attempt already spent was an
+        attempt the worker was ever allowed to make (issue #469).
+
+        SAME PREDICATE AS THE GUARD, and that matters more than any other property here:
+        `hooks.pending_turn_block` refuses a session's commands while a request is
+        `pending` and at no other time, `Daemon.heal_pull_request` defers on exactly
+        that, and this asks it of a past moment. A request still `awaiting_case` refuses
+        only the END of a turn, so it is no excuse for a nudge that failed — if this
+        counted one, a work order carrying a single held request nobody ever argued
+        would be refunded its whole budget every episode, for ever, which is the burn
+        issue #469 is about. §4 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
+        """
+        for approval in self.list_approvals(wo_id):
+            pending_at = approval["pending_at"]
+            if pending_at is None or pending_at > ts:
+                continue
+            decided_at = approval["decided_at"]
+            if decided_at is None or decided_at > ts:
+                return True
+        return False
 
     def expire_approvals(self) -> int:
         """Move spent or timed-out grants to `expired` so listings tell the truth.

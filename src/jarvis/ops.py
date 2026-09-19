@@ -3582,6 +3582,70 @@ def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
     return {"wo_id": wo["id"], "nudged": True, "attempts": attempt, "gave_up": False}
 
 
+def defer_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
+                    request: dict[str, Any]) -> bool:
+    """Say once that a pending gate is why this repair is not being attempted.
+
+    Issue #469, §3 of
+    docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md. No
+    attempt is spent and no message is queued; this is only the record.
+
+    ONCE PER EPISODE PER REQUEST, because the poll asks every couple of minutes for as
+    long as the review takes — six hours of it, in the issue. The attention the gate
+    deserves is the gate's own, which is already an item when it escalates.
+    """
+    if store.pr_repair_deferred(wo["id"], repair.name, request["id"]):
+        return False
+    store.add_event(wo["id"], repair.event("deferred"), {
+        "pr_url": wo.get("pr_url"), "approval_id": request["id"],
+        "kind": request["kind"],
+        "attempts": store.pr_repair_attempts(wo["id"], repair.name)})
+    return True
+
+
+def rearm_pr_repair(store: ProjectStore, wo: dict[str, Any],
+                    repair: PrRepair) -> int:
+    """Give back a budget spent on turns the worker was never allowed to take.
+
+    Issue #469, §4 of the spec above. Returns the number of attempts refunded, 0 when
+    there is nothing to refund — which is every ordinary give-up, and the answer this
+    must keep giving for a worker that genuinely tried and failed.
+
+    THE THREE CONDITIONS ARE IN THE CHEAPEST ORDER: an episode that has not given up is
+    the overwhelmingly common one and costs a single indexed read to rule out. The last
+    is the real predicate — EVERY nudge went out while a gate was open, so not one of
+    them could reach the conflict. Partial refunds are deliberately not a thing; see the
+    spec for why the whole-budget case is the one worth machinery.
+
+    The caller nudges immediately afterwards, which is what keeps `pr_repair_origin`
+    answering: the fresh attempt re-records the status the repair is taking the work
+    order out of, and the episode is never left open with no nudge in it.
+
+    ONCE PER WORK ORDER PER REPAIR, EVER, and that cap is not derived from the other
+    three conditions — it is the thing that makes a runaway refund impossible to write.
+    The argument that the conditions alone terminate is sound but it is an argument
+    about two predicates in two files agreeing; they disagreed once already (round 1 of
+    this order's review), and the failure mode is invisible: a budget silently restored
+    every episode, attention cleared each time, exactly the unattended burn issue #469
+    is about. The cost of the cap being wrong is one work order asking the user to
+    resolve a conflict by hand, which is where the OS started. Spec §4.
+    """
+    if not store.pr_repair_gave_up(wo["id"], repair.name):
+        return 0
+    if store.events_of_kind(wo["id"], repair.event("rearmed")):
+        return 0
+    if store.pending_approvals(wo["id"]):
+        return 0        # still shut — `Daemon.heal_pull_request`'s guard holds anyway
+    nudges = store.pr_repair_nudges(wo["id"], repair.name)
+    if not nudges or not all(store.gate_open_at(wo["id"], n["ts"]) for n in nudges):
+        return 0
+    store.add_event(wo["id"], repair.event("rearmed"), {
+        "pr_url": wo.get("pr_url"), "attempts": len(nudges)})
+    if wo["attention_reason"] == repair.blocker:
+        store.clear_attention(wo["id"])
+    return len(nudges)
+
+
 def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
                     repair: PrRepair) -> bool:
     """The pull request is well again: close the episode. True if there was one.
