@@ -76,18 +76,35 @@ boundary to be a number rather than an event, and the issue's ask is the whole-b
 case ("a budget burned entirely on gate refusals"). An episode where the worker got one
 genuine try keeps its give-up: it says something true.
 
-**The blocking window is `[approvals.ts, decided_at)`** — when the request was filed to
-when it was answered — with requests that were abandoned unargued (`expired` /
-`closed_as='abandoned'`) excluded, since nobody was ever reviewing one and it never went
-`pending`. This over-covers by the `awaiting_case` prefix of a request the worker
-argued later, because the row does not record when it went pending. That is the safe
-direction: over-covering costs at most three worker turns on a conflict that then gives
-up again properly, and under-covering leaves the order stranded for ever, which is the
-bug.
+**The blocking window is `[pending_at, decided_at)`** — the moment the request started
+refusing the worker's commands to the moment it was answered. `approvals.pending_at` is
+a new column for exactly this: `ts` is when the request was FILED, which for one filed
+`awaiting_case` is earlier, and `status` cannot recover the transition once the request
+is decided. NULL means the request never went pending and therefore never refused
+anybody: a held request nobody argued, and one abandoned unargued.
 
-**It terminates.** After a re-arm the guard in §3 means no nudge can go out under a
-gate, so a second give-up cannot satisfy condition 3 and cannot be re-armed. One refund
-per episode, at most.
+**The predicate is the guard's, asked of a past moment**, and that is the single most
+important property in this section. `hooks.pending_turn_block` refuses a session's
+commands while a request is `pending` and at no other time; §3 defers on exactly that;
+this asks whether it was true when the nudge went out. The first version of this change
+used `[ts, decided_at)` and excluded only abandoned requests, so the two predicates
+disagreed about a held request: §3 would nudge (correctly — `awaiting_case` only refuses
+the END of a turn), the worker would fail for real reasons, and the refund would hand
+the budget back anyway. Every episode. Attention cleared each time. That is a silent
+unattended burn, which is the thing issue #469 is about — so the two predicates must be
+the same predicate, not two readings of "a gate was open".
+
+Historical rows get `pending_at = ts` where the record supports it (`_backfill_pending_at`),
+which is exact for anything filed straight into `pending` — the default, and every gate
+a worker trips.
+
+**It terminates, twice over.** After a re-arm the guard in §3 means no nudge can go out
+under a gate, so a second give-up cannot satisfy condition 3. And independently of that
+argument: `rearm_pr_repair` refuses outright if a `pr_<repair>_rearmed` event already
+exists on the work order, so one refund per work order per repair is the hard ceiling.
+The belt is an argument about two predicates in two files agreeing, and they disagreed
+once already; the braces cost one indexed read. If the cap ever bites wrongly the work
+order asks the user to resolve a conflict by hand, which is where the OS started.
 
 ## 5. The wording
 

@@ -3343,8 +3343,19 @@ def rearm_pr_repair(store: ProjectStore, wo: dict[str, Any],
     The caller nudges immediately afterwards, which is what keeps `pr_repair_origin`
     answering: the fresh attempt re-records the status the repair is taking the work
     order out of, and the episode is never left open with no nudge in it.
+
+    ONCE PER WORK ORDER PER REPAIR, EVER, and that cap is not derived from the other
+    three conditions — it is the thing that makes a runaway refund impossible to write.
+    The argument that the conditions alone terminate is sound but it is an argument
+    about two predicates in two files agreeing; they disagreed once already (round 1 of
+    this order's review), and the failure mode is invisible: a budget silently restored
+    every episode, attention cleared each time, exactly the unattended burn issue #469
+    is about. The cost of the cap being wrong is one work order asking the user to
+    resolve a conflict by hand, which is where the OS started. Spec §4.
     """
     if not store.pr_repair_gave_up(wo["id"], repair.name):
+        return 0
+    if store.events_of_kind(wo["id"], repair.event("rearmed")):
         return 0
     if store.pending_approvals(wo["id"]):
         return 0        # still shut — `Daemon.heal_pull_request`'s guard holds anyway

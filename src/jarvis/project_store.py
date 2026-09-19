@@ -1031,6 +1031,13 @@ ADDED_COLUMNS = {
         # WHY a row landed in `expired`: 'lapsed', 'superseded' or 'abandoned' — only the
         # last is worth counting. Spec 2026-09-12 §4, §5.
         "closed_as": "TEXT NOT NULL DEFAULT ''",
+        # WHEN THIS REQUEST STARTED REFUSING THE WORKER'S COMMANDS — the moment it went
+        # `pending`, which `ts` does not record for one filed `awaiting_case` and `status`
+        # cannot recover once it is decided. NULL means never: a request nobody ever
+        # argued blocked nothing (`hooks.pending_turn_block` reads `pending` and only
+        # `pending`). The one reader is `gate_open_at`; §4 of
+        # docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
+        "pending_at": "REAL",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -1156,6 +1163,23 @@ class ProjectStore:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self._backfill_alarms()
         self._backfill_abandoned_gates()
+        self._backfill_pending_at()
+
+    def _backfill_pending_at(self) -> None:
+        """Give historical rows the best `pending_at` the record can support. Spec §4.
+
+        `ts` is the filing time, so it is exact for every row filed straight into
+        `pending` (the default, and every gate a worker trips) and early by the arguing
+        time for one that was held first. Two shapes are left NULL because they provably
+        never refused anyone: a request still `awaiting_case`, and one abandoned unargued.
+        Idempotent — it only ever fills a NULL.
+        """
+        self.conn.execute(
+            """UPDATE approvals SET pending_at = ts
+               WHERE pending_at IS NULL AND status != 'awaiting_case'
+                 AND closed_as != 'abandoned'"""
+        )
+        self.conn.commit()
 
     #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
     #: A prefix because the minute count varies per project; nothing else ever wrote it,
@@ -3388,12 +3412,16 @@ class ProjectStore:
                      agent_type: str | None = None,
                      status: str = "pending",
                      contested: bool = False) -> dict[str, Any]:
+        now = db.now()
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
-                                      evidence, max_uses, agent_type, status, contested)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (wo_id, db.now(), kind, command, matched, justification, evidence, max_uses,
-             agent_type, status, int(contested)),
+                                      evidence, max_uses, agent_type, status, contested,
+                                      pending_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            # `pending_at` iff it is pending from birth: an `awaiting_case` row gets one
+            # in `start_review` or never at all.
+            (wo_id, now, kind, command, matched, justification, evidence, max_uses,
+             agent_type, status, int(contested), now if status == "pending" else None),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -3415,8 +3443,9 @@ class ProjectStore:
         """Link the reviewer's question and open the request to review. See
         `gates.queue_for_review` — the one transition out of `awaiting_case`."""
         self.conn.execute(
-            "UPDATE approvals SET neo_question_id=?, status='pending' WHERE id=?",
-            (question_id, approval_id),
+            """UPDATE approvals SET neo_question_id=?, status='pending',
+                                    pending_at=COALESCE(pending_at, ?) WHERE id=?""",
+            (question_id, db.now(), approval_id),
         )
         return self.get_approval(approval_id)  # type: ignore[return-value]
 
@@ -3634,26 +3663,25 @@ class ProjectStore:
         return self.pending_approvals(wo_id) + self.held_approvals(wo_id)
 
     def gate_open_at(self, wo_id: str, ts: float) -> bool:
-        """Was a privileged-action gate holding this work order at `ts`?
+        """Was a privileged-action gate REFUSING THIS WORKER'S COMMANDS at `ts`?
 
         The historical form of `pending_approvals`, and it exists for one caller:
         `ops.rearm_pr_repair` asking whether a repair attempt already spent was an
         attempt the worker was ever allowed to make (issue #469).
 
-        THE WINDOW IS FILED-TO-DECIDED, which over-covers an `awaiting_case` prefix by
-        the time the worker took to argue its case — the row records when the request
-        was filed and when it was answered, not when it went `pending`. §4 of
-        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md argues
-        that direction: over-covering costs three worker turns on a repair that then
-        gives up properly, under-covering strands the work order for ever.
-
-        A request abandoned unargued is excluded — nobody ever reviewed one, so it never
-        reached the status that refuses a worker's commands.
+        SAME PREDICATE AS THE GUARD, and that matters more than any other property here:
+        `hooks.pending_turn_block` refuses a session's commands while a request is
+        `pending` and at no other time, `Daemon.heal_pull_request` defers on exactly
+        that, and this asks it of a past moment. A request still `awaiting_case` refuses
+        only the END of a turn, so it is no excuse for a nudge that failed — if this
+        counted one, a work order carrying a single held request nobody ever argued
+        would be refunded its whole budget every episode, for ever, which is the burn
+        issue #469 is about. §4 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
         """
         for approval in self.list_approvals(wo_id):
-            if approval["ts"] > ts:
-                continue
-            if approval["closed_as"] == "abandoned":
+            pending_at = approval["pending_at"]
+            if pending_at is None or pending_at > ts:
                 continue
             decided_at = approval["decided_at"]
             if decided_at is None or decided_at > ts:

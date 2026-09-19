@@ -1153,3 +1153,68 @@ def test_a_request_nobody_ever_argued_never_blocked_anything(started, project, f
 
     assert "pr_conflict_rearmed" not in [e["kind"] for e in
                                          store.list_events(parked_worker["id"])]
+
+
+def test_a_held_request_nobody_argues_never_refunds_anything(started, project, fake_gh,
+                                                             parked_worker):
+    """The loop this change nearly shipped, pinned shut.
+
+    One `awaiting_case` request, never argued and never decided, sitting on the work
+    order for ever. It refuses the end of a turn and nothing else, so the worker really
+    did get its three attempts and really did fail — the give-up is true and must stand.
+    An earlier `gate_open_at` counted the request anyway (open, not abandoned, no
+    verdict) and handed the whole budget back, every episode, clearing attention each
+    time: an unattended burn, which is issue #469 pointed the wrong way. Two episodes
+    here, because once is not a termination argument.
+    """
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    gate(store, parked_worker["id"], status="awaiting_case")
+
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 2):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    assert store.pr_repair_attempts(parked_worker["id"], "conflict") == \
+        PR_REPAIR_MAX_ATTEMPTS
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+    assert "pr_conflict_rearmed" not in [e["kind"] for e in
+                                         store.list_events(parked_worker["id"])]
+
+    fake_gh.set_pr(PR, "OPEN")                    # the user resolved it by hand
+    poll(started, store)
+    conflicting(fake_gh)                          # and the base moved again
+    for _ in range(PR_REPAIR_MAX_ATTEMPTS + 2):
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert "pr_conflict_rearmed" not in events
+    assert events.count("pr_conflict_unresolved") == 2
+    assert store.get_work_order(parked_worker["id"])["attention_reason"] == \
+        PR_CONFLICT_BLOCKER
+
+
+def test_the_refund_is_capped_at_one_per_work_order(started, project, fake_gh,
+                                                    parked_worker):
+    """The braces, tested apart from the belt: a second episode that satisfies every
+    refund condition is still not refunded, so no predicate bug can make this loop."""
+    conflicting(fake_gh)
+    store = ProjectStore(project)
+    for episode in range(2):
+        request = gate(store, parked_worker["id"])
+        for _ in range(PR_REPAIR_MAX_ATTEMPTS + 1):   # as the poller did before #469
+            ops.nudge_pr_repair(store, store.get_work_order(parked_worker["id"]),
+                                ops.PR_CONFLICT, base="main")
+            delivered(store, parked_worker["id"])
+        store.decide_approval(request["id"], "approved", "go ahead", "user")
+        poll(started, store)
+        delivered(store, parked_worker["id"])
+        if episode == 0:                              # clear it, so the next is fresh
+            fake_gh.set_pr(PR, "OPEN")
+            poll(started, store)
+            conflicting(fake_gh)
+
+    events = [e["kind"] for e in store.list_events(parked_worker["id"])]
+    assert events.count("pr_conflict_rearmed") == 1
