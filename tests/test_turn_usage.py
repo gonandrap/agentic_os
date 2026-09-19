@@ -510,3 +510,26 @@ def test_the_turn_file_tracks_the_session_total_and_never_the_turn(tmp_path):
     # the 184.6M that summing the five files gave.
     assert sum(read) == session_so_far[-1]
     assert sum(e["total_cost_usd"] for e in envelopes) == pytest.approx(32.02)
+
+
+def test_a_turn_keeps_its_own_cost_when_the_dollars_are_not_a_running_total(tmp_path):
+    """The two columns are classified SEPARATELY, and this is the case that needs it.
+
+    `kn-da437b27` has jarvis spawning a new process per turn, so a session whose
+    `modelUsage` accumulates while `total_cost_usd` does not is a shape the fleet can
+    actually produce. Applying the tokens' verdict to the dollars subtracted a larger
+    previous bill from a smaller one — and the clamp turned the negative into $0, on the
+    one column `budget.spent` enforces. A turn that cost $1.10 is billed $1.10.
+    """
+    turns = [spend(2, 500_000, 2_000_000, 20_000),
+             spend(4, 300_000, 1_200_000, 9_000),
+             spend(1, 100_000, 400_000, 3_000)]
+
+    envelopes = derive_series(tmp_path, turns, running(turns), [4.40, 1.10, 2.75])
+
+    assert [e["continues"] for e in envelopes] == [False, True, True]
+    for envelope, own in zip(envelopes, turns):
+        assert envelope["cache_read"] == own["cache_read"], "the tokens still diff"
+    assert [e["total_cost_usd"] for e in envelopes] == [4.40, 1.10, 2.75]
+    assert [m["cost_usd"] for e in envelopes for m in e["by_model"]] == \
+        [4.40, 1.10, 2.75]

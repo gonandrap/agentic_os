@@ -900,9 +900,21 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     fresh reading must hold none — one version-2 turn left in it is a result JSON that
     has been pruned, and its spend would be the transcript estimate, which is exactly
     the ageing this guard exists to refuse.
+
+    THAT IS NOT ENOUGH ON ITS OWN, because the version marker only speaks for turns the
+    bill can still SEE. An order whose session transcript is pruned between the seal and
+    the re-read loses its unrecorded turns entirely, re-derives the recorded ones to the
+    current version, and would pass the test above while quietly dropping real spend —
+    for ever, since the seal it overwrites was the last record of it. So the fresh
+    reading must also see no LESS than the seal did: any gap in `accuracy` that the
+    sealed bill did not already carry is evidence that has aged, not a correction.
     """
     from . import claude_cli
 
+    was_gaps = set((sealed.get("accuracy") or {}).get("gaps") or [])
+    now_gaps = set((fresh.get("accuracy") or {}).get("gaps") or [])
+    if now_gaps - was_gaps:
+        return False
     was = set(sealed["total"].get("usage_versions") or [])
     now = set(fresh["total"].get("usage_versions") or [])
     superseded = {v for v in (*was, *now) if v < claude_cli.USAGE_SCHEMA_VERSION}
@@ -1228,20 +1240,27 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
 
 
 #: How far a turn's own figure may stand above everything found INSIDE it — its API
-#: calls plus its subagents — before that is a defect rather than measurement noise.
-#: The gap is real and small: `modelUsage` also counts side-model calls that write no
-#: assistant message and so appear in no transcript, which over the 127 multi-turn
-#: orders on the dev machine runs to 1% of a bill and never more than 2%. A turn
-#: carrying the session's running total instead of its own starts at 200%, so the line
-#: sits an order of magnitude clear of both (issue #470).
-CALL_COVER_SLACK = 1.10
+#: calls plus its subagents — before that is a defect rather than something the
+#: transcript simply cannot see. BOTH NUMBERS ARE MEASURED, over the 40 most recent
+#: multi-turn orders on the dev machine:
+#:
+#:  * `modelUsage` counts side-model calls that write no assistant message, a flat
+#:    ~0.38M per turn and almost all of it cache_read (361,687 / 364,806 / 365,618 /
+#:    366,399 on turns of 2.7M to 4.1M, none with a subagent) — flat, so a
+#:    multiplicative allowance alone fails a short turn and passes a long one;
+#:  * a worker running under `--autocompact` compacts ITSELF, which re-reads the whole
+#:    conversation and writes no assistant message either. wo-d81fcc15 turn 2 is 1.19M
+#:    above its 6.73M of calls that way — 1.18x, with nothing recorded anywhere,
+#:    because that compaction is the CLI's and not `agent_usage.COMPACTION`.
+#:
+#: So the line is drawn where the DEFECT lives and not where the noise stops: a turn
+#: carrying the session's running total is a multiple of what is inside it — 45.64M
+#: against 4.12M on wo-966987af turn 3 — and the check is deliberately blind to a few
+#: percent, which no evidence on disk could settle either way (issue #470).
+CALL_COVER_SLACK = 2.0
 
-#: ...plus a flat per-turn allowance, because that gap is not proportional. Measured on
-#: the four longest healthy orders here, the part of a turn no transcript contains is
-#: ~0.38M and is almost entirely cache_read — 361,687 / 364,806 / 365,618 / 366,399 on
-#: turns of 2.7M to 4.1M, each with no subagent. A multiplicative slack alone therefore
-#: fails a short turn and passes a long one for the same absolute residue.
-CALL_COVER_RESIDUE = 500_000
+#: ...and the flat half of it, sized to absorb one self-compaction of a large context.
+CALL_COVER_RESIDUE = 1_500_000
 
 
 def _check_calls(payload: dict[str, Any]) -> list[str]:

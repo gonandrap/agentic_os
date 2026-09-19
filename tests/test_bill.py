@@ -449,25 +449,28 @@ def test_a_turn_bigger_than_everything_inside_it_fails_the_checks(store, wo,
     left in plain sight — a per-call table summing to a quarter of the headline, and an
     agent view giving all of it to a lead agent with no subagents — are this one check.
 
-    At a real turn's magnitude, deliberately: what the check allows is `CALL_COVER_SLACK`
-    plus `CALL_COVER_RESIDUE`, so a fixture of a few thousand tokens would pass however
-    it was inflated, and would guard nothing.
+    Built at a real order's magnitude and in the defect's own shape: a long first turn
+    and a short second one, which is how it was noticed — a per-call table summing to a
+    quarter of the headline above it. What the check allows is `CALL_COVER_SLACK` times
+    what is inside the turn plus `CALL_COVER_RESIDUE`, both measured, so an inflation of
+    a few percent is deliberately invisible here and so is any fixture of a few thousand
+    tokens.
     """
     give_session(store, wo["id"], "sess-inflated")
     first = add_turn(store, wo["id"], dict(recorded_usage(1.0), usage_v=3, input=0,
-                                           cache_write=200_000, cache_read=1_000_000,
-                                           output=10_000, cache_1h=0,
-                                           cache_5m=200_000))
+                                           cache_write=400_000, cache_read=8_000_000,
+                                           output=30_000, cache_1h=0,
+                                           cache_5m=400_000))
     at(store, first["id"], 1_100, 1_190)
     # Turn 2 reports turn 1's spend as well as its own — the version-2 reading.
     second = add_turn(store, wo["id"], dict(recorded_usage(2.5), usage_v=3, input=0,
-                                            cache_write=250_000, cache_read=5_000_000,
-                                            output=16_000, cache_1h=0,
-                                            cache_5m=250_000))
+                                            cache_write=500_000, cache_read=9_000_000,
+                                            output=36_000, cache_1h=0,
+                                            cache_5m=500_000))
     at(store, second["id"], 1_200, 1_290)
     transcripts("sess-inflated", [
-        assistant_row("m1", write=200_000, read=1_000_000, out=10_000, at=1_105),
-        assistant_row("m2", write=50_000, read=4_000_000, out=6_000, at=1_205),
+        assistant_row("m1", write=400_000, read=8_000_000, out=30_000, at=1_105),
+        assistant_row("m2", write=100_000, read=1_000_000, out=6_000, at=1_205),
     ])
 
     b = ops.bill(wo["id"])
@@ -510,6 +513,46 @@ def test_a_seal_counted_as_the_session_is_corrected_downward(store, wo, transcri
     assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
     assert b["total"]["tokens"]["total"] == sum(sum(own.values()) for own in turns)
     assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+
+
+def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
+        store, wo, transcripts, tmp_path):
+    """The other way a bill gets smaller, and it must not pass for a correction.
+
+    An order sealed with an UNRECORDED turn — one charged from the transcript, because
+    its result JSON was already gone — loses that whole line when Claude Code prunes the
+    transcript. Its recorded turns re-derive to the current version, so the version
+    marker alone says "corrected" and the seal would be overwritten by a bill missing
+    real spend, permanently: the seal was the last record of it.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-pruned")
+    # A third turn with no result JSON of its own: only the transcript speaks for it.
+    third = store.create_turn(wo["id"], kind="message", prompt="p")
+    at(store, third["id"], 1_400, 1_490)
+    rows = [assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                          out=own["output"], at=1_000 + 100 * i + 5)
+            for i, own in enumerate(turns, start=1)]
+    rows.append(assistant_row("m3", write=900_000, read=900_000, out=9_000, at=1_405))
+    transcripts("sess-pruned", rows)
+    store.set_status(wo["id"], "completed")
+    sealed = ops.bill(wo["id"], live=True)
+    for row in sealed["turn_rows"]:
+        row["usage_v"] = 2
+    sealed["total"]["usage_versions"] = [2]
+    sealed["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    store.seal_bill(wo["id"], json.dumps(sealed))
+    was = sealed["total"]["tokens"]["total"]
+    # ...and then the transcript ages out, taking turn 3's only evidence with it.
+    (tmp_path / "projects" / "-proj" / "sess-pruned.jsonl").unlink()
+
+    b = ops.bill(wo["id"])
+
+    assert b["total"]["tokens"]["total"] == was, "a pruned transcript rewrote the seal"
+    assert "corrected_from" not in b["accuracy"]
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION - 1
 
 
 # -- the hierarchy above a work order --------------------------------------------------

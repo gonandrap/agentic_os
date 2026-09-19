@@ -566,6 +566,15 @@ def derive_turn_usage(data: dict[str, Any],
     }
     before = _reported_of(previous)
     continues = _continues_previous(reported, before, own)
+    # THE DOLLARS ARE CLASSIFIED ON THEIR OWN, before any of this is spent — see
+    # `_cost_delta`. The verdict is sticky across the session because one turn cheaper
+    # than the one before it proves the column is per-turn for good, while a rise proves
+    # nothing either way.
+    cost, cost_per_turn = _cost_delta(
+        reported["total_cost_usd"],
+        (before or {}).get("total_cost_usd") if continues else None,
+        bool((before or {}).get("cost_per_turn")) if continues else False)
+    reported["cost_per_turn"] = cost_per_turn
     prior = (before or {}).get("by_model") or {}
     by_model = [
         {
@@ -573,7 +582,8 @@ def derive_turn_usage(data: dict[str, Any],
             # A model absent from the previous reading is new to the session, so its
             # whole figure is this turn's however the envelope is read; one that went
             # DOWN cannot be a continuation of the one before it either.
-            **_model_delta(counts, prior.get(name) if continues else None),
+            **_model_delta(counts, prior.get(name) if continues else None,
+                           cost_per_turn),
             "context_window": models[name].get("contextWindow"),
         }
         for name, counts in reported["by_model"].items()
@@ -584,9 +594,6 @@ def derive_turn_usage(data: dict[str, Any],
     else:
         totals = dict(own)
         version = 1
-    cost = reported["total_cost_usd"]
-    if continues and cost is not None:
-        cost = max(0.0, cost - ((before or {}).get("total_cost_usd") or 0.0))
     return {
         "usage_v": version,
         "total_cost_usd": cost,
@@ -614,19 +621,49 @@ def derive_turn_usage(data: dict[str, Any],
     }
 
 
-def _model_delta(counts: dict[str, Any],
-                 before: dict[str, Any] | None) -> dict[str, Any]:
+def _model_delta(counts: dict[str, Any], before: dict[str, Any] | None,
+                 cost_per_turn: bool = False) -> dict[str, Any]:
     """One model's share of a turn: its reading less the previous turn's, or the whole
     of it where there is no continuation to subtract."""
     if before is None or any((counts.get(c) or 0) < (before.get(c) or 0)
                              for c in _TOKEN_CLASSES):
         return {c: counts.get(c) or 0 for c in _TOKEN_CLASSES} | {
             "cost_usd": counts.get("cost_usd")}
-    cost = counts.get("cost_usd")
-    if cost is not None:
-        cost = max(0.0, cost - (before.get("cost_usd") or 0.0))
     return {c: (counts.get(c) or 0) - (before.get(c) or 0)
-            for c in _TOKEN_CLASSES} | {"cost_usd": cost}
+            for c in _TOKEN_CLASSES} | {
+        "cost_usd": _cost_delta(counts.get("cost_usd"), before.get("cost_usd"),
+                                cost_per_turn)[0]}
+
+
+def _cost_delta(now: float | None, before: float | None,
+                per_turn: bool) -> tuple[float | None, bool]:
+    """This turn's DOLLARS, decided on the dollars alone, and what they proved.
+
+    The tokens' verdict does not carry over. The two columns are reported by different
+    code in the CLI and `kn-da437b27` has jarvis spawning a NEW PROCESS per turn, which
+    is a shape where `modelUsage` could accumulate while the bill did not — and a cost
+    that is not monotone against the previous reading is not a running total, whatever
+    the tokens did. Subtracting there billed every turn but the first $0 on the one
+    column `budget.spent` enforces: silent, and in the spending direction.
+
+    So the subtraction happens only where it is defensible, and where it is not the
+    envelope's own figure stands. Nothing is clamped: a clamp is how a disagreement
+    between the two columns became a zero instead of a number somebody could question.
+
+    ONE DROP SETTLES THE WHOLE SESSION. A bill that falls cannot be a running total, and
+    the CLI does not change its mind mid-session, so `per_turn` rides forward — without
+    it only the cheaper turn would keep its figure and the next dearer one would go back
+    to being diffed against it.
+    """
+    if now is None:
+        return None, per_turn
+    if before is None:
+        return now, per_turn
+    if now < before:
+        return now, True
+    if per_turn:
+        return now, True
+    return now - before, False
 
 
 #: The prompt that compacts a resumed session, and the whole of the transport for it.
