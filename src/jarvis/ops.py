@@ -3148,6 +3148,140 @@ def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
     return True
 
 
+#: The event `carry_validated_head` writes. Not a `PrRepair` and not an automerge event:
+#: it is a fact about a VERDICT, and it belongs beside the round it moved.
+HEAD_CARRIED_EVENT = "validation_head_carried"
+
+
+def record_base_health(store: ProjectStore, wo: dict[str, Any], *, red: bool,
+                       base: str) -> bool:
+    """Write down whether this pull request's base is broken. ONLY ON A CHANGE.
+
+    True when a row was written. The transition discipline is not tidiness: it is what
+    lets `invariants.base_red_note` answer the status line in one indexed read (see it),
+    and it keeps the timeline readable — a work order parked for a day across a red base
+    would otherwise carry seven hundred identical rows saying nothing happened.
+    """
+    from . import db, invariants as invariants_mod
+
+    rows = store.events_of_kind(wo["id"], invariants_mod.PR_BASE_HEALTH_EVENT)
+    if rows:
+        last = db.from_json(rows[-1].get("payload"), {}) or {}
+        if bool(last.get("red")) == red:
+            return False
+    elif not red:
+        # NOTHING TO SAY. A green base is the ordinary state of the world, and a first
+        # row asserting it would put a line on the timeline of every parked work order
+        # in the fleet the first time its pull request went red for its own reasons.
+        return False
+    store.add_event(wo["id"], invariants_mod.PR_BASE_HEALTH_EVENT,
+                    {"red": red, "base": base, "pr_url": wo.get("pr_url")})
+    return True
+
+
+def base_heal_spent(store: ProjectStore, wo_id: str, base_sha: str) -> bool:
+    """Has this pull request already been rebuilt against THIS base commit?
+
+    The bound, and it is keyed on the base sha rather than counted: one update per
+    (pull request, base sha). If the merge ref was rebuilt on a green base and CI is
+    still red, the failure is the branch's own and the worker nudge is the correct next
+    step — retrying the update would only produce the same commit. A LATER base recovery
+    is a different sha and earns a fresh attempt, because it is a fresh question.
+
+    A REFUSED update counts as spent, the same as a successful one. Otherwise a pull
+    request GitHub will not update — already up to date, or a conflict it will not touch
+    — is retried every two minutes for ever and never reaches the worker who could
+    actually fix it.
+    """
+    from . import db, invariants as invariants_mod
+
+    for kind in (invariants_mod.PR_BASE_UPDATED_EVENT,
+                 invariants_mod.PR_BASE_UPDATE_FAILED_EVENT):
+        for row in store.events_of_kind(wo_id, kind):
+            if (db.from_json(row.get("payload"), {}) or {}).get("base_sha") == base_sha:
+                return True
+    return False
+
+
+def record_base_update(store: ProjectStore, wo: dict[str, Any], *, base: str,
+                       base_sha: str, head_before: str, head_after: str,
+                       checks: tuple[str, ...]) -> None:
+    """The OS healed this pull request itself. Spec §4: say so, on the record.
+
+    `head_before`/`head_after` are not decoration — they are what `carry_validated_head`
+    is allowed to rely on afterwards, and what tells a reader six weeks later that the
+    commit an automatic merge landed differed from the judged one by a base merge and
+    nothing else.
+    """
+    from . import invariants as invariants_mod
+
+    store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATED_EVENT,
+                    {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
+                     "head_before": head_before, "head_after": head_after,
+                     "checks": list(checks)})
+
+
+def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: str,
+                              base_sha: str, reason: str) -> None:
+    """GitHub refused the update. Spends the attempt — see `base_heal_spent`.
+
+    `reason` is `GitHubError.reason`, this OS's own short phrase, never `str(e)`: that
+    carries `gh`'s stderr, and the vocabulary note on `github.GitHubError` applies
+    wherever remote text would end up on a surface a person reads.
+    """
+    from . import invariants as invariants_mod
+
+    store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATE_FAILED_EVENT,
+                    {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
+                     "reason": reason})
+
+
+def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
+                         head_after: str, base: str, base_sha: str) -> dict | None:
+    """Bind the panel's existing verdict to the commit the OS's own merge produced.
+
+    **THE HEAL IS NOT DONE WHEN CI GOES GREEN; IT IS DONE WHEN THE PULL REQUEST CAN
+    MERGE.** Updating the branch moves the head, and `automerge.decide` refuses a commit
+    no round judged — so without this the heal turns a red pull request into a green one
+    held on `sha_moved`, which is the same stall with a nicer label. Both production
+    pull requests did exactly that on 2026-09-18 when the user updated them by hand, and
+    both needed `jarvis validation force` to recover.
+
+    **THE THREE FACTS, and the carry is refused unless all hold** (spec §5):
+
+    1. the latest round PASSED and the commit it accepted was `judged` — so there is a
+       verdict, and it is the one this heal started from;
+    2. `judged` was the head the OS updated FROM — the caller reads it before the
+       update, so a worker push that beat us means `judged != head_before` and nothing
+       is carried;
+    3. `head_after` is what that update produced, read back from GitHub in the same tick.
+
+    Together they say the difference between the judged commit and the new one is a
+    merge of the base and nothing else: `ci.update_branch` merges (never rebases), and
+    GitHub refuses the update outright on conflict rather than letting anyone resolve
+    one, so no authored content can enter this way. Any later push moves the head off
+    `head_after` and `decide` holds `sha_moved` again — correctly, because then there IS
+    new authored content.
+
+    What is NOT relaxed: CI must still pass on the carried commit (condition 6), and the
+    merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
+    never whether one happens.
+    """
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or not judged or not head_after or head_after == judged:
+        return None
+    if ProjectStore.validated_head(row) != judged:
+        return None
+    reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
+              f"failure inherited from a red base — no authored content changed")
+    store.carry_round_head(int(row["id"]), head_after, reason)
+    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
+               "judged_sha": judged, "carried_head_sha": head_after,
+               "base": base, "base_sha": base_sha, "reason": reason}
+    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    return carried
+
+
 def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
     """The status an OPEN repair episode took this work order out of, if any."""
     return store.pr_repair_origin(wo_id, tuple(r.name for r in PR_REPAIRS))

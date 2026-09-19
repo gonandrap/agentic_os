@@ -628,6 +628,12 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
     -- reasoning is.
     forced_reason TEXT NOT NULL DEFAULT '',
+    -- The commit this verdict has been CARRIED FORWARD to, and why, when the OS merged
+    -- the base into the branch and moved the head itself. Separate from `head_sha`,
+    -- which keeps meaning "what the seats read". Also in ADDED_COLUMNS, where the
+    -- reasoning is — this table already ships, so a live database gets it only there.
+    carried_head_sha TEXT NOT NULL DEFAULT '',
+    carried_reason TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -953,6 +959,22 @@ ADDED_COLUMNS = {
         # written by a submission and of every round written before this column existed.
         # NOT NULL so there is one spelling of "nobody forced this" rather than two.
         "forced_reason": "TEXT NOT NULL DEFAULT ''",
+        # THE COMMIT THIS VERDICT HAS BEEN CARRIED FORWARD TO, and why. A SECOND column
+        # rather than an overwrite of `head_sha`, and that is the whole point: `head_sha`
+        # means "the commit the seats read" and must stay true on `jarvis validation
+        # show` for ever. Writing the new head over it would make that surface say five
+        # judges examined a commit none of them ever saw.
+        #
+        # Written only by `ops.carry_validated_head`, only when the OS itself moved the
+        # head by merging the base in and nothing else did — see that function for the
+        # three facts it checks. `validated_head` prefers it, so this is what an
+        # automatic merge binds to; the gate the merge still files quotes both.
+        #
+        # DEFAULT '' MEANS "NEVER CARRIED", the honest reading of every round written by
+        # a submission and of every round written before this column existed. NOT NULL
+        # so there is one spelling of "not carried" rather than two.
+        "carried_head_sha": "TEXT NOT NULL DEFAULT ''",
+        "carried_reason": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -3019,6 +3041,19 @@ class ProjectStore:
         would come to merge code: `pending` and `failed` are not `passed`, and the
         question this asks is "was it accepted", not "was it never refused".
 
+        **`carried_head_sha` WINS OVER `head_sha` WHEN IT IS SET**, and that is the one
+        weakening of "nothing merges a commit no round judged". It is written only by
+        `ops.carry_validated_head`, only when the OS itself merged the base into the
+        branch and provably nothing else moved the head — so the commit it names differs
+        from the judged one by a base merge and no authored content. The alternative was
+        a fresh panel round per healed pull request, which spends a round number and so
+        manufactures an attention item out of a heal nobody asked for
+        (docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md §5).
+
+        Nothing else relaxes: CI must still be green on the carried commit, and the merge
+        still files its gate. Reading the two columns HERE rather than at the automerge
+        site is the same one-home rule the paragraph below states.
+
         One home for the rule, for `arbitrate`'s reason — a rule spread across three call
         sites is a rule that holds by luck (spec 2026-09-14 §5.2).
 
@@ -3033,7 +3068,18 @@ class ProjectStore:
         """
         if round_row is None or round_row["outcome"] != "passed":
             return None
-        return str(round_row["head_sha"] or "") or None
+        judged = str(round_row["head_sha"] or "")
+        if not judged:
+            # A carry can never manufacture a binding where the seats bound none: the
+            # whole licence for carrying is "this differs from what was judged by a base
+            # merge", and there is nothing to differ from. Belt to `carry_validated_head`'s
+            # braces, which refuses to write one.
+            return None
+        # `.get`, unlike the two lookups above: this column arrived after the rule did,
+        # and the callers that build a round row by hand (the decision table in
+        # `tests/test_automerge.py`) must keep meaning "never carried" rather than
+        # raising. A real row always has it — `_migrate` sees to that.
+        return str(round_row.get("carried_head_sha") or "") or judged
 
     def validation_rounds(self, *, wo_id: str | None = None,
                           fo_id: str | None = None) -> list[dict[str, Any]]:
@@ -3120,6 +3166,19 @@ class ProjectStore:
             (subject_id,),
         ).fetchone()
         return dict(row) if row else None
+
+    def carry_round_head(self, round_id: int, head_sha: str, reason: str) -> None:
+        """Bind a passed round's verdict to a commit the OS itself produced.
+
+        Writes `carried_head_sha`/`carried_reason` and NEVER touches `head_sha` — see those
+        columns. The guard that decides whether this may be called at all is
+        `ops.carry_validated_head`; this is only the write, kept dumb for the reason
+        every other writer here is: a rule enforced in two places is enforced in one and
+        copied in the other.
+        """
+        self.conn.execute(
+            "UPDATE validation_rounds SET carried_head_sha=?, carried_reason=? WHERE id=?",
+            (head_sha, reason, round_id))
 
     def record_validation_opinion(self, round_id: int, seat: str, *, reply: str = "",
                                   verdict: str = "", status: str = "ok",

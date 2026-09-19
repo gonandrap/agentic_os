@@ -1127,6 +1127,47 @@ elif argv[:2] == ["pr", "view"]:
         sys.exit(1)
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["run", "list"]:
+    # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
+    # on "was main red when this check ran", and a fake that answered one list for every
+    # branch could not express a red base and a green one in the same test.
+    branch = argv[argv.index("--branch") + 1] if "--branch" in argv else ""
+    limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else 30
+    rows = json.loads(os.environ.get("FAKE_GH_RUNS", "{}")).get(branch, [])
+    print(json.dumps(rows[:limit]))
+elif argv[:2] == ["pr", "update-branch"]:
+    # THE WRITE, AND IT MODELS THE MERGE REF RATHER THAN MOCKING THE OUTCOME. This is
+    # where a test of this feature is easiest to get vacuously right: a fake that simply
+    # turned the checks green would pass an implementation that RE-RAN the build, which
+    # is measured not to work (a re-run replays the same merge commit). So this does what
+    # GitHub does — it moves headRefOid, and it leaves the checks exactly as they were.
+    # Only a test that then registers the NEW build gets a green pull request, and an
+    # implementation that never moves the head never gets one at all.
+    prs = roster()
+    url = argv[2] if len(argv) > 2 else ""
+    pr = prs.get(url)
+    if pr is None:
+        sys.stderr.write("no pull requests found for this URL\n")
+        sys.exit(1)
+    refuse = os.environ.get("FAKE_GH_REFUSE_UPDATE")
+    if refuse:
+        sys.stderr.write(refuse + "\n")
+        sys.exit(1)
+    if pr.get("mergeable") == "CONFLICTING":
+        # GitHub refuses rather than resolving — the property `ci.update_branch` rests
+        # its "adds no authored content" claim on.
+        sys.stderr.write("merge conflict between base and head\n")
+        sys.exit(1)
+    try:
+        with open(merged_path) as f:
+            landed = json.load(f)
+    except (OSError, ValueError):
+        landed = {}
+    moved = os.environ.get("FAKE_GH_UPDATED_HEAD") or (pr.get("headRefOid", "") + "u")
+    landed[url] = {**landed.get(url, {}), "headRefOid": moved}
+    with open(merged_path, "w") as f:
+        json.dump(landed, f)
+    print(f"Updated branch of pull request {url}")
 elif argv[:2] == ["pr", "diff"]:
     prs = roster()
     pr = prs.get(argv[2] if len(argv) > 2 else "")
@@ -1550,6 +1591,55 @@ def fake_gh(tmp_path, monkeypatch):
                 held = json.loads(landed.read_text())
                 if held.pop(pr_url, None) is not None:
                     landed.write_text(json.dumps(held))
+
+        runs: dict[str, list[dict]] = {}
+
+        def set_runs(self, branch: str, rows: list[dict]) -> None:
+            """Register what `gh run list --branch <branch>` answers, NEWEST FIRST.
+
+            `rows` are `gh`'s own shape — `databaseId`, `headSha`, `conclusion`,
+            `status`, `startedAt`, `workflowName`. Lower-case conclusions, because that
+            is what the real CLI answers here and upper-case is what it answers on a
+            check run; a fixture that smoothed the two over would hide the normalisation
+            `ci.Run` exists to do.
+            """
+            self.runs[branch] = list(rows)
+            monkeypatch.setenv("FAKE_GH_RUNS", json.dumps(self.runs))
+
+        def refuse_update(self, message: str = "failed to update branch") -> None:
+            """Make `gh pr update-branch` fail and NOTHING else — reads keep working.
+
+            `fail()` is the wrong tool: it fails `pr view` too, so the poll never reaches
+            the update and every assertion about a refused one passes vacuously.
+            """
+            monkeypatch.setenv("FAKE_GH_REFUSE_UPDATE", message)
+
+        def updated_head(self, sha: str) -> None:
+            """What the next `gh pr update-branch` moves `headRefOid` to.
+
+            Named rather than derived when a test needs to talk about the new commit —
+            the verdict carry-forward binds to it, so a test asserting the carry has to
+            be able to write the sha down.
+            """
+            monkeypatch.setenv("FAKE_GH_UPDATED_HEAD", sha)
+
+        @property
+        def updates(self) -> list[str]:
+            """Every pull request `gh pr update-branch` was called on, in order."""
+            return [c["argv"][2] for c in self.calls
+                    if c["argv"][:2] == ["pr", "update-branch"] and len(c["argv"]) > 2]
+
+        @property
+        def reruns(self) -> list[str]:
+            """Every `gh run rerun` — which must always be EMPTY.
+
+            The plausible wrong implementation of the inherited-failure heal, and it
+            fails silently: a re-run replays the same merge commit, so it comes back red
+            having spent full CI. A test asserting the heal happened would pass on it;
+            only a test asserting this list is empty catches it.
+            """
+            return [" ".join(c["argv"]) for c in self.calls
+                    if c["argv"][:2] == ["run", "rerun"]]
 
         def set_pr_artifact(self, pr_url: str, *, diff: str = "", title: str = "",
                     body: str = "", files: list[dict] | None = None,

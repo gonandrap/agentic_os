@@ -3691,24 +3691,37 @@ class Daemon:
         * **open with a failing check** — the same, with a different message
           (`ops.PR_CHECKS`, and
           docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
-          A check that is merely not green is NOT this: `github.RED_CONCLUSIONS`.
+          A check that is merely not green is NOT this: `github.RED_CONCLUSIONS`. And it
+          is not the worker's problem either until `heal_inherited_failure` has ruled
+          out the base — a check that failed because `main` was broken when it ran is
+          one no push can fix, so the OS heals or holds it and the worker never hears.
         * **open, mergeable and green** — nothing to do, and nothing written unless a
           repair episode is being closed.
 
         THE LAST ONE IS THE BUDGET, because it is the overwhelmingly common case: one
-        `gh` call and THREE indexed reads per pull request, no write. The three are one
+        `gh` call and FOUR indexed reads per pull request, no write. The four are one
         per question this branch has to ask the timeline — was a closure already
         reported (`pr_closure_told`), is a conflict episode open, is a checks episode
-        open — and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing
-        else on the path touches the database: the work-order row itself is re-read only
-        when a clear has just run, and the step's `list_work_orders` is one query for the
-        whole project however many pull requests it has.
+        open, and is a "waiting for the base" note still up (`ops.record_base_health`) —
+        and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing else on
+        the path touches the database: the work-order row itself is re-read only when a
+        clear has just run, and the step's `list_work_orders` is one query for the whole
+        project however many pull requests it has.
 
         That sentence used to say "one indexed read" and had been false since this body
         was rewritten. It is a claim worth keeping honest rather than deleting —
-        `tests/test_pr_checks.py` counts the statements, so a fourth read fails a test
+        `tests/test_pr_checks.py` counts the statements, so a fifth read fails a test
         instead of quietly costing the fleet a query every two minutes per open pull
         request.
+
+        The fourth was bought deliberately and it is the cheaper of two wrong answers: a
+        pull request that goes green while its base is still broken would otherwise keep
+        a status line saying the OS is waiting for a build that no longer blocks it. It
+        is paid INSIDE `checks_green`, so a queued or failing pull request pays nothing.
+
+        **A RED PULL REQUEST COSTS MORE, AND ONLY A RED ONE.** `heal_inherited_failure`
+        adds one `gh run list` per PROJECT per tick — shared across every pull request in
+        the loop, filled lazily, and never called at all while the fleet is green.
 
         **The automatic merge costs that case NOTHING, and its own cost is counted too.**
         `Daemon.auto_merge` returns on `project.validation.auto_merge` before it reads
@@ -3741,6 +3754,15 @@ class Daemon:
         if not parked:
             return
         from . import github, ops
+
+        # THE BASE'S CI, READ ONCE PER PROJECT PER TICK AND LAZILY — `heal_inherited_
+        # failure` fills this only when some pull request is actually failing, so a
+        # project whose pull requests are all green never makes the call. Sharing it
+        # across the loop is what makes the heal FLEET-WIDE rather than per pull
+        # request: the tick after `main` goes green, EVERY parked order carrying a stale
+        # red check is rebuilt, including the ones with no repair episode and no session
+        # to nudge — not just the two that happened to have a worker being nudged.
+        base_ci: dict[str, tuple[Any, ...] | None] = {}
 
         for wo in parked:
             try:
@@ -3801,14 +3823,23 @@ class Daemon:
                     # conflict. `record_only` cannot merge or propose.
                     self.auto_merge(project, store, wo, pr, record_only=True)
                 elif pr.failing:
-                    self.heal_pull_request(
-                        project, store, wo, ops.PR_CHECKS,
-                        f"has failing checks ({', '.join(pr.failing)})",
-                        failing=", ".join(pr.failing),
-                        # BEHIND rides along with a nudge that was going out anyway and
-                        # never causes one: spec §5.
-                        behind=(ops.PR_BEHIND_NOTE.format(base=pr.base_ref or "its base")
-                                if pr.behind else ""))
+                    # IS THIS THE BRANCH'S FAILURE AT ALL? A check that failed because
+                    # the BASE was broken when it ran is one no worker can fix, and
+                    # nudging one costs a whole conversation re-send per attempt for an
+                    # answer that cannot change (wo-43c4c665 and wo-b2f88616, three turns
+                    # and ~USD 5.22 each). This step heals it or holds it; only when it
+                    # does neither does the worker hear about it.
+                    handled, pr = self.heal_inherited_failure(project, store, wo, pr,
+                                                              base_ci)
+                    if not handled:
+                        self.heal_pull_request(
+                            project, store, wo, ops.PR_CHECKS,
+                            f"has failing checks ({', '.join(pr.failing)})",
+                            failing=", ".join(pr.failing),
+                            # BEHIND rides along with a nudge that was going out anyway
+                            # and never causes one: spec §5.
+                            behind=(ops.PR_BEHIND_NOTE.format(
+                                base=pr.base_ref or "its base") if pr.behind else ""))
                     self.auto_merge(project, store, wo, pr, record_only=True)
                 else:
                     healed = pr.mergeable_now and ops.clear_pr_repair(
@@ -3833,6 +3864,15 @@ class Daemon:
                         if ops.clear_pr_repair(store, row, ops.PR_CHECKS):
                             log.info("[%s] %s is green again — %s stopped failing",
                                      project.name, wo["pr_url"], wo["id"])
+                        # ...and take down "waiting for main to go green" if it is up.
+                        # THE FOURTH INDEXED READ THE BUDGET ABOVE NAMES, and it is here
+                        # rather than on every poll: a pull request that goes green
+                        # while its base is still red (its checks predate the breakage)
+                        # would otherwise keep a status line saying the OS is waiting for
+                        # a build that no longer blocks it. Inside `checks_green`, so a
+                        # queued or failing pull request pays nothing for it.
+                        ops.record_base_health(store, wo, red=False,
+                                               base=pr.base_ref or "its base")
                     # AFTER the repairs clear, and inside the same branch: a pull request
                     # the OS is still nudging a worker about is not one it may merge.
                     # The repair branches above call this too, `record_only` — which
@@ -4384,6 +4424,124 @@ class Daemon:
             else:
                 store.clear_attention(wo["id"])
         return True
+
+    def heal_inherited_failure(self, project: ProjectSpec, store: ProjectStore,
+                               wo: dict, pr: Any,
+                               base_ci: dict[str, Any]) -> tuple[bool, Any]:
+        """A pull request red only because its base was. Heal it, or wait for the base.
+
+        Returns `(handled, pr)`. `handled` false means this is the branch's own failure
+        and the caller nudges the worker exactly as before; the pull request comes back
+        because a successful heal re-reads it, and the caller's `auto_merge` must decide
+        against the head the update produced rather than the one it replaced.
+
+        docs/superpowers/specs/2026-09-18-a-red-base-heals-itself.md. Three outcomes:
+
+        * **HOLD** (`handled`, nothing written but a transition). The base is red NOW.
+          Nothing the worker pushes can pass, so no attempt is spent and no message is
+          queued — the wasted-turn case this whole step exists for. `invariants.
+          base_red_note` renders what is being waited for, so the work order reads
+          "waiting for `main` to go green" rather than saying nothing at all.
+        * **HEAL** (`handled`). The base was red when the check ran and is green now:
+          update the branch so GitHub rebuilds the merge ref against a base that works,
+          then carry the panel's verdict to the commit that produced.
+        * **FALL THROUGH** (not `handled`). Everything else, including a second red
+          after a heal — then the failure is the branch's own and the worker nudge is
+          right.
+
+        **A RE-RUN WOULD NOT WORK AND THE MEASUREMENT SAYS SO** — see `ci.update_branch`.
+        A re-run replays the same merge commit, so it reproduces an inherited failure for
+        ever at full CI cost; both re-runs tried on production 2026-09-18 came back red.
+
+        **THE TWO GUARDS ARE `heal_pull_request`'S, MINUS THE ONES ABOUT MESSAGES.** No
+        session and a queued message do not matter here — nothing is being said to
+        anybody — but a turn in flight and an open validation round both do, and for the
+        stronger reason: this MOVES THE BRANCH HEAD. Under a running worker that is a
+        push it did not make; under an open round it is the branch moving beneath the
+        seats mid-judgement, which is exactly the hazard Neo question 283 ruled on.
+        Deferred, never dropped: the next tick finds the same red pull request.
+        """
+        from . import ci, github, ops
+
+        base_ref = pr.base_ref or ""
+        # The workflows THIS pull request is failing, de-duplicated and in order. A
+        # legacy commit status carries none, and a pull request failing only those is
+        # not one this heal can judge — it falls through, which is today's behaviour.
+        workflows = tuple(dict.fromkeys(
+            c.get("workflow") or "" for c in pr.red if c.get("workflow")))
+        if not base_ref or not workflows:
+            return False, pr
+
+        if base_ref not in base_ci:
+            try:
+                base_ci[base_ref] = ci.base_runs(base_ref, cwd=project.path)
+            except github.GitHubError as e:
+                # Cached as None so one unreadable base costs one call per tick rather
+                # than one per parked pull request. Falling through is the safe
+                # direction: not knowing whether the base is broken must never suppress
+                # a nudge that would otherwise go out.
+                log.debug("[%s] could not read %s's CI: %s", project.name, base_ref, e)
+                base_ci[base_ref] = None
+        runs = base_ci[base_ref]
+        if runs is None:
+            return False, pr
+
+        if ci.base_is_red(runs, workflows):
+            if ops.record_base_health(store, wo, red=True, base=base_ref):
+                log.info("[%s] %s is red — holding %s rather than nudging it",
+                         project.name, base_ref, wo["id"])
+            return True, pr
+        ops.record_base_health(store, wo, red=False, base=base_ref)
+
+        if not any(ci.inherited(c, runs) for c in pr.red):
+            return False, pr
+        base_sha = ci.base_sha(runs, workflows)
+        if not base_sha or ops.base_heal_spent(store, wo["id"], base_sha):
+            # Already rebuilt on this base and still red: the failure is the branch's
+            # own. `ops.base_heal_spent` for why a refused update counts too.
+            return False, pr
+        if worker_session.busy(store, wo["id"]) or store.validation_round_open(wo["id"]):
+            log.debug("[%s] %s is in flight — base heal deferred", project.name,
+                      wo["id"])
+            return True, pr
+
+        # READ BEFORE THE UPDATE. `carry_validated_head`'s fact 2: the verdict may only
+        # be carried if the commit the panel accepted is the one this update is about to
+        # replace, and after the update there is no way to ask that question.
+        judged = ProjectStore.validated_head(
+            store.latest_validation_round(wo_id=wo["id"])) or ""
+        head_before = pr.head_oid
+        try:
+            ci.update_branch(wo["pr_url"], cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] could not rebuild %s against %s: %s", project.name,
+                     wo["pr_url"], base_ref, e)
+            ops.record_base_update_failed(store, wo, base=base_ref, base_sha=base_sha,
+                                          reason=e.reason)
+            return False, pr
+        try:
+            pr = github.pr_view(wo["pr_url"], cwd=project.path)
+        except github.GitHubError as e:
+            # The update LANDED; only the read back failed. Recorded with the head
+            # unmoved, which refuses the carry — the next tick reads the real head and
+            # the pull request holds `sha_moved` until a round is forced, which is worse
+            # than a carry and much better than carrying to a commit nobody confirmed.
+            log.info("[%s] rebuilt %s but could not re-read it: %s", project.name,
+                     wo["pr_url"], e)
+        ops.record_base_update(store, wo, base=base_ref, base_sha=base_sha,
+                               head_before=head_before, head_after=pr.head_oid,
+                               checks=pr.failing)
+        log.info("[%s] %s was red only because %s was — rebuilt it against %s",
+                 project.name, wo["pr_url"], base_ref, base_sha[:10])
+        if judged and judged == head_before:
+            carried = ops.carry_validated_head(store, wo, judged=judged,
+                                               head_after=pr.head_oid, base=base_ref,
+                                               base_sha=base_sha)
+            if carried:
+                log.info("[%s] carried round %s's verdict from %s to %s on %s",
+                         project.name, carried["round"], judged[:10],
+                         carried["carried_head_sha"][:10], wo["id"])
+        return True, pr
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                           repair: Any, what: str, **fields: Any) -> None:
