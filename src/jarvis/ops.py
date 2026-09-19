@@ -1762,16 +1762,32 @@ def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
 #: fragment and an `abc#1` cannot match — this is the GitHub shorthand, written on purpose.
 ISSUE_MENTION_RE = re.compile(r"(?<![\w/])#([0-9]{1,7})(?![0-9])")
 
-#: A full issue URL SOMEWHERE IN a body of prose. `issues.ISSUE_URL_RE` is anchored at
+#: SOMETHING ISSUE-URL-SHAPED in a body of prose. `issues.ISSUE_URL_RE` is anchored at
 #: both ends — it answers "is this string a URL", which is the question a write asks —
-#: and cannot scan. The character classes are deliberately identical, so anything this
-#: finds is something that one will accept.
+#: and cannot scan. This one only FINDS candidates: the host and the repository are left
+#: out of the capture on purpose, because nothing here decides whether a match belongs to
+#: the project. `issue_url_for` decides that, by string equality, for both shapes below.
 ISSUE_LINK_RE = re.compile(
-    r"https://[A-Za-z0-9.-]+/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/[0-9]+(?![0-9])")
+    r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/([0-9]+)(?![0-9])")
 
 
 def issue_url_for(repo: str, number: int) -> str:
+    """THE ONE DEFINITION of what a project's own issue URL looks like — host included.
+
+    Every path that decides "is this issue ours" compares against this rather than
+    picking fields out of a URL, because a comparison that reads only the owner and the
+    repository accepts `https://attacker.example/<owner>/<repo>/issues/7` as the
+    project's own. That URL then reaches `tracked_issues` under the real repository name
+    and the daemon's sweep points `gh` at a host nobody in this project chose. A brief is
+    not always written by the user (the tracker is public), so the destination of a write
+    must never be derived from prose — only ever compared with a locally-derived one.
+    """
     return f"https://github.com/{repo}/issues/{number}"
+
+
+def is_own_issue_url(url: str, repo: str, number: int) -> bool:
+    """Case-insensitive because GitHub is; host, owner, repository and number all count."""
+    return (url or "").lower() == issue_url_for(repo, number).lower()
 
 
 def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
@@ -1780,7 +1796,9 @@ def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
     TWO SHAPES, AND THE SECOND IS DELIBERATELY NARROWER THAN THE FIRST.
 
     * A FULL ISSUE URL on this project's own repository counts outright: `/issues/N`
-      cannot be anything but an issue, and nobody pastes one by accident.
+      cannot be anything but an issue, and nobody pastes one by accident. ON THIS
+      PROJECT'S OWN is decided by `is_own_issue_url` — the whole URL, host and all — and
+      what is stored is the URL that check was made against, never the prose's own text.
     * A BARE `#N` counts only for an issue the project ALREADY TRACKS. `#N` is also how
       a pull request is written, and the OS cannot tell the two apart without a network
       call it must not make here — so an unrecognised number is left alone rather than
@@ -1794,8 +1812,9 @@ def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
     body = text or ""
     found: dict[str, None] = {}
     for match in ISSUE_LINK_RE.finditer(body):
-        if f"{match.group(1)}/{match.group(2)}".lower() == repo.lower():
-            found.setdefault(match.group(0), None)
+        number = int(match.group(1))
+        if is_own_issue_url(match.group(0), repo, number):
+            found.setdefault(issue_url_for(repo, number), None)
     for match in ISSUE_MENTION_RE.finditer(body):
         url = issue_url_for(repo, int(match.group(1)))
         if url in known:
@@ -1840,11 +1859,16 @@ def record_issue_references(store: ProjectStore, project_path: Path,
 
 
 def issues_on(url: str, repo: str) -> bool:
-    """Is `url` an issue URL on `repo`? The local half of `checked_issue_url`."""
+    """Is `url` an issue URL on `repo`? The local half of `checked_issue_url`.
+
+    The anchored match is what proves the string is a URL and nothing but a URL; the
+    NUMBER is all that is taken from it, and the rest is decided against
+    `issue_url_for` — see there for why no field of a URL may be trusted on its own.
+    """
     from .issues import ISSUE_URL_RE
 
     match = ISSUE_URL_RE.match(url or "")
-    return bool(match) and f"{match.group(2)}/{match.group(3)}".lower() == repo.lower()
+    return bool(match) and is_own_issue_url(url, repo, int(match.group(4)))
 
 
 #: What a unit with no linked issue projects. ALWAYS PRESENT, `NO_FOLLOW_UPS`'s rule:

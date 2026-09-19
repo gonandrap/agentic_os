@@ -198,6 +198,7 @@ def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
     "--repo=someone/else",                                   # reads as a flag
     "https://github.com/gonandrap/agentic_os/issues/7/x",    # not anchored
     "https://github.com/someone/else/issues/7",              # another repository
+    "https://evil.example/gonandrap/agentic_os/issues/7",    # the repository, another HOST
     "https://github.com/gonandrap/agentic_os/pull/7",        # not an issue
 ])
 def test_the_os_refuses_to_write_anywhere_but_its_own_tracker(url):
@@ -231,6 +232,12 @@ def test_a_caller_may_name_its_own_repository_and_is_still_held_to_it():
     # ...and naming a repository does not relax the SHAPE rule either.
     with pytest.raises(issues.IssueLifecycleError):
         issues.checked_issue_url("--repo=acme/proj_a", "acme/proj_a")
+    # ...nor does it let the HOST through. A URL is `<host>/<owner>/<repo>/issues/N` and
+    # the caller names only the middle: match on owner and repository alone and the
+    # project's real name under an attacker's host reads as the project's own.
+    with pytest.raises(issues.IssueLifecycleError):
+        issues.checked_issue_url("https://evil.example/acme/proj_a/issues/12",
+                                 "acme/proj_a")
 
 
 def test_the_default_is_still_the_os_tracker():

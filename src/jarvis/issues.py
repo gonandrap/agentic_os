@@ -77,6 +77,12 @@ ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
 #: same reason: the daemon's reconcile tick must not block on a network problem.
 GH_TIMEOUT = 30
 
+#: THE ONLY HOST this OS writes an issue to. `gh` talks to github.com and every URL the
+#: OS mints (`ops.issue_url_for`, and `gh issue create`'s own output) is on it, so this
+#: is a statement of fact rather than a policy — and it is what `checked_issue_url` holds
+#: a URL out of a RECORD to, since a record's issue URL can come from a brief.
+ISSUE_HOST = "github.com"
+
 #: The ONLY shape an issue URL may have before it becomes an argument — anchored at both
 #: ends, `https://` required, which is also what makes a leading `-` unreachable so no
 #: argument can be read as a `gh` flag. `github.PR_URL_RE`'s twin.
@@ -258,6 +264,14 @@ def checked_issue_url(url: str, repo: str | None = None) -> str:
             f"{url!r} is not an issue URL this OS will write to",
             GitHubError.URL_REFUSED)
     want = (repo or bug_repo()).lower()
+    # THE HOST COUNTS, and is checked before the repository so the message names the
+    # actual objection. A URL is `<host>/<owner>/<repo>/issues/N`, so reading only the
+    # middle two accepts the project's real owner and repository under a host nobody
+    # chose — and this function is the last thing between a URL and a `gh` write.
+    if match.group(1).lower() != ISSUE_HOST:
+        raise IssueLifecycleError(
+            f"{url!r} is on {match.group(1)}, but this OS only writes to {ISSUE_HOST}",
+            GitHubError.URL_REFUSED)
     got = f"{match.group(2)}/{match.group(3)}".lower()
     if got != want:
         raise IssueLifecycleError(

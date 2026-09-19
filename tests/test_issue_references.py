@@ -158,6 +158,30 @@ def test_an_issue_on_another_repository_is_not_linked(fleet, tracker):  # noqa: 
     assert links(fleet, wo["id"]) == []
 
 
+def test_the_same_owner_and_repository_on_another_host_is_not_linked(fleet, tracker):  # noqa: F811
+    """THE HOST IS PART OF THE IDENTITY, and this is the case that makes it a write path.
+
+    A brief is not always written by the user — the tracker is public and its text reaches
+    a work order. A URL carrying the project's REAL owner and repository under a host
+    nobody chose used to be admitted as the project's own, land in `tracked_issues` under
+    the real repository name, and be handed to the daemon's sweep, which points `gh` at
+    whatever it was given. Reading a URL field by field is what allows that; the whole
+    string is compared against `ops.issue_url_for`, which hardcodes github.com.
+
+    Both shapes that reach a tracker, because they were two separate holes: a citation
+    scanned out of PROSE, and the `issue_url` an order is ASSIGNED.
+    """
+    evil = f"https://evil.example/{REPO}/issues/7"
+
+    cited = ops.create_work_order("proj_a", "Do the thing", description=f"see {evil}")
+    assigned = ops.create_work_order("proj_a", "Fix the thing", issue_url=evil)
+
+    assert links(fleet, cited["id"]) == []
+    assert links(fleet, assigned["id"]) == []
+    assert not ops.issues_on(evil, REPO)
+    assert ops.issues_on(f"{SERIES}/7", REPO)
+
+
 def test_one_order_counts_once_and_the_strongest_link_wins(fleet, tracker):  # noqa: F811
     """THE COUNT IS OF DISTINCT WORK ORDERS. An order that raised an issue and then cites
     it — a later brief quoting its own finding — must not count twice, and re-recording
