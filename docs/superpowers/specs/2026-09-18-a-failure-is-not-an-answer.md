@@ -78,6 +78,32 @@ A roster seat with no opinion at all counts as unreached. `run_blind` returns on
 per prompt and `_run_seat` never raises, so it cannot happen today; if it ever does, a
 veto nobody recorded is a veto nobody heard.
 
+### Three answers to "was this seat reached", not two (review round 2)
+
+`Opinion.refused` is a third case, and it needs its own question because the two it sits
+between want opposite things:
+
+| | what it is | what the round does |
+| --- | --- | --- |
+| `refused` | the account's window is spent; the reply names when it lifts | **wait it out**, spending no attempt |
+| unreached, not refused | the transport dropped the call | retry on the 60/300/900 ladder |
+| `unavailable` | no definition ships in this build | exempt for ever; proceed without it |
+
+Collapsing a refusal into the second is issue #235 — three retries in twenty minutes
+against a window measured in hours. Collapsing it into the third is a gate closed with the
+blast-radius veto absent. `panel.decide` therefore checks `refused_veto_seats` **before**
+`unreachable_veto_seats` and raises `UsageLimitError`, so `drain_queue` takes its
+usage-limit branch and `NeoStore.hold_claim` parks the question until `reset_at`. That
+ordering is the same one `drain_queue` and `daemon._validate_work_order` already state.
+
+A refused seat is *also* returned by `unreachable_veto_seats`, deliberately: if the
+ordering is ever lost it must still stop the verdict. Degrading to a slow retry is
+survivable; taking a verdict without the veto is not.
+
+A refusal at a seat that can force nothing (`taste`) is not held — it costs the decision
+no authority, and holding on it would stall the queue on the one seat whose silence is
+harmless.
+
 ## 4. The supervisor's alarm queue
 
 `_transport_failure` returned `decision: "escalate"` and `_apply` wrote `status='failed'`
@@ -122,10 +148,12 @@ message it exists to notice.
 
 ## 8. Testing
 
-`jarvis.testing.transport_faults` is the fault-injection harness: one named fault per
-production shape — `rc1_empty` (the exact shape of question 388), `timeout`,
-`empty_stdout`, `malformed_json`, `usage_limit`, `mid_stream_disconnect`. Every site in
-this spec is driven through every applicable fault, asserting that nothing was decided,
+`jarvis.testing` carries the fault-injection harness: one named fault per production
+shape — `rc1_empty` (the exact shape of question 388), `timeout`, `empty_stdout`,
+`malformed_json`, `usage_limit`, `mid_stream_disconnect` — plus `fake_claude.fail_seat`
+and its round-2 sibling `fake_claude.refuse_seat`, which emits the real result JSON so a
+test exercises `claude_cli.usage_limit` and `Opinion.refused` rather than stand-ins for
+them. Every site in this spec is driven through every applicable fault, asserting that nothing was decided,
 nothing was delivered, the unit is still pending and retryable with `attempts`
 incremented, a later successful call answers it properly, the user is asked for nothing
 until the retries are spent, and the surfaced item then says **unreachable**.

@@ -813,6 +813,81 @@ def test_an_approval_gate_is_never_settled_a_veto_seat_short(store, fake_claude)
         panel.decide(store, q, full())
 
 
+# -- review round 2: a veto seat the WINDOW refused ------------------------------------
+
+
+@pytest.mark.parametrize("seat", ["blast", "record"])
+def test_a_refused_veto_seat_raises_the_usage_limit_not_a_generic_outage(
+        store, fake_claude, seat):
+    """REVIEW ROUND 2. A spent window is a THIRD answer to "was this seat reached".
+
+    Raised generically it lands in `drain_queue`'s transport branch and burns all three
+    retries in twenty minutes against a window measured in hours — issue #235, the shape
+    spec §1 says never to repeat. It must carry the refusal, and with it `reset_at`.
+    """
+    fake_claude.refuse_seat(seat)
+    q = claim(store, "which delimiter?")
+
+    with pytest.raises(claude_cli.UsageLimitError) as caught:
+        panel.decide(store, q, full())
+
+    assert caught.value.limit is not None
+    assert caught.value.limit.reset_at is not None, (
+        "the held question needs the moment the window reopens, or it is guessing"
+    )
+    assert "chair" not in {r["seat"] for r in store.opinions(q["id"])}, (
+        "the chair synthesised a verdict with the veto seat absent"
+    )
+
+
+def test_a_refused_veto_seat_is_recorded_as_refused_by_the_real_seat_runner(
+        store, fake_claude):
+    """The chain under the test above, driven rather than assumed: the fake emits the
+    real result JSON, `claude_cli.usage_limit` classifies it, `_run_seat` carries it on
+    `Opinion.refused`, and `refused_veto_seats` reads THAT — not a status string."""
+    fake_claude.refuse_seat("blast")
+    q = claim(store, "which delimiter?")
+
+    captured: list = []
+    real_round = panel._round                                      # noqa: SLF001
+
+    def spy(*args, **kwargs):
+        ops_ = real_round(*args, **kwargs)
+        captured.extend(ops_)
+        return ops_
+
+    monkeypatch_round(panel, spy)
+    try:
+        with pytest.raises(claude_cli.UsageLimitError):
+            panel.decide(store, q, full())
+    finally:
+        monkeypatch_round(panel, real_round)
+
+    blast = next(op for op in captured if op.seat == "blast")
+    assert blast.refused is not None, "the refusal never reached the Opinion"
+    assert blast.unavailable is False, "a refusal is not a seat this build cannot run"
+    roster = ["premise", "record", "blast", "taste"]
+    assert [s for s, _ in panel.refused_veto_seats(captured, roster)] == ["blast"]
+    assert "blast" in panel.unreachable_veto_seats(captured, roster), (
+        "a refused seat must also read as unreached, so losing the ordering in `decide` "
+        "degrades to a slow retry rather than to a verdict taken without the veto"
+    )
+
+
+def test_a_refusal_at_a_seat_that_can_force_nothing_still_decides(store, fake_claude):
+    """The control. `taste` holds no veto, so losing it to the window costs the decision
+    no authority — and a rule that held the question for ANY refused seat would stall
+    the queue on the one seat whose silence is harmless."""
+    fake_claude.refuse_seat("taste")
+    q = claim(store, "which delimiter?")
+
+    result = panel.decide(store, q, full())
+
+    assert result["panel"]["route"] == "panel"
+    rows = {r["seat"]: r["status"] for r in store.opinions(q["id"])}
+    assert rows["taste"] == "abstained" and rows["chair"] == "ok"
+
+
 def test_a_transport_fault_at_a_veto_seat_is_caught_however_it_is_recorded(
         store, fake_claude):
     """REVIEW ROUND 1. The predicate must key on whether the seat was REACHED, not on

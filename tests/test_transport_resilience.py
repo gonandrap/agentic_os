@@ -337,6 +337,45 @@ def test_a_silent_veto_seat_never_becomes_a_vote():
     assert panel.arbitrate(silent) is None
 
 
+def test_a_refused_veto_seat_holds_the_question_and_spends_no_attempt(asked,
+                                                                      fake_claude):
+    """REVIEW ROUND 2, END TO END — the property the whole ladder turns on.
+
+    A usage-limit refusal at `blast` must reach `NeoStore.hold_claim` through
+    `drain_queue`'s `UsageLimitError` branch: parked until the window reopens, with
+    `attempts` untouched. Through the generic branch instead it would spend all three
+    retries inside twenty minutes against an outage the inbox has measured in hours —
+    GitHub issue #235, which spec §1 says never to repeat.
+    """
+    from jarvis.catalog import NeoConfig, PanelConfig
+
+    fake_claude.refuse_seat("blast")
+    cfg = NeoConfig(panel=PanelConfig(
+        enabled=True, roster=("premise", "record", "blast", "taste", "chair")))
+    deliver, unreachable = T.Recorder(), T.Recorder()
+
+    store = NeoStore()
+    try:
+        results = neo_mod.drain_queue(
+            store, model=cfg.model, deliver=deliver, unreachable=unreachable,
+            answer=lambda s, question, *a, **k: panel.decide(s, question, cfg))
+    finally:
+        store.close()
+
+    assert not deliver.calls and not unreachable.calls
+    assert results[0]["outcome"] == "held", (
+        f"a refused veto seat took the wrong branch: {results[0]['outcome']}"
+    )
+    q = _q()
+    assert q["status"] == "queued"
+    assert q["attempts"] == 0, (
+        "a spent window burned a transport retry — the issue #235 shape"
+    )
+    assert q["retry_after"] > time.time() + 60, (
+        "the question was not parked until the window reopens"
+    )
+
+
 # -- §4: the supervisor's alarm queue ----------------------------------------------
 
 

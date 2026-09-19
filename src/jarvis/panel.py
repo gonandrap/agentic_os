@@ -352,6 +352,34 @@ def _unresolvable(data: dict[str, Any]) -> bool:
     return str(data.get("contradiction") or "").strip().lower() == "unresolvable"
 
 
+def refused_veto_seats(
+        opinions: Sequence[Opinion],
+        roster: Sequence[str]) -> list[tuple[str, claude_cli.UsageLimit]]:
+    """Veto seats the ACCOUNT refused, in roster order — a spent usage window.
+
+    A THIRD ANSWER TO "was this seat reached", and it needs its own question because the
+    two it sits between want opposite things. A seat the transport dropped is retried in
+    seconds; a seat with no definition is exempted for ever; a seat REFUSED states the
+    moment it can be asked again, so it is neither retried on that ladder nor exempted —
+    it is waited out. Collapsing it into either one is issue #235 in one direction and a
+    missing veto in the other.
+
+    Read from `refused` directly rather than inferred from `status` or `replied`: those
+    are what the seat's call LOOKED like, and this is a fact the refusal itself carried.
+    `seats.Opinion.refused` says in as many words that the caller decides what a refusal
+    means for its round, and for a seat that may veto, this is that decision.
+    """
+    by_seat = {op.seat: op for op in opinions}
+    out: list[tuple[str, claude_cli.UsageLimit]] = []
+    for seat in roster:
+        if seat not in FORCES_ESCALATE:
+            continue
+        op = by_seat.get(seat)
+        if op is not None and op.refused is not None:
+            out.append((seat, op.refused))
+    return out
+
+
 def unreachable_veto_seats(opinions: Sequence[Opinion],
                            roster: Sequence[str]) -> list[str]:
     """Seats that could have forced an escalation and were never reached, in roster order.
@@ -375,6 +403,12 @@ def unreachable_veto_seats(opinions: Sequence[Opinion],
     A roster seat with no opinion at all counts as unreached. `run_blind` returns one
     Opinion per prompt and `_run_seat` never raises, so it cannot happen today — and if
     it ever does, a veto seat nobody recorded is exactly a veto nobody heard.
+
+    A REFUSED seat is in here too, deliberately. `decide` checks `refused_veto_seats`
+    first and never reaches this for one, so the overlap changes nothing today — but a
+    refused seat was not reached, and if that ordering is ever lost this must still stop
+    the verdict rather than wave it through. The failure it degrades to is a slower
+    retry; the failure the other way is a gate closed with the veto absent.
     """
     by_seat = {op.seat: op for op in opinions}
     unreached = []
@@ -506,6 +540,22 @@ def decide(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     rest = [s for s in roster if s != "premise"]
     if rest:
         opinions = [*opinions, *_round(store, q, cfg, rest, record)]
+
+    refused = refused_veto_seats(opinions, roster)
+    if refused:
+        # BEFORE the generic outage below, and the ordering IS the fix — `drain_queue`
+        # and `validation.decide` both state it. A spent window is not a transport fault:
+        # raised as `UsageLimitError` it reaches `NeoStore.hold_claim`, which parks the
+        # question until the window reopens and spends no attempt; raised as the generic
+        # error below it would burn all three retries inside twenty minutes against an
+        # outage the inbox has measured in hours (GitHub issue #235, spec §1).
+        #
+        # A refusal is NOT the `unavailable` exemption either. The seat can be asked
+        # again, so the verdict waits for it rather than proceeding without it.
+        seat, limit = refused[0]
+        log.info("panel: %s was refused by the usage window on question %s; "
+                 "holding the question rather than deciding without it", seat, q["id"])
+        raise claude_cli.UsageLimitError(limit)
 
     silent = unreachable_veto_seats(opinions, roster)
     if silent:

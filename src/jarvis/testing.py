@@ -765,6 +765,21 @@ elif "-p" in argv and "--resume" not in argv:
         # of them at once. A degradation test needs to fail exactly one.
         if seat in [s for s in os.environ.get("FAKE_SEAT_FAIL", "").split(",") if s]:
             sys.stderr.write(f"seat {seat} failed (test-forced)\n"); sys.exit(1)
+        # THE USAGE LIMIT, PER SEAT, and it is a different refusal from the line above:
+        # the CLI never reached the API, and the reply NAMES WHEN THE WINDOW REOPENS.
+        # Emitted in the result-JSON shape `claude_cli.usage_limit` parses, so the test
+        # drives the real classifier into a real `UsageLimitError` and a real
+        # `Opinion.refused` — a hand-set `refused` would prove nothing about that chain.
+        if seat in [s for s in os.environ.get("FAKE_SEAT_REFUSE", "").split(",") if s]:
+            reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                                   "11:50pm (America/Los_Angeles)")
+            print(json.dumps({
+                "type": "result", "subtype": "success", "is_error": True,
+                "num_turns": 1, "total_cost_usd": 0, "duration_api_ms": 0,
+                "terminal_reason": "api_error", "api_error_status": 429,
+                "result": "You've hit your session limit · resets " + reset,
+            }))
+            sys.exit(1)
         if "FORCE_SEAT_GARBAGE" in prompt and seat == "premise":
             emit_headless("the premise here is, well, hard to say")
             sys.exit(0)
@@ -1737,6 +1752,20 @@ def fake_claude(tmp_path, monkeypatch):
             """
             env = "FAKE_SEAT_FAIL" if roster == "neo" else "FAKE_VALIDATION_SEAT_FAIL"
             monkeypatch.setenv(env, ",".join(seats))
+
+        def refuse_seat(self, *seats: str,
+                        reset: str = "11:50pm (America/Los_Angeles)") -> None:
+            """Refuse the named Neo panel seats for the USAGE LIMIT, resetting at `reset`.
+
+            `fail_seat`'s sibling, and the distinction is the one the whole retry ladder
+            turns on: a seat that FAILED is a fault to retry in seconds, a seat that was
+            REFUSED names the moment its window reopens and must be waited out instead
+            (GitHub issue #235). The fake emits the real result-JSON shape, so what the
+            test exercises is `claude_cli.usage_limit` and `Opinion.refused` rather than
+            a stand-in for them.
+            """
+            monkeypatch.setenv("FAKE_SEAT_REFUSE", ",".join(seats))
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
 
         def turns_fail(self, mode: str = "fail") -> None:
             """Make subsequent turns fail. `fail` = non-zero exit, `silent` = exits
