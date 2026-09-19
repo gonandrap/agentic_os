@@ -533,3 +533,54 @@ def test_a_turn_keeps_its_own_cost_when_the_dollars_are_not_a_running_total(tmp_
     assert [e["total_cost_usd"] for e in envelopes] == [4.40, 1.10, 2.75]
     assert [m["cost_usd"] for e in envelopes for m in e["by_model"]] == \
         [4.40, 1.10, 2.75]
+
+
+def test_a_rising_per_turn_series_is_still_never_diffed(tmp_path):
+    """The floor arm ALONE, with nothing else left to decide it.
+
+    `test_a_per_turn_envelope_is_never_diffed` above is settled before the floor is
+    reached: its second turn's `input` goes down, so monotonicity rejects it and the
+    third condition is never exercised. Here every class rises turn over turn, the
+    session id is the same throughout, and the envelopes are still per-turn — the
+    pre-2.1.277 shape that a rising series makes indistinguishable from a running total
+    unless the turn's own `usage` is consulted as a floor. Diffing these loses 5.0M of a
+    11.1M turn.
+    """
+    turns = [spend(2, 1_000_000, 4_000_000, 50_000),
+             spend(5, 2_000_000, 9_000_000, 90_000),
+             spend(7, 3_000_000, 14_000_000, 120_000)]
+    for before, after in zip(turns, turns[1:]):
+        assert all(after[c] >= before[c] for c in before), "the fixture must be monotone"
+
+    envelopes = derive_series(tmp_path, turns, turns, [4.10, 9.30, 14.05])
+
+    assert [e["continues"] for e in envelopes] == [False, False, False]
+    assert [e["cache_read"] for e in envelopes] == [own["cache_read"] for own in turns]
+    assert [e["total_cost_usd"] for e in envelopes] == [4.10, 9.30, 14.05]
+
+
+def test_a_turn_with_no_model_usage_is_never_the_next_turn_s_baseline(tmp_path):
+    """A version-1 envelope is not a running total, whatever it carries.
+
+    A result with no `modelUsage` block — an old CLI, or a turn that errored before one
+    was written — is stamped version 1, and it still gets a `reported` block holding the
+    file's own `total_cost_usd` and an EMPTY `by_model`. Consulted as a baseline it is
+    monotone in every class by being empty, so the next turn of the same session reads as
+    a continuation and has the version-1 turn's dollars taken off it: $1.40 billed as
+    $0.90 here. The turn after a version-1 one is read whole.
+    """
+    first = result_json(cost=0.50, session_id="sess-a")
+    first.pop("modelUsage")
+    out = tmp_path / "1.json"
+    out.write_text(json.dumps(first))
+    previous = claude_cli.read_turn_result(out).usage
+    assert previous["usage_v"] == 1
+
+    second = claude_cli.read_turn_result(
+        turn_file(tmp_path, 2, own=spend(2, 100_000, 900_000, 9_000),
+                  cumulative=spend(2, 100_000, 900_000, 9_000), cost=1.40),
+        previous=previous).usage
+
+    assert second["continues"] is False
+    assert second["total_cost_usd"] == pytest.approx(1.40), "a version-1 cost was diffed"
+    assert second["cache_read"] == 900_000

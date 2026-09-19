@@ -419,11 +419,17 @@ def _reported_of(envelope: dict[str, Any] | None) -> dict[str, Any] | None:
     """
     if not isinstance(envelope, dict):
         return None
+    # THE VERSION IS ASKED FIRST, and the `reported` block cannot overrule it. A turn
+    # whose result carried no `modelUsage` at all is stamped version 1 and still gets a
+    # `reported` block — with an empty `by_model` and the file's own `total_cost_usd`.
+    # Read as a baseline it is monotone in every class by being empty, so the turn after
+    # it reads as a continuation and has those dollars subtracted from it: a number that
+    # never accumulated, taken off one that might not have either.
+    if (envelope.get("usage_v") or 1) < 2:
+        return None
     reported = envelope.get("reported")
     if isinstance(reported, dict):
         return reported
-    if (envelope.get("usage_v") or 1) < 2:
-        return None
     return {
         "session_id": envelope.get("session_id") or "",
         "total_cost_usd": envelope.get("total_cost_usd"),
