@@ -98,6 +98,36 @@ def test_the_order_lists_every_follow_up_across_every_round(fleet, tracker):  # 
     assert index["references"] == []
 
 
+def test_the_list_reads_the_finding_even_when_the_tracker_may_not(fleet, tracker):  # noqa: F811
+    """A PUBLIC TRACKER IS TOLD NOTHING, AND THE USER'S OWN LIST STILL READS.
+
+    wo-069d758e's rule: on a repository the OS cannot establish is private, the issue is
+    called `Validation follow-up vf-…` and the seat's words stay out of it. `tracked_issues`
+    caches that title because it is what is really on GitHub — so a list rendered off the
+    cache alone would be fifteen identical rows of a token, on exactly the tracker this
+    project has. The words never left the OS; they are on the filing event, and these
+    surfaces are the user's own.
+    """
+    tracker.set_private(False)
+    fleet.daemon.validator = Validator(verdict("passed", "Name the retry budget"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    store = store_of(fleet)
+    try:
+        index = ops.issue_index(store, wo["id"])
+        rows = store.issue_board()
+    finally:
+        store.close()
+
+    assert [i["title"] for i in index["raised"]] == ["Name the retry budget"]
+    # ...and the cache was not quietly rewritten to say so. What GitHub was told is what
+    # is stored, because the sweep re-reads it and would disagree with anything else.
+    assert "Name the retry budget" not in rows[0]["title"]
+
+
 def test_wo_show_lists_the_follow_ups_and_still_withholds_the_seat(fleet, tracker,  # noqa: F811
                                                                    capsys):
     """The definition of done for the terminal half — and the rule it must not break on

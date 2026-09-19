@@ -192,6 +192,27 @@ def test_every_gh_command_this_module_builds_is_a_declared_issue_verb():
         f"{sorted(verbs - set(issues.ISSUE_VERBS))}")
 
 
+#: The commands in a write module that WRITE NOTHING, and what each is for. Every one of
+#: them earns its place by making a write safe: `issue view` is what makes the label and
+#: close idempotent, `issue list` is the follow-up dedupe, and `repo view` is the privacy
+#: read that decides whether a seat's own words may be published at all (spec §9 of
+#: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
+ISSUE_READS = {("issue", "view"), ("issue", "list"), ("repo", "view")}
+
+
+def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
+    """The AST test above answers "is every command declared?"; this one answers "which
+    commands are declared", which is the question a reader of ISSUE_VERBS has.
+
+    A `<=` check passes the moment a verb is ADDED to the tuple, so on its own it lets the
+    set grow with only a line of production code touched. Pinning the set exactly is what
+    makes a widening land here, in the place the decision gets recorded (`kn-2531869c`).
+    """
+    assert set(issues.ISSUE_VERBS) == ISSUE_READS | {
+        ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
+        ("label", "create"), ("issue", "create")}
+
+
 @pytest.mark.parametrize("url", [
     "",
     "http://github.com/gonandrap/agentic_os/issues/7",      # not https
@@ -262,6 +283,41 @@ def test_a_repository_name_is_checked_before_it_becomes_an_argument(repo):
 
 def test_a_real_repository_name_is_accepted():
     assert issues.checked_repo("acme/proj_a") == "acme/proj_a"
+
+
+# -- is the destination private? the read that decides what may be published -----------
+
+
+def test_a_repository_github_calls_private_is_the_only_one_reported_private(fake_gh):
+    """Both answers off the same read, because "it returns False" is also true of a
+    function that never looks."""
+    fake_gh.set_private(True)
+    assert issues.repo_is_private("acme/proj_a") is True
+    fake_gh.set_private(False)
+    assert issues.repo_is_private("acme/proj_a") is False
+
+
+@pytest.mark.parametrize("break_it, message", [
+    ("fail", "gh: Could not resolve to a Repository with that name"),
+    ("garble_privacy_read", "gh: a warning nobody expected"),
+])
+def test_a_repository_the_os_cannot_read_is_treated_as_public(fake_gh, break_it,
+                                                              message):
+    """FAIL CLOSED: a refusal and an unparseable answer reach the same branch as "public".
+    Unknown is not a third case — the finding text goes out only where the OS has
+    POSITIVELY established the destination is private (spec §9)."""
+    getattr(fake_gh, break_it)(message)
+    assert issues.repo_is_private("acme/proj_a") is False
+
+
+def test_a_repository_name_that_would_read_as_a_flag_is_never_sent(fake_gh):
+    """`gh repo view` takes the repository POSITIONALLY — it has no `--repo` flag — so
+    `checked_repo` is the only thing standing between a name and an argument `gh` would
+    read as an option. It raises, and the blanket `except` turns that into "not
+    private", which is the safe answer for a repository nobody could look up."""
+    assert issues.repo_is_private("--json=isPrivate") is False
+    assert [c for c in fake_gh.calls if c["argv"][:2] == ["repo", "view"]] == [], (
+        "a name that failed the shape check still reached `gh`")
 
 
 # -- where an issue belongs, given its work order -------------------------------------
