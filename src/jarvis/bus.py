@@ -106,13 +106,31 @@ class DeferralRequest:
     description: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ChildrenLanded:
+    """The work orders filed after round `round` have all completed.
+
+    The only event that reaches an idle manager from the reconciler rather than from a
+    reviewer or a worker — see `Daemon._manager_handoff` for why it has to exist.
+    """
+
+    round: int
+    children: tuple[str, ...] = ()
+    note: str = ""
+
+
 #: kind -> the dataclass that IS that kind. Every entry in `ENVELOPE_KINDS` must appear
 #: here; a test walks the tuple rather than listing the kinds, so a kind added without a
 #: payload type fails the suite instead of producing an `undeliverable` row months later.
 PAYLOADS: dict[str, type] = {
     "review_feedback": ReviewFeedback,
     "deferral_request": DeferralRequest,
+    "children_landed": ChildrenLanded,
 }
+#: Every payload type, as one name. Widened rather than spelled out at each signature so
+#: that adding a kind is one entry in PAYLOADS and nothing else.
+Payload = ReviewFeedback | DeferralRequest | ChildrenLanded
+
 #: The reverse lookup `post` derives `kind` from. Built from PAYLOADS so the two cannot
 #: drift.
 KINDS: dict[type, str] = {cls: kind for kind, cls in PAYLOADS.items()}
@@ -120,11 +138,13 @@ KINDS: dict[type, str] = {cls: kind for kind, cls in PAYLOADS.items()}
 #: Roles the router can actually resolve — the whole routing table lives in `resolve`.
 ADDRESSABLE_ROLES = ("implementor", "manager")
 #: Roles that only ever send. `reviewer` has no session of its own: a panel is called,
-#: it is not messaged.
-SENDER_ONLY_ROLES = ("reviewer",)
+#: it is not messaged. `reconciler` is the daemon's own tick, which is nobody's addressee
+#: by construction — the whole point of a reconciler is that it re-derives rather than
+#: waits.
+SENDER_ONLY_ROLES = ("reviewer", "reconciler")
 
 
-def parse_payload(kind: str, payload_json: str | None) -> ReviewFeedback | DeferralRequest:
+def parse_payload(kind: str, payload_json: str | None) -> Payload:
     """Rebuild a stored payload as the dataclass its `kind` names.
 
     Raises BusError if it no longer fits — a schema that moved, a hand-written row, a
@@ -152,7 +172,7 @@ def parse_payload(kind: str, payload_json: str | None) -> ReviewFeedback | Defer
 
 
 def post(store: ProjectStore, *, subject: Subject, from_role: str, to_role: str,
-         payload: ReviewFeedback | DeferralRequest) -> int:
+         payload: Payload) -> int:
     """Queue an envelope. Returns its id.
 
     NEVER resolves — resolution is delivery's job, and a sender that resolved would be a
@@ -253,7 +273,7 @@ def _q(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def render(payload: ReviewFeedback | DeferralRequest, *, project: str = "",
+def render(payload: Payload, *, project: str = "",
            origin_wo_id: str | None = None, origin_fo_id: str | None = None) -> str:
     """The text the recipient's session actually receives.
 
@@ -276,6 +296,13 @@ def render(payload: ReviewFeedback | DeferralRequest, *, project: str = "",
             lines += ["", "What has to change:"]
             lines += [f"- {ask}" for ask in payload.asks]
         lines += ["", "Act on this and continue your work order."]
+        return "\n".join(lines)
+    if isinstance(payload, ChildrenLanded):
+        lines = [f"The work orders you filed after round {payload.round} have landed."]
+        if payload.children:
+            lines += [""] + [f"- {wo_id}" for wo_id in payload.children]
+        if payload.note:
+            lines += ["", payload.note]
         return "\n".join(lines)
     lines = [f"Deferral request: {payload.title}", "", payload.why]
     if payload.description:
@@ -336,7 +363,7 @@ def deliver(store: ProjectStore, central: CentralStore, envelope: dict[str, Any]
 
 
 def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
-             payload: ReviewFeedback | DeferralRequest, *,
+             payload: Payload, *,
              project: str) -> dict[str, Any]:
     """What `render` needs beyond the payload, for the kinds that need anything.
 
@@ -352,7 +379,7 @@ def _context(store: ProjectStore, central: CentralStore, envelope: dict[str, Any
 
 
 def _unfilled(store: ProjectStore, central: CentralStore, envelope: dict[str, Any],
-              payload: ReviewFeedback | DeferralRequest, *, project: str) -> str:
+              payload: Payload, *, project: str) -> str:
     """Nobody fills the role. THE ROUTER decides what happens — never the sender.
 
     Three cases, and they are different verdicts rather than one shrug:

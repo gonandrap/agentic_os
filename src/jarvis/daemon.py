@@ -225,6 +225,31 @@ does (`jarvis wo create <project> "..." --parent {fo_id}`), and once they have l
 `jarvis fo submit {fo_id} --summary "..." --evidence "..."`. Re-submitting without changed
 code or new evidence will end the review."""
 
+#: What an idle manager is told when the work orders it filed after a rejection have all
+#: completed. The reconciler's half of the loop `_reject_feature` starts: see
+#: `Daemon._manager_handoff`.
+FEATURE_CHILDREN_LANDED = """Everything you filed under {fo_id} has completed and its
+code is on the default branch, so the feature is ready to go back to the panel.
+
+If the review's feedback is addressed, run `jarvis fo submit {fo_id} --summary "..."
+--evidence "..."`. If it is not, file the work orders that would address it
+(`jarvis wo create <project> "..." --parent {fo_id}`) and submit once they land."""
+
+#: The two ways the handoff gives up and asks the user instead. Both are the same failure
+#: from the feature's point of view — nobody is going to resubmit it — and they are two
+#: strings because they ask the user for different things.
+FEATURE_MANAGER_SILENT = (
+    "its review was rejected in round {n} and its manager filed no work orders in "
+    "answer, so nothing will resubmit it — decide what has to change, or close it")
+FEATURE_MANAGER_STALLED = (
+    "its manager was told the work orders it filed after round {n} had landed and did "
+    "not resubmit the feature — `jarvis fo submit {fo_id}` is what it was asked to run")
+
+#: `kind` of the event that records what the handoff did about one judged round. The
+#: dedupe key is the EPISODE, `(round, action)` — a new judged round is a new episode, so
+#: a feature rejected twice is nudged twice (kn-089de524).
+FEATURE_HANDOFF_EVENT = "manager_handoff"
+
 #: How many transport outages in a row one round survives before the OS gives up on it.
 #: An outage is not a verdict, so it consumes no round — but retrying for ever would
 #: park a work order in `validating` with nobody watching, which is the exact silent
@@ -988,6 +1013,11 @@ class Daemon:
         manager out of its own loop. Resubmission is the manager's act (`jarvis fo
         submit`), never the reconciler's.
 
+        WHICH IS ONLY HALF A HANDOFF, and until issue #480 the other half did not exist:
+        nothing told the manager the children had landed, so it waited for a message with
+        no sender and the feature parked for ever. `_manager_handoff` is that half, and it
+        belongs here because this is the branch that knows the whole precondition.
+
         Both switches are read here rather than in the round machine, for the reason the
         whole design turns on: `enabled` gates OPENING a round and never settling one, so
         a user who turns the panel off at three in the morning drains what is open and
@@ -1001,7 +1031,10 @@ class Daemon:
         if not (cfg.enabled and cfg.feature_units):
             return False
         if store.validation_rounds(fo_id=fo["id"]):
-            return True  # judged once already; the manager owns the next submission
+            # Judged once already; the manager owns the next submission — and THIS is the
+            # only tick that knows it can make one (issue #480).
+            self._manager_handoff(project, store, fo)
+            return True
         try:
             round_row = ops.submit_feature_for_validation(
                 store, project.path, fo, declared="", summary="", cfg=cfg)
@@ -1012,6 +1045,84 @@ class Daemon:
         log.info("[%s] feature %s -> validating (round %d)", project.name, fo["id"],
                  round_row["round"])
         return True
+
+    def _manager_handoff(self, project: ProjectSpec, store: ProjectStore,
+                         fo: dict) -> None:
+        """Tell an idle manager its children landed — or give up and ask the user.
+
+        THE OTHER HALF OF `_reject_feature`, missing until issue #480. A rejection posts
+        feedback to the role `manager` and returns the feature to `executing`; the manager
+        files remediation work orders and ends its turn, because a manager is
+        idle-until-messaged by design. Nothing then told it they had landed, so every
+        feature rejected even once parked for ever with all its children green.
+
+        Called from the one branch that knows the whole precondition — `executing`, a
+        judged round, every live child `completed` — and it acts at most twice per round:
+
+        * **children filed since that round, and the manager is idle** — the envelope,
+          and the manager runs `jarvis fo submit`;
+        * **anything else** — the flag, because no third party is going to resubmit it.
+          That covers both a manager that answered the feedback with no work orders at
+          all (Neo, question 467: silence must not read as "still working") and one that
+          was nudged and did not submit. Every path terminates.
+
+        WHAT MAKES IT SAFE ON A RECONCILER'S PATH is that both writes are keyed on
+        `(round, action)` in `FEATURE_HANDOFF_EVENT`. This branch is re-derived every
+        tick, so an unconditional write here is a per-tick write (kn-089de524) — and the
+        flag in particular would overwrite a `needs_attention` the user had already put
+        down.
+
+        THE IDLE TEST IS THREE THINGS, not one. A manager that is running has not
+        finished reacting; one with a queued message, or with the rejection envelope still
+        queued against its feature, has not started. Nudging any of them would post over a
+        turn already in flight and, worse, would fire on the very tick after
+        `_reject_feature` — when the children are indeed all `completed`, because they are
+        the ones that were just judged.
+        """
+        from . import ops
+
+        fo_id = fo["id"]
+        last = store.latest_validation_round(fo_id=fo_id)
+        if not last or last["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
+            return  # a round is in flight or being retried: not the manager's turn yet
+        manager = store.manager_work_order(fo_id)
+        if not manager or manager["status"] != "idle":
+            return
+        if store.queued_messages(manager["id"]):
+            return
+        if any(e["state"] == "queued" and e["to_role"] == "manager"
+               for e in store.envelopes(subject_fo_id=fo_id)):
+            return
+
+        n = int(last["round"])
+        done = {(int(p.get("round") or 0), str(p.get("action") or ""))
+                for p in (db.from_json(e["payload"], {}) for e in
+                          ops.feature_events_of_kind(store, fo_id,
+                                                     FEATURE_HANDOFF_EVENT))}
+        if (n, "flagged") in done:
+            return
+        landed = tuple(c["id"] for c in store.feature_children(fo_id)
+                       if not c["superseded"] and float(c["created_at"]) > last["ts"])
+        if landed and (n, "nudged") not in done:
+            bus.post(store, subject=bus.Subject(fo_id=fo_id),
+                     from_role="reconciler", to_role="manager",
+                     payload=bus.ChildrenLanded(
+                         round=n, children=landed,
+                         note=FEATURE_CHILDREN_LANDED.format(fo_id=fo_id)))
+            ops.feature_event(store, fo_id, FEATURE_HANDOFF_EVENT,
+                              {"round": n, "action": "nudged", "children": list(landed),
+                               "feature_order": fo_id})
+            log.info("[%s] feature %s: told its manager %d work order(s) landed after "
+                     "round %d", project.name, fo_id, len(landed), n)
+            return
+
+        template = FEATURE_MANAGER_STALLED if landed else FEATURE_MANAGER_SILENT
+        reason = template.format(n=n, fo_id=fo_id)
+        store.flag_feature_attention(fo_id, reason)
+        ops.feature_event(store, fo_id, FEATURE_HANDOFF_EVENT,
+                          {"round": n, "action": "flagged", "reason": reason,
+                           "feature_order": fo_id})
+        log.info("[%s] feature %s flagged: %s", project.name, fo_id, reason)
 
     def _complete_feature(self, store: ProjectStore, fo: dict) -> None:
         """The one place a feature order ends successfully.

@@ -319,8 +319,8 @@ def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
 # the whole justification for a bus is that a new participant costs a routing rule — and a
 # CHECK on `to_role` would turn adding a role into a schema migration, which is exactly
 # the cost this design exists to avoid.
-ENVELOPE_ROLES = ("reviewer", "implementor", "manager")
-ENVELOPE_KINDS = ("review_feedback", "deferral_request")
+ENVELOPE_ROLES = ("reviewer", "implementor", "manager", "reconciler")
+ENVELOPE_KINDS = ("review_feedback", "deferral_request", "children_landed")
 # queued -> delivered (a work order filled the role and was sent the message)
 #        -> handled_by_router (nobody filled it and the router acted itself)
 #        -> undeliverable (nobody filled it and nobody could act — see bus.deliver)

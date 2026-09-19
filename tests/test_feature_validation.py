@@ -39,7 +39,9 @@ import pytest
 
 from jarvis import claude_cli, ops, validation
 from jarvis.catalog import load_catalog
-from jarvis.daemon import VALIDATION_ESCALATED_TITLE, Daemon
+from jarvis.daemon import (FEATURE_HANDOFF_EVENT, FEATURE_MANAGER_SILENT,
+                           FEATURE_MANAGER_STALLED,
+                           VALIDATION_ESCALATED_TITLE, Daemon)
 from jarvis.invariants import VALIDATION_STUCK_BLOCKER
 from jarvis.project_store import ProjectStore
 from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section, make_git_project
@@ -709,6 +711,203 @@ def test_a_rejected_feature_is_not_resubmitted_by_the_reconciler(fleet):
         assert len(store.validation_rounds(fo_id=fo_id)) == 1
         assert len(validator.calls) == 1
         assert store.get_feature_order(fo_id)["status"] == "executing"
+    finally:
+        store.close()
+
+
+# -- 3b. and who tells the manager its answer landed (issue #480) ---------------------
+
+
+def _until_idle(fleet, store, fo_id, limit: int = 6) -> dict:
+    """Tick until the manager has read whatever it was sent and gone idle again.
+
+    The manager's turn is a real `claude` call through the fake, so "it has finished
+    reacting" takes more than one tick and takes a different number of them depending on
+    what it was sent. Asserting on a fixed tick count would pin the fake's timing rather
+    than the handoff.
+    """
+    for _ in range(limit):
+        fleet.tick()
+        manager = store.manager_work_order(fo_id)
+        if manager["status"] == "idle" and not store.queued_messages(manager["id"]):
+            return manager
+    raise AssertionError("the manager never went idle")
+
+
+def _remediate(fleet, store, fo_id, title: str) -> dict:
+    """What a manager does with a rejection, in the order it really happens.
+
+    The work order is filed DURING the manager's turn and lands afterwards — the same
+    order `_manager_handoff` reads it in. Filing it once the manager has already gone
+    idle stages a sequence that cannot occur, and hides whether the handoff waited.
+    """
+    child = fleet.file_child(fo_id, store, title)
+    _until_idle(fleet, store, fo_id)
+    fleet.merge(f"{title.replace(' ', '_')}.py", f"# {title}\n")
+    store.update_work_order(child["id"], result_summary=f"did {title}")
+    store.set_status(child["id"], "completed")
+    return child
+
+
+def _handoffs(store, fo_id) -> list[tuple]:
+    return [(json.loads(e["payload"])["round"], json.loads(e["payload"])["action"])
+            for e in ops.feature_events_of_kind(store, fo_id, FEATURE_HANDOFF_EVENT)]
+
+
+def test_a_manager_is_told_when_the_children_it_filed_after_a_rejection_land(fleet):
+    """THE BUG (#480). A rejection asks the manager for remediation work orders, and a
+    manager is idle-until-messaged BY DESIGN — so with nothing posting "they landed", every
+    feature rejected even once parked for ever with all its children green.
+
+    Asserted on the MESSAGE the manager actually received, not just on the envelope: the
+    thing that unsticks the loop is the manager reading `jarvis fo submit`.
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        manager = store.manager_work_order(fo_id)
+        child = _remediate(fleet, store, fo_id, "fix the header row")
+        sent_before = len(messages(store, manager["id"]))
+
+        fleet.tick()
+
+        posted = [e for e in envelopes(store) if e["kind"] == "children_landed"]
+        assert len(posted) == 1, "nothing told the manager its work order had landed"
+        assert posted[0]["to_role"] == "manager"
+        assert posted[0]["subject_fo_id"] == fo_id
+        assert _handoffs(store, fo_id) == [(1, "nudged")]
+
+        fleet.tick()  # delivery
+        text = messages(store, manager["id"])[-1]["content"]
+        assert len(messages(store, manager["id"])) == sent_before + 1
+        assert child["id"] in text
+        assert f"jarvis fo submit {fo_id}" in text
+        assert store.get_feature_order(fo_id)["needs_attention"] == 0, (
+            "a feature the OS just unstuck itself must not also cost the user attention")
+    finally:
+        store.close()
+
+
+def test_the_handoff_fires_once_per_round_however_many_ticks_run(fleet):
+    """A RECONCILER FIX IS NOT DONE AT ONE TICK (kn-089de524). This branch re-derives
+    every tick over children that stay `completed` for ever, so an unguarded post is one
+    envelope every five seconds — and the manager re-reading its whole conversation each
+    time."""
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        _remediate(fleet, store, fo_id, "fix the header row")
+
+        for _ in range(6):
+            fleet.tick()
+
+        assert len([e for e in envelopes(store) if e["kind"] == "children_landed"]) == 1
+        assert _handoffs(store, fo_id).count((1, "nudged")) == 1
+    finally:
+        store.close()
+
+
+def test_a_manager_that_answers_a_rejection_with_no_work_orders_flags_the_feature(fleet):
+    """Neo, question 467: silence must not read as "still working".
+
+    A manager that read the feedback and filed nothing is indistinguishable from one that
+    never read it — except that it is idle with the message delivered. Nobody is going to
+    resubmit that feature, so it is the user's call, and the flag is what asks for it.
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        _until_idle(fleet, store, fo_id)
+
+        fleet.tick()
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["needs_attention"] == 1
+        assert fo["attention_reason"] == FEATURE_MANAGER_SILENT.format(n=1)
+        assert not [e for e in envelopes(store) if e["kind"] == "children_landed"], (
+            "the manager was nudged about work orders it never filed")
+        assert _handoffs(store, fo_id) == [(1, "flagged")]
+    finally:
+        store.close()
+
+
+def test_the_nudge_is_not_repeated_and_the_stall_reaches_the_user(fleet):
+    """The fallback the issue asks for: nudged, and it still did not submit.
+
+    Two ticks of the same branch must not say the same thing twice, and the second thing
+    it says is not the first one again — a manager that was told and did nothing is a
+    different report from one that was never told.
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        _remediate(fleet, store, fo_id, "fix the header row")
+        fleet.tick()
+        assert _handoffs(store, fo_id) == [(1, "nudged")]
+
+        _until_idle(fleet, store, fo_id)  # it read the nudge and did not submit
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["attention_reason"] == FEATURE_MANAGER_STALLED.format(n=1, fo_id=fo_id)
+        assert _handoffs(store, fo_id) == [(1, "nudged"), (1, "flagged")]
+
+        # ...and the user acknowledging it is not undone on the next tick.
+        store.clear_feature_attention(fo_id)
+        for _ in range(3):
+            fleet.tick()
+        assert store.get_feature_order(fo_id)["needs_attention"] == 0
+        assert _handoffs(store, fo_id) == [(1, "nudged"), (1, "flagged")]
+    finally:
+        store.close()
+
+
+def test_nothing_is_said_while_the_rejection_is_still_on_its_way(fleet):
+    """THE RACE THE GUARD EXISTS FOR. On the tick right after `_reject_feature` every
+    child IS `completed` — they are the ones that were just judged — so a handoff that
+    only asked "are the children done?" would nudge, or flag, a manager that has not yet
+    been handed the feedback it is being judged for not acting on.
+
+    Delivery is SUPPRESSED rather than merely raced: within one tick `deliver_messages`
+    runs before `settle_features`, so on the fixture's timing the manager is already
+    running by the time the handoff looks at it — and the queued-envelope guard would
+    read as dead code. Held delivery is not hypothetical; the project cap holds exactly
+    this envelope (kn-54917ba7).
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+
+        manager = store.manager_work_order(fo_id)
+        assert manager["status"] == "idle", "the fixture no longer stages the race"
+        assert [e["state"] for e in envelopes(store)] == ["queued"]
+        fleet.daemon.deliver_envelopes = lambda *a, **k: None
+        fleet.tick()
+        assert [e["state"] for e in envelopes(store)] == ["queued"], (
+            "the feedback was delivered after all; this no longer tests the guard")
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["needs_attention"] == 0, fo["attention_reason"]
+        assert _handoffs(store, fo_id) == []
     finally:
         store.close()
 
