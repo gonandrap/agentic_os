@@ -6647,7 +6647,7 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import inspection
+    from . import holds, inspection
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -6667,11 +6667,16 @@ def inspect_report(target: str, project: str | None = None, *,
             configs[project_name] = replace(cfg, **overrides) if overrides else cfg
         return configs[project_name]
 
-    def unit(project_name: str, wo: dict[str, Any]) -> dict[str, Any]:
+    def unit(project_name: str, wo: dict[str, Any],
+             store: ProjectStore) -> dict[str, Any]:
         session = wo.get("session_id") or ""
         cfg = settings(project_name)
-        anatomy = (inspection.read_session(session, cfg, index=index) if session
-                   else inspection.Anatomy(session_id="",
+        # The OS's own record of what it was holding this order for, so the report can
+        # state both clocks and name the difference (`holds`). Two indexed reads.
+        spans = holds.held(store, wo["id"])
+        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans)
+                   if session
+                   else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,
                                            join_floor=cfg.report_join_floor))
         payload = anatomy.as_dict()
@@ -6682,11 +6687,16 @@ def inspect_report(target: str, project: str | None = None, *,
     try:
         name, path, fo = find_feature_order(target, project)
     except OpsError:
-        name, _wo_path, wo = find_work_order(target, project)
+        name, wo_path, wo = find_work_order(target, project)
         cfg = settings(name)
+        store = ProjectStore(wo_path)
+        try:
+            payload = unit(name, wo, store)
+        finally:
+            store.close()
         return {"scope": wo["id"], "title": wo["title"],
                 "write_floor": cfg.report_write_floor,
-                "join_floor": cfg.report_join_floor, "units": [unit(name, wo)]}
+                "join_floor": cfg.report_join_floor, "units": [payload]}
 
     store = ProjectStore(path)
     try:
@@ -6694,10 +6704,11 @@ def inspect_report(target: str, project: str | None = None, *,
         planner_id = fo.get("plan_wo_id")
         if planner_id:
             try:
-                units.append(unit(name, store.get_work_order(planner_id)))
+                units.append(unit(name, store.get_work_order(planner_id), store))
             except KeyError:
                 pass
-        units.extend(unit(name, child) for child in store.feature_children(fo["id"]))
+        units.extend(unit(name, child, store)
+                     for child in store.feature_children(fo["id"]))
     finally:
         store.close()
     cfg = settings(name)

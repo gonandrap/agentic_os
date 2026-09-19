@@ -661,7 +661,19 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     if not enabled:
         return None
     now = time.time() if now is None else now
-    if now - float(turn["ended_at"]) < minutes * SECONDS_PER_MINUTE:
+    ended = float(turn["ended_at"])
+    if now - ended < minutes * SECONDS_PER_MINUTE:
+        return None
+    # ...and how much of that silence was the OS itself (`holds`, user ruling
+    # 2026-09-18). BELOW the wall-clock test and never above it: this reads the whole
+    # timeline, and the ordering note on this function is load-bearing — every work
+    # order pays for every line here on every reconcile tick, and only the handful that
+    # have already been quiet for an hour pay for this one.
+    from . import holds as holds_mod
+
+    spans = holds_mod.held(store, wo["id"], now=now)
+    if (now - ended) - sum(h.overlap(ended, now, now) for h in spans) \
+            < minutes * SECONDS_PER_MINUTE:
         return None
     from .ops import waiting_on
 

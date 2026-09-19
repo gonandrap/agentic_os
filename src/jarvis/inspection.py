@@ -90,6 +90,7 @@ from typing import Any, Iterable, Sequence
 from . import usage as usage_mod
 from .catalog import (DEFAULT_INSPECT_REPORT_JOIN_FLOOR,
                       DEFAULT_INSPECT_REPORT_WRITE_FLOOR, InspectConfig)
+from .holds import HOLD_CAUSES, Hold, by_cause
 
 #: Cache TTLs in seconds. NOT CONFIGURABLE, and deliberately not: these are the two
 #: durations Anthropic's prompt cache actually offers (kn-f94abf34), not a policy Jarvis
@@ -246,10 +247,43 @@ class Turn:
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
+    #: The intervals of THIS turn the OS's own record says it was held (`holds.held`),
+    #: already clipped to it. Empty when nothing held it, and empty for a reading taken
+    #: without a store — a report that cannot see the record must say a turn was held
+    #: for zero seconds, never guess.
+    holds: list[Hold] = field(default_factory=list)
 
     @property
     def wall(self) -> float:
         return max(0.0, self.ended - self.started)
+
+    @property
+    def held(self) -> float:
+        """Wall clock this turn was not permitted to run — see `holds`.
+
+        Clamped to the wall clock rather than trusted: the spans come from one table and
+        the clock from another file, and an `active` that went negative would be a
+        partition no reader could make sense of.
+        """
+        return min(self.wall, sum(h.overlap(self.started, self.ended)
+                                  for h in self.holds))
+
+    @property
+    def active(self) -> float:
+        """THE CLOCK A THRESHOLD BELONGS ON: wall minus every recorded hold.
+
+        Equal to `wall` on a turn nothing held, which is most of them — so this is not a
+        second accounting to keep in step, it is the same one with the OS's own waiting
+        taken out of it.
+
+        NOT `active_ended`, which is a MOMENT and not a duration: that one is where the
+        token accounting stops being able to see inside the turn, and it is what `idle`
+        is measured from.
+        """
+        return max(0.0, self.wall - self.held)
+
+    def held_by(self) -> dict[str, float]:
+        return by_cause(self.holds, self.started, self.ended)
 
     @property
     def blocked(self) -> float:
@@ -334,7 +368,13 @@ class Turn:
     def as_dict(self) -> dict[str, Any]:
         return {
             "seq": self.seq, "started": self.started, "ended": self.ended,
-            "wall": round(self.wall, 2), "generating": round(self.generating, 2),
+            "wall": round(self.wall, 2),
+            # BOTH CLOCKS, ALWAYS, and the wall one first: it is the honest answer to
+            # "how long did this take in the real world" and deleting it was never on
+            # the table. `held` is the difference, `held_by` says who took it.
+            "active": round(self.active, 2), "held": round(self.held, 2),
+            "held_by": {k: round(v, 2) for k, v in self.held_by().items()},
+            "generating": round(self.generating, 2),
             "blocked": round(self.blocked, 2), "tools": round(self.tools, 2),
             "idle": round(self.idle, 2),
             "unaccounted": round(self.unaccounted, 2),
@@ -372,6 +412,11 @@ class Anatomy:
     #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside
     #: the transcript. This is what turns "blocked 450s on a7b62083" into a sentence.
     subagents: dict[str, str] = field(default_factory=dict)
+    #: Every hold on the WHOLE work order (`holds.held`), including any falling outside
+    #: the turns below. Kept whole rather than only as the per-turn slices, because a
+    #: hold still running past the last turn is the live one, and it is the answer to
+    #: "why has nothing happened since".
+    holds: list[Hold] = field(default_factory=list)
 
     @property
     def spans(self) -> list[ToolSpan]:
@@ -380,6 +425,34 @@ class Anatomy:
     @property
     def wall(self) -> float:
         return sum(t.wall for t in self.turns)
+
+    @property
+    def held(self) -> float:
+        return sum(t.held for t in self.turns)
+
+    @property
+    def active(self) -> float:
+        return sum(t.active for t in self.turns)
+
+    def held_by(self) -> dict[str, float]:
+        """Seconds held per cause across the session, biggest first."""
+        totals: dict[str, float] = {}
+        for turn in self.turns:
+            for cause, seconds in turn.held_by().items():
+                totals[cause] = totals.get(cause, 0.0) + seconds
+        return dict(sorted(totals.items(), key=lambda kv: -kv[1]))
+
+    @property
+    def unexplained(self) -> float:
+        """Idle the record does NOT account for — the residual, and the honest one.
+
+        `held` is clipped to the gaps between turns (`holds`' module note), so it is a
+        subset of `idle` and this subtraction is exact rather than an estimate. It is the
+        number the question behind this module actually asked: once the holds come out,
+        is there a turn that sat open with no API call in flight and nothing holding it?
+        A large one here is a DIFFERENT defect from anything this file can fix.
+        """
+        return max(0.0, sum(t.idle for t in self.turns) - self.held)
 
     def joins(self, over: float | None = None) -> list[ToolSpan]:
         """Blocking joins at or over `over` seconds — the report's floor by default."""
@@ -407,8 +480,15 @@ class Anatomy:
         return sorted(by_name.values(), key=lambda r: r["seconds"], reverse=True)
 
     def partition(self) -> dict[str, float]:
-        """The whole session's clock, summed over its turns."""
-        return {"wall": self.wall,
+        """The whole session's clock, summed over its turns.
+
+        `active`, `held` and `unexplained` are deliberately NOT in `PARTS`: those five
+        divide the wall clock between them and have to keep summing to it, while these
+        cut the same clock a second way. Folding them in would make every percentage the
+        renderers print stop meaning anything.
+        """
+        return {"wall": self.wall, "active": self.active, "held": self.held,
+                "unexplained": self.unexplained,
                 **{k: sum(getattr(t, k) for t in self.turns) for k in PARTS}}
 
     def cache_ttl(self) -> dict[str, int]:
@@ -450,6 +530,12 @@ class Anatomy:
             "join_floor": self.join_floor,
             "partition": {k: round(v, 2) for k, v in part.items()},
             "share": {k: round(part[k] / wall, 4) for k in PARTS},
+            "held_by": {k: round(v, 2) for k, v in self.held_by().items()},
+            "holds": [h.as_dict() for h in self.holds],
+            # The legend, carried WITH the reading rather than looked up beside it: a
+            # `--json` consumer and the dashboard both render a cause and neither should
+            # have to hold its own copy of the wording (`PART_LABELS`' rule).
+            "hold_causes": HOLD_CAUSES,
             "context_peak": max((t.context_peak for t in self.turns), default=0),
             "rewrite_excess": self.rewrite_excess(),
             "cache_ttl": self.cache_ttl(),
@@ -633,12 +719,20 @@ def classify_writes(calls: Sequence[usage_mod.Call], floor: int,
 
 def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
-                 index: dict[str, list[Path]] | None = None) -> Anatomy:
+                 index: dict[str, list[Path]] | None = None,
+                 spans: Sequence[Hold] = ()) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
 
     Segments are read in path order and their turns concatenated by start time, then
     renumbered — a session resumed under a second cwd has a file under each slug
     (`usage.index_sessions`), and numbering per file would produce two turn 1s.
+
+    `spans` is `holds.held` for the work order this session belongs to, and it is PASSED
+    IN rather than read here on purpose: this module walks files Claude Code wrote and
+    has never opened the OS's own database, which is what keeps it free to be called
+    from a test, a `--json` consumer and the daemon alike. Left empty the report is the
+    one it was before — every turn `active == wall`, which is the honest reading for a
+    caller that cannot see the record rather than a claim that nothing held it.
     """
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
@@ -667,7 +761,23 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagents)
+    # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
+    # attached before it would be measured against a turn whose `ended` was still its
+    # own last row rather than its successor's prompt.
+    anatomy.holds = list(spans)
+    _attach_holds(turns, anatomy.holds)
     return anatomy
+
+
+def _attach_holds(turns: Sequence[Turn], spans: Sequence[Hold]) -> None:
+    """Give every turn the holds that overlap it. One hold can reach two turns.
+
+    The whole span is attached to each rather than pre-cut, because `Turn.held` clips it
+    to its own clock anyway — and a pre-cut copy is a second version of the same fact to
+    keep in step.
+    """
+    for turn in turns:
+        turn.holds = [h for h in spans if h.overlap(turn.started, turn.ended) > 0]
 
 
 def _close_turns(turns: Sequence[Turn]) -> None:
@@ -835,6 +945,28 @@ def _spend_so_far(turn: Turn, now: float | None) -> str:
             f"${spend.list_cost_usd:.2f} so far")
 
 
+def held_note(wall: float, holding: dict[str, float]) -> str:
+    """" (6.8h on the wall clock, 4.0h of it held by a fleet usage limit)", or "".
+
+    THE ONE PLACE THE DIFFERENCE BETWEEN THE TWO CLOCKS IS PUT INTO WORDS, shared by the
+    live alarm and the report so a user who meets it in an attention line and then runs
+    `jarvis inspect` reads the same sentence twice rather than two accounts of one fact.
+    Empty when nothing held the turn, which is most turns — the wall clock is then the
+    active one and a reader is owed no explanation of a difference that does not exist.
+    """
+    if not holding:
+        return ""
+    named = ", ".join(f"{_hours(seconds)} of it held by {HOLD_CAUSES.get(cause, cause)}"
+                      for cause, seconds in holding.items())
+    return f" ({_hours(wall)} on the wall clock, {named})"
+
+
+def _hours(seconds: float) -> str:
+    """Durations as a reader thinks of them — `cli._mins` for a sentence rather than a
+    column, so an alarm about four hours does not say `239.4m`."""
+    return f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{int(seconds // 60)}m"
+
+
 def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
            now: float | None = None, *, dispatched: float) -> list[Alarm]:
     """What is wrong with the turn that is running, most actionable first.
@@ -856,6 +988,15 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     limit to its reset, one the 16 hours a work order sat parked overnight. Pass the
     turn RECORD's dispatch time; a transcript turn older than it is the previous turn,
     and nothing is known about the new one yet.
+
+    THE TWO DURATION ALARMS ARE JUDGED ON ACTIVE TIME, NOT WALL CLOCK (the user's ruling
+    of 2026-09-18). Both say something about the WORK — that it has been running an hour,
+    that it has started and made no call — and neither claim is true of an order the OS
+    is holding: a turn that spans a spent usage window is not slow, it is obeying. The
+    `dispatched` guard above already kept the commonest shape of that out, but it is a
+    proxy for the right question and this is the right question. `long-join` deliberately
+    stays on the WALL clock: what it reports is a prompt cache going cold, and the cache
+    expires in real seconds whether or not anyone was allowed to work.
     """
     if not anatomy.found or not anatomy.turns or not cfg.enabled:
         return []
@@ -863,6 +1004,13 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     if turn.started < dispatched:
         return []
     wall = max(turn.wall, (now - turn.started) if now else 0.0)
+    # `anatomy.holds` and NOT `turn.holds`: the per-turn slices were attached against a
+    # turn that ends where the transcript stopped, and the hold this function exists to
+    # respect is the one still running past that — the live case is the only case here.
+    window = (turn.started, turn.started + wall)
+    held = min(wall, sum(h.overlap(*window, now) for h in anatomy.holds))
+    active = max(0.0, wall - held)
+    holding = by_cause(anatomy.holds, *window, now)
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
 
@@ -871,15 +1019,16 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     # nothing, so `long-turn`'s claim — that it is still being billed — would be false;
     # the finding is the silence itself, and it is raised sooner.
     if not turn.observed:
-        if wall >= cfg.alarm_stalled_minutes * 60:
+        if active >= cfg.alarm_stalled_minutes * 60:
             raised.append(Alarm(STALL_ALARM, (
-                f"this turn has been open {int(wall // 60)} minutes and has made no API "
-                f"call at all — the work never started, and nothing has been spent on "
-                f"it{hint}")))
-    elif wall >= cfg.alarm_turn_minutes * 60:
+                f"this turn has been open {int(active // 60)} minutes"
+                f"{held_note(wall, holding)} and has made no API call at all — the work "
+                f"never started, and nothing has been spent on it{hint}")))
+    elif active >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
-            f"this turn has been running {int(wall // 60)} minutes and is still being "
-            f"billed ({_spend_so_far(turn, now)}){hint}")))
+            f"this turn has been running {int(active // 60)} minutes"
+            f"{held_note(wall, holding)} and is still being billed "
+            f"({_spend_so_far(turn, now)}){hint}")))
     for span in turn.spans:
         if span.is_join and not span.finished and now and \
                 now - span.started >= cfg.alarm_join_seconds:
@@ -905,15 +1054,20 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
 def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
                 now: float | None = None, dispatched: float,
                 root: Path | None = None,
-                index: dict[str, list[Path]] | None = None) -> list[Alarm]:
+                index: dict[str, list[Path]] | None = None,
+                spans: Sequence[Hold] = ()) -> list[Alarm]:
     """`alarms` for a session id — one transcript read, no paid call, nothing written.
 
     The session is read at the ALARM's write threshold rather than the report's: the only
     writes this needs to see are the ones big enough to raise one, and classifying the
     small ones would be work whose answer is thrown away.
+
+    `spans` is the caller's `holds.held` for this work order. Passing none is the pre-hold
+    behaviour and alarms on the wall clock, which is why `Daemon.check_burning_turns`
+    always passes them: the default is what a caller without a store gets, not a policy.
     """
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
-    anatomy = read_session(session_id, reading, root=root, index=index)
+    anatomy = read_session(session_id, reading, root=root, index=index, spans=spans)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)
 
 

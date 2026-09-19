@@ -952,8 +952,9 @@ def test_the_transcript_is_read_for_a_work_order_and_never_for_a_feature(
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
     reads: list[str] = []
     real = inspection.read_session
-    monkeypatch.setattr(inspection, "read_session",
-                        lambda sid, cfg=None: (reads.append(sid), real(sid, cfg))[1])
+    monkeypatch.setattr(
+        inspection, "read_session",
+        lambda sid, cfg=None, **kw: (reads.append(sid), real(sid, cfg, **kw))[1])
 
     inspect_cfg = daemon.catalog.projects[0].inspect
     store = ProjectStore(project)
