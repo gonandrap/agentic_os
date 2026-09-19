@@ -90,9 +90,7 @@ RUN IT:
     {scope}
 
 `--repair` because the daemon already applies these same repairs on every reconcile \
-tick, so this run repairs nothing the OS would not have done anyway; and because a \
-read-only run re-reads git for every completed work order in the project, since \
-INV-WORK-LANDED's cache can only be written by a repairing run (see `ops.run_doctor`). \
+tick, so this run repairs nothing the OS would not have done anyway. \
 {os_note}
 
 THEN TURN WHAT IT FOUND INTO WORK. For each violation reported:

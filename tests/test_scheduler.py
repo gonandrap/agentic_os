@@ -604,8 +604,8 @@ def test_os_owner_falls_back_to_one_project_and_always_the_same_one(tmp_path):
 
 def test_the_daily_run_repairs():
     """Ruled on, not a default: the daemon already applies these repairs every reconcile
-    tick, and a read-only run re-reads git for every completed order because
-    INV-WORK-LANDED's cache is a timeline write (`ops.run_doctor`)."""
+    tick, so a daily run that repairs does nothing the OS would not have done anyway
+    (`ops.run_doctor`)."""
     body = schedule.DOCTOR_JOB.describe(schedule.JobContext(project="proj_a"))
     assert "--repair" in body
 

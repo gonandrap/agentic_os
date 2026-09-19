@@ -23,8 +23,13 @@ Every RETRY_EVERY_TICKS ticks it additionally:
 
 Every PR_POLL_EVERY_TICKS ticks it additionally:
   6. asks GitHub what happened to the pull requests its work orders are parked behind,
-     and ends the ones that were merged — the only step that leaves the machine, and
-     the reason a merge does not need a `jarvis wo done` after it
+     and ends the ones that were merged — the reason a merge does not need a
+     `jarvis wo done` after it
+
+Every LANDING_SWEEP_EVERY_TICKS ticks it additionally:
+  7b. asks GitHub what became of the pull request a COMPLETED order recorded, and writes
+     the answer to the timeline — the other thing that leaves the machine, and what
+     INV-WORK-LANDED reads so that the invariants themselves never call `gh`
 
 Every RECONCILE_EVERY_TICKS ticks it additionally:
   7. tracks the sessions the user *injected* (`jarvis wo inject`) — the only step that
@@ -80,8 +85,8 @@ log = logging.getLogger("jarvisd")
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
-#: interval. Its own cadence rather than the reconcile one because it is the only step
-#: that leaves the machine: one `gh` subprocess per parked work order per poll. Two
+#: interval. Its own cadence rather than the reconcile one because it leaves the machine:
+#: one `gh` subprocess per parked work order per poll. Two
 #: minutes is well inside what a user perceives as "it noticed my merge", and a fleet
 #: with five PRs parked spends ~150 calls/hour against `gh`'s 5000/hour authenticated
 #: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
@@ -121,19 +126,18 @@ PR_POLL_STATUSES = PR_REPAIR_STATUSES
 #: costing a sixth of what checking every tick would.
 RETRY_EVERY_TICKS = 2
 
-#: Sweep for completed work orders whose code never reached the default branch every N
-#: ticks — an hour at the default 5s interval. Its own cadence for `PR_POLL_EVERY_TICKS`'
-#: reason one step removed: it does not leave the machine, but it is the only check that
-#: shells out, at a `git` invocation per touched file of every completed order whose
-#: verdict is not already cached. An hour is far inside the window that matters — the
-#: orders GitHub issue #232 found had been stranded for SEVEN WEEKS — and a settled
-#: verdict is recorded once and never recomputed, so a mature project's steady-state cost
-#: is the orders nobody has landed yet, which is the number this exists to drive to zero.
+#: Sweep for completed work orders whose pull request never merged every N ticks — an
+#: hour at the default 5s interval. Its own cadence for `PR_POLL_EVERY_TICKS`' reason and
+#: one of its own: `refresh_landings` leaves the machine, and the check that reads it
+#: walks every completed order the project has ever had, which no other invariant does.
+#: An hour is far inside the window that matters — the orders GitHub issue #232 found had
+#: been unmerged for SEVEN WEEKS — and a settled reading stands for
+#: `landing.FRESH_FOR_SECONDS`, so a mature project's steady-state cost is the orders
+#: nobody has merged yet, which is the number this exists to drive to zero.
 #:
-#: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside
-#: `check_invariants`, which only runs on the reconcile tick, so a cadence that did not
-#: line up would silently sweep at some beat frequency of the two. 720 % 6 == 0, and both
-#: fire on tick 721.
+#: A MULTIPLE OF `RECONCILE_EVERY_TICKS` on purpose: the sweep runs inside the reconcile
+#: block, so a cadence that did not line up would silently sweep at some beat frequency
+#: of the two. 720 % 6 == 0, and both fire on tick 721.
 LANDING_SWEEP_EVERY_TICKS = 720
 
 #: Look at the scheduler's clock every N ticks — a minute at the default 5s interval. Its
@@ -669,6 +673,11 @@ class Daemon:
                     # a person, so the thing it saves is measured in the user's hours.
                     # It only ASKS — the ruling lands through the Neo drain below.
                     self.auto_review(project, store)
+                    # Immediately before the check that reads it, in the same tick: the
+                    # landing invariant is a pure timeline read, and this is the only
+                    # thing that puts a pull-request fact on that timeline.
+                    if sweep_landings:
+                        self.refresh_landings(project, store)
                     # Last: check the state everything above just produced.
                     self.check_invariants(project, store, sweep_landings=sweep_landings)
                 self.central.touch_project(project.name)
@@ -3841,6 +3850,90 @@ class Daemon:
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
+
+    def refresh_landings(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Ask GitHub what became of the pull request each COMPLETED order recorded.
+
+        The other half of INV-WORK-LANDED, and the half that has a network. That check is
+        a pure timeline read by design (`invariants.check_work_lands`); this is what puts
+        the fact on the timeline for it, as a `landing_seen` event.
+
+        **IT READS `pr_url` AND NOTHING ELSE**, per the user's 2026-09-18 ruling. An order
+        with no `pr_url` is skipped without a round trip: whether it should have had one is
+        INV-PR-RECORDED's question (`wo-2005a89b`), and the chain is written out in
+        `landing`'s module docstring and in `invariants.check_work_lands`. So this does not
+        go looking for branches, does not list a repository's pull requests, and cannot
+        report on a pull request the work order never claimed.
+
+        **WHY IT HAS TO ASK AT ALL, RATHER THAN READ THE TIMELINE.** `Daemon.poll_pull_
+        requests` writes `pr_merged` only while an order is parked in `waiting_pr_merge`.
+        An order that reached `completed` any other way — reviewed, marked done, finished
+        before that poll existed — has a `pr_url` and no event about it, which is most of
+        the live records. Inferring "no `pr_merged` event" as "did not merge" would
+        reproduce the false positives this rewrite removed.
+
+        **IT COSTS ONE `gh pr view` PER ORDER, BOUNDED THREE WAYS.** By cadence:
+        `LANDING_SWEEP_EVERY_TICKS`, an hour. By `landing.FRESH_FOR_SECONDS`, which stops
+        a settled order being re-asked every sweep for ever. And by
+        `landing.REFRESH_PER_SWEEP`, which caps how many orders one sweep may ask about —
+        a project with two hundred completed orders and a cold timeline would otherwise
+        spend two hundred round trips inside a single tick. It fills in over a few sweeps
+        instead, newest first, which is `list_work_orders`' own order and the right one: a
+        recently completed order is the one a merge is still plausibly coming for.
+
+        A `gh` that cannot answer leaves the previous record standing, so a broken poll
+        makes the sweep stale rather than wrong. It reports through
+        `_warn_pr_poll_broken`, whose wording is the merge poll's — one broken `gh` is one
+        fact, and the poll runs thirty times more often, so it is always the one that says
+        it first.
+        """
+        from . import github, landing
+
+        candidates = [wo for wo in store.list_work_orders(
+            statuses=("completed",), include_hidden=True)
+            if wo.get("pr_url") and not (
+                store.work_abandoned(wo["id"])
+                or store.work_unlanded_open(wo["id"], closed_by="marked_done"))]
+        stale = [wo for wo in candidates if self._needs_landing_refresh(store, wo["id"])]
+        for wo in stale[:landing.REFRESH_PER_SWEEP]:
+            wo_id = wo["id"]
+            try:
+                pr = github.pr_view(str(wo["pr_url"]), cwd=project.path)
+            except github.GitHubError as e:
+                log.debug("[%s] could not read the pull request of %s: %s", project.name,
+                          wo_id, e)
+                self._warn_pr_poll_broken(project, store, e)
+                # Continue, unlike the branch sweep this replaced: here each order asks
+                # about a DIFFERENT url, and one unreadable pull request (deleted repo,
+                # moved fork) is a fact about that url rather than about `gh`. A `gh` that
+                # is broken outright fails every order the same way, and the warning above
+                # is deduplicated, so the noise is bounded either way.
+                continue
+            except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] refreshing the landing of %s failed", project.name,
+                              wo_id)
+                continue
+            found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
+            store.add_event(wo_id, "landing_seen", found.record())
+            log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
+
+    def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:
+        """Is this completed order's landing record missing or old enough to re-ask?
+
+        Never read -> yes. Recorded as unsettled -> yes, every sweep: an open pull request
+        is the one that changes. Recorded as settled -> only past
+        `landing.FRESH_FOR_SECONDS`; see `refresh_landings` on why "settled" is not "for
+        ever" here.
+        """
+        from . import landing
+
+        seen = store.events_of_kind(wo_id, "landing_seen")
+        if not seen:
+            return True
+        latest = seen[-1]
+        if landing.from_record(wo_id, db.from_json(latest["payload"], {})).unsettled:
+            return True
+        return db.now() - float(latest["ts"] or 0.0) >= landing.FRESH_FOR_SECONDS
 
     def auto_merge(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                    pr: Any, *, record_only: bool = False) -> None:

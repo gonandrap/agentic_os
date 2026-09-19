@@ -192,22 +192,24 @@ def run_doctor(project: str | None = None, repair: bool = False,
     the same checks with repair enabled on every reconcile tick — this is the manual
     handle for "is the OS lying to me right now?".
 
-    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` shell
-    out to git, so the daemon rations them to its own cadence and this does not.
-    INV-WORK-LANDED is the one that matters — "what has this fleet produced that is not
-    on the default branch" has no other home, and the audit that first answered it
-    (GitHub issue #232, six stranded work orders) was a one-off done by hand.
+    It runs MORE than the daemon does on most ticks: `invariants.SLOW_INVARIANTS` walk
+    every completed order a project has ever had, so the daemon rations them to its own
+    cadence and this does not. INV-WORK-LANDED is the one that matters — "what has this
+    fleet delivered that nobody merged" has no other home, and the audit that first
+    answered it (GitHub issue #232, six stranded work orders) was a one-off done by hand.
 
-    It also pays full price for it without `repair`, and answers LESS. INV-WORK-LANDED
-    caches its settled verdicts as a timeline event, and a read-only run has no timeline
-    to write to, so the default `jarvis doctor` re-reads git for every completed work
-    order every single time — the cache is populated by the daemon's hourly sweep and by
-    `--repair`, never by a plain run. The same rule costs it the coverage verdict
-    outright: refreshing the default branch writes to the repository, so a plain run does
-    not (`landing.refresh_base(allow_network=False)`) and will not condemn a branch
-    against a ref it could not bring up to date — it reports stranded work through the
-    rungs that read no base, and `unknown` where the content test would have answered.
-    Read-only is worth more than either: see `check_work_lands`.
+    `repair` no longer changes that answer. It used to: the check kept a cache of settled
+    verdicts as a timeline event and refreshed the default branch it measured against,
+    and a read-only run could do neither, so a plain `jarvis doctor` paid a per-file git
+    walk every time AND withheld the content verdict. Since the check began judging the
+    PULL REQUEST it is a pure timeline read with nothing to write and no ref to be stale
+    — what it cannot do is ASK GITHUB, and that round trip is the daemon's
+    (`Daemon.refresh_landings`). So a plain run and a repairing one say the same
+    thing. On a project the daemon has never swept both say the same thing too, and it is
+    not silence: `INV-LANDING-AUDIT-FRESH` names how many pull requests the audit has no
+    current answer for. Until review round 1 of wo-16a488ee it WAS silence, so this
+    command printed "all OS invariants hold" over an audit that had no data — a lie that
+    is worse than any false positive, because nothing shows it happening.
 
     `include_os=False` drops the OS-LEVEL checks — `check_os` and the release marker —
     and keeps the per-project ones. The scheduler's daily run passes it for every project
@@ -262,7 +264,8 @@ def run_doctor(project: str | None = None, repair: bool = False,
         try:
             # `slow=True` unconditionally: INV-WORK-LANDED is the whole reason issue
             # #232 asked for a report, and a human who typed `jarvis doctor` is waiting
-            # for its answer. The daemon is the caller that has to ration it.
+            # for its answer. The daemon is the caller that has to ration it — it walks
+            # the whole settled backlog, which no other check here does.
             found = check_project(store, repair=repair, slow=True)
         finally:
             store.close()
@@ -2229,6 +2232,37 @@ def unlanded_work(store: ProjectStore, wo: dict[str, Any],
     return landing.authored(landing.worktree_of(store.project_path, recorded))
 
 
+def unmerged_pull_request(store: ProjectStore, wo_id: str) -> str:
+    """This order's recorded pull request, unless the record says it merged. "" if it did.
+
+    The other half of `unlanded_work`, and the reason `jarvis wo done` can clear an
+    INV-WORK-LANDED alert at all. `unlanded_work` reads the WORKTREE; that check reads the
+    PULL REQUEST, and the two disagree the moment a worktree is cleaned up — which is
+    every order old enough for the check to be complaining about it. Measured on the live
+    `jarvis_os` records on 2026-09-18: five of the eight alerted orders had no worktree on
+    disk, so `jarvis wo done` wrote no `work_unlanded` event, so the exclusion the check
+    looks for was never recorded and the same alert came back on the next sweep. An alert
+    whose printed remedy does nothing is how a checker gets switched off.
+
+    "The record says it merged" is a `pr_merged` event or a settled `landing_seen` — never
+    a round trip, because this runs inside a CLI command the user is waiting on. Nothing
+    having looked yet reads as unmerged, which over-records rather than under-records: a
+    `work_unlanded` event about a pull request that turns out to have merged excuses an
+    order the check was already silent about, and `work_unlanded_open`'s episode
+    arithmetic retires it the moment a `pr_merged` lands anyway.
+    """
+    from . import landing
+
+    pr_url = str(store.get_work_order(wo_id).get("pr_url") or "")
+    if not pr_url or store.events_of_kind(wo_id, "pr_merged"):
+        return ""
+    seen = store.events_of_kind(wo_id, "landing_seen")
+    if seen and not landing.from_record(
+            wo_id, db.from_json(seen[-1]["payload"], {})).unsettled:
+        return ""
+    return pr_url
+
+
 def park_unlanded(store: ProjectStore, wo: dict[str, Any],
                   work: landing.Authored) -> str:
     """Hold a work order that would otherwise complete over unlanded code, and SAY SO.
@@ -2858,6 +2892,11 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
     thing being enforced is that the decision is WRITTEN DOWN, not that it is prevented.
     The predicate is `unlanded_work`'s and is deliberately narrow — see Neo question 280.
 
+    **`--abandon` ON AN ALREADY-SETTLED ORDER RECORDS AND STOPS.** It is INV-WORK-LANDED's
+    printed remedy, so it is typed months after the work; opening a validation round there
+    escalates a session that no longer exists and hands the user a fresh attention item in
+    exchange for the one they just cleared. See the branch below.
+
     An open gate request outranks all of it, and this is the third enforcement point of
     docs/superpowers/specs/2026-09-12-a-gate-that-holds.md: declaring yourself done is
     the one route around a gate that neither the Stop hold nor the narrowed tool surface
@@ -2914,6 +2953,18 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # belongs to and the landing would refuse the very order it just excused.
             store.add_event(wo_id, "abandoned",
                             {"reason": abandon, **stranding.record()})
+            if _wo["status"] in TERMINAL_STATUSES:
+                # RECORDING A DECISION ABOUT SETTLED WORK IS NOT A DELIVERY. This is the
+                # remedy INV-WORK-LANDED prints, and it is typed against orders that
+                # settled weeks ago — so everything below would fire on work nobody is
+                # doing: a validation round opens over a session that is gone, the panel
+                # answers "this submission changes no files", the order is escalated to
+                # `needs_review` and an attention item appears. That happened to
+                # `wo-5eedc84d` on 2026-09-18, which is how this was found: the user
+                # cleared one alert and got a different one back. The abandonment is
+                # written above, `work_abandoned` reads it, the alert is clear; a settled
+                # order's status is not this command's to move.
+                return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
         if cfg is not None and cfg.enabled:
             submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
         # ...and the status is the JOIN's to decide, not this branch's.
@@ -2950,6 +3001,12 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     them with no way to close the work order at all. What issue #232 actually asks for
     is that the evidence stop being written over in silence, so the event goes on the
     record and the status does not change.
+
+    **"UNLANDED" IS THE WORKTREE *OR* THE PULL REQUEST**, and it used to be only the
+    first. `unlanded_work` answers "nothing" for any order carrying a `pr_url`, so this
+    wrote no event for exactly the population INV-WORK-LANDED now checks — the remedy the
+    user was told to type recorded nothing, and the alert came back an hour later. See
+    `unmerged_pull_request`.
     """
     name, path, wo = find_work_order(wo_id, project_name)
     store = ProjectStore(path)
@@ -2961,10 +3018,12 @@ def mark_done(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
                 f"{wo_id}` to accept, or `--reject` to send it back."
             )
         stranding = unlanded_work(store, wo)
-        if stranding.produced and not store.work_abandoned(wo_id):
+        unmerged = unmerged_pull_request(store, wo_id)
+        if (stranding.produced or unmerged) and not store.work_abandoned(wo_id):
             store.add_event(wo_id, "work_unlanded",
-                            {**stranding.record(), "was": wo["status"],
-                             "closed_by": "marked_done"})
+                            {**stranding.record(),
+                             **({"pr_url": unmerged} if unmerged else {}),
+                             "was": wo["status"], "closed_by": "marked_done"})
         stopped = close_out(store, wo, "marked_done", why="work order marked done")
     finally:
         store.close()
@@ -3033,10 +3092,11 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     `head_oid` is the sha that merged, and it goes on the event because THE EVENT IS THE
     ONLY PLACE IT CAN LIVE. `pr_state` is stale by construction with one permitted reader
     (kn-dbc4971d), and asking GitHub again months later is a round trip per settled work
-    order; a fact recorded when it was true is neither. It is what lets the landing sweep
-    answer issue #232's Mode C exactly — commits the branch grew AFTER the merge — rather
-    than falling back to the content heuristic. Empty for every work order that merged
-    before this shipped, which is exactly why that fallback exists.
+    order; a fact recorded when it was true is neither. It answered issue #232's Mode C
+    exactly — commits the branch grew AFTER the merge — until the user narrowed
+    INV-WORK-LANDED to the pull request on 2026-09-18, and NOTHING READS IT NOW. It stays
+    because a merge whose commit is not written down anywhere is a hole in the record,
+    and this is the one path that knows it.
 
     `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
     above cutting the other way. A merge the OS performed itself is indistinguishable
