@@ -15,6 +15,8 @@ existed (`tests/test_active_time.py::PRODUCTION`).
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from test_cost_report import registered  # noqa: F401 — a project `ops` can resolve
 from test_inspection import (assistant_row, prompt_row,  # noqa: F401 — fixture by name
@@ -129,8 +131,7 @@ def test_the_hold_is_read_off_the_timeline_not_guessed_from_the_gap(record, wo_i
 
     assert [h.cause for h in spans] == [holds.PAUSE_USAGE_LIMIT]
     assert (spans[0].started, spans[0].ended) == (refused_at, resumed_at)
-    assert round((spans[0].ended - spans[0].started) / MINUTE, 1) == shape["held"]
-    assert shape["reset"] in spans[0].detail
+    assert round((spans[0].finish() - spans[0].started) / MINUTE, 1) == shape["held"]
 
 
 def test_a_hold_that_has_not_ended_runs_to_now(record):
@@ -442,6 +443,62 @@ def test_the_supervisor_is_told_about_the_hold_before_it_judges(
     assert any("of it active" in line for line in lines)
     assert not any("HELD" in line for line in blind), \
         "without the record it must report the wall clock, not invent a hold"
+
+
+# -- what the report must never carry ---------------------------------------------------
+
+#: A gate command of the shape this repository's workers really propose. The token sits at
+#: the FRONT of the URL, which is why `[:160]` looked like a defence and was not
+#: (kn-1791a5e6). Fake, and shaped like the real thing on purpose.
+TOKENISED_PUSH = ("git push https://x-access-token:ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                  "@github.com/acme/proj.git HEAD:main")
+
+
+def test_a_gate_command_never_reaches_the_timing_report(record, write_transcript):
+    """A GATE'S COMMAND IS A CREDENTIAL CARRIER AND A TIMING REPORT IS NOT THE PLACE FOR IT.
+
+    `gate_requested` records the privileged shell line a worker proposed, which in this
+    repository routinely embeds a tokenised remote. An earlier draft of `holds` lifted it
+    into `Hold.detail` and published it through `jarvis inspect --json`, truncated to 160
+    characters — and truncation is not a defence when the credential is at the front of
+    the URL. Nobody expects to redact a timing report before pasting it into a PR body.
+    """
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("gate_requested", T0 + 60,
+              {"approval_id": 1, "kind": "pr_merge", "command": TOKENISED_PUSH})
+    rec.event("gate_decided", T0 + 600,
+              {"approval_id": 1, "decision": "approved", "reason": TOKENISED_PUSH})
+    session, _refused, _resumed = held_turn(PRODUCTION["wo-7e08ac40"],
+                                            write_transcript, "held")
+    store.update_work_order(wo, session_id=session)
+
+    payload = json.dumps(ops.inspect_report(wo))
+
+    assert "ghp_" not in payload
+    assert "x-access-token" not in payload
+    # The hold itself is still reported — this is a redaction, not a blind spot.
+    assert holds.GATE in json.loads(payload)["units"][0]["held_by"]
+
+
+def test_a_hold_publishes_a_fixed_set_of_fields_and_no_free_text(record):
+    """THE GUARD ON THE FUNCTION RATHER THAN ON THIS MONTH'S CALLERS (kn-1791a5e6).
+
+    Every text a hold could quote — a refusal, a worker's question, a gate's command — is
+    text this OS does not control, so the rule is structural: what `as_dict` publishes is
+    an id, three numbers and a sentence from `HOLD_CAUSES`, which is our own fixed table.
+    A new key here has to be added to this list deliberately, with this test asking why.
+    """
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60, state="failed")
+    rec.event("turn_paused", T0 + 60, {"seq": 1, "reason": "usage_limit",
+                                       "error": TOKENISED_PUSH})
+
+    published = holds.held(store, wo, now=T0 + 3600)[0].as_dict(T0 + 3600)
+
+    assert set(published) == {"cause", "phrase", "started", "ended", "open", "seconds"}
+    assert published["phrase"] in holds.HOLD_CAUSES.values()
+    assert "ghp_" not in json.dumps(published)
 
 
 def test_every_hold_cause_has_a_phrase_for_the_user():

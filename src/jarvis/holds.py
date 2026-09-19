@@ -151,14 +151,25 @@ class Hold:
     `ended` is None while the hold is still on. Not `now` frozen at read time: a reader
     that stores one of these and re-renders it later would otherwise report a hold as
     over because it once asked the clock.
+
+    THREE FIELDS AND NO FREE TEXT, WHICH IS A SECURITY BOUNDARY RATHER THAN MINIMALISM.
+    An earlier draft carried a `detail` lifted from the opening event's payload — the
+    refusal message, the question, the gate's command — and `as_dict` published it
+    through `jarvis inspect --json`. Every one of those sources is text this OS does not
+    control: a gate's command is the privileged shell line a worker proposed, which in
+    this repository routinely embeds a tokenised remote, and a transport pause's `error`
+    is a VCS stderr tail, which is kn-1791a5e6's leak verbatim. Truncating is not a
+    defence there (the credential is at the FRONT of the URL), and scrubbing is a
+    denylist that only removes the leak somebody already thought of. A timing report has
+    no use for any of it: what a reader needs is the CAUSE, and `HOLD_CAUSES` is a fixed
+    table of our own sentences. The reset moment is not lost with it — the timeline keeps
+    `reset_at` on the `turn_paused` payload, and `invariants.pause_note` is what renders
+    it to a person. Adding a field here means publishing it; think first.
     """
 
     cause: str
     started: float
     ended: float | None = None
-    #: The refusal, the question, the command — whatever the opening event recorded.
-    #: Display only, and already squeezed onto one line.
-    detail: str = ""
 
     @property
     def open(self) -> bool:
@@ -179,7 +190,7 @@ class Hold:
 
     def as_dict(self, now: float | None = None) -> dict[str, Any]:
         return {"cause": self.cause, "phrase": self.phrase, "started": self.started,
-                "ended": self.ended, "open": self.open, "detail": self.detail,
+                "ended": self.ended, "open": self.open,
                 "seconds": round(self.finish(now) - self.started, 2)}
 
 
@@ -207,19 +218,6 @@ def _key(payload: dict[str, Any], field: str | None) -> Any:
     return None if field is None else payload.get(field)
 
 
-def _detail_of(payload: dict[str, Any]) -> str:
-    """The opening event's own words for what it is holding, on one line.
-
-    `error` first because the transport pauses put the refusal there and the refusal
-    names the moment the window reopens — the sentence that would have settled the
-    exchange this module came from.
-    """
-    for name in ("error", "reason", "command", "question", "doing"):
-        value = payload.get(name)
-        if isinstance(value, str) and value.strip():
-            return " ".join(value.split())[:160]
-    return ""
-
 
 def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
     """Pair the timeline's opening and closing events into raw hold spans.
@@ -246,21 +244,20 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
             for cause, key in list(open_holds):
                 if cause in causes and (field is None or key in keys):
                     hold = open_holds.pop((cause, key))
-                    done.append(Hold(hold.cause, hold.started, max(ts, hold.started),
-                                     hold.detail))
+                    done.append(Hold(hold.cause, hold.started,
+                                     max(ts, hold.started)))
         # A round the panel could not run because the usage window was spent closes the
         # round and holds the WORK ORDER until the window reopens — a usage-limit hold
         # with no `turn_paused` behind it, because no worker turn was ever launched into
         # it. Ended by the next submission, which is the OS reopening the round itself.
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_HELD_CAUSE:
-            open_holds[(PAUSE_USAGE_LIMIT, None)] = Hold(
-                PAUSE_USAGE_LIMIT, ts, None, _detail_of(payload))
+            open_holds[(PAUSE_USAGE_LIMIT, None)] = Hold(PAUSE_USAGE_LIMIT, ts)
             continue
         if kind in ("validation_submitted", "validation_forced"):
             reopened = open_holds.pop((PAUSE_USAGE_LIMIT, None), None)
             if reopened is not None:
                 done.append(Hold(reopened.cause, reopened.started,
-                                 max(ts, reopened.started), reopened.detail))
+                                 max(ts, reopened.started)))
         opener = _OPEN.get(kind)
         if opener is None:
             continue
@@ -269,7 +266,7 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
         if cause not in HOLD_CAUSES:
             continue
         key = _key(payload, field)
-        open_holds[(cause, key)] = Hold(cause, ts, None, _detail_of(payload))
+        open_holds[(cause, key)] = Hold(cause, ts)
     done.extend(open_holds.values())
     done.sort(key=lambda h: h.started)
     return done
@@ -302,11 +299,11 @@ def _outside(spans: Sequence[Hold], working: Sequence[tuple[float, float]],
             if stop <= cursor or start >= end:
                 continue
             if start > cursor:
-                out.append(Hold(hold.cause, cursor, start, hold.detail))
+                out.append(Hold(hold.cause, cursor, start))
             cursor = max(cursor, stop)
         if end > cursor:
             out.append(Hold(hold.cause, cursor,
-                            None if hold.open and end >= now else end, hold.detail))
+                            None if hold.open and end >= now else end))
     out.sort(key=lambda h: h.started)
     return out
 
@@ -328,7 +325,7 @@ def _merge(spans: Sequence[Hold], now: float) -> list[Hold]:
         if end - start < _MIN_HOLD:
             continue
         out.append(Hold(hold.cause, start,
-                        None if hold.open and end >= now else end, hold.detail))
+                        None if hold.open and end >= now else end))
         cursor = end
     return out
 
