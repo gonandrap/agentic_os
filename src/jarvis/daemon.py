@@ -4641,16 +4641,31 @@ class Daemon:
         """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
 
         ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
-        four guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
-        a nudge already queued, a turn already in flight, and a validation round that
-        owns the work order. Spec §3 for why each of the first three would otherwise
-        cost a duplicated turn or silently spend the budget, and §4.1 for the fourth.
+        five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        a nudge already queued, a turn already in flight, a validation round that owns
+        the work order, and a privileged-action gate that would refuse everything the
+        repair needs to run. Spec §3 for why each of the first three would otherwise
+        cost a duplicated turn or silently spend the budget, §4.1 for the fourth, and
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md for
+        the fifth.
         """
         from . import ops
 
         if not wo.get("session_id"):
             return
         if store.queued_messages(wo["id"]) or worker_session.busy(store, wo["id"]):
+            return
+        # A GATE UNDER REVIEW REFUSES THE REPAIR BEFORE IT STARTS (issue #469).
+        # `pending_approvals` and not `open_approvals`: this is the exact predicate
+        # `hooks.pending_turn_block` enforces, which is the code that actually denies
+        # the worker's commands — an `awaiting_case` request blocks the END of a turn,
+        # not the work in it. Deferred, never dropped: nothing is spent, and the tick
+        # after the verdict nudges normally.
+        blocking = store.pending_approvals(wo["id"])
+        if blocking:
+            if ops.defer_pr_repair(store, wo, repair, blocking[0]):
+                log.info("[%s] %s is %s but gate %s is under review — repair deferred",
+                         project.name, wo["id"], what, blocking[0]["id"])
             return
         # THE ROUND MACHINE OWNS THIS SESSION. Keyed off the ROUND, not the status, and
         # that distinction is the whole guard: since issue 212 a round runs while the
@@ -4666,6 +4681,13 @@ class Daemon:
             log.debug("[%s] %s has a validation round open — repair deferred",
                       project.name, wo["id"])
             return
+        # ...and the other half of #469: a budget ALREADY spent that way. Before
+        # nudging, because the refund and the fresh attempt belong to the same tick —
+        # `ops.rearm_pr_repair` says why.
+        refunded = ops.rearm_pr_repair(store, wo, repair)
+        if refunded:
+            log.info("[%s] %s: %s attempts were spent behind a gate the worker could "
+                     "not pass — budget re-armed", project.name, wo["id"], refunded)
         out = ops.nudge_pr_repair(store, wo, repair, **fields)
         if out["gave_up"]:
             log.info("[%s] %s still %s after %s attempts — %s needs the user",

@@ -2447,7 +2447,7 @@ class ProjectStore:
         return found
 
     def _this_episode(self, wo_id: str, repair: str, kind: str) -> list[dict[str, Any]]:
-        """Events of `kind` since the last `pr_<repair>_cleared` — this EPISODE's.
+        """Events of `kind` since this EPISODE began — the last clear or re-arm.
 
         Repair state is derived from the timeline rather than kept in columns; the clear
         is the budget reset. See §4 of
@@ -2457,17 +2457,51 @@ class ProjectStore:
         because a store may not import `ops`. The two episodes are counted APART on
         purpose: a branch that conflicted twice last week has spent nothing of the red
         build's budget, and they are different problems with different fixes.
+
+        TWO EVENTS OPEN A FRESH EPISODE, not one. `pr_<repair>_rearmed` is the budget
+        given back because the attempts were never made — the worker was refused by a
+        pending gate before it could read the conflict (issue #469, §4 and §6 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md). It
+        moves the boundary here rather than at each caller so that the attempt count,
+        the give-up and the origin all reset together and cannot disagree about which
+        episode is current.
+
+        The second read happens only once there is something to count: a pull request
+        that has never been nudged returns above it, which is what keeps the green case
+        at the cost `test_a_green_pull_request_costs_one_call_three_reads_and_no_write`
+        pins.
         """
         rows = self.events_of_kind(wo_id, kind)
         if not rows:
             return []
-        cleared = self.events_of_kind(wo_id, f"pr_{repair}_cleared")
-        since = cleared[-1]["ts"] if cleared else 0.0
+        opened = (self.events_of_kind(wo_id, f"pr_{repair}_cleared")
+                  + self.events_of_kind(wo_id, f"pr_{repair}_rearmed"))
+        since = max((e["ts"] for e in opened), default=0.0)
         return [r for r in rows if r["ts"] > since]
+
+    def pr_repair_nudges(self, wo_id: str, repair: str) -> list[dict[str, Any]]:
+        """Every ask of this episode, oldest first — the attempts themselves.
+
+        `pr_repair_attempts` is the count; this is what `ops.rearm_pr_repair` needs
+        instead, because WHEN each one went out is what says whether the worker was
+        allowed to act on it (issue #469).
+        """
+        return self._this_episode(wo_id, repair, f"pr_{repair}_nudged")
 
     def pr_repair_attempts(self, wo_id: str, repair: str) -> int:
         """How many times the OS has asked this worker to fix the SAME thing."""
-        return len(self._this_episode(wo_id, repair, f"pr_{repair}_nudged"))
+        return len(self.pr_repair_nudges(wo_id, repair))
+
+    def pr_repair_deferred(self, wo_id: str, repair: str, approval_id: int) -> bool:
+        """Has this episode already recorded that THIS gate is holding the repair up?
+
+        The dedupe behind `ops.defer_pr_repair`: the poll asks every tick for as long as
+        the review takes, and the timeline must carry the fact once, not once per tick.
+        """
+        for event in self._this_episode(wo_id, repair, f"pr_{repair}_deferred"):
+            if (db.from_json(event["payload"], {}) or {}).get("approval_id") == approval_id:
+                return True
+        return False
 
     def pr_repair_gave_up(self, wo_id: str, repair: str) -> bool:
         """Has the OS already stopped trying on this episode and said so?
@@ -3598,6 +3632,33 @@ class ProjectStore:
         Named once so a seventh status cannot reach one of them and not the other.
         """
         return self.pending_approvals(wo_id) + self.held_approvals(wo_id)
+
+    def gate_open_at(self, wo_id: str, ts: float) -> bool:
+        """Was a privileged-action gate holding this work order at `ts`?
+
+        The historical form of `pending_approvals`, and it exists for one caller:
+        `ops.rearm_pr_repair` asking whether a repair attempt already spent was an
+        attempt the worker was ever allowed to make (issue #469).
+
+        THE WINDOW IS FILED-TO-DECIDED, which over-covers an `awaiting_case` prefix by
+        the time the worker took to argue its case — the row records when the request
+        was filed and when it was answered, not when it went `pending`. §4 of
+        docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md argues
+        that direction: over-covering costs three worker turns on a repair that then
+        gives up properly, under-covering strands the work order for ever.
+
+        A request abandoned unargued is excluded — nobody ever reviewed one, so it never
+        reached the status that refuses a worker's commands.
+        """
+        for approval in self.list_approvals(wo_id):
+            if approval["ts"] > ts:
+                continue
+            if approval["closed_as"] == "abandoned":
+                continue
+            decided_at = approval["decided_at"]
+            if decided_at is None or decided_at > ts:
+                return True
+        return False
 
     def expire_approvals(self) -> int:
         """Move spent or timed-out grants to `expired` so listings tell the truth.
