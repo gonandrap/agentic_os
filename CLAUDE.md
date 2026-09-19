@@ -234,6 +234,25 @@ jarvis validation force <wo-id> --reason "…"    # judge this work order AGAIN,
                                            # it is where the user can SEE why an order is
                                            # parked: the commit each round judged against
                                            # the live head of the pull request.
+jarvis issues [project]                    # TRACKER ISSUES THE FLEET KEEPS RUNNING INTO,
+                                           # most-referenced first. A validation panel
+                                           # files its non-blocking findings as GitHub
+                                           # issues; this is the other end of that — how
+                                           # many DISTINCT work orders have pointed at
+                                           # each one, which is the signal for what to
+                                           # pick up next. Three things count and only
+                                           # three: the order whose review RAISED it, an
+                                           # order DISPATCHED to fix it, and an order
+                                           # whose brief CITES it. A passing mention is
+                                           # not a reference — over-counting would
+                                           # destroy the ranking. Local, no network; the
+                                           # same list is a section on each project's
+                                           # dashboard page, and the count also rides on
+                                           # the issue itself as a `referenced: N` label
+                                           # so it shows when scanning GitHub. Each
+                                           # order's own list — every follow-up it
+                                           # raised, across every round — is on
+                                           # `jarvis wo show` and its page.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most

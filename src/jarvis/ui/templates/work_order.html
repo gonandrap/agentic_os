@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% import "_bill.html" as bill_ui %}
 {% import "_validation.html" as validation_ui %}
+{% import "_issues.html" as issues_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -333,6 +334,10 @@
 {# Outside the tabs with the gates and the assumptions: a round that was rejected or
    escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}
+
+{# Below the rounds, because it is what came OUT of them — and once for the whole order
+   rather than once per round, which is the thing the per-round fragment could not be. #}
+{{ issues_ui.unit(issues) }}
 
 {# The three readings of one work order. Everything above stays outside the tabs — an
    ask hidden behind a tab is an ask that does not happen. §6 of

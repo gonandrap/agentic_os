@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_validation.html" as validation_ui %}
+{% import "_issues.html" as issues_ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
 {% block content %}
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
@@ -128,6 +129,8 @@
 {% endif %}
 
 {{ validation_ui.section(validation, 'h3') }}
+
+{{ issues_ui.unit(issues, 'h3') }}
 
 {% if fo.status == 'failed' %}
 {# The user's own way past a dead child. Without it, reviving a feature needed somebody

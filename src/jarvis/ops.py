@@ -12,11 +12,12 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -789,7 +790,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                     f"{parent_id} is {parent['status']}, so nothing more can be filed "
                     f"under it — file this work order on its own, or open a new feature"
                 )
-        return store.create_work_order(
+        wo = store.create_work_order(
             title=title, description=description, origin=origin, model=model,
             effort=effort, permission_mode=permission_mode,
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
@@ -798,6 +799,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
         )
+        # AT CREATION, from the brief the order is actually given — the only moment at
+        # which "this order points at that issue" is a fact rather than an inference.
+        record_issue_references(store, paths[project_name], wo)
+        return wo
     except (KeyError, ValueError) as e:
         # A dependency on a work order in another project cannot be honoured — the edge
         # is resolved inside one project database — so say which project was searched
@@ -1718,6 +1723,20 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
         # exactly this (`cli._finding_lines`).
         payload["items"].append({"url": url, "number": issues.issue_number(url),
                                  "title": key, "seat": seat, "withheld": not private})
+        # THE RELATION, beside the event. The event says what this ROUND did; this says
+        # what the ORDER has raised, which is the question `jarvis wo show` could not
+        # answer and which no amount of reading the event could make cheap. `announced`
+        # because `_follow_up_body` has just written that sentence into the issue itself
+        # — the sweep must not comment it a second time.
+        #
+        # `title` here and `key` on the event are DELIBERATELY DIFFERENT STRINGS. The
+        # event carries the finding's own words, which is what the surfaces print beside
+        # it; this row carries WHAT THE TRACKER WAS TOLD, because it is a cache of the
+        # issue as it exists on GitHub and the sweep refreshes it from `gh issue view`.
+        # On a public repository those two are not the same sentence.
+        store.record_issue(url, number=issues.issue_number(url), repo=repo, title=title,
+                           state="OPEN")
+        store.link_issue(url, unit_id, "raised", round_no=n, seat=seat, announced=True)
     return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
 
@@ -1851,6 +1870,220 @@ def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
         if p.get("reason"):
             rnd["reason"] = str(p["reason"])
     return out
+
+
+# -- the issue index: which orders point at which issues, and how many ---------------
+#
+# The relation `filed_follow_ups` could not express. That resolver answers "what did THIS
+# ROUND file", which is a fact about one round; these answer "what has this ORDER raised"
+# and "how many orders have pointed at this issue" — the second of which did not exist at
+# all, and is the priority signal the user asked for. Local, both directions, no network.
+
+#: A `#N` in a brief. Anchored against a preceding word character or slash so a URL's own
+#: fragment and an `abc#1` cannot match — this is the GitHub shorthand, written on purpose.
+ISSUE_MENTION_RE = re.compile(r"(?<![\w/])#([0-9]{1,7})(?![0-9])")
+
+#: SOMETHING ISSUE-URL-SHAPED in a body of prose. `issues.ISSUE_URL_RE` is anchored at
+#: both ends — it answers "is this string a URL", which is the question a write asks —
+#: and cannot scan. This one only FINDS candidates: the host and the repository are left
+#: out of the capture on purpose, because nothing here decides whether a match belongs to
+#: the project. `issue_url_for` decides that, by string equality, for both shapes below.
+ISSUE_LINK_RE = re.compile(
+    r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/issues/([0-9]+)(?![0-9])")
+
+
+def issue_url_for(repo: str, number: int) -> str:
+    """THE ONE DEFINITION of what a project's own issue URL looks like — host included.
+
+    Every path that decides "is this issue ours" compares against this rather than
+    picking fields out of a URL, because a comparison that reads only the owner and the
+    repository accepts `https://attacker.example/<owner>/<repo>/issues/7` as the
+    project's own. That URL then reaches `tracked_issues` under the real repository name
+    and the daemon's sweep points `gh` at a host nobody in this project chose. A brief is
+    not always written by the user (the tracker is public), so the destination of a write
+    must never be derived from prose — only ever compared with a locally-derived one.
+    """
+    return f"https://github.com/{repo}/issues/{number}"
+
+
+def is_own_issue_url(url: str, repo: str, number: int) -> bool:
+    """Case-insensitive because GitHub is; host, owner, repository and number all count."""
+    return (url or "").lower() == issue_url_for(repo, number).lower()
+
+
+def issue_citations(text: str, repo: str, known: Collection[str]) -> list[str]:
+    """Every issue on `repo` that `text` deliberately cites. Conservative by design.
+
+    TWO SHAPES, AND THE SECOND IS DELIBERATELY NARROWER THAN THE FIRST.
+
+    * A FULL ISSUE URL on this project's own repository counts outright: `/issues/N`
+      cannot be anything but an issue, and nobody pastes one by accident. ON THIS
+      PROJECT'S OWN is decided by `is_own_issue_url` — the whole URL, host and all — and
+      what is stored is the URL that check was made against, never the prose's own text.
+    * A BARE `#N` counts only for an issue the project ALREADY TRACKS. `#N` is also how
+      a pull request is written, and the OS cannot tell the two apart without a network
+      call it must not make here — so an unrecognised number is left alone rather than
+      becoming a link to an issue that may not exist. Every issue whose count the user
+      reads is already tracked (the panel filed it, or an order was dispatched at it),
+      so the narrowing costs the signal nothing.
+
+    A passing mention in a result summary is not a citation and never reaches here: the
+    only text this is asked about is the brief the work order was created with.
+    """
+    body = text or ""
+    found: dict[str, None] = {}
+    for match in ISSUE_LINK_RE.finditer(body):
+        number = int(match.group(1))
+        if is_own_issue_url(match.group(0), repo, number):
+            found.setdefault(issue_url_for(repo, number), None)
+    for match in ISSUE_MENTION_RE.finditer(body):
+        url = issue_url_for(repo, int(match.group(1)))
+        if url in known:
+            found.setdefault(url, None)
+    return list(found)
+
+
+def record_issue_references(store: ProjectStore, project_path: Path,
+                            wo: Mapping[str, Any]) -> list[str]:
+    """Link a freshly created work order to the issues its brief points at.
+
+    ONLY ISSUES ON THE PROJECT'S OWN `origin`, which is one rule doing two jobs: it is
+    the locally-derived repository name that `issues.checked_issue_url` will later hold
+    every write to (`kn-2531869c`), and it is what keeps the count a fact about this
+    project's tracker rather than a half-populated view of the whole fleet.
+
+    Never raises: a work order must not fail to be created because a reference could not
+    be recorded.
+    """
+    from . import issues
+
+    repo = follow_up_repo(project_path)
+    if not repo:
+        return []
+    linked: list[str] = []
+    known = {row["issue_url"] for row in store.issue_board()}
+    wanted: list[tuple[str, str]] = []
+    assigned = str(wo.get("issue_url") or "")
+    if assigned and issues_on(assigned, repo):
+        wanted.append((assigned, "assigned"))
+    brief = f"{wo.get('title') or ''}\n{wo.get('description') or ''}"
+    wanted += [(url, "cited") for url in issue_citations(brief, repo, known)]
+    for url, kind in wanted:
+        try:
+            store.record_issue(url, number=issues.issue_number(url), repo=repo)
+            store.link_issue(url, wo["id"], kind)
+        except (ValueError, sqlite3.Error):
+            log.exception("could not link %s to %s", url, wo.get("id"))
+            continue
+        linked.append(url)
+    return linked
+
+
+def issues_on(url: str, repo: str) -> bool:
+    """Is `url` an issue URL on `repo`? The local half of `checked_issue_url`.
+
+    The anchored match is what proves the string is a URL and nothing but a URL; the
+    NUMBER is all that is taken from it, and the rest is decided against
+    `issue_url_for` — see there for why no field of a URL may be trusted on its own.
+    """
+    from .issues import ISSUE_URL_RE
+
+    match = ISSUE_URL_RE.match(url or "")
+    return bool(match) and is_own_issue_url(url, repo, int(match.group(4)))
+
+
+#: What a unit with no linked issue projects. ALWAYS PRESENT, `NO_FOLLOW_UPS`'s rule:
+#: a key that comes and goes renders as silence in Jinja and as a `KeyError` nowhere.
+NO_ISSUES: dict[str, Any] = {"raised": [], "references": []}
+
+
+def issue_index(store: ProjectStore, unit_id: str) -> dict[str, Any]:
+    """Every issue one order raised, and every other issue it points at.
+
+    THE CONSOLIDATED LIST, across every round — which is the thing the per-round
+    fragments could not be. An order judged over four rounds filed its follow-ups in four
+    places and had no total anywhere; wo-61173704 filed fifteen that way.
+
+    `state` is what the sweep last read off GitHub, "" until it has looked once. Cached
+    rather than fetched for `filed_follow_ups`'s reason: `jarvis wo show` must not fail
+    because the tracker is unreachable.
+
+    THE TITLE IS THE FINDING'S OWN WHEREVER THE OS STILL HAS IT. `tracked_issues.title`
+    is a cache of what the issue is CALLED ON GITHUB, which on a public tracker is
+    `Validation follow-up vf-…` and nothing else — a list of fifteen of those tells the
+    reader nothing. The words the seat wrote are on the filing event, they never left the
+    OS, and these surfaces are the user's own. Same rule `cli._finding_lines` already
+    follows for a withheld finding, and the reason the event keeps the finding's title
+    rather than the tracker's.
+    """
+    titles = _filed_titles(store, unit_id)
+    raised, refs = [], []
+    for row in store.issue_links_of(unit_id):
+        (raised if row["kind"] == "raised" else refs).append({
+            "url": row["issue_url"], "number": row["number"] or 0,
+            "title": titles.get(row["issue_url"]) or row["title"] or "",
+            "state": row["state"] or "",
+            "kind": row["kind"], "round": row["round"] or 0,
+            "seat": row["seat"] or ""})
+    return {"raised": raised, "references": refs}
+
+
+def _filed_titles(store: ProjectStore, unit_id: str) -> dict[str, str]:
+    """`{issue url: the finding's own title}` for everything this unit filed.
+
+    Off the events, so it costs a query and no network. Which kind of unit the id names
+    is read off the id, `validation_view`'s idiom.
+    """
+    kind = {"fo_id": unit_id} if unit_id.startswith("fo-") else {"wo_id": unit_id}
+    out: dict[str, str] = {}
+    for payload in filed_follow_ups(store, **kind).values():  # type: ignore[arg-type]
+        for item in payload.get("filed") or []:
+            url, title = str(item.get("url") or ""), str(item.get("title") or "")
+            if url and title:
+                out[url] = title
+    return out
+
+
+def issue_board(store: ProjectStore, limit: int = 50) -> list[dict[str, Any]]:
+    """This project's tracked issues, most-referenced first.
+
+    The ranking the user reads when choosing what to work on next: `refs` counts DISTINCT
+    work orders, so "three separate pieces of work ran into this" is a number rather than
+    a thing to go and count on GitHub.
+
+    OPEN AND UNKNOWN-STATE ISSUES ONLY. A closed issue's reference count is history, and
+    a ranking that carries it is a ranking with nothing to act on at the top.
+    """
+    return [row for row in store.issue_board()
+            if (row.get("state") or "") != "CLOSED"][:limit]
+
+
+def issue_board_across(project_name: str | None = None,
+                       limit: int = 50) -> list[dict[str, Any]]:
+    """`issue_board` for one project or for the whole fleet, ranked across all of them.
+
+    Each row carries its `project`, because an issue number alone does not identify an
+    issue once more than one tracker is in play — and the fleet-wide read is the default
+    for the same reason `jarvis alarms` is: the user is choosing what to work on next,
+    not auditing one project.
+    """
+    paths = registered_project_paths()
+    if project_name:
+        if project_name not in paths:
+            raise OpsError(f"project {project_name!r} not registered "
+                           f"(known: {sorted(paths)})")
+        paths = {project_name: paths[project_name]}
+    out: list[dict[str, Any]] = []
+    for name, path in paths.items():
+        if not path.is_dir():
+            continue
+        store = ProjectStore(path)
+        try:
+            out += [{**row, "project": name} for row in issue_board(store, limit=limit)]
+        finally:
+            store.close()
+    out.sort(key=lambda row: (-int(row["refs"]), -int(row["number"] or 0)))
+    return out[:limit]
 
 
 def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
@@ -4151,6 +4384,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # child's page. Empty for every unit that has never been validated, and it
             # is the emptiness the surfaces branch on — no rounds, no section.
             "validation_rounds": validation_rounds(store, fo_id=fo_id),
+            # The feature's OWN follow-ups — the ones its plan review raised. A child's
+            # are on the child, where the round that raised them is.
+            "issues": issue_index(store, fo_id),
             # Every finding ABOUT this feature, whatever carried it, on the same
             # always-present rule as the rounds — and the rows themselves, exactly as
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
