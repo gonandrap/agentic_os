@@ -1181,6 +1181,25 @@ def test_the_cli_demands_an_owner_for_contest(monkeypatch, capsys, fleet):
     assert fleet.approval()["contested"] == 1
 
 
+def test_the_cli_prints_a_spent_grant_as_spent(capsys, fleet):
+    """`jarvis gate list` is the other half of issue 491 — the one the user reads in a
+    terminal. It printed `expired by neo` for a merge that ran."""
+    from jarvis import cli
+
+    fleet.request("gh pr merge 31 --squash")
+    approval = fleet.approval()
+    ops.decide_gate(approval["id"], verdict="approved", reason="the panel passed it")
+    for _ in range(gates.GRANT_MAX_USES):
+        assert _decision(fleet.attempt("gh pr merge 31 --squash")) == "allow"
+    capsys.readouterr()
+
+    assert cli.main(["gate", "list"]) == 0
+
+    line = capsys.readouterr().out
+    assert "spent — approved by" in line
+    assert "expired by" not in line
+
+
 def test_a_contest_may_only_amend_an_open_uncontested_row(fleet):
     """One claim, one review. Re-contesting rewrites the argument under a reviewer who is
     already reading it; contesting a ruled row asks the same question of a second

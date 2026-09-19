@@ -805,13 +805,23 @@ def test_the_grants_already_swept_as_lapsed_are_re_filed_as_spent(gated):
     gated.store.conn.execute(
         "UPDATE approvals SET status='expired', closed_as='lapsed' WHERE id=?",
         (unused["id"],))
+    # A superseded row and an abandoned one, which the backfill must not reach either.
+    gated.attempt("./scripts/" + "ship" + "it.sh")
+    other = [a for a in gated.store.list_approvals(gated.wo["id"])
+             if a["id"] not in (spent["id"], unused["id"])][0]
+    gated.store.supersede_approval(other["id"], "the release moved")
     gated.store.close()
 
     store = ProjectStore(gated.project)        # re-open: the migration runs on __init__
     try:
         assert store.get_approval(spent["id"])["closed_as"] == "spent"
         # The one that really did lapse is untouched — the backfill is keyed on `uses`.
+        # This is production gate 166: approved by the user, never used, head moved.
         assert store.get_approval(unused["id"])["closed_as"] == "lapsed"
+        assert store.get_approval(other["id"])["closed_as"] == "superseded"
+        # Neither count is a casualty of rows moving between `closed_as` values.
+        assert store.dismissed_count() == 0
+        assert store.abandoned_count() == 0
     finally:
         store.close()
 
