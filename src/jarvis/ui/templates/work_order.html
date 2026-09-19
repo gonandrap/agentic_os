@@ -260,7 +260,9 @@
 <h2>Privileged actions</h2>
 <div class="panel">
   {% for a in approvals %}
-  {% set m = gate_meta.get(a.status, {'word': a.status, 'icon': '•', 'tone': 'muted'}) %}
+  {# The display state, not the status — see `ui.app.gate_display`. #}
+  {% set m = gate_meta.get(gate_display(a),
+                           {'word': a.status, 'icon': '•', 'tone': 'muted'}) %}
   <div class="msg">
     <div class="who {{ 'tone-warn' if a.status == 'pending' }}">#{{ a.id }} · {{ a.kind }} ·
       <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>

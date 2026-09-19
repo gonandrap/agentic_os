@@ -120,7 +120,24 @@ GATE_META = {
     # word because nobody reviewed it — calling that "expired" alongside a lapsed grant
     # hides the one gate outcome that is evidence of a classifier defect (spec 2026-09-12).
     "abandoned": {"word": "abandoned, never reviewed", "icon": "⊗", "tone": "muted"},
+    # Same treatment, opposite outcome: `expired` with `closed_as='spent'` was approved
+    # and then USED. Toned `ok` because it is a success, and it is the overwhelming
+    # majority of decided gates — muting it made a working auto-merge pipeline read as
+    # Neo letting every merge lapse (spec 2026-09-19 §1).
+    "spent": {"word": "spent", "icon": "✓", "tone": "ok"},
 }
+
+
+def gate_display(g: dict) -> str:
+    """The key this gate renders under, which is not always its status: `expired` splits
+    by `closed_as` — spec 2026-09-19 §1. One function because three surfaces read
+    `GATE_META` and a ternary copied into each is how one of them comes to disagree.
+    `cli._gate_display` is the CLI's twin, kept in step by test_gates.
+    """
+    if g["status"] == "expired" and g["closed_as"] in ("spent", "abandoned"):
+        return g["closed_as"]
+    return g["status"]
+
 
 # How often the dashboard re-reads OS state. Not a page reload — the browser swaps
 # the live regions in place (see dashboard.html), so in-progress typing survives.
@@ -657,6 +674,7 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
+        gate_display=gate_display,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         fmt_left=fmt_left,
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can

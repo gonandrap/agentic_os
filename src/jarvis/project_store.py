@@ -1050,8 +1050,8 @@ ADDED_COLUMNS = {
         # `jarvis gate contest`: a different claim from every other row, and the column is
         # what makes "dismissed or denied, never approved" enforceable — spec §2.
         "contested": "INTEGER NOT NULL DEFAULT 0",
-        # WHY a row landed in `expired`: 'lapsed', 'superseded' or 'abandoned' — only the
-        # last is worth counting. Spec 2026-09-12 §4, §5.
+        # WHY a row landed in `expired`: 'spent', 'lapsed', 'superseded' or 'abandoned'
+        # — only the last is worth counting. Spec 2026-09-12 §4, §5; 2026-09-19 §1.
         "closed_as": "TEXT NOT NULL DEFAULT ''",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
@@ -1178,6 +1178,7 @@ class ProjectStore:
                     self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         self._backfill_alarms()
         self._backfill_abandoned_gates()
+        self._backfill_spent_gates()
 
     #: The reason `gates.sweep_unargued` wrote while the TTL still recorded a DENIAL.
     #: A prefix because the minute count varies per project; nothing else ever wrote it,
@@ -1195,6 +1196,20 @@ class ProjectStore:
                WHERE status='denied' AND decided_by='os' AND closed_as=''
                  AND decision_reason LIKE ?""",
             (self._TTL_DENIAL_PREFIX + "%",),
+        )
+
+    def _backfill_spent_gates(self) -> None:
+        """Re-file the grants that were USED as spent, not lapsed. Spec 2026-09-19 §1.
+
+        Without this, every auto-merge the fleet has ever run keeps reading as a grant
+        Neo let time out — 23 of the 26 `auto_merge` gates in production on 2026-09-19.
+        NARROW and idempotent: `uses > 0` is what the two sweeps disagreed about, and
+        nothing else writes `closed_as='lapsed'`.
+        """
+        self.conn.execute(
+            """UPDATE approvals SET closed_as='spent'
+               WHERE status='expired' AND closed_as='lapsed'
+                 AND uses > 0 AND uses >= max_uses"""
         )
 
     def _backfill_alarms(self) -> None:
@@ -3665,18 +3680,28 @@ class ProjectStore:
         showing a month-old "approved" release gate reads as standing permission, which
         is exactly the wrong impression to leave lying around.
 
-        `status='approved'` in the WHERE clause is doing two jobs, and the second one is
+        TWO SWEEPS, because the two ways out of `approved` are opposite outcomes and one
+        word for both is a lie in the majority case: a grant whose uses ran out was
+        approved AND USED — the merge ran — while one whose clock ran out was approved
+        and never used by anyone. Spent goes first so a grant that is both reads as what
+        actually happened to it. Spec 2026-09-19 §1; same argument as `abandoned`.
+
+        `status='approved'` in the WHERE clauses is doing two jobs, and the second one is
         load-bearing: it EXCLUDES `dismissed`. A dismissal never expires, and sweeping it
         into `expired` would also erase the false-positive count that
         `dismissed_count()` exists to report — the whole reason the verdict is separate.
         """
-        cur = self.conn.execute(
+        spent = self.conn.execute(
+            """UPDATE approvals SET status='expired', closed_as='spent'
+               WHERE status='approved' AND uses > 0 AND uses >= max_uses""",
+        )
+        lapsed = self.conn.execute(
             """UPDATE approvals SET status='expired', closed_as='lapsed'
                WHERE status='approved'
                  AND (uses >= max_uses OR (expires_at IS NOT NULL AND expires_at < ?))""",
             (db.now(),),
         )
-        return cur.rowcount
+        return spent.rowcount + lapsed.rowcount
 
     def abandon_approval(self, approval_id: int, reason: str) -> dict[str, Any]:
         """Close a held request whose case never came. NOT a verdict — see
