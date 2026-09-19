@@ -68,6 +68,14 @@ log = logging.getLogger(__name__)
 #: the two would destroy exactly the distinction the report exists to show (issue #103).
 WORKER_SUBPROCESS = "worker_subprocess"
 
+#: The `/compact` the OS sends before a prompt whose cache has expired
+#: (`worker_session.compact`). An OS kind and not a worker one: the worker did not ask
+#: for it and learns nothing from it — Jarvis spent it on the CONVERSATION, to make the
+#: worker's next turn cheaper. It has to be recorded here or it is not recorded at all,
+#: because a compaction writes no assistant message for `usage.read_session` to find,
+#: and a saving reported without it would be gross rather than net.
+COMPACTION = "compaction"
+
 #: Kinds that belong to the WORKER rather than to the OS. A set rather than one name so
 #: a future descendant kind joins the class without the report having to learn about it.
 SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
@@ -88,6 +96,7 @@ KIND_LABELS = {
     # JUDGING; folded together, `jarvis cost` cannot answer "what does watching
     # cost" — the first question anyone asks before turning this on.
     "health": "supervisor health review",
+    COMPACTION: "compacting a cold conversation",
     WORKER_SUBPROCESS: "worker subprocess",
 }
 

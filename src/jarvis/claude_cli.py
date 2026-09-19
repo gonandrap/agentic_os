@@ -492,6 +492,27 @@ def derive_turn_usage(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+#: The prompt that compacts a resumed session, and the whole of the transport for it.
+#: There is no `--compact` flag: `/compact` is a LOCAL command the CLI declares
+#: `supportsNonInteractive: true`, so it runs under `-p --resume` like any other prompt
+#: and returns a normal result envelope with an empty `result`.
+#:
+#: FOUR MEASURED PROPERTIES, verified on 2.1.277 on 2026-09-18 (the probe and its
+#: numbers: docs/superpowers/specs/2026-09-18-compact-past-the-ttl.md):
+#:
+#:  * the session id does not move — the summary is written into the same transcript,
+#:    behind a `compact_boundary` system row (`usage.compaction_stamps`);
+#:  * the call is charged as PLAIN INPUT, not as a cache write, so at an already-cold
+#:    boundary it re-sends the conversation at 1.0x where the next prompt would have
+#:    re-sent it at 1.25x;
+#:  * it writes no assistant message, so `usage.read_session` — and therefore the bill
+#:    and every cache-health check — cannot see what it cost. That is why
+#:    `worker_session._reap` records it in `agent_usage` instead;
+#:  * it is idempotent enough to retry: compacting an already-compacted conversation
+#:    summarises a summary, which is cheap and loses little.
+COMPACT_PROMPT = "/compact"
+
+
 def turn_args(
     prompt: str,
     session_id: str,

@@ -255,6 +255,18 @@ NOT_RETRIED = ("pending", "completed", "cancelled", "budget_exhausted")
 # `Daemon.deliver_messages` and `Daemon.retry_paused_turns`, which is where that is done.
 SLOT_STATUSES = ("dispatching", "running")
 
+#: What a `wo_turns` row can be. `dispatch` opens the conversation, `message` carries
+#: something to the worker, and `compact` carries nothing to it at all: it is the OS
+#: spending a turn on the CONVERSATION rather than on the work, summarising it before a
+#: prompt re-sends a history whose cache has expired (`worker_session.compact`). A kind
+#: rather than a flag on `message` because every reader that counts turns, prices them
+#: or shows them has to be able to tell the three apart.
+TURN_KINDS = ("dispatch", "message", "compact")
+
+#: The one whose reply belongs to nobody. A compact turn's `result` is the CLI's, not
+#: the worker's, so it is never recorded as an agent reply and never shown as one.
+COMPACT_TURN = "compact"
+
 
 def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
     """Would starting a turn on this work order NOW take a `max_concurrent` slot it is
@@ -2663,7 +2675,7 @@ class ProjectStore:
                     errfile: str = "") -> dict[str, Any]:
         """Open a turn row. Written BEFORE the process is spawned, so a turn can never
         be running with nothing on record to reap it."""
-        assert kind in ("dispatch", "message"), kind
+        assert kind in TURN_KINDS, kind
         seq = self.conn.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?", (wo_id,)
         ).fetchone()["n"]

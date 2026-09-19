@@ -2168,9 +2168,45 @@ class Daemon:
                 f"the review could not be run: the validator was unreachable "
                 f"{outages} times in a row. Nobody has judged the work.")
 
+    def _compacted_first(self, project: ProjectSpec, store: ProjectStore,
+                         wo: dict) -> bool:
+        """Spend this work order's turn on a `/compact` instead of on the message?
+
+        True when a compaction was launched, and then the caller must leave the queue
+        alone: the message goes out on the tick after it settles, which is inside the
+        cache TTL and against a conversation an order of magnitude smaller.
+
+        NEVER AT THE COST OF THE MESSAGE. A compaction that cannot be launched is not a
+        reason to hold a worker's next prompt — the boundary was going to be paid for
+        anyway, and paying it is strictly better than a work order that stops moving —
+        so every failure here returns False and the delivery proceeds exactly as it
+        did before this shipped.
+        """
+        try:
+            due = worker_session.compaction_due(
+                store, wo, self.catalog.os.compact_min_context)
+            if due is None:
+                return False
+            turn = worker_session.compact(store, project, wo, due)
+        except budget_mod.BudgetExhausted:
+            return False  # `_deliver` raises and escalates on the same call; let it
+        except Exception:  # noqa: BLE001 — a saving must never cost a delivery
+            log.exception("[%s] could not compact %s before its next prompt",
+                          project.name, wo["id"])
+            return False
+        log.info("[%s] compacting %s before its next prompt (turn %s): %s",
+                 project.name, wo["id"], turn["seq"], due.why)
+        return True
+
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
         ids = [m["id"] for m in msgs]
+        # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
+        # them has happened yet — and the next tick delivers them into a conversation
+        # that is both summarised and warm again. Deliberately before the `delivering`
+        # event, so the record does not claim a delivery that a compaction preempted.
+        if self._compacted_first(project, store, wo):
+            return
         log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
         store.add_event(wo["id"], "delivering", {"msg_ids": ids})
         # A blank line between messages and nothing else. Anything framing them — a
@@ -3384,7 +3420,7 @@ class Daemon:
         order*. The second half is the settlement logic that used to compare against
         `claude agents --json`, reading a row Jarvis owns instead of a roster it does not.
         """
-        for turn in worker_session.poll(store):
+        for turn in worker_session.poll(store, project.name):
             log.info("[%s] turn %s of %s ended: %s", project.name, turn["seq"],
                      turn["wo_id"], turn["state"])
         # `idle` is in the sweep, and it is what MIGRATES the managers this release

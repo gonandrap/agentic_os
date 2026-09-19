@@ -227,6 +227,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 f"{p.get('attempts')} {what} retries: {p.get('error') or ''}")
     if kind == "turn_cancelled":
         return "Worker turn cancelled", ""
+    # A SIGNAL AND NOT PLUMBING, unlike `turn_started`/`turn_ended` beside it. The OS
+    # spent a model call on the conversation rather than on the work, and it dropped
+    # detail the worker had: that is a thing that happened TO this work order, and the
+    # pinned self-healing learning asks for it to be provable rather than asserted.
+    if kind == "compacting":
+        return "Compacting the conversation", p.get("reason") or ""
+    if kind == "compacted":
+        # `ok` is absent on the hook's own event (`hooks.note_compaction`), which only
+        # ever fires for a compaction that already happened — so missing means true.
+        if p.get("ok") is False:
+            # The conversation is INTACT and the next prompt still pays the re-write.
+            # Saying "compacted" here would put a saving on the record that the bill
+            # will not show.
+            return "Compaction failed", str(p.get("error") or "")
+        before, after = p.get("before"), p.get("after")
+        if isinstance(before, int) and isinstance(after, int) and before:
+            return ("Conversation compacted",
+                    f"{before:,} tokens summarised to {after:,}")
+        return "Conversation compacted", ""
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
     if kind == "cost_alarm":

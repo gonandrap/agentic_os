@@ -59,6 +59,9 @@ completely different fixes:
     prefix-miss   the previous call is RECENT and the prefix was re-written anyway. A
                   DEFECT: something changed the prompt prefix (kn-335170a1). The fix is
                   upstream of the clock entirely.
+    compaction    the OS compacted here (`worker_session.compact`), so this write is a
+                  summary replacing a history. Not a defect and not free: it is the
+                  price of the ttl-expiry write that did NOT happen.
 
 THE THRESHOLD IS LOAD-BEARING, not cosmetic. Inside one turn every call after the first
 writes the delta it just added to the conversation while reading the rest — a few
@@ -106,6 +109,11 @@ TTL_1H = 3600.0
 JOIN_TOOLS = ("TaskOutput",)
 
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
+#: The fourth, and the only one the OS chose. A compaction leaves a summary that the
+#: next call writes seconds later with the static head still served — the exact shape of
+#: a prefix miss, and the reason it is labelled before the gap is looked at. Without it
+#: `jarvis inspect` would report the remedy as the defect it was bought to avoid.
+COMPACTION = "compaction"
 
 #: The buckets a wall clock divides into, in the order they are rendered. Walked rather
 #: than spelled out at each site, so a bucket cannot exist in one renderer and not another
@@ -117,6 +125,8 @@ WRITE_CAUSE_NOTES = {
     COLD_START: "the first call of the session — unavoidable",
     TTL_EXPIRY: "the cache had expired: nothing was called for longer than the TTL",
     PREFIX_MISS: "the prefix was re-written while it was still warm — a defect",
+    COMPACTION: "the OS compacted the conversation here — this is the summary being "
+                "written, and it is the price of not re-sending the whole history",
 }
 
 #: How a turn's injected prompt is recognised, most specific first. The text is the
@@ -587,13 +597,18 @@ def read_transcript(path: Path | str,
     return turns, _subagent_labels(Path(path))
 
 
-def classify_writes(calls: Sequence[usage_mod.Call], floor: int) -> list[Write]:
+def classify_writes(calls: Sequence[usage_mod.Call], floor: int,
+                    compactions: Sequence[float] = ()) -> list[Write]:
     """Every cache write at or over `floor`, labelled with what caused it.
 
     The gap is measured to the PREVIOUS API call in the session whatever its size, and
     compared against the TTL that call bought — a 1-hour write (every Jarvis call before
     kn-5dd784f5) survives a gap that would expire a 5-minute one, so testing both
     against 300 seconds would call an honest expiry a defect.
+
+    `compactions` are the moments the conversation was replaced
+    (`usage.compactions_in`); a write across one is labelled `COMPACTION` before
+    anything else, because by gap and read alone it is indistinguishable from a miss.
     """
     writes: list[Write] = []
     previous: usage_mod.Call | None = None
@@ -603,6 +618,8 @@ def classify_writes(calls: Sequence[usage_mod.Call], floor: int) -> list[Write]:
             gap = call.ts - previous.ts if previous is not None else 0.0
             if previous is None:
                 cause = COLD_START
+            elif any(previous.ts < c <= call.ts for c in compactions):
+                cause = COMPACTION
             elif gap > ttl:
                 cause = TTL_EXPIRY
             else:
@@ -643,7 +660,10 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     anatomy.turns = turns
 
     calls = usage_mod.session_calls(session_id, index=index)
-    anatomy.writes = classify_writes(calls, cfg.report_write_floor)
+    compactions = [c for path in sorted(paths)
+                   for c in usage_mod.compaction_stamps(path)]
+    anatomy.writes = classify_writes(calls, cfg.report_write_floor,
+                                     sorted(compactions))
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagents)
@@ -870,8 +890,11 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"wait will be paid for twice{hint}")))
             break
     for write in anatomy.writes:
+        # A compaction is exempt for `COLD_START`'s reason and one more: the alarm's
+        # advice is "the conversation is being paid for again", and here it is being
+        # paid for ONCE, on purpose, instead of in full.
         if write.ts >= turn.started and write.written >= cfg.alarm_write_tokens \
-                and write.cause != COLD_START:
+                and write.cause not in (COLD_START, COMPACTION):
             raised.append(Alarm(WRITE_ALARM, (
                 f"re-sent {write.written:,} cached tokens in one call ({write.cause}) "
                 f"— the conversation is being paid for again{hint}")))

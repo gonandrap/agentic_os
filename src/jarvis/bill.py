@@ -79,7 +79,12 @@ TURN_CALL_LIMIT = 200
 #: 3 — the re-write block's RAW cause split (`ttl_write`, `prefix_write`) and the worker
 #:     session's own `cache_write`, which the cache-TTL decision needs as its
 #:     denominator. `ttl_share` alone cannot recover them: it is their ratio.
-PAYLOAD_VERSION = 3
+#: 4 — the THIRD boundary cause, `compact_write`/`compact_boundaries`: a boundary the OS
+#:     compacted across, which looks exactly like a prefix miss and is not one
+#:     (`usage.Usage.rewrite_compact_write`). Absent on a version-3 seal means ZERO
+#:     rather than unknown — those orders predate compaction — so an old bill stays
+#:     readable and `prefix_boundaries` keeps its meaning across the change.
+PAYLOAD_VERSION = 4
 
 #: The actor a line belongs to. Three, because they are three different KINDS of spend
 #: and the user's first question about the old line was why the OS's half looked like
@@ -1112,6 +1117,8 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             # `usage.Usage.rewrite_ttl_write`.
             "ttl_write": total.rewrite_ttl_write,
             "prefix_write": total.rewrite_prefix_write,
+            "compact_write": total.rewrite_compact_write,
+            "compact_boundaries": total.boundaries_compact,
             "cache_write": total.cache_write,
         },
         "context_peak": total.context_peak,
@@ -1490,6 +1497,11 @@ class CacheWrites:
     prefix_write: int = 0
     boundaries: int = 0
     ttl_boundaries: int = 0
+    #: The boundaries the OS compacted across, and what they wrote. Kept apart from
+    #: `prefix_write` or the remedy would be counted as the defect — see
+    #: `usage.Usage.rewrite_compact_write`.
+    compact_write: int = 0
+    compact_boundaries: int = 0
     #: Sealed orders in the window whose bill predates `PAYLOAD_VERSION` 3 and so has no
     #: raw split to read. Counted, never treated as a zero: an unmeasured order is not
     #: evidence of a healthy one, and saying how many were skipped is what keeps the
@@ -1504,12 +1516,20 @@ class CacheWrites:
             prefix_write=self.prefix_write + other.prefix_write,
             boundaries=self.boundaries + other.boundaries,
             ttl_boundaries=self.ttl_boundaries + other.ttl_boundaries,
+            compact_write=self.compact_write + other.compact_write,
+            compact_boundaries=self.compact_boundaries + other.compact_boundaries,
             unmeasured_orders=self.unmeasured_orders + other.unmeasured_orders,
         )
 
     @property
     def prefix_boundaries(self) -> int:
-        return self.boundaries - self.ttl_boundaries
+        """The boundaries left once the two EXPLAINED kinds are taken out.
+
+        A compacted boundary is subtracted along with an expired one: the OS asked for
+        it, so counting it here would report the prefix drifting every time compaction
+        worked (`usage.Usage.rewrite_compact_write`).
+        """
+        return self.boundaries - self.ttl_boundaries - self.compact_boundaries
 
     @property
     def ttl_share_of_writes(self) -> float | None:
@@ -1565,4 +1585,9 @@ def cache_writes_since(store: Any, since: float) -> CacheWrites:
         found.prefix_write += int(rewrite.get("prefix_write") or 0)
         found.boundaries += int(rewrite.get("boundaries") or 0)
         found.ttl_boundaries += int(rewrite.get("ttl_boundaries") or 0)
+        # Absent on a version-3 seal, and zero is the right reading rather than a gap:
+        # nothing sealed before `PAYLOAD_VERSION` 4 could have been compacted, because
+        # the OS did not compact anything.
+        found.compact_write += int(rewrite.get("compact_write") or 0)
+        found.compact_boundaries += int(rewrite.get("compact_boundaries") or 0)
     return found
