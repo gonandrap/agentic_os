@@ -340,7 +340,19 @@ def test_a_re_delivery_opens_a_new_episode_and_the_next_park_does_record(started
 def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(started,
                                                                          project):
     """The pairing, and the one that decides whether route 4's fix ships: the ~60
-    planners, investigations and knowledge-base writes must settle exactly as before."""
+    planners, investigations and knowledge-base writes must settle exactly as before.
+
+    **AND IT PINS THE ATTENTION CLEARING, which is no longer written here.** This branch
+    used to be `set_status("completed")` FOLLOWED BY `clear_attention`; both are now
+    `land_finished`'s. The status is the half a test reaches for and the flag is the half
+    that rots quietly — a settled order still holding an attention item asks the user for
+    something that is over, and no assertion on the status would ever notice.
+
+    The flag is raised deliberately before the tick, so this fails if the clearing goes
+    away rather than passing because there was nothing to clear. It is raised the way
+    this order really would carry one: `true_blockers`' line for a worker that stopped
+    mid-turn, from the tick before the one that settles it.
+    """
     wo = _order(project, "answer a question")
     store = ProjectStore(project)
     try:
@@ -348,11 +360,16 @@ def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(starte
         store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
         store.update_work_order(wo["id"], result_summary="answered it")
         store.set_status(wo["id"], "running")
+        store.flag_attention(wo["id"], "worker stopped without finishing")
         started.settle_work_order(started.catalog.projects[0], store,
                                   store.get_work_order(wo["id"]))
-        assert store.get_work_order(wo["id"])["status"] == "completed"
+        settled = store.get_work_order(wo["id"])
     finally:
         store.close()
+
+    assert settled["status"] == "completed"
+    assert settled["needs_attention"] == 0, "a settled no-code order still wants the user"
+    assert settled["attention_reason"] is None
 
 
 def test_route_wo_done_records_rather_than_refusing(started, project):

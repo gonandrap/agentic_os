@@ -75,6 +75,16 @@ silently stop being recorded as unlanded the moment it had been once. A re-deliv
 writes one of those three events, so the next park is a new episode and does record.
 Both directions have a test, and the wrong key fails the second one.
 
+### 3b. Delegating a call means inheriting the duty to test it
+
+The branch was `set_status("completed")` **followed by `clear_attention`**, and both are
+now `land_finished`'s. Replacing two calls with one moves BOTH duties, and only the
+status is the half a test naturally reaches for: a settled order still holding an
+attention item asks the user for something that is over, and no assertion on the status
+would ever notice. The clean-path test now raises the flag before the tick and asserts it
+is down after — non-vacuous by construction, and removing `clear_attention` from
+`land_finished` fails it and nothing else in the file.
+
 ## 4. How the invariant knows, months later
 
 Neo question 429. `landing.authored` is exact only while the worktree exists, and a
