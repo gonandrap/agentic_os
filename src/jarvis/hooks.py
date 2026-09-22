@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import concision
 from .project_store import ProjectStore
 
 # A Bash command every worker must be able to run without a permission prompt:
@@ -291,6 +292,47 @@ def pr_body_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, 
         + "The template and the rules for filling it are in your "
           "`open-a-pull-request` skill; this repository's copy, if it has one, is "
           "`.github/pull_request_template.md`."
+    )
+
+
+def finish_summary_decision(payload: dict[str, Any],
+                            env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a `jarvis wo finish --summary` longer than the cap.
+
+    The mechanism half of docs/superpowers/specs/2026-09-19-concision-enforced.md (SS5.2).
+    Prose could not do this job: kn-fe226ab1 measured a contract bullet changing worker
+    behaviour 0/5, twice, and named a refusing hook as what the class wants instead.
+    `pr_body_decision` above is the same shape for the same reason.
+
+    Denies rather than truncating. A hook that edited the summary would be putting words
+    the worker never wrote onto a record the user reads as the worker's, and the worker
+    is the only party that knows which sentence was load-bearing.
+
+    The denial names the skills on purpose. A worker has no reason to open `i-have-adhd`
+    until something tells it its output is wrong; this is the moment it is wrong, and
+    the moment it can still act.
+    """
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    cap = concision.summary_cap(env)
+    if not cap:
+        return None  # switched off for this project
+    summary = concision.finish_summary((payload.get("tool_input") or {}).get("command", ""))
+    if summary is None:
+        return None
+    words = concision.word_count(summary)
+    if words <= cap:
+        return None
+    return _deny(
+        f"This `--summary` is {words} words; the cap is {cap}.\n"
+        f"  - The summary is the HEADLINE, not the report. One or two sentences: what "
+        f"you built and where it landed.\n"
+        f"  - Everything you just cut belongs in the final message of this turn, which "
+        f"is captured onto the work order verbatim and is what the user and Neo "
+        f"actually read. Nothing is lost by moving it there.\n"
+        f"  - Evidence goes in `--evidence`, not in the summary.\n"
+        f"Your `i-have-adhd` and `caveman` skills are how to shorten it without "
+        f"dropping anything that matters."
     )
 
 
@@ -639,6 +681,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         unreviewable = pr_body_decision(payload, env)
         if unreviewable is not None:
             return unreviewable
+        # BEFORE the auto-allow below, which would otherwise wave every `jarvis …`
+        # through and make the cap unreachable — the same ordering argument this
+        # docstring already makes for the two PR checks.
+        overlong = finish_summary_decision(payload, env)
+        if overlong is not None:
+            return overlong
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
@@ -1280,6 +1328,21 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
                 note_prefix(payload, env, root, store, wo)
             except Exception:  # noqa: BLE001
                 pass
+            # ...and the house style, which is the whole point of this event for
+            # concision (spec 2026-09-19 SS5.1). SessionStart fires once per turn,
+            # before the turn's first API call, which is the only place a rule can
+            # reach EVERY byte the turn generates without depending on the model
+            # electing to load a skill — the failure SS1 measured, 0 invocations in 142
+            # sessions. `additionalContext` is the same channel the compaction brief
+            # already rides on `PostToolUse`.
+            #
+            # It appends after the cached conversation rather than editing the system
+            # prompt, so it does not move the prefix `note_prefix` just fingerprinted.
+            return {"wo_id": wo_id, "event": event,
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": concision.house_style(),
+                    }}
 
         elif not _is_current_session(store, wo_id, session_id):
             # A superseded session reporting on itself. Its own end is not the work

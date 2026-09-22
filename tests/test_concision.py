@@ -65,22 +65,53 @@ def test_the_skill_reaches_every_worker_and_can_be_model_invoked(project):
         assert surface in front, f"description does not mention {surface!r}"
 
 
-def test_caveman_reaches_every_worker_unmodified(project):
-    """The other half of SS4. Ships verbatim rather than adapted, because upstream
-    already auto-triggers and carries no `disable-model-invocation` — so the thing to
-    pin is that nobody has quietly edited it, which would make the README's "diff it
-    against upstream" promise false.
+def test_caveman_is_adapted_and_says_so(project):
+    """It shipped verbatim until 2026-09-19 and no longer does.
+
+    The verbatim copy was invoked 0 times in 142 worker sessions and would have
+    compressed nothing if it had loaded, because its upstream `## Boundaries` section
+    excluded every surface a Jarvis worker writes (spec 2026-09-19 SS2). What this pins
+    is the two properties that made the old copy inert, so neither can come back: the
+    trigger must name Jarvis surfaces, and the self-exclusion must be gone.
     """
     from jarvis import bootstrap
 
-    vendored = (ASSETS / "skills" / "caveman" / "SKILL.md").read_bytes()
-    assert b"name: caveman" in vendored
-    assert b"disable-model-invocation" not in vendored
+    vendored = (ASSETS / "skills" / "caveman" / "SKILL.md").read_text()
+    # Whitespace-collapsed: the description is a folded YAML scalar, so a phrase the
+    # reader sees as one line may be split across two in the file.
+    front = " ".join(vendored.split("---")[1].split())
+    assert "disable-model-invocation" not in vendored
+    # The upstream trigger — "user says caveman mode" — describes a conversation a
+    # headless worker cannot have. The description has to name what it actually governs.
+    for surface in ("finish summary", "PR bodies", "code comments"):
+        assert surface in front, f"description does not name {surface!r}"
+
+    # The self-exclusion. Upstream sends "code, comments, commits, docs, issue/PR/MR
+    # text" back to normal prose; under that rule the skill has no job here at all.
+    body = vendored[vendored.index("## Boundaries"):]
+    assert "no persisted-outside-chat exemption" in body
+    assert "commit messages and PR bodies" in body
+
+    # ...but the correctness rails are NOT collateral. SS4.2: these guard accuracy, not
+    # length, and a future trim for brevity must fail here rather than in production.
+    for rail in ("exact error strings", "not / never / no / only / except",
+                 "security warnings", "failing test output"):
+        assert rail in body, f"correctness rail dropped from caveman: {rail!r}"
+
     roots = bootstrap.install_agent_assets(project, kind="worker")
     hit = [r / ".claude" / "skills" / "caveman" / "SKILL.md" for r in roots]
-    hit = [p for p in hit if p.is_file()]
+    hit = [q for q in hit if q.is_file()]
     assert hit, f"caveman not delivered to any --add-dir root: {roots}"
-    assert hit[0].read_bytes() == vendored
+    assert hit[0].read_text() == vendored
+
+
+def test_the_readme_does_not_still_promise_a_verbatim_copy(project):
+    """The README's whole value is that a reader can diff against upstream. It said
+    "verbatim" and "do not edit it in place"; once the file is adapted, leaving that
+    claim there is worse than having no README."""
+    readme = (ASSETS / "skills" / "caveman" / "README.md").read_text()
+    assert "no longer a verbatim copy" in readme
+    assert "The diff against upstream" in readme
 
 
 def test_both_skills_ship_their_licences(project):

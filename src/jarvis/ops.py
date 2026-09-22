@@ -5271,6 +5271,12 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # (`dispatch._write_worker_settings`). A running worker's session already holds the
     # servers and skills it was launched with; nothing re-reads this at it.
     ("*.wiring.*", "next-dispatch"),
+    # Same reason as `wiring`, one layer down: the cap reaches the hook as
+    # `JARVIS_SUMMARY_MAX_WORDS`, written into the settings file at spawn
+    # (`dispatch._write_worker_settings`). A worker already running keeps the cap it
+    # was launched with, and nothing re-reads the catalog at it — the hook must not,
+    # since it runs on every Bash command.
+    ("*.concision.*", "next-dispatch"),
 )
 
 APPLY_NOTES = {

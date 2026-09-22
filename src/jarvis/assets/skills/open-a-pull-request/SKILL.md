@@ -15,6 +15,19 @@ A `gh pr create` whose body is missing a section, or which contains a bare `#N`,
 **denied by a hook** with the fix named. Filling the template correctly the first time
 is faster than being sent back.
 
+## 0. Load the house style first
+
+```
+Skill(skill="i-have-adhd")
+```
+
+The body you are about to write is the longest single thing this work order produces,
+and it is read by someone who already has the diff. Load `i-have-adhd` before drafting
+it, not after — it decides what goes in and in what order, which is not a thing you can
+apply to a finished draft without rewriting it. `caveman` compresses the wording of what
+it selects; both are in force for a Jarvis work order whether or not you open them, and
+opening them gets you the examples.
+
 ## 1. Get the template
 
 In this repository, in order:

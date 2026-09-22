@@ -185,6 +185,14 @@ def test_contract_section_contains_everything_the_old_contract_had():
 
 
 def test_record_section_carries_the_full_record_rule():
+    """`ceases to exist` was here until 2026-09-19 and is deliberately gone.
+
+    It was half of a contradiction: the same section called `--summary` "a one-line
+    headline" and warned that a detail living only there ceased to exist, which is
+    answerable only by writing the detail in both places — and the record shows that is
+    what workers did (spec 2026-09-19 SS7). The rule it protected survives in the
+    `never a substitute` clause below; what is gone is the licence to pad the summary.
+    """
     from jarvis import worker_brief
     text = worker_brief.render_section("record", wo_id="wo-brief01")
     for phrase in (
@@ -194,9 +202,11 @@ def test_record_section_carries_the_full_record_rule():
         "jarvis wo finish wo-brief01",
         "--pr <url>",
         "waiting for",
-        "ceases to exist",
+        "never a substitute for the final message",
     ):
         assert phrase in text, f"lost from the record section: {phrase!r}"
+    assert "ceases to exist" not in text, (
+        "the summary/final-message contradiction is back — see spec 2026-09-19 SS7")
 
 
 def test_navigation_section_is_the_full_navigation_briefing():

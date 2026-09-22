@@ -25,7 +25,11 @@
     "knowledge_inject_limit": 8,
     "knowledge_digest_limit": 40,
     "knowledge_digest_chars": 4000,
-    "neo": {
+    "$comment_concision": "How terse the OS holds its workers. `summary_max_words` caps `jarvis wo finish --summary`; a longer one is refused by the PreToolUse hook and costs the worker a turn. 0 switches the refusal off. Per project too: put a `concision` block on the project and it inherits the rest. See docs/superpowers/specs/2026-09-19-concision-enforced.md.",
+  "concision": {
+    "summary_max_words": 120
+  },
+  "neo": {
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",
       "enabled": true,
       "model": "opus",

@@ -28,6 +28,8 @@ Two invariants inherited from the knowledge base work:
 
 from __future__ import annotations
 
+from .concision import DEFAULT_SUMMARY_MAX_WORDS as SUMMARY_MAX_WORDS
+
 WO_PLACEHOLDER = "<wo-id>"
 PROJECT_PLACEHOLDER = "<project>"
 
@@ -264,11 +266,11 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"is already on this record. Rules: `jarvis brief concision`.",
         f"- When done, ALWAYS run `jarvis wo finish {wo_id} --summary \"...\"` "
         f"(code you wrote needs `--pr <url>` or `--abandon`) and then write your "
-        f"complete answer as the last thing you say. The work order record IS this "
-        f"conversation: the last message of every turn is captured verbatim, the "
-        f"user and Neo decide from that record, and neither will ever open this "
-        f"session — a detail that lives only in the summary is a detail that "
-        f"ceases to exist.",
+        f"complete answer as the last thing you say. The record IS this "
+        f"conversation: the last message of every turn is captured verbatim and is "
+        f"what the user and Neo decide from. The summary is the HEADLINE — capped "
+        f"at {SUMMARY_MAX_WORDS} words, longer REFUSED — your final message is the "
+        f"report, and where detail goes.",
         f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
         f"finish: the tests, evals and checks you actually ran, and what they "
         f"reported. The summary says what you built; the evidence says how you "
@@ -422,10 +424,15 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "into it, and the user and Neo make their decisions from that record — "
         "neither will ever open this session. So end every turn with the complete "
         "answer: findings, caveats, uncertainties, what you did NOT do, and "
-        "absolute paths. `--summary` is a one-line headline for that answer, never "
-        "a substitute for it — anything that lives only in the summary is the only "
-        "thing anyone reads, so a detail you drop there is a detail that ceases to "
-        "exist.",
+        "absolute paths.",
+        "",
+        f"`--summary` is the HEADLINE for that answer and is capped at "
+        f"{SUMMARY_MAX_WORDS} words — the OS REFUSES a longer one, which costs you a "
+        f"whole turn. One or two sentences: what you built and where it landed. It is "
+        f"never a substitute for the final message, and never the place to put a "
+        f"detail, because the final message is where a detail survives. Evidence goes "
+        f"in `--evidence`, not in the summary. Older work orders on this record carry "
+        f"500-word summaries; do not copy them.",
         "",
         "# Finishing",
         f"When done, ALWAYS run: `jarvis wo finish {wo_id} --summary \"...\"` and "
@@ -572,9 +579,11 @@ def concision_section() -> str:
     """
     lines = [
         "# Point, do not explain",
-        "Three surfaces, one rule each. All three are things you WRITE, which is "
-        "why no output style covers them — the OS sets `outputStyle: Concise` for "
-        "what you SAY, and this section is the rest.",
+        "Three surfaces, one rule each. The HOUSE STYLE governs how you write all "
+        "three and everything else — it is injected into every turn of your session "
+        "and its rules are your `caveman` and `i-have-adhd` skills "
+        "(docs/superpowers/specs/2026-09-19-concision-enforced.md). This section is "
+        "what the style cannot know: which surface holds what.",
         "",
         "## Code comments point at documentation; they are not documentation",
         "One line, naming the reason or citing a spec section: `# -- SS3`. If the "
