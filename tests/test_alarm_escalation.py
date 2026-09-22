@@ -355,7 +355,7 @@ def test_neo_handing_the_alarm_back_leaves_it_escalated_and_flags_the_user(escal
     (row,) = _inbox(wo_id)
     assert row["level"] == "warning"
     assert f"jarvis alarms show {alarm['id']}" in row["body"]
-    assert f"jarvis neo show {alarm['neo_question_id']}" in row["body"]
+    assert f"/neo/question/{alarm['neo_question_id']}" in row["body"]
 
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:

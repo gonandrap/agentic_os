@@ -57,6 +57,15 @@ def wo_url(catalog: Catalog, project: str, wo_id: str) -> str:
     return f"{ui_base_url(catalog)}/wo/{quote(project)}/{quote(wo_id)}#{PENDING_ANCHOR}"
 
 
+def neo_question_url(catalog: Catalog, question_id: Any) -> str:
+    """Deep link to one Neo question — its verdict, its reasoning, its answer box.
+
+    A notification reaches Telegram, where `jarvis neo show <id>` is a command the reader
+    cannot run: the user is on their phone. `wo_url`'s rule, one surface along.
+    """
+    return f"{ui_base_url(catalog)}/neo/question/{urllib.parse.quote(str(question_id))}"
+
+
 def check_wo_link(central: CentralStore, catalog: Catalog, project: str,
                   wo_id: str) -> tuple[str | None, str]:
     """`(url, problem)` — the deep link, or `None` and why it would dead-end.

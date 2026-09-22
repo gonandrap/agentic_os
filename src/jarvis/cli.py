@@ -365,11 +365,26 @@ def build_parser() -> argparse.ArgumentParser:
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
     sp.add_argument("--json", action="store_true")
 
-    sp = sub.add_parser(
+    # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
+    # implicit `list`, on `alarms`' precedent below and for the same argparse reason.
+    issues_p = sub.add_parser(
         "issues",
-        help="tracker issues the fleet keeps running into, most-referenced first")
+        help="tracker issues the fleet keeps running into, most-referenced first",
+    ).add_subparsers(dest="issues_cmd", required=True)
+
+    sp = issues_p.add_parser("list", help="every linked issue, most-referenced first "
+                                          "(the default)")
     sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50, help="issues to show (default: 50)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = issues_p.add_parser(
+        "start", help="open a work order on a tracker issue — the route a bug that was "
+                      "not dispatched takes")
+    sp.add_argument("issue", help="an issue URL, `#123` or `123`")
+    sp.add_argument("--project", help="whose tracker the issue is on (default: the "
+                                      "project whose git `origin` is the OS's own "
+                                      "bug repository)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis alarms` and `jarvis alarms <project>` are the two spellings that already
@@ -1677,6 +1692,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 #: The `alarms` subcommands. Anything else after `alarms` is the project positional the
 #: command has always taken, so it is a `list` argument and not a typo'd verb.
 ALARMS_SUBCOMMANDS = ("list", "show", "review")
+ISSUES_SUBCOMMANDS = ("list", "start")
 
 
 def _normalise_alarms(argv: list[str]) -> list[str]:
@@ -1693,6 +1709,34 @@ def _normalise_alarms(argv: list[str]) -> list[str]:
     if len(argv) > 1 and argv[1] in (*ALARMS_SUBCOMMANDS, "-h", "--help"):
         return argv
     return [argv[0], "list", *argv[1:]]
+
+
+def _normalise_issues(argv: list[str]) -> list[str]:
+    """`_normalise_alarms` for `jarvis issues [project]` — see there for the why."""
+    if not argv or argv[0] != "issues":
+        return argv
+    if len(argv) > 1 and argv[1] in (*ISSUES_SUBCOMMANDS, "-h", "--help"):
+        return argv
+    return [argv[0], "list", *argv[1:]]
+
+
+def cmd_issues_start(args: argparse.Namespace) -> int:
+    """Start work on a tracker issue. What `jarvis backlog promote` used to be for a bug.
+
+    `issues.start_work` holds the whole decision; this prints it. The work order is the
+    only thing worth saying — the user asked for one and got one, or an id that was
+    already live on that issue (the dedupe there), and either way that is where the work
+    is now.
+    """
+    from . import issues as issues_mod
+
+    out = issues_mod.start_work(args.issue, args.project)
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"{out['wo_id']}  {out['project']}  {out['issue_url']}"
+          + (f"  `{out['priority']}`" if out["priority"] else ""))
+    return 0
 
 
 def cmd_issues(args: argparse.Namespace) -> int:
@@ -3331,7 +3375,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = _normalise_alarms(list(sys.argv[1:] if argv is None else argv))
+    argv = _normalise_issues(
+        _normalise_alarms(list(sys.argv[1:] if argv is None else argv)))
     # accept --json anywhere, not only before the subcommand
     as_json = "--json" in argv
     args = build_parser().parse_args([a for a in argv if a != "--json"])
@@ -3358,7 +3403,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "alarms":
             return cmd_alarms(args)
         if args.cmd == "issues":
-            return cmd_issues(args)
+            return (cmd_issues_start(args) if args.issues_cmd == "start"
+                    else cmd_issues(args))
         if args.cmd == "supervisor":
             return cmd_supervisor(args)
         if args.cmd == "adopt":

@@ -343,9 +343,12 @@ def _decorate_question(q: dict) -> dict:
     putting it here would bury the one thing the user opened the disclosure to read.
     Building it here rather than storing it means it cannot drift from what Neo gets.
     """
-    from .. import digest, neo
+    from .. import digest, issues, neo
     q["digest_view"] = digest.decode(q.get("digest"))
     q["full_context"] = neo.build_question_prompt(q)
+    # `triage` only, and empty everywhere else: the one kind whose subject is a tracker
+    # issue rather than a work order, so it is the one with nowhere else to send a reader.
+    q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
     return q
 
 

@@ -13,8 +13,8 @@ told workers to put everything inside the question text. The ruling (wo-e4a359cb
 * A worker question is one paragraph that may reference a design artifact section
   in-text (`section 3 of design doc "docs/x.md"`); ops resolves the reference and
   hands Neo ONLY that section, not the whole document.
-* An escalation inbox row is a headline pointing at `jarvis neo show`, never the
-  verbatim question.
+* An escalation inbox row is a headline LINKING to the question's dashboard page, never
+  the verbatim question — the row reaches Telegram, where a command cannot be run.
 
 Several assertions pair a "this must NOT appear" with a same-test control that the
 text demonstrably existed at that moment — a skeleton is only evidence of dieting if
@@ -356,6 +356,6 @@ def test_an_escalated_question_lands_in_the_inbox_as_a_headline(dispatched, proj
     assert "may I rotate the key?" in item["body"]
     assert "context sentence 39." in long_tail
     assert "context sentence 39." not in item["body"]  # the tail stayed out
-    assert f"jarvis neo show 1" in item["body"]
+    assert "/neo/question/1" in item["body"]
     assert f"jarvis neo answer 1" in item["body"]
     assert len(item["body"]) < 600

@@ -61,11 +61,10 @@ OPEN_Q_STATUSES = NEO_HELD_Q_STATUSES + USER_HELD_Q_STATUSES
 #
 # `triage` is the odd one out, deliberately: it is the only kind with NO work order
 # behind it, so its `wo_id` is EMPTY. A bug filed through `jarvis bug report` has an
-# issue and a backlog item and nothing else, and the whole point of the question is to
-# decide whether it earns a work order at all (issue #240, and the user's ruling of
-# 2026-09-14). Everything its verdict has to act on travels in `context` as JSON — see
-# `issues.ask_triage`. Its real resolution is `jarvis backlog promote`, which is what all
-# seven sites above are told.
+# issue and nothing else, and the whole point of the question is to decide whether it
+# earns a work order at all (issue #240, and the user's ruling of 2026-09-14). Everything
+# its verdict has to act on travels in `context` as JSON — see `issues.ask_triage`. Its
+# real resolution is `jarvis issues start`, which is what all seven sites above are told.
 #
 # `assumption` is the one the OS files ITSELF, against a work order parked in
 # `needs_review` — see `autoreview.py`. Like `triage` and `alarm` nobody asked it, so its

@@ -94,11 +94,22 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json):
 
         def triage(self, **verdict):
             """Deliver a Neo verdict for the queued triage question, as the drain does."""
+            self.triage_raw(**{"escalate": False, "approve": True, "answer": "",
+                               "reason": "because", **verdict})
+
+        def triage_raw(self, **raw):
+            """The same, from Neo's REPLY rather than from a hand-built verdict.
+
+            Everything goes through `neo.parse_verdict` so no test can assert against a
+            shape Neo cannot emit (kn-89230548) — and so the fields `triage`'s defaults
+            supply can be left OUT, which is the whole of the question-493 defect: a
+            reply carrying neither `verdict` nor `approve`.
+            """
+            from jarvis import neo
             from jarvis.catalog import load_catalog
             from jarvis.central_store import CentralStore
             from jarvis.daemon import Daemon
-            full = {"escalate": False, "approve": True, "verdict": "approved",
-                    "answer": "", "reason": "because", "dispatch": None, **verdict}
+            full = neo.parse_verdict(json.dumps(raw))
             central = CentralStore()
             try:
                 Daemon(load_catalog(catalog))._deliver_triage_verdict(
@@ -440,29 +451,33 @@ def test_a_non_dispatching_bug_is_queued_and_never_asks_neo(fleet, level):
     from jarvis.neo_store import NeoStore
 
     pickup = fleet.file_bug(priority=level)["pickup"]
-    assert pickup["backlog_id"] and not pickup["wo_id"]
+    assert not pickup["wo_id"]
     assert f"priority: {level}" in fleet.gh.issue()["labels"]
     assert "in progress" not in fleet.gh.issue()["labels"]
+    assert "jarvis issues start" in pickup["reason"], \
+        "the route out has to be one that exists"
 
     neo = NeoStore()
     try:
         assert not [q for q in neo.list_questions() if q.get("kind") == "triage"]
     finally:
         neo.close()
+    # AND NO SECOND QUEUE (kn-c5725f1f). The tracker is the tracker now; a backlog item
+    # beside the issue is a list the user stopped reading.
     central = CentralStore()
     try:
-        assert any(i["id"] == pickup["backlog_id"] for i in central.list_backlog())
+        assert not central.list_backlog()
     finally:
         central.close()
 
 
 @pytest.mark.parametrize("level", ["critical", "blocker"])
 def test_a_dispatching_claim_goes_to_neo_and_waits(fleet, level):
-    """The filing agent's rating is a CLAIM. Nothing is dispatched off it — the bug waits
-    in the backlog exactly like any other until Neo rules."""
+    """The filing agent's rating is a CLAIM. Nothing is dispatched off it — the bug sits
+    on the tracker exactly like any other until Neo rules."""
     pickup = fleet.file_bug(priority=level)["pickup"]
     assert pickup["neo_question_id"], "a critical/blocker claim must be re-assessed"
-    assert pickup["backlog_id"] and not pickup["wo_id"]
+    assert not pickup["backlog_id"] and not pickup["wo_id"]
     assert f"priority: {level}" in fleet.gh.issue()["labels"]
     assert not fleet.wo_id(), "no work order exists until Neo confirms"
 
@@ -513,6 +528,96 @@ def test_a_downgrade_that_names_a_higher_level_is_not_a_confirmation(fleet):
     assert not fleet.wo_id()
 
 
+def test_neo_confirming_in_the_answer_is_not_a_downgrade(fleet):
+    """Neo question 493, verbatim in shape: a reply with NO `verdict` and NO `approve`,
+    whose answer opens with the word `approve`. The OS told the user Neo had downgraded
+    the bug to `high` — a verdict Neo never gave, at a level nobody chose."""
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False,
+                     answer="approve — confirmed critical: the OS lies to the user",
+                     reason="Irreversible loss of blocker state plus a false "
+                            "acknowledged record is squarely the critical bar.")
+
+    assert fleet.wo_id(), "an approval confirms the claim and dispatches the work"
+    assert "priority: critical" in fleet.gh.issue()["labels"]
+    assert f"priority: {issues.SAFE_DOWNGRADE}" not in fleet.gh.issue()["labels"]
+
+
+def test_a_verdict_nobody_could_parse_is_unconfirmed_not_a_downgrade(fleet):
+    """The third outcome `settle_triage` documents and never used to reach. A reply that
+    ruled on nothing must not become a confident sentence about a level Neo never named
+    — `SAFE_DOWNGRADE` is for a deny, not for output nobody could read."""
+    from jarvis.central_store import CentralStore
+
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False, answer="it depends on the release",
+                     reason="could not decide from the report")
+
+    assert not fleet.wo_id()
+    assert "priority: critical" in fleet.gh.issue()["labels"], \
+        "the claim stands on the record as a claim"
+    assert f"priority: {issues.SAFE_DOWNGRADE}" not in fleet.gh.issue()["labels"]
+    central = CentralStore()
+    try:
+        items = central.unacked_inbox()
+    finally:
+        central.close()
+    assert any("UNCONFIRMED" in (i["title"] or "") for i in items)
+    assert not any("downgraded" in (i["title"] or "") for i in items)
+
+
+def test_a_level_in_the_answer_alone_downgrades_when_it_is_below_the_claim(fleet):
+    """Review round 1: the third route through `read_triage_verdict`, and the one that
+    writes the user-facing "Neo downgraded a `critical` bug to `X`" sentence.
+
+    Every OTHER downgrade test reaches the explicit-deny branch, because the fixture's
+    defaults supply `approve=False`. This is the shape production actually emitted —
+    neither `verdict` nor `approve`, the ruling in `answer` — with the ruling being a
+    level rather than the word `approve`.
+    """
+    from jarvis.central_store import CentralStore
+
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False,
+                     answer="high — not a blocker because the work order still lands",
+                     reason="a real defect with a workaround")
+
+    assert not fleet.wo_id(), "a downgraded claim dispatches nothing"
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: high" in labels and "priority: critical" not in labels
+    central = CentralStore()
+    try:
+        titles = [i["title"] or "" for i in central.unacked_inbox()]
+    finally:
+        central.close()
+    assert any("downgraded a `critical` bug to `high`" in t for t in titles)
+
+
+def test_a_level_in_the_answer_alone_is_unconfirmed_when_it_is_not_below_the_claim(
+        fleet):
+    """The companion, and the one that pins the ORDERING `downgrade_to` owns. `blocker`
+    is not a downgrade of `critical`, and with no verdict field beside it nobody denied
+    anything either — so there is nothing to act on and nothing to tell the user a level
+    about."""
+    from jarvis.central_store import CentralStore
+
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False, answer="blocker", reason="it stops the fleet")
+
+    assert not fleet.wo_id()
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: critical" in labels, "the claim stands on the record as a claim"
+    assert f"priority: {issues.SAFE_DOWNGRADE}" not in labels
+    assert "priority: blocker" not in labels, "and is never raised by the back door"
+    central = CentralStore()
+    try:
+        titles = [i["title"] or "" for i in central.unacked_inbox()]
+    finally:
+        central.close()
+    assert any("UNCONFIRMED" in t for t in titles)
+    assert not any("downgraded" in t for t in titles)
+
+
 def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
     """The user's instruction: the disagreement is the signal that says whether the
     rubric is working, so neither half may be overwritten silently."""
@@ -535,7 +640,8 @@ def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
     finally:
         central.close()
     assert "bounded to one surface" in inbox
-    assert "jarvis neo show" in inbox, "and a pointer to the rest of it"
+    assert "/neo/question/" in inbox, \
+        "and a LINK to the rest of it — the row reaches a phone, where a command is dead"
 
 
 def test_neos_reasoning_never_reaches_the_public_tracker(fleet):
@@ -583,8 +689,9 @@ def test_a_filing_that_cannot_reach_neo_is_queued_not_dispatched(fleet, monkeypa
     monkeypatch.setattr(issues, "ask_triage", boom)
 
     pickup = fleet.file_bug(priority="blocker")["pickup"]
-    assert pickup["backlog_id"] and not pickup["wo_id"]
+    assert not pickup["wo_id"]
     assert "NOT confirmed" in pickup["reason"]
+    assert "jarvis issues start" in pickup["reason"]
     assert not fleet.wo_id()
 
 
@@ -841,7 +948,7 @@ def test_a_filing_says_so_when_the_priority_label_did_not_reach_the_tracker(
 
     result = fleet.file_bug(priority="high")
     assert result["url"], "the issue was created; the filing stands"
-    assert result["pickup"]["backlog_id"], "so does the queued item"
+    assert result["pickup"]["project"], "and it still reached a project's rails"
     assert "gh fell over" in result["pickup"]["label_error"]
     assert "did NOT reach the issue" in bugreport.pickup_note(result["pickup"])
 
@@ -1082,9 +1189,9 @@ def test_an_unconfirmed_triage_question_is_visible_and_points_at_the_backlog(fle
     items = [a for a in ops.os_status()["attention"]
              if a.get("neo_question_id") == qid]
     assert items, "an escalated priority claim must not be invisible"
-    assert "backlog promote" in items[0]["decide"], \
+    assert "jarvis issues start" in items[0]["decide"], \
         "`jarvis neo answer` would message a work order that does not exist"
-    assert pickup["backlog_id"] in items[0]["decide"]
+    assert fleet.issue_url in items[0]["decide"]
 
 
 def test_answering_a_triage_question_is_refused_and_names_the_right_command(fleet):
@@ -1097,7 +1204,7 @@ def test_answering_a_triage_question_is_refused_and_names_the_right_command(flee
 
     with pytest.raises(ops.OpsError) as e:
         ops.neo_answer_escalated(qid, "make it a blocker")
-    assert "backlog promote" in str(e.value) and pickup["backlog_id"] in str(e.value)
+    assert "jarvis issues start" in str(e.value) and fleet.issue_url in str(e.value)
 
 
 def test_correcting_neo_on_a_triage_question_messages_nobody(fleet):
@@ -1121,27 +1228,26 @@ def test_correcting_neo_on_a_triage_question_messages_nobody(fleet):
     assert not out["forwarded_to_worker"]
 
 
-def test_a_triage_question_is_closed_once_its_backlog_item_moves(fleet):
-    """INV-NEO-ESCALATION-STALE, extended to the one kind whose subject is a CENTRAL
-    backlog item rather than a row in this project's database. Without it a claim the
-    user has already promoted goes on asking for a ruling nobody can give — the exact
+def test_a_triage_question_is_closed_once_the_work_is_started(fleet):
+    """INV-NEO-ESCALATION-STALE, extended to the one kind whose subject is a TRACKER
+    ISSUE rather than a row in this project's database. Without it a claim the user has
+    already started work on goes on asking for a ruling nobody can give — the exact
     production shape that invariant was written for."""
     from jarvis import invariants
-    from jarvis.central_store import CentralStore
     from jarvis.neo_store import NeoStore
 
-    pickup = fleet.file_bug(priority="blocker")["pickup"]
+    fleet.file_bug(priority="blocker")
     qid = _escalate(fleet)
 
     store = fleet.store()
     try:
         assert not list(invariants.check_neo_escalations_are_live(store)), \
-            "while the item is still queued the question is live"
-        central = CentralStore()
-        try:
-            central.mark_backlog(pickup["backlog_id"], "promoted")
-        finally:
-            central.close()
+            "while nothing is on the issue the question is live"
+    finally:
+        store.close()
+    issues.start_work(fleet.issue_url)
+    store = fleet.store()
+    try:
         found = list(invariants.check_neo_escalations_are_live(store))
     finally:
         store.close()
@@ -1152,3 +1258,65 @@ def test_a_triage_question_is_closed_once_its_backlog_item_moves(fleet):
         assert neo.get(qid)["status"] not in ("escalated", "failed")
     finally:
         neo.close()
+
+
+# -- the route out: jarvis issues start ------------------------------------------------
+#
+# What `jarvis backlog promote` was for a bug that was not dispatched. The filing stopped
+# creating a backlog item (kn-c5725f1f, the user's instruction), so every surface that
+# says "this was not dispatched" now names this — and a named route that did not exist
+# would be worse than the queue it replaced.
+
+
+def test_starting_an_issue_creates_the_work_order_the_filing_did_not(fleet):
+    from jarvis import ops
+
+    fleet.file_bug(priority="high")
+    out = issues.start_work(fleet.issue_url)
+
+    assert out["wo_id"] and out["project"] == "proj_a"
+    _name, _path, wo = ops.find_work_order(out["wo_id"])
+    assert wo["issue_url"] == fleet.issue_url
+    assert wo["issue_priority"] == "high", "read off the tracker's own label"
+    assert "in progress" in fleet.gh.issue()["labels"]
+    # NO RELEASE IS PROMISED. Only a confirmed critical/blocker ships one, and a brief
+    # that said otherwise would have the worker expecting a release that never comes.
+    assert "release goes out" not in wo["description"]
+    assert "user started work on it themselves" in wo["description"]
+
+
+def test_starting_the_same_issue_twice_hands_back_the_live_work_order(fleet):
+    """`promote_confirmed`'s dedupe (#240 D), reached from the other direction — which is
+    the reason `start_work` goes through it instead of calling `create_work_order`."""
+    fleet.file_bug(priority="high")
+    first = issues.start_work(fleet.issue_url)
+    assert issues.start_work(fleet.issue_url)["wo_id"] == first["wo_id"]
+
+
+@pytest.mark.parametrize("ref", ["#7", "7"])
+def test_an_issue_number_resolves_against_the_projects_own_tracker(fleet, ref):
+    """The user typing what GitHub shows them. The number is resolved against the repo
+    the project owns and never against a host the string might have named."""
+    fleet.file_bug(priority="high")
+    assert issues.start_work(ref)["issue_url"] == fleet.issue_url
+
+
+def test_starting_a_closed_issue_is_refused(fleet):
+    from jarvis import ops
+
+    fleet.file_bug(priority="high")
+    fleet.gh.set_issue(fleet.issue_url, state="CLOSED")
+    with pytest.raises(ops.OpsError) as e:
+        issues.start_work(fleet.issue_url)
+    assert "closed" in str(e.value)
+
+
+def test_jarvis_issues_still_lists_and_start_is_a_subcommand(fleet, capsys):
+    """`jarvis issues [project]` keeps working verbatim -- `_normalise_issues` inserts
+    the implicit `list` -- and the new verb reaches `start_work`."""
+    fleet.file_bug(priority="high")
+    assert cli.main(["issues"]) == 0
+    assert cli.main(["issues", "proj_a"]) == 0
+    capsys.readouterr()
+    assert cli.main(["issues", "start", fleet.issue_url]) == 0
+    assert fleet.issue_url in capsys.readouterr().out
