@@ -2901,10 +2901,12 @@ class Daemon:
         pstore.add_event(q["wo_id"], "alarm_advice",
                          {"alarm_id": alarm["id"], "neo_question_id": q["id"],
                           "answer": note})
-        # §2's ack path exactly, `ops.ack_attention` and never `clear_attention`: that
-        # one wipes `acknowledged_blockers` and discards the user's own dismissals.
+        # §2's ack path exactly, `ops.ack_os_flag`: this settles the ALARM, so it puts
+        # down the flag the alarm raised and nothing else. Never `ack_attention` (the
+        # user's blanket dismissal — issue 573), never `clear_attention` (it discards
+        # their own earlier dismissals).
         try:
-            ops.ack_attention(q["wo_id"])
+            ops.ack_os_flag(q["wo_id"])
         except ops.OpsError as exc:
             log.info("alarm %s acked by neo; attention left up: %s", alarm["id"], exc)
         central.add_inbox(

@@ -2067,6 +2067,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 out.append({"project": name, **{k: wo[k] for k in (
                     "id", "title", "status", "origin", "needs_attention",
                     "attention_reason", "created_at", "hidden", "pr_url")},
+                    # WHY IT IS SITTING THERE, once the flag is down. `attention_reason`
+                    # is NULLed by every ack, so this is the only durable answer a
+                    # settled-looking `needs_review` can give (issue 573).
+                    "seen_blockers": invariants.acknowledged(wo),
                     "status_label": labels[wo["id"]]})
         # Running first, then the PRs waiting to be merged, then everything else as it
         # came (newest first, per project). `sorted` is stable, so the second key is
@@ -2082,9 +2086,13 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 hid = " 🙈" if wo["hidden"] else ""
                 pr = f"\n    → merge {wo['pr_url']}" if wo["status"] == "waiting_pr_merge" \
                      and wo["pr_url"] else ""
+                # Only for an OPEN order with the flag already down: a closed one's old
+                # dismissals are history, and a flagged one is printing its reason above.
+                seen = "".join(f"\n    ↩ already seen: {b}" for b in wo["seen_blockers"]) \
+                    if not wo["needs_attention"] and wo["status"] in OPEN_STATUSES else ""
                 print(f"{icon} {wo['id']} [{wo['project']}] [{badge}] "
                       f"{wo['title']} ({wo['status_label']}, "
-                      f"{_age(wo['created_at'])}){att}{hid}{pr}")
+                      f"{_age(wo['created_at'])}){att}{hid}{pr}{seen}")
             if not out:
                 print("no work orders")
 
@@ -2098,6 +2106,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 "project": name, **wo,
                 "status_label": invariants.status_label(store, wo),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
+                # What has already been dismissed on this order, decoded. Always
+                # present, empty or not: it is the only durable record of why a work
+                # order was ever flagged — `attention_reason` is NULLed by every ack —
+                # so a `needs_review` with the flag down can still say why (issue 573).
+                "seen_blockers": invariants.acknowledged(wo),
                 "timeline": build_timeline(wo, events, messages,
                                            include_debug=args.debug),
                 # What was said, in order, whoever spoke — the worker's questions to

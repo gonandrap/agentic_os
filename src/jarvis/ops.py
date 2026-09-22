@@ -3996,6 +3996,46 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
     return {"acknowledged": acknowledged, "skipped": skipped}
 
 
+def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Put down an attention flag the OS raised for ITSELF, acknowledging nothing.
+
+    `ack_attention` above is the user saying "I have seen this": it writes every live
+    blocker into `acknowledged_blockers`, and `true_blockers` then filters them out for
+    ever. The supervisor, the remedy applier and Neo's alarm answer were all calling it
+    to take down the flag THEY had raised (`supervisor.ALARM_BLOCKER`), and so dismissed
+    blockers the user had never been shown — issue 573, where an alarm ack silently
+    buried an IDLE_NO_FINISH the user never saw, permanently.
+
+    THERE IS NOTHING NARROW TO ACK, which is why this writes no acknowledgement at all:
+    `ALARM_BLOCKER` is not a string `true_blockers` derives (the alarm row is the memory
+    — see `supervisor._apply`), so there is no entry to add. Instead the blockers are
+    re-derived and the flag either goes down, because nothing is left, or is re-raised
+    against whatever IS left — which is how the blocker the alarm was masking comes back
+    with its own reason rather than disappearing.
+
+    A pending assumption needs no guard here, unlike in `ack_attention`: it is a blocker
+    like any other, so it simply re-flags.
+    """
+    from .invariants import true_blockers
+
+    name, path, _ = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        blockers = true_blockers(store, wo)
+        if blockers:
+            # Only when it would actually change: `flag_attention` writes a timeline row
+            # every call, and re-stating the same reason is noise on the record.
+            if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
+                store.flag_attention(wo_id, blockers[0])
+        elif wo["needs_attention"]:
+            store.lower_attention(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "attention_reason": blockers[0] if blockers
+            else None, "blockers": blockers}
+
+
 def hide_work_order(wo_id: str, hidden: bool = True,
                     project_name: str | None = None) -> dict[str, Any]:
     """Hide a work order from listings, summaries and the attention list.

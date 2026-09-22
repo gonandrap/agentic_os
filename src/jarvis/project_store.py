@@ -1889,17 +1889,36 @@ class ProjectStore:
         self.update_work_order(wo_id, needs_attention=0, attention_reason=None,
                                acknowledged_blockers=None)
 
-    def ack_attention(self, wo_id: str, blockers: list[str]) -> None:
+    def ack_attention(self, wo_id: str, blockers: list[str], by: str = "you") -> None:
         """Record that the user has seen these blockers, and put the flag down.
 
         Deliberately dumb: the caller derives `blockers` (via `invariants.true_blockers`)
         so the store stays free of policy. Unlike `clear_attention` this remembers what
         was dismissed, which is the only reason the flag stays down across reconcile
         ticks — see `acknowledged_blockers` in ADDED_COLUMNS.
+
+        `by` NAMES WHO DISMISSED THEM, because this is a claim about a person and the
+        record used to make it on their behalf (issue 573). Rows written before it
+        existed carry no `by` and the timeline attributes them to nobody — an OS ack and
+        a user's ack are indistinguishable in those, and guessing would repeat the bug.
+        THE ONLY CALLER IS THE USER'S OWN `ops.ack_attention`: a flag the OS raised for
+        itself goes down through `lower_attention`, which acknowledges nothing.
         """
         self.update_work_order(wo_id, needs_attention=0, attention_reason=None,
                                acknowledged_blockers=db.to_json(blockers))
-        self.add_event(wo_id, "acknowledged", {"blockers": blockers})
+        self.add_event(wo_id, "acknowledged", {"blockers": blockers, "by": by})
+
+    def lower_attention(self, wo_id: str) -> None:
+        """Put the flag down, dismissing nothing and forgetting nothing.
+
+        The third door beside `clear_attention` (the blocker is gone, so spend the acks)
+        and `ack_attention` (the user has seen these, so remember them). This one is for
+        a flag the OS raised for its OWN purposes and has now settled: it must not spend
+        the user's acks and must not forge new ones. Silent on the timeline on purpose —
+        `ops.ack_os_flag`'s callers all write an event of their own saying what they
+        settled, and a second row per alarm would say it twice.
+        """
+        self.update_work_order(wo_id, needs_attention=0, attention_reason=None)
 
     def set_hidden(self, wo_id: str, hidden: bool = True) -> None:
         """Hide (or unhide) a work order.
