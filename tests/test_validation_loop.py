@@ -344,11 +344,19 @@ def test_the_reconciler_does_not_settle_a_validating_work_order(fleet):
         store.close()
 
 
-def test_a_validating_work_order_is_not_polled_and_keeps_its_pull_request(
+def test_a_validating_work_order_is_polled_and_keeps_its_pull_request(
         fleet, fake_gh):
-    """`poll_pull_requests` looks only at `waiting_pr_merge`. Both halves asserted: a
-    validating work order must not be polled, and it must not lose its url on the way
-    through the round machine either."""
+    """A validating work order IS polled, and the poll leaves it exactly where it is
+    while the pull request is still open.
+
+    IT USED TO BE EXEMPT, on the rule that keeps `running` and `dispatching` out: leave
+    the statuses something else owns alone. `validating` is owned by the round machine
+    rather than by a worker typing, so nothing is writing to the branch — and since
+    `ops.rejudge_moved_head` the order can sit there for the length of a round while the
+    user merges the pull request by hand. `Daemon.PR_POLL_STATUSES` carries that
+    argument. Asserted here as the two halves that must both hold: the poll RUNS, and it
+    changes nothing on its own.
+    """
     held = Validator(passed())
     held.block()
     fleet.daemon.validator = held
@@ -356,19 +364,19 @@ def test_a_validating_work_order_is_not_polled_and_keeps_its_pull_request(
     fleet.change(wo["id"], "print('one')\n")
     pr = "https://github.com/x/y/pull/9"
     finish(fleet, wo["id"], pr=pr)
-    fake_gh.set_pr(pr, "MERGED", merged_at="2026-08-21T00:00:00Z")
+    fake_gh.set_pr(pr, "OPEN", merge_state="CLEAN")
 
     store = fleet.store()
     try:
-        # Measured as "no NEW gh call", not "no gh call at all": the evidence collector
-        # reads the pull request itself now (spec 2026-09-12 §3), so `finish` above has
-        # already made one and an absolute assertion here would be asserting that the
-        # panel never saw the artifact.
+        # Measured as "a NEW gh call", not "any gh call at all": the evidence collector
+        # reads the pull request itself (spec 2026-09-12 §3), so `finish` above has
+        # already made one and this must not be counting that.
         before = len(fake_gh.calls)
         fleet.daemon.poll_pull_requests(fleet.spec, store)
-        assert fake_gh.calls[before:] == [], "a validating work order was polled"
+        assert fake_gh.calls[before:], "a validating work order went unpolled"
         fresh = store.get_work_order(wo["id"])
-        assert fresh["status"] == "validating"
+        assert fresh["status"] == "validating", (
+            "the poll moved an order the round machine still owns")
         assert fresh["pr_url"] == pr, "the round machine dropped the pull request"
     finally:
         held.release.set()
@@ -1523,12 +1531,21 @@ def test_rejecting_assumptions_opens_no_round_of_its_own(fleet):
 
 
 def _outbox(fleet):
-    """The project outbox rows the next tick will route. `unrouted_notifications` is
+    """The VALIDATION outbox rows the next tick will route. `unrouted_notifications` is
     the honest read: `route_outbox` marks them `routed`, so anything still here has not
-    reached the central inbox yet."""
+    reached the central inbox yet.
+
+    FILTERED TO `validation`, which every caller in this file is about. The fixture has
+    no `fake_gh` and `finish` opens a pull request, so the daemon files one project-level
+    `pr-poll` warning about a `gh` the isolation gate blocked — and since the poll started
+    visiting `validating` too, it files that warning during the round rather than only
+    after it. That is a fact about the fixture, not about whether a give-up reached the
+    user, and an unfiltered read would make every assertion here depend on it.
+    """
     store = fleet.store()
     try:
-        return store.unrouted_notifications()
+        return [r for r in store.unrouted_notifications()
+                if r["source"] == "validation"]
     finally:
         store.close()
 
@@ -1572,12 +1589,7 @@ def test_the_give_up_notification_reaches_the_central_inbox(fleet):
     fleet.drain()
     fleet.tick()  # routes the outbox
 
-    # Filtered to this row's own source, not the whole outbox: the tick also polls the
-    # pull request `finish` now opens, this fixture has no `fake_gh`, and the daemon
-    # files one project-level `pr-poll` warning about it. That is a fact about the
-    # fixture, not about whether a give-up reaches the user.
-    assert [r for r in _outbox(fleet) if r["source"] == "validation"] == [], \
-        "the row was routed, not left behind"
+    assert _outbox(fleet) == [], "the row was routed, not left behind"
     central = CentralStore()
     try:
         rows = [i for i in central.unacked_inbox() if i["wo_id"] == wo["id"]]

@@ -538,3 +538,83 @@ def test_an_os_rejection_never_parks_the_order_silently(fleet, project, fake_gh)
     envelope = store.envelopes(subject_wo_id=wo["id"])[-1]
     assert envelope["state"] == "delivered"
     assert envelope["delivered_wo_id"] == wo["id"]
+
+
+# -- the pull request settles UNDER the re-judgement ------------------------------------
+
+
+def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
+        fleet, project, fake_gh):
+    """The gap re-judging opened. It moves the order into `validating`, which used to be
+    unpolled — so the user merging the pull request themselves, while five seats read a
+    diff that had just landed, went unnoticed until the round settled and parked the order
+    back in `waiting_pr_merge`. Noticing that merge is what the poll is for, so
+    `validating` is polled and the round is closed `void` first.
+    """
+    store, wo = parked(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)                      # the head moved: round 2 is open
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-22T10:00:00Z", head_oid=PUSHED)
+    poll(fleet, store)
+
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+    # VOID, not passed or rejected: nothing judged this, and nothing was left undecided.
+    # It costs the submitter no round, so a later re-delivery is not short of budget.
+    round_2 = store.validation_rounds(wo_id=wo["id"])[-1]
+    assert int(round_2["round"]) == 2 and round_2["outcome"] == "void"
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+    assert store.events_of_kind(wo["id"], "validation_void")
+    # The user merged it. The record must not claim the OS did.
+    assert store.events_of_kind(wo["id"], "automerge_merged") == []
+
+
+def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
+        fleet, project, fake_gh):
+    """The other ending, under the same rule: somebody shut the pull request on purpose,
+    so the panel's verdict decides nothing and the work order is the user's."""
+    store, wo = parked(project)
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)
+
+    fake_gh.set_pr(PR, "CLOSED", head_oid=PUSHED)
+    poll(fleet, store)
+
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "void"
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+def test_the_widened_poll_nudges_nobody_while_a_round_is_open(fleet, project, fake_gh):
+    """THE BOUND ON THE WIDENING. `validating` is polled but is NOT in
+    `PR_REPAIR_STATUSES`, and it must not be: `invariants.true_blockers` derives the two
+    repair give-ups only there, so a nudge sent here would raise a flag nothing can
+    re-derive and INV-ATTENTION-REASON would relabel it on the next tick.
+    """
+    store, wo = parked(project)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+    poll(fleet, store)                      # round 2 is open
+
+    # ...and now the pull request conflicts, which in any repair status sends the worker
+    # a nudge and opens a repair episode.
+    fake_gh.set_pr(PR, "OPEN", checks=RED, merge_state="DIRTY", head_oid=PUSHED)
+    poll(fleet, store)
+
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    assert store.pr_repair_attempts(wo["id"], ops.PR_CONFLICT) == 0
+    assert store.pr_repair_attempts(wo["id"], ops.PR_CHECKS) == 0
+    assert store.events_of_kind(wo["id"], "pr_conflict_nudged") == []
+    assert store.events_of_kind(wo["id"], "pr_checks_nudged") == []
+    # The round it is waiting on is untouched — nothing here voided it.
+    assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "pending"
+
+
+def test_validating_is_the_only_status_polled_without_being_repairable():
+    """The pairing `invariants.PR_REPAIR_STATUSES` documents, asserted rather than
+    described: every other polled status may derive a repair blocker."""
+    from jarvis.daemon import PR_POLL_STATUSES
+
+    assert set(PR_POLL_STATUSES) - set(invariants.PR_REPAIR_STATUSES) == {"validating"}
+    assert not set(invariants.PR_REPAIR_STATUSES) - set(PR_POLL_STATUSES)
