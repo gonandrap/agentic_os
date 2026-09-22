@@ -74,6 +74,30 @@ def _stub(directory: Path, name: str) -> Path:
     return p
 
 
+def _commit(repo: Path, subject: str) -> None:
+    """One commit on the current branch — the shape a squash-merged PR leaves on main."""
+    (repo / "notes.txt").write_text(subject + "\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", subject)
+
+
+def _tag_like_shipit(repo: Path, version: str) -> None:
+    """Tag the way shipit itself does, because that shape is what the notes must handle.
+
+    A release tag never sits on main: it is a lone `Release jarvis-X.Y.Z` bump commit on
+    a release branch cut from main. The previous tag is therefore NOT an ancestor of the
+    main head being shipped, so a changelog derived from it has to lean on reachability
+    rather than on the tag lying in main's own line.
+    """
+    _git(repo, "checkout", "-q", "-b", f"release/jarvis-{version}")
+    (repo / "pyproject.toml").write_text(
+        f'[project]\nname = "jarvis-os"\nversion = "{version}"\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", f"Release jarvis-{version}")
+    _git(repo, "tag", "-a", f"jarvis-{version}", "-m", f"Jarvis OS {version}")
+    _git(repo, "checkout", "-q", "main")
+
+
 def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """Drive the real script in --dry-run, with a STUB `uv` first on PATH.
 
@@ -82,10 +106,12 @@ def _dry_run(repo: Path, prod: Path, *args: str) -> subprocess.CompletedProcess[
     developer's machine and fail on the runner — which is exactly what it did. A dry run
     never executes `uv`, it only prints the plan, so a stub is the honest stand-in.
     """
+    stub_bin = _stub(repo.parent / "stub-bin", "uv").parent
+    _stub(stub_bin, "gh")  # same reasoning as `uv`: whether the host happens to have a
+                           # `gh` must not decide if the release page is planned
     env = {**os.environ,
            "PRODUCTION_CODE": str(prod),
-           "PATH": f"{_stub(repo.parent / 'stub-bin', 'uv').parent}"
-                   f"{os.pathsep}{os.environ['PATH']}"}
+           "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"}
     return subprocess.run(
         ["bash", str(repo / "scripts" / "shipit.sh"), "--dry-run", *args],
         cwd=str(repo), env=env, capture_output=True, text=True)
@@ -432,6 +458,90 @@ def _run_with_only(tmp_path: Path, repo: Path, *, keep: tuple[str, ...],
         cwd=str(repo), capture_output=True, text=True,
         env={"PATH": str(sandbox), "HOME": str(tmp_path / "home"),
              "PRODUCTION_CODE": str(tmp_path / "prod")})
+
+
+# -- the release page (what GitHub shows as this version's changelog) ------------
+#
+# Pushing a tag leaves /releases empty: there is no per-version page, and no way to
+# see what a version contains without reading git by hand. shipit therefore publishes
+# a GitHub release for every tag it cuts, with notes built from the commits main
+# gained since the previous release.
+
+
+def test_publishes_a_github_release_for_the_tag(tmp_path):
+    repo = _make_repo(tmp_path)
+    _git(repo, "tag", "-a", "jarvis-0.1.2", "-m", "x")
+    r = _dry_run(repo, tmp_path / "prod", "patch")
+    assert r.returncode == 0, r.stderr
+    assert "gh release create 'jarvis-0.1.3'" in r.stdout
+    assert "Jarvis OS 0.1.3" in r.stdout
+
+
+def test_the_release_notes_list_what_landed_since_the_previous_release(tmp_path):
+    repo = _make_repo(tmp_path)
+    _tag_like_shipit(repo, "0.1.2")
+    _commit(repo, "Teach the gate about spent grants (#516)")
+    _commit(repo, "Cap the finish summary (#574)")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "patch")
+    assert r.returncode == 0, r.stderr
+    assert "Teach the gate about spent grants (#516)" in r.stdout
+    assert "Cap the finish summary (#574)" in r.stdout
+
+
+def test_the_release_notes_exclude_what_the_previous_release_already_shipped(tmp_path):
+    """The range is anchored on the previous TAG, which does not sit on main."""
+    repo = _make_repo(tmp_path)
+    _commit(repo, "Shipped back in 0.1.2")
+    _tag_like_shipit(repo, "0.1.2")
+    _commit(repo, "Landed after 0.1.2")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "patch")
+    assert r.returncode == 0, r.stderr
+    assert "Landed after 0.1.2" in r.stdout
+    assert "Shipped back in 0.1.2" not in r.stdout
+    # the previous release's own bump commit is not a change this release makes
+    assert "- Release jarvis-0.1.2" not in r.stdout
+
+
+def test_the_first_release_still_gets_notes(tmp_path):
+    """No previous tag to anchor on — the notes cover the history, not nothing."""
+    repo = _make_repo(tmp_path)
+    _commit(repo, "The very first thing")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "0.1.0")
+    assert r.returncode == 0, r.stderr
+    assert "gh release create 'jarvis-0.1.0'" in r.stdout
+    assert "The very first thing" in r.stdout
+
+
+def test_the_release_is_published_after_the_tag_reaches_origin(tmp_path):
+    """gh attaches the page to a tag the REMOTE already carries (--verify-tag)."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert out.index("push origin 'refs/tags/jarvis-0.2.0'") < out.index("gh release create")
+
+
+def test_a_staged_release_is_published_too(tmp_path):
+    """--stage hands the restarts to the daemon, not the changelog."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--stage", "--wo", "wo-abc123", "0.2.0")
+    assert r.returncode == 0, r.stderr
+    assert "gh release create 'jarvis-0.2.0'" in r.stdout
+
+
+def test_a_missing_gh_does_not_abort_the_release(tmp_path):
+    """A release page is a record, not a precondition for running code."""
+    repo = _make_repo(tmp_path)
+    r = _run_with_only(tmp_path, repo,
+                       keep=(*_PRECONDITION_TOOLS, "diff"), stub=("uv",))
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "gh not found" in out
+    assert "gh release create jarvis-0.2.0" in out   # the command to run by hand later
+    assert "deploying to" in out                      # and the deploy carried on
 
 
 def test_refuses_when_uv_is_not_on_path(tmp_path):
