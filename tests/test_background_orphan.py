@@ -281,10 +281,13 @@ def test_a_real_turn_reaped_by_the_transport_files_the_finding(fleet, fake_claud
     worker_session.start(store, fleet["project"], store.get_work_order(wo["id"]), "go")
     session_id = store.get_work_order(wo["id"])["session_id"]
     assert session_id, "`start` persists the session id before it launches the turn"
-    # Pinned to the turn's own clock: a real turn is over in milliseconds, and rows
-    # stamped after it ended are outside the window the detector reads.
+    # Pinned INSIDE the turn's own clock: a real turn is over in milliseconds, so rows
+    # stamped after it ended fall outside the window the detector reads. The 1ms is not
+    # decoration — a transcript stamp is ISO text with MICROSECOND resolution, so a row
+    # written at exactly `started_at` re-reads as up to half a microsecond BELOW it and
+    # is skipped by `since <= stamp`, half the time.
     _transcript(root, session_id,
-                _launch(store.latest_turn(wo["id"])["started_at"], gap=0.0))
+                _launch(store.latest_turn(wo["id"])["started_at"] + 0.001, gap=0.0))
 
     assert settle_turns(store)
 
