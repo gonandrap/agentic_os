@@ -197,3 +197,115 @@ def test_the_two_holds_are_one_mechanism_and_two_sentences():
     assert "unit (3.11)" in detail
     assert "usage" not in title.lower() and "limit" not in title.lower()
     assert VALIDATION_CI_CAUSE != VALIDATION_HELD_CAUSE
+
+
+# -- 4. the three renderers -----------------------------------------------------------
+
+
+class _Pr:
+    """The narrowest pull request `automerge.decide` reads before it holds."""
+    head_oid = "abc123abc123"
+    state = "OPEN"
+    mergeable_now = True
+    checks_green = True
+
+
+class _Cfg:
+    enabled = True
+    auto_merge = True
+
+
+def test_the_hold_is_on_the_ROUND_and_not_only_on_the_event(fleet, fake_gh):
+    """GitHub issue #581. The cause used to live on the `validation_failed` event alone,
+    and none of the three surfaces that render a round can reach it — a feature round's
+    event is on its manager's timeline, not on the round's own subject. So all three
+    printed the storage word, and a green, mergeable pull request read as a failed
+    review for the whole CI window."""
+    from jarvis import automerge, ops
+    from jarvis.project_store import validation_standing
+
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "x = 1")
+    fleet.daemon.validator = Validator(passed())
+    pr = finish(fleet, wo["id"])["pr_url"]
+    fake_gh.set_pr_artifact(pr, checks=PENDING, files=FILES, diff="+x = 1")
+
+    fleet.drain()
+
+    store = ProjectStore(fleet.project)
+    try:
+        row = store.validation_rounds(wo_id=wo["id"])[0]
+        assert row["outcome"] == "failed", "the mechanism layer must not change"
+        assert row["hold_cause"] == VALIDATION_CI_CAUSE
+
+        # 1. the CLI — `jarvis wo show`, `fo show`, `validation show`
+        line = ops.round_line(ops.validation_rounds(store, wo_id=wo["id"])[0])
+        assert "waiting for CI" in line and "· failed ·" not in line
+
+        # 2. the auto-merge hold sentence, which is the one the user quoted. The
+        #    DECISION is unchanged — a held round still does not merge.
+        held = automerge.decide(dict(row),
+                                {**store.get_work_order(wo["id"]),
+                                 "status": "waiting_pr_merge"},
+                                _Pr(), _Cfg(), validated_head="",
+                                pending_assumptions=False)
+        assert held.armed is False
+        assert held.code == automerge.HELD_NOT_PASSED
+        assert held.reason == "round 1 is waiting for CI"
+    finally:
+        store.close()
+
+    # 3. the dashboard badge, rendered in tests/test_ui.py. All three read this one
+    #    helper, which is what stops one of them drifting (kn-432d0f19).
+    assert validation_standing(row) == ("waiting for CI", "active", "◑")
+
+
+def test_a_round_closed_for_any_other_reason_clears_the_hold(fleet):
+    """Written on EVERY close, not only the holding ones. A held round is re-closed in
+    place when the tick picks it up again, so a cause left behind by an earlier hold
+    would outlive the hold and report a genuine outage as "waiting for CI"."""
+    from jarvis.project_store import validation_standing
+
+    store = ProjectStore(fleet.project)
+    try:
+        wo = store.create_work_order("t")
+        rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+        store.close_validation_round(rnd["id"], "failed", "waiting",
+                                     hold_cause=VALIDATION_CI_CAUSE)
+        assert store.get_validation_round(rnd["id"])["hold_cause"] == VALIDATION_CI_CAUSE
+
+        store.close_validation_round(rnd["id"], "failed", "the validator was unreachable")
+
+        after = store.get_validation_round(rnd["id"])
+        assert after["hold_cause"] is None
+        assert validation_standing(after) == ("failed", "bad", "✗")
+    finally:
+        store.close()
+
+
+def test_a_row_written_before_the_column_existed_reads_as_it_always_did(fleet):
+    """kn-c712a5d6: a new column is untested until a test reads a row that predates it.
+    NULL is "nothing is holding this round" — the honest reading of every pre-migration
+    row, and of every genuine failure. There is no backfill and this is why one is not
+    owed: a round still genuinely held rewrites the column on its next recheck tick,
+    which is the whole population anyone can misread."""
+    from jarvis import ops
+
+    store = ProjectStore(fleet.project)
+    try:
+        wo = store.create_work_order("t")
+        rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+        store.close_validation_round(rnd["id"], "failed", "no validator is configured")
+        store.conn.execute("UPDATE validation_rounds SET hold_cause=NULL WHERE id=?",
+                           (rnd["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    store = ProjectStore(fleet.project)  # re-opened, so `_migrate` has run over the row
+    try:
+        assert store.validation_rounds(wo_id=wo["id"])[0]["hold_cause"] is None
+        assert "· failed ·" in ops.round_line(
+            ops.validation_rounds(store, wo_id=wo["id"])[0])
+    finally:
+        store.close()

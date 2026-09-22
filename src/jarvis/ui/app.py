@@ -29,6 +29,7 @@ from ..project_store import (
     TERMINAL_STATUSES,
     WO_STATUSES,
     ProjectStore,
+    validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
 
@@ -675,6 +676,10 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # A round's word, tone and icon — the same tuple `ops.round_line` and
+        # `automerge.decide` render from, so no surface can call a CI wait a failure on
+        # its own (GitHub issue #581).
+        validation_standing=validation_standing,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         fmt_left=fmt_left,
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
