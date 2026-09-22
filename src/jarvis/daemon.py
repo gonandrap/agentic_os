@@ -54,7 +54,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection,
+from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
                worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
@@ -2418,12 +2418,28 @@ class Daemon:
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
         ids = [m["id"] for m in msgs]
+        anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
         # them has happened yet — and the next tick delivers them into a conversation
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
             return
+        # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
+        # whose last turn died on a background job used to re-enter the identical turn
+        # shape knowing nothing, and the worker backgrounded and signed off again —
+        # twice, on wo-d81fcc15. As a MESSAGE of its own rather than a header wrapped
+        # around the user's, which is what keeps the rule below true (spec §4 of
+        # docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
+        note = background.resume_note(store, wo, msgs)
+        if note:
+            msgs = [{"id": store.queue_message(wo["id"], note,
+                                               source=background.SOURCE),
+                     "content": note, "source": background.SOURCE}, *msgs]
+            # NOT `ids[0]`, which the turn is anchored to below: the cost of a turn is
+            # charged to the ASK, and the ask is the user's message, not the OS's note
+            # about the last one.
+            ids = [m["id"] for m in msgs]
         log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
         store.add_event(wo["id"], "delivering", {"msg_ids": ids})
         # A blank line between messages and nothing else. Anything framing them — a
@@ -2431,7 +2447,7 @@ class Daemon:
         # instruction from the user, and the user wrote none of it.
         text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
+            turn = worker_session.send(store, project, wo, text, msg_id=anchor)
         except budget_mod.BudgetExhausted as e:
             # The messages stay QUEUED, not `failed`: nothing is wrong with them and the
             # user raising the budget is exactly what sends them. `delivery_hold` keeps

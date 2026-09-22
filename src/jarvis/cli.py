@@ -45,6 +45,23 @@ def _print(data: Any, as_json: bool) -> None:
         _pretty(data)
 
 
+def _readable_conversation(detail: dict[str, Any]) -> dict[str, Any]:
+    """A work order's document with the empty `void` markers dropped.
+
+    HUMAN output only, on `_readable_rounds`' rule one line down: `--json` keeps the key
+    on every turn, because a key that comes and goes is one every consumer has to guard,
+    while a person reading `jarvis wo show` gets the retraction only where there is one
+    — an empty `void:` over every message the OS has nothing to say about is the noise
+    that makes the one that matters invisible.
+    """
+    row = dict(detail)
+    turns = row.get("conversation")
+    if isinstance(turns, list):
+        row["conversation"] = [{k: v for k, v in turn.items()
+                                if k != "void" or v} for turn in turns]
+    return row
+
+
 def _readable_rounds(detail: dict[str, Any]) -> dict[str, Any]:
     """A unit's document with its validation rounds collapsed to one line each.
 
@@ -2147,7 +2164,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_rounds(_readable_issues(detail))))))
+            _readable_alarms(_readable_rounds(_readable_issues(
+                _readable_conversation(detail)))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

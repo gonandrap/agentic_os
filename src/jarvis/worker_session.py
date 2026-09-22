@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import budget, claude_cli, systemd_units, usage
+from . import background, budget, claude_cli, systemd_units, usage
 from .catalog import ProjectSpec
 from .project_store import COMPACT_TURN, COST_FROM_TRANSCRIPT, ProjectStore
 
@@ -736,8 +736,15 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
                                  num_turns=result.num_turns, usage_json=usage_json)
 
     reply = result.result or _last_assistant_message(store, wo_id, turn)
-    if reply:
-        store.record_agent_reply(wo_id, reply)
+    msg_id = store.record_agent_reply(wo_id, reply) if reply else None
+    # WHAT THE TURN LEFT RUNNING, asked here because this is the one place a turn is
+    # settled exactly once — a reconciler branch would re-derive it every tick
+    # (kn-089de524). The reply is already on the record: what this decides is whether it
+    # is still true. Spec
+    # docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md.
+    orphaned = background.orphaned_in_turn(store, wo_id, turn)
+    if orphaned:
+        background.record(store, wo_id, turn, orphaned, msg_id)
     store.add_event(wo_id, "turn_ended", {
         "seq": turn["seq"], "chars": len(reply or ""),
         "cost_usd": result.cost_usd, "turns": result.num_turns,

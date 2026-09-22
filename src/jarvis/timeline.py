@@ -51,6 +51,24 @@ DEBUG_KINDS = frozenset({
     "health_reviewed",
 })
 
+#: `background.EVENT`, spelled out here for the reason `SUPERVISOR_SOURCE` is: this
+#: module is a leaf and opens nothing. A test pins the two equal. Spec
+#: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md.
+BACKGROUND_ORPHANED = "background_orphaned"
+
+#: What the conversation prints ABOVE a message whose turn left a background job behind
+#: — `build_conversation`'s `void` field, spec §3. It retracts the promise without
+#: touching the words: the message is what the worker said, and this is what the OS
+#: knows about it. Free of any elapsed time, so it reads the same the hour it is written
+#: and two days later.
+VOID_MESSAGE = ("⚠ VOID — the turn that wrote this ended while {jobs} was still "
+                "running, and a turn is one process: the job died with it. Nothing this "
+                "message describes as running has run since.")
+
+#: How much of a command survives into a job's label — `background.COMMAND_CHARS`, and
+#: pinned equal to it by the same test.
+JOB_COMMAND_CHARS = 80
+
 STATUS_LABEL = {
     "pending": "Queued",
     "dispatching": "Dispatching worker",
@@ -601,6 +619,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # timeline is the only place the user ever sees it: the item itself lands on the
         # backlog, where nothing points back at this work order's story.
         return ("Deferred something out of scope", p.get("title") or "")
+    if kind == BACKGROUND_ORPHANED:
+        # The detector, on the timeline beside the void it puts on the message itself —
+        # spec §2. Names the jobs, because the id is what a reader checks against `ps`
+        # and what the OS's own alarm quoted.
+        return ("A background job died with the turn that started it",
+                _job_labels(p) + " — nothing it was told to do has run")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":
@@ -623,7 +647,10 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 #: seeing GitHub report CONFLICTING or a failed check (§6 of
 #: docs/superpowers/specs/2026-08-22-a-work-order-heals-its-own-pull-request.md, and
 #: docs/superpowers/specs/2026-09-13-a-work-order-never-sits-on-a-red-pull-request.md).
-UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks"})
+#: The third is `background.SOURCE`: the note a resume carries when the last turn ended
+#: on a background job the OS caught dying with it (§4 of
+#: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
+UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan"})
 
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
 #: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a
@@ -684,6 +711,41 @@ def _message_ref(m: dict[str, Any]) -> dict[str, Any] | None:
     return {"kind": "message", "id": mid, "label": "in the conversation"}
 
 
+def _job_labels(p: dict[str, Any]) -> str:
+    """The jobs in a `background_orphaned` payload, named for a person.
+
+    `background.Job.label`'s wording, written out again for the reason the constants
+    above are: this module imports nothing. A test pins the two renderings equal.
+    """
+    named = []
+    for job in (p.get("jobs") or ()):
+        if not isinstance(job, dict):
+            continue
+        command = " ".join(str(job.get("command") or "").split())
+        if len(command) > JOB_COMMAND_CHARS:
+            command = command[:JOB_COMMAND_CHARS] + "…"
+        named.append(f"`{job.get('id')}` (`{command}`)" if command
+                     else f"`{job.get('id')}`")
+    return ", ".join(named) or "a background job"
+
+
+def _voided(events: list[dict[str, Any]]) -> dict[Any, str]:
+    """Which messages the OS has since contradicted, keyed by message id — spec §3.
+
+    DERIVED at render time from the event the reaper wrote, never stored beside the
+    message: the fact has one home, every surface that builds the conversation reads it
+    from here, and no column had to be added to carry a second copy of it.
+    """
+    void: dict[Any, str] = {}
+    for e in events:
+        if e.get("kind") != BACKGROUND_ORPHANED:
+            continue
+        p = _payload(e)
+        if p.get("msg_id") is not None:
+            void[p["msg_id"]] = VOID_MESSAGE.format(jobs=_job_labels(p))
+    return void
+
+
 def build_conversation(events: list[dict[str, Any]],
                        messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Everything that was SAID about this work order, in the order it was said.
@@ -719,7 +781,8 @@ def build_conversation(events: list[dict[str, Any]],
             qid = _neo_question_id(p)
             turns.append({
                 "ts": e.get("ts") or 0.0, "kind": "question", "who": "worker → Neo",
-                "content": text, "anchor": f"q-{qid}" if qid is not None else "",
+                "void": "", "content": text,
+                "anchor": f"q-{qid}" if qid is not None else "",
                 "ref": _ref(kind, p), "msg_id": None,
                 "source": "neo", "status": "", "inbound": False,
             })
@@ -729,13 +792,17 @@ def build_conversation(events: list[dict[str, Any]],
             "kind": "note" if kind == "alarm_reviewed" else "advice",
             "who": ("supervisor → you" if kind == "alarm_reviewed"
                     else "neo → supervisor"),
-            "content": text, "anchor": "", "ref": _ref(kind, p), "msg_id": None,
-            "source": "", "status": "", "inbound": False,
+            "void": "", "content": text, "anchor": "", "ref": _ref(kind, p),
+            "msg_id": None, "source": "", "status": "", "inbound": False,
         })
+    void = _voided(events)
     for m in messages:
         mid = m.get("id")
         turns.append({
             "ts": m.get("ts") or 0.0, "kind": "message", "who": _message_label(m),
+            # BEFORE `content`, so the CLI's generic printer renders the retraction
+            # above the words it retracts rather than below them (spec §3).
+            "void": void.get(mid, ""),
             "content": m.get("content") or "",
             "anchor": f"msg-{mid}" if mid is not None else "",
             "ref": None, "msg_id": mid, "source": m.get("source") or "",
