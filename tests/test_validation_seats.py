@@ -642,7 +642,7 @@ def test_the_shared_prefix_carries_the_packet_and_no_seats_mandate(store, jarvis
 #: where-a-follow-up-goes paragraph are shared by all four; THE TIEBREAKER IS NOT — see
 #: `test_the_tiebreaker_ships_to_exactly_the_two_seats_whose_uncertainty_costs_a_round`.
 BLOCKER_BLOCK_START = "## WHAT MAKES A FINDING A BLOCKER"
-DEFINITION_END = "project, in your words, and the work lands."
+DEFINITION_END = "and on the internal record otherwise — and the work lands."
 NARROWING_START = "`reason` and `asks` are about your BLOCKERS."
 NARROWING_END = "carried further than the filing."
 TIEBREAKER = ("If you are weighing whether something is worth a round trip, that weighing "
@@ -725,7 +725,7 @@ def test_the_blocker_definition_states_the_default_and_where_a_remark_goes():
     assert "only if the work is not fit to ship without it" in block
     assert "Everything else is a `follow_up`" in block
     assert "including everything you would merely have written differently" in block
-    assert "filed as a ticket against this project" in block, (
+    assert "it is kept" in block and "as a ticket on this project's tracker" in block, (
         "a seat told its remark is discarded will argue for it instead")
     assert "not exactly `blocker` is read as `follow_up`" in flat("architect")
 
@@ -880,9 +880,10 @@ def test_findings_normalises_a_seats_reply_into_titles_and_details():
         findings=[{"severity": "blocker", "title": " ops.py files twice ", "detail": "d1"},
                   {"severity": "follow_up", "title": "t2", "detail": "d2"}]))
 
+    bare = {"file": "", "symbol": "", "failure": ""}
     assert found == [{"severity": "blocker", "title": "ops.py files twice",
-                      "detail": "d1"},
-                     {"severity": "follow_up", "title": "t2", "detail": "d2"}]
+                      "detail": "d1", **bare},
+                     {"severity": "follow_up", "title": "t2", "detail": "d2", **bare}]
 
 
 def test_a_severity_nobody_defined_is_filed_and_never_blocks():
@@ -913,7 +914,8 @@ def test_only_the_exact_word_blocker_may_cost_the_submitter_a_round():
         {"severity": "blocker", "title": "t", "detail": "d"}]))
 
     assert validation.blockers(found) == [{"severity": "blocker", "title": "t",
-                                           "detail": "d"}]
+                                           "detail": "d", "file": "", "symbol": "",
+                                           "failure": ""}]
     assert validation.follow_ups(found) == []
 
 
@@ -1231,7 +1233,7 @@ def test_decide_returns_the_follow_ups_the_seats_raised_and_the_chair_never_saw(
     assert result["follow_ups"] == [{
         "seat": "architect", "title": "the architect follow-up",
         "detail": "what the architect seat would file rather than argue",
-        "round": round_row["round"]}]
+        "round": round_row["round"], "file": "", "symbol": "", "failure": ""}]
 
     chair = chair_prompt_of(fake_claude)
     assert "what the architect seat would file rather than argue" not in chair
@@ -1319,4 +1321,5 @@ def test_a_chair_finding_is_never_filed_as_a_follow_up():
         seats.Opinion(seat="maintainer", status="ok",
                       raw=json.dumps({"verdict": "pass", "findings": findings}))], 4)
 
-    assert filed == [{"seat": "maintainer", "title": "t", "detail": "d", "round": 4}]
+    assert filed == [{"seat": "maintainer", "title": "t", "detail": "d", "round": 4,
+                      "file": "", "symbol": "", "failure": ""}]

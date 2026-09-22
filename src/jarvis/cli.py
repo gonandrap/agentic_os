@@ -99,10 +99,18 @@ def _readable_issues(detail: dict[str, Any]) -> dict[str, Any]:
     index = row.pop("issues", None) or {}
     raised = [issue_line(i) for i in index.get("raised") or []]
     refs = [issue_line(i) for i in index.get("references") or []]
+    # NO ISSUE WAS OPENED FOR THESE and that is what the line has to say — the finding is
+    # whole on the record, and a reader who went looking for it on GitHub would find
+    # nothing (`ops.file_validation_follow_ups`).
+    kept = [f"internal only: {i.get('title') or ''}"
+            + (f" ({i['file']})" if i.get("file") else "")
+            for i in index.get("withheld") or []]
     if raised:
         row["follow_ups_raised"] = raised
     if refs:
         row["issues_referenced"] = refs
+    if kept:
+        row["follow_ups_kept"] = kept
     return row
 
 
@@ -1718,8 +1726,12 @@ def cmd_issues(args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         title = row["title"] or row["issue_url"]
-        print(f"{row['refs']:>3}  #{row['number']}  [{row['project']}] {title}")
-        print(f"     {row['issue_url']}")
+        where = "internal" if row.get("internal") else f"#{row['number']}"
+        print(f"{row['refs']:>3}  {where}  [{row['project']}] {title}")
+        # An internal follow-up is one the panel raised on a repository the OS could not
+        # establish is private, so nothing was published and there is no link to print.
+        print(f"     {row['issue_url']}" if row["issue_url"]
+              else "     kept on the internal record — no tracker issue was opened")
         who = ", ".join(f"{u['unit_id']} ({u['kind']})" for u in row["units"])
         print(f"     {who}")
     return 0
@@ -2272,6 +2284,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 for rnd in detail["validation_rounds"]:
                     print(f"  {ops.round_line(rnd)}")
             for heading, key in (("follow-ups raised", "follow_ups_raised"),
+                                 ("follow-ups kept internally", "follow_ups_kept"),
                                  ("issues referenced", "issues_referenced")):
                 if detail.get(key):
                     print(f"\n{heading}:")
@@ -3204,6 +3217,9 @@ def cmd_validation(args: argparse.Namespace) -> int:
         if dropped := follow_ups.get("dropped"):
             print(f"  {dropped} further follow-up(s) went over the per-round cap and "
                   f"were not filed; a later round may raise them again")
+        for item in follow_ups.get("withheld") or []:
+            print(f"  kept internally: {item.get('title') or ''} — no issue was opened "
+                  f"({follow_ups.get('reason') or 'the tracker may be public'})")
         if failed := follow_ups.get("failed"):
             why = follow_ups.get("reason") or "the tracker refused or was unreachable"
             print(f"  {failed} follow-up(s) could not be filed as issues — {why}")

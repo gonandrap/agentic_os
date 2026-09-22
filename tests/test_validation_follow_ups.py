@@ -55,10 +55,27 @@ def _seats(verdict: str) -> list[dict]:
             for seat in ("tester", "security")]
 
 
-def follow_up(title: str, detail: str = "", seat: str = "maintainer") -> dict:
-    """One entry of `decide`'s `follow_ups` key, as §3 returns it."""
+def follow_up(title: str, detail: str = "", seat: str = "maintainer", *,
+              file: str = "src/proj/a.py", symbol: str = "run",
+              failure: str = "run({}) returns None instead of raising") -> dict:
+    """One ADMISSIBLE entry of `decide`'s `follow_ups` key, as §3 returns it.
+
+    `file` and `failure` are what `ops.follow_up_admissible` requires — a follow-up names
+    a behaviour that is wrong, in code that exists — so the default here is a finding
+    that may become a ticket. `nit()` below is the other kind.
+    """
     return {"seat": seat, "title": title, "detail": detail or f"about {title}",
-            "round": 1}
+            "round": 1, "file": file, "symbol": symbol, "failure": failure}
+
+
+def nit(title: str, seat: str = "tester") -> dict:
+    """A finding that names no wrong behaviour: "no test covers this", a stale docstring.
+
+    Never a tracker item, and never dropped either — it reaches the submitter through
+    `ops.follow_up_feedback` in the round that is going back anyway.
+    """
+    return {"seat": seat, "title": title, "detail": f"about {title}", "round": 1,
+            "file": "", "symbol": "", "failure": ""}
 
 
 def verdict(outcome: str, *titles: str, reason: str = "", seat: str = "maintainer",
@@ -133,28 +150,71 @@ def payload(fleet, wo_id: str) -> dict:  # noqa: F811
     return json.loads(rows[-1]["payload"]) if rows else {}
 
 
+def settle_again(fleet, wo_id: str, findings: list[dict], **cfg) -> dict:  # noqa: F811
+    """A SECOND SETTLE on one order, over the round it already has.
+
+    What `jarvis validation force` produces: the loop settled once, the user re-judged
+    the same pull request, and the filer runs again. The per-order cap and the dedupe
+    both have to hold ACROSS settles, which one round can never show.
+    """
+    store = fleet.store()
+    try:
+        rnd = store.latest_validation_round(wo_id=wo_id)
+        conf = fleet.spec.validation
+        return ops.file_validation_follow_ups(store, fleet.spec, dict(rnd), findings,
+                                              conf, wo_id=wo_id)
+    finally:
+        store.close()
+
+
+def kept_rows(fleet, unit_id: str) -> list[dict]:  # noqa: F811
+    """The withheld follow-ups on the internal record, oldest first."""
+    store = fleet.store()
+    try:
+        return store.internal_follow_ups(unit_id)
+    finally:
+        store.close()
+
+
 # -- 1. the filing ---------------------------------------------------------------------
 
 
-def test_a_rejected_round_files_an_issue_and_still_sends_back_its_blockers(fleet,
-                                                                           tracker):
-    """The whole point, in one test: the round's non-blocking remarks become issues on
-    the project's tracker and the submitter is sent back over its blocker alone.
+def test_a_rejection_with_rounds_left_files_nothing_and_sends_back_its_blockers(fleet,
+                                                                                tracker):
+    """FILED AT SETTLE, NEVER MID-LOOP. Round 1's findings used to be filed at once and
+    then fixed in round 2, leaving issues open against code that no longer exists — 20 of
+    them on wo-0a9ba9b3. The submitter is still sent back over its blocker alone.
 
-    Both halves, because either is satisfied by the wrong machine. A panel that filed
-    nothing passes "the worker was told only the reason"; a panel that pushed every nit
-    passes "an issue exists"."""
+    Both halves, because either is satisfied by the wrong machine: a panel that files
+    nothing ever passes "the worker was told only the reason"; a panel that pushed every
+    nit at the worker passes "no issue exists"."""
+    fleet.reconfigure(max_rounds=9)
     wo = judged(fleet, "rejected", "Name the retry budget in the docstring",
                 reason="the new branch has no test")
     fleet.tick()  # deliver the feedback
 
-    rows = filed(tracker)
-    assert titles(tracker) == ["Name the retry budget in the docstring"]
-    assert rows[0]["url"].startswith(SERIES)
+    assert filed(tracker) == [], "an intermediate round filed against unsettled code"
     told = sent(fleet, wo["id"])
     assert "the new branch has no test" in told
     assert "retry budget" not in told, "a follow-up reached the submitter"
     assert "github.com/acme" not in told, "an issue link reached the submitter"
+
+
+def test_the_last_round_of_a_rejected_order_still_files(fleet, tracker):
+    """The loop is over and there is no round left to fix anything in, so the findings
+    are filed rather than lost with it — Neo's ruling on this order: the user decides the
+    blockers, and holding the follow-ups risks losing them entirely."""
+    fleet.reconfigure(max_rounds=1)
+    wo = judged(fleet, "rejected", "Name the retry budget in the docstring",
+                reason="the new branch has no test")
+
+    assert titles(tracker) == ["Name the retry budget in the docstring"]
+    assert filed(tracker)[0]["url"].startswith(SERIES)
+    store = fleet.store()
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    finally:
+        store.close()
 
 
 def test_it_is_filed_on_the_project_under_review_not_the_os_tracker(fleet, tracker):
@@ -307,24 +367,14 @@ def test_an_issue_the_user_has_since_closed_is_still_not_re_filed(fleet, tracker
     Paired with the round-2 test above, which proves the dedupe works at all — this one
     alone would pass on a machine that never files anything twice because it never files
     anything."""
-    fleet.reconfigure(max_rounds=9)
-    validator = Validator(verdict("rejected", "Name the retry budget", reason="no test"),
-                          verdict("passed", "Name the retry budget"))
-    fleet.daemon.validator = validator
-    wo = fleet.dispatch()
-    fleet.change(wo["id"], "print('one')\n")
-    finish(fleet, wo["id"])
-    fleet.drain()
+    wo = judged(fleet, "passed", "Name the retry budget")
     rows = filed(tracker)
     assert len(rows) == 1
     # The user reads it and closes it, which is what a tracker is for.
     tracker.add_issue(rows[0]["url"], title=rows[0]["title"], body=rows[0]["body"],
                       state="CLOSED", labels=rows[0]["labels"])
 
-    fleet.tick()
-    fleet.change(wo["id"], "print('one')\nprint('two')\n")
-    finish(fleet, wo["id"], summary="fixed")
-    fleet.drain()
+    settle_again(fleet, wo["id"], [follow_up("Name the retry budget")])
 
     assert [r["state"] for r in filed(tracker)] == ["CLOSED"], (
         "a closed follow-up was filed again")
@@ -362,11 +412,8 @@ def test_the_same_title_twice_in_one_round_is_one_issue(fleet, tracker):
 SIX = ("one", "two", "three", "four", "five", "six")
 
 
-def test_only_five_follow_ups_are_filed_per_round_and_the_rest_are_counted(fleet,
-                                                                           tracker):
-    """Title matching will never be reliable — a seat writes a slightly different
-    sentence each round — so the damage is BOUNDED rather than chased. The failure mode
-    is a few near-duplicate issues a user closes, not a tracker nobody can read."""
+def test_only_five_follow_ups_are_filed_and_the_rest_are_counted(fleet, tracker):
+    """The bound itself. What it bounds is the ORDER, which the next test pins."""
     wo = judged(fleet, "passed", *SIX)
 
     assert titles(tracker) == list(SIX[:5])
@@ -394,41 +441,54 @@ def test_the_cap_is_a_per_project_setting(fleet, tracker):
     assert titles(tracker) == ["one", "two"]
 
 
-def test_a_dropped_finding_is_filed_by_a_later_round(fleet, tracker):
-    """Over the cap is not the same as refused. Capping BEFORE the dedupe would mean a
-    unit whose first findings are already filed never reaches the ones behind them, on
-    any round, for ever."""
-    _round_two(fleet,
-               verdict("rejected", "one", "two", "three", reason="no test"),
-               verdict("passed", "one", "two", "three"), max_follow_ups=2)
+def test_the_cap_bounds_the_order_and_not_one_settle(fleet, tracker):
+    """THE ARITHMETIC THAT PRODUCED TWENTY ISSUES. Applied per round, a unit judged four
+    times filed four times the cap — 4 x 5 on wo-0a9ba9b3. What the order has already
+    raised is subtracted, so a second settle with entirely fresh findings files nothing
+    once the cap is spent.
 
-    assert titles(tracker) == ["one", "two", "three"]
+    Asserted on FRESH titles, not on re-raised ones: a machine whose dedupe worked and
+    whose cap did not would pass a repeat."""
+    fleet.reconfigure(max_follow_ups=2)
+    wo = judged(fleet, "passed", *SIX)
+    assert titles(tracker) == ["one", "two"]
+
+    result = settle_again(fleet, wo["id"],
+                          [follow_up(t) for t in ("seven", "eight")])
+
+    assert titles(tracker) == ["one", "two"], "a second settle filed past the cap"
+    assert result["dropped"] == 2
 
 
 # -- 4. what cannot be filed, and is therefore counted ---------------------------------
 
 
-def test_a_project_with_no_github_remote_counts_the_findings_it_could_not_file(fleet,
-                                                                               fake_gh):
-    """Several projects in the fleet are local-only. The finding is not silently lost:
-    it is counted, given a reason, and both reach the record — a finding that evaporated
-    is otherwise indistinguishable from a round that raised none."""
+def test_a_project_with_no_github_remote_keeps_the_finding_on_the_record(fleet,
+                                                                        fake_gh):
+    """Several projects in the fleet are local-only. No repository is no proof of
+    privacy, so the finding takes the same path a public tracker's does: kept whole,
+    internally, and nothing published. It used to be counted as a failure, which read as
+    a finding lost to a broken network rather than one deliberately not published."""
     fake_gh.issue_series(SERIES)  # no `origin` is added: that is the case under test
     wo = judged(fleet, "passed", "Name the retry budget")
 
     assert [c for c in fake_gh.calls if c["argv"][:2] == ["issue", "create"]] == []
     p = payload(fleet, wo["id"])
-    assert p["failed"] == 1 and p["items"] == []
-    assert "no GitHub `origin`" in p["reason"]
+    assert p["failed"] == 0 and p["items"] == []
+    assert [i["title"] for i in p["withheld"]] == ["Name the retry budget"]
+    assert kept_rows(fleet, wo["id"])[0]["detail"] == "about Name the retry budget"
 
 
-def test_a_tracker_that_cannot_be_read_files_nothing_rather_than_duplicating(fleet,
-                                                                             tracker):
+def test_a_tracker_that_cannot_be_read_files_nothing_rather_than_duplicating(
+        fleet, tracker, monkeypatch):
     """The dedupe's read is a PRECONDITION of the writes, not an optimisation. Filing
     without it would duplicate every follow-up this unit already has, which is the exact
     flood the dedupe exists to prevent — so an unreadable tracker costs the round its
     follow-ups and says so."""
-    tracker.fail("HTTP 403: rate limit exceeded")
+    def refuse(repo, unit_id):
+        raise issues.IssueLifecycleError("HTTP 403: rate limit exceeded", "REFUSED")
+
+    monkeypatch.setattr(issues, "follow_ups_filed", refuse)
     wo = judged(fleet, "passed", "Name the retry budget")
 
     assert [c for c in tracker.calls if c["argv"][:2] == ["issue", "create"]] == []
@@ -528,16 +588,30 @@ def test_the_filing_is_readable_on_the_timeline(fleet, tracker):
     assert "maintainer" not in line["label"] + line["detail"]
 
 
-def test_the_timeline_says_when_a_follow_up_could_not_be_filed(fleet, fake_gh):
+def test_the_timeline_says_when_a_follow_up_could_not_be_filed(fleet, tracker,
+                                                               monkeypatch):
     """The label changes, not just the detail. A round that raised follow-ups and filed
     none must not read as a round that raised none — that is the whole difference a
     remote destination introduces."""
-    fake_gh.issue_series(SERIES)  # no `origin`
+    monkeypatch.setattr(issues, "follow_ups_filed", _unreadable)
     wo = judged(fleet, "passed", "Name the retry budget")
 
     line = _timeline(fleet, wo["id"])
     assert line["label"] == "Review raised follow-ups it could not file"
     assert "1 could not be filed" in line["detail"]
+
+
+def test_the_timeline_distinguishes_kept_from_could_not_be_filed(fleet, fake_gh):
+    """THE THIRD OUTCOME, and it is not a failure: nothing was published because nothing
+    may be, and the finding is whole on the record. A reader told "could not be filed"
+    goes looking for a broken tracker that is working perfectly."""
+    fake_gh.issue_series(SERIES)  # no `origin`
+    wo = judged(fleet, "passed", "Name the retry budget")
+
+    line = _timeline(fleet, wo["id"])
+    assert line["label"] == "Review kept 1 follow-up off the tracker"
+    assert "kept on the internal record" in line["detail"]
+    assert "could not be filed" not in line["detail"]
 
 
 def _timeline(fleet, wo_id: str) -> dict:  # noqa: F811
@@ -625,15 +699,28 @@ def test_round_line_says_what_went_over_the_cap(fleet, tracker):
         "· 2 follow-up issues filed, 4 over the cap"), _line(fleet, wo)
 
 
-def test_round_line_says_what_could_not_be_filed_at_all(fleet, fake_gh):
+def test_round_line_says_what_could_not_be_filed_at_all(fleet, tracker, monkeypatch):
     """A round that filed NOTHING and dropped nothing still has something to say, and
     this is the shape that came out as `· , · 6 not filed` when the clauses were appended
     to a string instead of joined: the cap is never reached on this path, so the first
     two clauses are empty and only the third is not."""
-    fake_gh.issue_series(SERIES)  # no `origin`
+    monkeypatch.setattr(issues, "follow_ups_filed", _unreadable)
     wo = judged(fleet, "passed", *SIX)
 
     assert _line(fleet, wo).endswith("· 6 not filed"), _line(fleet, wo)
+
+
+def test_round_line_says_what_was_kept_off_the_tracker(fleet, tracker):
+    """The third outcome on the same line: nothing was published, nothing failed, and
+    the findings are on the record in full."""
+    tracker.set_private(False)
+    wo = judged(fleet, "passed", "one", "two")
+
+    assert "2 kept internally" in _line(fleet, wo), _line(fleet, wo)
+
+
+def _unreadable(repo, unit_id):
+    raise issues.IssueLifecycleError("HTTP 403: rate limit exceeded", "REFUSED")
 
 
 def _line(fleet, wo) -> str:  # noqa: F811
@@ -675,6 +762,7 @@ def test_validation_show_classifies_each_finding_and_links_the_issue(fleet, trac
                             '{"severity": "follow_up", "title": "Name the retry budget",'
                             ' "detail": "in the docstring"}]}'}],
         "follow_ups": [follow_up("Name the retry budget", seat="tester")]})
+    fleet.reconfigure(max_rounds=1)  # so this rejection SETTLES the loop and files
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
@@ -742,7 +830,7 @@ def test_the_dashboard_section_bites_when_the_projection_loses_the_key(fleet, tr
     assert "Raised by this order" not in page
 
 
-def test_the_dashboard_says_what_could_not_be_filed(fleet, fake_gh):
+def test_the_dashboard_says_what_could_not_be_filed(fleet, tracker, monkeypatch):
     """The failure is a rendered fact, not only a log line — and it is TWO facts, so it
     is asserted as two.
 
@@ -757,7 +845,7 @@ def test_the_dashboard_says_what_could_not_be_filed(fleet, fake_gh):
 
     from jarvis.ui.app import create_app
 
-    fake_gh.issue_series(SERIES)  # no `origin`
+    monkeypatch.setattr(issues, "follow_ups_filed", _unreadable)
     wo = judged(fleet, "passed", "Name the retry budget")
 
     page = TestClient(create_app(), follow_redirects=False).get(
@@ -769,7 +857,7 @@ def test_the_dashboard_says_what_could_not_be_filed(fleet, fake_gh):
     assert "1 follow-up could not be filed as an issue" in shown, "the PANEL is silent"
     assert "1 could not be filed &mdash;" in shown or "1 could not be filed —" in shown, \
         "the TIMELINE is silent"
-    assert shown.count("no GitHub") == 2, "only one of the two gave the reason"
+    assert shown.count("could not be read") == 2, "only one of the two gave the reason"
 
 
 # -- 8. the feature order, and what must not widen -------------------------------------
@@ -778,8 +866,9 @@ def test_the_dashboard_says_what_could_not_be_filed(fleet, fake_gh):
 def test_both_validation_loops_file_through_the_one_function(fleet):
     """`_round_config`'s docstring records Neo's ruling (question 176) that the two loops
     are held identical. A STRUCTURAL claim about the daemon, not a restatement of one
-    function in terms of itself: each loop reaches the shared filer, and does so BEFORE
-    the outcome branch — a follow-up is filed whether the round passed or was rejected."""
+    function in terms of itself: each loop reaches the shared filer, and does so INSIDE
+    the outcome branch — at settle, twice, once where the round passed and once where it
+    was refused with no round left."""
     src = Path(Daemon._validate_work_order.__code__.co_filename).read_text()
     tree = ast.parse(src)
     for name in ("_validate_work_order", "_validate_feature"):
@@ -788,10 +877,10 @@ def test_both_validation_loops_file_through_the_one_function(fleet):
         calls = [n.lineno for n in ast.walk(fn) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "_file_follow_ups"]
-        assert len(calls) == 1, f"{name} does not file follow-ups exactly once"
+        assert len(calls) == 2, f"{name} does not file at both settle points"
         branch = next(n.lineno for n in ast.walk(fn) if isinstance(n, ast.Assign)
                       and any(getattr(t, "id", "") == "outcome" for t in n.targets))
-        assert calls[0] < branch, f"{name} files inside the outcome branch"
+        assert min(calls) > branch, f"{name} files before the outcome is known"
 
 
 def test_a_feature_orders_follow_up_is_filed_on_the_same_tracker(fleet, tracker):
@@ -884,7 +973,8 @@ def leaky(seat: str = "security") -> dict:
     """One finding whose detail and title both carry text that must not be published."""
     return {"seat": seat, "round": 1,
             "title": f"Rotate the credential in {INTERNAL_PATH}",
-            "detail": LEAKY_DETAIL}
+            "detail": LEAKY_DETAIL, "file": "src/proj/a.py", "symbol": "load_tokens",
+            "failure": "load_tokens() reads the fixture token in production"}
 
 
 def _judge_leaky(fleet) -> dict:  # noqa: F811
@@ -909,12 +999,17 @@ def _everything_gh_was_told(tracker) -> str:
                      for c in tracker.calls)
 
 
-def test_a_public_tracker_is_told_no_word_the_seat_wrote(fleet, tracker):
-    """THE LEAK TEST. A finding quoting a credential and an absolute internal path, filed
-    against a repository the privacy read reports PUBLIC: no part of either reaches `gh`.
+def test_a_public_tracker_is_told_nothing_at_all(fleet, tracker):
+    """THE LEAK TEST, AND THE EMPTY-ISSUE TEST, on one finding. A finding quoting a
+    credential and an absolute internal path, on a repository the privacy read reports
+    PUBLIC: no part of either reaches `gh` — and no issue is opened either.
 
-    Paired with the control below — a filer that withheld everything, or that broke and
-    filed nothing at all, passes this one on its own."""
+    The issue this used to file said the text was withheld and carried nothing else;
+    twenty of those landed on a public tracker from one order (#523-#527, #538-#552) and
+    a reader could not tell them apart. What the OS may not publish, it keeps.
+
+    Paired with the control below — a filer that broke and did nothing at all passes the
+    silence half of this on its own."""
     tracker.set_private(False)
     wo = _judge_leaky(fleet)
 
@@ -923,19 +1018,17 @@ def test_a_public_tracker_is_told_no_word_the_seat_wrote(fleet, tracker):
     assert LEAKY_DETAIL not in told
     for fragment in DISTINCTIVE:
         assert fragment not in told, f"{fragment!r} was published"
+    assert [c for c in tracker.calls if c["argv"][:2] == ["issue", "create"]] == []
 
-    # WITHHELD, NOT DROPPED: the issue exists, says why it is bare, and names the command
-    # that reads the finding on the record that still holds it in full.
-    row = filed(tracker)[0]
-    digest = ops.follow_up_digest(leaky()["title"])
-    assert row["title"] == f"Validation follow-up {digest}"
-    assert f"jarvis validation show {wo['id']}" in row["body"]
-    assert "held on the internal record" in row["body"]
-    assert "`security` seat" in row["body"] and "Round 1" in row["body"]
-    item = payload(fleet, wo["id"])["items"][0]
-    assert item["withheld"] is True
-    assert item["title"] == ops.follow_up_key(leaky()["title"]), (
-        "the internal record lost the finding it filed")
+    # KEPT WHOLE, and readable: the finding, its detail, the seat and the code it names.
+    row = kept_rows(fleet, wo["id"])[0]
+    assert row["title"] == ops.follow_up_key(leaky()["title"])
+    assert row["detail"] == LEAKY_DETAIL
+    assert row["seat"] == "security" and row["round"] == 1
+    assert row["file"] == "src/proj/a.py"
+    item = payload(fleet, wo["id"])["withheld"][0]
+    assert item["title"] == row["title"] and item["digest"] == row["digest"]
+    assert payload(fleet, wo["id"])["items"] == []
 
 
 def test_a_private_tracker_still_gets_the_finding_in_full(fleet, tracker):
@@ -949,104 +1042,240 @@ def test_a_private_tracker_still_gets_the_finding_in_full(fleet, tracker):
     assert LEAKY_DETAIL in row["body"], "the private branch withheld the finding"
     assert row["title"].startswith(f"Rotate the credential in {INTERNAL_PATH}")
     assert "`security` seat" in row["body"] and wo["id"] in row["body"]
+    assert kept_rows(fleet, wo["id"]) == [], "it was both filed and kept"
+
+
+def test_the_issue_body_carries_the_failure_scenario_and_the_code(fleet, tracker):
+    """What makes a filed issue actionable, and what the admissibility gate demanded
+    before it could be filed at all: the file it is wrong in and how it goes wrong."""
+    judged(fleet, "passed", "Name the retry budget")
+
+    body = filed(tracker)[0]["body"]
+    assert "src/proj/a.py" in body and "run" in body
+    assert "returns None instead of raising" in body
 
 
 @pytest.mark.parametrize("break_it", ["fail_privacy_read", "garble_privacy_read"])
-def test_a_privacy_read_that_does_not_answer_withholds_the_finding(fleet, tracker,
-                                                                   break_it):
+def test_a_privacy_read_that_does_not_answer_keeps_the_finding(fleet, tracker,
+                                                               break_it):
     """FAIL CLOSED, pinned on both ways of not answering: a `gh` that RAISES and a `gh`
     that exits 0 with something unparseable. Different code paths — `_run` raises for one
     and `json.loads` for the other — and one `except` is what is being verified, so the
     plain-public case above cannot stand in for either.
 
-    ONLY the privacy read is broken. `fail()` would take the dedupe read down too, the
-    round would file nothing at all, and every assertion here would pass for that reason
-    instead of for this one."""
+    ONLY the privacy read is broken. `fail()` would take the dedupe read down too and
+    every assertion here would pass for that reason instead of for this one."""
     getattr(tracker, break_it)()
     wo = _judge_leaky(fleet)
 
     told = _everything_gh_was_told(tracker)
     for fragment in (CREDENTIAL, INTERNAL_PATH, *DISTINCTIVE):
         assert fragment not in told, f"{fragment!r} was published on an unknown tracker"
-    assert filed(tracker)[0]["title"].startswith("Validation follow-up vf-")
-    assert payload(fleet, wo["id"])["items"][0]["withheld"] is True
+    assert [c for c in tracker.calls if c["argv"][:2] == ["issue", "create"]] == []
+    assert len(kept_rows(fleet, wo["id"])) == 1
+    assert payload(fleet, wo["id"])["withheld"], "the finding was lost with the read"
 
 
-def test_the_private_title_carries_the_token_the_public_one_dedupes_on(fleet, tracker):
-    """The digest is derived from `follow_up_key(title)` and NOTHING ELSE, so the same
-    finding carries the same token in both shapes. That is what the dedupe survives a
-    privacy flip on, and it is pinned here rather than inside the flip test so a change
-    to the derivation fails in one obvious place."""
+def test_the_title_carries_the_token_the_dedupe_reads(fleet, tracker):
+    """The digest is derived from `follow_up_claim` — the file, the symbol and the title
+    — and from nothing else, so a seat that rewords its sentence in a later round does
+    not file the same observation twice. Pinned here rather than inside a flip test so a
+    change to the derivation fails in one obvious place."""
     judged(fleet, "passed", "Name the retry budget")
 
-    digest = ops.follow_up_digest("  Name the   retry budget ")
-    assert digest == ops.follow_up_digest("Name the retry budget")
+    digest = ops.follow_up_digest_of(follow_up("  Name the   retry budget "))
+    assert digest == ops.follow_up_digest_of(follow_up("Name the retry budget"))
     assert filed(tracker)[0]["title"] == f"Name the retry budget [{digest}]"
     assert ops.follow_up_token(filed(tracker)[0]["title"]) == digest
     assert ops.follow_up_token("Name the retry budget") == "", (
         "a pre-§9 title must report no token, or the fallback never runs")
 
 
-def test_the_dedupe_survives_the_tracker_turning_public_between_rounds(fleet, tracker):
-    """THE TRAP THIS FEATURE WOULD OTHERWISE SET. Round 1 files A on a private tracker
-    under its own title; round 2 reads the repository as public, re-raises A and adds B.
-    A dedupe on the published title stops matching there and re-files A on every round
-    from then on, for ever.
+def test_the_same_claim_reworded_is_not_filed_twice(fleet, tracker):
+    """THE DUPLICATE THAT WALKED THROUGH. The same observation was filed three times on
+    wo-0a9ba9b3 — #538 "CI ran nothing on PR #520, so the declared suite counts are
+    unverifiable", #546 "No CI ran on PR #520, so the declared suite result is the only
+    account of testing", #552 "CI ran no checks on PR #520" — because the key was the
+    sha256 of the sentence. The key is the (file, symbol) the finding names plus its
+    claim, so the rewording has to move the code it points at to file again."""
+    wo = judged(fleet, "passed", "Name the retry budget")
+    same = follow_up("Name the retry budget", file="src/proj/a.py", symbol="run")
+    reworded = {**same, "title": "Name the retry budget"}
 
-    Asserted by IDENTITY — which titles, carrying which tokens — because "two issues" is
-    equally what a filer that lost A and filed B twice would leave behind."""
-    fleet.reconfigure(max_rounds=9)
+    settle_again(fleet, wo["id"], [reworded])
+    assert len(filed(tracker)) == 1, "a reworded duplicate was filed"
+
+    settle_again(fleet, wo["id"],
+                 [follow_up("Name the retry budget", file="src/proj/b.py")])
+    assert len(filed(tracker)) == 2, "a different file is a different finding"
+
+
+def test_a_flip_to_public_neither_re_files_nor_re_records(fleet, tracker):
+    """THE TRAP THIS FEATURE WOULD OTHERWISE SET, now across both destinations. Settle 1
+    files A on a private tracker; the repository is flipped open; settle 2 re-raises A
+    and adds B. A must not be filed again and must not be copied onto the internal
+    record either, and B — which may no longer travel — must be kept."""
     a, b = "Name the retry budget", "Fold the two parsers into one"
-    validator = Validator(verdict("rejected", a, reason="no test"),
-                          verdict("passed", a, b))
-    fleet.daemon.validator = validator
-    wo = fleet.dispatch()
-    fleet.change(wo["id"], "print('one')\n")
-    finish(fleet, wo["id"])
-    fleet.drain()
-    assert titles(tracker) == [a], "round 1 did not file the private shape"
+    wo = judged(fleet, "passed", a)
+    assert titles(tracker) == [a]
 
-    tracker.set_private(False)          # the repository is flipped open between rounds
-    fleet.tick()
-    fleet.change(wo["id"], "print('one')\nprint('two')\n")
-    finish(fleet, wo["id"], summary="fixed")
-    fleet.drain()
-    assert [c["round"] for c in validator.calls] == [1, 2], "round 2 never ran"
+    tracker.set_private(False)
+    settle_again(fleet, wo["id"], [follow_up(a), follow_up(b)])
 
-    assert [r["title"] for r in filed(tracker)] == [
-        f"{a} [{ops.follow_up_digest(a)}]",             # round 1's, NOT filed again
-        f"Validation follow-up {ops.follow_up_digest(b)}",
-    ], "the flip re-filed a follow-up, or lost one"
-    assert wo["id"] in filed(tracker)[1]["body"]
+    assert titles(tracker) == [a], "the flip re-filed a follow-up"
+    assert [r["title"] for r in kept_rows(fleet, wo["id"])] == [b], (
+        "the flip copied a filed finding onto the internal record, or lost the new one")
 
 
 def test_a_follow_up_filed_before_this_shipped_is_not_filed_again(fleet, tracker):
     """The other half of the same trap: every issue already on a tracker was filed under
-    a bare finding title and carries no token at all, so the dedupe falls back to the
-    plain key. Without that fallback this change re-files the fleet's entire standing
-    backlog of follow-ups on the next round each unit runs.
+    a bare finding title or under a title-derived token, and neither matches the claim
+    digest. Without both fallbacks this change re-files the fleet's entire standing
+    backlog of follow-ups on the next settle each unit reaches.
 
-    The pre-change issue is made by filing one and then rewriting its title to the shape
-    §9 replaced — so the unit id in its body is this unit's, which is what the dedupe's
-    search matches on."""
-    fleet.reconfigure(max_rounds=9)
-    a = "Name the retry budget"
-    validator = Validator(verdict("rejected", a, reason="no test"),
-                          verdict("passed", a))
-    fleet.daemon.validator = validator
+    Both shapes in one test, because they fall back through different comparisons: the
+    pre-§9 issue carries no token at all, and the §9 issue carries `follow_up_digest`.
+    """
+    wo = judged(fleet, "passed", "Name the retry budget")
+    old = filed(tracker)[0]
+    tracker.add_issue(old["url"], title="Name the retry budget", body=old["body"],
+                      labels=old["labels"])                     # the pre-§9 shape
+    other = "Fold the two parsers into one"
+    tracker.add_issue(f"{SERIES}/901",
+                      title=f"Validation follow-up {ops.follow_up_digest(other)}",
+                      body=f"raised on {wo['id']}", labels=[issues.FOLLOW_UP_LABEL])
+
+    settle_again(fleet, wo["id"],
+                 [follow_up("Name the retry budget"), follow_up(other)])
+
+    assert len(filed(tracker)) == 2, "a follow-up already on the tracker was filed again"
+
+
+# -- 10. the admissibility gate --------------------------------------------------------
+#
+# Roughly half of the forty issues wo-0a9ba9b3 and wo-2005a89b filed were not defects in
+# the deliverable: "CI has not run on the PR", "the PR body does not name…", "the
+# docstring is stale", and coverage nits of the form "X has no test" — an unbounded
+# supply in any codebase. A follow-up must name a behaviour that IS WRONG, in a file,
+# with a concrete failure. The rest are worth telling the submitter and are told.
+
+
+def test_a_finding_that_names_no_wrong_behaviour_is_not_an_issue(fleet, tracker):
+    """The gate itself, on the four shapes that filled the tracker."""
+    fleet.reconfigure(max_rounds=1)
+    fleet.daemon.validator = Validator(
+        {"outcome": "passed", "reason": "", "seats": _seats("pass"),
+         "follow_ups": [nit("No test covers the repair path"),
+                        nit("budget.spent still documents itself as two queries"),
+                        nit("The PR body does not say which change owns the repair"),
+                        nit("CI ran no checks on PR #520")]})
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
     fleet.drain()
-    old = filed(tracker)[0]
-    tracker.add_issue(old["url"], title=a, body=old["body"], labels=old["labels"])
 
-    fleet.tick()
-    fleet.change(wo["id"], "print('one')\nprint('two')\n")
-    finish(fleet, wo["id"], summary="fixed")
+    assert filed(tracker) == []
+    assert kept_rows(fleet, wo["id"]) == [], "an inadmissible finding was kept as a nit"
+    assert payload(fleet, wo["id"]) == {}
+
+
+def test_an_admissible_finding_beside_them_is_still_filed(fleet, tracker):
+    """THE PAIRING. A gate that refused everything would pass the test above, and this
+    order is explicitly not a licence to reject everything — #549 and #525 were real."""
+    fleet.daemon.validator = Validator(
+        {"outcome": "passed", "reason": "", "seats": _seats("pass"),
+         "follow_ups": [nit("No test covers the repair path"),
+                        follow_up("The stale-row repair repeats for ever")]})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
     fleet.drain()
-    assert [c["round"] for c in validator.calls] == [1, 2], "round 2 never ran"
 
-    assert [r["title"] for r in filed(tracker)] == [a], (
-        "a follow-up filed before the token existed was filed a second time")
-    assert wo["id"] in old["body"]
+    assert titles(tracker) == ["The stale-row repair repeats for ever"]
+
+
+def test_the_inadmissible_ones_reach_the_submitter_instead(fleet, tracker):
+    """NOT DROPPED, ROUTED. In a round that is going back anyway, a stale docstring costs
+    nothing and is fixed in the same session; on the tracker it outlives the session and
+    nobody acts on it. The blocker's own reason still leads."""
+    fleet.reconfigure(max_rounds=9)
+    fleet.daemon.validator = Validator(
+        {"outcome": "rejected", "reason": "the new branch has no test",
+         "seats": _seats("reject"),
+         "follow_ups": [nit("The docstring for budget.spent is stale"),
+                        follow_up("The stale-row repair repeats for ever")]})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+    fleet.tick()  # deliver the feedback
+
+    told = sent(fleet, wo["id"])
+    assert "the new branch has no test" in told
+    assert "The docstring for budget.spent is stale" in told
+    assert "The stale-row repair repeats for ever" not in told, (
+        "a tracker item was pushed at the submitter")
+
+
+def test_the_round_record_does_not_carry_the_aside(fleet, tracker):
+    """The note is for whoever is fixing this, not for the record: writing it into the
+    round's outcome would restate it on every surface that prints a round."""
+    fleet.reconfigure(max_rounds=9)
+    fleet.daemon.validator = Validator(
+        {"outcome": "rejected", "reason": "the new branch has no test",
+         "seats": _seats("reject"),
+         "follow_ups": [nit("The docstring for budget.spent is stale")]})
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        rnd = store.latest_validation_round(wo_id=wo["id"])
+    finally:
+        store.close()
+    assert rnd["reason"] == "the new branch has no test"
+
+
+# -- 11. the surfaces of a withheld follow-up ------------------------------------------
+
+
+def test_jarvis_issues_lists_the_kept_ones_marked_internal(fleet, tracker, capsys):
+    """A finding kept off the tracker is still something the project might pick up, and
+    `jarvis issues` is where the user chooses what to do next. Marked, because a row that
+    looked like a tracker issue would send them to GitHub for a number that is not
+    there."""
+    tracker.set_private(False)
+    judged(fleet, "passed", "The stale-row repair repeats for ever")
+    capsys.readouterr()
+
+    cli.main(["issues"])
+
+    out = capsys.readouterr().out
+    assert "The stale-row repair repeats for ever" in out
+    assert "internal" in out
+    assert "no tracker issue was opened" in out
+
+
+def test_the_work_order_page_and_show_carry_them(fleet, tracker, capsys):
+    """Both ends of `ops.issue_index`, which is what the page and the command share."""
+    from fastapi.testclient import TestClient
+
+    from jarvis.ui.app import create_app
+
+    tracker.set_private(False)
+    wo = judged(fleet, "passed", "The stale-row repair repeats for ever")
+
+    page = TestClient(create_app(), follow_redirects=False).get(
+        f"/wo/proj_a/{wo['id']}").text
+    shown = " ".join(page.split())
+    assert "Kept on the internal record" in shown
+    assert "The stale-row repair repeats for ever" in shown
+    assert "no tracker issue was opened" in shown
+
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"]])
+    out = capsys.readouterr().out
+    assert "follow_ups_kept" in out
+    assert "internal only: The stale-row repair repeats for ever" in out

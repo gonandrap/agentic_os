@@ -868,6 +868,27 @@ CREATE TABLE IF NOT EXISTS issue_links (
     announced_at REAL,
     PRIMARY KEY (issue_url, unit_id)
 );
+-- A FOLLOW-UP THE TRACKER MAY NOT CARRY. When the OS cannot establish the project's
+-- repository is private, a seat's words are not published (spec §9) — and an issue with
+-- the text withheld carries nothing a reader can act on, so none is opened at all. The
+-- finding lives here instead, in full, and the surfaces mark it internal-only.
+-- UNIQUE on (digest, unit_id): the same dedupe key the tracker half uses, so a repeat
+-- settle files nothing twice.
+CREATE TABLE IF NOT EXISTS internal_follow_ups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    round INTEGER NOT NULL DEFAULT 0,
+    seat TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    file TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL DEFAULT '',
+    failure TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    UNIQUE (digest, unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_internal_follow_ups_unit ON internal_follow_ups(unit_id);
 CREATE INDEX IF NOT EXISTS idx_issue_links_unit ON issue_links(unit_id);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
@@ -1495,6 +1516,34 @@ class ProjectStore:
                 self.conn.execute(
                     "UPDATE tracked_issues SET state=?, checked_at=? WHERE issue_url=?",
                     (state, db.now(), issue_url))
+
+    def record_internal_follow_up(self, digest: str, unit_id: str, *, round: int = 0,
+                                  seat: str = "", title: str = "", detail: str = "",
+                                  file: str = "", symbol: str = "",
+                                  failure: str = "") -> bool:
+        """Keep a follow-up whose text may not be published. True if this one is new.
+
+        The tracker half of the same decision is `ops.file_validation_follow_ups`; this
+        is where a finding goes when the repository is not established private (spec §9)
+        — the whole finding, because the internal record is where it is read from.
+        """
+        with db.write_transaction(self.conn):
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO internal_follow_ups "
+                "(digest, unit_id, round, seat, title, detail, file, symbol, failure, "
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (digest, unit_id, round, seat, title, detail, file, symbol, failure,
+                 db.now()))
+            return cur.rowcount > 0
+
+    def internal_follow_ups(self, unit_id: str | None = None) -> list[dict[str, Any]]:
+        """Withheld follow-ups — one unit's, or the whole project's, oldest first."""
+        sql = "SELECT * FROM internal_follow_ups"
+        args: tuple[Any, ...] = ()
+        if unit_id:
+            sql += " WHERE unit_id=?"
+            args = (unit_id,)
+        return db.rows_to_dicts(self.conn.execute(sql + " ORDER BY id", args).fetchall())
 
     def record_issue_label(self, issue_url: str, count: int) -> None:
         """The `referenced: N` the OS last managed to put on the issue."""

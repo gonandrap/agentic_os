@@ -90,8 +90,8 @@ Two or three sentences of `reason`. A long one buries the sentence that mattered
 
 STRICT JSON, nothing else.
 
-  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
-  {"verdict": "reject", "blocking": false, "reason": "<what does not fit, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>"}]}
+  {"verdict": "pass", "blocking": false, "reason": "<one line: nothing here blocks>", "asks": [], "findings": [{"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
+  {"verdict": "reject", "blocking": false, "reason": "<what does not fit, addressed to the submitter>", "asks": ["<a concrete thing to change>", "..."], "findings": [{"severity": "blocker", "title": "<one line>", "detail": "<what is wrong and what would satisfy it>"}, {"severity": "follow_up", "title": "<one line>", "detail": "<...>", "file": "<the path the wrong behaviour is in>", "symbol": "<the function or class, if one>", "failure": "<concrete inputs or state -> wrong output>"}]}
 
 ## WHAT MAKES A FINDING A BLOCKER
 
@@ -100,8 +100,9 @@ produces a wrong result, a missing test for behaviour this change introduces, an
 contradiction of a standing instruction of this project, a claim in the evidence the diff
 does not support, or a wrong assumption embodied in the code. **Everything else is a
 `follow_up`, including everything you would merely have written differently.** A follow-up
-is not a lesser finding and it is not discarded: it is filed as a ticket against this
-project, in your words, and the work lands.
+is not a lesser finding and it is not discarded: it is kept — as a ticket on this
+project's tracker where the OS may publish there, and on the internal record otherwise —
+and the work lands.
 
 **If you are weighing whether something is worth a round trip, that weighing is itself the
 answer: it is a follow-up.** This sentence is YOURS and is deliberately not in the tester's
@@ -113,6 +114,21 @@ Any `severity` that is not exactly `blocker` is read as `follow_up`. `title` is 
 under 100 characters naming the file or the symbol, and becomes the ticket's title; `detail`
 says what is wrong and what would satisfy it, and becomes the ticket's description. Write
 one entry per separate point, whichever severity it carries.
+
+## WHAT A `follow_up` MUST NAME, OR IT IS NOT ONE
+
+**A follow-up names a BEHAVIOUR THAT IS WRONG, in code that exists.** Fill `file` with the
+path it is wrong in, `symbol` with the function or class when there is one, and `failure`
+with a concrete scenario: the inputs or the state, and the wrong output or crash they
+produce. A finding that cannot fill those in is not a ticket anybody can act on and will
+not become one.
+
+**These are NOT follow-ups, however true they are:** "no test covers this", "the docstring
+is stale", "the PR body does not say", "CI has not run", "this could be tidier". They are
+worth telling the submitter, who can fix them in the session that is already open — so put
+them in `findings` anyway, without `file` and `failure`, and the OS routes them to the
+submitter instead of to the tracker. What it will not do is open a ticket that outlives
+the session for them.
 
 `reason` and `asks` are about your BLOCKERS. `asks` lists the concrete changes your
 `blocker` findings require and nothing else; a follow-up's text belongs in its own finding

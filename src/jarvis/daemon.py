@@ -1672,29 +1672,38 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
-            # BEFORE THE OUTCOME BRANCH, not inside it: a follow-up is filed whether the
-            # round passed or was rejected. `.get(...) or ()` because `self.validator` is
-            # injectable and fakes returning only the three older keys are legitimate.
-            self._file_follow_ups(store, project, round_row,
-                                  verdict.get("follow_ups") or (), cfg,
-                                  unit=wo_id, wo_id=wo_id)
+            # IN THE OUTCOME BRANCH, not before it: a follow-up is filed when the LOOP
+            # SETTLES, from the last judged round only, so an issue always describes the
+            # code that shipped rather than code round 2 went on to change (spec §4.4).
+            # `.get(...) or ()` because `self.validator` is injectable and fakes
+            # returning only the three older keys are legitimate.
+            follow_ups = verdict.get("follow_ups") or ()
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 
             if outcome == "passed":
                 store.close_validation_round(round_id, "passed", reason)
+                self._file_follow_ups(store, project, round_row, follow_ups, cfg,
+                                      unit=wo_id, wo_id=wo_id)
                 store.add_event(wo_id, "validation_passed",
                                 {"round": n, "round_id": round_id})
                 status = ops.land_when_cleared(store, wo)
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
             elif outcome == "rejected" and n < max_rounds:
-                self._reject(store, wo, round_id, n, max_rounds, reason)
+                # The inadmissible follow-ups ride along HERE and nowhere else: a stale
+                # docstring or a missing test costs nothing in a session that is going
+                # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
+                self._reject(store, wo, round_id, n, max_rounds, reason,
+                             note=ops.follow_up_feedback(follow_ups))
                 log.info("[%s] %s rejected in round %d of %d",
                          project.name, wo_id, n, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
-                # ask for a resubmission there is no round left to judge.
+                # ask for a resubmission there is no round left to judge — and the loop
+                # is over, so the follow-ups are filed rather than lost with it.
+                self._file_follow_ups(store, project, round_row, follow_ups, cfg,
+                                      unit=wo_id, wo_id=wo_id)
                 self._escalate(store, wo, round_id, n, reason or (
                     f"the review was not satisfied after {max_rounds} rounds."))
             else:
@@ -1783,7 +1792,7 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str) -> None:
+                reason: str, *, note: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -1791,6 +1800,11 @@ class Daemon:
         fills that role, and what happens when nothing does, is the router's business
         (src/jarvis/bus.py) — which is the whole reason a rejection can serve a feature
         order's manager tomorrow without a line changing here.
+
+        `note` REACHES THE SUBMITTER AND NOT THE RECORD. The round's stored reason is the
+        panel's verdict; the findings that were not admissible as tracker issues are an
+        aside to whoever is fixing this, and writing them into the outcome would restate
+        on every surface that prints a round.
         """
         wo_id = wo["id"]
         store.close_validation_round(round_id, "rejected", reason)
@@ -1800,7 +1814,8 @@ class Daemon:
                  from_role="reviewer", to_role="implementor",
                  payload=bus.ReviewFeedback(
                      round=n, outcome="rejected",
-                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds, reason=reason,
+                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds,
+                                                   reason=reason + note,
                                                    wo_id=wo_id)))
 
     @staticmethod
@@ -2196,15 +2211,17 @@ class Daemon:
                     status=str(seat.get("status") or "ok"),
                     model=str(seat.get("model") or ""),
                     latency_ms=int(seat.get("latency_ms") or 0))
-            # `_validate_work_order`'s line, in the same place and for the same reason.
-            self._file_follow_ups(store, project, round_row,
-                                  verdict.get("follow_ups") or (), cfg,
-                                  unit=fo_id, fo_id=fo_id)
+            # `_validate_work_order`'s lines, in the same places and for the same
+            # reasons: filed at settle, from this round, and the inadmissible ones sent
+            # to the manager instead.
+            follow_ups = verdict.get("follow_ups") or ()
             outcome = str(verdict.get("outcome") or "")
             reason = str(verdict.get("reason") or "")
 
             if outcome == "passed":
                 store.close_validation_round(round_id, "passed", reason)
+                self._file_follow_ups(store, project, round_row, follow_ups, cfg,
+                                      unit=fo_id, fo_id=fo_id)
                 ops.feature_event(store, fo_id, "validation_passed",
                                   {"round": n, "round_id": round_id,
                                    "feature_order": fo_id})
@@ -2212,12 +2229,15 @@ class Daemon:
                 log.info("[%s] feature %s passed review in round %d",
                          project.name, fo_id, n)
             elif outcome == "rejected" and n < max_rounds:
-                self._reject_feature(store, fo, round_id, n, max_rounds, reason)
+                self._reject_feature(store, fo, round_id, n, max_rounds, reason,
+                                     note=ops.follow_up_feedback(follow_ups))
                 log.info("[%s] feature %s rejected in round %d of %d",
                          project.name, fo_id, n, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Telling the manager to
                 # remediate now would ask for a resubmission there is no round to judge.
+                self._file_follow_ups(store, project, round_row, follow_ups, cfg,
+                                      unit=fo_id, fo_id=fo_id)
                 self._escalate_feature(store, fo, round_id, n, reason or (
                     f"the review was not satisfied after {max_rounds} rounds."))
             else:
@@ -2230,7 +2250,7 @@ class Daemon:
 
     @staticmethod
     def _reject_feature(store: ProjectStore, fo: dict, round_id: int, n: int,
-                        max_rounds: int, reason: str) -> None:
+                        max_rounds: int, reason: str, *, note: str = "") -> None:
         """Close the round, tell the role `manager`, and put the feature back to work.
 
         `executing`, not `validating`: the manager's answer to feedback is remediation
@@ -2258,7 +2278,8 @@ class Daemon:
                  payload=bus.ReviewFeedback(
                      round=n, outcome="rejected",
                      reason=FEATURE_REVIEW_FEEDBACK.format(n=n, max=max_rounds,
-                                                           reason=reason, fo_id=fo_id)))
+                                                           reason=reason + note,
+                                                           fo_id=fo_id)))
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
 

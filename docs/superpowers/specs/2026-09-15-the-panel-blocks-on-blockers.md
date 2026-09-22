@@ -1123,3 +1123,65 @@ make `validation.py` import `neo`, `neo_store`, `panel` or `bus`. Never put per-
 `build_shared_prefix`. Never add a field to `evidence.fingerprint` without reading its exclusion
 table first. And never raise `validation.max_rounds` to make your tests pass — that is the fix
 this feature was created to replace.
+
+## 10. A follow-up the tracker cannot carry must not become an issue (wo-3619e6e4)
+
+**What shipped between §4 and here was a tracker full of rows with nothing in them.**
+wo-0a9ba9b3 filed twenty (#523-#527, #538-#552) and wo-2005a89b twenty more, every one of
+them titled `Validation follow-up vf-<8 hex>` over the same boilerplate saying the finding
+text is withheld. §9 is right and stays: `gonandrap/agentic_os` is genuinely public, so no
+word a seat wrote may go on it. The defect is what §4 did next — it filed anyway.
+
+Four changes, each fixing one multiplier of that twenty, and one gate that stops the junk
+at source.
+
+### 10.1 The privacy read decides whether an issue EXISTS, not only what it says
+
+The same `issues.repo_is_private` answer that withholds the text now withholds the
+filing. A withheld finding is kept WHOLE in `internal_follow_ups` — title, detail, seat,
+round, and the three anchors of §10.4 — and `jarvis issues`, the project page and the
+order's own list show it MARKED INTERNAL-ONLY. Nothing changes on a repository the OS
+establishes is private: the full title and body travel, and filing stays valuable.
+
+A project with no `origin` takes the same path. No repository is no proof of privacy, and
+the finding is kept rather than counted as a failure — `failed` means the tracker refused
+or could not be reached, which is a different fact and reads differently on every surface.
+
+### 10.2 The cap bounds the ORDER
+
+`max_follow_ups` bounded one ROUND (§4.4), so wo-0a9ba9b3's four rounds filed 4 x 5. What
+the order has already raised — its tracker links plus its internal rows, both LOCAL reads
+— is subtracted before the cap bounds anything.
+
+### 10.3 Filed at SETTLE, from the last judged round only
+
+Round 1's findings were filed immediately and then fixed in round 2, leaving issues open
+against code that no longer exists. Filing now happens where the loop ENDS: on a pass, and
+on a rejection with no round left (the user decides the blockers; holding the follow-ups
+there would risk losing them entirely). A unit that ends VOIDED or abandoned files nothing
+— findings against code that never lands are exactly the noise this section removes.
+
+### 10.4 The dedupe keys on the claim, not on the sentence
+
+`sha256(title)` let the same observation through three times — #538, #546, #552 are one
+finding reworded. A follow-up now carries `file`, `symbol` and `failure` in the seat
+schema, and the digest is over `follow_up_claim`: the file, the symbol and the title. The
+two older keys stay as FALLBACKS — `follow_up_digest(title)` for everything filed under
+§9, the bare title for everything older — or this change re-files the fleet's whole
+standing backlog on the next settle.
+
+### 10.5 Admissibility: a follow-up names a behaviour that is WRONG
+
+Roughly half of the forty were not defects in the deliverable: "CI has not run on the PR"
+(transient infrastructure state), "the PR body does not say", "the docstring is stale",
+and coverage nits of the form "X has no test" — an unbounded supply in any codebase.
+
+`ops.follow_up_admissible` requires `file` and `failure` to be non-empty: the code it is
+wrong in, and a concrete scenario where inputs or state produce a wrong output. STRUCTURE,
+NOT PROSE — classifying the title text would be a blocklist over model output, catching
+the phrasings somebody thought of.
+
+**The rest are routed, never dropped.** `ops.follow_up_feedback` appends them to the
+rejection the submitter is already being sent, where they cost nothing and are fixed in
+the session that is open. They reach the submitter and NOT the round's stored reason: an
+aside restated on every surface that prints a round is the noise this feature is about.

@@ -13,7 +13,8 @@ round machine to act on. It is called; it is never messaged, and it messages nob
         "reason":  str,     # <= 1500 chars, second person, addressed to the submitter,
                             # empty ONLY when the outcome is "passed"
         "seats":   [{"seat", "status", "verdict", "reply", "model", "latency_ms"}, ...],
-        "follow_ups": [{"seat", "title", "detail", "round"}, ...],
+        "follow_ups": [{"seat", "title", "detail", "round",
+                        "file", "symbol", "failure"}, ...],
     }
 
 `follow_ups` is what the seats raised and judged the work SHIPPABLE WITHOUT. This module
@@ -761,8 +762,31 @@ def _parsed_findings(data: Mapping[str, Any]) -> list[dict[str, str]]:
         if not title and not detail:
             continue
         severity = BLOCKER if item.get("severity") == BLOCKER else FOLLOW_UP
-        out.append({"severity": severity, "title": title, "detail": detail})
+        out.append({"severity": severity, "title": title, "detail": detail,
+                    **_anchor(item)})
     return out
+
+
+#: What a follow-up must name before it can become a tracker issue, carried on the
+#: finding rather than read out of its prose. `file` and `symbol` are also the dedupe
+#: key, which raw title text could never be: a seat rewords the same nit every round.
+#: Spec §4.4: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+ANCHOR_KEYS = ("file", "symbol", "failure")
+
+#: How long each of them may be. A finding is a ticket, not a report.
+ANCHOR_LIMIT = 500
+
+
+def _anchor(item: Mapping[str, Any]) -> dict[str, str]:
+    """The three fields a follow-up names the wrong behaviour with.
+
+    ALWAYS ALL THREE, empty where the seat gave nothing — `NO_FOLLOW_UPS`'s rule, and
+    here it is also what makes `ops.follow_up_admissible` a test of content rather than
+    of shape: a seat on the old schema produces three empty strings and is inadmissible,
+    which is the right answer for a finding that names no code.
+    """
+    return {k: " ".join(str(item.get(k) or "").split())[:ANCHOR_LIMIT]
+            for k in ANCHOR_KEYS}
 
 
 def _synthesised(reason: str, asks: Sequence[str]) -> dict[str, str]:
@@ -775,7 +799,8 @@ def _synthesised(reason: str, asks: Sequence[str]) -> dict[str, str]:
     line = " ".join(reason.split()) or UNSTATED_REJECTION
     if len(line) > TITLE_LIMIT:
         line = line[:TITLE_LIMIT - 1].rsplit(" ", 1)[0] + "…"
-    return {"severity": BLOCKER, "title": line, "detail": _message(reason, asks)}
+    return {"severity": BLOCKER, "title": line, "detail": _message(reason, asks),
+            **_anchor({})}
 
 
 def blockers(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -979,7 +1004,8 @@ def _follow_ups(opinions: Sequence[seats.Opinion], round_no: int) -> list[dict[s
             continue
         row = {"seat": op.seat, "status": op.status, "reply": op.raw}
         out += [{"seat": op.seat, "title": f["title"], "detail": f["detail"],
-                 "round": round_no}
+                 "round": round_no,
+                 **{k: f.get(k, "") for k in ANCHOR_KEYS}}
                 for f in follow_ups(findings(row))]
     return out
 

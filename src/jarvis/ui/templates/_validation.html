@@ -110,8 +110,13 @@
    turned the panel on. `follow_ups` is nonetheless ALWAYS in the projection — a key that
    came and went would vanish here silently, which is `kn-99e37a4b`'s whole lesson. #}
 {% macro follow_ups(filed) %}
-{% if filed and (filed.dropped or filed.failed) %}
+{% if filed and (filed.dropped or filed.failed or filed.withheld) %}
 <div class="sub" style="margin-top:6px">
+  {% if filed.withheld %}
+  <div>{{ filed.withheld|length }} follow-up{{ '' if filed.withheld|length == 1 else 's' }}
+    {{ 'was' if filed.withheld|length == 1 else 'were' }} kept on the internal record —
+    no tracker issue was opened{% if filed.reason %} ({{ filed.reason }}){% endif %}.</div>
+  {% endif %}
   {% if filed.dropped %}
   <div>{{ filed.dropped }} further follow-up{{ '' if filed.dropped == 1 else 's' }} went
     over the per-round cap and {{ 'was' if filed.dropped == 1 else 'were' }} not filed.</div>
