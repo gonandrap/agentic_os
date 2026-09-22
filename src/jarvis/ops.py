@@ -38,7 +38,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, config_version, db, fleet, invariants
+from . import budget, bus, config_version, db, fleet, invariants
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -2618,10 +2618,98 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
 
 
+#: HOW MANY TIMES RUNNING a submitter may be sent back without the panel before the OS
+#: stops trying and asks the user. Two, because the bounce is free and a free loop with
+#: no ceiling is the failure this whole feature is about — spec
+#: docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §6.
+BOUNCE_LIMIT = 2
+
+#: WHAT A BOUNCED SUBMITTER IS TOLD. Deliberately shaped like `daemon.REVIEW_FEEDBACK`
+#: and deliberately NOT numbered "round n of max": no round was opened and none was
+#: spent, and a number here would teach the submitter it has fewer attempts than it has.
+BOUNCE_FEEDBACK = """REVIEW FEEDBACK (no round was spent)
+Round {n} asked you to change {paths}, and this submission changes none of them. It was
+not sent to the panel: a resubmission that answers nothing on the list costs a review
+round and moves the work order no further.
+
+Go back to round {n}'s feedback and address it. If you believe one of those points is
+already answered, or should not be, say which and why in `--evidence` and change the
+file it is about anyway — the review cannot read an argument you did not make in the
+diff. Then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
+#: The give-up when that has happened `BOUNCE_LIMIT` times running.
+BOUNCE_EXHAUSTED = (
+    "this work order has been sent back {n} times running for changing nothing round "
+    "{round} asked about ({paths}), and it is still changing none of them. Nobody has "
+    "judged the latest submission: decide whether the review's list is right before "
+    "spending another round on it.")
+
+
+def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id: int,
+                              n: int, reason: str) -> None:
+    """Give up on this unit and ask the user. THE ONE HOME of that transition.
+
+    Called by `Daemon._escalate`, whose docstring carries the reasoning for every line
+    below — why the attention reason is `VALIDATION_STUCK_BLOCKER` verbatim, why the
+    notification is the half the flag cannot do, and why Neo is not asked first.
+    """
+    from .daemon import VALIDATION_ESCALATED_TITLE, escalation_body
+    from .invariants import VALIDATION_STUCK_BLOCKER
+
+    wo_id = wo["id"]
+    store.close_validation_round(round_id, "escalated", reason)
+    store.add_event(wo_id, "validation_escalated",
+                    {"round": n, "round_id": round_id, "reason": reason})
+    store.set_status(wo_id, "needs_review")
+    store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
+    store.add_notification(
+        title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
+        body=escalation_body(reason), level="warning", wo_id=wo_id,
+        source="validation",
+    )
+
+
+def unanswered_paths(store: ProjectStore, wo_id: str,
+                     packet: Any) -> tuple[dict[str, Any], tuple[str, ...]] | None:
+    """`(the round that asked, the paths it asked about)` when this submission answers
+    none of them, else None.
+
+    The store half of `validation.unanswered_submission`, which is pure and is where the
+    rule lives. Two reads: the last round a panel settled, and the blockers it raised —
+    read through `validation.blockers(validation.findings(...))`, the SAME pair
+    `prior_round_history` reads, because a second classifier is a second answer to what
+    the submitter was told.
+    """
+    from . import validation
+
+    previous = store.last_judged_round(wo_id=wo_id)
+    if previous is None:
+        return None
+    raised: list[dict[str, str]] = []
+    for op in store.validation_opinions(int(previous["id"])):
+        raised += validation.blockers(validation.findings(op))
+    cited = validation.unanswered_submission(
+        previous, raised, ProjectStore.validation_file_shas(previous),
+        dict(packet.file_shas))
+    return (previous, cited) if cited is not None else None
+
+
+def consecutive_bounces(store: ProjectStore, wo_id: str, after_round: int) -> int:
+    """How many times running this submitter has already been bounced off `after_round`.
+
+    Keyed on the round it was bounced AFTER rather than counted raw, which is what makes
+    "consecutive" true by construction: a panel round that happens in between becomes the
+    new `after_round`, so the count restarts without anything having to reset it.
+    """
+    return sum(1 for e in store.events_of_kind(wo_id, "validation_bounced")
+               if int(db.from_json(e["payload"], {}).get("after_round") or 0)
+               == after_round)
+
+
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                           *, declared: str, cfg: Any,
-                          forced_reason: str = "") -> dict[str, Any]:
-    """Open a validation round over what this work order has produced.
+                          forced_reason: str = "") -> dict[str, Any] | None:
+    """Open a validation round over what this work order has produced, or bounce it.
 
     Collects the evidence, fingerprints it, opens the round and parks the work order in
     `validating`. It judges nothing: the daemon runs the validator off its tick thread
@@ -2637,6 +2725,20 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     round spends a number exactly like a submitted one, which is why the budget question
     has the answer it has — spec
     docs/superpowers/specs/2026-09-15-forcing-a-validation-round.md §4.
+
+    **RETURNS None WHEN THE SUBMISSION WAS BOUNCED** — sent straight back to the worker
+    because it changes nothing the previous round asked about, WITHOUT opening a round
+    and so without spending one (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5). The caller
+    needs no branch for it: the previous round is still `rejected`, which is an
+    `OPEN_VALIDATION_OUTCOME`, so `land_when_cleared` parks the work order in
+    `validating` exactly as it does after a panel rejection, and `Daemon._deliver` flips
+    it back to `running` when the envelope lands. HERE rather than in the daemon because
+    a round the daemon refuses has already been NUMBERED, and the number and the budget
+    are one function (kn-a5e91633) — a bounce that spent a number would spend a round.
+
+    A FORCED ROUND IS NEVER BOUNCED, for `Daemon._repeat_submission`'s reason: there is
+    no submitter to send anything back to.
     """
     from . import evidence as evidence_mod
     from . import specs
@@ -2647,6 +2749,35 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         # The store read is the caller's: `evidence` may not touch a database (spec §4).
         assumptions=store.all_assumptions(wo["id"]))
     nxt = store.counted_validation_rounds(wo_id=wo["id"]) + 1
+    unanswered = (None if forced_reason.strip()
+                  else unanswered_paths(store, str(wo["id"]), packet))
+    if unanswered is not None:
+        previous, cited = unanswered
+        if consecutive_bounces(store, str(wo["id"]),
+                               int(previous["round"])) < BOUNCE_LIMIT:
+            _bounce(store, wo, previous, cited, nxt)
+            return None
+        # The ceiling. A round IS opened and immediately given up on, rather than the
+        # give-up being written bare: `invariants.true_blockers` re-derives
+        # VALIDATION_STUCK_BLOCKER from a round whose outcome is `escalated`, so an
+        # escalation with no round behind it would have its attention flag rewritten on
+        # the next reconcile tick and the user would never be asked.
+        round_row = store.open_validation_round(
+            wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
+            summary=str(wo.get("result_summary") or ""), evidence=declared,
+            pr_url=wo.get("pr_url"), round=nxt,
+            config_version=current_config_version())
+        store.set_validation_file_shas(int(round_row["id"]), packet.file_shas)
+        escalate_validation_round(
+            store, wo, int(round_row["id"]), nxt,
+            BOUNCE_EXHAUSTED.format(n=BOUNCE_LIMIT, round=int(previous["round"]),
+                                    paths=", ".join(cited)))
+        # RE-READ, because the row above is the one that was opened and the caller has to
+        # be able to see that it has already been settled. `finish` reads this outcome to
+        # know not to land the work order: `land_when_cleared` LANDS an `escalated` round
+        # — deliberately, for `review_work_order` — and would put the give-up the user has
+        # just been asked about straight into the merge queue.
+        return store.get_validation_round(int(round_row["id"]))
     round_row = store.open_validation_round(
         wo_id=wo["id"], fingerprint=evidence_mod.fingerprint(packet),
         summary=str(wo.get("result_summary") or ""), evidence=declared,
@@ -2661,6 +2792,32 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
                      "fingerprint": round_row["fingerprint"],
                      "files": len(packet.files)})
     return round_row
+
+
+def _bounce(store: ProjectStore, wo: dict[str, Any], previous: dict[str, Any],
+            cited: tuple[str, ...], would_be: int) -> None:
+    """Send this submission back to the worker without convening the panel.
+
+    THE EVENT IS NOT OPTIONAL (the user's ruling, Neo question 518): a bounce that left
+    no trace would be the OS silently discarding a delivery, and the paths it checked are
+    the whole of why it did — a reader who disagrees can see the list, and the round it
+    came from, without re-running anything.
+
+    Written BEFORE the envelope, so a bus that refuses still leaves the record saying
+    what happened. The feedback travels to the ROLE `implementor` and never to a named
+    work order, for `Daemon._reject`'s reason.
+    """
+    wo_id = str(wo["id"])
+    n = int(previous["round"])
+    store.add_event(wo_id, "validation_bounced",
+                    {"after_round": n, "round_id": int(previous["id"]),
+                     "would_be_round": would_be, "cited": list(cited)})
+    bus.post(store, subject=bus.Subject(wo_id=wo_id),
+             from_role="reviewer", to_role="implementor",
+             payload=bus.ReviewFeedback(
+                 round=n, outcome="rejected",
+                 reason=BOUNCE_FEEDBACK.format(n=n, wo_id=wo_id,
+                                               paths=", ".join(cited))))
 
 
 def force_validation_refusal(store: ProjectStore, wo: dict[str, Any], *,
@@ -3351,10 +3508,18 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
-        if cfg is not None and cfg.enabled:
-            submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
-        # ...and the status is the JOIN's to decide, not this branch's.
-        status = land_when_cleared(store, fresh, pr_url)
+        opened = (submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
+                  if cfg is not None and cfg.enabled else None)
+        if str((opened or {}).get("outcome") or "") == "escalated":
+            # The bounce ceiling, and the ONE case where a submission has already settled
+            # itself: the user has been asked, and the landing below would land the
+            # give-up. Spec docs/superpowers/specs/2026-09-22-a-round-must-answer-the-
+            # list.md §6. Every other outcome — including a bounce, which opens no round
+            # at all — is the join's to decide.
+            status = str(store.get_work_order(wo_id)["status"] or "")
+        else:
+            # ...and the status is the JOIN's to decide, not this branch's.
+            status = land_when_cleared(store, fresh, pr_url)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,

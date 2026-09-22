@@ -493,6 +493,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # The reason IS the ask the worker has to answer, so unlike the "answered"
         # kinds above it is shown here: nothing else in the timeline carries it.
         return "Validation rejected — sent back", p.get("reason") or ""
+    if kind == "validation_bounced":
+        # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against
+        # `max_rounds` and concludes the budget is gone when it is untouched. The paths
+        # are the whole justification — spec
+        # docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §7.
+        cited = ", ".join(str(c) for c in (p.get("cited") or ()))
+        return (f"Sent back without a review round — nothing round "
+                f"{p.get('after_round')} asked about changed",
+                f"unchanged since that round: {cited}" if cited else "")
     if kind == "validation_escalated":
         return ("Validation gave up — over to you", p.get("reason") or "")
     if kind == "validation_void":
