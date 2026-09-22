@@ -35,6 +35,13 @@ worker turn the notification never arrives — that is the whole bug — so in p
 every uncollected launch is orphaned, and the resolution cases exist so that an
 interactive session, or a worker that polled the job to completion, is not accused.
 
+The notification is read ONLY out of what the harness writes — a `queue-operation`'s
+`content`, the `attachment.prompt` copy of it, a user row's plain-string message. Never
+out of assistant text. Every resolution case above is a kill-switch on the detector, and
+a kill-switch the policed thing can write is no check at all: a worker whose reply quoted
+a `<task-notification>` — this spec quotes several — would clear its own finding and get
+no event, no void and no nudge, silently.
+
 One exemption: a turn that recorded a `finished` event is not judged. The worker's
 `wo finish` summary is the authoritative last word there, and a job it collected before
 finishing must not be reported as abandoned.

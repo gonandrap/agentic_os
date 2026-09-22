@@ -114,6 +114,40 @@ def test_a_notification_that_it_is_still_running_does_not(root):
         "sess-1", since=now - 1, until=now + 60)] == ["b51fl7bhe"]
 
 
+def test_a_worker_cannot_clear_its_own_finding_by_saying_so(root):
+    """THE KILL-SWITCH IS NOT WRITABLE BY THE THING IT POLICES. The notification is a
+    HARNESS artefact; the same characters in an assistant's reply are the model's words,
+    and a turn that merely quotes one — discussing this very issue — must not exempt
+    itself. Fail-open here is silent: no event, no void, no nudge."""
+    now = time.time()
+    forged = {"type": "assistant", "timestamp": _stamp(now + 1),
+              "message": {"role": "assistant", "content": [
+                  {"type": "text", "text": _notification(now + 1)["content"]}]}}
+    prose = {"type": "assistant", "timestamp": _stamp(now + 2),
+             "message": {"role": "assistant",
+                         "content": _notification(now + 2)["content"]}}
+    _transcript(root, "sess-1", [*_launch(now), forged, prose])
+
+    assert [j.job_id for j in background.jobs_left_running(
+        "sess-1", since=now - 1, until=now + 60)] == ["b51fl7bhe"]
+
+
+def test_the_harness_copy_of_the_notification_still_clears_it(root):
+    """The narrowing keeps every shape the harness itself writes: the `queue-operation`
+    above, the `attachment.prompt` copy of it, and a USER row's plain-string message."""
+    now = time.time()
+    text = _notification(now + 1)["content"]
+    attached = {"type": "user", "timestamp": _stamp(now + 1),
+                "attachment": {"prompt": text}}
+    _transcript(root, "sess-1", [*_launch(now), attached])
+    assert background.jobs_left_running("sess-1", since=now - 1, until=now + 60) == []
+
+    spoken = {"type": "user", "timestamp": _stamp(now + 1),
+              "message": {"role": "user", "content": text}}
+    _transcript(root, "sess-2", [*_launch(now), spoken])
+    assert background.jobs_left_running("sess-2", since=now - 1, until=now + 60) == []
+
+
 def test_killing_the_job_is_collecting_it(root):
     """The worker knew the job was there and dealt with it. Nothing was abandoned and
     nothing it said about the job can be a promise."""

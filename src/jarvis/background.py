@@ -210,20 +210,26 @@ def _notified(row: dict[str, Any]) -> set[str]:
 
 
 def _prose_of(row: dict[str, Any]) -> Iterator[str]:
-    """Every place a transcript row carries free text. A notification arrives as a
-    `queue-operation`'s `content` and again as an `attachment`'s `prompt`; a user row
-    carries it in the message."""
+    """Where the HARNESS writes a notification, and nowhere the model writes anything.
+
+    THE DETECTOR'S KILL-SWITCH MUST NOT BE WRITABLE BY THE THING IT POLICES. A
+    `<task-notification>` in this text puts a job in `collected`, which is the whole
+    exemption — so a worker whose reply merely QUOTED one (this module's own docstrings
+    do, and so does any turn discussing issue #575) would clear its own finding: no
+    event, no void, no nudge, silently. Fail-open, by the worker's own prose.
+
+    So only the three shapes the harness itself writes, verified on a real transcript:
+    a `queue-operation`'s `content`, the `attachment.prompt` copy of the same
+    notification, and a USER row's plain-string message — never an assistant row's,
+    which carries the model's words in exactly that field.
+    """
     for value in (row.get("content"), (row.get("attachment") or {}).get("prompt")
                   if isinstance(row.get("attachment"), dict) else None):
         if isinstance(value, str):
             yield value
     content = (row.get("message") or {}).get("content")
-    if isinstance(content, str):
+    if row.get("type") == "user" and isinstance(content, str):
         yield content
-    for block in usage.blocks_of(row):
-        text = block.get("text") if block.get("type") == "text" else None
-        if isinstance(text, str):
-            yield text
 
 
 def _text_of(content: Any) -> str:
