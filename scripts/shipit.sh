@@ -12,7 +12,9 @@
 #      release branch* — main is never modified (done in a throwaway git worktree so the
 #      shared main checkout's HEAD never moves). Both files, or the tag ships a lock
 #      that disagrees with its pyproject and production rewrites it (issue 202).
-#   4. Push the release branch AND the tag to origin.
+#   4. Push the release branch AND the tag to origin, then publish a GitHub RELEASE
+#      against the tag whose notes list everything main gained since the previous
+#      release — the per-version changelog a bare tag does not give you (best-effort).
 #   5. Deploy the tag to  $PRODUCTION_CODE/jarvis_os  from ORIGIN (clone on first run,
 #      then fetch + checkout the tag + `uv sync`), and restart the systemd services.
 #   6. Notify Telegram (best-effort).
@@ -256,6 +258,74 @@ run "git worktree remove --force '$WT'"
 say "pushing $REL_BRANCH and $TAG to origin"
 run "git push origin 'refs/heads/$REL_BRANCH:refs/heads/$REL_BRANCH'"
 run "git push origin 'refs/tags/$TAG'"
+
+# --- 4a. publish the GitHub release — this version's changelog page --------------
+#
+# A pushed tag gives GitHub nothing to show: /releases stays empty, and there is no
+# per-version page saying what a version actually contains. So every tag shipit cuts
+# gets a release published against it, and the notes are the answer to "what changed".
+#
+# The notes are built here rather than left to `gh --generate-notes` because our tags
+# DO NOT SIT ON MAIN: each is a lone bump commit on a release branch, so the range that
+# describes a release is `<previous tag>..<the main head being shipped>`. Reachability
+# makes that exact — the previous tag's own bump commit is not an ancestor of main, but
+# everything main held when that tag was cut is, so the range is precisely what this
+# release adds and nothing else, with no need to know where the tag was planted.
+# --first-parent keeps it to one line per landed PR whether main took it squashed or
+# merged.
+#
+# BEST-EFFORT, exactly like the Telegram notify below. By the time we reach here the
+# tag is on origin and production is about to move to it: a missing `gh`, a lapsed
+# token or a page that already exists are all reasons to say so and carry on, never to
+# abort a release halfway through. Every failure prints the command to run by hand, so
+# a release that missed its page is one paste away from having one.
+PREV_TAG="jarvis-$BASE"
+GH_TITLE="Jarvis OS $VERSION"
+
+release_notes() {  # the body of the release page, on stdout
+  local range="$MAIN_SHA" have_prev=0 base
+  if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
+    have_prev=1
+    range="$PREV_TAG..$MAIN_SHA"
+  fi
+  printf "## What's changed\n\n"
+  git log --first-parent --format='- %s (%h)' "$range" \
+    || printf -- '- (could not read the git log for %s)\n' "$range"
+  # A compare link only means something with something to compare against, and only on
+  # GitHub — this repo's origin is the one place `gh` can publish to anyway.
+  if [ "$have_prev" = 1 ]; then
+    base="$(printf '%s\n' "$ORIGIN_URL" | sed -E 's#^git@[^:]+:#https://github.com/#; s#\.git$##')"
+    case "$base" in
+      https://github.com/*)
+        printf '\n**Full changelog**: %s/compare/%s...%s\n' "$base" "$PREV_TAG" "$TAG" ;;
+    esac
+  fi
+}
+
+say "publishing GitHub release $TAG"
+if ! command -v gh >/dev/null 2>&1; then
+  say "gh not found on PATH — $TAG gets no release page. The tag is on origin already;"
+  say "  publish it later with: gh release create $TAG --title '$GH_TITLE' --generate-notes"
+else
+  NOTES_FILE="$(mktemp)"
+  release_notes > "$NOTES_FILE"
+  say "release notes:"
+  sed 's/^/    /' "$NOTES_FILE"
+  # A hung `gh` must not hold up a deploy whose tag is already published.
+  GH_TIMEOUT=""
+  if command -v timeout >/dev/null 2>&1; then GH_TIMEOUT="timeout 60"; fi
+  if [ "$DRY_RUN" = 1 ]; then
+    printf "  [dry-run] gh release create '%s' --title '%s' --notes-file %s --verify-tag\n" \
+      "$TAG" "$GH_TITLE" "$NOTES_FILE"
+  elif $GH_TIMEOUT gh release create "$TAG" --title "$GH_TITLE" \
+         --notes-file "$NOTES_FILE" --verify-tag; then
+    say "release published for $TAG"
+  else
+    say "gh release create failed (non-fatal) — $TAG is on origin and the deploy continues;"
+    say "  publish the page with: gh release create $TAG --title '$GH_TITLE' --generate-notes"
+  fi
+  rm -f "$NOTES_FILE"
+fi
 
 # --- 5. deploy to production (from origin, not this checkout) --------------------
 say "deploying to $PROD_DIR"
