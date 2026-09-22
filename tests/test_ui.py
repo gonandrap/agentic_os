@@ -338,6 +338,32 @@ def test_the_question_page_holds_the_question_and_its_answer(client, daemon, pro
     assert f"/wo/proj_a/{wo['id']}" in page  # back to the work order that asked
 
 
+def test_a_triage_question_sends_the_reader_to_the_issue_not_the_backlog(client):
+    """No worker exists to answer a `triage` question (issue #240), so the page offers no
+    reply box — and what it offers instead has to be a route that EXISTS. The filing
+    stopped creating a backlog item (kn-c5725f1f), so `promote it from the backlog` was
+    pointing at a queue that is no longer written."""
+    import json as _json
+
+    from jarvis.neo_store import NeoStore
+
+    url = "https://github.com/someone/repo/issues/41"
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "", "is this really a blocker?", kind="triage",
+                    context=_json.dumps({"issue_url": url, "priority": "blocker"}))
+        neo.mark(q["id"], "escalated", reason="not enough evidence")
+    finally:
+        neo.close()
+
+    page = client.get(f"/neo/question/{q['id']}").text
+    assert "jarvis issues start" in page and url in page
+    # The nav bar still links the backlog page; what must be gone is this block sending
+    # the reader there as the resolution.
+    assert "from the backlog" not in page and "backlog promote" not in page
+    assert 'action="/neo/' not in page, "there is nobody to reply to"
+
+
 def test_a_question_that_does_not_exist_says_so(client):
     r = client.get("/neo/question/9999")
     assert r.status_code == 404
