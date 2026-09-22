@@ -337,6 +337,8 @@ def test_the_two_modules_say_the_same_thing(fleet):
     """`timeline` is a leaf that imports nothing, so it spells the constants out. This
     is the pin that keeps the two copies equal."""
     assert timeline.BACKGROUND_ORPHANED == background.EVENT
+    assert timeline.BACKGROUND_NUDGED == background.NUDGED
+    assert timeline.BACKGROUND_UNRESOLVED == background.UNRESOLVED
     assert background.SOURCE in timeline.UNAUTHORED_SOURCES
     assert timeline.JOB_COMMAND_CHARS == background.COMMAND_CHARS
     job = {"id": "b51fl7bhe", "command": SUITE}
@@ -424,6 +426,85 @@ def test_an_ordinary_work_order_gets_no_note(fleet, fake_claude, settle_turns):
     assert settle_turns(store)
 
     assert background.resume_note(store, store.get_work_order(wo["id"])) == ""
+
+
+# -- 5. the OS typing `resume` itself, twice -------------------------------------------
+
+
+def _settled(fleet, wo_id: str) -> dict:
+    fleet["daemon"].settle_work_order(fleet["project"], fleet["store"],
+                                      fleet["store"].get_work_order(wo_id))
+    return fleet["store"].get_work_order(wo_id)
+
+
+def test_the_os_sends_it_back_before_asking_the_user(fleet):
+    """§4b. A stall with a known cure and a worker still holding the conversation is
+    one the OS clears itself — making the user type `resume` is the bug, not the fix."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    _orphaned(store, wo["id"])
+
+    fresh = _settled(fleet, wo["id"])
+
+    queued = store.queued_messages(wo["id"])
+    assert [m["source"] for m in queued] == [background.SOURCE]
+    assert "b51fl7bhe" in queued[0]["content"]
+    assert fresh["status"] != "needs_review", "parked on a stall it was about to clear"
+    assert not fresh["needs_attention"]
+    nudge = json.loads(store.events_of_kind(wo["id"], background.NUDGED)[0]["payload"])
+    assert nudge["attempt"] == 1 and nudge["of"] == background.NUDGE_MAX
+
+
+def test_a_waiting_nudge_is_never_sent_twice(fleet):
+    """The reconciler is back in two minutes and the message is still queued."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    _orphaned(store, wo["id"])
+    _settled(fleet, wo["id"])
+
+    _settled(fleet, wo["id"])
+    _settled(fleet, wo["id"])
+
+    assert len(store.queued_messages(wo["id"])) == 1
+    assert len(store.events_of_kind(wo["id"], background.NUDGED)) == 1
+
+
+def test_a_worker_that_backgrounds_again_after_two_tries_reaches_the_user(fleet):
+    """The cap, and what is deliberately NOT written with it: no attention reason of
+    this module's own — `true_blockers` stays the one author of what a parked work
+    order says, and #573 owns that sentence."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    for _ in range(background.NUDGE_MAX):
+        _orphaned(store, wo["id"])
+        assert _settled(fleet, wo["id"])["status"] != "needs_review"
+        for msg in store.queued_messages(wo["id"]):
+            store.mark_message(msg["id"], "delivered")
+    _orphaned(store, wo["id"])
+
+    fresh = _settled(fleet, wo["id"])
+
+    assert fresh["status"] == "needs_review" and fresh["needs_attention"]
+    assert store.queued_messages(wo["id"]) == []
+    gave_up = store.events_of_kind(wo["id"], background.UNRESOLVED)
+    assert len(gave_up) == 1
+    assert json.loads(gave_up[0]["payload"])["attempts"] == background.NUDGE_MAX
+    # Said once: the finding still matches the latest turn on every later tick.
+    _settled(fleet, wo["id"])
+    assert len(store.events_of_kind(wo["id"], background.UNRESOLVED)) == 1
+
+
+def test_an_ordinary_idle_turn_still_parks(fleet):
+    """The branch this sits in front of, unchanged for everything else."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    turn = store.create_turn(wo["id"], kind="message", prompt="go")
+    store.finish_turn(turn["id"], "done", result="I had a look and stopped")
+
+    fresh = _settled(fleet, wo["id"])
+
+    assert fresh["status"] == "needs_review" and fresh["needs_attention"]
+    assert store.queued_messages(wo["id"]) == []
 
 
 def test_the_note_is_spent_by_the_turn_it_was_written_for(fleet):

@@ -303,3 +303,44 @@ def resume_note(store: Any, wo: dict[str, Any],
         return ""
     jobs = jobs_of(payload)
     return RESUME_NOTE.format(jobs=labels(jobs) if jobs else "the job it started")
+
+
+#: How many times the OS sends a work order back on its own before the user is asked.
+#: TWO, and the cap is the whole safety of it: the turn being retried is one that ended
+#: in seconds saying nothing, so a worker that does it a third time is not going to stop
+#: on the fourth. Neo, question 500.
+NUDGE_MAX = 2
+
+#: The OS sent it back itself. `nudged` carries the attempt; `unresolved` is written once
+#: when the budget is gone and the work order is left to the ordinary idle path.
+NUDGED = "background_nudged"
+UNRESOLVED = "background_unresolved"
+
+
+def nudge(store: Any, wo: dict[str, Any]) -> bool:
+    """Send this work order back to its worker over a job that died with its turn.
+
+    True when the OS has taken it on, and then the caller must leave the row alone: the
+    message is queued, the next delivery pass turns it into a turn, and the work order
+    moves itself. False when there is nothing to nudge about or the budget is spent,
+    and then the caller settles it exactly as it always did — this raises no attention
+    reason of its own, deliberately, so `invariants.true_blockers` stays the one author
+    of what a parked work order says (kn-089de524 and INV-ATTENTION-REASON).
+
+    kn-ca2e365e's rule, on the remedy side: the user's own lever is `jarvis wo send`,
+    and this reuses it rather than inventing a second way to start a turn.
+    """
+    note = resume_note(store, wo)
+    if not note:
+        return False
+    attempts = len(store.events_of_kind(wo["id"], NUDGED))
+    if attempts >= NUDGE_MAX:
+        # Said once, then never again: `pending_orphan` still matches the latest turn on
+        # every subsequent tick, and the reconciler is here every couple of minutes.
+        if not store.events_of_kind(wo["id"], UNRESOLVED):
+            store.add_event(wo["id"], UNRESOLVED, {"attempts": attempts})
+        return False
+    msg_id = store.queue_message(wo["id"], note, source=SOURCE)
+    store.add_event(wo["id"], NUDGED, {"attempt": attempts + 1, "of": NUDGE_MAX,
+                                       "msg_id": msg_id})
+    return True

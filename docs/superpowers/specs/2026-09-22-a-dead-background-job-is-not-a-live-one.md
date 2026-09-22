@@ -72,6 +72,25 @@ because this is a separate message rather than a header wrapped around theirs.
 Queued once per turn: a delivery that fails and is retried finds the note already on the
 record and does not write a second.
 
+## 4b. And the OS types `resume` itself, twice
+
+A stall with a known cure and a worker still holding the whole conversation is one the
+OS should clear without spending the user's attention (Neo, question 500). So the
+`needs_review` branch of `Daemon.settle_work_order` asks `background.nudge` first: it
+queues that same note, the next delivery pass turns it into a turn, and the work order
+moves itself. Nothing else about the branch changes.
+
+Twice, and then the work order parks exactly as it always did. The cap is the safety:
+the turn being retried is one that ended in seconds saying nothing, and a worker that
+does it a third time will not stop on the fourth. The give-up writes an event and **no
+attention reason of its own** — `invariants.true_blockers` stays the one author of what
+a parked work order says, and this branch's existing `IDLE_NO_FINISH_BLOCKER` (issue
+#573's) is untouched.
+
+No re-nudging while the message waits: `settle_work_order` returns on
+`queued_messages` several branches above this one, on every tick until the turn goes
+out.
+
 ## 5. Deliberately not here
 
 `needs_review`'s durable reason, `IDLE_NO_FINISH_BLOCKER`, `ops.ack_attention` and the
@@ -79,6 +98,5 @@ record and does not write a second.
 ABSENT reason; this one fixes a PRESENT falsehood, and the header is not where the
 falsehood is printed.
 
-No self-healing nudge either. The OS does not re-dispatch the worker on its own here:
-the detector's job is to stop the record lying, and the resume the user already types is
-the retry.
+No new attention reason, no new work-order status, and no repair of wo-d81fcc15 — the
+order that produced the bug is left where it is on purpose, as the brief asked.

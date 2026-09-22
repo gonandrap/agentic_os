@@ -55,6 +55,8 @@ DEBUG_KINDS = frozenset({
 #: module is a leaf and opens nothing. A test pins the two equal. Spec
 #: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md.
 BACKGROUND_ORPHANED = "background_orphaned"
+BACKGROUND_NUDGED = "background_nudged"
+BACKGROUND_UNRESOLVED = "background_unresolved"
 
 #: What the conversation prints ABOVE a message whose turn left a background job behind
 #: — `build_conversation`'s `void` field, spec §3. It retracts the promise without
@@ -625,6 +627,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # and what the OS's own alarm quoted.
         return ("A background job died with the turn that started it",
                 _job_labels(p) + " — nothing it was told to do has run")
+    if kind == BACKGROUND_NUDGED:
+        # Says the OS did it, for `pr_checks_nudged`'s reason one surface along: a
+        # message nobody typed must not read afterwards as one the user sent.
+        of = p.get("of")
+        return ("Sent back to run it in the foreground",
+                f"attempt {p.get('attempt')} of {of}" if of else "")
+    if kind == BACKGROUND_UNRESOLVED:
+        return ("Backgrounded it again after being sent back — over to you",
+                f"{p.get('attempts')} attempts")
     if kind == "finished":
         return "Finished", p.get("summary") or ""
     if kind == "marked_done":

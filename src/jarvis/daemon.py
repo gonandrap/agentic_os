@@ -3960,6 +3960,16 @@ class Daemon:
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 
+            # THE OS SENDS IT BACK ITSELF WHEN IT KNOWS WHY IT STOPPED. A turn that
+            # ended on a background job it had just killed is a stall with a known cure
+            # and a worker still holding the whole conversation, so making the user type
+            # `resume` is the bug rather than the fix (Neo, question 500). Twice, then
+            # this falls through and the work order parks exactly as it always did.
+            # Nothing is re-nudged while the message waits: the `queued_messages` guard
+            # above returns before this on every tick until the turn goes out.
+            if background.nudge(store, fresh):
+                return
+
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
