@@ -28,6 +28,12 @@ DEFAULT_SUMMARY_MAX_WORDS = 120
 #: `concision.summary_max_words`. Absent means the default; `0` disables the check.
 SUMMARY_CAP_ENV = "JARVIS_SUMMARY_MAX_WORDS"
 
+#: Set per work order by `dispatch._write_worker_settings` from the work order's own
+#: `append_system_prompt`, falling back to the catalog's `worker.append_system_prompt` --
+#: the same resolution `worker_session.briefing` uses for `--append-system-prompt`, so a
+#: subagent is told what its parent was told. Env for the module docstring's reason.
+STANDING_PROMPT_ENV = "JARVIS_APPEND_SYSTEM_PROMPT"
+
 #: Markers around the injected block. `evals/llm/test_house_style_ab.py` builds its
 #: WITHOUT arm by cutting between these, so the two arms stay byte-equal everywhere else
 #: -- kn-fe226ab1's finding that an A/B which re-composes its arms measures nothing.
@@ -156,3 +162,24 @@ def house_style() -> str:
         "verbatim.",
         HOUSE_STYLE_END,
     ])
+
+
+def subagent_context(env: dict[str, str] | None = None) -> str:
+    """What a `SubagentStart` hook injects: the house style, plus the project's standing
+    worker instructions when it has any.
+
+    A Task subagent inherits its parent's CLAUDE.md, skills, settings and hooks, and
+    NONE of its `--append-system-prompt`, `--agent` persona or `SessionStart`
+    `additionalContext` -- measured on Claude Code 2.1.278, spec
+    docs/superpowers/specs/2026-09-19-concision-enforced.md SS5.1. So the two things a
+    worker was given out of band have to be re-delivered here or the subagent writes
+    without either.
+
+    The standing prompt is read from the environment, never from `catalog`: see the
+    module docstring.
+    """
+    standing = (env if env is not None else os.environ).get(STANDING_PROMPT_ENV) or ""
+    parts = [house_style()]
+    if standing.strip():
+        parts.append("# Standing instructions for this project\n\n" + standing.strip())
+    return "\n\n".join(parts)

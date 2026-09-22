@@ -156,3 +156,44 @@ def test_the_section_names_the_knowledge_it_argues_from():
         assert heading in text
     # Concision is never an excuse to drop evidence.
     assert "correctness" in text
+
+
+# -- the subagent transport (SS5.1) -----------------------------------------------------
+
+def test_the_standing_prompt_travels_to_the_worker_by_env(project, jarvis_home):
+    """The subagent injection's only moving part. A subagent inherits none of the
+    parent's `--append-system-prompt`, so the `SubagentStart` hook re-injects it — and
+    it has to read it from the environment, because `concision` may not import
+    `catalog`. The hook is asserted against the file `_write_worker_settings` actually
+    wrote, not against a hand-built env, so the two cannot drift.
+
+    The work order's own override wins over the catalog default, matching the
+    resolution `worker_session.briefing` uses for the flag itself.
+    """
+    from jarvis import concision, hooks
+    from jarvis.catalog import WorkerDefaults
+
+    spec = _spec(project, worker=WorkerDefaults(append_system_prompt="catalog rule"))
+    written = json.loads(_write_worker_settings(spec, {"id": "wo-conc02"}).read_text())
+    env = written["env"]
+    assert env[concision.STANDING_PROMPT_ENV] == "catalog rule"
+
+    injected = hooks.handle_hook(
+        {"hook_event_name": "SubagentStart", "agent_type": "general-purpose"}, env)
+    assert "catalog rule" in injected["hookSpecificOutput"]["additionalContext"]
+
+    override = json.loads(_write_worker_settings(
+        spec, {"id": "wo-conc03", "append_system_prompt": "this order's rule"}).read_text())
+    assert override["env"][concision.STANDING_PROMPT_ENV] == "this order's rule"
+
+
+def test_the_subagent_hook_is_wired_in_the_baseline_settings():
+    """It reaches a worker through the same file as every other hook, so a subagent in
+    ANY managed project gets it — including one the user opened themselves, where the
+    handler no-ops on the missing `JARVIS_WO_ID`."""
+    entries = build_settings({})["hooks"]["SubagentStart"]
+
+    assert len(entries) == 1
+    assert "matcher" not in entries[0]  # every agent type
+    assert entries[0]["hooks"][0]["command"] == \
+        build_settings({})["hooks"]["SessionStart"][0]["hooks"][0]["command"]
