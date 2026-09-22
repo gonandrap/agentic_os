@@ -34,8 +34,12 @@ def _stamp(when: float) -> str:
 
 
 def _launch(when: float, job_id: str = "b51fl7bhe",
-            command: str = SUITE) -> list[dict]:
-    """The two rows a background launch writes: the call, and the id it came back with."""
+            command: str = SUITE, gap: float = 0.1) -> list[dict]:
+    """The two rows a background launch writes: the call, and the id it came back with.
+
+    `gap` is how long the call took to come back. A real turn is bounded by its own
+    clock, so the end-to-end test pins both rows to one instant rather than racing it.
+    """
     call_id = f"toolu_{job_id}"
     return [
         {"type": "assistant", "timestamp": _stamp(when),
@@ -43,7 +47,7 @@ def _launch(when: float, job_id: str = "b51fl7bhe",
              {"type": "tool_use", "id": call_id, "name": "Bash",
               "input": {"command": command, "description": "Run the suite",
                         "run_in_background": True}}]}},
-        {"type": "user", "timestamp": _stamp(when + 0.1),
+        {"type": "user", "timestamp": _stamp(when + gap),
          "message": {"role": "user", "content": [
              {"type": "tool_result", "tool_use_id": call_id,
               "content": f"Command running in background with ID: {job_id}."}]},
@@ -227,6 +231,36 @@ def test_the_reaper_files_the_finding_against_the_reply(fleet, root):
     payload = json.loads(event["payload"])
     assert payload["msg_id"] == msg_id and payload["seq"] == turn["seq"]
     assert payload["jobs"] == [{"id": "b51fl7bhe", "command": SUITE}]
+
+
+def test_a_real_turn_reaped_by_the_transport_files_the_finding(fleet, fake_claude,
+                                                               root, settle_turns):
+    """END TO END and the only test here that does: a real turn through
+    `worker_session.start`, a transcript with a background launch in it, and the REAP is
+    what has to produce the finding. Nothing is called by hand and no event is written.
+
+    This is what fails if the four lines in `worker_session._reap` are deleted, or if
+    the work order's `session_id` is not on the record by the time `_reap` reads it.
+    """
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    worker_session.start(store, fleet["project"], store.get_work_order(wo["id"]), "go")
+    session_id = store.get_work_order(wo["id"])["session_id"]
+    assert session_id, "`start` persists the session id before it launches the turn"
+    # Pinned to the turn's own clock: a real turn is over in milliseconds, and rows
+    # stamped after it ended are outside the window the detector reads.
+    _transcript(root, session_id,
+                _launch(store.latest_turn(wo["id"])["started_at"], gap=0.0))
+
+    assert settle_turns(store)
+
+    events = store.events_of_kind(wo["id"], background.EVENT)
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["jobs"] == [{"id": "b51fl7bhe", "command": SUITE}]
+    assert payload["seq"] == store.latest_turn(wo["id"])["seq"]
+    # …and against the reply THE REAPER recorded, which is the message the void marks.
+    assert payload["msg_id"] == store.agent_replies(wo["id"])[-1]["id"]
 
 
 def test_a_turn_that_finished_is_not_judged(fleet, root):
