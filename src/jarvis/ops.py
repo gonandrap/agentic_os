@@ -3458,6 +3458,43 @@ def mark_backlog_done(wo: dict[str, Any]) -> None:
         central.close()
 
 
+def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
+                              reason: str) -> int | None:
+    """Close an open validation round whose question the pull request just answered.
+
+    Called by the pull-request poll immediately before `complete_merged` or
+    `record_pr_closed`, and only by them. A work order can be `validating` while its pull
+    request is merged or closed by hand — `rejudge_moved_head` opens a round on a head the
+    OS's own repair loop moved, and the user is right there at the pull request — and a
+    round judging a diff that has already landed, or been refused, is spent work whatever
+    it decides.
+
+    `void` and not `passed`, `rejected` or `failed`: nobody judged this and nothing is
+    left undecided, which is precisely what that outcome means (`project_store.
+    VALIDATION_OUTCOMES`). It costs the submitter no round, it is in none of the OPEN or
+    RUNNABLE sets, and `invariants._validation_escalated` cannot re-derive a give-up from
+    it — so the round machine and the reconciler both let the work order go. THE SEATS
+    MAY STILL BE READING, and that is the other half: `Daemon._validate_work_order`
+    re-reads this outcome when its validator returns and drops the verdict rather than
+    writing over a round that settled underneath it.
+
+    DELIBERATELY NOT `Daemon._void`, which ends with `land_when_cleared`: that would park
+    the order back in `waiting_pr_merge` a line before the caller completes or refuses it,
+    and the last writer would be deciding the status by accident. This one closes the
+    round and stops, leaving the ending to the caller that knows it.
+
+    Returns the round number it voided, or None when there was nothing open — the ordinary
+    case, and the reason this is safe to call unconditionally.
+    """
+    rnd = store.latest_validation_round(wo_id=wo["id"])
+    if not rnd or not store.round_machine_owns(rnd):
+        return None
+    store.close_validation_round(rnd["id"], "void", reason)
+    store.add_event(wo["id"], "validation_void",
+                    {"round": rnd["round"], "round_id": rnd["id"], "reason": reason})
+    return int(rnd["round"])
+
+
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
                     merged_at: str | None = None,
                     head_oid: str = "",

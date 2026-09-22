@@ -152,13 +152,19 @@ UNLANDED_BLOCKER = ("work not landed — merge its pull request, or record that 
 #: build, because they are different problems and `ops.PrRepair` counts them apart.
 PR_REPAIR_MAX_ATTEMPTS = 3
 
-#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT — so the statuses
-#: the poll asks GitHub about (`Daemon.PR_POLL_STATUSES` is this tuple) and the only ones
-#: in which either repair blocker below may be derived. ONE home for the set, because the
-#: two have to agree: a status the poll nudges in but `true_blockers` does not derive for
-#: raises a give-up flag nothing can re-derive, and INV-ATTENTION-REASON relabels it on
-#: the next tick; a status derived for but never polled asserts a repair that cannot be
-#: happening. Issue #224 widened the poll and this is what keeps the pair honest.
+#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT AND A WORKER CAN BE
+#: ASKED TO FIX IT — so the statuses the poll may NUDGE in (`Daemon.PR_POLL_STATUSES` is
+#: built from this tuple) and the only ones in which either repair blocker below may be
+#: derived. ONE home for the set, because the two have to agree: a status the poll nudges
+#: in but `true_blockers` does not derive for raises a give-up flag nothing can
+#: re-derive, and INV-ATTENTION-REASON relabels it on the next tick; a status derived for
+#: but never polled asserts a repair that cannot be happening. Issue #224 widened the poll
+#: and this is what keeps the pair honest.
+#:
+#: THE POLL IS NOW THE WIDER OF THE TWO. It also visits `validating`, where a round can
+#: sit for minutes while the user merges the pull request by hand — but it does nothing
+#: there except notice the merge or the closure, precisely so this pairing still holds.
+#: `Daemon.PR_POLL_STATUSES` carries the argument; the bound is enforced in the loop.
 #:
 #: Every member is in BLOCKED_STATUSES, or INV-ATTENTION-MISSING would derive the give-up
 #: correctly and then never surface it.
