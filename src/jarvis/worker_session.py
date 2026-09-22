@@ -647,8 +647,10 @@ def _unit_still_running(turn: dict[str, Any]) -> bool:
 def _reap(store: ProjectStore, turn: dict[str, Any],
           project_name: str = "") -> dict[str, Any]:
     wo_id = turn["wo_id"]
-    result = claude_cli.read_turn_result(Path(turn["outfile"]),
-                                         Path(turn["errfile"]) if turn["errfile"] else None)
+    result = claude_cli.read_turn_result(
+        Path(turn["outfile"]),
+        Path(turn["errfile"]) if turn["errfile"] else None,
+        previous=store.turn_usage_before(wo_id, turn["seq"]))
     if result is None:
         error = (_stderr_tail(turn) or _transcript_error(store, wo_id, turn)
                  or NO_RESULT)

@@ -3181,7 +3181,8 @@ class ProjectStore:
         )
         return self.get_turn(turn_id)  # type: ignore[return-value]
 
-    def set_turn_usage(self, turn_id: int, usage_json: str) -> None:
+    def set_turn_usage(self, turn_id: int, usage_json: str,
+                       cost_usd: float | None = None) -> None:
         """Backfill a settled turn's recorded usage (parsed late from its outfile).
 
         THE COST RIDES WITH IT. The envelope this re-reads carries `total_cost_usd`, and
@@ -3189,8 +3190,15 @@ class ProjectStore:
         summed as $0.00 by the one query the enforcement runs (issue #471). Coalesced
         rather than set: a row whose cost is already known must not be nulled by an
         envelope that lost the field.
+
+        `cost_usd` overrides that reading for a caller that has already worked out this
+        turn's SHARE of it — `ops._turn_usage` re-deriving a row whose envelope holds the
+        resumed session's running total (issue #470). Both paths agree once the row is
+        current; they disagree exactly while it is being repaired.
         """
-        cost = (db.from_json(usage_json, None) or {}).get("total_cost_usd")
+        cost = cost_usd
+        if cost is None:
+            cost = (db.from_json(usage_json, None) or {}).get("total_cost_usd")
         self.conn.execute(
             "UPDATE wo_turns SET usage_json=?, cost_usd=COALESCE(?, cost_usd), "
             "cost_source=CASE WHEN ? IS NULL THEN cost_source ELSE ? END WHERE id=?",
@@ -3201,6 +3209,22 @@ class ProjectStore:
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq DESC LIMIT 1", (wo_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def turn_usage_before(self, wo_id: str, seq: int) -> dict[str, Any] | None:
+        """The usage envelope of the last turn recorded before `seq`, or None.
+
+        The baseline a turn's own spend is measured against: from CLI 2.1.277 a result
+        envelope reports the whole resumed session's usage, so the turn before it is
+        what makes the newest one a per-turn figure (`claude_cli.derive_turn_usage`).
+        Any KIND of turn counts — a `/compact` spends inside the same session and the
+        running total contains it.
+        """
+        row = self.conn.execute(
+            "SELECT usage_json FROM wo_turns WHERE wo_id=? AND seq<? AND "
+            "usage_json IS NOT NULL ORDER BY seq DESC LIMIT 1", (wo_id, seq)
+        ).fetchone()
+        envelope = db.from_json(row["usage_json"], None) if row else None
+        return envelope if isinstance(envelope, dict) else None
 
     def running_turns(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

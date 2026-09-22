@@ -344,6 +344,39 @@ def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
     assert "210k" in page.text and "26k" in page.text
 
 
+def test_the_bill_says_which_way_a_turn_it_cannot_re_read_was_counted(client, project):
+    """Two superseded readings, and they are wrong in OPPOSITE directions.
+
+    A version-1 turn counted a fraction of itself and a version-2 one counted the whole
+    resumed session (issue #470). Both survive only where the result JSON is gone, both
+    are labelled, and one label for both would tell half the readers the wrong story
+    about which way their bill is off.
+    """
+    wo = ops.create_work_order("proj_a", "counted before the fix")
+    store = ProjectStore(project)
+    try:
+        for version in (1, 2):
+            turn = store.create_turn(wo["id"], kind="message", prompt="p")
+            store.finish_turn(turn["id"], "done", result="r", cost_usd=0.05,
+                              num_turns=1, usage_json=json.dumps({
+                                  "usage_v": version, "total_cost_usd": 0.05,
+                                  "input": 2, "cache_write": 2_558,
+                                  "cache_read": 45_689, "output": 941,
+                                  "by_model": [{"model": "claude-opus-5",
+                                                "input": 2, "cache_write": 2_558,
+                                                "cache_read": 45_689, "output": 941,
+                                                "cost_usd": 0.05}]}))
+    finally:
+        store.close()
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+
+    assert page.status_code == 200
+    assert "counted the old way" in page.text
+    assert "are the pre-fix reading" in page.text
+    assert "running total and is OVERstated" in page.text
+
+
 def test_the_bill_gives_each_panel_seat_its_own_line(client, project):
     """The standing ruling — one row per seat, never one per question — rendered.
 

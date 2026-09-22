@@ -9,9 +9,16 @@ runs. The whole design rests on it:
 * **The cap is PER INVOCATION, not per session.** A session that had already spent
   $0.0327 across its first turn resumed under `--max-budget-usd 0.01` and ran to
   completion, spending another $0.0072. Prior spend on the same session id does not
-  count against the flag, and `total_cost_usd` on the resumed envelope reports that
-  invocation's spend alone. THIS IS THE WHOLE REASON THIS MODULE EXISTS: the running
+  count against the flag. THIS IS THE WHOLE REASON THIS MODULE EXISTS: the running
   total is Jarvis's to keep, and each turn is handed `budget - spent so far`.
+  * The same measurement also concluded that `total_cost_usd` on the resumed envelope
+    reports that invocation's spend alone. THAT HALF IS FALSE, on every multi-turn
+    order since CLI 2.1.277: it is the RESUMED SESSION'S RUNNING BILL, as is
+    `modelUsage` (issue #470). The cap and the accounting simply do not agree about
+    which dollars they mean, and `_spend` summing the column as it was read made a $50
+    ceiling cut wo-966987af at a real $29.87 — the error growing with every turn.
+    `claude_cli.derive_turn_usage` now records the DELTA, so `wo_turns.cost_usd` is
+    this turn's spend and the sum below is the order's, once.
 * **It is checked BETWEEN API calls, so it overshoots.** A run capped at $0.001 spent
   $0.0471 — 47x — because the first call was already past the line when the check ran.
   The flag is a stop signal, not a hard limit; the bound is "one API call of overshoot",
@@ -54,6 +61,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .claude_cli import USAGE_SCHEMA_VERSION
 from .project_store import (
     FO_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
@@ -120,14 +128,38 @@ class Spend:
 
 def spent(store: ProjectStore, central: CentralStore | None, wo_id: str) -> Spend:
     """One work order's whole bill to date. Two queries, no transcript walk."""
-    row = store.conn.execute(
-        "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM wo_turns WHERE wo_id=?", (wo_id,)
-    ).fetchone()
+    row = _worker_row(store, wo_id)
+    if row["stale"]:
+        # A turn counted under an older reading of the result envelope is re-derived
+        # before it is summed, ONCE, and written back (`ops._turn_usage`) — the same
+        # lazy repair `jarvis cost` runs, done here because this is the number that
+        # STOPS work: version-2 rows hold the resumed session's running total, so an
+        # order would exhaust a budget it had spent a third of. Costs one JSON read per
+        # stale turn and nothing at all afterwards.
+        from . import ops
+
+        ops._turn_rows(store, wo_id)
+        row = _worker_row(store, wo_id)
     worker = float(row["c"] or 0.0)
     jarvis = 0.0
     if central is not None:
         jarvis = central.wo_call_cost(wo_id)
     return Spend(worker_usd=worker, jarvis_usd=jarvis)
+
+
+def _worker_row(store: ProjectStore, wo_id: str) -> Any:
+    """The worker half of one order's spend, and how many of its turns were counted
+    under a superseded reading of the result envelope — in one query, because the
+    common case is zero and must stay a single indexed scan."""
+    return store.conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS c, "
+        "       COALESCE(SUM(CASE WHEN COALESCE("
+        "           json_extract(usage_json, '$.usage_v'), 1) < ? "
+        "           AND outfile IS NOT NULL AND outfile <> '' "
+        "           AND state IN ('done', 'failed') THEN 1 ELSE 0 END), 0) AS stale "
+        "FROM wo_turns WHERE wo_id=?",
+        (USAGE_SCHEMA_VERSION, wo_id),
+    ).fetchone()
 
 
 def in_flight(store: ProjectStore, wo_id: str) -> float:

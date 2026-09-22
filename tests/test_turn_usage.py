@@ -101,16 +101,15 @@ def test_read_turn_result_carries_the_usage_envelope(tmp_path):
 def test_token_totals_come_from_model_usage_not_from_the_usage_object(tmp_path):
     """THE CORRECTION, pinned against the shape that hid it for months.
 
-    The result envelope's top-level `usage` object is not the turn's total. Measured
-    over the 186 live result files that carry both, it runs at 33-60% of `modelUsage` —
-    which agrees to the TOKEN with the transcript `usage.read_session` derives
-    independently, and whose `costUSD` sums to `total_cost_usd` to the cent. So the
-    totals come from `modelUsage`, and this fixture makes the two DIFFER, because a
-    fixture where they agree cannot fail if the wrong one is read (which is exactly how
-    the original went unnoticed: every test fixture had them equal).
+    The turn's totals come from `modelUsage`, which is the COMPLETE accounting: it
+    carries what the turn's subagents spent and what any side-model call spent, and the
+    top-level `usage` object carries neither. This fixture makes the two DIFFER, because
+    a fixture where they agree cannot fail if the wrong one is read — which is exactly
+    how the original went unnoticed: every fixture had them equal.
 
-    Dollars were never wrong — they come from `total_cost_usd` — so what this pins is
-    every token figure the OS records. Ruled on question 121, wo-4576667e.
+    The "33-60%" this docstring used to argue from was a per-turn delta measured against
+    a session running total, and the tests below the multi-turn banner are what settled
+    it. Nothing here changes: a single-turn envelope reads the same either way.
     """
     out = tmp_path / "1.json"
     out.write_text(json.dumps(result_json(**{
@@ -290,3 +289,298 @@ def test_reap_records_usage_and_cost_on_a_failed_turn(store, tmp_path):
     assert u["output"] == 941
     assert fresh["cost_usd"] == pytest.approx(0.0719595)
     assert fresh["num_turns"] == 2
+
+
+# -- a turn's share of a session running total ------------------------------------------
+#
+# From CLI 2.1.277 `modelUsage` and `total_cost_usd` report the WHOLE resumed session
+# rather than the turn that just ran, and every fixture above this line is single-turn —
+# where the two readings are identical and no test can tell them apart. These are the
+# multi-turn ones. Both shapes come from live orders on the dev machine: the monotone
+# series from wo-966987af, the mid-series restart from wo-2005a89b (issue #470).
+
+
+def turn_file(tmp_path, seq: int, *, own: dict, cumulative: dict,
+              cost: float, session: str = "sess-a"):
+    """One result JSON in the 2.1.277 shape: `usage` is this turn, `modelUsage` is the
+    session so far, and `total_cost_usd` is the session's running bill."""
+    out = tmp_path / f"{seq}.json"
+    out.write_text(json.dumps(result_json(
+        cost=cost,
+        session_id=session,
+        **{
+            "usage": {
+                "input_tokens": own["input"],
+                "cache_creation_input_tokens": own["cache_write"],
+                "cache_read_input_tokens": own["cache_read"],
+                "output_tokens": own["output"],
+                "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                                   "ephemeral_5m_input_tokens": own["cache_write"]},
+                "iterations": [],
+            },
+            "modelUsage": {"claude-opus-5": {
+                "inputTokens": cumulative["input"],
+                "outputTokens": cumulative["output"],
+                "cacheReadInputTokens": cumulative["cache_read"],
+                "cacheCreationInputTokens": cumulative["cache_write"],
+                "costUSD": cost, "contextWindow": 1_000_000}},
+        })))
+    return out
+
+
+def spend(input_=2, cache_write=0, cache_read=0, output=0) -> dict:
+    return {"input": input_, "cache_write": cache_write,
+            "cache_read": cache_read, "output": output}
+
+
+def running(turns: list[dict]) -> list[dict]:
+    """The cumulative series a resumed session reports, from the turns' own spend."""
+    out, total = [], spend(0)
+    for own in turns:
+        total = {c: total[c] + own[c] for c in total}
+        out.append(dict(total))
+    return out
+
+
+def derive_series(tmp_path, turns: list[dict], cumulative: list[dict],
+                  costs: list[float], session: str = "sess-a") -> list[dict]:
+    """Read a whole conversation the way the OS does — each turn against the one
+    before it — and hand back the envelopes."""
+    envelopes, previous = [], None
+    for i, (own, cum, cost) in enumerate(zip(turns, cumulative, costs), start=1):
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost,
+                        session=session)
+        result = claude_cli.read_turn_result(out, previous=previous)
+        envelopes.append(result.usage)
+        previous = result.usage
+    return envelopes
+
+
+def test_a_turn_is_billed_its_delta_not_the_session_running_total(tmp_path):
+    """wo-966987af's shape: five turns, a monotone `modelUsage`, and a bill that said
+    184.6M for a 49.4M conversation because it summed the running total five times."""
+    turns = [
+        spend(2, 1_000_000, 1_000_000, 20_000),
+        spend(4, 2_000_000, 37_000_000, 120_000),
+        spend(2, 500_000, 4_000_000, 10_000),
+        spend(1, 90_000, 700_000, 2_000),
+        spend(3, 400_000, 2_550_000, 8_000),
+    ]
+    cumulative = running(turns)
+
+    envelopes = derive_series(tmp_path, turns, cumulative,
+                             [2.28, 25.60, 28.88, 29.87, 32.02])
+
+    for envelope, own in zip(envelopes, turns):
+        for cls in own:
+            assert envelope[cls] == own[cls], envelope
+    # and the identity that matters to a bill: the turns sum to the session, ONCE.
+    assert sum(e["cache_read"] for e in envelopes) == cumulative[-1]["cache_read"]
+    assert sum(e["total_cost_usd"] for e in envelopes) == pytest.approx(32.02)
+    assert [e["continues"] for e in envelopes] == [False, True, True, True, True]
+
+
+def test_a_series_that_restarts_is_read_from_the_file_itself(tmp_path):
+    """wo-2005a89b's shape: the running total DROPS mid-order, because the process
+    behind it restarted. A value lower than its predecessor starts a new series, and
+    that file's own figure is the whole of the turn — never a clamp at zero."""
+    first = [spend(2, 500_000, 2_000_000, 20_000),
+             spend(4, 1_500_000, 17_000_000, 90_000)]
+    second = [spend(2, 100_000, 400_000, 5_000),
+              spend(1, 800_000, 10_000_000, 40_000)]
+    turns = first + second
+    cumulative = running(first) + running(second)
+
+    envelopes = derive_series(tmp_path, turns, cumulative, [2.49, 16.90, 0.33, 6.31])
+
+    assert [e["continues"] for e in envelopes] == [False, True, False, True]
+    for envelope, own in zip(envelopes, turns):
+        assert envelope["cache_read"] == own["cache_read"]
+    assert envelopes[2]["total_cost_usd"] == pytest.approx(0.33)
+    assert envelopes[3]["total_cost_usd"] == pytest.approx(5.98)   # 6.31 - 0.33
+
+
+def test_a_per_turn_envelope_is_never_diffed(tmp_path):
+    """THE REGRESSION THE OBVIOUS FIX WOULD HAVE SHIPPED. Up to CLI 2.1.274 `modelUsage`
+    IS the turn's own spend and equals `usage` — on 93% of the 814 result files on this
+    machine, the residue being subagents rather than a fraction. Subtracting there loses
+    a median 15% of every historical bill, so a rising series is not enough to call an
+    envelope cumulative: the implied delta has to cover the turn's own `usage` too.
+    """
+    turns = [spend(9, 3_000_000, 15_000_000, 380_000),
+             spend(4, 6_000_000, 28_000_000, 130_000),   # bigger, and still its own
+             spend(2, 1_000_000, 3_000_000, 40_000)]
+
+    envelopes = derive_series(tmp_path, turns, turns, [12.23, 20.14, 13.30])
+
+    assert [e["continues"] for e in envelopes] == [False, False, False]
+    for envelope, own in zip(envelopes, turns):
+        assert envelope["cache_read"] == own["cache_read"]
+    assert [e["total_cost_usd"] for e in envelopes] == [12.23, 20.14, 13.30]
+
+
+def test_a_turn_that_reports_no_usage_keeps_the_delta_it_uncovered(tmp_path):
+    """wo-2005a89b turn 4, decided deliberately: an API error returned a `usage` object
+    of all zeroes while the running total had moved by 10.75M.
+
+    That spend is real — the session transcript contains it — so it is charged to the
+    turn whose envelope first reports it rather than dropped. Dropping it would lose
+    tokens the OS can prove were spent, and there is no other turn to give them to.
+    """
+    turns = [spend(2, 500_000, 2_000_000, 20_000), spend(0, 0, 0, 0)]
+    cumulative = [dict(turns[0]),
+                  {"input": 4, "cache_write": 900_000,
+                   "cache_read": 9_000_000, "output": 50_000}]
+
+    envelopes = derive_series(tmp_path, turns, cumulative, [2.49, 8.80])
+
+    assert envelopes[1]["continues"] is True
+    assert envelopes[1]["cache_read"] == 9_000_000 - 2_000_000
+    assert envelopes[1]["total_cost_usd"] == pytest.approx(6.31)
+
+
+def test_a_different_session_is_never_a_continuation(tmp_path):
+    """A running total belongs to one accumulator. Diffing across session ids would
+    subtract one conversation's history from another's."""
+    turns = [spend(2, 500_000, 2_000_000, 20_000), spend(4, 900_000, 9_000_000, 50_000)]
+    cumulative = running(turns)
+
+    first = claude_cli.read_turn_result(
+        turn_file(tmp_path, 1, own=turns[0], cumulative=cumulative[0], cost=2.49,
+                  session="sess-a")).usage
+    second = claude_cli.read_turn_result(
+        turn_file(tmp_path, 2, own=turns[1], cumulative=cumulative[1], cost=8.80,
+                  session="sess-b"), previous=first).usage
+
+    assert second["continues"] is False
+    assert second["cache_read"] == cumulative[1]["cache_read"]
+
+
+def test_reaping_a_conversation_records_each_turn_and_not_the_session(store, tmp_path):
+    """End to end through the store: the seam that hands each reap the turn before it.
+
+    The plumbing is half the defect. `derive_turn_usage` cannot see a work order, so a
+    perfect classifier reached by a `_reap` that passes no history would still record
+    the whole session on every turn — and `cost_usd` is what a budget is enforced on.
+    """
+    turns = [spend(2, 500_000, 2_000_000, 20_000),
+             spend(4, 1_500_000, 17_000_000, 90_000)]
+    cumulative = running(turns)
+    wo = store.create_work_order("a conversation", "")
+    for i, (own, cum, cost) in enumerate(zip(turns, cumulative, [2.49, 16.90]), start=1):
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
+        store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
+                           (str(out), time.time() - 60, turn["id"]))
+        worker_session.poll(store)
+
+    rows = store.list_turns(wo["id"])
+    assert [json.loads(r["usage_json"])["cache_read"] for r in rows] == \
+        [own["cache_read"] for own in turns]
+    assert [round(r["cost_usd"], 2) for r in rows] == [2.49, 14.41]
+
+
+def test_the_turn_file_tracks_the_session_total_and_never_the_turn(tmp_path):
+    """wo-966987af, measured per turn against its transcript with the turn's own
+    started_at/ended_at as the boundaries. Its five result JSONs report
+
+        turn  calls   this turn   session so far   `modelUsage` in the file
+           1     21       2.17M            2.17M                     2.02M
+           2    152      39.12M           41.14M                    41.14M
+           3     16       4.12M           45.26M                    45.64M
+           4     13       0.79M           46.05M                    46.43M
+           5     32       2.96M           49.01M                    49.39M
+
+    — the file tracks the SESSION column in every row. Turn 3 spent 4.12M and its file
+    says 45.64M, which is the reading `USAGE_SCHEMA_VERSION` 2 took at face value.
+    """
+    session_so_far = [2_020_000, 41_140_000, 45_640_000, 46_430_000, 49_390_000]
+    this_turn = [2_170_000, 39_120_000, 4_120_000, 790_000, 2_960_000]
+    turns = [spend(0, 0, own, 0) for own in this_turn]
+    cumulative = [spend(0, 0, total, 0) for total in session_so_far]
+
+    envelopes = derive_series(tmp_path, turns, cumulative,
+                              [2.28, 25.60, 28.88, 29.87, 32.02])
+
+    read = [e["cache_read"] for e in envelopes]
+    assert read[2] == 4_500_000, "turn 3 is its own spend, not the session's"
+    for got, measured in zip(read, this_turn):
+        assert abs(got - measured) < measured * 0.1, (read, this_turn)
+    # The identity the bill rests on: the turns sum to the session ONCE — 49.39M, not
+    # the 184.6M that summing the five files gave.
+    assert sum(read) == session_so_far[-1]
+    assert sum(e["total_cost_usd"] for e in envelopes) == pytest.approx(32.02)
+
+
+def test_a_turn_keeps_its_own_cost_when_the_dollars_are_not_a_running_total(tmp_path):
+    """The two columns are classified SEPARATELY, and this is the case that needs it.
+
+    `kn-da437b27` has jarvis spawning a new process per turn, so a session whose
+    `modelUsage` accumulates while `total_cost_usd` does not is a shape the fleet can
+    actually produce. Applying the tokens' verdict to the dollars subtracted a larger
+    previous bill from a smaller one — and the clamp turned the negative into $0, on the
+    one column `budget.spent` enforces. A turn that cost $1.10 is billed $1.10.
+    """
+    turns = [spend(2, 500_000, 2_000_000, 20_000),
+             spend(4, 300_000, 1_200_000, 9_000),
+             spend(1, 100_000, 400_000, 3_000)]
+
+    envelopes = derive_series(tmp_path, turns, running(turns), [4.40, 1.10, 2.75])
+
+    assert [e["continues"] for e in envelopes] == [False, True, True]
+    for envelope, own in zip(envelopes, turns):
+        assert envelope["cache_read"] == own["cache_read"], "the tokens still diff"
+    assert [e["total_cost_usd"] for e in envelopes] == [4.40, 1.10, 2.75]
+    assert [m["cost_usd"] for e in envelopes for m in e["by_model"]] == \
+        [4.40, 1.10, 2.75]
+
+
+def test_a_rising_per_turn_series_is_still_never_diffed(tmp_path):
+    """The floor arm ALONE, with nothing else left to decide it.
+
+    `test_a_per_turn_envelope_is_never_diffed` above is settled before the floor is
+    reached: its second turn's `input` goes down, so monotonicity rejects it and the
+    third condition is never exercised. Here every class rises turn over turn, the
+    session id is the same throughout, and the envelopes are still per-turn — the
+    pre-2.1.277 shape that a rising series makes indistinguishable from a running total
+    unless the turn's own `usage` is consulted as a floor. Diffing these loses 5.0M of a
+    11.1M turn.
+    """
+    turns = [spend(2, 1_000_000, 4_000_000, 50_000),
+             spend(5, 2_000_000, 9_000_000, 90_000),
+             spend(7, 3_000_000, 14_000_000, 120_000)]
+    for before, after in zip(turns, turns[1:]):
+        assert all(after[c] >= before[c] for c in before), "the fixture must be monotone"
+
+    envelopes = derive_series(tmp_path, turns, turns, [4.10, 9.30, 14.05])
+
+    assert [e["continues"] for e in envelopes] == [False, False, False]
+    assert [e["cache_read"] for e in envelopes] == [own["cache_read"] for own in turns]
+    assert [e["total_cost_usd"] for e in envelopes] == [4.10, 9.30, 14.05]
+
+
+def test_a_turn_with_no_model_usage_is_never_the_next_turn_s_baseline(tmp_path):
+    """A version-1 envelope is not a running total, whatever it carries.
+
+    A result with no `modelUsage` block — an old CLI, or a turn that errored before one
+    was written — is stamped version 1, and it still gets a `reported` block holding the
+    file's own `total_cost_usd` and an EMPTY `by_model`. Consulted as a baseline it is
+    monotone in every class by being empty, so the next turn of the same session reads as
+    a continuation and has the version-1 turn's dollars taken off it: $1.40 billed as
+    $0.90 here. The turn after a version-1 one is read whole.
+    """
+    first = result_json(cost=0.50, session_id="sess-a")
+    first.pop("modelUsage")
+    out = tmp_path / "1.json"
+    out.write_text(json.dumps(first))
+    previous = claude_cli.read_turn_result(out).usage
+    assert previous["usage_v"] == 1
+
+    second = claude_cli.read_turn_result(
+        turn_file(tmp_path, 2, own=spend(2, 100_000, 900_000, 9_000),
+                  cumulative=spend(2, 100_000, 900_000, 9_000), cost=1.40),
+        previous=previous).usage
+
+    assert second["continues"] is False
+    assert second["total_cost_usd"] == pytest.approx(1.40), "a version-1 cost was diffed"
+    assert second["cache_read"] == 900_000

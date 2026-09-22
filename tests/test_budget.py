@@ -220,6 +220,65 @@ def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
     assert cap.remaining_usd == 6.0
 
 
+def test_a_ceiling_re_reads_turns_counted_as_the_whole_session(started, store,
+                                                               tmp_path):
+    """A live order's remaining budget cannot be computed from the old reading.
+
+    `wo_turns.cost_usd` held each turn's `total_cost_usd`, and from CLI 2.1.277 that is
+    the resumed session's running bill — so a three-turn order looked to have spent
+    $2.49 + $16.90 + $27.10 when it had spent $27.10, and stopped at a third of the
+    ceiling its user set (issue #470). The rows are re-derived from the result JSONs
+    before they are summed, which is the only way an order already stopped on a phantom
+    overrun starts running again.
+    """
+    from tests.test_turn_usage import running, spend, turn_file
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=10.0)
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    for i, (own, cum, cost) in enumerate(zip(turns, running(turns), [2.0, 6.5]),
+                                         start=1):
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
+        turn = store.create_turn(wo["id"], kind="message", prompt="work")
+        store.conn.execute("UPDATE wo_turns SET outfile=? WHERE id=?",
+                           (str(out), turn["id"]))
+        # Recorded the way the release before this one did: the session's running bill.
+        store.finish_turn(turn["id"], "done", result="done", cost_usd=cost,
+                          usage_json=json.dumps({"usage_v": 2, "total_cost_usd": cost}))
+
+    assert budget.spent(store, None, wo["id"]).worker_usd == pytest.approx(6.5)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None and cap.remaining_usd == pytest.approx(3.5)
+
+
+def test_a_cap_is_not_tripped_by_the_session_running_total(started, store, tmp_path):
+    """Recorded live, turn by turn, the way a running order records them.
+
+    wo-966987af's real dollars under the $50 standing ceiling jarvis_os now carries.
+    Summing `total_cost_usd` as the envelope reports it gives $2.28 + $25.60 + $28.88 +
+    $29.87 + $32.02 = $118.65 and stops the order at turn 4, having really spent
+    $29.87 of its $50. The conversation cost $32.02 and must run to the end.
+    """
+    from jarvis import worker_session
+    from tests.test_turn_usage import running, spend, turn_file
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=50.0)
+    turns = [spend(0, 0, own, 0)
+             for own in (2_170_000, 39_120_000, 4_120_000, 790_000, 2_960_000)]
+    costs = [2.28, 25.60, 28.88, 29.87, 32.02]
+    for i, (own, cum, cost) in enumerate(zip(turns, running(turns), costs), start=1):
+        turn = store.create_turn(wo["id"], kind="dispatch", prompt="go")
+        out = turn_file(tmp_path, i, own=own, cumulative=cum, cost=cost)
+        store.conn.execute("UPDATE wo_turns SET outfile=?, started_at=? WHERE id=?",
+                           (str(out), time.time() - 60, turn["id"]))
+        worker_session.poll(store)
+        cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+        assert cap is not None and cap.remaining_usd > 0, f"cut short at turn {i}"
+
+    assert budget.spent(store, None, wo["id"]).worker_usd == pytest.approx(32.02)
+    cap = budget.ceiling(store, None, store.get_work_order(wo["id"]))
+    assert cap is not None and cap.remaining_usd == pytest.approx(17.98)
+
+
 def test_no_budget_means_no_ceiling(started, store):
     wo = ops.create_work_order("proj_a", "uncapped", description="do it")
     assert store.get_work_order(wo["id"])["budget_usd"] is None

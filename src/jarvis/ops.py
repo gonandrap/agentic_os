@@ -6500,10 +6500,11 @@ def promote_backlog(item_id: str, force: bool = False,
 _SETTLED_TURN_STATES = ("done", "failed")
 
 
-def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | None:
+def _turn_usage(store: ProjectStore, turn: dict[str, Any],
+                previous: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """A settled turn's recorded usage envelope, lazily (re-)derived from its outfile.
 
-    Two migrations run through this one seam, and both are lazy for the same reason —
+    Three migrations run through this one seam, and all are lazy for the same reason —
     the outfile is still on disk for the overwhelming majority of turns, so history is
     recoverable on demand and, once written back, outlives the file:
 
@@ -6512,6 +6513,14 @@ def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | N
       result envelope's top-level `usage` object, which counts a fraction of the turn
       (see `claude_cli.derive_turn_usage`). They are re-derived rather than trusted: a
       table holding two incompatible counts in one column cannot be summed at all.
+    * Version-2 rows read `modelUsage` as the turn's own spend, which it stopped being
+      at CLI 2.1.277. Re-deriving them needs `previous`, so this must be walked in
+      order — `_turn_rows` does, and it is the only caller that should.
+
+    `cost_usd` IS REPAIRED WITH THE TOKENS, on the row and not only in the envelope:
+    that column is what `budget.spent` sums and what a dispatch computes the next turn's
+    ceiling from, so leaving it cumulative would keep stopping orders at a third of the
+    budget their user set long after the bill stopped saying so.
 
     A stale envelope whose outfile is gone is returned AS IT IS, still stamped with its
     old version, because a wrong number that says which reading produced it can be
@@ -6527,10 +6536,12 @@ def _turn_usage(store: ProjectStore, turn: dict[str, Any]) -> dict[str, Any] | N
         return stored
     if turn.get("state") not in _SETTLED_TURN_STATES or not turn.get("outfile"):
         return stored
-    result = claude_cli.read_turn_result(Path(turn["outfile"]))
+    result = claude_cli.read_turn_result(Path(turn["outfile"]), previous=previous)
     if result is None or not result.usage:
         return stored
-    store.set_turn_usage(turn["id"], db.to_json(result.usage))
+    store.set_turn_usage(turn["id"], db.to_json(result.usage),
+                         cost_usd=result.cost_usd)
+    turn["cost_usd"] = result.cost_usd
     return result.usage
 
 
@@ -6584,7 +6595,16 @@ def _turn_row(turn: dict[str, Any], u: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _turn_rows(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
-    return [_turn_row(t, _turn_usage(store, t)) for t in store.list_turns(wo_id)]
+    """Every turn of one work order, in order — and in order because it has to be: each
+    envelope is derived against the one before it (`_turn_usage`)."""
+    rows: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for turn in store.list_turns(wo_id):
+        envelope = _turn_usage(store, turn, previous)
+        rows.append(_turn_row(turn, envelope))
+        if envelope is not None:
+            previous = envelope
+    return rows
 
 
 def _turn_summary(rows: list[dict[str, Any]]) -> tuple[str, int, int,
