@@ -344,7 +344,7 @@ def test_the_dashboard_shows_the_blocker_the_flag_could_not_carry(
     def second_blocker(text: str) -> str:
         # The added paragraph exactly. Matched as markup rather than by counting the
         # bare sentence, which also appears in the `attention` timeline event below it.
-        return f'<p class="st tone-warn"><span class="i">◭</span>{text}</p>'
+        return f'<p class="st wrap tone-warn"><span class="i">◭</span>{text}</p>'
 
     page = client.get(f"/wo/proj_a/{masked['id']}").text
 
