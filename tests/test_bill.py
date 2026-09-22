@@ -664,6 +664,60 @@ def test_a_feature_orders_bill_is_its_childrens_bills(store, transcripts):
         == {planner["id"], child["id"]}
 
 
+def test_a_feature_seal_corrects_when_its_childrens_turns_were_read_the_old_way(
+        store, transcripts, tmp_path):
+    """The same correction one level up, where the turns are a level down.
+
+    A feature order's payload has no `turn_rows` of its own — its turns are its
+    children's — so the guard can only answer for it by recursing through `orders`.
+    Without that recursion a feature seal holds no version at all, the correction can
+    never fire, and it fails the silent way this order exists to kill.
+    """
+    from tests.test_turn_usage import spend
+
+    fo = store.create_feature_order("a feature sealed under the old reading", "")
+    child = store.create_work_order("build it", "", parent_id=fo["id"])
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, child, tmp_path, turns, [1.0, 2.5], session="sess-feature")
+    transcripts("sess-feature", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    store.set_status(child["id"], "completed")
+    inflated = ops.bill(fo["id"], live=True)
+    assert "turn_rows" not in inflated, "a feature carries its turns one level down"
+    for order in inflated["orders"]:
+        for row in order["turn_rows"]:
+            row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(fo["id"], json.dumps(inflated), feature=True)
+
+    b = ops.bill(fo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+
+
+def test_a_feature_discloses_a_floor_its_child_turns_were_counted_at(
+        store, transcripts):
+    """The other caller reads turns a level down too: narrowing `_accuracy` to turn
+    versions must not lose a disclosure a child really owes."""
+    fo = store.create_feature_order("a feature counted before the fix", "")
+    child = store.create_work_order("build it", "", parent_id=fo["id"])
+    store.conn.commit()
+    add_turn(store, child["id"], recorded_usage(0.05))  # no `usage_v`, no outfile
+
+    b = ops.bill(fo["id"])
+
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if gap.startswith(child["id"]) and "a floor, not a total" in gap], \
+        b["accuracy"]["gaps"]
+    assert not b["accuracy"]["complete"]
+
+
 # -- the version marker ----------------------------------------------------------------
 
 
