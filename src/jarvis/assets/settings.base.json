@@ -39,6 +39,14 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "$comment": "The twin of SessionStart, which never fires for a subagent. A Task subagent inherits CLAUDE.md, skills, settings and hooks, and NOT the parent's --append-system-prompt, --agent persona or SessionStart additionalContext — so the house style and the project's standing worker instructions are re-injected here. No matcher: every agent type gets them, including the shipped jarvis-architect / jarvis-test-lead seats. Spec 2026-09-19-concision-enforced.md SS5.1.",
+        "hooks": [
+          { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
