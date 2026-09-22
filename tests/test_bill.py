@@ -555,6 +555,67 @@ def test_a_correction_is_not_blocked_by_an_os_call_stamped_the_old_way(
     assert b["accuracy"]["gaps"] == []
 
 
+def test_an_os_call_counted_before_the_modelusage_fix_is_still_disclosed(
+        store, wo, transcripts, tmp_path):
+    """Version 1 on a CALL is a real under-reading and survives the narrowing.
+
+    It does not mean what version 2 means: no resumed session, no running total, just
+    an envelope with no `modelUsage`, so the figure is the lead agent's spend and
+    misses anything the call ran below itself. Scoping the guard to turns must not take
+    that disclosure off the page — and it is worded for a call, because a sentence
+    about turns is not actionable when what is short is Jarvis's own spend.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-v1-call")
+    transcripts("sess-v1-call", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+
+    b = ops.bill(wo["id"], live=True)
+
+    assert [row["usage_v"] for row in b["turn_rows"]] == [3, 3], "the turns are current"
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if "lead agent's spend only" in gap], b["accuracy"]["gaps"]
+    # ...and it is not the sentence about turns, which is false of this bill.
+    assert not [gap for gap in b["accuracy"]["gaps"] if "Some turns were counted" in gap]
+    assert not b["accuracy"]["complete"]
+
+
+def test_a_version_one_os_call_does_not_block_the_correction_it_cannot_speak_for(
+        store, wo, transcripts, tmp_path):
+    """The disclosure above is not a veto: a call the seal already disclosed is not
+    evidence that aged, so the turns it sits beside still correct."""
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-v1-guard")
+    transcripts("sess-v1-guard", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+    assert [gap for gap in b["accuracy"]["gaps"] if "lead agent's spend only" in gap]
+
+
 def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
         store, wo, transcripts, tmp_path, capsys):
     """Both renderers announced every re-derivation as detail 'adopted only because it

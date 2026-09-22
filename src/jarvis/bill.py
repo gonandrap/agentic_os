@@ -947,6 +947,25 @@ def _turn_versions(payload: dict[str, Any]) -> set[int]:
     return versions
 
 
+def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
+    """Which reading produced JARVIS'S OWN CALLS on one bill.
+
+    Kept apart from `_turn_versions` because the two versions mean different things
+    here. Version 2 is about diffing a RESUMED session and says nothing about a
+    one-shot call, which is why the guard must not read it. Version 1 is not about
+    sessions at all: it means the envelope carried no `modelUsage`, so the figure is
+    the lead agent's `usage` and misses anything the call spawned beneath it
+    (`claude_cli.derive_turn_usage`) — a real under-reading for a call, and disclosed
+    as one. No call can ever be corrected: a one-shot `claude -p` keeps no result JSON.
+    """
+    versions: set[int] = set()
+    for row in rows:
+        version = (db.from_json(row.get("usage_json"), {}) or {}).get("usage_v")
+        if version is not None:
+            versions.add(version)
+    return versions
+
+
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
     """The bill frozen onto this order when it settled, if there is one."""
     raw = order.get("bill_json")
@@ -985,7 +1004,7 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
 
 
 def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
-              session: Any) -> dict[str, Any]:
+              session: Any, calls: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     """What this bill could not see — the disclaimer, computed rather than assumed.
 
     A bill sealed at completion is complete. One reconstructed later from whatever
@@ -1000,6 +1019,13 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
     # a turn's reading and printing it here disclosed a ceiling that was not there
     # (`_turn_versions`).
     versions = _turn_versions({"turn_rows": turn_rows})
+    if 1 in _call_versions(calls):
+        # Said separately from the turn line below and worded for a CALL, because the
+        # two are true of different things and a reader cannot act on a sentence about
+        # turns when what is short is Jarvis's own spend.
+        gaps.append("Some of Jarvis's own calls on this order were counted before the "
+                    "modelUsage fix, so each is its lead agent's spend only and misses "
+                    "whatever it spawned beneath itself — a floor, not a total.")
     if 1 in versions:
         gaps.append("Some turns were counted before the modelUsage fix and their result "
                     "JSON is gone too, so their tokens are the old, low reading — a "
@@ -1073,7 +1099,7 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
             f"Only the most recent {CALL_LIMIT} recorded calls are on this bill.")
     _annotate_turns(payload, turn_rows)
     payload["checks"] = reconcile(payload)
-    payload["accuracy"] = _accuracy(payload, turn_rows, session)
+    payload["accuracy"] = _accuracy(payload, turn_rows, session, calls)
     payload["floor_reason"] = ops.COST_FLOOR_NOTE
     return payload
 
