@@ -245,9 +245,11 @@ FEATURE_MANAGER_STALLED = (
     "its manager was told the work orders it filed after round {n} had landed and did "
     "not resubmit the feature — `jarvis fo submit {fo_id}` is what it was asked to run")
 
-#: `kind` of the event that records what the handoff did about one judged round. The
-#: dedupe key is the EPISODE, `(round, action)` — a new judged round is a new episode, so
-#: a feature rejected twice is nudged twice (kn-089de524).
+#: `kind` of the event that records what the handoff did, and the only memory it has.
+#: Each payload carries the `round` and the `children` the action was about, because THAT
+#: PAIR is the episode — not the round alone. A manager that answers a nudge with one more
+#: work order has acted, and must be nudged again when it lands; a dedupe on the round
+#: would skip that and then flag it for doing nothing (kn-089de524).
 FEATURE_HANDOFF_EVENT = "manager_handoff"
 
 #: How many transport outages in a row one round survives before the OS gives up on it.
@@ -1057,20 +1059,26 @@ class Daemon:
         feature rejected even once parked for ever with all its children green.
 
         Called from the one branch that knows the whole precondition — `executing`, a
-        judged round, every live child `completed` — and it acts at most twice per round:
+        judged round, every live child `completed` — and it does one of two things:
 
-        * **children filed since that round, and the manager is idle** — the envelope,
-          and the manager runs `jarvis fo submit`;
-        * **anything else** — the flag, because no third party is going to resubmit it.
-          That covers both a manager that answered the feedback with no work orders at
-          all (Neo, question 467: silence must not read as "still working") and one that
-          was nudged and did not submit. Every path terminates.
+        * **work orders have landed that it has not already been told about** — the
+          envelope, and the manager runs `jarvis fo submit`;
+        * **nothing new since the last thing it was told** — the flag, because no third
+          party is going to resubmit it. That covers both a manager that answered the
+          feedback with no work orders at all (Neo, question 467: silence must not read as
+          "still working") and one that was nudged and did not submit.
 
-        WHAT MAKES IT SAFE ON A RECONCILER'S PATH is that both writes are keyed on
-        `(round, action)` in `FEATURE_HANDOFF_EVENT`. This branch is re-derived every
-        tick, so an unconditional write here is a per-tick write (kn-089de524) — and the
-        flag in particular would overwrite a `needs_attention` the user had already put
-        down.
+        THE DEDUPE KEY IS THE SET OF CHILDREN COVERED, NOT THE ROUND, and that is the
+        whole reason the loop terminates instead of parking one cycle deeper. The nudge
+        invites the manager to file MORE work orders and submit once they land — so a
+        manager that does exactly that, twice, is acting correctly and must be nudged
+        each time. Keyed on `(round, "nudged")` the second landing is silently skipped
+        and the feature is flagged STALLED against a manager that acted: a false report,
+        spending the user's attention on a gap the OS could have closed itself. Same for
+        the flag: it is keyed on what had been nudged when it was raised, so a stall
+        after a FRESH nudge is a new episode and reaches the user, while a cleared flag
+        is never re-raised over an unchanged situation (kn-089de524 — this branch is
+        re-derived every tick, so an unconditional write here is a per-tick write).
 
         THE IDLE TEST IS THREE THINGS, not one. A manager that is running has not
         finished reacting; one with a queued message, or with the rejection envelope still
@@ -1095,33 +1103,40 @@ class Daemon:
             return
 
         n = int(last["round"])
-        done = {(int(p.get("round") or 0), str(p.get("action") or ""))
-                for p in (db.from_json(e["payload"], {}) for e in
-                          ops.feature_events_of_kind(store, fo_id,
-                                                     FEATURE_HANDOFF_EVENT))}
-        if (n, "flagged") in done:
-            return
+        said = [p for p in (db.from_json(e["payload"], {}) for e in
+                            ops.feature_events_of_kind(store, fo_id,
+                                                       FEATURE_HANDOFF_EVENT))
+                if int(p.get("round") or 0) == n]
+        covered = {wo_id for p in said if p.get("action") == "nudged"
+                   for wo_id in (p.get("children") or ())}
         landed = tuple(c["id"] for c in store.feature_children(fo_id)
                        if not c["superseded"] and float(c["created_at"]) > last["ts"])
-        if landed and (n, "nudged") not in done:
+        fresh = tuple(wo_id for wo_id in landed if wo_id not in covered)
+        if fresh:
             bus.post(store, subject=bus.Subject(fo_id=fo_id),
                      from_role="reconciler", to_role="manager",
                      payload=bus.ChildrenLanded(
-                         round=n, children=landed,
+                         round=n, children=fresh,
                          note=FEATURE_CHILDREN_LANDED.format(fo_id=fo_id)))
             ops.feature_event(store, fo_id, FEATURE_HANDOFF_EVENT,
-                              {"round": n, "action": "nudged", "children": list(landed),
+                              {"round": n, "action": "nudged", "children": list(fresh),
                                "feature_order": fo_id})
             log.info("[%s] feature %s: told its manager %d work order(s) landed after "
-                     "round %d", project.name, fo_id, len(landed), n)
+                     "round %d", project.name, fo_id, len(fresh), n)
             return
 
-        template = FEATURE_MANAGER_STALLED if landed else FEATURE_MANAGER_SILENT
+        # Nothing new. Flag it — unless this exact situation is what was already flagged,
+        # in which case the user has seen it and may have put the flag down on purpose.
+        here = sorted(covered)
+        if any(p.get("action") == "flagged" and sorted(p.get("children") or ()) == here
+               for p in said):
+            return
+        template = FEATURE_MANAGER_STALLED if covered else FEATURE_MANAGER_SILENT
         reason = template.format(n=n, fo_id=fo_id)
         store.flag_feature_attention(fo_id, reason)
         ops.feature_event(store, fo_id, FEATURE_HANDOFF_EVENT,
                           {"round": n, "action": "flagged", "reason": reason,
-                           "feature_order": fo_id})
+                           "children": here, "feature_order": fo_id})
         log.info("[%s] feature %s flagged: %s", project.name, fo_id, reason)
 
     def _complete_feature(self, store: ProjectStore, fo: dict) -> None:

@@ -815,6 +815,80 @@ def test_the_handoff_fires_once_per_round_however_many_ticks_run(fleet):
         store.close()
 
 
+def test_a_manager_that_answers_the_nudge_with_more_work_is_nudged_again(fleet):
+    """THE NUDGE INVITES EXACTLY THIS. `FEATURE_CHILDREN_LANDED` tells the manager that if
+    the feedback is not yet addressed it should file the work orders that would address it
+    and submit once THEY land — so a manager that files one more is doing what it was
+    asked, and the second landing has to reach it too.
+
+    Deduping on `(round, "nudged")` skips that second nudge and then flags the feature
+    STALLED against a manager that acted: a false report, and the feature parks one cycle
+    deeper. The key is the set of children already covered, so a round can nudge as many
+    times as the manager files.
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        manager = store.manager_work_order(fo_id)
+        first = _remediate(fleet, store, fo_id, "fix the header row")
+        fleet.tick()
+        assert _handoffs(store, fo_id) == [(1, "nudged")]
+
+        second = _remediate(fleet, store, fo_id, "quote the separator")
+        fleet.tick()
+
+        assert _handoffs(store, fo_id) == [(1, "nudged"), (1, "nudged")], (
+            "the manager filed more work and was not told the new one landed")
+        assert store.get_feature_order(fo_id)["needs_attention"] == 0, (
+            "a manager that answered the nudge was reported as having done nothing")
+        posted = [e for e in envelopes(store) if e["kind"] == "children_landed"]
+        assert len(posted) == 2
+        fleet.tick()  # delivery
+        text = messages(store, manager["id"])[-1]["content"]
+        assert second["id"] in text
+        assert first["id"] not in text, (
+            "the second nudge re-announced a work order the manager already knew about")
+    finally:
+        store.close()
+
+
+def test_a_stall_after_a_fresh_nudge_still_reaches_the_user(fleet):
+    """The flag is keyed on what had been nudged when it was raised, for the same reason.
+
+    Round-keyed, the flag raised after the FIRST stall would suppress the second for ever —
+    so a manager that acted once, was nudged, and then went quiet would never be reported.
+    """
+    fleet.daemon.validator = Validator(rejected())
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.drain()
+        _remediate(fleet, store, fo_id, "fix the header row")
+        fleet.tick()
+        _until_idle(fleet, store, fo_id)  # read the nudge, did not submit
+        assert _handoffs(store, fo_id) == [(1, "nudged"), (1, "flagged")]
+        store.clear_feature_attention(fo_id)
+
+        _remediate(fleet, store, fo_id, "quote the separator")
+        fleet.tick()
+        assert _handoffs(store, fo_id)[-1] == (1, "nudged")
+        _until_idle(fleet, store, fo_id)  # and went quiet again
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["needs_attention"] == 1, (
+            "the second stall was swallowed by the first stall's flag")
+        assert fo["attention_reason"] == FEATURE_MANAGER_STALLED.format(n=1, fo_id=fo_id)
+        assert _handoffs(store, fo_id).count((1, "flagged")) == 2
+    finally:
+        store.close()
+
+
 def test_a_manager_that_answers_a_rejection_with_no_work_orders_flags_the_feature(fleet):
     """Neo, question 467: silence must not read as "still working".
 
