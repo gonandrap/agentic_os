@@ -298,8 +298,14 @@ AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it res
 #: `Daemon.settle_work_order` flags it and `true_blockers` re-derives it, from here, for
 #: the reason PR_CLOSED_BLOCKER gives above. They said two different sentences for one
 #: state until this constant existed.
+#: ENDS WITH THE WAY OUT, like PARKED_BLOCKER and STALE_FINISH_BLOCKER below. It said
+#: "review the session" and stopped there, which is a diagnosis with no action — issue
+#: 573's third fault. Changing the string invalidates every existing ack of it (they are
+#: stored verbatim), so those orders re-flag once, which is the point: none of them ever
+#: named a command.
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
-                          "nothing it started is still running; review the session")
+                          "nothing it started is still running; read its last message, "
+                          "then `jarvis wo send` or `jarvis wo done`")
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
@@ -660,8 +666,20 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).
-    acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
-    return [b for b in blockers if b not in acked]
+    return [b for b in blockers if b not in acknowledged(wo)]
+
+
+def acknowledged(wo: dict[str, Any]) -> list[str]:
+    """What has already been dismissed on this work order, decoded from the column.
+
+    ONE READER FOR A COLUMN THAT IS STORED AS RAW JSON, because it is also the only
+    durable record of WHY a settled work order was ever flagged: `attention_reason` is
+    NULLed the moment the flag goes down, so every surface that answers "why is this in
+    `needs_review`?" reads this instead (issue 573's second fault). `true_blockers`
+    filters against the same list, so the two can never disagree about what counts as
+    seen.
+    """
+    return db.from_json(wo.get("acknowledged_blockers"), []) or []
 
 
 def stuck_message(store: ProjectStore, wo: dict[str, Any],

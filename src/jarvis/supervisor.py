@@ -972,8 +972,9 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
            alarm: dict[str, Any], verdict: dict[str, Any], evidence: str,
            cfg: Any) -> None:
     """Write the verdict down. THE ALARM ROW IS THE MEMORY: `invariants.true_blockers`
-    has no branch for a live cost alarm, so `ack_attention(wo_id, [])` records nothing
-    durable and only §1's dedupe keeps the flag down. See §2.
+    has no branch for a live cost alarm, so there is no blocker string to acknowledge
+    and only §1's dedupe keeps the flag down. That is exactly why the ack below is
+    `ops.ack_os_flag` and not the user's one. See §2.
     """
     from . import db, ops
 
@@ -1011,12 +1012,13 @@ def _apply(pstore: Any, neo_store: Any, central: Any, project: str, wo: dict[str
                      {"alarm_id": alarm_id, "verdict": "ack",
                       "reason": verdict["reason"], "note": verdict["note"]})
 
-    # THROUGH `ops.ack_attention`, NEVER `ProjectStore.clear_attention`, which wipes
-    # `acknowledged_blockers` and would discard the user's own earlier dismissals. It
-    # also refuses an order with a pending assumption — the louder ask — and then the
-    # alarm stays `acked` (it WAS judged) with the flag up.
+    # THROUGH `ops.ack_os_flag`, which takes down the flag THIS alarm raised and leaves
+    # every other blocker standing. `ops.ack_attention` — what this called until issue
+    # 573 — is the USER saying they have seen it, and acking an alarm is not that: it
+    # dismissed blockers the user was never shown, for ever. `clear_attention` is wrong
+    # for the opposite reason: it would discard the user's own earlier dismissals.
     try:
-        ops.ack_attention(wo["id"])
+        ops.ack_os_flag(wo["id"])
     except ops.OpsError as exc:
         log.info("alarm %s acked; attention left up: %s", alarm_id, exc)
 

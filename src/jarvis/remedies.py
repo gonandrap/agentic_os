@@ -166,7 +166,7 @@ def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any
 
     NOT `ops.send_message`, and this is not a style choice: that function ends with
     `clear_attention`, which sets `acknowledged_blockers` to NULL and so discards the
-    user's own earlier dismissals — before `apply` ever reaches `ops.ack_attention`.
+    user's own earlier dismissals — before `apply` ever reaches `ops.ack_os_flag`.
     `ops.nudge_pr_repair` is the precedent for an OS-authored message and does the two
     right things; the event half of it is written by `apply`, once, for every remedy.
     """
@@ -603,12 +603,12 @@ def apply(pstore: Any, central: Any, project: str, approval: dict[str, Any] | No
              f"Read it with: jarvis alarms show {alarm['id']}",
         wo_id=wo_id)
 
-    # THROUGH `ops.ack_attention`, NEVER `ProjectStore.clear_attention`, which wipes
-    # `acknowledged_blockers` and so discards the user's own earlier dismissals. It also
-    # refuses an order with a pending assumption — the louder ask — and then the alarm
-    # stays `acked` (it WAS addressed) with the flag up.
+    # `supervisor._apply`'s ack path exactly: `ops.ack_os_flag` takes down the flag the
+    # alarm raised and re-raises whatever else is blocking. Never `ack_attention` (that
+    # is the user's blanket dismissal and would bury blockers they never saw — issue
+    # 573), never `clear_attention` (that discards their earlier dismissals).
     try:
-        ops.ack_attention(wo_id)
+        ops.ack_os_flag(wo_id)
     except ops.OpsError as exc:
         log.info("remedy applied on %s; attention left up: %s", alarm["id"], exc)
     log.info("remedy %s applied for %s: %s", remedy.id, alarm["id"], result)

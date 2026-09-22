@@ -158,23 +158,25 @@ def _agent_calls(kind: str) -> list[dict]:
 # -- the ack, which is the whole point -------------------------------------------------
 
 
-def test_an_explicable_alarm_is_acked_and_the_ack_is_remembered_not_wiped(
+def test_an_explicable_alarm_is_acked_without_dismissing_the_users_blockers(
         started, catalog_file, monkeypatch, tmp_path, fake_claude):
     """The done condition of §2, and the assertion that makes it mean something.
 
-    `needs_attention == 0` ALONE GRADES NOTHING — `ProjectStore.clear_attention` reaches
-    it too, and that is the exact regression the ack path forbids: it wipes
-    `acknowledged_blockers` ("any ack against it is spent"), so a supervisor using it
-    silently discards what the user has already dismissed on that order.
+    `needs_attention == 0` ALONE GRADES NOTHING, and issue 573 is why it is not even the
+    right target: the supervisor used `ops.ack_attention`, the USER's blanket dismissal,
+    which writes every live blocker into `acknowledged_blockers` and so buried blockers
+    the user had never been shown — for ever, since `true_blockers` filters them out
+    afterwards. `clear_attention` is forbidden for the opposite reason: it NULLs the
+    column and discards the user's own earlier dismissals.
 
     So the order is given a blocker `invariants.true_blockers` genuinely re-derives, and
-    the discriminating assertion is that the blocker is WRITTEN INTO
-    `acknowledged_blockers` — which only `ops.ack_attention` does. `clear_attention`
-    would leave the column NULL.
+    the discriminating assertions are that it is STILL FLAGGED, that the column is still
+    NULL, and that no `acknowledged` event claims the user dismissed it.
 
     A live alarm cannot be that blocker: `true_blockers` has no branch for one (an alarm
     fires on a `running` order and no branch matches that status), which is why the
-    supervisor's answer is recorded on the ALARM ROW and the row is the memory.
+    supervisor's answer is recorded on the ALARM ROW and the row is the memory — and why
+    there is no narrow entry to acknowledge in its place.
     """
     _enable(catalog_file)
     daemon = started()
@@ -198,10 +200,12 @@ def test_an_explicable_alarm_is_acked_and_the_ack_is_remembered_not_wiped(
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
         wo = store.get_work_order(wo_id)
-        assert wo["needs_attention"] == 0
-        # THE DISCRIMINATING ASSERTION. `clear_attention` would have left this NULL.
-        assert json.loads(wo["acknowledged_blockers"]) == [
-            "worker failed — review and retry"]
+        # THE DISCRIMINATING ASSERTIONS. `ack_attention` would have lowered the flag and
+        # written the blocker into the column as if the user had seen it.
+        assert wo["needs_attention"] == 1
+        assert wo["attention_reason"] == "worker failed — review and retry"
+        assert wo["acknowledged_blockers"] is None
+        assert store.events_of_kind(wo_id, "acknowledged") == []
         (event,) = store.events_of_kind(wo_id, "alarm_reviewed")
         payload = json.loads(event["payload"])
         assert payload["alarm_id"] == alarm["id"]

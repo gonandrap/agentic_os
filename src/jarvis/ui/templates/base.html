@@ -81,6 +81,9 @@
 
   /* status & origin are words with a mark — never color alone */
   .st { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  /* `.st` is mostly one-line chips, where nowrap is right. A blocker is a SENTENCE and
+     is now long enough to run off the card — issue 573's reason has to be readable. */
+  .st.wrap { white-space: normal; }
   .st .i { margin-right: 5px; }
   .tone-ok { color: var(--green); } .tone-bad { color: var(--red); }
   .tone-warn { color: var(--amber); } .tone-active { color: var(--cyan); }

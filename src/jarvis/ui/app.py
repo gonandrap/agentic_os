@@ -980,6 +980,10 @@ def create_app() -> FastAPI:
         # the same number the enforcement uses.
         cap = ops.work_order_budget(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
+                      # What has already been dismissed here. The page's only durable
+                      # answer to "why is this in `needs_review`?" once the flag is
+                      # down — `attention_reason` does not survive an ack (issue 573).
+                      seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,

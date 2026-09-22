@@ -125,7 +125,7 @@
       <code class="sid">claude --resume {{ wo.session_id }}</code></p>
   {% endif %}
   {% if wo.needs_attention %}
-    <p class="st tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
+    <p class="st wrap tone-warn"{% if pending == 'attention' %} id="pending"{% endif %}>
       <span class="i">◭</span>{{ wo.attention_reason }}
       {% if not unreviewed %}
       <form class="inline" method="post" action="/wo/{{ project }}/{{ wo.id }}/ack">
@@ -136,8 +136,19 @@
     </p>
     {# The second blocker, when the one reason slot above is already spoken for. #}
     {% if parked and parked != wo.attention_reason %}
-      <p class="st tone-warn"><span class="i">◭</span>{{ parked }}</p>
+      <p class="st wrap tone-warn"><span class="i">◭</span>{{ parked }}</p>
     {% endif %}
+  {% endif %}
+  {# WHY IT IS SITTING HERE, once the flag is down. `attention_reason` is NULLed by every
+     ack, so this column is the only thing left that can answer it — issue 573, where a
+     `needs_review` order sat for 2.6 days with no reason on any surface. Shown BESIDE a
+     live flag as well: an order can have one thing seen and another still owed. #}
+  {% if seen %}
+    {% for b in seen %}
+      <p class="st wrap sub"><span class="i">↩</span>already seen: {{ b }}</p>
+    {% endfor %}
+  {% endif %}
+  {% if wo.needs_attention %}
     {# The escape hatch, and ONLY for the one thing it can fix. `waiting.what == 'prompt'`
        means nothing else accounts for the wait — no gate, no question with Neo, no queued
        message, no turn in flight. Offered for every `waiting_input` work order, as it

@@ -282,13 +282,15 @@ def test_the_advice_reaches_the_user_as_an_inbox_row_pointing_at_the_alarm(escal
     assert f"/alarms/proj_a/{alarm['id']}" in row["body"]
 
 
-def test_the_advice_puts_the_attention_flag_down_through_the_ack_path(escalated):
-    """`ops.ack_attention`, never `ProjectStore.clear_attention` — the same rule §2's ack
-    inherited, and `needs_attention == 0` alone does not discriminate between them.
+def test_the_advice_leaves_a_blocker_the_user_never_saw_standing(escalated):
+    """`ops.ack_os_flag`, never `ops.ack_attention` — issue 573.
 
-    So the order carries a blocker `invariants.true_blockers` genuinely re-derives, and
-    the assertion is that the blocker lands in `acknowledged_blockers`. `clear_attention`
-    would leave that column NULL and silently discard the user's own earlier dismissals.
+    Settling an ALARM says the alarm is judged. It says nothing about the work order's
+    own blockers, and the ack path used to write all of them into
+    `acknowledged_blockers` as if the user had dismissed them — permanently, because
+    `true_blockers` filters them out for ever afterwards. So the order carries a blocker
+    of its own here, and the assertions are that it is still flagged, that the column is
+    still NULL, and that no `acknowledged` event claims otherwise.
     """
     daemon, wo_id = escalated()
     store = ProjectStore(ops.find_work_order(wo_id)[1])
@@ -303,10 +305,39 @@ def test_the_advice_puts_the_attention_flag_down_through_the_ack_path(escalated)
     store = ProjectStore(ops.find_work_order(wo_id)[1])
     try:
         wo = store.get_work_order(wo_id)
+        events = store.list_events(wo_id)
+    finally:
+        store.close()
+    assert wo["needs_attention"] == 1
+    assert wo["attention_reason"] == "worker failed — review and retry"
+    assert wo["acknowledged_blockers"] is None
+    assert [e for e in events if e["kind"] == "acknowledged"] == []
+
+
+def test_the_advice_puts_the_flag_down_when_nothing_else_blocks(escalated):
+    """The other half of `ack_os_flag`: with no blocker left the flag it raised goes
+    down, and the user's own earlier dismissals are still on the row — `clear_attention`
+    would have NULLed them."""
+    daemon, wo_id = escalated()
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        store.ack_attention(wo_id, ["something the user really did dismiss"])
+        store.flag_attention(wo_id, supervisor.ALARM_BLOCKER.format(
+            alarm_id=_alarm(wo_id)["id"]))
+    finally:
+        store.close()
+
+    daemon._neo_drain()
+
+    store = ProjectStore(ops.find_work_order(wo_id)[1])
+    try:
+        wo = store.get_work_order(wo_id)
     finally:
         store.close()
     assert wo["needs_attention"] == 0
-    assert json.loads(wo["acknowledged_blockers"]) == ["worker failed — review and retry"]
+    assert wo["attention_reason"] is None
+    assert json.loads(wo["acknowledged_blockers"]) == [
+        "something the user really did dismiss"]
 
 
 def test_neo_handing_the_alarm_back_leaves_it_escalated_and_flags_the_user(escalated):
