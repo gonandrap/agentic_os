@@ -70,7 +70,7 @@ from typing import Any
 
 import pytest
 
-from jarvis import claude_cli, evidence, structured, validation
+from jarvis import claude_cli, evidence, ops, structured, validation
 from jarvis.catalog import ValidationConfig
 from jarvis.central_store import CentralStore
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
@@ -115,6 +115,12 @@ MUST_PASS_FLOOR = 3
 #: the property the whole feature is judged on (spec §6), and "two of three land" is not
 #: the claim — it is the treadmill with a better score.
 MUST_PASS_WITH_FOLLOW_UPS_FLOOR = 3
+
+#: Of those same 3, how many must raise at least one follow-up that NAMES ITS CODE — a
+#: `file` and a `failure`, the two `ops.follow_up_admissible` requires before a remark may
+#: become a ticket. Not equal to `n`: a submission whose remarks are all genuine nits is a
+#: correct outcome with nothing to file.
+ANCHORED_FOLLOW_UP_FLOOR = 2
 
 #: Of 2 submissions carrying a real defect AND cosmetic remarks, how many the panel must
 #: refuse. Also equal to `n`. THE MIRROR THE FEATURE NEEDS: nothing else in the suite
@@ -1583,6 +1589,28 @@ def test_the_improvements_were_filed_not_argued(runs):
                  if runs[c[0]].outcome == "passed" and runs[c[0]].reason.strip()}
     assert not talkative, (
         f"a remark reached the submitter on a passing round: {talkative}")
+
+
+@scenario("validation-llm/a-filed-remark-names-the-code-it-is-about",
+          "the remarks that are filed name a file and a failure, so they can become "
+          "tickets")
+def test_a_filed_remark_carries_its_anchors(runs):
+    """WHETHER A LIVE SEAT FILLS THE SCHEMA THE TRACKER GATE READS (spec §10.5).
+
+    Since wo-3619e6e4 a follow-up only becomes an issue if it names the `file` it is wrong
+    in and the `failure` it produces; anything else is round feedback to the submitter.
+    Every deterministic test of that gate hands it a hand-built dict, so a mandate the
+    seats ignore would file NOTHING fleet-wide and no test in the repository would move.
+
+    The floor is not `n`: a submission whose only remarks are genuine nits is a correct
+    outcome with nothing anchored. What must not happen is a whole battery of obviously
+    improvable code producing not one remark a tracker could carry.
+    """
+    anchored = {c[0] for c in MUST_PASS_WITH_FOLLOW_UPS
+                if any(ops.follow_up_admissible(f) for f in runs[c[0]].filed)}
+    assert len(anchored) >= ANCHORED_FOLLOW_UP_FLOOR, (
+        "no seat named the code its remark was about, so every follow-up the fleet "
+        f"raises is inadmissible and nothing is ever filed: anchored {sorted(anchored)}")
 
 
 # -- battery four: the defect blocks and the nits do not ------------------------------------

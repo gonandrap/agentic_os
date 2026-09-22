@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import paths, seats, validation
+from jarvis import ops, paths, seats, validation
 from jarvis.bootstrap import ASSETS
 from jarvis.catalog import ValidationConfig
 from jarvis.evidence import EvidencePacket
@@ -886,6 +886,40 @@ def test_findings_normalises_a_seats_reply_into_titles_and_details():
                      {"severity": "follow_up", "title": "t2", "detail": "d2", **bare}]
 
 
+def test_a_finding_carries_the_three_anchors_the_seat_named():
+    """THE NEGATIVE CONTROL OF EVERY `bare` ASSERTION IN THIS FILE. Those pin the empty
+    default, and an `_anchor` that ignored its argument and returned three empty strings
+    would satisfy all of them — while making every follow-up fleet-wide inadmissible and
+    silently filing nothing anywhere. This reads the seat's own values back out.
+    """
+    found = validation.findings(opinion(verdict="pass", findings=[{
+        "severity": "follow_up", "title": "`_refund` credits a budget nobody debited",
+        "detail": "d", "file": "src/jarvis/landing.py", "symbol": "_refund",
+        "failure": "a denied gate on attempt 1 leaves four attempts of three"}]))
+
+    assert found == [{"severity": "follow_up",
+                      "title": "`_refund` credits a budget nobody debited", "detail": "d",
+                      "file": "src/jarvis/landing.py", "symbol": "_refund",
+                      "failure": "a denied gate on attempt 1 leaves four attempts of "
+                                 "three"}]
+    assert ops.follow_up_admissible(found[0]), \
+        "the anchors arrived and still did not clear the gate they exist for"
+
+
+def test_an_anchor_is_collapsed_and_bounded():
+    """A finding is a ticket, not a report: `file` keys the dedupe, so a value that
+    differs only by a newline must not be a different key, and `failure` is prose a seat
+    can run away with."""
+    found = validation.findings(opinion(verdict="pass", findings=[{
+        "severity": "follow_up", "title": "t", "detail": "d",
+        "file": " src/jarvis/landing.py \n", "symbol": "a\n\tb   c",
+        "failure": "x" * (validation.ANCHOR_LIMIT + 50)}]))
+
+    assert found[0]["file"] == "src/jarvis/landing.py"
+    assert found[0]["symbol"] == "a b c"
+    assert found[0]["failure"] == "x" * validation.ANCHOR_LIMIT
+
+
 def test_a_severity_nobody_defined_is_filed_and_never_blocks():
     """THE DIRECTION IS THE WHOLE POINT, and it is the mirror of `_raised`'s permissive
     `bool()` pointing the opposite way. `blocking` points AT a rejection, so reading it
@@ -1239,6 +1273,28 @@ def test_decide_returns_the_follow_ups_the_seats_raised_and_the_chair_never_saw(
     assert "what the architect seat would file rather than argue" not in chair
     assert "## Seat: architect\n" + validation.NO_BLOCKER_LINE in chair
     assert "1 further finding(s)" in chair
+
+
+def test_decide_carries_a_seats_anchors_through_to_the_follow_up(
+        store, jarvis_home, fake_claude):
+    """The same path one level up: the values §4 keys its dedupe and its admissibility on
+    come off the seat's own reply, through `findings`, through `_follow_ups`, into the key
+    `ops.file_validation_follow_ups` reads. Every other test of this key runs on a
+    follow-up with no anchors at all."""
+    wo = store.create_work_order("t")
+    round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="f")
+
+    result = validation.decide(store, round_row,
+                               packet(declared="FORCE_ANCHORED_FOLLOWUP_ARCHITECT"),
+                               ValidationConfig(enabled=True))
+
+    assert result["outcome"] == "passed"
+    assert result["follow_ups"] == [{
+        "seat": "architect", "title": "the anchored architect follow-up",
+        "detail": "what the architect seat would file rather than argue",
+        "round": round_row["round"], "file": "src/proj/landing.py", "symbol": "_refund",
+        "failure": "a denied gate on attempt 1 leaves four attempts of a three-attempt "
+                   "budget"}]
 
 
 @pytest.mark.parametrize("hook, detail", [

@@ -1185,3 +1185,10 @@ the phrasings somebody thought of.
 rejection the submitter is already being sent, where they cost nothing and are fixed in
 the session that is open. They reach the submitter and NOT the round's stored reason: an
 aside restated on every surface that prints a round is the noise this feature is about.
+
+**And the gate is only as good as the seats filling the schema.** A mandate the models
+ignore files nothing anywhere, silently, and no deterministic test would move: the fake
+seat fills the anchors, so the suite would stay green over a panel that never did. That is
+why `evals/llm/test_validation_judgment.py::test_a_filed_remark_carries_its_anchors`
+grades live seats on it, at a floor below `n` — a submission whose remarks are all genuine
+nits is a correct outcome with nothing to file.

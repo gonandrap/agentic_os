@@ -1279,3 +1279,44 @@ def test_the_work_order_page_and_show_carry_them(fleet, tracker, capsys):
     out = capsys.readouterr().out
     assert "follow_ups_kept" in out
     assert "internal only: The stale-row repair repeats for ever" in out
+
+
+# -- 12. the panel, not the fixture ----------------------------------------------------
+
+
+def _panel_settle(fleet, wo_id: str, summary: str) -> None:  # noqa: F811
+    """One round judged by the REAL panel over the fake `claude`, settling on a pass.
+
+    The FORCE token rides in the finish summary, never in the description: a description
+    is carried into every later round's packet.
+    """
+    fleet.change(wo_id, "print('one')\n")
+    finish(fleet, wo_id, summary=summary)
+    fleet.drain()
+
+
+def test_a_follow_up_the_seats_themselves_anchored_is_filed_with_those_anchors(
+        fleet, tracker, fake_claude):
+    """EVERY OTHER FILING TEST HERE INJECTS `follow_up()` DICTS, so the whole gate could
+    pass on a schema no seat ever fills. This one runs the shipped panel: the anchors are
+    parsed out of the architect's own JSON reply, and they are what reaches the tracker.
+    """
+    wo = fleet.dispatch()
+    _panel_settle(fleet, wo["id"], "FORCE_ANCHORED_FOLLOWUP_ARCHITECT")
+
+    assert titles(tracker) == ["the anchored architect follow-up"]
+    body = filed(tracker)[0]["body"]
+    assert "src/proj/landing.py" in body and "_refund" in body
+    assert "four attempts of a three-attempt budget" in body
+
+
+def test_a_seat_that_anchors_nothing_files_nothing(fleet, tracker, fake_claude):
+    """The negative control of the row above, and the case the gate exists for: the same
+    panel, the same settle, a follow-up with no `file` and no `failure` — a seat still on
+    the pre-§10 schema. Without this, an `_anchor` that ignored the seat's values would
+    pass the test above by filing whatever it liked."""
+    wo = fleet.dispatch()
+    _panel_settle(fleet, wo["id"], "FORCE_FOLLOWUP_ARCHITECT")
+
+    assert titles(tracker) == []
+    assert kept_rows(fleet, wo["id"]) == [], "inadmissible is not the same as withheld"
