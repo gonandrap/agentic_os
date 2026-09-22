@@ -2553,7 +2553,8 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
 
 def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
                       pr_url: str | None = None, *,
-                      panel_cleared: bool = False) -> str:
+                      panel_cleared: bool = False,
+                      panel_open: bool = False) -> str:
     """THE JOIN: where a finished work order sits, given BOTH gates over it.
 
     An assumption review and a validation round are two independent judgements over one
@@ -2572,7 +2573,17 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
     must not re-read the round it wrote: the no-validator path closes its round `failed`
     — never `passed`, because nobody judged the work — and that outcome otherwise reads
     here as a round still in flight.
+
+    **`panel_open` is its opposite and is the BOUNCE's**, which refused a submission
+    without opening a round at all. The latest row is then not the row that decision was
+    taken from — `unanswered_paths` reads `last_judged_round`, which walks back past
+    `failed` and `void` rows — so re-reading it here could land, on a `void` or a
+    `passed` older than the rejection, work a panel has just been told not to judge. The
+    caller states the outcome it holds instead of this function inferring one. Both
+    halves of the user's gate above still run: an assumption is a separate judgement and
+    a bounce says nothing about it.
     """
+    assert not (panel_cleared and panel_open), "the panel is settled or it is not"
     wo_id = wo["id"]
     if store.pending_assumptions(wo_id):
         store.set_status(wo_id, "needs_review")
@@ -2586,7 +2597,7 @@ def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
         return "needs_review"
     latest = store.latest_validation_round(wo_id=wo_id) if not panel_cleared else None
     outcome = str((latest or {}).get("outcome") or "")
-    if outcome in OPEN_VALIDATION_OUTCOMES:
+    if panel_open or outcome in OPEN_VALIDATION_OUTCOMES:
         store.set_status(wo_id, "validating")
         store.clear_attention(wo_id)
         return "validating"
@@ -2729,11 +2740,12 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     **RETURNS None WHEN THE SUBMISSION WAS BOUNCED** — sent straight back to the worker
     because it changes nothing the previous round asked about, WITHOUT opening a round
     and so without spending one (spec
-    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5). The caller
-    needs no branch for it: the previous round is still `rejected`, which is an
-    `OPEN_VALIDATION_OUTCOME`, so `land_when_cleared` parks the work order in
-    `validating` exactly as it does after a panel rejection, and `Daemon._deliver` flips
-    it back to `running` when the envelope lands. HERE rather than in the daemon because
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5). The work order
+    parks in `validating` exactly as it does after a panel rejection, and
+    `Daemon._deliver` flips it back to `running` when the envelope lands — but the caller
+    MUST say so (`land_when_cleared(panel_open=True)`) rather than let the join re-derive
+    it: the rejection this bounce read is `last_judged_round`'s, and the LATEST row can be
+    a `failed` or `void` written after it. HERE rather than in the daemon because
     a round the daemon refuses has already been NUMBERED, and the number and the budget
     are one function (kn-a5e91633) — a bounce that spent a number would spend a round.
 
@@ -3508,18 +3520,24 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
-        opened = (submit_for_validation(store, path, fresh, declared=evidence, cfg=cfg)
-                  if cfg is not None and cfg.enabled else None)
+        opened = bounced = None
+        if cfg is not None and cfg.enabled:
+            opened = submit_for_validation(store, path, fresh, declared=evidence,
+                                           cfg=cfg)
+            # None means BOUNCED, and only here: with validation off no submission was
+            # attempted at all, and the two must not collapse into one `opened is None`.
+            bounced = opened is None
         if str((opened or {}).get("outcome") or "") == "escalated":
             # The bounce ceiling, and the ONE case where a submission has already settled
             # itself: the user has been asked, and the landing below would land the
             # give-up. Spec docs/superpowers/specs/2026-09-22-a-round-must-answer-the-
-            # list.md §6. Every other outcome — including a bounce, which opens no round
-            # at all — is the join's to decide.
+            # list.md §6.
             status = str(store.get_work_order(wo_id)["status"] or "")
         else:
-            # ...and the status is the JOIN's to decide, not this branch's.
-            status = land_when_cleared(store, fresh, pr_url)
+            # ...and the status is the JOIN's to decide, not this branch's — but a
+            # BOUNCE is told to it rather than re-derived from the latest round, which
+            # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
+            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced))
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,

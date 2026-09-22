@@ -67,6 +67,13 @@ the round has already been numbered, and the number and the budget are one funct
 
 A forced round is never bounced, for `Daemon._repeat_submission`'s reason.
 
+**A bounce TELLS the join where the work order sits** — `land_when_cleared(panel_open=True)`
+— and never lets it re-derive that from the latest round. The rule reads
+`last_judged_round`, which walks back past `failed` and `void` rows, so the latest row can
+be one the bounce never looked at: a `void` written after the rejection is settled, is not
+an open outcome, and would land unreviewed work in the merge queue. The assumption half of
+the join still runs; a bounce says nothing about assumptions.
+
 ## 6. The ceiling
 
 `ops.BOUNCE_LIMIT = 2` consecutive bounces off the same round. The third opens a round and

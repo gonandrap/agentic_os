@@ -197,6 +197,36 @@ def test_a_submission_touching_none_of_the_cited_paths_never_reaches_the_panel(f
     assert [r["round"] for r in rounds(fleet, wo["id"])] == [1]
 
 
+def test_a_bounce_parks_even_when_the_LATEST_round_is_not_the_one_it_read(fleet):
+    """The bounce reads `last_judged_round`, which walks BACK past `failed` and `void`
+    rows — so the latest row can be one the bounce never looked at, and letting the join
+    re-derive the status from it lands unreviewed work in the merge queue.
+
+    The `void` here is the row `Daemon._void` writes (a redelivery with nothing in it):
+    settled, and NOT counted, so `last_judged_round` still answers round 1.
+    """
+    wo = fleet.dispatch()
+    rejected_once(fleet, wo["id"], "src/app.py")
+    store = fleet.store()
+    try:
+        voided = store.open_validation_round(wo_id=wo["id"], fingerprint="empty",
+                                             round=2)
+        store.close_validation_round(int(voided["id"]), "void", "nothing to judge")
+    finally:
+        store.close()
+
+    edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")
+    assert finish(fleet, wo["id"])["status"] == "validating"
+
+    store = fleet.store()
+    try:
+        assert store.get_work_order(wo["id"])["status"] == "validating"
+        assert str(store.latest_validation_round(wo_id=wo["id"])["outcome"]) == "void"
+    finally:
+        store.close()
+    assert events(fleet, wo["id"], "validation_bounced"), "this was a bounce"
+
+
 def test_the_bounce_spends_no_round(fleet):
     """The next real submission is still round 2 — spec §5."""
     wo = fleet.dispatch()
