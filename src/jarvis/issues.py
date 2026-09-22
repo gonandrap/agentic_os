@@ -1051,12 +1051,13 @@ def read_triage_verdict(claimed: str, verdict: dict[str, Any]) -> tuple[str, str
         return ("confirmed", claimed)
     if said in ("denied", "dismissed"):
         return ("downgraded", downgrade_to(claimed, stated))
-    try:
-        level = checked_priority(stated)
-    except ValueError:
-        return ("unconfirmed", claimed)
-    return (("downgraded", level)
-            if PRIORITIES.index(level) < PRIORITIES.index(checked_priority(claimed))
+    # `downgrade_to` OWNS THE ORDERING (review round 1): it already answers "is this a
+    # level below the claim", and a second comparison here would be a second answer to
+    # that question on the path that writes the "Neo downgraded a `critical` bug to `X`"
+    # sentence. It folds both refusals onto `SAFE_DOWNGRADE`, so a level that came back
+    # unchanged is one it accepted — and anything else is a level Neo did not state
+    # BELOW the claim, which with no verdict field is nothing to act on.
+    return (("downgraded", stated) if downgrade_to(claimed, stated) == stated
             else ("unconfirmed", claimed))
 
 

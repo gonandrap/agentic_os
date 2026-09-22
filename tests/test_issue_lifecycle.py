@@ -566,6 +566,58 @@ def test_a_verdict_nobody_could_parse_is_unconfirmed_not_a_downgrade(fleet):
     assert not any("downgraded" in (i["title"] or "") for i in items)
 
 
+def test_a_level_in_the_answer_alone_downgrades_when_it_is_below_the_claim(fleet):
+    """Review round 1: the third route through `read_triage_verdict`, and the one that
+    writes the user-facing "Neo downgraded a `critical` bug to `X`" sentence.
+
+    Every OTHER downgrade test reaches the explicit-deny branch, because the fixture's
+    defaults supply `approve=False`. This is the shape production actually emitted —
+    neither `verdict` nor `approve`, the ruling in `answer` — with the ruling being a
+    level rather than the word `approve`.
+    """
+    from jarvis.central_store import CentralStore
+
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False,
+                     answer="high — not a blocker because the work order still lands",
+                     reason="a real defect with a workaround")
+
+    assert not fleet.wo_id(), "a downgraded claim dispatches nothing"
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: high" in labels and "priority: critical" not in labels
+    central = CentralStore()
+    try:
+        titles = [i["title"] or "" for i in central.unacked_inbox()]
+    finally:
+        central.close()
+    assert any("downgraded a `critical` bug to `high`" in t for t in titles)
+
+
+def test_a_level_in_the_answer_alone_is_unconfirmed_when_it_is_not_below_the_claim(
+        fleet):
+    """The companion, and the one that pins the ORDERING `downgrade_to` owns. `blocker`
+    is not a downgrade of `critical`, and with no verdict field beside it nobody denied
+    anything either — so there is nothing to act on and nothing to tell the user a level
+    about."""
+    from jarvis.central_store import CentralStore
+
+    fleet.file_bug(priority="critical")
+    fleet.triage_raw(escalate=False, answer="blocker", reason="it stops the fleet")
+
+    assert not fleet.wo_id()
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: critical" in labels, "the claim stands on the record as a claim"
+    assert f"priority: {issues.SAFE_DOWNGRADE}" not in labels
+    assert "priority: blocker" not in labels, "and is never raised by the back door"
+    central = CentralStore()
+    try:
+        titles = [i["title"] or "" for i in central.unacked_inbox()]
+    finally:
+        central.close()
+    assert any("UNCONFIRMED" in t for t in titles)
+    assert not any("downgraded" in t for t in titles)
+
+
 def test_the_tracker_records_both_the_claim_and_the_verdict(fleet):
     """The user's instruction: the disagreement is the signal that says whether the
     rubric is working, so neither half may be overwritten silently."""
