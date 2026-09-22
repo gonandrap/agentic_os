@@ -1,6 +1,6 @@
 ---
 name: i-have-adhd
-description: Use when writing anything a person will read - a work-order message, a Neo question, a finish summary, a PR body, a commit message, a code comment, or the final answer of a turn. Shapes it for a reader who needs the point first and has no patience for preamble, recap or repetition. Also use when you notice yourself about to restate context the reader already has.
+description: The house style's shaping half, always active in a Jarvis work order. Governs the ORDER and the CUT of anything a person will read - a work-order message, a Neo question, a finish summary, a PR body, a commit message, a code comment, or the final answer of a turn. Load it at the start of a work order, before writing a PR body, and whenever a hook tells you something you wrote is too long. Pairs with `caveman`, which compresses the words once this has chosen them.
 license: MIT
 ---
 
@@ -15,6 +15,15 @@ brain can act on it.
 These rules apply to everything you write for the rest of the session, not only the next
 message. They do not expire and they do not lapse when the topic changes. If you are
 unsure whether they still apply, they do.
+
+**In a Jarvis work order there is no off switch.** The style belongs to the OS, not to
+the session. The operative rules here and in `caveman` are injected into every turn by
+the `SessionStart` hook (`jarvis.concision.house_style`), so they are in force whether or
+not you opened this file; opening it gets you the examples and the reasoning.
+
+**How this divides with `caveman`.** `caveman` decides how many words a sentence costs.
+This file decides which sentences exist and what order they come in. Run both: compress
+after shaping, never instead of it.
 
 ## What ADHD changes about reading
 

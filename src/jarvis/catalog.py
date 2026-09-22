@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import concision
 from . import probes as probes_mod
 from . import schedule as schedule_mod
 from .gates import GateConfig
@@ -481,6 +482,26 @@ class ValidationConfig:
     follow_ups: bool = True
     # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
+
+
+# -- the house style: how terse the OS holds its workers ---------------------------------
+
+
+@dataclass(frozen=True)
+class ConcisionConfig:
+    """The one number the concision machinery needs per project.
+
+    Design: docs/superpowers/specs/2026-09-19-concision-enforced.md SS5.3. Per project
+    as well as fleet-wide, with `_parse_inspect`'s field-level inheritance.
+
+    `summary_max_words` = 0 turns the `jarvis wo finish --summary` refusal OFF for the
+    project, which is why zero is ACCEPTED here where `_parse_inspect` refuses it. The
+    two mean opposite things: an inspect count of zero would make an alarm fire on
+    everything, whereas a cap of zero makes a refusal fire on nothing. Off is a position
+    a project is entitled to take; an alarm that cries wolf is not.
+    """
+
+    summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -980,6 +1001,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
@@ -1088,6 +1110,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
@@ -1399,6 +1422,26 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
+                     where: str = "os.concision") -> ConcisionConfig:
+    """`os.concision`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Negative is refused; zero is not (see `ConcisionConfig`). A cap below the refusal
+    message's own length would deny every finish and leave the worker no shape of
+    summary that passes, so the floor is the smallest cap a real headline fits in.
+    """
+    base = base or ConcisionConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    words = int(raw.get("summary_max_words", base.summary_max_words))
+    if words < 0:
+        raise _err(f"{where}.summary_max_words must be 0 (off) or more, got {words}")
+    if 0 < words < 20:
+        raise _err(f"{where}.summary_max_words of {words} leaves no summary that can "
+                   f"pass; use 0 to switch the cap off")
+    return ConcisionConfig(summary_max_words=words)
+
+
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,
                 where: str = "os.bugs") -> BugsConfig:
     """`os.bugs`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -1703,6 +1746,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
@@ -1771,6 +1815,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        concision_cfg = _parse_concision(
+            p.get("concision", {}), base=os_cfg.concision,
+            where=f"projects[{i}] ({name}).concision")
         supervisor_cfg = _parse_supervisor(
             p.get("supervisor", {}), base=os_cfg.supervisor,
             where=f"projects[{i}] ({name}).supervisor")
@@ -1798,6 +1845,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                concision=concision_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,

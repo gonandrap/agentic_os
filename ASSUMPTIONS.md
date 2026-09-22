@@ -569,3 +569,38 @@ for every call to be recorded here instead. These are those calls.
     after someone re-runs `install_prod_service.sh` — the exact silent-no-op that cost a
     release when `gh` fell off the daemon's PATH (#90). `JARVIS_TURN_TRANSPORT=systemd|
     direct|auto` overrides it; the test-isolation gate pins `direct`.
+
+82. **The `caveman` skill stops being a verbatim vendor, and compresses everything a
+    worker writes — commits and PR bodies included.** Measured 2026-09-19: `caveman` and
+    `i-have-adhd` reached every worker and were invoked **0 times in 142 sessions**,
+    while the median finish summary went 40 words (July) to 344 (September). Two causes,
+    both in the skill: its trigger gated on a user saying "caveman mode", which a
+    headless worker has no user to say, and its `## Boundaries` section returned every
+    persisted artifact to normal prose — which is every surface a Jarvis worker writes,
+    including the work-order record, because the record goes through a CLI call. The
+    boundary was upstream's and it exists for a real reason: commits, PR bodies and code
+    comments outlive the OS and are read by people who never opted into the style. The
+    user was shown that cost explicitly and chose whole-output compression at level
+    `full` anyway. So the README's "verbatim copy, diff it against upstream" promise is
+    replaced by an enumerated diff, and `tests/test_concision.py` now pins the
+    adaptation instead of byte-equality. The correctness rails (exact errors, numbers,
+    units, negations, security warnings, irreversible-action confirmations) are NOT
+    compressed and are pinned separately. Reversal criterion: repository readability —
+    if a future reader cannot follow the git log, re-read spec SS4.1 and narrow the
+    boundary back to the permanent artifacts.
+
+83. **The house style is injected by a hook, not left to the model to load, and
+    `--summary` is capped at 120 words by a refusal.** kn-fe226ab1 measured contract
+    prose at 0/5 against the model's prior, twice, and concluded the class wants a
+    mechanism. So the operative rules of both skills ride every turn as `SessionStart`
+    `additionalContext` (`concision.house_style`), and `hooks.finish_summary_decision`
+    denies an over-long `--summary` — positioned before `preflight_decision`'s
+    `jarvis …` auto-allow, which would otherwise make the cap dead code. The cap travels
+    as `JARVIS_SUMMARY_MAX_WORDS` rather than being read from the catalog, because the
+    hook runs on every Bash command and a catalog parse there is a 39% tax on a ~155ms
+    process. 120 is generous on purpose: a denial costs a whole extra turn and a full
+    conversation re-send at the cache-write rate, so a tight cap would cost more than
+    the verbosity it prevents. `concision.summary_max_words: 0` switches it off per
+    project. The brief edit that removes the "ceases to exist" contradiction (spec SS7)
+    is NOT claimed to change behaviour and is not measured; the injection is, by
+    `evals/llm/test_house_style_ab.py`.

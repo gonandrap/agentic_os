@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import hooks, invariants, ops, timeline
+from jarvis import concision, hooks, invariants, ops, timeline
 from jarvis.hooks import (PREFIX_INGREDIENTS, PREFIX_UNKNOWN, handle_hook, note_prefix,
                           prefix_baseline, prefix_drift, prefix_fingerprint)
 from jarvis.project_store import ProjectStore
@@ -297,7 +297,13 @@ def test_a_broken_read_costs_a_data_point_and_not_the_session(wo, project, monke
 
     result = handle_hook(session_start(cwd=project), env(project, wo["id"]))
 
-    assert result == {"wo_id": wo["id"], "event": "SessionStart"}
+    assert result["wo_id"] == wo["id"]
+    assert result["event"] == "SessionStart"
+    # The house style still rides out (spec 2026-09-19 SS5.1). It shares this event
+    # with the fingerprint and must not share its fate: a broken measurement costs a
+    # data point, and silently dropping the style with it would cost every turn.
+    assert result["hookSpecificOutput"]["additionalContext"].startswith(
+        concision.HOUSE_STYLE_BEGIN)
 
 
 # -- 3. the cost, since it is paid on every session --------------------------------------

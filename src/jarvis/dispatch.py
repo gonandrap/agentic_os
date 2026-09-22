@@ -145,6 +145,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # answer is fixed at spawn, and a per-call catalog read would be a second
         # source of truth that can disagree with the settings beside it.
         "JARVIS_SERENA": "1" if serena else "0",
+        # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
+        # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
+        # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
+        # parse there would be a 39% tax on a ~155ms hook process.
+        "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
         # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
         # which Claude Code would otherwise pick for a headless session. Taken from
         # `claude_cli` rather than spelled again: the settings file and the spawn
