@@ -12,6 +12,7 @@ FAIL-OPEN case, so a test built on those would pass with the whole feature delet
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -145,6 +146,40 @@ def test_a_judged_round_records_a_digest_per_file(fleet):
 
     shas = ProjectStore.validation_file_shas(rounds(fleet, wo["id"])[0])
     assert "src/app.py" in shas and shas["src/app.py"]
+
+
+def test_a_round_that_predates_the_column_lets_the_panel_judge(tmp_path):
+    """The fail-open the spec promises costs a live submitter nothing.
+
+    Every round judged before this work order landed recorded no map, and `''` reads as
+    "not recorded" and never as "the submitter touched nothing" — otherwise the first
+    resubmission on every upgraded database would be bounced for work it did do. The
+    column is DROPPED and the store reopened, because a fresh database gets it from the
+    `CREATE TABLE` and would pass with the migration forgotten.
+    """
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    store = ProjectStore(proj)                          # today's schema...
+    wo = store.create_work_order(title="aged", description="")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="a")
+    store.close_validation_round(int(rnd["id"]), "rejected", "fix src/app.py")
+    store.close()
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE validation_rounds DROP COLUMN file_shas")   # ...aged
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                          # the upgrade
+    try:
+        row = store.last_judged_round(wo_id=wo["id"])
+        assert row is not None and row["file_shas"] == ""
+        assert ProjectStore.validation_file_shas(row) == {}
+        # and the rule reads that as "I cannot tell", not as "nothing moved"
+        assert validation.unanswered_submission(
+            row, [{"title": "src/app.py is wrong", "detail": ""}],
+            ProjectStore.validation_file_shas(row), {"notes/notes.py": "9"}) is None
+    finally:
+        store.close()
 
 
 # -- failure 2: a resubmission that answers none of the list ---------------------------
