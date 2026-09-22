@@ -2183,6 +2183,77 @@ def test_an_abandoned_request_is_not_shown_as_expired(gated):
     assert "1 more were abandoned" in page
 
 
+def test_a_spent_grant_is_not_shown_as_expired(gated):
+    """Issue 491: 23 of 26 production auto_merge gates were approved, used, and then
+    badged `– expired` — a working pipeline reading as Neo letting every merge lapse."""
+    from jarvis.hooks import preflight_decision
+
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 31 --squash"},
+               "cwd": str(gated.project)}
+    preflight_decision(payload, settings["env"])
+    store = ProjectStore(gated.project)
+    try:
+        approval = store.list_approvals(gated.wo_id)[0]
+        gates.apply_decision(store, approval["id"], verdict="approved", reason="green",
+                             decided_by="neo")
+    finally:
+        store.close()
+    for _ in range(gates.GRANT_MAX_USES):
+        preflight_decision(payload, settings["env"])
+
+    page = gated.client.get("/gates").text           # the view sweeps as it renders
+
+    assert "spent" in page
+    assert f"{gates.GRANT_MAX_USES}/{gates.GRANT_MAX_USES} used" in page
+    # ...and NOT as the outcome it is the opposite of.
+    assert ">expired<" not in page
+
+
+def test_the_work_order_page_splits_expired_too(gated):
+    """The other renderer of `GATE_META`, and the one that had never split `expired` at
+    all: it keyed on the raw status, so `abandoned` never reached this page either. The
+    twin test pins the two helpers as FUNCTIONS — only a page assertion catches this
+    template going back to `a.status`."""
+    from jarvis.hooks import preflight_decision
+
+    settings = json.loads(
+        (gated.project / ".jarvis" / "worker-settings"
+         / f"{gated.wo_id}.json").read_text())
+    payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 31 --squash"},
+               "cwd": str(gated.project)}
+    preflight_decision(payload, settings["env"])
+    store = ProjectStore(gated.project)
+    try:
+        gates.apply_decision(store, store.list_approvals(gated.wo_id)[0]["id"],
+                             verdict="approved", reason="green", decided_by="neo")
+    finally:
+        store.close()
+    for _ in range(gates.GRANT_MAX_USES):
+        preflight_decision(payload, settings["env"])
+
+    # ...and beside it the outcome this page has never been able to say either: blocked,
+    # never argued, closed by the TTL (`gates.sweep_unargued`).
+    preflight_decision({"tool_name": "Bash",
+                        "tool_input": {"command": gated.gated_command},
+                        "cwd": str(gated.project)}, settings["env"])
+    store = ProjectStore(gated.project)
+    try:
+        held = [a for a in store.list_approvals(gated.wo_id)
+                if a["command"] == gated.gated_command][0]
+        store.abandon_approval(held["id"], "no case was made for it within 30 minutes")
+    finally:
+        store.close()
+
+    page = gated.client.get(f"/wo/proj_a/{gated.wo_id}").text   # sweeps as it renders
+
+    assert ">spent</span>" in page
+    assert ">abandoned, never reviewed</span>" in page
+    assert ">expired</span>" not in page
+
+
 # -- budgets ---------------------------------------------------------------------------
 
 

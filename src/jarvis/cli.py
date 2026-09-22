@@ -2338,7 +2338,19 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
 GATE_ICON = {"awaiting_case": "✎", "pending": "⏸", "approved": "✅",
              "denied": "⛔", "dismissed": "⊘",
-             "expired": "⌛"}
+             "expired": "⌛",
+             # Keyed on the DISPLAY state, not the status: a spent grant is `expired` in
+             # the database and an hourglass would say it timed out — spec 2026-09-19 §1.
+             "spent": "☑"}
+
+
+def _gate_display(row: dict) -> str:
+    """The word this gate is rendered under, which is not always its status: `expired`
+    splits by `closed_as` — spec 2026-09-19 §1. Mirrors `ui.app.GATE_META`'s keys.
+    """
+    if row["status"] == "expired" and row["closed_as"] in ("spent", "abandoned"):
+        return row["closed_as"]
+    return row["status"]
 
 
 _ROLE_ICON = {"match": "✋", "exempt": "✓", "canary": "🔒"}
@@ -2432,7 +2444,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
             print("no approval requests" + (" pending" if args.pending else ""))
         else:
             for r in rows:
-                icon = GATE_ICON.get(r["status"], "•")
+                icon = GATE_ICON.get(_gate_display(r), "•")
                 where = "you" if r["escalated"] else "neo"
                 if r["status"] == "awaiting_case":
                     # Never "pending": nobody is holding it. It is the worker's move.
@@ -2445,6 +2457,11 @@ def cmd_gate(args: argparse.Namespace) -> int:
                 elif r["closed_as"] == "abandoned":
                     # Not a verdict, and it must not print as one: nobody reviewed it.
                     state = "abandoned — no case was ever made, nothing was decided"
+                elif r["closed_as"] == "spent":
+                    # The opposite of a lapse: this grant was used, so saying "expired"
+                    # reads as Neo letting a merge time out — spec 2026-09-19 §1.
+                    state = (f"spent — approved by {r['decided_by'] or '?'}, then used "
+                             f"{r['uses']}/{r['max_uses']}")
                 else:
                     state = f"{r['status']} by {r['decided_by'] or '?'}"
                 print(f"{icon} {r['id']} [{r['project']}] {r['kind']} · {state} "

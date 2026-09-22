@@ -134,8 +134,9 @@
     <tr><th>#</th><th>project / wo</th><th>action</th><th>command</th>
         <th>verdict</th><th>by</th><th>age</th></tr>
     {% for g in decided %}
-    {# Keyed on the DISPLAY state: an abandoned row is `expired` in the database. #}
-    {% set m = gate_meta.get('abandoned' if g.closed_as == 'abandoned' else g.status,
+    {# Keyed on the DISPLAY state: an abandoned or spent row is `expired` in the DB. #}
+    {% set display = gate_display(g) %}
+    {% set m = gate_meta.get(display,
                              {'word': g.status, 'icon': '•', 'tone': 'muted'}) %}
     <tr>
       <td class="mono">{{ g.id }}</td>
@@ -144,7 +145,7 @@
       <td class="mono">{{ g.command[:80] }}
         {% if g.decision_reason %}<div class="sub">{{ g.decision_reason }}</div>{% endif %}</td>
       <td><span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ m.word }}</span>
-        {% if g.status == 'approved' %}<div class="sub">{{ g.uses }}/{{ g.max_uses }} used</div>{% endif %}</td>
+        {% if g.status == 'approved' or display == 'spent' %}<div class="sub">{{ g.uses }}/{{ g.max_uses }} used</div>{% endif %}</td>
       <td class="mono">{{ g.decided_by or '—' }}</td>
       <td class="mono">{{ fmt_age(g.ts) }}</td>
     </tr>

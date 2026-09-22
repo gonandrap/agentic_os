@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import gate_rules, gates
+from jarvis import db, gate_rules, gates
 from jarvis.bootstrap import _gates_section
 from jarvis.catalog import ProjectSpec
 from jarvis.dispatch import _gate_briefing
@@ -728,6 +728,120 @@ def test_the_expiry_sweep_leaves_dismissed_rows_alone(gated):
     assert gated.store.get_approval(approval["id"])["status"] == "dismissed"
     assert gated.store.dismissed_count() == 1
     assert gated.store.dismissed_count(gated.wo["id"]) == 1
+
+
+def test_a_spent_grant_is_not_filed_as_a_lapse(gated):
+    """The 23-of-26 case, issue 491. A grant whose uses ran out was APPROVED AND USED —
+    the merge ran — and one that timed out was never used by anyone. Both landed in
+    `closed_as='lapsed'`, so both printed `expired by neo`. Spec 2026-09-19 §1."""
+    gated.attempt("gh pr merge 31")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    for _ in range(gates.GRANT_MAX_USES):
+        gated.attempt("gh pr merge 31")
+
+    gated.store.expire_approvals()
+
+    row = gated.store.get_approval(approval["id"])
+    assert row["status"] == "expired"
+    assert row["closed_as"] == "spent"
+    assert row["uses"] == gates.GRANT_MAX_USES
+
+
+def test_a_grant_nobody_used_still_lapses(gated):
+    """The other half of the split: an unused grant that ran out of clock. It must keep
+    reading as a lapse, or the fix has only moved the lie."""
+    gated.attempt("gh pr merge 31")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    gated.store.conn.execute("UPDATE approvals SET expires_at = ? WHERE id=?",
+                             (db.now() - 60, approval["id"]))
+
+    gated.store.expire_approvals()
+
+    row = gated.store.get_approval(approval["id"])
+    assert row["status"] == "expired"
+    assert row["closed_as"] == "lapsed"
+    assert row["uses"] == 0
+
+
+def test_a_grant_that_was_used_and_then_timed_out_reads_as_spent(gated):
+    """Both conditions at once. What happened to it is that it was used; the clock
+    running out afterwards is not the story — hence the order of the two sweeps."""
+    gated.attempt("gh pr merge 31")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, approval["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    for _ in range(gates.GRANT_MAX_USES):
+        gated.attempt("gh pr merge 31")
+    gated.store.conn.execute("UPDATE approvals SET expires_at = ? WHERE id=?",
+                             (db.now() - 60, approval["id"]))
+
+    gated.store.expire_approvals()
+
+    assert gated.store.get_approval(approval["id"])["closed_as"] == "spent"
+
+
+def test_the_grants_already_swept_as_lapsed_are_re_filed_as_spent(gated):
+    """The rows already on the record — every auto-merge the fleet has run. Without the
+    backfill they read as a lapse for ever. Spec 2026-09-19 §1."""
+    from jarvis.project_store import ProjectStore
+
+    gated.attempt("gh pr merge 31")
+    spent = gated.store.list_approvals(gated.wo["id"])[0]
+    gates.apply_decision(gated.store, spent["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    gated.attempt("gh pr merge 32")
+    unused = [a for a in gated.store.list_approvals(gated.wo["id"])
+              if a["id"] != spent["id"]][0]
+    gates.apply_decision(gated.store, unused["id"], verdict="approved", reason="ok",
+                         decided_by="neo")
+    # Exactly what the single old sweep wrote for both, reproduced rather than imported.
+    gated.store.conn.execute(
+        """UPDATE approvals SET status='expired', closed_as='lapsed', uses=?
+           WHERE id=?""", (gates.GRANT_MAX_USES, spent["id"]))
+    gated.store.conn.execute(
+        "UPDATE approvals SET status='expired', closed_as='lapsed' WHERE id=?",
+        (unused["id"],))
+    # A superseded row and an abandoned one, which the backfill must not reach either.
+    gated.attempt("./scripts/" + "ship" + "it.sh")
+    other = [a for a in gated.store.list_approvals(gated.wo["id"])
+             if a["id"] not in (spent["id"], unused["id"])][0]
+    gated.store.supersede_approval(other["id"], "the release moved")
+    gated.store.close()
+
+    store = ProjectStore(gated.project)        # re-open: the migration runs on __init__
+    try:
+        assert store.get_approval(spent["id"])["closed_as"] == "spent"
+        # The one that really did lapse is untouched — the backfill is keyed on `uses`.
+        # This is production gate 166: approved by the user, never used, head moved.
+        assert store.get_approval(unused["id"])["closed_as"] == "lapsed"
+        assert store.get_approval(other["id"])["closed_as"] == "superseded"
+        # Neither count is a casualty of rows moving between `closed_as` values.
+        assert store.dismissed_count() == 0
+        assert store.abandoned_count() == 0
+    finally:
+        store.close()
+
+
+def test_both_surfaces_render_a_spent_grant_under_the_same_key(gated):
+    """`cli._gate_display` and `ui.app.gate_display` are twins by hand, and a display
+    word only one of them knows about is how `jarvis gate list` and /gates come to
+    disagree about the same row."""
+    from jarvis import cli
+    from jarvis.ui import app as ui_app
+
+    for closed_as, expected in (("spent", "spent"), ("abandoned", "abandoned"),
+                                ("lapsed", "expired"), ("superseded", "expired")):
+        row = {"status": "expired", "closed_as": closed_as}
+        assert cli._gate_display(row) == expected
+        assert ui_app.gate_display(row) == expected
+        assert expected in ui_app.GATE_META
+
+    live = {"status": "approved", "closed_as": ""}
+    assert cli._gate_display(live) == ui_app.gate_display(live) == "approved"
 
 
 def test_a_dismissal_does_not_widen_beyond_the_exact_command(gated):
