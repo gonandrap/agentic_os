@@ -1384,13 +1384,15 @@ def round_line(rnd: dict[str, Any]) -> str:
     # attention on an absence, the way `automerge_state` returns None rather than "off".
     filed = rnd.get("follow_ups") or NO_FOLLOW_UPS
     n_filed, dropped = len(filed.get("filed") or ()), int(filed.get("dropped") or 0)
-    failed = int(filed.get("failed") or 0)
+    failed, n_kept = int(filed.get("failed") or 0), len(filed.get("withheld") or ())
     # Assembled as a LIST and joined, not appended to a string: the three are
     # independent, any subset can be empty, and string-appending a separator per clause
     # is how a round that only FAILED came out as "· , · 6 not filed".
     parts = []
     if n_filed:
         parts.append(f"{n_filed} follow-up issue{'' if n_filed == 1 else 's'} filed")
+    if n_kept:
+        parts.append(f"{n_kept} kept internally")
     if dropped:
         parts.append(f"{dropped} over the cap")
     if failed:
@@ -1510,7 +1512,8 @@ FOLLOW_UPS_EVENT = "validation_follow_ups_filed"
 #: `validation_rounds`, `assumptions` and `alarms` already follow: a key that comes and
 #: goes is a key every consumer has to guard, and a Jinja template guards it by
 #: rendering nothing at all (`kn-99e37a4b`).
-NO_FOLLOW_UPS: dict[str, Any] = {"filed": [], "dropped": 0, "failed": 0}
+NO_FOLLOW_UPS: dict[str, Any] = {"filed": [], "withheld": [], "dropped": 0,
+                                 "failed": 0}
 
 
 def follow_up_key(title: Any) -> str:
@@ -1528,9 +1531,9 @@ def follow_up_key(title: Any) -> str:
 #: Anchored to eight hex characters so a person's own issue cannot accidentally carry one.
 FOLLOW_UP_TOKEN_RE = re.compile(r"\bvf-[0-9a-f]{8}\b")
 
-#: What a withheld follow-up is called on a tracker the OS could not establish is private.
-#: Carries no word any model wrote — the digest is derived from the finding's title, and a
-#: digest is not the text (spec §9).
+#: What a withheld follow-up USED TO BE CALLED on a tracker the OS could not establish is
+#: private. No issue is opened for one any more (see `file_validation_follow_ups`); this
+#: names the rows filed before that, which is what `jarvis issues` needs it for.
 WITHHELD_TITLE = "Validation follow-up"
 
 
@@ -1557,14 +1560,71 @@ def follow_up_token(title: Any) -> str:
     return m.group(0) if m else ""
 
 
-def follow_up_title(key: str, digest: str, *, private: bool) -> str:
-    """What the issue is called on the tracker. Both shapes carry the digest.
+def follow_up_claim(finding: Mapping[str, Any]) -> str:
+    """THE DEDUPE KEY: the code a finding names, plus what it claims about it.
 
-    The private shape keeps the finding's own title, which is what makes a tracker full
-    of them readable; the public one has nothing but the token, because a title a seat
-    wrote is model prose like any other.
+    `sha256(title)` was the key until wo-3619e6e4, and a seat writes a slightly different
+    sentence for the same nit every round — so the same observation was filed three times
+    on wo-0a9ba9b3 (#538, #546, #552). `file` and `symbol` are the seat's own anchors and
+    do not move when the sentence is reworded; the title rides along because one symbol
+    can carry two different claims.
+
+    Falls back to the title alone for a finding that names no code — those are
+    inadmissible now, but `follow_up_digest` is also computed over pre-schema rows.
     """
-    return f"{key} [{digest}]" if private else f"{WITHHELD_TITLE} {digest}"
+    parts = [str(finding.get("file") or "").strip().lower(),
+             str(finding.get("symbol") or "").strip(),
+             follow_up_key(finding.get("title"))]
+    return "|".join(p for p in parts if p)
+
+
+def follow_up_digest_of(finding: Mapping[str, Any]) -> str:
+    """One finding's token, over `follow_up_claim` rather than over its title alone."""
+    return "vf-" + hashlib.sha256(follow_up_claim(finding).encode()).hexdigest()[:8]
+
+
+#: What a follow-up must be about before it may become a tracker issue: a behaviour that
+#: is WRONG, named against the code it is wrong in. "No test covers this", "the docstring
+#: is stale", "the PR body does not say", "CI has not run" are legitimate things to tell
+#: the SUBMITTER — `follow_up_feedback` routes them there — and are an unbounded supply
+#: in any codebase, which is what filled a public tracker with 40 issues.
+def follow_up_admissible(finding: Mapping[str, Any]) -> bool:
+    """Does this finding name a wrong behaviour, in a named file, with a failure?
+
+    STRUCTURE, NOT PROSE. The seat mandates ask for `file` and `failure` on every
+    follow-up (spec §4.4); a finding that cannot fill them in is one nobody could act on
+    from the tracker either. Classifying the title text instead would be a blocklist over
+    model prose — it catches the phrasings somebody thought of.
+    """
+    return bool(str(finding.get("file") or "").strip()
+                and str(finding.get("failure") or "").strip())
+
+
+def follow_up_feedback(follow_ups: Sequence[Mapping[str, Any]]) -> str:
+    """The inadmissible findings, as a note for the SUBMITTER, or "".
+
+    They are not dropped: in the round the submitter is already being sent back, a stale
+    docstring or a missing test costs nothing and is fixed in the same session. This is
+    where they go instead of the tracker.
+    """
+    lines = [f"- {follow_up_key(f.get('title'))}"
+             for f in follow_ups if not follow_up_admissible(f)
+             and follow_up_key(f.get("title"))]
+    if not lines:
+        return ""
+    return ("\n\nAlso raised, and not blocking — worth fixing here rather than "
+            "carrying:\n" + "\n".join(lines))
+
+
+def follow_up_title(key: str, digest: str) -> str:
+    """What the issue is called on the tracker: the finding's own title and its token.
+
+    ONE SHAPE SINCE wo-3619e6e4. The withheld shape — `WITHHELD_TITLE` and a digest —
+    was what a follow-up got on a tracker the OS could not establish is private, and it
+    named nothing a reader could act on; that finding is now kept internally and no issue
+    is opened, so the only issue this writes is one whose text may travel (spec §9).
+    """
+    return f"{key} [{digest}]"
 
 
 def follow_up_repo(project_path: Path) -> str:
@@ -1589,44 +1649,43 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
                                follow_ups: Sequence[Mapping[str, Any]],
                                cfg: Any, *, wo_id: str | None = None,
                                fo_id: str | None = None) -> dict[str, Any]:
-    """File this round's non-blocking findings as issues on the project's own tracker.
+    """Keep this unit's non-blocking findings — on the tracker if they may travel there.
 
-    Called by BOTH daemon validation loops immediately after the opinions are recorded
-    and BEFORE the outcome branch: a follow-up is filed whether the round passed or was
-    rejected. Making it conditional on an outcome the seat could not see when it wrote
-    would reintroduce, in miniature, the treadmill this feature exists to end.
+    Called by both daemon validation loops when the loop SETTLES, from the last judged
+    round only, and never from an intermediate one (spec §4.4). Round 1's findings used
+    to be filed at once and then fixed in round 2, leaving issues open against code that
+    no longer exists; an issue now always describes the code that shipped.
 
-    **Not in `validation.py`.** That module's contract is "it is called; it is never
+    **A FINDING THE TRACKER CANNOT CARRY DOES NOT BECOME AN ISSUE.** The privacy read
+    that decides whether a seat's words may be published (spec §9) decides whether an
+    issue is opened at all: what a withheld one produced was a row titled `Validation
+    follow-up vf-…` over boilerplate saying the text is elsewhere — twenty of them on
+    wo-0a9ba9b3 — which is backlog with no information in it. Withheld findings are kept
+    WHOLE in `internal_follow_ups` instead, and `jarvis issues` and the project page mark
+    them internal-only. Nothing changes on a repository the OS establishes IS private.
+
+    A project with no `origin` takes the same path: no repository is no proof of privacy,
+    and the finding is kept rather than counted as a failure the way it was before.
+
+    **THE CAP IS PER ORDER.** `cfg.max_follow_ups` bounded one ROUND, so a unit judged
+    four times could file four times the cap. What the order has already raised — tracker
+    links plus internal rows, both local reads — is subtracted first.
+
+    **NOTHING INADMISSIBLE IS FILED.** `follow_up_admissible` is the gate; the rest go to
+    the submitter through `follow_up_feedback`, in the round, where they cost nothing.
+
+    **NOT IN `validation.py`.** That module's contract is "it is called; it is never
     messaged, and it messages nobody" — a panel that files GitHub issues has a side
     effect the round machine cannot roll back when the round later fails on transport.
-    That is a contract boundary rather than a mechanical one, which is why it is written
-    down here.
 
-    **Not in `daemon.py` either.** One function, two callers, for the reason
-    `side_effects_of` and `collect_feature_evidence` are already here — and two inline
-    copies of a filing rule is the shape that drifts, when `_round_config`'s docstring
-    records Neo's ruling (question 176) that the two loops are held identical.
+    **NOT IN `daemon.py` either.** One function, two callers, for the reason
+    `side_effects_of` and `collect_feature_evidence` are already here.
 
-    **NOT OVER THE BUS, though `bus.DeferralRequest` is exactly this shape** and
-    `reviewer` is already a legal sender. When the subject is under a feature order,
-    `bus.resolve` finds the manager and the deferral is DELIVERED AS A MESSAGE telling it
-    to run a command — a manager turn per nit, and the same fact recorded two different
-    ways depending on parentage. Direct filing has one behaviour.
+    **THE SEAT'S WORDS GO OUT ONLY TO A TRACKER SHOWN TO BE PRIVATE** (spec §9).
 
-    **THE SUBMITTER IS TOLD NOTHING.** These are the project's tracker, not the worker's
-    homework, and `validation.REASON_LIMIT` is 1500 characters that
-    `daemon.REVIEW_FEEDBACK` and then `bus.render` each re-frame — every sentence added
-    there pushes the instructions that matter off the bottom.
-
-    **THE SEAT'S WORDS GO OUT ONLY TO A TRACKER SHOWN TO BE PRIVATE** (spec §9). Anywhere
-    else the issue carries the classification and a pointer at the record, and never the
-    finding itself — including its title, which is a seat's sentence like any other.
-
-    **A FAILURE IS COUNTED, NEVER SWALLOWED.** Filing crosses a network now, so it can
-    fail in a way the backlog insert this replaced could not: no `origin`, no `gh`, no
-    credentials, a rate limit. Each such finding lands in `failed`, which reaches the
-    event, the timeline and every surface — because a finding that silently evaporated
-    is indistinguishable from a round that raised none.
+    **A FAILURE IS COUNTED, NEVER SWALLOWED.** Filing crosses a network, so it can fail:
+    no `gh`, no credentials, a rate limit. Each such finding lands in `failed`, because a
+    finding that silently evaporated is indistinguishable from a round that raised none.
 
     Returns the event payload whether or not anything was written.
     """
@@ -1635,38 +1694,66 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     n, round_id = int(round_row["round"]), int(round_row["id"])
     unit_id = wo_id or fo_id or ""
     payload: dict[str, Any] = {"round": n, "round_id": round_id, "unit": unit_id,
-                               "items": [], "dropped": 0, "failed": 0}
+                               "items": [], "withheld": [], "dropped": 0, "failed": 0}
     # `follow_ups` is read defensively by the CALLER too (`verdict.get(...) or ()`):
     # `Daemon.validator` is injectable and several suites inject fakes that return only
     # the three keys that predate this.
     if not getattr(cfg, "follow_ups", True) or not follow_ups:
         return payload
 
-    # DISTINCT TITLES FIRST, and no network yet: two seats can reach the same nit in one
+    # ADMISSIBLE, DISTINCT, and no network yet: two seats can reach the same nit in one
     # round, and the tracker cannot dedupe an issue this round has not filed yet.
-    pending = _distinct(follow_ups)
+    pending = _distinct([f for f in follow_ups if follow_up_admissible(f)])
     if not pending:
         return payload
 
+    kept = {str(row["digest"]) for row in store.internal_follow_ups(unit_id)}
+    # THE ORDER'S OWN HISTORY, both halves, both local. `issue_links_of` is the relation
+    # `jarvis wo show` reads; counting the tracker over the network instead would make
+    # the cap depend on a call that is allowed to fail.
+    raised = len(kept) + len([r for r in store.issue_links_of(unit_id)
+                              if r["kind"] == "raised"])
+    cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
+    room = max(0, cap - raised)
+
     repo = follow_up_repo(project.path)
-    if not repo:
-        # A project with no GitHub remote. Reported rather than silently skipped, and
-        # counted as failures because that is what they are: findings the panel raised
-        # and the OS could not record anywhere.
-        payload["failed"] += len(pending)
-        payload["reason"] = "the project has no GitHub `origin`"
+    # ONE privacy read, and it fails closed: anything but a positive "this repository is
+    # private" withholds the finding — and now withholds the issue with it.
+    private = bool(repo) and issues.repo_is_private(repo)
+    if not private:
+        # AND NOT ONE THE TRACKER ALREADY CARRIES. A repository flipped open between two
+        # settles would otherwise record a second, internal copy of a finding that is
+        # already an issue — the same trap the digest was built for (`kn-4fbf00ee`), one
+        # destination along. Read off the filing events, so it costs no network.
+        filed_keys = set(_filed_titles(store, unit_id).values())
+        fresh = [f for f in pending if follow_up_digest_of(f) not in kept
+                 and follow_up_key(f.get("title")) not in filed_keys]
+        payload["dropped"] = max(0, len(fresh) - room)
+        for finding in fresh[:room]:
+            key = follow_up_key(finding.get("title"))
+            digest = follow_up_digest_of(finding)
+            seat = str(finding.get("seat") or "")
+            store.record_internal_follow_up(
+                digest, unit_id, round=n, seat=seat, title=key,
+                detail=str(finding.get("detail") or ""),
+                file=str(finding.get("file") or ""),
+                symbol=str(finding.get("symbol") or ""),
+                failure=str(finding.get("failure") or ""))
+            payload["withheld"].append({"digest": digest, "title": key, "seat": seat})
+        if payload["withheld"]:
+            payload["reason"] = (f"{repo or 'the project'} is not a repository this OS "
+                                 f"could establish is private, so the findings are kept "
+                                 f"on the internal record")
         return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
     try:
         # ONE round trip for the dedupe, whatever the cap — see `issues.follow_ups_filed`
         # for why it must read `--state all`.
         #
-        # TWO KEYS PER FILED ISSUE, AND THE SECOND IS WHAT SURVIVES A PRIVACY FLIP. The
-        # title's SHAPE now depends on an answer that can change between rounds (spec
-        # §9), so a dedupe on the title alone re-files every follow-up this unit has,
-        # every round, for ever, the first time the privacy read answers differently.
-        # The digest token is identical in both shapes; the plain key is the fallback
-        # for every issue filed before §9 landed, which carries no token.
+        # THREE KEYS PER FILED ISSUE, because the digest has been derived two ways. The
+        # claim digest is the live one; `follow_up_digest(title)` matches everything
+        # filed between spec §9 and wo-3619e6e4; the plain title matches everything older
+        # than §9, which carries no token at all.
         already, already_keys = set(), set()
         for row in issues.follow_ups_filed(repo, unit_id):
             already.add(follow_up_token(row.get("title")))
@@ -1685,35 +1772,24 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
     #
     # Capping first reads as the tidier rule — bound the work before doing any of it —
     # and it STARVES: a unit whose first `cap` findings are already filed spends the
-    # whole cap on duplicates and never reaches the ones behind them, on this round or
-    # any later one, for ever. Caught by a test, not by review.
-    #
-    # Nothing is paid for the order. The dedupe is ONE `issue list` call however many
-    # findings there are, and the per-finding network calls are the creates below, which
-    # the cap still bounds. So "cap before the network" is satisfied where it actually
-    # mattered.
+    # whole cap on duplicates and never reaches the ones behind them. Caught by a test,
+    # not by review.
     fresh = [f for f in pending
-             if follow_up_digest(f.get("title")) not in already
+             if follow_up_digest_of(f) not in already
+             and follow_up_digest_of(f) not in kept
+             and follow_up_digest(f.get("title")) not in already
              and follow_up_key(f.get("title")) not in already_keys]
-    cap = int(getattr(cfg, "max_follow_ups", DEFAULT_VALIDATION_FOLLOW_UP_CAP))
-    payload["dropped"] = max(0, len(fresh) - cap)
-    if not fresh[:cap]:
+    payload["dropped"] = max(0, len(fresh) - room)
+    if not fresh[:room]:
         return _record_filing(store, payload, wo_id=wo_id, fo_id=fo_id)
 
-    # WHETHER A SEAT'S WORDS MAY LEAVE THE MACHINE AT ALL, asked ONCE per round and only
-    # when there is something to file (spec §9). It fails closed: anything but a positive
-    # "this repository is private" withholds the finding text, and the issue carries the
-    # classification alone.
-    private = issues.repo_is_private(repo)
     pr_url = str(round_row.get("pr_url") or "")
-    for finding in fresh[:cap]:
+    for finding in fresh[:room]:
         key = follow_up_key(finding.get("title"))
         seat = str(finding.get("seat") or "")
-        title = follow_up_title(key, follow_up_digest(key), private=private)
-        body = (_follow_up_body(finding, unit_id=unit_id, round_no=n, pr_url=pr_url,
-                                seat=seat) if private
-                else _withheld_body(unit_id=unit_id, round_no=n, pr_url=pr_url,
-                                    seat=seat, repo=repo))
+        title = follow_up_title(key, follow_up_digest_of(finding))
+        body = _follow_up_body(finding, unit_id=unit_id, round_no=n, pr_url=pr_url,
+                               seat=seat)
         try:
             url = issues.file_follow_up(repo, title, body)
         except GitHubError as e:
@@ -1722,22 +1798,13 @@ def file_validation_follow_ups(store: ProjectStore, project: ProjectSpec,
             payload["failed"] += 1
             continue
         # `title` ON THE EVENT IS THE FINDING'S OWN, never what the tracker was told. The
-        # record is internal — it is where a withheld finding is READ FROM — and the
-        # surfaces that print a filed issue beside the finding that caused it key on
-        # exactly this (`cli._finding_lines`).
+        # record is internal and the surfaces that print a filed issue beside the finding
+        # that caused it key on exactly this (`cli._finding_lines`).
         payload["items"].append({"url": url, "number": issues.issue_number(url),
-                                 "title": key, "seat": seat, "withheld": not private})
+                                 "title": key, "seat": seat, "withheld": False})
         # THE RELATION, beside the event. The event says what this ROUND did; this says
-        # what the ORDER has raised, which is the question `jarvis wo show` could not
-        # answer and which no amount of reading the event could make cheap. `announced`
-        # because `_follow_up_body` has just written that sentence into the issue itself
-        # — the sweep must not comment it a second time.
-        #
-        # `title` here and `key` on the event are DELIBERATELY DIFFERENT STRINGS. The
-        # event carries the finding's own words, which is what the surfaces print beside
-        # it; this row carries WHAT THE TRACKER WAS TOLD, because it is a cache of the
-        # issue as it exists on GitHub and the sweep refreshes it from `gh issue view`.
-        # On a public repository those two are not the same sentence.
+        # what the ORDER has raised. `announced` because `_follow_up_body` has just
+        # written that sentence into the issue itself.
         store.record_issue(url, number=issues.issue_number(url), repo=repo, title=title,
                            state="OPEN")
         store.link_issue(url, unit_id, "raised", round_no=n, seat=seat, announced=True)
@@ -1765,50 +1832,14 @@ def _distinct(follow_ups: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]
 def _record_filing(store: ProjectStore, payload: dict[str, Any], *,
                    wo_id: str | None, fo_id: str | None) -> dict[str, Any]:
     """Write the event, unless the round had nothing at all to say."""
-    if payload["items"] or payload["dropped"] or payload["failed"]:
+    if (payload["items"] or payload["withheld"] or payload["dropped"]
+            or payload["failed"]):
         if wo_id:
             store.add_event(wo_id, FOLLOW_UPS_EVENT, payload)
         else:
             feature_event(store, str(fo_id), FOLLOW_UPS_EVENT,
                           {**payload, "feature_order": fo_id})
     return payload
-
-
-def _withheld_body(*, unit_id: str, round_no: int, pr_url: str, seat: str,
-                   repo: str) -> str:
-    """The issue body when the OS could not establish the tracker is private.
-
-    NOT ONE WORD A MODEL WROTE — spec §9, carrying over §8 of
-    docs/superpowers/specs/2026-09-14-a-filed-bug-runs-itself.md: the finding was written
-    by a seat that does not know it will be published, to a tracker that indexes and
-    caches whether or not the issue is later deleted, with nobody reading it in between.
-    A credential a seat noticed in a fixture is precisely the remark it files rather than
-    blocks on, so the text this feature newly publishes is enriched for the text that
-    must not be.
-
-    WITHHOLD, DO NOT DROP (`kn-bfbb2a3a`). The unit, the round and the seat are a
-    CLASSIFICATION rather than the secret, and an issue that looks empty by accident is
-    worse than one that says why it is empty — so the body carries the exact command that
-    reads the finding on the internal record. Same shape as §8's own comments: ids, a
-    link, and a pointer.
-    """
-    lines = [
-        f"The Jarvis validation panel raised a non-blocking finding on `{unit_id}`.",
-        "",
-        f"**The finding text is held on the internal record.** `{repo}` is not a "
-        f"repository this OS could establish is private, and a review model's own words "
-        f"are not published to a tracker that may be public.",
-        "",
-        f"Read it with `jarvis validation show {unit_id}`.",
-        "",
-        "---",
-        f"Round {round_no} of `{unit_id}`, raised by the `{seat or 'panel'}` seat as a "
-        f"follow-up rather than a blocker — the review judged the work shippable "
-        f"without it.",
-    ]
-    if pr_url:
-        lines.append(f"Pull request: {pr_url}")
-    return "\n".join(lines)
 
 
 def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
@@ -1826,6 +1857,11 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     alone does not say which change it was written about.
     """
     detail = str(finding.get("detail") or "").strip()
+    # WHAT MAKES THE ISSUE ACTIONABLE, and what `follow_up_admissible` required before
+    # this could be filed at all: the code it is about and the way it goes wrong.
+    where = " ".join(x for x in (str(finding.get("file") or "").strip(),
+                                 str(finding.get("symbol") or "").strip()) if x)
+    failure = str(finding.get("failure") or "").strip()
     footer = [
         "",
         "---",
@@ -1835,7 +1871,10 @@ def _follow_up_body(finding: Mapping[str, Any], *, unit_id: str, round_no: int,
     ]
     if pr_url:
         footer.append(f"Pull request: {pr_url}")
-    return "\n".join([detail or "_The seat recorded no detail._", *footer])
+    return "\n".join([detail or "_The seat recorded no detail._",
+                      *([f"\n**Where:** `{where}`"] if where else []),
+                      *([f"\n**Failure:** {failure}"] if failure else []),
+                      *footer])
 
 
 def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
@@ -1865,10 +1904,16 @@ def filed_follow_ups(store: ProjectStore, *, wo_id: str | None = None,
         # round's filing: items accumulate, and `dropped`/`failed` are the LAST attempt's
         # — the attempt that decided what is still missing.
         rnd = out.setdefault(int(p.get("round_id") or 0),
-                             {"filed": [], "dropped": 0, "failed": 0})
+                             {"filed": [], "withheld": [], "dropped": 0, "failed": 0})
         for item in p.get("items") or ():
             if isinstance(item, Mapping) and item.get("url"):
                 rnd["filed"].append(dict(item))
+        # KEPT, NOT FILED. No URL and nothing to link, so it cannot ride in `filed` —
+        # and a round whose findings all went this way would otherwise read as a round
+        # that raised nothing at all.
+        for item in p.get("withheld") or ():
+            if isinstance(item, Mapping) and item.get("title"):
+                rnd["withheld"].append(dict(item))
         rnd["dropped"] = int(p.get("dropped") or 0)
         rnd["failed"] = int(p.get("failed") or 0)
         if p.get("reason"):
@@ -1998,7 +2043,7 @@ def issues_on(url: str, repo: str) -> bool:
 
 #: What a unit with no linked issue projects. ALWAYS PRESENT, `NO_FOLLOW_UPS`'s rule:
 #: a key that comes and goes renders as silence in Jinja and as a `KeyError` nowhere.
-NO_ISSUES: dict[str, Any] = {"raised": [], "references": []}
+NO_ISSUES: dict[str, Any] = {"raised": [], "references": [], "withheld": []}
 
 
 def issue_index(store: ProjectStore, unit_id: str) -> dict[str, Any]:
@@ -2021,6 +2066,15 @@ def issue_index(store: ProjectStore, unit_id: str) -> dict[str, Any]:
     rather than the tracker's.
     """
     titles = _filed_titles(store, unit_id)
+    # WITHHELD FOLLOW-UPS ARE NOT ISSUES AND ARE STILL THIS ORDER'S. Nothing was opened
+    # on the tracker for them (spec §9 decides the filing, not just the text), so the
+    # only place they can be read is here and on `jarvis issues` — losing them would
+    # trade forty empty issues for forty findings nobody can see.
+    withheld = [{"digest": row["digest"], "title": row["title"], "seat": row["seat"],
+                 "round": row["round"] or 0, "file": row["file"],
+                 "symbol": row["symbol"], "failure": row["failure"],
+                 "detail": row["detail"]}
+                for row in store.internal_follow_ups(unit_id)]
     raised, refs = [], []
     for row in store.issue_links_of(unit_id):
         (raised if row["kind"] == "raised" else refs).append({
@@ -2029,7 +2083,7 @@ def issue_index(store: ProjectStore, unit_id: str) -> dict[str, Any]:
             "state": row["state"] or "",
             "kind": row["kind"], "round": row["round"] or 0,
             "seat": row["seat"] or ""})
-    return {"raised": raised, "references": refs}
+    return {"raised": raised, "references": refs, "withheld": withheld}
 
 
 def _filed_titles(store: ProjectStore, unit_id: str) -> dict[str, str]:
@@ -2058,8 +2112,25 @@ def issue_board(store: ProjectStore, limit: int = 50) -> list[dict[str, Any]]:
     OPEN AND UNKNOWN-STATE ISSUES ONLY. A closed issue's reference count is history, and
     a ranking that carries it is a ranking with nothing to act on at the top.
     """
-    return [row for row in store.issue_board()
-            if (row.get("state") or "") != "CLOSED"][:limit]
+    rows = [{**row, "internal": False} for row in store.issue_board()
+            if (row.get("state") or "") != "CLOSED"]
+    return (rows + internal_board(store))[:limit]
+
+
+def internal_board(store: ProjectStore) -> list[dict[str, Any]]:
+    """The withheld follow-ups, in the shape `issue_board` rows have.
+
+    THE SAME LIST, MARKED. A finding kept off the tracker is still a thing the project
+    might pick up, and a surface that showed only what GitHub has would hide every
+    finding on a public repository — which is most of them. `refs` is 1 by construction:
+    an internal row belongs to the one order that raised it, so nothing can point at it
+    the way a tracker issue can.
+    """
+    return [{"issue_url": "", "number": 0, "repo": "", "title": row["title"],
+             "state": "", "refs": 1, "internal": True, "digest": row["digest"],
+             "units": [{"unit_id": row["unit_id"], "kind": "raised",
+                        "round": row["round"] or 0, "seat": row["seat"] or ""}]}
+            for row in store.internal_follow_ups()]
 
 
 def issue_board_across(project_name: str | None = None,
@@ -2086,7 +2157,8 @@ def issue_board_across(project_name: str | None = None,
             out += [{**row, "project": name} for row in issue_board(store, limit=limit)]
         finally:
             store.close()
-    out.sort(key=lambda row: (-int(row["refs"]), -int(row["number"] or 0)))
+    out.sort(key=lambda row: (-int(row["refs"]), bool(row.get("internal")),
+                              -int(row["number"] or 0)))
     return out[:limit]
 
 

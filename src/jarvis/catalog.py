@@ -392,13 +392,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
-# How many follow-up findings one round may file against the project backlog.
+# How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
-# A BOUND, NOT A JUDGEMENT. Title matching is the only dedupe available — a seat writes a
-# slightly different sentence for the same nit each round — so near-duplicate rows WILL
-# get through. 5 keeps that failure a handful of items a user drops in a minute rather
-# than a backlog nobody can read; findings past it are dropped and a later round may
-# raise them again. Spec §4.4:
+# PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
+# ROUND, a unit judged four times filed four times the cap — twenty issues on
+# wo-0a9ba9b3. What the order has already raised is subtracted before this bounds
+# anything.
+#
+# The near-duplicates this comment used to accept are gone with it: the dedupe keys on
+# the (file, symbol) a finding names plus its claim (`ops.follow_up_claim`), not on the
+# sentence a seat happened to write that round. Spec §4.4:
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 

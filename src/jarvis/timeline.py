@@ -471,11 +471,19 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # submitter; which reviewer said it belongs in the issue body and on
         # `jarvis validation show` (spec §4.7).
         items = [i for i in (p.get("items") or ()) if isinstance(i, dict)]
+        kept = [i for i in (p.get("withheld") or ()) if isinstance(i, dict)]
         dropped, failed = int(p.get("dropped") or 0), int(p.get("failed") or 0)
         parts = [f"#{i.get('number')}" if i.get("number") else str(i.get("url") or "")
                  for i in items]
+        # KEPT IS NOT FILED AND NOT LOST, and the label has to be able to say the third
+        # thing: no issue was opened because the text may not be published there, and the
+        # finding is on the record in full (`ops.file_validation_follow_ups`).
+        if kept:
+            parts.append(f"{len(kept)} kept on the internal record"
+                         + (f" — {p['reason']}" if p.get("reason") and not failed
+                            else ""))
         if dropped:
-            parts.append(f"{dropped} more over the per-round cap")
+            parts.append(f"{dropped} more over the cap")
         # A FINDING THAT COULD NOT BE FILED IS THE INTERESTING ONE. Filing crosses a
         # network, so it can fail where the backlog row it replaced could not, and a
         # reader who is not told simply never learns the remark existed.
@@ -483,8 +491,13 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
             parts.append(f"{failed} could not be filed"
                          + (f" — {p['reason']}" if p.get("reason") else ""))
         if not items:
-            return ("Review raised follow-ups it could not file"
-                    if failed else "Review filed no follow-ups", "; ".join(parts))
+            if failed:
+                return "Review raised follow-ups it could not file", "; ".join(parts)
+            if kept:
+                return (f"Review kept {len(kept)} follow-up"
+                        f"{'' if len(kept) == 1 else 's'} off the tracker",
+                        "; ".join(parts))
+            return "Review filed no follow-ups", "; ".join(parts)
         return (f"Review filed {len(items)} follow-up issue"
                 f"{'' if len(items) == 1 else 's'}", "; ".join(parts))
     if kind == "validation_passed":

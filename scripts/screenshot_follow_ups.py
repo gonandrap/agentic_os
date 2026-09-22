@@ -41,17 +41,34 @@ PORT = 8803
 PR = "https://github.com/gonandrap/agentic_os/pull/263"
 JUDGED = "9b2c1d4e5f60718293a4b5c6d7e8f90123456789"
 
+#: EVERY ONE ADMISSIBLE — `file` and `failure` are what `ops.follow_up_admissible`
+#: requires before a finding may become a ticket (spec §10.5), and a script seeded with
+#: pre-§10 findings would photograph an empty section.
 FINDINGS = [
     {"seat": "maintainer", "round": 1,
-     "title": "Name the retry budget in `_repair`'s docstring",
-     "detail": "The 3-attempt ceiling is a literal in the loop; a reader has to count "
-               "it. Worth a sentence, not worth a round."},
+     "title": "`_repair` retries a conflict against the check budget",
+     "detail": "The 3-attempt ceiling is one literal shared by both axes.",
+     "file": "src/jarvis/landing.py", "symbol": "_repair",
+     "failure": "a conflict that takes three attempts leaves a red check with none"},
     {"seat": "architect", "round": 1,
-     "title": "Fold the two conflict parsers into one",
-     "detail": "`_parse_state` and `_merge_state` read the same field with different "
-               "fallbacks. They agree today."},
+     "title": "`_parse_state` and `_merge_state` disagree on a missing field",
+     "detail": "They read the same field with different fallbacks. They agree today.",
+     "file": "src/jarvis/landing.py", "symbol": "_parse_state",
+     "failure": "a payload with no `state` key parses as CONFLICTING in one and as "
+                "UNKNOWN in the other"},
 ]
 
+
+#: The finding the second order raises, on a tracker that may be public.
+WITHHELD = [
+    {"seat": "security", "round": 1,
+     "title": "`_refund` credits a budget the gate never debited",
+     "detail": "The refund runs on every denial, including one that never spent an "
+               "attempt.",
+     "file": "src/jarvis/landing.py", "symbol": "_refund",
+     "failure": "a denied gate on attempt 1 leaves the order with four attempts of a "
+                "three-attempt budget"},
+]
 
 ORIGIN = "https://github.com/gonandrap/agentic_os.git"
 ISSUES = "https://github.com/gonandrap/agentic_os/issues"
@@ -148,7 +165,40 @@ def order(store, catalog) -> str:
     return str(wo["id"])
 
 
-def seed() -> tuple[Path, str]:
+def withheld_order(store, catalog) -> str:
+    """One work order whose follow-up may NOT be published, so none was filed.
+
+    `FAKE_GH_PRIVATE=0` is the whole difference: the privacy read answers PUBLIC, the
+    seat's words stay off the tracker, and — since spec §10 — the issue stays off it too.
+    The finding is kept whole on the internal record and the page says so.
+    """
+    from jarvis import ops
+
+    wo = ops.create_work_order(
+        "jarvis_os", "Count a repair attempt only where the worker was allowed one",
+        "A gate that blocked the worker still spent its repair budget.")
+    ops.finish(wo["id"], "opened a pull request", pr_url=PR,
+               evidence="uv run pytest tests/ evals/ — 1041 passed")
+    cfg = catalog.project("jarvis_os").validation
+    rnd = store.latest_validation_round(wo_id=wo["id"])
+    assert rnd is not None
+    store.set_validation_head(rnd["id"], JUDGED)
+    store.record_validation_opinion(
+        rnd["id"], "tester", verdict="pass", model="claude-opus-5", latency_ms=15200,
+        reply="Nothing here blocks; one remark filed rather than argued.")
+    os.environ["FAKE_GH_PRIVATE"] = "0"
+    try:
+        ops.file_validation_follow_ups(store, catalog.project("jarvis_os"), dict(rnd),
+                                       WITHHELD, cfg, wo_id=wo["id"])
+    finally:
+        os.environ.pop("FAKE_GH_PRIVATE", None)
+    store.close_validation_round(rnd["id"], "passed", "")
+    store.add_event(wo["id"], "validation_passed", {"round": 1, "round_id": rnd["id"]})
+    store.set_status(wo["id"], "waiting_pr_merge")
+    return str(wo["id"])
+
+
+def seed() -> tuple[Path, str, str]:
     from jarvis import ops
     from jarvis.catalog import load_catalog
     from jarvis.central_store import CentralStore
@@ -172,9 +222,11 @@ def seed() -> tuple[Path, str]:
     ops.start_os(str(catalog), foreground=True)
 
     pstore = ProjectStore(project)
-    wo_id = order(pstore, load_catalog(catalog))
+    loaded = load_catalog(catalog)
+    wo_id = order(pstore, loaded)
+    kept_id = withheld_order(pstore, loaded)
     pstore.close()
-    return catalog, wo_id
+    return catalog, wo_id, kept_id
 
 
 def serve() -> None:
@@ -185,7 +237,7 @@ def serve() -> None:
     uvicorn.run(create_app(), host="127.0.0.1", port=PORT, log_level="warning")
 
 
-def shoot(wo_id: str) -> None:
+def shoot(wo_id: str, kept_id: str) -> None:
     from playwright.sync_api import sync_playwright
 
     SHOTS.mkdir(parents=True, exist_ok=True)
@@ -193,9 +245,18 @@ def shoot(wo_id: str) -> None:
         browser = p.chromium.launch()
         page = browser.new_page(viewport={"width": 1280, "height": 900})
         page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{wo_id}")
-        page.locator("h2", has_text="Validation").first.scroll_into_view_if_needed()
+        page.locator("h2", has_text="Tracker issues").first.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
         page.screenshot(path=SHOTS / "validation-follow-ups.png")
+        # THE OTHER HALF OF THE SAME DECISION (spec §10.1): on a repository the OS
+        # cannot establish is private, no issue is opened at all and the finding is on
+        # the internal record. A shot of the filing case alone would not show it.
+        page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{kept_id}")
+        page.locator("h2", has_text="Tracker issues").first.scroll_into_view_if_needed()
+        page.wait_for_timeout(200)
+        page.screenshot(path=SHOTS / "validation-follow-ups-kept.png")
+        page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{wo_id}")
+        page.wait_for_timeout(200)
         # The TIMELINE is the other rendered surface: an unlabelled event kind renders
         # as the bare kind beside a JSON blob, which is what the new branch prevents.
         page.get_by_role("tab", name="Timeline").click()
@@ -210,10 +271,10 @@ def main() -> int:
     os.environ["JARVIS_HOME"] = tempfile.mkdtemp()
     os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))
-    _catalog, wo_id = seed()
+    _catalog, wo_id, kept_id = seed()
     threading.Thread(target=serve, daemon=True).start()
     time.sleep(2)
-    shoot(wo_id)
+    shoot(wo_id, kept_id)
     print("\n".join(str(q) for q in sorted(SHOTS.glob("validation-follow-ups*.png"))))
     return 0
 
