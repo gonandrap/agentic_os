@@ -1360,6 +1360,39 @@ def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retr
         store.close()
 
 
+def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
+    """GitHub issue #581 on the feature side, and the case that argued the shape of the
+    fix: this hold's event lives on the MANAGER's timeline, so nothing reading the
+    round's own subject could ever recover the cause from it. The round row is the only
+    carrier all three renderers can reach."""
+    from jarvis.claude_cli import UsageLimit, UsageLimitError
+    from jarvis.project_store import VALIDATION_HELD_CAUSE, validation_standing
+
+    fleet.daemon.validator = Validator(UsageLimitError(UsageLimit(
+        message="You've hit your session limit · resets 11:50pm (America/Los_Angeles)",
+        reset_at=time.time() + 3600)))
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.drain()
+
+        row = store.latest_validation_round(fo_id=fo_id)
+        assert row["outcome"] == "failed", "the mechanism layer must not change"
+        assert row["hold_cause"] == VALIDATION_HELD_CAUSE
+        assert validation_standing(row) == ("held for the usage window", "active", "◑")
+
+        # The projection `jarvis fo show` and the feature's dashboard page read.
+        projected = ops.validation_rounds(store, fo_id=fo_id)[-1]
+        assert projected["hold_cause"] == VALIDATION_HELD_CAUSE
+        line = ops.round_line(projected)
+        assert "held for the usage window" in line and "· failed ·" not in line
+    finally:
+        store.close()
+
+
 def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
     """A feature whose plan was released while validation was off has no manager, so a
     rejection would have no addressee and the round's own events would have no timeline

@@ -49,6 +49,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
+from .project_store import validation_standing
+
 log = logging.getLogger(__name__)
 
 #: The gate every merge here rides. `gate_rules.AUTO_MERGE`, spelled through the import
@@ -237,8 +239,15 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                          f"round {n} passed, but which commit it judged was not "
                          f"recorded — it read a worktree rather than the pull request",
                          head_sha=head, round_id=round_id, round_n=n)
+        # THE DECISION IS UNCHANGED — a round that is not `passed` does not merge,
+        # whatever is holding it — and only the SENTENCE is. Interpolating the raw
+        # outcome reported a round waiting on GitHub Actions as "round 3 is failed", in
+        # answer to the one question its reader was asking: why a green, mergeable pull
+        # request had not merged (GitHub issue #581). `validation_standing` is the same
+        # word the badge and `ops.round_line` show.
         return _held(HELD_NOT_PASSED,
-                     f"round {n} is {outcome}" if round_row is not None
+                     f"round {n} is {validation_standing(round_row)[0]}"
+                     if round_row is not None
                      else "the panel has never judged this work order", round_n=n)
 
     if judged != head:

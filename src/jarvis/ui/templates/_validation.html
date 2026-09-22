@@ -28,14 +28,14 @@
          every historical round would be noise, and the auto-merge line below says so
          in words when it matters. #}
       {% if r.head_sha %}<span class="mono sub">@{{ r.head_sha[:10] }}</span>{% endif %}
-      {% if r.outcome == 'passed' %}<span class="st tone-ok"><span class="i">✓</span>passed</span>
-      {% elif r.outcome == 'rejected' %}<span class="st tone-warn"><span class="i">◭</span>rejected</span>
-      {% elif r.outcome == 'escalated' %}<span class="st tone-warn"><span class="i">🙋</span>escalated</span>
-      {% elif r.outcome == 'failed' %}<span class="st tone-bad"><span class="i">✗</span>failed</span>
-      {# Voided: nothing here was for a reviewer, so no seat was asked. Muted rather than
-         warn — the unit settled and nobody is owed a decision. #}
-      {% elif r.outcome == 'void' %}<span class="st tone-muted"><span class="i">∅</span>voided</span>
-      {% else %}<span class="st tone-active"><span class="i">◑</span>{{ r.outcome }}</span>{% endif %}
+      {# THE BADGE IS NOT KEYED ON `outcome`. `failed` is the storage word for a
+         reviewer outage, an unconfigured panel AND a round merely waiting — and this
+         template used to paint all three red, which is how a green pull request read as
+         a failed review for its whole CI window (GitHub issue #581). The word, the tone
+         and the icon come from `project_store.validation_standing`, which `round_line`
+         and `automerge.decide` also render from. #}
+      {% set word, tone, icon = validation_standing(r) %}
+      <span class="st tone-{{ tone }}"><span class="i">{{ icon }}</span>{{ word }}</span>
       <span class="sub">{{ fmt_age(r.ts) }} ago</span>
       {# WHO OPENED IT, and only when the answer is not "a submission did". A round a
          person forced (`jarvis validation force`) must never read afterwards like a

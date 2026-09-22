@@ -171,6 +171,33 @@ def test_a_hold_spends_none_of_the_transport_budget(fleet):
         store.close()
 
 
+def test_a_held_round_reads_as_held_and_not_as_a_failure(fleet):
+    """GitHub issue #581's other hold. `failed` is the storage word for a usage window
+    too, and the CI twin in tests/test_validation_ci_hold.py covers only the other cause
+    — so this is the second write path of `hold_cause` (kn-c712a5d6)."""
+    from jarvis.project_store import (VALIDATION_HELD_CAUSE, ProjectStore,
+                                      validation_standing)
+
+    fleet.daemon.validator = Validator(refused(3600))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    fleet.drain()
+
+    store = ProjectStore(fleet.project)
+    try:
+        row = store.validation_rounds(wo_id=wo["id"])[0]
+        assert row["outcome"] == "failed", "the mechanism layer must not change"
+        assert row["hold_cause"] == VALIDATION_HELD_CAUSE
+        assert validation_standing(row) == ("held for the usage window", "active", "◑")
+
+        line = ops.round_line(ops.validation_rounds(store, wo_id=wo["id"])[0])
+        assert "held for the usage window" in line and "· failed ·" not in line
+    finally:
+        store.close()
+
+
 def test_a_transport_outage_still_escalates_after_three(fleet):
     """The budget survives this change: fast retries are the right answer to a blip."""
     fleet.daemon.validator = Validator(claude_cli.ClaudeCliError("connection reset"))

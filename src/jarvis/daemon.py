@@ -1898,7 +1898,8 @@ class Daemon:
 
         reopens = limit.reset_at or (time.time()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
+                                     hold_cause=VALIDATION_HELD_CAUSE)
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_HELD_CAUSE,
                          "reopens_at": reopens, "error": limit.message[:500]})
@@ -1931,7 +1932,8 @@ class Daemon:
         store.close_validation_round(
             round_id, "failed",
             f"waiting for GitHub to finish the checks on this pull request before "
-            f"judging it: {names}")
+            f"judging it: {names}",
+            hold_cause=VALIDATION_CI_CAUSE)
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_CI_CAUSE,
                          "reopens_at": reopens, "pending": list(pending)})
@@ -2343,7 +2345,8 @@ class Daemon:
         fo_id = fo["id"]
         reopens = limit.reset_at or (time.time()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
+                                     hold_cause=VALIDATION_HELD_CAUSE)
         ops.feature_event(store, fo_id, "validation_failed",
                           {"round": n, "cause": VALIDATION_HELD_CAUSE,
                            "reopens_at": reopens, "error": limit.message[:500],

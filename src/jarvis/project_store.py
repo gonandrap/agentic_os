@@ -134,6 +134,52 @@ VALIDATION_CI_CAUSE = "ci_pending"
 #: spins every tick for ever.
 VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE})
 
+#: HOW A ROUND READS TO A PERSON: one word, one tone, one icon, for every
+#: (outcome, hold_cause) pair. THE POINT IS THAT THERE IS ONE OF THESE — three surfaces
+#: render a round (`ops.round_line`, `ui/templates/_validation.html`, and the auto-merge
+#: hold sentence in `automerge.decide`) and a rule written out three times is a rule that
+#: drifts in two of them (kn-432d0f19: "the display key is a function, not a ternary").
+#:
+#: `failed` is the entry this exists for. It is the storage word for three different
+#: facts — the reviewer was unreachable, no reviewer was configured, and nothing is wrong
+#: at all and the round is merely WAITING — and only `hold_cause` tells them apart. A
+#: waiting round is toned `active`, not `bad`: it is the system working, and painting it
+#: red is what made a green, mergeable pull request read as a failed review for the whole
+#: CI window (GitHub issue #581).
+#:
+#: The tones are the dashboard's own vocabulary (`tone-ok`, `tone-warn`, …); the CLI and
+#: the auto-merge sentence take the word alone.
+VALIDATION_STANDINGS: dict[tuple[str, str | None], tuple[str, str, str]] = {
+    ("passed", None): ("passed", "ok", "✓"),
+    ("rejected", None): ("rejected", "warn", "◭"),
+    ("escalated", None): ("escalated", "warn", "🙋"),
+    # Nothing here was for a reviewer, so nobody judged and nobody is owed a decision.
+    ("void", None): ("voided", "muted", "∅"),
+    ("failed", None): ("failed", "bad", "✗"),
+    ("failed", VALIDATION_CI_CAUSE): ("waiting for CI", "active", "◑"),
+    ("failed", VALIDATION_HELD_CAUSE): ("held for the usage window", "active", "◑"),
+}
+
+
+def validation_standing(round_row: Any) -> tuple[str, str, str]:
+    """The word, tone and icon for one round row. Never raises, never returns nothing.
+
+    An unknown outcome falls through to the outcome itself, toned `active` — `pending`
+    is the ordinary member of that branch, and a value this table has not learned yet
+    must render as itself rather than as a failure.
+
+    A `hold_cause` against any outcome but `failed` is ignored rather than trusted: every
+    non-hold close clears the column, so the pair cannot occur, and rendering off a stale
+    one would be this same defect one layer down.
+    """
+    outcome = str((round_row or {}).get("outcome") or "")
+    cause = (round_row or {}).get("hold_cause") or None
+    if cause not in VALIDATION_HOLDING_CAUSES:
+        cause = None
+    hit = (VALIDATION_STANDINGS.get((outcome, cause))
+           or VALIDATION_STANDINGS.get((outcome, None)))
+    return hit or (outcome, "active", "◑")
+
 
 def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     """The moment this round may go again, or 0 when nothing is holding it back.
@@ -698,6 +744,9 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
     -- reasoning is.
     forced_reason TEXT NOT NULL DEFAULT '',
+    -- WHY this round is `failed` when nothing failed: a `VALIDATION_HOLDING_CAUSES`
+    -- token, NULL on every other close. Also in ADDED_COLUMNS, where the reasoning is.
+    hold_cause TEXT,
     -- The commit this verdict has been CARRIED FORWARD to, and why, when the OS merged
     -- the base into the branch and moved the head itself. Separate from `head_sha`,
     -- which keeps meaning "what the seats read". Also in ADDED_COLUMNS, where the
@@ -1078,6 +1127,22 @@ ADDED_COLUMNS = {
         # written by a submission and of every round written before this column existed.
         # NOT NULL so there is one spelling of "nobody forced this" rather than two.
         "forced_reason": "TEXT NOT NULL DEFAULT ''",
+        # WHY A `failed` ROUND IS NOT A FAILURE — `VALIDATION_CI_CAUSE` while GitHub is
+        # still running the checks, `VALIDATION_HELD_CAUSE` while the account's usage
+        # window is spent. The cause was already on the `validation_failed` event, which
+        # `validation_hold_until` reads for the SCHEDULING decision; it is here because
+        # three RENDERERS need it and none of them can reach that event — a feature
+        # round's lives on its manager's timeline, not on the round's own subject. See
+        # `validation_standing`.
+        #
+        # NULLABLE, and NULL is "nothing is holding this round": the honest reading of
+        # every non-hold close and of every row written before this column existed. NO
+        # BACKFILL, and the reader is what justifies that — a round still genuinely held
+        # is re-closed in place on its next recheck tick and writes the column itself
+        # within `CI_HOLD_RECHECK_SECONDS`, which is the whole population anybody can
+        # misread. A row that keeps NULL is a round that settled, and a settled round is
+        # not waiting for anything.
+        "hold_cause": "TEXT",
         # THE COMMIT THIS VERDICT HAS BEEN CARRIED FORWARD TO, and why. A SECOND column
         # rather than an overwrite of `head_sha`, and that is the whole point: `head_sha`
         # means "the commit the seats read" and must stay true on `jarvis validation
@@ -3531,11 +3596,20 @@ class ProjectStore:
         return dict(row) if row else None
 
     def close_validation_round(self, round_id: int, outcome: str,
-                               reason: str = "") -> None:
+                               reason: str = "",
+                               hold_cause: str | None = None) -> None:
+        """Close a round. `hold_cause` says why a `failed` one is WAITING, not broken.
+
+        WRITTEN ON EVERY CLOSE, including the ones that pass None. A held round is
+        re-closed in place each time the tick picks it up again, so a cause left behind
+        by an earlier hold would outlive the hold and make a genuine outage read as
+        "waiting for CI". Clearing it is the same statement as setting it.
+        """
         assert outcome in VALIDATION_OUTCOMES, outcome
+        assert hold_cause is None or hold_cause in VALIDATION_HOLDING_CAUSES, hold_cause
         self.conn.execute(
-            "UPDATE validation_rounds SET outcome=?, reason=? WHERE id=?",
-            (outcome, reason, round_id),
+            "UPDATE validation_rounds SET outcome=?, reason=?, hold_cause=? WHERE id=?",
+            (outcome, reason, hold_cause, round_id),
         )
 
     def set_validation_head(self, round_id: int, head_sha: str) -> None:

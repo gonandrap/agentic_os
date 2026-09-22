@@ -56,6 +56,7 @@ from .project_store import (
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     ProjectStore,
+    validation_standing,
 )
 
 
@@ -1395,7 +1396,10 @@ def round_line(rnd: dict[str, Any]) -> str:
     if failed:
         parts.append(f"{failed} not filed")
     note = f" · {', '.join(parts)}" if parts else ""
-    return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
+    # THE WORD, not the raw outcome: `failed` is three different facts and only
+    # `validation_standing` knows which one this row is (GitHub issue #581).
+    word, _tone, _icon = validation_standing(rnd)
+    return (f"round {rnd['round']} · {rnd['fingerprint']} · {word}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
             + note
@@ -2098,7 +2102,7 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
     return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
                                   "reason", "pr_url", "config_version", "head_sha",
-                                  "forced_reason")},
+                                  "forced_reason", "hold_cause")},
              # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
              # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
              # dashboard pages read THIS projection, so a key that came and went would
