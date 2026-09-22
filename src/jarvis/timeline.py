@@ -438,11 +438,23 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # read afterwards like a worker re-delivering, and the timeline is where that
         # reading happens. The reason is the ask the operator answered, so like
         # `validation_rejected` it is shown rather than folded away.
+        #
+        # AND THE OS FORCES ONE TOO now that a moved head re-judges itself (spec
+        # docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md §5). The
+        # label separates them for the reason it exists in the first place: a round no
+        # person asked for must not read afterwards as one they did.
         rnd, was = p.get("round"), p.get("was")
-        return (f"Validation forced by hand — round {rnd}" if rnd
-                else "Validation forced by hand",
+        who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
+        return (f"Validation forced {who} — round {rnd}" if rnd
+                else f"Validation forced {who}",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
+    if kind == "validation_rejudge_declined":
+        # The one moved head the OS will NOT re-judge: the round it would open is the
+        # last one, and that one is the user's (same spec, §4).
+        return ("Left for you to re-judge",
+                f"the head is now {str(p.get('head_sha') or '')[:10]} and round "
+                f"{p.get('next_round')} of {p.get('max_rounds')} would be the last")
     if kind == "validation_follow_ups_filed":
         # A SEVENTH kind, and the only one that is not a verdict: the round's
         # non-blocking remarks, filed as issues on the project's own tracker instead of

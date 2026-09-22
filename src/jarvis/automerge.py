@@ -270,6 +270,28 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                     **fields)
 
 
+def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any,
+                        cfg: Any, *, pending_assumptions: bool = False) -> bool:
+    """Would this pull request merge right now if a round had judged the head it has?
+
+    PURE, and it re-derives no condition: it asks `decide` the same question with the
+    live head substituted for the judged one, so the six facts stay in one table. The
+    answer is "the ONLY thing standing between this pull request and a merge is a verdict
+    bound to an older commit" — which is what makes re-judging it worth a round number
+    (spec docs/superpowers/specs/2026-09-19-a-moved-head-re-judges-itself.md section 3).
+
+    **ONLY MEANINGFUL AFTER A `HELD_SHA_MOVED`, and its one caller checks that first.**
+    Substituting the head satisfies conditions 4 and 5 by construction, so on any other
+    hold this would answer about a round that never passed — `HELD_NOT_PASSED` is a
+    verdict the panel meant to stand, and nothing here may read it as a near miss.
+    """
+    head = str(pr.head_oid or "")
+    if not head:
+        return False
+    return decide(round_row, wo, pr, cfg, validated_head=head,
+                  pending_assumptions=pending_assumptions).armed
+
+
 def merge_command(pr_url: str, sha: str) -> str:
     """The exact command a merge runs, as one string. The thing a reviewer authorises.
 
