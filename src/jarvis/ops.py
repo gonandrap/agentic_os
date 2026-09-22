@@ -3469,7 +3469,10 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
     left undecided, which is precisely what that outcome means (`project_store.
     VALIDATION_OUTCOMES`). It costs the submitter no round, it is in none of the OPEN or
     RUNNABLE sets, and `invariants._validation_escalated` cannot re-derive a give-up from
-    it — so the round machine and the reconciler both let the work order go.
+    it — so the round machine and the reconciler both let the work order go. THE SEATS
+    MAY STILL BE READING, and that is the other half: `Daemon._validate_work_order`
+    re-reads this outcome when its validator returns and drops the verdict rather than
+    writing over a round that settled underneath it.
 
     DELIBERATELY NOT `Daemon._void`, which ends with `land_when_cleared`: that would park
     the order back in `waiting_pr_merge` a line before the caller completes or refuses it,

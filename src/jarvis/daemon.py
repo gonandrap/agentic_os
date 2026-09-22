@@ -1667,17 +1667,36 @@ class Daemon:
                     f"nothing new to judge.")
                 return
 
+            failure: claude_cli.ClaudeCliError | None = None
+            verdict = {}
             try:
                 verdict = validator(store, dict(round_row), packet)
-            except claude_cli.UsageLimitError as e:
+            except claude_cli.ClaudeCliError as e:
+                failure = e
+
+            # THE UNIT MAY HAVE SETTLED WHILE THE SEATS READ. The seats take minutes,
+            # and `poll_pull_requests` now visits `validating` — so a pull request
+            # merged or closed by hand closes this round `void` and completes or
+            # refuses the work order underneath it (`ops.void_round_for_settled_pr`).
+            # Every exit below writes an outcome over that `void` and re-lands `wo`,
+            # which is READ FROM BEFORE THE ROUND STARTED: the verdict would overwrite
+            # the settled round, and `land_when_cleared` would park a completed order
+            # back in `waiting_pr_merge`. Nothing here is owed to a question that has
+            # stopped mattering.
+            if not store.round_machine_owns(store.get_validation_round(round_id)):
+                log.info("[%s] %s: round %d settled underneath the panel — dropping "
+                         "the verdict", project.name, wo_id, n)
+                return
+
+            if isinstance(failure, claude_cli.UsageLimitError):
                 # BEFORE the generic outage below, and that ordering is the fix: a spent
                 # window is not a transport fault and must not spend its budget.
-                self._validation_held(store, wo, round_id, n, e.limit)
+                self._validation_held(store, wo, round_id, n, failure.limit)
                 log.info("[%s] %s: round %d held until the usage window reopens",
                          project.name, wo_id, n)
                 return
-            except claude_cli.ClaudeCliError as e:
-                self._validation_outage(store, wo, round_id, n, e)
+            if failure is not None:
+                self._validation_outage(store, wo, round_id, n, failure)
                 return
 
             for seat in verdict.get("seats") or ():

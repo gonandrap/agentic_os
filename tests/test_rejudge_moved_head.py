@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -153,6 +154,38 @@ def judge(fleet, store, panel: Panel, timeout: float = 15.0) -> None:
     while fleet.validating and time.monotonic() < deadline:
         time.sleep(0.01)
     assert not fleet.validating, "a validation round never finished"
+
+
+class HeldPanel(Panel):
+    """A panel stopped MID-ROUND, so the pull request can settle underneath it.
+
+    The five seats take minutes on a real round; every test above settles one in a
+    microsecond, which is the one window the tests below are about."""
+
+    def __init__(self, outcome: str = "passed"):
+        super().__init__(outcome)
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def __call__(self, store, round_row, packet):
+        self.entered.set()
+        assert self.released.wait(15), "the held panel was never released"
+        return super().__call__(store, round_row, packet)
+
+
+def hold(fleet, store, panel: HeldPanel) -> None:
+    """Start the open round and leave it inside the validator."""
+    fleet.validator = panel
+    fleet.validation_tick(fleet.catalog.project("proj_a"), store)
+    assert panel.entered.wait(15), "the round never reached the panel"
+
+
+def release(fleet, panel: HeldPanel, timeout: float = 15.0) -> None:
+    panel.released.set()
+    deadline = time.monotonic() + timeout
+    while fleet.validating and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not fleet.validating, "the released round never finished"
 
 
 def rounds_of(store, wo) -> list[int]:
@@ -555,6 +588,10 @@ def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)                      # the head moved: round 2 is open
     assert store.get_work_order(wo["id"])["status"] == "validating"
+    # AND THE SEATS ARE ACTUALLY READING IT. The merge lands mid-round, which is the
+    # only shape of this that can happen: five seats take minutes.
+    panel = HeldPanel("passed")
+    hold(fleet, store, panel)
 
     fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-22T10:00:00Z", head_oid=PUSHED)
     poll(fleet, store)
@@ -569,6 +606,18 @@ def test_a_hand_merge_during_the_re_judgement_is_noticed_on_the_very_next_poll(
     # The user merged it. The record must not claim the OS did.
     assert store.events_of_kind(wo["id"], "automerge_merged") == []
 
+    # AND THE PANEL FINISHES ANYWAY. Its verdict is about a question that stopped
+    # mattering, so it must not overwrite the `void` — nor re-land the work order it
+    # read before the merge, which `ops.land_when_cleared` would park back in
+    # `waiting_pr_merge` on a pass.
+    release(fleet, panel)
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "completed"
+    assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "void"
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+    assert store.events_of_kind(wo["id"], "validation_passed") == []
+
 
 def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
         fleet, project, fake_gh):
@@ -577,6 +626,8 @@ def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
     store, wo = parked(project)
     artifact(fake_gh, head_oid=PUSHED)
     poll(fleet, store)
+    panel = HeldPanel("passed")
+    hold(fleet, store, panel)
 
     fake_gh.set_pr(PR, "CLOSED", head_oid=PUSHED)
     poll(fleet, store)
@@ -584,6 +635,14 @@ def test_a_hand_closure_during_the_re_judgement_reaches_the_user_the_same_way(
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
     assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "void"
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+    # The mirror of the merge case: a panel settling afterwards must not pass the work
+    # order out of the user's hands and back behind a pull request nobody will merge.
+    release(fleet, panel)
+
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"
+    assert store.validation_rounds(wo_id=wo["id"])[-1]["outcome"] == "void"
+    assert store.events_of_kind(wo["id"], "validation_passed") == []
 
 
 def test_the_widened_poll_nudges_nobody_while_a_round_is_open(fleet, project, fake_gh):
