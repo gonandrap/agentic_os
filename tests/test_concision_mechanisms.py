@@ -161,3 +161,73 @@ def test_the_ab_markers_are_present_and_cut_cleanly():
     start = prompt.index(concision.HOUSE_STYLE_BEGIN)
     end = prompt.index(concision.HOUSE_STYLE_END) + len(concision.HOUSE_STYLE_END)
     assert prompt[:start] + prompt[end:] == "before\n\nafter"
+
+
+# -- the subagent injection (SS5.1, the SessionStart twin) -------------------------------
+
+STANDING = "Run `uv run pytest tests/ evals/` before opening a PR."
+
+
+def _subagent(agent_type="general-purpose", **env):
+    return hooks.handle_hook(
+        {"hook_event_name": "SubagentStart", "session_id": "sess-1",
+         "agent_id": "agent-1", "agent_type": agent_type, "cwd": "/tmp"},
+        env)
+
+
+def test_a_subagent_is_handed_the_house_style_and_the_project_standing_prompt():
+    """The gap this closes, measured on Claude Code 2.1.278: a Task subagent inherits
+    CLAUDE.md, skills, settings and hooks, and NONE of `--append-system-prompt`, the
+    `--agent` persona or anything `SessionStart` injected — `SessionStart` never fires
+    for one (0 of 18 subagent transcripts carry the marker). So both halves have to be
+    in the text, not merely a dict coming back."""
+    out = _subagent(JARVIS_WO_ID="wo-conc01",
+                    JARVIS_APPEND_SYSTEM_PROMPT=STANDING)["hookSpecificOutput"]
+
+    assert out["hookEventName"] == "SubagentStart"
+    context = out["additionalContext"]
+    assert concision.HOUSE_STYLE_BEGIN in context
+    assert "Say each thing ONCE" in context
+    assert "Failing test output" in context
+    assert STANDING in context
+
+
+def test_every_agent_type_gets_it():
+    """No matcher in `settings.base.json`, so the shipped `jarvis-architect` /
+    `jarvis-test-lead` seats are covered too: their definitions say what to think about,
+    not how to write, and the standing prompt is the project's either way."""
+    for agent_type in ("general-purpose", "Explore", "jarvis-architect"):
+        context = _subagent(agent_type, JARVIS_WO_ID="wo-conc01",
+                            JARVIS_APPEND_SYSTEM_PROMPT=STANDING
+                            )["hookSpecificOutput"]["additionalContext"]
+        assert STANDING in context, f"{agent_type} got no standing prompt"
+
+
+def test_a_project_with_no_standing_prompt_still_gets_the_style():
+    """The standing half is optional and its absence must not swallow the style half —
+    nor leave a heading with nothing under it."""
+    context = _subagent(JARVIS_WO_ID="wo-conc01"
+                        )["hookSpecificOutput"]["additionalContext"]
+
+    assert context == concision.house_style()
+
+
+def test_a_session_the_user_opened_gets_nothing():
+    """Same `JARVIS_WO_ID` guard as the refusal above: the OS does not inject its worker
+    contract into a subagent of a session it was not asked to run."""
+    assert _subagent(JARVIS_APPEND_SYSTEM_PROMPT=STANDING) is None
+
+
+def test_the_hook_reads_the_standing_prompt_from_the_environment():
+    """`concision` must not import `catalog`: this hook fires on every Task call and a
+    catalog parse is ~60ms against a ~155ms process (module docstring). An import in
+    this path is a defect, not a style point — so the source is asserted, not assumed."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(concision))
+    imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(tree)
+                 if isinstance(n, ast.Import) for a in n.names}
+    assert not any((m or "").endswith("catalog") for m in imported), imported
+    assert concision.subagent_context({}) == concision.house_style()

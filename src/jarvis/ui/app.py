@@ -29,6 +29,7 @@ from ..project_store import (
     TERMINAL_STATUSES,
     WO_STATUSES,
     ProjectStore,
+    validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
 
@@ -342,9 +343,12 @@ def _decorate_question(q: dict) -> dict:
     putting it here would bury the one thing the user opened the disclosure to read.
     Building it here rather than storing it means it cannot drift from what Neo gets.
     """
-    from .. import digest, neo
+    from .. import digest, issues, neo
     q["digest_view"] = digest.decode(q.get("digest"))
     q["full_context"] = neo.build_question_prompt(q)
+    # `triage` only, and empty everywhere else: the one kind whose subject is a tracker
+    # issue rather than a work order, so it is the one with nowhere else to send a reader.
+    q["issue_url"] = (issues.triage_payload(q) or {}).get("issue_url") or ""
     return q
 
 
@@ -675,6 +679,10 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # A round's word, tone and icon — the same tuple `ops.round_line` and
+        # `automerge.decide` render from, so no surface can call a CI wait a failure on
+        # its own (GitHub issue #581).
+        validation_standing=validation_standing,
         fo_status_meta=FO_STATUS_META, level_tone=LEVEL_TONE, fmt_age=fmt_age,
         fmt_left=fmt_left,
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
@@ -980,6 +988,10 @@ def create_app() -> FastAPI:
         # the same number the enforcement uses.
         cap = ops.work_order_budget(wo_id, pname)
         return render(request, "work_order.html", project=pname, wo=wo, parked=parked,
+                      # What has already been dismissed here. The page's only durable
+                      # answer to "why is this in `needs_review`?" once the flag is
+                      # down — `attention_reason` does not survive an ack (issue 573).
+                      seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,

@@ -1,5 +1,6 @@
 """Handler for `jarvis _hook` — invoked by the Claude Code hooks that the OS injects
-into every managed project's settings (SessionStart / Stop / SessionEnd / Notification).
+into every managed project's settings (SessionStart / SubagentStart / Stop /
+SessionEnd / Notification).
 
 Claude Code pipes a JSON payload on stdin (hook_event_name, session_id, cwd, ...).
 We map the session to a work order (JARVIS_WO_ID env var set at dispatch, falling back
@@ -815,10 +816,13 @@ def capture_memory_write(payload: dict[str, Any], env: dict[str, str]) -> dict[s
 #     MID-TURN re-writes the entire conversation (kn-f94abf34 (2)); SessionStart runs
 #     before that connect, so a fingerprint taken here cannot see the case that costs the
 #     money. Finding 4 action 3 is what settles MCP.
-#   · A PROJECT'S STANDING `append_system_prompt` from the catalog. Importing
-#     `jarvis.catalog` costs ~60ms against a 155ms hook — a 39% tax on every session to
-#     watch a field nothing but a human edit moves. The work order's own override is
-#     covered, because that row is already loaded.
+#   · (no longer true, kept because the reasoning is) A PROJECT'S STANDING
+#     `append_system_prompt` from the catalog was uncovered while reading it meant
+#     importing `jarvis.catalog` — ~60ms against a 155ms hook, a 39% tax on every session
+#     to watch a field nothing but a human edit moves. It now rides in the worker settings
+#     file for the `SubagentStart` hook (`concision.STANDING_PROMPT_ENV`), so the
+#     `worker_settings` digest sees it at no extra cost. The work order's own override was
+#     always covered, because that row is already loaded.
 
 #: Bounds on the memory-file walk, so the hook's cost cannot grow with someone's rules
 #: directory. Exceeding either is not an error: the digest simply covers what fitted, and
@@ -1263,6 +1267,32 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
     return ""
 
 
+def _subagent_start(payload: dict[str, Any],
+                    env: dict[str, str]) -> dict[str, Any] | None:
+    """Re-deliver to a Task subagent the instructions it does not inherit.
+
+    Measured on Claude Code 2.1.278: a subagent inherits CLAUDE.md, the skill listing,
+    the parent's `--settings` (so `permissions.allow`/`deny` still apply to its tool
+    calls) and the hooks; it does NOT inherit the parent's `--append-system-prompt`, its
+    `--agent` persona, or anything `SessionStart` injected -- `SessionStart` never fires
+    for a subagent at all. What is lost is instruction, not authorisation.
+
+    No database and no catalog, for `finish_summary_decision`'s reason: both halves of
+    the text are fixed at spawn, one static and one already in the environment, and a
+    hook that opened the project DB to serve them would pay for it on every Task call.
+    `JARVIS_WO_ID` is therefore the whole test of "is this a worker" -- a session the
+    user opened themselves gets nothing.
+    """
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    return {"wo_id": env["JARVIS_WO_ID"], "event": "SubagentStart",
+            "agent_type": payload.get("agent_type"),
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": concision.subagent_context(env),
+            }}
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -1279,6 +1309,9 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
 
     if event == "PreCompact":
         return _pre_compact(payload, env, cwd)
+
+    if event == "SubagentStart":
+        return _subagent_start(payload, env)
 
     root_env = env.get("JARVIS_PROJECT_PATH")
     root = Path(root_env) if root_env else find_project_root(cwd)

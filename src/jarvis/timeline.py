@@ -268,6 +268,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return "Conversation compacted", ""
     if kind == "attention":
         return "Needs you", p.get("reason") or ""
+    if kind == "acknowledged":
+        # Reached the user as an escaped JSON blob until issue 573. WHO acked is part of
+        # the claim, not decoration: rows written before `ProjectStore.ack_attention`
+        # recorded it carry no `by`, and those are attributed to nobody rather than to
+        # the user — some of them were the OS acking on their behalf, which is the bug.
+        who = p.get("by")
+        return (f"Acknowledged by {who}" if who else "Acknowledged",
+                "\n".join(str(b) for b in (p.get("blockers") or [])))
     if kind == "cost_alarm":
         # Its own line rather than folded into "Needs you": only the FIRST alarm of a
         # turn raises the flag, so the rest exist only here, and this is the row that

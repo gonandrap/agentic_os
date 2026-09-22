@@ -152,13 +152,19 @@ UNLANDED_BLOCKER = ("work not landed — merge its pull request, or record that 
 #: build, because they are different problems and `ops.PrRepair` counts them apart.
 PR_REPAIR_MAX_ATTEMPTS = 3
 
-#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT — so the statuses
-#: the poll asks GitHub about (`Daemon.PR_POLL_STATUSES` is this tuple) and the only ones
-#: in which either repair blocker below may be derived. ONE home for the set, because the
-#: two have to agree: a status the poll nudges in but `true_blockers` does not derive for
-#: raises a give-up flag nothing can re-derive, and INV-ATTENTION-REASON relabels it on
-#: the next tick; a status derived for but never polled asserts a repair that cannot be
-#: happening. Issue #224 widened the poll and this is what keeps the pair honest.
+#: The statuses in which a pull request can SIT WITH NOBODY MOVING IT AND A WORKER CAN BE
+#: ASKED TO FIX IT — so the statuses the poll may NUDGE in (`Daemon.PR_POLL_STATUSES` is
+#: built from this tuple) and the only ones in which either repair blocker below may be
+#: derived. ONE home for the set, because the two have to agree: a status the poll nudges
+#: in but `true_blockers` does not derive for raises a give-up flag nothing can
+#: re-derive, and INV-ATTENTION-REASON relabels it on the next tick; a status derived for
+#: but never polled asserts a repair that cannot be happening. Issue #224 widened the poll
+#: and this is what keeps the pair honest.
+#:
+#: THE POLL IS NOW THE WIDER OF THE TWO. It also visits `validating`, where a round can
+#: sit for minutes while the user merges the pull request by hand — but it does nothing
+#: there except notice the merge or the closure, precisely so this pairing still holds.
+#: `Daemon.PR_POLL_STATUSES` carries the argument; the bound is enforced in the loop.
 #:
 #: Every member is in BLOCKED_STATUSES, or INV-ATTENTION-MISSING would derive the give-up
 #: correctly and then never surface it.
@@ -298,8 +304,14 @@ AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it res
 #: `Daemon.settle_work_order` flags it and `true_blockers` re-derives it, from here, for
 #: the reason PR_CLOSED_BLOCKER gives above. They said two different sentences for one
 #: state until this constant existed.
+#: ENDS WITH THE WAY OUT, like PARKED_BLOCKER and STALE_FINISH_BLOCKER below. It said
+#: "review the session" and stopped there, which is a diagnosis with no action — issue
+#: 573's third fault. Changing the string invalidates every existing ack of it (they are
+#: stored verbatim), so those orders re-flag once, which is the point: none of them ever
+#: named a command.
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
-                          "nothing it started is still running; review the session")
+                          "nothing it started is still running; read its last message, "
+                          "then `jarvis wo send` or `jarvis wo done`")
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
@@ -660,8 +672,20 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # What the user has already looked at and dismissed stops being a blocker — but only
     # exactly that. Anything new still gets through (a pending assumption never can be
     # acknowledged away; `jarvis wo ack` refuses).
-    acked = db.from_json(wo.get("acknowledged_blockers"), []) or []
-    return [b for b in blockers if b not in acked]
+    return [b for b in blockers if b not in acknowledged(wo)]
+
+
+def acknowledged(wo: dict[str, Any]) -> list[str]:
+    """What has already been dismissed on this work order, decoded from the column.
+
+    ONE READER FOR A COLUMN THAT IS STORED AS RAW JSON, because it is also the only
+    durable record of WHY a settled work order was ever flagged: `attention_reason` is
+    NULLed the moment the flag goes down, so every surface that answers "why is this in
+    `needs_review`?" reads this instead (issue 573's second fault). `true_blockers`
+    filters against the same list, so the two can never disagree about what counts as
+    seen.
+    """
+    return db.from_json(wo.get("acknowledged_blockers"), []) or []
 
 
 def stuck_message(store: ProjectStore, wo: dict[str, Any],
@@ -1766,25 +1790,32 @@ def _stale_triage_question(store: ProjectStore,
                            q: dict[str, Any]) -> tuple[str, str] | None:
     """(answer, why) if this priority re-assessment is moot, else None. Issue #240.
 
-    The subject of a `triage` question is the BACKLOG ITEM the filing left behind, not a
-    work order — this is the only kind with no work order behind it at all. So "still
-    live" means that item is still waiting: once the user has promoted it, or dismissed
-    it, or it has gone, nobody can act on the rating any more and the escalation is
-    asking for a ruling that would change nothing.
+    The subject of a `triage` question is THE ISSUE, not a work order — this is the only
+    kind with no work order behind it at all. So "still live" means nobody has started
+    the work yet: once a live work order is on that issue, the rating cannot change
+    anything and the escalation is asking for a ruling nobody would act on.
 
-    A missing item is decisive here, unlike `_stale_alarm_question`, and for the reason
-    that check spells out: the backlog is CENTRAL, so absence means gone rather than
-    "belongs to another project" — the caller has already established this project owns
-    the question before calling.
+    It used to be the backlog item the filing left behind, and the item is still checked
+    when one is there — a question asked before `route_filing` stopped creating them
+    (kn-c5725f1f). The issue test is the one that applies to anything asked since.
     """
     from . import issues
     from .central_store import CentralStore
+    from .project_store import TERMINAL_STATUSES
 
     payload = issues.triage_payload(q)
-    item_id = (payload or {}).get("backlog_id") or ""
-    if not item_id:
+    url = (payload or {}).get("issue_url") or ""
+    if not url:
         # A question whose context nobody can parse. `settle_triage` already refuses to
         # act on one, and closing it here would guess at what it was about.
+        return None
+    for wo in store.work_orders_for_issue(url):
+        if wo["status"] not in TERMINAL_STATUSES:
+            return (f"SUPERSEDED — {wo['id']} is already on this issue",
+                    f"work order {wo['id']} is live on {url}, so the rating changes "
+                    f"nothing")
+    item_id = (payload or {}).get("backlog_id") or ""
+    if not item_id:
         return None
     central = CentralStore()
     try:

@@ -664,20 +664,18 @@ def test_jarvis_gate_deny_does_not_take_the_alarms_flag_back_down(granted):
 
 def test_the_end_to_end_pair_from_proposal_to_a_delivered_nudge(
         started, catalog_file, monkeypatch, tmp_path):
-    """PROPOSE, THEN APPLY, AND `acknowledged_blockers` HOLDING A RE-DERIVED BLOCKER.
+    """PROPOSE, THEN APPLY, AND THE USER'S OWN BLOCKER LEFT STANDING.
 
-    THE OBVIOUS VERSION OF THIS ASSERTION IS UNACHIEVABLE, and `kn-b133acce` is why:
-    §5 asks for an EARLIER ack to be "still on the row", but `ops.ack_attention`
-    overwrites the column with `true_blockers(store, wo)`, whose last line filters out
-    anything already acked — so a pre-existing ack is always either overwritten or
-    filtered to `[]`, whatever the code under test does. Measured on this diff: `[]`.
+    §5 asked for an earlier ack to be "still on the row", which `ops.ack_attention`
+    could never deliver (kn-b133acce). Issue 573 settled it a level up: applying a
+    remedy settles the ALARM and must acknowledge NOTHING on the user's behalf, so the
+    ack path is `ops.ack_os_flag`.
 
-    What discriminates instead is the shape that entry landed on. Give the order a
-    blocker `true_blockers` genuinely re-derives (`status='failed'` makes "worker failed
-    — review and retry" live), let the remedy run, and require THAT string to be in the
-    column afterwards. `ProjectStore.clear_attention` — the forbidden move — leaves it
-    NULL, and `needs_attention == 0` is reached identically by both, so the column is
-    the only thing that tells them apart.
+    Give the order a blocker `true_blockers` genuinely re-derives (`status='failed'`
+    makes "worker failed — review and retry" live), let the remedy run, and require it
+    to be STILL FLAGGED with the column still NULL. `ack_attention` would lower the flag
+    and record a dismissal the user never made; `clear_attention` would NULL the column
+    and discard the dismissals they did.
     """
     daemon, wo_id = _proposed(started, catalog_file, monkeypatch, tmp_path,
                               "FORCE_SUPERVISOR_PROPOSE", "nudge")
@@ -705,10 +703,10 @@ def test_the_end_to_end_pair_from_proposal_to_a_delivered_nudge(
         assert "Where have you got to" in queued[0]["content"]
 
         assert store.get_alarm(alarm["id"])["status"] == "acked"
-        assert wo["needs_attention"] == 0
-        assert wo["acknowledged_blockers"] is not None
-        assert "worker failed — review and retry" in json.loads(
-            wo["acknowledged_blockers"])
+        assert wo["needs_attention"] == 1
+        assert wo["attention_reason"] == "worker failed — review and retry"
+        assert wo["acknowledged_blockers"] is None
+        assert store.events_of_kind(wo_id, "acknowledged") == []
 
         (applied,) = store.events_of_kind(wo_id, "remedy_applied")
         payload = json.loads(applied["payload"])

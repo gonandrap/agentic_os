@@ -228,6 +228,20 @@ def _gate_verdict(data: dict[str, Any]) -> str:
     return "approved" if bool(data.get("approve", False)) else "denied"
 
 
+def _verdict_stated(data: dict[str, Any]) -> bool:
+    """Did Neo actually RULE, or is `denied` only what `_gate_verdict` fell back to?
+
+    `_gate_verdict` collapses the two, which is right for a gate — no explicit yes, no
+    gate — and wrong for every caller that has a third outcome for output nobody could
+    parse. Without this a reply that named no verdict at all is indistinguishable from a
+    deliberate refusal, and `issues.read_triage_verdict` would have to guess.
+    """
+    raw = data.get("verdict")
+    if isinstance(raw, str) and _VERDICT_ALIASES.get(raw.strip().lower()):
+        return True
+    return isinstance(data.get("approve"), bool)
+
+
 def parse_dispatch(data: Any) -> dict[str, str] | None:
     """Normalise the optional `dispatch` block — Neo filing a pre-approved work order
     to correct a self-contradicting ledger (see PERSONA).
@@ -260,6 +274,7 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         "reason": str(data.get("reason") or ""),
         "verdict": verdict,
         "approve": verdict == "approved",
+        "verdict_stated": _verdict_stated(data),
         "dispatch": parse_dispatch(data.get("dispatch")),
         # Carried through unvalidated on purpose: whether a proposed exemption may exist
         # is decided by `gate_rules.propose_exemption`, against canary commands this layer
@@ -293,7 +308,7 @@ def _unparseable_verdict(raw: str) -> dict[str, Any]:
     there for why that mattered.
     """
     return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
-            "dispatch": None,
+            "verdict_stated": False, "dispatch": None,
             "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
 
 

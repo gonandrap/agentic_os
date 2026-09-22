@@ -863,6 +863,9 @@ def test_parse_verdict_tolerates_fences():
     # "not approved" — an answer that never mentions either must never open a gate.
     assert v == {"escalate": False, "answer": "go", "reason": "r",
                  "approve": False, "verdict": "denied", "dispatch": None,
+                 # `denied` here is a FALLBACK, not a ruling, and a caller with a third
+                 # outcome for output nobody could parse has to be able to tell.
+                 "verdict_stated": False,
                  # An answer that proposes no gate exemption proposes none: the empty
                  # string must never reach the rule base as a pattern that matches
                  # everything.

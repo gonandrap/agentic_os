@@ -253,6 +253,18 @@ jarvis issues [project]                    # TRACKER ISSUES THE FLEET KEEPS RUNN
                                            # order's own list — every follow-up it
                                            # raised, across every round — is on
                                            # `jarvis wo show` and its page.
+jarvis issues start <issue-url|#number>    # open a work order ON a tracker issue. THE
+                                           # ROUTE A BUG THAT WAS NOT DISPATCHED TAKES:
+                                           # `jarvis bug report` files the issue and
+                                           # nothing else — no backlog item, because
+                                           # GitHub issues replaced the backlog and the
+                                           # user stopped reading it. So a `low`/`medium`
+                                           # /`high` filing, and a `critical` Neo
+                                           # downgraded or could not settle, all wait on
+                                           # the TRACKER, and this is what picks one up.
+                                           # Hands back the existing work order if one is
+                                           # already live on that issue. `--project` when
+                                           # the issue is not on the OS's own tracker.
 jarvis gate list [--pending]               # privileged-action approvals (merge a PR, ship
                                            # a release). Workers attempt these and get
                                            # blocked; Neo reviews and decides, so most
@@ -322,8 +334,8 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # the (PUBLIC) tracker + Telegram ping.
                                            # Every agent has the report-jarvis-bug skill.
                                            # --priority is REQUIRED and is the ONLY thing
-                                           # that routes the bug: low/medium/high queue
-                                           # in the backlog for the user to promote;
+                                           # that routes the bug: low/medium/high wait on
+                                           # the tracker for `jarvis issues start`;
                                            # critical/blocker are RE-ASSESSED BY NEO
                                            # against the rubric in `--help`, and only if
                                            # Neo confirms does a work order get created

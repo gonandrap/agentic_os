@@ -66,7 +66,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """
     import json as _json
 
-    from . import agent_usage, wiring
+    from . import agent_usage, concision, wiring
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -150,6 +150,13 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
         # parse there would be a 39% tax on a ~155ms hook process.
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
+        # The standing worker instructions, for the `SubagentStart` hook to re-inject:
+        # a subagent inherits none of its parent's `--append-system-prompt`. Resolved
+        # exactly as `worker_session.briefing` resolves it, so the subagent is told what
+        # the worker was told. Env for `JARVIS_GATES`' reason — `concision` must not
+        # import `catalog` (see its module docstring).
+        concision.STANDING_PROMPT_ENV: (wo.get("append_system_prompt")
+                                        or project.worker.append_system_prompt or ""),
         # Buy the 5-minute prompt cache (write 1.25x) instead of the 1-hour one (2x),
         # which Claude Code would otherwise pick for a headless session. Taken from
         # `claude_cli` rather than spelled again: the settings file and the spawn

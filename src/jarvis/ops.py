@@ -56,6 +56,7 @@ from .project_store import (
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     ProjectStore,
+    validation_standing,
 )
 
 
@@ -630,16 +631,16 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         backlog_open = central.list_backlog(status="open")
         for q in escalated_questions:
             # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240):
-            # nothing is blocked on the answer, the bug is sitting in the backlog, and
+            # nothing is blocked on the answer, the bug is sitting on the tracker, and
             # `jarvis neo answer` would try to message a work order that does not exist.
             # Still listed — an unconfirmed `blocker` the user never hears about is the
             # failure this whole path exists to avoid — but pointed at the command that
             # actually resolves it.
             triage = q.get("kind") == "triage"
-            item_id = ""
+            url = ""
             if triage:
                 from . import issues
-                item_id = (issues.triage_payload(q) or {}).get("backlog_id") or ""
+                url = (issues.triage_payload(q) or {}).get("issue_url") or ""
             attention.append({
                 "project": q["project"], "wo_id": q["wo_id"],
                 "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
@@ -650,7 +651,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "release was cut" if triage
                     else "Neo declined to answer for you"),
                 "neo_question_id": q["id"],
-                "decide": (f"jarvis backlog promote {item_id}" if item_id else
+                "decide": (issues.START_COMMAND.format(url=url) if url else
                            f"jarvis neo show {q['id']}") if triage else
                           f"jarvis neo answer {q['id']} \"…\"",
             })
@@ -1395,7 +1396,10 @@ def round_line(rnd: dict[str, Any]) -> str:
     if failed:
         parts.append(f"{failed} not filed")
     note = f" · {', '.join(parts)}" if parts else ""
-    return (f"round {rnd['round']} · {rnd['fingerprint']} · {rnd['outcome']}"
+    # THE WORD, not the raw outcome: `failed` is three different facts and only
+    # `validation_standing` knows which one this row is (GitHub issue #581).
+    word, _tone, _icon = validation_standing(rnd)
+    return (f"round {rnd['round']} · {rnd['fingerprint']} · {word}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
             + note
@@ -2098,7 +2102,7 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
     return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
                                   "reason", "pr_url", "config_version", "head_sha",
-                                  "forced_reason")},
+                                  "forced_reason", "hold_cause")},
              # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
              # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
              # dashboard pages read THIS projection, so a key that came and went would
@@ -3454,6 +3458,43 @@ def mark_backlog_done(wo: dict[str, Any]) -> None:
         central.close()
 
 
+def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
+                              reason: str) -> int | None:
+    """Close an open validation round whose question the pull request just answered.
+
+    Called by the pull-request poll immediately before `complete_merged` or
+    `record_pr_closed`, and only by them. A work order can be `validating` while its pull
+    request is merged or closed by hand — `rejudge_moved_head` opens a round on a head the
+    OS's own repair loop moved, and the user is right there at the pull request — and a
+    round judging a diff that has already landed, or been refused, is spent work whatever
+    it decides.
+
+    `void` and not `passed`, `rejected` or `failed`: nobody judged this and nothing is
+    left undecided, which is precisely what that outcome means (`project_store.
+    VALIDATION_OUTCOMES`). It costs the submitter no round, it is in none of the OPEN or
+    RUNNABLE sets, and `invariants._validation_escalated` cannot re-derive a give-up from
+    it — so the round machine and the reconciler both let the work order go. THE SEATS
+    MAY STILL BE READING, and that is the other half: `Daemon._validate_work_order`
+    re-reads this outcome when its validator returns and drops the verdict rather than
+    writing over a round that settled underneath it.
+
+    DELIBERATELY NOT `Daemon._void`, which ends with `land_when_cleared`: that would park
+    the order back in `waiting_pr_merge` a line before the caller completes or refuses it,
+    and the last writer would be deciding the status by accident. This one closes the
+    round and stops, leaving the ending to the caller that knows it.
+
+    Returns the round number it voided, or None when there was nothing open — the ordinary
+    case, and the reason this is safe to call unconditionally.
+    """
+    rnd = store.latest_validation_round(wo_id=wo["id"])
+    if not rnd or not store.round_machine_owns(rnd):
+        return None
+    store.close_validation_round(rnd["id"], "void", reason)
+    store.add_event(wo["id"], "validation_void",
+                    {"round": rnd["round"], "round_id": rnd["id"], "reason": reason})
+    return int(rnd["round"])
+
+
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
                     merged_at: str | None = None,
                     head_oid: str = "",
@@ -4099,6 +4140,46 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
         finally:
             store.close()
     return {"acknowledged": acknowledged, "skipped": skipped}
+
+
+def ack_os_flag(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Put down an attention flag the OS raised for ITSELF, acknowledging nothing.
+
+    `ack_attention` above is the user saying "I have seen this": it writes every live
+    blocker into `acknowledged_blockers`, and `true_blockers` then filters them out for
+    ever. The supervisor, the remedy applier and Neo's alarm answer were all calling it
+    to take down the flag THEY had raised (`supervisor.ALARM_BLOCKER`), and so dismissed
+    blockers the user had never been shown — issue 573, where an alarm ack silently
+    buried an IDLE_NO_FINISH the user never saw, permanently.
+
+    THERE IS NOTHING NARROW TO ACK, which is why this writes no acknowledgement at all:
+    `ALARM_BLOCKER` is not a string `true_blockers` derives (the alarm row is the memory
+    — see `supervisor._apply`), so there is no entry to add. Instead the blockers are
+    re-derived and the flag either goes down, because nothing is left, or is re-raised
+    against whatever IS left — which is how the blocker the alarm was masking comes back
+    with its own reason rather than disappearing.
+
+    A pending assumption needs no guard here, unlike in `ack_attention`: it is a blocker
+    like any other, so it simply re-flags.
+    """
+    from .invariants import true_blockers
+
+    name, path, _ = find_work_order(wo_id, project_name)
+    store = ProjectStore(path)
+    try:
+        wo = store.get_work_order(wo_id)
+        blockers = true_blockers(store, wo)
+        if blockers:
+            # Only when it would actually change: `flag_attention` writes a timeline row
+            # every call, and re-stating the same reason is noise on the record.
+            if not wo["needs_attention"] or wo.get("attention_reason") != blockers[0]:
+                store.flag_attention(wo_id, blockers[0])
+        elif wo["needs_attention"]:
+            store.lower_attention(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "attention_reason": blockers[0] if blockers
+            else None, "blockers": blockers}
 
 
 def hide_work_order(wo_id: str, hidden: bool = True,
@@ -5192,9 +5273,9 @@ def _triage_promote_hint(q: dict[str, Any]) -> str:
     twin, and best-effort for the same reason: it only ever builds a refusal's tail."""
     from . import issues
 
-    item_id = (issues.triage_payload(q) or {}).get("backlog_id") or "<bl-id>"
-    return (f"it is queued in the backlog, so promote it with: "
-            f"jarvis backlog promote {item_id}")
+    url = (issues.triage_payload(q) or {}).get("issue_url") or "<issue-url>"
+    return (f"it is on the tracker, so start work on it with: "
+            f"{issues.START_COMMAND.format(url=url)}")
 
 
 def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
@@ -5236,7 +5317,7 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         # than the alarm's: its `wo_id` is EMPTY (issue #240), so the delivery below
         # would look up a work order that was never created. What the user is really
         # deciding is whether the bug is worth a work order, and that decision is
-        # `jarvis backlog promote`. Refused HERE as well as in the template, because
+        # `jarvis issues start`. Refused HERE as well as in the template, because
         # `jarvis neo answer` reaches this too (kn-4edb0eb7).
         if q.get("kind") == "triage":
             raise OpsError(f"neo question {question_id} is a bug-priority "

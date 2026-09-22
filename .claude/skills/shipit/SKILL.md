@@ -50,7 +50,14 @@ established.
 2. Cuts branch `release/jarvis-X.Y.Z` from `main`.
 3. Bumps `pyproject.toml` + commits + annotated tag `jarvis-X.Y.Z` **on the release
    branch** — `main` is never modified (done in a throwaway `git worktree`).
-4. **Pushes the release branch and the tag to `origin`.**
+4. **Pushes the release branch and the tag to `origin`**, then **publishes a GitHub
+   release** against the tag. A bare tag shows nothing on `/releases`; the release page
+   is where a version's changelog lives. Its notes are built from
+   `git log --first-parent <previous tag>..<main head being shipped>` — one line per
+   landed PR, plus a compare link — rather than from `gh --generate-notes`, because our
+   tags sit on release branches rather than on main. Best-effort: a missing `gh`, an
+   expired token or a page that already exists prints the command to run by hand and the
+   deploy carries on. Nothing about it can fail a release.
 5. Deploys the tag to `$PRODUCTION_CODE/jarvis_os` from `origin` (clone on first run,
    then `git fetch` + `checkout <tag>` + `uv sync --frozen`), creating a default
    production catalog if none exists.
@@ -78,8 +85,10 @@ scripts/shipit.sh --dry-run       # preview; changes nothing
 ```
 
 Always run `--dry-run` first if the user is unsure of the version, show them the plan,
-then run for real. After shipping, report: the version/tag, the release branch, the prod
-directory, and the `jarvis-ui.service` status.
+then run for real — the dry run prints the exact release notes that would be published,
+so it is also the way to check the changelog before it is public. After shipping, report:
+the version/tag, the release branch, the GitHub release page, the prod directory, and the
+`jarvis-ui.service` status.
 
 The daemon restart is queued (step 8) and lands a few seconds after the script exits —
 **and if you were run by Jarvis, it kills this session**, which is by design and not a

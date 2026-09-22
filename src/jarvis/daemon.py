@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               worker_session)
+               notify, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -101,19 +101,35 @@ PR_POLL_EVERY_TICKS = 24
 #: that escalated into `needs_review` behind a red build completely unpolled, which is
 #: precisely when the user is about to decide whether to merge it.
 #:
-#: THE SAME TUPLE `invariants.true_blockers` DERIVES THE REPAIR BLOCKERS FOR, aliased
-#: rather than repeated: a status this polls and that does not derive raises a give-up
-#: flag nothing can re-derive. See `invariants.PR_REPAIR_STATUSES` for that half.
+#: BUILT FROM the tuple `invariants.true_blockers` derives the repair blockers for,
+#: rather than repeating it: a status this NUDGES in and that does not derive raises a
+#: give-up flag nothing can re-derive. See `invariants.PR_REPAIR_STATUSES` for that half.
+#: The two were the same set until `validating` joined this one; what keeps them honest
+#: now is that the loop runs no repair branch outside `PR_REPAIR_STATUSES`.
 #:
-#: The in-flight statuses (`running`, `dispatching`, `validating`) are deliberately out.
-#: Something already owns those — a live turn, or the round machine, which
-#: `settle_work_order` refuses to touch for the same reason — and `complete_merged` on
-#: one would end a work order out from under a worker that is still writing to it. They
-#: also cannot SIT: whatever is driving them will settle them into a status that is here.
+#: `running` and `dispatching` are deliberately out. A live turn already owns those, and
+#: `complete_merged` on one would end a work order out from under a worker that is still
+#: writing to its branch. They also cannot SIT: whatever is driving them will settle them
+#: into a status that is here.
+#:
+#: `validating` IS IN, and it is the one member that is not in `PR_REPAIR_STATUSES`. What
+#: owns a `validating` order is the round machine, not a worker typing: nothing is writing
+#: to the branch, so the reason the other two in-flight statuses are out does not reach it.
+#: What it CAN do is sit for the length of a whole round — minutes, and
+#: `ops.rejudge_moved_head` made that window routine rather than rare — while the user
+#: merges or closes the pull request by hand and the OS goes on judging a question that
+#: has stopped mattering. Noticing that merge is the promise this poll exists to keep, so
+#: it is kept here too; the round is closed `void` first, which is the outcome that
+#: already means exactly this.
+#:
+#: ONLY THE MERGED AND CLOSED BRANCHES RUN THERE. The repair branches stay bounded by
+#: `PR_REPAIR_STATUSES`, and the loop enforces that rather than trusting the branches'
+#: own guards: a nudge sent in `validating` would raise a give-up flag `true_blockers`
+#: cannot re-derive there.
 #:
 #: `pending` is out too: an order that has not been dispatched has no pull request. So
 #: are the terminal ones — a merged or cancelled work order's pull request is over.
-PR_POLL_STATUSES = PR_REPAIR_STATUSES
+PR_POLL_STATUSES = PR_REPAIR_STATUSES + ("validating",)
 
 #: Look for a work order the transport parked — the usage limit or a broken API — every
 #: N ticks, which is ten seconds at the default 5s interval. Its own cadence rather than
@@ -1651,17 +1667,36 @@ class Daemon:
                     f"nothing new to judge.")
                 return
 
+            failure: claude_cli.ClaudeCliError | None = None
+            verdict = {}
             try:
                 verdict = validator(store, dict(round_row), packet)
-            except claude_cli.UsageLimitError as e:
+            except claude_cli.ClaudeCliError as e:
+                failure = e
+
+            # THE UNIT MAY HAVE SETTLED WHILE THE SEATS READ. The seats take minutes,
+            # and `poll_pull_requests` now visits `validating` — so a pull request
+            # merged or closed by hand closes this round `void` and completes or
+            # refuses the work order underneath it (`ops.void_round_for_settled_pr`).
+            # Every exit below writes an outcome over that `void` and re-lands `wo`,
+            # which is READ FROM BEFORE THE ROUND STARTED: the verdict would overwrite
+            # the settled round, and `land_when_cleared` would park a completed order
+            # back in `waiting_pr_merge`. Nothing here is owed to a question that has
+            # stopped mattering.
+            if not store.round_machine_owns(store.get_validation_round(round_id)):
+                log.info("[%s] %s: round %d settled underneath the panel — dropping "
+                         "the verdict", project.name, wo_id, n)
+                return
+
+            if isinstance(failure, claude_cli.UsageLimitError):
                 # BEFORE the generic outage below, and that ordering is the fix: a spent
                 # window is not a transport fault and must not spend its budget.
-                self._validation_held(store, wo, round_id, n, e.limit)
+                self._validation_held(store, wo, round_id, n, failure.limit)
                 log.info("[%s] %s: round %d held until the usage window reopens",
                          project.name, wo_id, n)
                 return
-            except claude_cli.ClaudeCliError as e:
-                self._validation_outage(store, wo, round_id, n, e)
+            if failure is not None:
+                self._validation_outage(store, wo, round_id, n, failure)
                 return
 
             for seat in verdict.get("seats") or ():
@@ -1898,7 +1933,8 @@ class Daemon:
 
         reopens = limit.reset_at or (time.time()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
+                                     hold_cause=VALIDATION_HELD_CAUSE)
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_HELD_CAUSE,
                          "reopens_at": reopens, "error": limit.message[:500]})
@@ -1931,7 +1967,8 @@ class Daemon:
         store.close_validation_round(
             round_id, "failed",
             f"waiting for GitHub to finish the checks on this pull request before "
-            f"judging it: {names}")
+            f"judging it: {names}",
+            hold_cause=VALIDATION_CI_CAUSE)
         store.add_event(wo["id"], "validation_failed",
                         {"round": n, "cause": VALIDATION_CI_CAUSE,
                          "reopens_at": reopens, "pending": list(pending)})
@@ -2343,7 +2380,8 @@ class Daemon:
         fo_id = fo["id"]
         reopens = limit.reset_at or (time.time()
                                      + worker_session.RATE_LIMIT_FALLBACK_DELAY)
-        store.close_validation_round(round_id, "failed", usage_hold_note(reopens))
+        store.close_validation_round(round_id, "failed", usage_hold_note(reopens),
+                                     hold_cause=VALIDATION_HELD_CAUSE)
         ops.feature_event(store, fo_id, "validation_failed",
                           {"round": n, "cause": VALIDATION_HELD_CAUSE,
                            "reopens_at": reopens, "error": limit.message[:500],
@@ -2560,8 +2598,9 @@ class Daemon:
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
                         body=f"Q: {head}\nWhy: {(verdict['reason'] or '')[:200]}\n"
-                             f"Read it in full: jarvis neo show {q['id']}\n"
-                             f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                             f"Read it and answer it: "
+                             f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                             f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
                         wo_id=q["wo_id"],
                     )
                     if pstore:
@@ -2613,8 +2652,9 @@ class Daemon:
                 body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
                      f"every time it was tried. This is not an escalation: Neo made no "
                      f"decision.\nLast error: {detail[:200]}\n"
-                     f"Read it in full: jarvis neo show {q['id']}\n"
-                     f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                     f"Read it and answer it: "
+                     f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                     f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
                 wo_id=q["wo_id"],
             )
             ppath = paths.get(q["project"])
@@ -2898,7 +2938,8 @@ class Daemon:
                      f"The supervisor could not settle it: {alarm['verdict_reason']}\n"
                      f"Neo declined to decide: {(verdict['reason'] or '')[:200]}\n"
                      f"Read it with: jarvis alarms show {alarm['id']}\n"
-                     f"The question in full: jarvis neo show {q['id']}",
+                     "The question in full: "
+                     f"{notify.neo_question_url(self.catalog, q['id'])}",
                 wo_id=q["wo_id"])
             pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
                 alarm_id=alarm["id"]))
@@ -2917,10 +2958,12 @@ class Daemon:
         pstore.add_event(q["wo_id"], "alarm_advice",
                          {"alarm_id": alarm["id"], "neo_question_id": q["id"],
                           "answer": note})
-        # §2's ack path exactly, `ops.ack_attention` and never `clear_attention`: that
-        # one wipes `acknowledged_blockers` and discards the user's own dismissals.
+        # §2's ack path exactly, `ops.ack_os_flag`: this settles the ALARM, so it puts
+        # down the flag the alarm raised and nothing else. Never `ack_attention` (the
+        # user's blanket dismissal — issue 573), never `clear_attention` (it discards
+        # their own earlier dismissals).
         try:
-            ops.ack_attention(q["wo_id"])
+            ops.ack_os_flag(q["wo_id"])
         except ops.OpsError as exc:
             log.info("alarm %s acked by neo; attention left up: %s", alarm["id"], exc)
         central.add_inbox(
@@ -4120,6 +4163,11 @@ class Daemon:
                 continue
             try:
                 if pr.merged:
+                    # THE ROUND FIRST, if one is open: the pull request has landed, so
+                    # whatever the panel is still judging it about cannot change that.
+                    # No-op on every order that is not `validating`.
+                    ops.void_round_for_settled_pr(
+                        store, wo, "the pull request merged while this round was open")
                     # Deliberately silent. `route_new_inbox` has no level filter, so an
                     # "info" row here would Telegram the user on every merge — about a
                     # merge they just performed themselves. `jarvis wo done` announces
@@ -4143,7 +4191,23 @@ class Daemon:
                     if not store.pr_closure_told(wo["id"]):
                         log.info("[%s] %s closed unmerged — %s needs the user",
                                  project.name, wo["pr_url"], wo["id"])
+                        # Same reason as the merge above, the other way: a pull request
+                        # somebody shut on purpose is not one the panel's verdict decides
+                        # anything about, and the order is on its way to the user.
+                        ops.void_round_for_settled_pr(
+                            store, wo,
+                            "the pull request was closed while this round was open")
                         ops.record_pr_closed(store, wo)
+                elif wo["status"] not in PR_REPAIR_STATUSES:
+                    # `validating`, and the pull request is neither merged nor closed —
+                    # so there is nothing here for this poll to do. EVERY BRANCH BELOW
+                    # EITHER NUDGES A WORKER OR DERIVES A REPAIR EPISODE, and both are
+                    # bounded by `PR_REPAIR_STATUSES` (see `PR_POLL_STATUSES`). Each has
+                    # its own guard that would decline anyway — `heal_pull_request`
+                    # refuses on an open round, `auto_merge` returns on any status but
+                    # `waiting_pr_merge` — but the bound is stated once, here, rather
+                    # than left as the sum of three guards nobody re-checks together.
+                    pass
                 elif self._note_reopened(project, store, wo):
                     # The pull request is OPEN and the record still says it was refused.
                     # Nothing used to write this, so `pr_state` said CLOSED for ever
@@ -5120,25 +5184,24 @@ class Daemon:
         # (`issues.TRIAGE_COMMENT`, review round 2).
         why = (out.get("reason") or "").strip()
         head = (why[:300] + ("…" if len(why) > 300 else "")) or "no reason given"
-        full = f"Neo's reasoning in full: jarvis neo show {q.get('id')}"
+        full = ("Neo's reasoning in full: "
+                f"{notify.neo_question_url(self.catalog, q.get('id'))}")
+        start = issues.START_COMMAND.format(url=out["issue_url"])
         if out["outcome"] == "unconfirmed":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="warning",
                 title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
                 body=(f"{out['issue_url']}\nNeo could not settle the priority "
-                      f"({head}), so NOTHING was dispatched and no release was cut. It "
-                      f"is queued at {out.get('backlog_id') or '(no backlog item)'} — "
-                      f"promote it with `jarvis backlog promote "
-                      f"{out.get('backlog_id') or '<id>'}` if you agree with the "
-                      f"rating.\n{full}"))
+                      f"({head}), so NOTHING was dispatched and no release was cut. The "
+                      f"issue stands at `{out['claimed']}` as a claim; start work on it "
+                      f"with `{start}` if you agree with the rating.\n{full}"))
         elif out["outcome"] == "downgraded":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
                 body=(f"{out['issue_url']}\n{head}\n"
-                      f"Queued at {out.get('backlog_id') or '(no backlog item)'} rather "
-                      f"than dispatched.\n{full}"))
+                      f"Not dispatched. Start work on it with `{start}`.\n{full}"))
 
     def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep the tracker saying what the OS is actually doing. Issue #240.

@@ -14,7 +14,7 @@ from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
 from jarvis.invariants import IDLE_NO_FINISH_BLOCKER, check_project  # noqa: E402
-from jarvis.project_store import ProjectStore  # noqa: E402
+from jarvis.project_store import VALIDATION_CI_CAUSE, ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
 
@@ -336,6 +336,32 @@ def test_the_question_page_holds_the_question_and_its_answer(client, daemon, pro
     assert "CSV or JSON for the export default?" in page
     assert "CSV, and gzip it" in page
     assert f"/wo/proj_a/{wo['id']}" in page  # back to the work order that asked
+
+
+def test_a_triage_question_sends_the_reader_to_the_issue_not_the_backlog(client):
+    """No worker exists to answer a `triage` question (issue #240), so the page offers no
+    reply box — and what it offers instead has to be a route that EXISTS. The filing
+    stopped creating a backlog item (kn-c5725f1f), so `promote it from the backlog` was
+    pointing at a queue that is no longer written."""
+    import json as _json
+
+    from jarvis.neo_store import NeoStore
+
+    url = "https://github.com/someone/repo/issues/41"
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "", "is this really a blocker?", kind="triage",
+                    context=_json.dumps({"issue_url": url, "priority": "blocker"}))
+        neo.mark(q["id"], "escalated", reason="not enough evidence")
+    finally:
+        neo.close()
+
+    page = client.get(f"/neo/question/{q['id']}").text
+    assert "jarvis issues start" in page and url in page
+    # The nav bar still links the backlog page; what must be gone is this block sending
+    # the reader there as the resolution.
+    assert "from the backlog" not in page and "backlog promote" not in page
+    assert 'action="/neo/' not in page, "there is nobody to reply to"
 
 
 def test_a_question_that_does_not_exist_says_so(client):
@@ -2062,6 +2088,40 @@ def test_a_voided_round_reads_as_voided_and_not_as_the_raw_word(client, project)
     # The fall-through badge prints the raw outcome and colours it "in flight", which is
     # the one reading a settled round must not get.
     assert ">void</span>" not in page
+
+
+def test_a_round_waiting_for_ci_is_not_painted_as_a_failure(client, project):
+    """GitHub issue #581. `failed` is the storage word for a CI wait as much as for a
+    reviewer outage, and the red ✗ this page used to print for both is what made a
+    green, mergeable pull request read as a failed review for its whole CI window."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add the export")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="dddd4444")
+    store.close_validation_round(rnd["id"], "failed", "waiting for GitHub: unit (3.13)",
+                                 hold_cause=VALIDATION_CI_CAUSE)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'class="st tone-active"><span class="i">◑</span>waiting for CI</span>' in page
+    assert ">failed</span>" not in page
+    # Not a bare `"tone-bad" not in page`: the stylesheet names every tone.
+    assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
+
+
+def test_a_round_that_really_failed_keeps_the_red_badge(client, project):
+    """The other half, and the one a rendering fix breaks by accident: an outage and an
+    unconfigured panel have no `hold_cause`, nothing is coming back on its own, and they
+    must still read as failures. This also covers every row written before the column
+    existed — they carry NULL, and NULL means "nothing is holding this"."""
+    store = ProjectStore(project)
+    wo = store.create_work_order("add the import")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="eeee5555")
+    store.close_validation_round(rnd["id"], "failed", "the validator could not be reached")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'class="st tone-bad"><span class="i">✗</span>failed</span>' in page
+    assert "waiting for CI" not in page
 
 
 def test_a_unit_that_was_never_validated_gets_no_validation_section(client, project):
