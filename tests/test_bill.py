@@ -39,7 +39,7 @@ def wo(store):
 
 def os_call(wo_id: str, kind: str = "neo_answer", *, label: str = "question",
             ts: float | None = None, cost: float = 0.02, output: int = 900,
-            question_id: int | None = 1) -> None:
+            question_id: int | None = 1, usage_v: int | None = None) -> None:
     """Record one OS-side call, optionally back-dated to a chosen moment.
 
     The timestamp is what the turn attribution keys on, so a test about attribution has
@@ -49,7 +49,8 @@ def os_call(wo_id: str, kind: str = "neo_answer", *, label: str = "question",
                        model="claude-opus-5", question_id=question_id,
                        usage={"total_cost_usd": cost, "input": 10,
                               "cache_write": 5_000, "cache_read": 20_000,
-                              "output": output})
+                              "output": output}
+                       | ({} if usage_v is None else {"usage_v": usage_v}))
     if ts is not None:
         central = CentralStore()
         try:
@@ -515,6 +516,77 @@ def test_a_seal_counted_as_the_session_is_corrected_downward(store, wo, transcri
     assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
 
 
+def test_a_correction_is_not_blocked_by_an_os_call_stamped_the_old_way(
+        store, wo, transcripts, tmp_path):
+    """The defect that made the correction above unreachable on every REAL bill.
+
+    An OS call is a one-shot `claude -p` and its result JSON is never kept, so the
+    version stamped on it can never be refreshed the way a turn's is. It was read as if
+    it spoke for a turn, which made a fresh bill look permanently mid-upgrade: 4,907 of
+    the fleet's 6,102 `agent_calls` rows carry version 2, so on wo-0a9ba9b3 — whose
+    seven turns had all re-derived to version 3 — the guard refused for ever and the
+    disclaimer announced a ceiling that was not there.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-os-call")
+    transcripts("sess-os-call", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=2)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    assert 2 in inflated["total"]["usage_versions"], "the OS call is not stamped"
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+    # ...and the same stamp no longer makes the bill disclose a ceiling it does not have.
+    assert b["accuracy"]["gaps"] == []
+
+
+def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
+        store, wo, transcripts, tmp_path, capsys):
+    """Both renderers announced every re-derivation as detail 'adopted only because it
+    still saw every token the seal held'. On a correction that sentence is false about
+    the one bill it is printed beside, which is the shape of defect this order is
+    about — a plausible claim nobody can check."""
+    from jarvis import cli
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-said")
+    transcripts("sess-said", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    cli._print_provenance(ops.bill(wo["id"])["accuracy"])
+
+    printed = capsys.readouterr().out
+    assert "saw every token the seal held" not in printed
+    assert "the whole session's running total" in printed
+
+
 def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
         store, wo, transcripts, tmp_path):
     """The other way a bill gets smaller, and it must not pass for a correction.
@@ -537,6 +609,9 @@ def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
             for i, own in enumerate(turns, start=1)]
     rows.append(assistant_row("m3", write=900_000, read=900_000, out=9_000, at=1_405))
     transcripts("sess-pruned", rows)
+    # Carrying the same old OS-call stamp as the test above, so the two cases differ in
+    # nothing but the reason the bill shrank.
+    os_call(wo["id"], ts=1_150, usage_v=2)
     store.set_status(wo["id"], "completed")
     sealed = ops.bill(wo["id"], live=True)
     for row in sealed["turn_rows"]:

@@ -908,6 +908,13 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     for ever, since the seal it overwrites was the last record of it. So the fresh
     reading must also see no LESS than the seal did: any gap in `accuracy` that the
     sealed bill did not already carry is evidence that has aged, not a correction.
+
+    IT ASKS ABOUT TURNS AND ONLY TURNS, which `total.usage_versions` cannot answer:
+    that set also holds the stamp of every `agent_calls` row on the bill, and an OS
+    call is a one-shot `claude -p` with no result JSON kept, so its version can never
+    be refreshed the way `ops._turn_usage` refreshes a turn's. Reading the mixed set
+    made every bill carrying a pre-fix OS call permanently ineligible — the defect this
+    docstring used to describe as working.
     """
     from . import claude_cli
 
@@ -915,10 +922,29 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     now_gaps = set((fresh.get("accuracy") or {}).get("gaps") or [])
     if now_gaps - was_gaps:
         return False
-    was = set(sealed["total"].get("usage_versions") or [])
-    now = set(fresh["total"].get("usage_versions") or [])
+    was = _turn_versions(sealed)
+    now = _turn_versions(fresh)
     superseded = {v for v in (*was, *now) if v < claude_cli.USAGE_SCHEMA_VERSION}
     return bool(was & superseded) and not (now & superseded)
+
+
+def _turn_versions(payload: dict[str, Any]) -> set[int]:
+    """Which reading produced the WORKER TURNS of one bill, at any level of it.
+
+    A version-independent figure is the difference between the two populations: the
+    v2-to-v3 correction is about diffing a RESUMED session's running totals, and a
+    one-shot OS call has no previous envelope to diff (`claude_cli.derive_turn_usage`),
+    so its stamp says which parser read it and nothing about its numbers.
+
+    Reads the turn rows every payload already carries, sealed ones included, so this
+    needed no new field and no `PAYLOAD_VERSION` bump. Unrecorded turns are skipped:
+    they have no envelope to have a version, and `_accuracy` discloses them separately.
+    """
+    versions = {row.get("usage_v") or 1
+                for row in payload.get("turn_rows") or [] if row.get("recorded")}
+    for order in payload.get("orders") or []:      # a feature order, one level down
+        versions |= _turn_versions(order)
+    return versions
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
@@ -970,7 +996,10 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
     if turn_rows and not session.found:
         gaps.append("Claude Code's transcript for the worker's session is gone, so any "
                     "turn without a result JSON of its own could not be counted at all.")
-    versions = payload["total"].get("usage_versions") or []
+    # Turn versions, not the bill's mixed set: an OS call's stamp is not a claim about
+    # a turn's reading and printing it here disclosed a ceiling that was not there
+    # (`_turn_versions`).
+    versions = _turn_versions({"turn_rows": turn_rows})
     if 1 in versions:
         gaps.append("Some turns were counted before the modelUsage fix and their result "
                     "JSON is gone too, so their tokens are the old, low reading — a "
