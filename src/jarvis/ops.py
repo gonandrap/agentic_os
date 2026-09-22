@@ -630,16 +630,16 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         backlog_open = central.list_backlog(status="open")
         for q in escalated_questions:
             # A `triage` question is the one kind with NO WORKER BEHIND IT (issue #240):
-            # nothing is blocked on the answer, the bug is sitting in the backlog, and
+            # nothing is blocked on the answer, the bug is sitting on the tracker, and
             # `jarvis neo answer` would try to message a work order that does not exist.
             # Still listed — an unconfirmed `blocker` the user never hears about is the
             # failure this whole path exists to avoid — but pointed at the command that
             # actually resolves it.
             triage = q.get("kind") == "triage"
-            item_id = ""
+            url = ""
             if triage:
                 from . import issues
-                item_id = (issues.triage_payload(q) or {}).get("backlog_id") or ""
+                url = (issues.triage_payload(q) or {}).get("issue_url") or ""
             attention.append({
                 "project": q["project"], "wo_id": q["wo_id"],
                 "title": (f"Neo could not confirm a bug's priority: {q['question'][:60]}"
@@ -650,7 +650,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "release was cut" if triage
                     else "Neo declined to answer for you"),
                 "neo_question_id": q["id"],
-                "decide": (f"jarvis backlog promote {item_id}" if item_id else
+                "decide": (issues.START_COMMAND.format(url=url) if url else
                            f"jarvis neo show {q['id']}") if triage else
                           f"jarvis neo answer {q['id']} \"…\"",
             })
@@ -5087,9 +5087,9 @@ def _triage_promote_hint(q: dict[str, Any]) -> str:
     twin, and best-effort for the same reason: it only ever builds a refusal's tail."""
     from . import issues
 
-    item_id = (issues.triage_payload(q) or {}).get("backlog_id") or "<bl-id>"
-    return (f"it is queued in the backlog, so promote it with: "
-            f"jarvis backlog promote {item_id}")
+    url = (issues.triage_payload(q) or {}).get("issue_url") or "<issue-url>"
+    return (f"it is on the tracker, so start work on it with: "
+            f"{issues.START_COMMAND.format(url=url)}")
 
 
 def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
@@ -5131,7 +5131,7 @@ def neo_answer_escalated(question_id: int, answer: str) -> dict[str, Any]:
         # than the alarm's: its `wo_id` is EMPTY (issue #240), so the delivery below
         # would look up a work order that was never created. What the user is really
         # deciding is whether the bug is worth a work order, and that decision is
-        # `jarvis backlog promote`. Refused HERE as well as in the template, because
+        # `jarvis issues start`. Refused HERE as well as in the template, because
         # `jarvis neo answer` reaches this too (kn-4edb0eb7).
         if q.get("kind") == "triage":
             raise OpsError(f"neo question {question_id} is a bug-priority "

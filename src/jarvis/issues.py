@@ -204,6 +204,11 @@ def dispatches(level: str) -> bool:
 def downgrade_to(claimed: str, stated: str) -> str:
     """Where a Neo downgrade lands, given what (if anything) Neo named.
 
+    **ONLY EVER CALLED ON A VERDICT THAT SAID `deny`** — see `read_triage_verdict`, which
+    routes a verdict nobody could parse to `unconfirmed` instead. `SAFE_DOWNGRADE` is a
+    refusal to dispatch a claim Neo explicitly refused to confirm; it is not a level to
+    put in front of the user when Neo never ruled at all.
+
     FAILS TOWARDS NOT DISPATCHING, in both of the two ways this can go wrong. A level Neo
     did not state, or stated unintelligibly, becomes `SAFE_DOWNGRADE`; and a "downgrade"
     that names a level at or above the claim is not a downgrade at all, so it becomes
@@ -784,8 +789,7 @@ def tracker_project(catalog: Any, repo: str | None = None) -> Any:
 WORK_ORDER_BRIEF = """\
 Fix {url}.
 
-This bug is `{priority}`, confirmed by Neo against the OS's own rubric, which is why it \
-became a work order rather than a backlog item. A release goes out once your fix LANDS.
+{why}
 
 The issue text is reproduced below; it is what the reporting agent saw. Read the issue \
 itself first if anything since then has been added to it.
@@ -797,19 +801,18 @@ not open a second issue for the same thing.
 
 {body}"""
 
-#: The backlog item a filed bug always becomes first. The issue URL is in the text rather
-#: than in a column because the backlog is an OS-wide intake list that knows nothing about
-#: trackers, and a column there would be one more thing for every other intake path to
-#: leave NULL.
-BACKLOG_NOTE = """\
-Filed through `jarvis bug report` as `{priority}`.
+#: `WORK_ORDER_BRIEF`'s `why`, one per route in. They differ in the only thing the worker
+#: could act on differently: whether a release follows the landing.
+TRIAGED_WHY = """\
+This bug is `{priority}`, confirmed by Neo against the OS's own rubric, which is why it \
+became a work order at all. A release goes out once your fix LANDS."""
+STARTED_WHY = """\
+This bug is `{priority}` on the tracker and the user started work on it themselves."""
 
-{url}
-
----
-
-{body}"""
-
+#: THE ROUTE OUT, written once. Every surface that tells the user a bug was not
+#: dispatched names this — the notification, the filing note, the tracker comment — and
+#: naming a command that does not exist is exactly what this replaced.
+START_COMMAND = "jarvis issues start {url}"
 
 def route_filing(issue_url: str, title: str, body: str, priority: str,
                  repo: str | None = None) -> dict[str, Any]:
@@ -819,13 +822,18 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
     the issue exists and an exception here would report "not filed" about a bug that was
     (`bugreport.report_bug`'s rule). Every outcome carries a `reason` the user reads.
 
-    **THE BACKLOG IS WHERE EVERY BUG LANDS**, whatever its priority, and that is what
+    **THE TRACKER IS WHERE EVERY BUG LANDS**, whatever its priority, and that is what
     makes failing closed the default rather than a branch. A `critical` or `blocker`
-    filing is a CLAIM: it goes to the backlog like the rest and a `triage` question goes
-    to Neo, and only Neo confirming it promotes the item out. So a Neo that is off,
-    unreachable or unintelligible leaves the bug exactly where it is — queued, visible,
-    and marked unconfirmed — which is the direction the user asked for. There is no path
-    from a filing to a work order that does not go through a verdict.
+    filing is a CLAIM: the issue is labelled like any other and a `triage` question goes
+    to Neo, and only Neo confirming it becomes a work order. So a Neo that is off,
+    unreachable or unintelligible leaves the bug exactly where it is — on the tracker,
+    visible, and marked unconfirmed — which is the direction the user asked for. There is
+    no path from a filing to a work order that does not go through a verdict.
+
+    **AND NO SECOND QUEUE.** This used to open a `jarvis backlog` item beside the issue,
+    and then tell the user to `jarvis backlog promote` it. The user stopped reading the
+    backlog when GitHub issues replaced it (kn-c5725f1f), so that item was a queue nobody
+    saw. `start_work` is the route out now, and it starts from the issue.
 
     `low`, `medium` and `high` are not re-assessed. They commit the fleet to nothing, so
     there is nothing to guard against.
@@ -859,30 +867,19 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
     except GitHubError as e:
         out["label_error"] = str(e)
 
-    central = CentralStore()
-    try:
-        item = central.add_backlog(
-            spec.name, title,
-            description=BACKLOG_NOTE.format(priority=priority, url=issue_url, body=body),
-            origin_note=f"jarvis bug report ({priority})")
-    finally:
-        central.close()
-    out["backlog_id"] = item["id"]
-
     if not dispatches(priority):
-        out["reason"] = (f"`{priority}` is queued for the user to promote: "
-                         f"`jarvis backlog promote {item['id']}`")
+        out["reason"] = (f"`{priority}` is on the tracker for the user to pick up: "
+                         f"`{START_COMMAND.format(url=issue_url)}`")
         return out
 
     try:
-        out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority,
-                                            item["id"])
+        out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority)
         out["reason"] = (f"`{priority}` claimed — Neo is re-assessing it against the "
                          f"rubric; a work order is created only if Neo confirms")
-    except Exception as e:  # noqa: BLE001 — the issue and the backlog item both exist
+    except Exception as e:  # noqa: BLE001 — the issue exists whatever happens here
         out["reason"] = (f"`{priority}` claimed but NOT confirmed — Neo could not be "
-                         f"asked ({e}). It is queued at {item['id']} and nothing was "
-                         f"dispatched.")
+                         f"asked ({e}). Nothing was dispatched; start it yourself with "
+                         f"`{START_COMMAND.format(url=issue_url)}`.")
     return out
 
 
@@ -931,20 +928,19 @@ Title: {title}
 {body}"""
 
 
-def ask_triage(project: str, issue_url: str, title: str, body: str, priority: str,
-               backlog_id: str) -> int:
+def ask_triage(project: str, issue_url: str, title: str, body: str,
+               priority: str) -> int:
     """Queue the re-assessment. Returns the Neo question id.
 
     The question row IS the pending-triage record — there is no second table and no
     `pending` column anywhere. Everything the daemon needs to act on the verdict travels
     in `context` as JSON, which means a triage that is never answered leaves no state to
-    clean up and no row that could disagree with the backlog.
+    clean up and nothing that could disagree with the tracker.
     """
     from .neo_store import NeoStore
 
     context = json.dumps({"issue_url": issue_url, "title": title,
-                          "priority": priority, "backlog_id": backlog_id,
-                          "body": body[:4000]})
+                          "priority": priority, "body": body[:4000]})
     neo = NeoStore()
     try:
         q = neo.ask(project, "", TRIAGE_QUESTION.format(
@@ -1018,6 +1014,52 @@ def record_applied(store: Any, wo: dict[str, Any], label: str) -> str:
 # -- acting on the verdict ------------------------------------------------------------
 
 
+def read_triage_verdict(claimed: str, verdict: dict[str, Any]) -> tuple[str, str]:
+    """`(outcome, settled)` — what Neo actually ruled on a priority claim.
+
+    THE THIRD OUTCOME IS NOT A FALLBACK, IT IS THE DEFAULT. Until this, anything that was
+    not `approve` was reported as a `downgraded`, and `downgrade_to` supplied a level, so
+    a reply nobody could parse reached the user as "Neo downgraded a `critical` bug to
+    `high`" — a sentence in which every word was invented. `downgraded` now requires that
+    Neo RULED: either the parser read an explicit verdict (`neo._verdict_stated`) or the
+    answer's first word says so in as many letters.
+
+    The answer's first word is read at all because `TRIAGE_QUESTION` tells Neo to put its
+    level there, which is exactly what primes a model to put its RULING there too — and
+    it is the reply the fleet observed (question 493: `answer: approve — confirmed
+    critical`, no `verdict` field, reported to the user as a downgrade). Read here and not
+    in `neo._gate_verdict` on purpose: prose in `answer` must never be able to open a
+    gate, where the only way through is an explicit yes.
+    """
+    from .neo import _VERDICT_ALIASES
+
+    stated = ((verdict.get("answer") or "").strip().split() or [""])[0]
+    stated = stated.strip("`.,:;*").lower()
+    said = _VERDICT_ALIASES.get(stated) or ""
+
+    if verdict.get("approve"):
+        return ("confirmed", claimed)
+    if verdict.get("verdict_stated"):
+        # An explicit deny whose answer opens with "approve" is a reply contradicting
+        # itself; neither half may be acted on.
+        return (("unconfirmed", claimed) if said == "approved"
+                else ("downgraded", downgrade_to(claimed, stated)))
+
+    # No verdict field at all: `approve` is False only because that is what it defaults
+    # to, so the answer is the only thing that can carry a ruling.
+    if said == "approved":
+        return ("confirmed", claimed)
+    if said in ("denied", "dismissed"):
+        return ("downgraded", downgrade_to(claimed, stated))
+    try:
+        level = checked_priority(stated)
+    except ValueError:
+        return ("unconfirmed", claimed)
+    return (("downgraded", level)
+            if PRIORITIES.index(level) < PRIORITIES.index(checked_priority(claimed))
+            else ("unconfirmed", claimed))
+
+
 def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
                   ) -> dict[str, Any]:
     """Route a bug now that Neo has ruled on its priority. The daemon's whole triage step.
@@ -1029,10 +1071,14 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
       job and not this one.
     * **downgraded** (`verdict: deny`) — the priority label is corrected and the item
       stays in the backlog for the user to promote when they choose.
-    * **unconfirmed** (escalated, or output nobody could parse) — nothing at all. The
-      claim stands on the record as a claim, the item waits, and the user is told. The
-      refusal direction is the point: an unconfirmed `blocker` that quietly became a
+    * **unconfirmed** (escalated, or output nobody could parse) — nothing at all, not
+      even a tracker comment: no verdict was reached, so there is no second level to put
+      beside the claim. The claim stands on the record as a claim and the user is told.
+      The refusal direction is the point: an unconfirmed `blocker` that quietly became a
       release is the worse failure.
+
+    Which of the three a verdict is, is `read_triage_verdict`'s decision and nothing here
+    may re-derive it.
 
     The tracker gets a comment carrying BOTH levels in every case where a verdict was
     reached, because the disagreement between the claim and the verdict is what tells the
@@ -1059,15 +1105,9 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         out["outcome"] = "unconfirmed"
         return out
 
-    if verdict.get("approve"):
-        out["outcome"] = "confirmed"
-    else:
-        out["outcome"] = "downgraded"
-        # The FIRST WORD of `answer`, which is what the question asked for. Anything else
-        # lands on `SAFE_DOWNGRADE` — see `downgrade_to`; a level nobody stated must never
-        # be guessed at upwards.
-        stated = ((verdict.get("answer") or "").strip().split() or [""])[0]
-        out["settled"] = downgrade_to(claimed, stated.strip("`.,"))
+    out["outcome"], out["settled"] = read_triage_verdict(claimed, verdict)
+    if out["outcome"] == "unconfirmed":
+        return out
 
     spec = next((p for p in getattr(catalog, "projects", [])
                  if p.name == q.get("project")), None)
@@ -1079,6 +1119,9 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     if out["outcome"] == "confirmed":
         out["wo_id"] = promote_confirmed(spec, payload)
         if out["backlog_id"]:
+            # Only a question asked BEFORE the backlog item stopped being created can
+            # have one. Kept so an upgrade cannot leave an in-flight triage's item open
+            # for ever; nothing written today reaches this.
             central = CentralStore()
             try:
                 central.mark_backlog(out["backlog_id"], "promoted",
@@ -1093,18 +1136,23 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
         comment(url, triage_comment(
             claimed, out["settled"],
             f"A work order is on it: `{out['wo_id']}`." if out["wo_id"] else
-            "Queued in the Jarvis backlog; no work order was created."))
+            f"No work order was created. Start one with "
+            f"`{START_COMMAND.format(url=url)}`."))
     except GitHubError as e:
         out["comment_error"] = str(e)
     return out
 
 
-def promote_confirmed(spec: Any, payload: dict[str, Any]) -> str:
+def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "") -> str:
     """Create the work order a confirmed `critical`/`blocker` earned. Returns its id.
 
     **NO SECOND WORK ORDER FOR ONE ISSUE** (#240 D). An issue that already has a LIVE work
     order hands that one back; one whose work orders have all settled is free to get
     another, which is exactly what a reopened issue needs.
+
+    `why` is the brief's second paragraph, so `start_work` can reuse every other thing
+    this does — that dedupe, `issue_url`/`issue_priority`, the in-progress label — without
+    telling its worker a release is coming.
     """
     from .ops import create_work_order
     from .project_store import TERMINAL_STATUSES, ProjectStore
@@ -1121,8 +1169,9 @@ def promote_confirmed(spec: Any, payload: dict[str, Any]) -> str:
 
     wo = create_work_order(
         spec.name, payload.get("title") or url,
-        description=WORK_ORDER_BRIEF.format(url=url, priority=priority,
-                                            body=payload.get("body") or ""),
+        description=WORK_ORDER_BRIEF.format(
+            url=url, body=payload.get("body") or "",
+            why=why or TRIAGED_WHY.format(priority=priority)),
         origin="jarvis", issue_url=url, issue_priority=priority)
     store = ProjectStore(spec.path)
     try:
@@ -1135,3 +1184,90 @@ def promote_confirmed(spec: Any, payload: dict[str, Any]) -> str:
     finally:
         store.close()
     return str(wo["id"])
+
+
+def issue_body(url: str, repo: str | None = None) -> str:
+    """The issue's text. Its own call because `Issue` is cached by the reference index,
+    where a body nobody reads would be the largest field in the cache."""
+    url = checked_issue_url(url, repo)
+    try:
+        payload = json.loads(_run(["issue", "view", url, "--json", "body"], url=url))
+    except json.JSONDecodeError:
+        return ""
+    return str(payload.get("body") or "") if isinstance(payload, dict) else ""
+
+
+def issue_priority(issue: Issue) -> str:
+    """The level the tracker itself is carrying, or `""` if nobody has rated it."""
+    for level in PRIORITIES:
+        if issue.has(priority_label(level)):
+            return level
+    return ""
+
+
+def issue_ref_url(target: str, repo: str) -> str:
+    """`#123`, `123` or a whole URL — one issue URL. Raises on anything else.
+
+    A bare number is resolved against `repo` and never against whatever host the string
+    might have named, which is `checked_issue_url`'s rule arriving one step earlier.
+    """
+    from .ops import issue_url_for
+
+    ref = (target or "").strip()
+    if ISSUE_URL_RE.match(ref):
+        return ref
+    number = ref.lstrip("#")
+    if not number.isdigit() or int(number) <= 0:
+        raise IssueLifecycleError(
+            f"{target!r} is neither an issue URL nor an issue number",
+            GitHubError.URL_REFUSED)
+    return issue_url_for(repo, int(number))
+
+
+def start_work(target: str, project: str | None = None) -> dict[str, Any]:
+    """Open a work order on a tracker issue. THE ROUTE A BUG THAT WAS NOT DISPATCHED TAKES.
+
+    It used to be `jarvis backlog promote <bl-id>`, because every filing left a backlog
+    item behind. GitHub issues replaced the backlog as the tracker (kn-c5725f1f, the
+    user's instruction), so the filing no longer creates one — and a notification that
+    still named `backlog promote` would be pointing at a route that no longer exists.
+
+    `promote_confirmed` does the work, which is the point of reusing it: the "no second
+    work order for one issue" dedupe, `issue_url`/`issue_priority` and the in-progress
+    label are all decisions already made there, and a second implementation of any of
+    them would be a second answer to the same question.
+    """
+    from . import github
+    from .ops import OpsError, registered_project_paths, resolve_catalog
+
+    catalog = resolve_catalog()
+    if project:
+        spec = next((p for p in getattr(catalog, "projects", [])
+                     if p.name == project), None)
+        if spec is None:
+            raise OpsError(f"project {project!r} is not in the catalog")
+        origin = github.origin_repo(spec.path)
+        if origin is None:
+            raise OpsError(f"project {project!r} has no git `origin`, so it owns no "
+                           f"tracker to start an issue from")
+        repo = f"{origin[0]}/{origin[1]}"
+    else:
+        repo = bug_repo()
+        spec = tracker_project(catalog, repo)
+        if spec is None:
+            raise OpsError(f"no registered project has {repo} as its git `origin` — "
+                           f"name the project with --project")
+    if spec.name not in registered_project_paths():
+        raise OpsError(f"project {spec.name!r} is in the catalog but not registered — "
+                       f"run `jarvis start` first")
+
+    url = issue_ref_url(target, repo)
+    issue = view(url, repo)
+    if issue.closed:
+        raise OpsError(f"{url} is closed — reopen it before starting work on it")
+    level = issue_priority(issue)
+    wo_id = promote_confirmed(
+        spec, {"issue_url": url, "title": issue.title, "priority": level,
+               "body": issue_body(url, repo)},
+        why=STARTED_WHY.format(priority=level or "unrated"))
+    return {"wo_id": wo_id, "project": spec.name, "issue_url": url, "priority": level}

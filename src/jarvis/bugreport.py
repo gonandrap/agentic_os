@@ -348,8 +348,8 @@ def pickup_note(pickup: dict[str, Any]) -> str:
     if pickup.get("wo_id"):
         head = (f"`{level}` confirmed — work order {pickup['wo_id']} in "
                 f"{pickup.get('project') or '?'}")
-    elif pickup.get("backlog_id"):
-        head = f"`{level}` — {pickup['backlog_id']}"
+    elif pickup.get("project"):
+        head = f"`{level}`"
     else:
         head = f"`{level}` — not tracked"
     line = f"{head}: {pickup.get('reason') or ''}".rstrip(": ")

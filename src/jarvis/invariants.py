@@ -1703,25 +1703,32 @@ def _stale_triage_question(store: ProjectStore,
                            q: dict[str, Any]) -> tuple[str, str] | None:
     """(answer, why) if this priority re-assessment is moot, else None. Issue #240.
 
-    The subject of a `triage` question is the BACKLOG ITEM the filing left behind, not a
-    work order — this is the only kind with no work order behind it at all. So "still
-    live" means that item is still waiting: once the user has promoted it, or dismissed
-    it, or it has gone, nobody can act on the rating any more and the escalation is
-    asking for a ruling that would change nothing.
+    The subject of a `triage` question is THE ISSUE, not a work order — this is the only
+    kind with no work order behind it at all. So "still live" means nobody has started
+    the work yet: once a live work order is on that issue, the rating cannot change
+    anything and the escalation is asking for a ruling nobody would act on.
 
-    A missing item is decisive here, unlike `_stale_alarm_question`, and for the reason
-    that check spells out: the backlog is CENTRAL, so absence means gone rather than
-    "belongs to another project" — the caller has already established this project owns
-    the question before calling.
+    It used to be the backlog item the filing left behind, and the item is still checked
+    when one is there — a question asked before `route_filing` stopped creating them
+    (kn-c5725f1f). The issue test is the one that applies to anything asked since.
     """
     from . import issues
     from .central_store import CentralStore
+    from .project_store import TERMINAL_STATUSES
 
     payload = issues.triage_payload(q)
-    item_id = (payload or {}).get("backlog_id") or ""
-    if not item_id:
+    url = (payload or {}).get("issue_url") or ""
+    if not url:
         # A question whose context nobody can parse. `settle_triage` already refuses to
         # act on one, and closing it here would guess at what it was about.
+        return None
+    for wo in store.work_orders_for_issue(url):
+        if wo["status"] not in TERMINAL_STATUSES:
+            return (f"SUPERSEDED — {wo['id']} is already on this issue",
+                    f"work order {wo['id']} is live on {url}, so the rating changes "
+                    f"nothing")
+    item_id = (payload or {}).get("backlog_id") or ""
+    if not item_id:
         return None
     central = CentralStore()
     try:

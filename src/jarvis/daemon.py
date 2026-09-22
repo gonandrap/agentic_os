@@ -54,7 +54,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection,
+from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection, notify,
                worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
@@ -2544,8 +2544,9 @@ class Daemon:
                         project=q["project"], level="warning",
                         title=f"Neo escalated a question from {q['wo_id']}",
                         body=f"Q: {head}\nWhy: {(verdict['reason'] or '')[:200]}\n"
-                             f"Read it in full: jarvis neo show {q['id']}\n"
-                             f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                             f"Read it and answer it: "
+                             f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                             f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
                         wo_id=q["wo_id"],
                     )
                     if pstore:
@@ -2597,8 +2598,9 @@ class Daemon:
                 body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
                      f"every time it was tried. This is not an escalation: Neo made no "
                      f"decision.\nLast error: {detail[:200]}\n"
-                     f"Read it in full: jarvis neo show {q['id']}\n"
-                     f"Answer it with: jarvis neo answer {q['id']} \"...\"",
+                     f"Read it and answer it: "
+                     f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                     f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
                 wo_id=q["wo_id"],
             )
             ppath = paths.get(q["project"])
@@ -2882,7 +2884,8 @@ class Daemon:
                      f"The supervisor could not settle it: {alarm['verdict_reason']}\n"
                      f"Neo declined to decide: {(verdict['reason'] or '')[:200]}\n"
                      f"Read it with: jarvis alarms show {alarm['id']}\n"
-                     f"The question in full: jarvis neo show {q['id']}",
+                     "The question in full: "
+                     f"{notify.neo_question_url(self.catalog, q['id'])}",
                 wo_id=q["wo_id"])
             pstore.flag_attention(q["wo_id"], supervisor.ALARM_BLOCKER.format(
                 alarm_id=alarm["id"]))
@@ -5058,25 +5061,24 @@ class Daemon:
         # (`issues.TRIAGE_COMMENT`, review round 2).
         why = (out.get("reason") or "").strip()
         head = (why[:300] + ("…" if len(why) > 300 else "")) or "no reason given"
-        full = f"Neo's reasoning in full: jarvis neo show {q.get('id')}"
+        full = ("Neo's reasoning in full: "
+                f"{notify.neo_question_url(self.catalog, q.get('id'))}")
+        start = issues.START_COMMAND.format(url=out["issue_url"])
         if out["outcome"] == "unconfirmed":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="warning",
                 title=f"a `{out['claimed']}` bug report is UNCONFIRMED",
                 body=(f"{out['issue_url']}\nNeo could not settle the priority "
-                      f"({head}), so NOTHING was dispatched and no release was cut. It "
-                      f"is queued at {out.get('backlog_id') or '(no backlog item)'} — "
-                      f"promote it with `jarvis backlog promote "
-                      f"{out.get('backlog_id') or '<id>'}` if you agree with the "
-                      f"rating.\n{full}"))
+                      f"({head}), so NOTHING was dispatched and no release was cut. The "
+                      f"issue stands at `{out['claimed']}` as a claim; start work on it "
+                      f"with `{start}` if you agree with the rating.\n{full}"))
         elif out["outcome"] == "downgraded":
             central.add_inbox(
                 project=q.get("project") or "jarvis-os", level="info",
                 title=f"Neo downgraded a `{out['claimed']}` bug to "
                       f"`{out['settled']}`",
                 body=(f"{out['issue_url']}\n{head}\n"
-                      f"Queued at {out.get('backlog_id') or '(no backlog item)'} rather "
-                      f"than dispatched.\n{full}"))
+                      f"Not dispatched. Start work on it with `{start}`.\n{full}"))
 
     def sync_issues(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep the tracker saying what the OS is actually doing. Issue #240.
