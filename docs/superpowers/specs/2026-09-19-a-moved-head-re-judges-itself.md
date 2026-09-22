@@ -76,7 +76,17 @@ sentence naming both commits, and its `validation_forced` event carries `by: "os
 the timeline says "re-judged by the OS" and never "forced by hand". A verdict a person
 did not ask for must not read afterwards as one they did.
 
-## 6. Out of scope
+## 6. When the OS's own round is REJECTED
+
+Below `max_rounds` it goes exactly where every other rejection goes: `Daemon._reject`
+posts the feedback to the `implementor` role and the order stays `validating` until the
+worker takes it up. Nothing about the round being machine-opened changes that, and a
+parked order still has the session that called `jarvis wo finish`, so the role is filled.
+It is NOT the silent park of §7 — `validating` is a state the round machine owns, the
+merge poll only looks at `waiting_pr_merge` and so writes no hold at all, and guard 6
+keeps the round that would ESCALATE out of the machine's hands entirely.
+
+## 7. Out of scope
 
 A second route to the same symptom — `ops.land_finished` parking an order over a
 REJECTED round (wo-7e08ac40, hold `HELD_NOT_PASSED`) — is a different cause and is

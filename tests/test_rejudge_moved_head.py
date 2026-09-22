@@ -478,3 +478,63 @@ def test_raising_the_budget_is_all_the_user_has_to_do(tmp_path, project, jarvis_
 
     assert rounds_of(store, wo) == [1, 2, 3]
     assert store.get_work_order(wo["id"])["status"] == "validating"
+
+
+def test_a_round_the_os_opened_and_the_panel_rejected_goes_back_to_the_worker(
+        fleet, project, fake_gh):
+    """THE OUTCOME THIS CHANGE NEWLY AUTOMATES: the OS opened the round, and the panel
+    refused it. A rejection below `max_rounds` must land where every other rejection
+    lands — feedback in the worker's session — and never in the silent park of
+    wo-7e08ac40, which is `waiting_pr_merge` over a `not_passed` hold with nobody left
+    to act and no flag.
+
+    The session stamp is what `parked` leaves out and every real parked order has:
+    `waiting_pr_merge` is reached through `jarvis wo finish`, which only a dispatched
+    worker can call.
+    """
+    store, wo = parked(project)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+    judge(fleet, store, Panel("rejected"))
+
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    spec = fleet.catalog.project("proj_a")
+    fleet.deliver_envelopes(spec, store)
+    queued = store.queued_messages(wo["id"])
+    assert len(queued) == 1
+    assert "Review feedback (round 2): rejected." in queued[0]["content"]
+
+    fleet.deliver_messages(spec, store)
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "running"                    # the worker has it back
+    assert not store.queued_messages(wo["id"])
+
+
+def test_an_os_rejection_never_parks_the_order_silently(fleet, project, fake_gh):
+    """The other half of the same worry: while the feedback is in flight the order must
+    not read as a settled park. It stays `validating` — a state the round machine owns
+    and `invariants.MESSAGE_STUCK_STATUSES` deliberately leaves to it — the poll writes
+    no hold at all because a parked order is the only thing it looks at, and the
+    envelope names the work order itself as the implementor, so the feedback reached
+    somebody rather than nobody."""
+    store, wo = parked(project)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+    judge(fleet, store, Panel("rejected"))
+    fleet.deliver_envelopes(fleet.catalog.project("proj_a"), store)
+    before = len(store.events_of_kind(wo["id"], "automerge_held"))
+    poll(fleet, store)                                   # the parked-order poll, again
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "validating"
+    assert len(store.events_of_kind(wo["id"], "automerge_held")) == before
+    codes = [db.from_json(e["payload"], {}).get("code")
+             for e in store.events_of_kind(wo["id"], "automerge_held")]
+    assert automerge.HELD_NOT_PASSED not in codes
+    envelope = store.envelopes(subject_wo_id=wo["id"])[-1]
+    assert envelope["state"] == "delivered"
+    assert envelope["delivered_wo_id"] == wo["id"]
