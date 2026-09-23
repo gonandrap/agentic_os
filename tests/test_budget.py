@@ -826,6 +826,31 @@ def test_the_status_reads_with_its_figures(started, store):
     assert "$2.50" in label and "$2.00" in label
 
 
+def test_the_status_label_counts_both_halves_like_every_other_surface(started, store):
+    """Issue #692. The label used to pass `central=None` to `budget.ceiling`, so it
+    printed the WORKER half against the WHOLE cap — a parked order reading under budget,
+    and a status chip contradicting the Budget line on its own page."""
+    from jarvis.central_store import CentralStore
+    from jarvis.invariants import status_label
+
+    wo = ops.create_work_order("proj_a", "capped", description="do it", budget_usd=50.0)
+    bill_the_turn(store, wo["id"], 42.42)
+    central = CentralStore()
+    try:
+        central.add_agent_call("neo", label="question", model="sonnet",
+                               project="proj_a", wo_id=wo["id"], ok=True,
+                               usage={"total_cost_usd": 8.08})
+    finally:
+        central.close()
+    store.set_status(wo["id"], "budget_exhausted")
+
+    label = status_label(store, store.get_work_order(wo["id"]))
+    assert "$50.50" in label and "$50.00" in label
+    assert "$42.42" not in label
+    # ...and it is the same figure the page's Budget line prints.
+    assert ops.work_order_budget(wo["id"])["spent_usd"] == 50.50
+
+
 def test_the_label_does_not_promise_a_retry_that_will_never_come(started, store):
     """A spent order can also hold a booked retry, and only one of the two happens:
     `NOT_RETRIED` means the sweep never relaunches this status."""
