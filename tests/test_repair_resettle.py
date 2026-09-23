@@ -266,6 +266,33 @@ def test_a_turn_the_user_started_is_still_judged(started, project, repaired,
     assert parked_reason(store, row, now=long_after) == STALE_FINISH_BLOCKER
 
 
+def test_a_nudge_batched_behind_a_users_message_reads_as_the_users(
+        started, project, fake_gh, repaired, fake_claude, settle_turns):
+    """`Daemon._deliver` stamps only the FIRST message of a batch, and that is right:
+    the turn carried an instruction the OS did not write, so it is judged and it cannot
+    lift the merge hold."""
+    store = ProjectStore(project)
+    fake_gh.set_pr(PR, "OPEN")
+    started.tick_count = 0                      # a tick that polls: clears the episode
+    poll(started, store)
+
+    ops.send_message(repaired["id"], "squash it before you merge")
+    conflicting(fake_gh)
+    ops.nudge_pr_repair(store, store.get_work_order(repaired["id"]),
+                        ops.PR_CONFLICT, base="main")
+    started.tick_count = 1                      # a tick that delivers but does not poll
+    started.tick()
+    assert settle_turns(store)
+    store.set_status(repaired["id"], "needs_review")
+
+    turn = store.latest_turn(repaired["id"])
+    assert store.turn_opened_by(turn) == "jarvis"
+    assert not ops.resettle_after_repair(store, repaired["id"])
+    row = store.get_work_order(repaired["id"])
+    long_after = float(turn["ended_at"]) + 365 * 24 * 3600
+    assert parked_reason(store, row, now=long_after) == STALE_FINISH_BLOCKER
+
+
 def test_a_dispatch_turn_reports_no_source(started, project):
     wo = ops.create_work_order("proj_a", "add feature X")
     started.tick()
