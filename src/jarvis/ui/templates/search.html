@@ -39,7 +39,7 @@
   </p>
   <div class="panel">
     {% for h in hits %}
-    <div class="row">
+    <div class="row search-hit">
       <span class="st tone-muted" style="width: 8.5em">{{ h.kind.replace('_', ' ') }}</span>
       <div class="grow">
         <a href="{{ h.url }}"><strong>{{ h.title }}</strong></a>

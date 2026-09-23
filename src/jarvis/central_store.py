@@ -587,8 +587,6 @@ class CentralStore:
             (status, promoted_wo_id, item_id),
         )
 
-    # -- knowledge -------------------------------------------------------------------
-
     def search_backlog(self, words: Sequence[str], project: str | None = None,
                        limit: int = 50) -> list[dict[str, Any]]:
         """Backlog items matching `words`, every status — promoted and done included."""
@@ -602,6 +600,8 @@ class CentralStore:
         q.append("ORDER BY _score DESC, created_at DESC LIMIT ?")
         rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
         return db.rows_to_dicts(rows)
+
+    # -- knowledge -------------------------------------------------------------------
 
     def add_knowledge(self, content: str, project: str = "", topic: str = "",
                       tags: str = "", wo_id: str = "") -> dict[str, Any]:

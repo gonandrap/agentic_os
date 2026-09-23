@@ -14,12 +14,12 @@ than they return (Neo question 528).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import db
-from .central_store import CentralStore, headline
-from .neo_store import NeoStore
-from .project_store import ProjectStore
+
+if TYPE_CHECKING:
+    from .project_store import ProjectStore
 
 # Every kind a search can return, in the order a tie is broken — the units of work
 # first, the records about them after.
@@ -80,7 +80,7 @@ def _project_paths(project: str | None) -> dict[str, Path]:
     return paths
 
 
-def _from_project(store: ProjectStore, name: str, words: list[str], kinds: set[str],
+def _from_project(store: "ProjectStore", name: str, words: list[str], kinds: set[str],
                   limit: int) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if "work_order" in kinds:
@@ -127,6 +127,12 @@ def search(query: str, *, project: str | None = None,
     for while looking at that project's page. Knowledge is scoped the way
     `jarvis learn search` scopes it: that project plus the global entries.
     """
+    # Imported here, not at module level: `build_parser` reads KINDS on EVERY cli
+    # invocation, and the stores pull in the whole data layer behind them.
+    from .central_store import CentralStore, headline
+    from .neo_store import NeoStore
+    from .project_store import ProjectStore
+
     words = db.search_words(query)
     if not words:
         return []

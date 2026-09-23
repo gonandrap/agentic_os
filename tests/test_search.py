@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from jarvis import ops, search
+from jarvis.cli import build_parser
 from jarvis.central_store import CentralStore
 from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
@@ -91,8 +92,8 @@ def test_empty_query_returns_nothing(started):
     assert search.search("   ") == []
 
 
-def test_every_kind_is_searched(started):
-    """The six kinds the order named, plus knowledge (Neo question 528)."""
+def _one_of_every_kind():
+    """File one record of each searchable kind, all saying "login spinner"."""
     wo_id = _wo("fix the login spinner")
     path = ops.find_work_order(wo_id)[1]
     store = ProjectStore(path)
@@ -110,28 +111,43 @@ def test_every_kind_is_searched(started):
     central = CentralStore()
     try:
         item = central.add_backlog("proj_a", "retire the login spinner")
-        central.add_knowledge("the login spinner is driven by a cold cache",
-                              project="proj_a", topic="ui")
+        kn = central.add_knowledge("the login spinner is driven by a cold cache",
+                                   project="proj_a", topic="ui")
     finally:
         central.close()
     neo = NeoStore()
     try:
-        q = neo.ask("proj_a", wo_id, "should the login spinner block the page?")
-        qid = q["id"]
+        qid = neo.ask("proj_a", wo_id, "should the login spinner block the page?")["id"]
         neo.record_answer(qid, "no, the spinner is cosmetic")
     finally:
         neo.close()
+    return {"work_order": wo_id, "feature_order": fo["id"], "alarm": alarm["id"],
+            "gate": gate_id, "backlog": item["id"], "neo_question": str(qid),
+            "knowledge": kn["id"]}
 
+
+def test_every_kind_is_searched(started):
+    """The six kinds the order named, plus knowledge (Neo question 528)."""
+    filed = _one_of_every_kind()
     hits = search.search("login spinner")
-    found = {h["kind"]: h["id"] for h in hits}
-    assert found["work_order"] == wo_id
-    assert found["feature_order"] == fo["id"]
-    assert found["alarm"] == alarm["id"]
-    assert found["gate"] == gate_id
-    assert found["backlog"] == item["id"]
-    assert found["neo_question"] == str(qid)
-    assert found["knowledge"].startswith("kn-")
+    assert {h["kind"]: h["id"] for h in hits} == filed
     assert dict(search.counts(hits))["work_order"] == 1
+
+
+def test_every_hit_is_actionable_from_either_surface(started):
+    """A hit carries a page that renders and a `jarvis` command that exists — for EVERY
+    kind, not just the work order. Spec section 4."""
+    filed = _one_of_every_kind()
+    client = _client()
+    parser = build_parser()
+    seen = set()
+    for hit in search.search("login spinner"):
+        seen.add(hit["kind"])
+        assert client.get(hit["url"].split("#")[0]).status_code == 200, hit
+        words = hit["ref"].split()
+        assert words[0] == "jarvis" and words[-1] == filed[hit["kind"]], hit
+        parser.parse_args(words[1:])   # the command the hit prints is a real one
+    assert seen == set(search.KINDS)
 
 
 def test_kind_filter_and_unknown_kind(started):
