@@ -364,6 +364,9 @@ class WorkerDefaults:
     # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
+    # Whether the lead must delegate file edits to its crew. §7 of
+    # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
+    require_crew: bool = True
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -1792,6 +1795,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
+        require_crew = w.get("require_crew", True)
+        if not isinstance(require_crew, bool):
+            raise _err(f"project {name}: worker.require_crew must be true or false, "
+                       f"got {require_crew!r}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -1807,6 +1814,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             feature_budget_usd=_parse_budget(
                 w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
                 os_cfg.default_feature_budget_usd),
+            require_crew=require_crew,
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

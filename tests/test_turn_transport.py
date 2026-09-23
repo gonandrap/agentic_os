@@ -419,3 +419,52 @@ def _poll_until_settled(store, timeout: float = 15.0) -> list[dict]:
             return settled
         time.sleep(0.05)
     return []
+
+
+# -- the transport is DECLARED, not assumed --------------------------------------------
+# §3 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. Every rule that
+# depends on a turn being one-shot reads this key rather than hardcoding today's answer —
+# hardcode it and the day `spawn_background` acquires a production caller, every refusal
+# below becomes a lie the OS tells its own workers.
+
+
+def _worker_env(project) -> dict:
+    from jarvis.catalog import ProjectSpec
+    from jarvis.dispatch import _write_worker_settings
+
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    out = _write_worker_settings(spec, {"id": "wo-tt01", "title": "t"})
+    return json.loads(out.read_text())["env"]
+
+
+def test_worker_settings_declare_headless_transport(project, jarvis_home) -> None:
+    assert _worker_env(project)[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_HEADLESS
+
+
+def test_transport_value_comes_from_claude_cli_constant(project, jarvis_home) -> None:
+    """The argument the file already makes for `PROMPT_CACHE_5M_ENV`: the launcher and
+    the settings file must not be able to disagree about what a turn is."""
+    import inspect
+
+    from jarvis import dispatch
+
+    assert claude_cli.TRANSPORT_HEADLESS == "headless"
+    source = inspect.getsource(dispatch._write_worker_settings)
+    assert '"headless"' not in source and "'headless'" not in source
+
+
+def test_background_spawn_declares_background_transport(project, monkeypatch) -> None:
+    """The other transport names itself too, or §4 would refuse a job in the one session
+    where nothing kills it."""
+    seen: dict = {}
+
+    def fake_run(args, cwd=None, timeout=120, env_extra=None):
+        seen["env_extra"] = env_extra
+        return "job id: bg-1"
+
+    monkeypatch.setattr(claude_cli, "_run", fake_run)
+    claude_cli.spawn_background("do it", project, "[WO wo-tt01] t")
+
+    assert seen["env_extra"][claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_BACKGROUND

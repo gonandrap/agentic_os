@@ -79,8 +79,9 @@ def test_core_contract_is_under_the_budget():
     assert len(core) < worker_brief.CORE_BUDGET_CHARS, (
         f"core contract is {len(core)} chars — over the "
         f"{worker_brief.CORE_BUDGET_CHARS} budget")
-    # The whole bare prompt shrank: it measured 6032 chars before the split.
-    assert len(p) < 4500, f"bare worker prompt is {len(p)} chars"
+    # The whole bare prompt shrank: it measured 6032 chars before the split. 4500 until
+    # the crew block (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) bought its place.
+    assert len(p) < 5000, f"bare worker prompt is {len(p)} chars"
 
 
 def test_index_names_every_section_and_says_fetching_is_one_command():
@@ -282,3 +283,34 @@ def test_cli_brief_bare_lists_the_sections(jarvis_home, capsys):
     assert rc == 0
     for name in SECTION_NAMES:
         assert name in out.out
+
+
+# -- the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) -------------------------
+
+def test_worker_core_names_both_crew_seats():
+    p = _prompt()
+    assert "jarvis-spec-writer" in p and "jarvis-implementer" in p
+    assert "# Your crew" in p
+
+
+def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
+    from jarvis import worker_brief
+    core = "\n".join(worker_brief.core_contract("wo-crew01", "t", "p1",
+                                                has_knowledge=False))
+    for kept in ("git", "pr", "`jarvis", "review"):
+        assert kept in core.lower()
+    # the lead's own editing is refused by a hook, so the block states the mechanism
+    assert "refused" in core.lower()
+
+
+def test_planner_core_omits_crew_block():
+    from jarvis import worker_brief
+    core = "\n".join(worker_brief.core_contract("wo-crew02", "t", "p1",
+                                                has_knowledge=False, kind="planner"))
+    assert "jarvis-spec-writer" not in core
+    assert "# Your crew" not in core
+
+
+def test_template_version_bumped_for_crew():
+    from jarvis.bootstrap import TEMPLATE_VERSION
+    assert TEMPLATE_VERSION >= 12

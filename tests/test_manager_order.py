@@ -433,20 +433,24 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     assert f"jarvis wo finish {child['id']}" in worker_prompt
 
 
-def test_a_manager_gets_the_worker_assets_and_not_the_planning_seats(boot, project):
-    """`install_agent_assets` branches on `kind == "planner"`, so a manager falls to the
-    worker path — which is what it should get. Pinned because it is a fall-through: the
-    manager kind is nowhere in that function, and nothing else would notice if the branch
-    became `kind != "worker"`."""
+def test_a_manager_gets_the_skills_and_neither_crew_nor_planning_seats(boot, project):
+    """`install_agent_assets` now names all three kinds, and a manager is none of them: it
+    gets the skills every session gets and no agent definitions at all. Pinned because it
+    is still a fall-through — a manager coordinates, it does not write the code, so the
+    worker crew (spec 2026-09-23-the-crew-a-worker-must-use.md §5) is not its to delegate
+    to, and nothing else in that function would notice if the branch moved."""
     boot(validation=True)
 
     manager_roots = bootstrap.install_agent_assets(project, "manager")
     worker_roots = bootstrap.install_agent_assets(project, "worker")
     planner_roots = bootstrap.install_agent_assets(project, "planner")
 
-    assert manager_roots == worker_roots
-    assert len(planner_roots) == len(worker_roots) + 1
-    assert not any("agent-seats" in str(r) for r in manager_roots)
+    assert len(manager_roots) == 1, "skills only"
+    assert len(worker_roots) == len(planner_roots) == 2
+    assert not any("agent-seats" in str(r) or "agent-crew" in str(r)
+                   for r in manager_roots)
+    assert any("agent-crew" in str(r) for r in worker_roots)
+    assert any("agent-seats" in str(r) for r in planner_roots)
 
 
 # -- 6. filing remediation work under the feature --------------------------------------
