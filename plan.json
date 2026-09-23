@@ -1,0 +1,53 @@
+{
+  "summary": "A new order type, `jarvis io`, that analyses observed OS misbehaviour, reports root causes with quoted evidence, and files the fix orders the user accepts — plus one knowledge entry per accepted finding.",
+  "design_doc": "docs/superpowers/specs/2026-09-23-improvement-orders.md",
+  "children": [
+    {
+      "key": "persistence",
+      "title": "Add the improvement-order kind, its CLI, and the feature-order kind filters",
+      "spec_section": "2 — Persistence and the CLI surface",
+      "description": "First piece: nothing dispatches yet. Touch project_store.py, ops.py, cli.py and src/jarvis/testing.py only. Own tests/test_improvement_orders.py and the `kind` case added to tests/test_schema_upgrade.py; no sibling adds to either. Do NOT add the dispatch branch (a sibling owns dispatch.py and Daemon.plan_features's analyst loop) — your `plan_features` change is only the filter that stops a planner being opened for an improvement order. Do not add WO_KINDS 'analyst'; that sibling adds it. Leave `jarvis fo` behaviour and tests/test_feature_orders.py untouched.",
+      "acceptance": "tests/test_improvement_orders.py proves: `io create` stores kind='improvement' and metadata.evidence_refs verbatim; refuses empty -d, unregistered project, and no --ref, each naming the fix; list/show/cancel/budget round-trip; show prints counts first. PAIRED filters — an improvement order is absent from `fo list`, feature_status_counts, feature_summary and the flagged listings and gets no planner, while a feature order is still present in every one. Pin that feature_children excludes an analyst row and that feature_order_for_planner matching one does not trip INV-NEO-ESCALATIONS-LIVE. tests/test_schema_upgrade.py: a row written before the column reads back 'feature'. io- and fo- both pass the shared id-prefix predicate; a bogus prefix fails."
+    },
+    {
+      "key": "analyst",
+      "title": "Dispatch the analyst work order with its own briefing",
+      "spec_section": "3 — Dispatch and the analyst briefing",
+      "description": "Runs in parallel with the `report` piece, which owns findings.py, ops.submit_findings and the `jarvis io report` verb — so name that command in your prompt text and do not implement it. Own tests/test_analyst_dispatch.py; tests/test_improvement_orders.py belongs to the piece that landed the schema and you must not add to it. The `improvement_order` fixture in src/jarvis/testing.py already exists — build on it. Touch project_store.py's WO_KINDS, daemon.py, dispatch.py and supervisor.py only; the kind filters in ops.py are already in place.",
+      "acceptance": "tests/test_analyst_dispatch.py proves: one daemon tick on a `pending` improvement order files exactly ONE kind='analyst' work order (parent_id the io id, the observation verbatim as description), stores it in plan_wo_id, moves the order to `planning`, and a second tick files no second analyst. The analyst branch of dispatch.build_worker_prompt and of supervisor says produce a diagnosis not a fix, names `jarvis io report <io-id> --from-file`, renders every stored evidence ref with the command that reads it, and never says open a pull request or `jarvis wo finish`. Controls beside each: a worker still gets the worker contract, a planner still gets the planner prompt and its two seats, an analyst gets no seats. Assert argv through the fake_claude fixture; never invoke real claude.",
+      "needs": ["persistence"]
+    },
+    {
+      "key": "report",
+      "title": "Validate and store the findings report",
+      "spec_section": "4 — The findings report and its validator",
+      "description": "Runs in parallel with the `analyst` piece, which owns dispatch.py, daemon.py and WO_KINDS — so assume an analyst work order exists and do not create one. New module src/jarvis/findings.py, ops.submit_findings, and the `jarvis io report` verb in cli.py. Reuse plans._description_problems rather than copying its rules; do not edit plans.py or tests/test_plan_validator.py. Own tests/test_findings_validator.py and tests/test_findings_submit.py. Land `a_report` in src/jarvis/testing.py beside the existing `improvement_order` fixture. The review verb is a later piece's.",
+      "acceptance": "tests/test_findings_validator.py, mirroring tests/test_plan_validator.py and using no store, proves parse_report names EVERY problem at once in FindingsError.problems, one case per rejection in section 4.3, with a negative control beside each — in particular a description opening with an ordinal is ACCEPTED, `proposed_orders: []` is ACCEPTED, and 6 findings pass while 7 need a top-level justification. tests/test_findings_submit.py proves: validation happens before any write (a rejected report stores nothing and leaves the status unchanged); findings store as pending; the order reaches plan_review; the analyst is settled once and a resubmission does not re-settle it; any other status is refused with the status named; a resubmission replaces the report wholesale.",
+      "needs": ["persistence"]
+    },
+    {
+      "key": "review",
+      "title": "Decide findings, file the proposed orders, write the learnings",
+      "spec_section": "5 — Review, proposed orders, and auto-learnings",
+      "description": "The stored report and findings.py already exist; add ops.review_findings, the `jarvis io review` verb, and the `filed_orders` resolution on the existing ops.show_improvement_order plus its CLI rendering. Write a NEW function: do not extend ops.review_plan, and do not touch tests/test_feature_orders.py. Own tests/test_findings_review.py. Knowledge writes go through ops.learn_add, never CentralStore.add_knowledge. The dashboard consumes your `filed_orders` payload and belongs to the next piece; raise and clear the flag with flag_feature_attention / clear_feature_attention and render nothing.",
+      "acceptance": "tests/test_findings_review.py proves: accepting writes exactly ONE knowledge entry via ops.learn_add (topic os-failure-mode, tags carrying the io id, wo_id the analyst's, first line the root cause as a rule); files each proposed order in the finding's OWN project, including one whose project differs from the improvement order's; every filed order has parent_id NULL, metadata.origin_io set, and the io id in its description's first line, with the paired control that a released feature order's child still has parent_id. `jarvis io show` lists each accepted finding's filed orders with their CURRENT status, re-read live (change one order's status and the listing changes), and renders a deleted one as deleted instead of dropping it. A rejection with no feedback is refused; with feedback it adds a Neo learning and plan_question_id stays NULL. Unknown key, already-decided key and --accept-all with a rejection are refused. Deciding the last finding completes the order, including all-rejected. A filing failure keeps the flag up, raises one inbox row, leaves the decision and the knowledge entry standing, and a retried accept files without a second entry.",
+      "needs": ["report"]
+    },
+    {
+      "key": "surfaces",
+      "title": "Improvement-order dashboard page, attention line and cost rollup",
+      "spec_section": "6 — Surfaces: the page, attention, and cost",
+      "description": "ops.review_findings, ops.submit_findings and the `filed_orders` payload already exist; your POST routes call ops and hold no logic, and the page reads that payload rather than re-resolving any order. Touch ui/app.py, a new ui/templates/improvement_order.html, project.html, cli.py's cost prefix, and the attention reason in ops.submit_findings. Extend tests/test_ui.py beside its feature-page block and tests/test_cost_report.py; add tests/test_io_attention.py. The kind-aware label mapping goes in project_store.py beside FO_STATUSES, imported by all three renderers. CLAUDE.md is the last piece's.",
+      "acceptance": "tests/test_ui.py proves the page renders the counts-first line, the observation, the evidence refs, the analyst's status linked to its work-order page, and one card per finding with all five fields plus its proposed orders; an accepted finding's card lists the orders it filed, each linked to its own page with its current status; a pending card POSTs accept and reject-with-a-required-reason; an unknown io id renders a page, not a traceback; the project page lists open improvement orders without expanding findings. tests/test_io_attention.py proves exactly ONE flag is raised with review_headline as its reason and a decide string containing `jarvis io review <io-id>`, that an order in `planning` raises none, and that repeated daemon.tick() never re-raises or re-writes it. The labels analysing / findings awaiting you appear in all three renderers from one mapping, with the control that a feature order still reads planning / plan_review. tests/test_cost_report.py: `jarvis cost io-…` reports the analyst's session as non-zero worker spend and a completed order's bill seals exactly once.",
+      "needs": ["review"]
+    },
+    {
+      "key": "dogfood",
+      "title": "Document jarvis io in the crib sheet and run the first real improvement order",
+      "spec_section": "7 — Dogfood and the operator documentation",
+      "description": "Everything the run needs is already shipped; add no product code. Edit CLAUDE.md's crib sheet only, and extend tests/test_persona.py — no sibling touches either. Do not edit evals/llm/test_jarvis_judgment.py or reorder CLAUDE.md's operator sections. The real run is evidence for the pull request, not a test and not a committed file. You are the engineer, not the analyst: you do not write the report, decide any finding, or file the orders it proposes.",
+      "acceptance": "tests/test_persona.py asserts CLAUDE.md carries a `jarvis io` crib block naming all five verbs and saying io means improvement order, and its existing operator-directives-precede-dev-mode test still passes unchanged. Either run `JARVIS_EVALS_LLM=1 uv run pytest evals/llm/test_jarvis_judgment.py` and report all 14 scenarios in the pull request body, or say plainly there that it was not run and why. Then the run: file the order against wo-dd8668fa with its three refs, let it finish, and quote `jarvis io show <io-id>` verbatim in the pull request. DONE is the run happening and being quoted, not the report saying any particular thing — if it recommends the foreground retry rather than the no-background-tasks prompt rule, report that as a finding about the analyst prompt and do not edit it away.",
+      "needs": ["analyst", "surfaces"]
+    }
+  ]
+}
