@@ -73,3 +73,16 @@ def test_planner_design_doc_is_not_checked():
     `Agent profile` appendix — and `plans` validates it on those terms."""
     env = dict(ENV, JARVIS_WO_KIND="planner")
     assert _write(SPEC, "# Title\n", env=env) is None
+
+
+def test_either_missing_is_a_refusal_not_only_both():
+    """OR, not AND. A document with a problem and no fix is the exact defect the user
+    raised on wo-dd8668fa; requiring both to be absent would let it straight through."""
+    problem_only = "# T\n\n## The problem\n\nBroken.\n"
+    fix_only = "# T\n\n## The fix\n\nMechanism.\n"
+    neither = "# T\n\n## Notes\n\nx\n"
+
+    assert _decision(_write(SPEC, problem_only)) == "deny"
+    assert _decision(_write(SPEC, fix_only)) == "deny"
+    assert _decision(_write(SPEC, neither)) == "deny"
+    assert _write(SPEC, CONFORMING) is None

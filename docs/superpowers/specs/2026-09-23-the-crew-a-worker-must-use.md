@@ -270,7 +270,7 @@ to, and that is a different failure from forgetting.
 Catalog: `tests/test_catalog.py::test_worker_require_crew_defaults_true`,
 `tests/test_catalog.py::test_worker_require_crew_parsed`.
 
-## 8. A spec without a problem and a fix is refused at the write
+## 8. A spec missing EITHER its problem or its fix is refused at the write
 
 **What it does.** Refuses to let a spec file exist without the two sections this document is
 built on.
@@ -279,8 +279,10 @@ built on.
 the same Edit/Write branch, on `Write` only.
 
 Denies when the tool is `Write`, `tool_input.file_path` has a `specs/` path component and ends
-`.md`, and `tool_input.content` contains NO markdown heading matching a problem
-(`problem`, `what is broken`) AND NO heading matching a fix (`fix`, `solution`). Matching is
+`.md`, and `tool_input.content` is MISSING EITHER a markdown heading matching a problem
+(`problem`, `what is broken`) OR a heading matching a fix (`fix`, `solution`). Either one
+missing is a refusal — a document with a problem and no fix is the exact defect the user
+raised on wo-dd8668fa, so requiring both to be absent would let it through. Matching is
 case-insensitive and anchored to markdown headings (`^#{1,6}\s`), never to body prose — a spec
 that merely says "the problem" in a sentence has not got a section.
 

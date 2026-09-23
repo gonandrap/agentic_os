@@ -49,7 +49,7 @@ is. A spec that quietly patches a symptom buys a second bug later.
 State the rejected alternatives, each with the reason it loses. The obvious fix is what a
 reviewer will propose; answer it in the document.
 
-A `Write` of a `specs/*.md` with no problem heading and no fix heading is REFUSED by a
+A `Write` of a `specs/*.md` MISSING EITHER heading — no problem, or no fix — is REFUSED by a
 PreToolUse hook. Matching is on markdown headings, case-insensitive — a sentence in the
 body saying "the problem" is not a section. That refusal is the floor, not the bar: a
 conforming shape with no evidence in it still fails the lead's review.

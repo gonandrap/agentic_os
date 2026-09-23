@@ -106,8 +106,13 @@ def test_implementer_states_tdd_no_background_and_no_lead_commands(project, jarv
 def test_spec_writer_states_the_problem_and_fix_contract(project, jarvis_home):
     root = _crew_root(bootstrap.install_agent_assets(project, kind="worker"))
     text = (root / ".claude" / "agents" / "jarvis-spec-writer.md").read_text()
-    assert "root cause" in text.lower()
-    assert "refused" in text.lower()      # the hook is named as the check, not built here
+    lower = text.lower()
+    # the two sections the seat exists to guarantee, each named as a required section
+    assert "the problem" in lower and "the fix" in lower
+    assert "root cause" in lower
+    # and the seat states the rule the way the hook enforces it: EITHER missing refuses
+    assert "missing either" in lower
+    assert "refused" in lower              # the hook is named as the check, not built here
 
 
 def test_unwired_serena_does_not_touch_the_wired_copy(project, jarvis_home):
@@ -121,7 +126,15 @@ def test_unwired_serena_does_not_touch_the_wired_copy(project, jarvis_home):
 
 
 def test_wiring_config_deselection_reaches_the_crew(project, jarvis_home):
-    from jarvis import wiring
+    """Deselecting Serena must reach the SEAT DEFINITIONS, not merely `serena_wired`:
+    a seat left naming `mcp__plugin_serena_serena__find_symbol` in a project without
+    Serena sends the crew to a tool that is not there."""
+    from jarvis.worker_session import briefing_for
     spec = ProjectSpec(name="proj_a", path=project,
                        wiring=WiringConfig(disabled_plugins=("serena@claude-plugins-official",)))
-    assert wiring.serena_wired(spec.wiring) is False
+    dirs = briefing_for(spec, {"id": "wo-crew03", "title": "t", "kind": "worker"})
+    crew = next(Path(d) for d in dirs["add_dirs"] if Path(d).name == "agent-crew")
+    for seat in (crew / ".claude" / "agents").glob("*.md"):
+        text = seat.read_text()
+        assert "mcp__plugin_serena_serena__" not in text, seat.name
+        assert "not wired for this project" in text, seat.name

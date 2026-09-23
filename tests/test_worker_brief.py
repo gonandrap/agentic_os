@@ -303,12 +303,47 @@ def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
     assert "refused" in core.lower()
 
 
-def test_planner_core_omits_crew_block():
-    from jarvis import worker_brief
-    core = "\n".join(worker_brief.core_contract("wo-crew02", "t", "p1",
-                                                has_knowledge=False, kind="planner"))
-    assert "jarvis-spec-writer" not in core
-    assert "# Your crew" not in core
+def test_planner_prompt_names_no_crew_through_the_production_path():
+    """Not `core_contract(kind="planner")` — the real briefing a planner is dispatched
+    with. A planner never reaches the worker branch at all, so a unit test on the
+    argument would pass even if every planner were told to delegate to a seat it was
+    never handed."""
+    from jarvis.dispatch import build_worker_prompt
+    planner = dict(WO, id="wo-crew02", kind="planner")
+    out = build_worker_prompt(planner, SPEC)
+    assert "# Your crew" not in out
+    assert "jarvis-spec-writer" not in out and "jarvis-implementer" not in out
+
+
+def test_manager_prompt_names_no_crew_through_the_production_path():
+    from jarvis.dispatch import build_worker_prompt
+    manager = dict(WO, id="wo-crew03", kind="manager")
+    out = build_worker_prompt(manager, SPEC)
+    assert "# Your crew" not in out
+    assert "jarvis-spec-writer" not in out and "jarvis-implementer" not in out
+
+
+def test_the_same_path_with_kind_worker_does_carry_the_crew():
+    """The other half: the assertions above must fail for the right reason, not
+    because `build_worker_prompt` never emits the block for anyone."""
+    from jarvis.dispatch import build_worker_prompt
+    for kind in (None, "worker"):
+        wo = dict(WO, id="wo-crew04")
+        if kind:
+            wo["kind"] = kind
+        out = build_worker_prompt(wo, SPEC)
+        assert "# Your crew" in out
+        assert "jarvis-spec-writer" in out and "jarvis-implementer" in out
+
+
+def test_build_worker_prompt_passes_the_kind_down():
+    """`core_contract` takes `kind`; a production caller has to hand it over or the
+    default silently decides for every work order."""
+    import inspect
+
+    from jarvis import dispatch
+    source = inspect.getsource(dispatch.build_worker_prompt)
+    assert "kind=str(wo.get(\"kind\")" in source
 
 
 def test_template_version_bumped_for_crew():
