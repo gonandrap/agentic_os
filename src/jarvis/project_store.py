@@ -3373,6 +3373,23 @@ class ProjectStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def turn_opened_by(self, turn: dict[str, Any] | None) -> str:
+        """Who wrote the message that opened this turn — `wo_messages.source`.
+
+        "" for a dispatch, for a turn whose message row is gone, and for anything else
+        that has no `msg_id`. The repair sources (`ops.PrRepair.source`) are what issue
+        #705 defect 3 needs: a turn the OS itself opened with a nudge, and explicitly
+        forbade to call `jarvis wo finish`, is not a worker that stopped without
+        finishing. `Daemon._deliver` stamps the FIRST message of a delivered batch, so a
+        nudge behind a user's own message reads as the user's — which is right: that
+        turn carried an instruction the OS did not write.
+        """
+        if not turn or turn.get("msg_id") is None:
+            return ""
+        row = self.conn.execute("SELECT source FROM wo_messages WHERE id=?",
+                                (turn["msg_id"],)).fetchone()
+        return str(row["source"]) if row else ""
+
     def turn_usage_before(self, wo_id: str, seq: int) -> dict[str, Any] | None:
         """The usage envelope of the last turn recorded before `seq`, or None.
 

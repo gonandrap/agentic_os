@@ -594,6 +594,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "pr_checks_rearmed":
         return ("Failing checks — attempts given back, the gate had refused them",
                 f"{p.get('attempts')} attempts restored")
+    # "It fixed itself" has to be PROVABLE, which is the whole reason this event exists
+    # rather than a bare status change (issue #705).
+    if kind == "pr_repair_resettled":
+        return ("Back in the merge queue — the reason it was held is gone",
+                f"was {p.get('was')}" if p.get("was") else "")
     # THE ONLY `automerge_*` KINDS WITH LABELS HERE, and deliberately: every other one is
     # rendered by `ops.automerge_state` as the mechanism's one-line state on the work
     # order. These two are excluded from `ops.AUTOMERGE_EVENTS` — the state after either

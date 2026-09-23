@@ -205,6 +205,11 @@ PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "fail
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
 
+#: `ops.PrRepair.source` for both repairs — the `wo_messages.source` a nudge is queued
+#: under. Derived from the names above at the one site that owns them, so `parked_reason`
+#: cannot drift from what `nudge_pr_repair` writes.
+PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}")
+
 #: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
 #: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
 #: imports this module so the dependency cannot go the other way. A literal spelled at
@@ -650,7 +655,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    dropping the give-up because a decision is also open is the silent
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
-        elif _validation_escalated(store, wo):
+        elif validation_escalated(store, wo):
             blockers.append(VALIDATION_STUCK_BLOCKER)
         # 3. The landing refused to complete it over code that is on nothing but its own
         #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
@@ -811,7 +816,15 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     if waiting_on(store, wo)["what"] in SPOKEN_FOR_WAITS:
         return None
     finished = store.events_of_kind(wo["id"], "finished")
-    if finished and float(finished[-1]["ts"]) < float(turn["started_at"]):
+    if (finished and float(finished[-1]["ts"]) < float(turn["started_at"])
+            # ...UNLESS THE OS OPENED THAT TURN ITSELF. `PR_CONFLICT_NUDGE` and
+            # `PR_CHECKS_NUDGE` tell the worker in capitals not to call `jarvis wo
+            # finish` again, so a turn newer than the finish is the GUARANTEED outcome
+            # of the documented happy path, for both repairs, for every project — and
+            # reporting it sent the user to `jarvis wo send` against a worker whose pull
+            # request was already green (issue #705 defect 3). The instruction and the
+            # check were written against each other.
+            and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES):
         return STALE_FINISH_BLOCKER
     # A `needs_review` order with no stale finish is doing exactly what that status says,
     # and is already flagged for it. A second line on every review the user has not got
@@ -819,7 +832,7 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
     return None if wo["status"] == "needs_review" else PARKED_BLOCKER
 
 
-def _validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
+def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Did this work order's most recent validation round give up and ask for a human?
 
     Only the LATEST round is consulted. An escalation ends the loop, so an older
@@ -1277,9 +1290,18 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
         # Only assumptions are enforced strictly. For other blockers a hook-supplied
         # reason ("needs permission to run X") is more specific than anything we can
         # derive, and clobbering it would repeat the very bug this invariant exists for.
-        if not _mentions_assumptions(blockers[0]):
-            continue
-        if _mentions_assumptions(reason):
+        #
+        # XOR, since issue #705 defect 2. This used to repair only a reason that FAILED
+        # to name pending assumptions; the reverse — a count of assumptions nobody still
+        # owes a decision on — was skipped by construction and therefore immortal,
+        # printed first on `jarvis status` for as long as the flag was up. A stale count
+        # is not more specific than anything, it is simply wrong.
+        #
+        # NOT "either side mentions assumptions": both mentioning them is `ops.assume`'s
+        # generic "assumptions pending review" against a real pending decision, which is
+        # true and merely vaguer — and repairing it reports a violation against every
+        # work order that files an assumption.
+        if _mentions_assumptions(blockers[0]) == _mentions_assumptions(reason):
             continue
         store.flag_attention(wo["id"], blockers[0])
         yield Violation(
@@ -1289,6 +1311,36 @@ def check_attention_reason_is_true(store: ProjectStore) -> Iterator[Violation]:
             repaired=True,
             repair=f"reason set to {blockers[0]!r}",
             context={"was": reason, "now": blockers[0]},
+        )
+
+
+def check_repaired_work_rejoins_the_merge_queue(store: ProjectStore) -> Iterator[Violation]:
+    """INV-REPAIR-RESETTLED — a repaired pull request goes back in the merge queue.
+
+    Issue #705 defect 1. `ops.clear_pr_repair` re-derives the status as it closes the
+    episode, which fixes every repair from here on; this is what reaches the orders
+    already stranded by the version that did not, and it is the standing guarantee that
+    nothing else can strand one again — `waiting_pr_merge` is the only status the
+    auto-merge poll looks at, so an order held out of it is out of the queue for ever.
+
+    Repairable, and `ops.resettle_after_repair` is the single derivation — the flag it
+    leaves is re-derived from `true_blockers`, so this cannot relabel anything.
+    """
+    from . import ops as ops_mod
+
+    for wo in store.list_work_orders(statuses=("needs_review",), include_hidden=True):
+        was = wo["attention_reason"]
+        if not ops_mod.resettle_after_repair(store, wo["id"]):
+            continue
+        yield Violation(
+            invariant="INV-REPAIR-RESETTLED",
+            wo_id=wo["id"],
+            detail="repaired pull request left out of the merge queue by a stale "
+                   "pre-repair status snapshot",
+            repaired=True,
+            repair="status set to waiting_pr_merge; attention re-derived",
+            context={"was": "needs_review", "reason": was,
+                     "now": store.get_work_order(wo["id"])["attention_reason"]},
         )
 
 
@@ -1671,7 +1723,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     LIVE means the subject still has this decision open: a `pending` approval, a feature
     order in `plan_review`, or an `escalated` alarm — each still pointing at this very
     question. Everything else is moot, which is the same "only the LATEST round counts"
-    reading `_validation_escalated` uses. A question whose subject this project does not
+    reading `validation_escalated` uses. A question whose subject this project does not
     know is left alone — that is how another project's rows are skipped, since the checks
     run per project while Neo's database is OS-wide.
 
@@ -3357,6 +3409,10 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe
+    check_repaired_work_rejoins_the_merge_queue,  # BEFORE the reason checks: it moves
+                                   # the status they derive a reason from, so running it
+                                   # after would label an order for a status it is about
+                                   # to leave — and re-label it on the next tick
     check_attention_reason_is_true,
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
