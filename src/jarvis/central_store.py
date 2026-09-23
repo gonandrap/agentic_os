@@ -589,6 +589,20 @@ class CentralStore:
 
     # -- knowledge -------------------------------------------------------------------
 
+    def search_backlog(self, words: Sequence[str], project: str | None = None,
+                       limit: int = 50) -> list[dict[str, Any]]:
+        """Backlog items matching `words`, every status — promoted and done included."""
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "description": 1, "origin_note": 1,
+        })
+        q = [f"SELECT *, {expr} AS _score FROM backlog WHERE _score > 0"]
+        if project:
+            q.append("AND project=?")
+            params.append(project)
+        q.append("ORDER BY _score DESC, created_at DESC LIMIT ?")
+        rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
+        return db.rows_to_dicts(rows)
+
     def add_knowledge(self, content: str, project: str = "", topic: str = "",
                       tags: str = "", wo_id: str = "") -> dict[str, Any]:
         """Write one entry. `wo_id` attributes it — see the column's comment.

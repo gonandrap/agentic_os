@@ -304,6 +304,8 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .search import KINDS as SEARCH_KINDS
+
     # Imported HERE rather than at module scope: `jarvis --help` is the one path that
     # needs the rubric, and `issues` pulls in `github` and `bugreport` behind it. Every
     # other CLI import in this file is deferred for the same reason.
@@ -371,6 +373,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "search",
+        help="find any artifact — work orders, feature orders, Neo questions, alarms, "
+             "gates, backlog items, knowledge — across the fleet or one project",
+    )
+    sp.add_argument("query", help="words to look for, or an id to jump to")
+    sp.add_argument("--project", help="one project (default: the whole fleet)")
+    sp.add_argument("--kind", action="append", choices=list(SEARCH_KINDS),
+                    help="restrict to one kind; repeatable")
+    sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
@@ -1750,6 +1764,38 @@ def cmd_issues_start(args: argparse.Namespace) -> int:
         return 0
     print(f"{out['wo_id']}  {out['project']}  {out['issue_url']}"
           + (f"  `{out['priority']}`" if out["priority"] else ""))
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """`jarvis search` — the find-it-again verb, over every record the OS keeps.
+
+    Settled work is the point, so nothing is filtered by status: the listings hide
+    completed orders behind a reveal, and hunting through that reveal is what this
+    replaces (wo-edf5c425). Kinds are grouped, because the count line is what tells the
+    user whether to narrow with --kind.
+    """
+    from . import search as search_mod
+
+    hits = search_mod.search(args.query, project=args.project,
+                             kinds=tuple(args.kind) if args.kind else None,
+                             limit=args.limit)
+    if args.json:
+        _print(hits, True)
+        return 0
+    if not hits:
+        where = f" in {args.project}" if args.project else ""
+        print(f"nothing matches {args.query!r}{where}")
+        return 0
+    print("  ".join(f"{kind} {n}" for kind, n in search_mod.counts(hits)))
+    for hit in hits:
+        status = f" [{hit['status']}]" if hit["status"] else ""
+        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}){status}  "
+              f"{_age(hit['ts'])}")
+        print(f"  {hit['title']}")
+        if hit["snippet"]:
+            print(f"  {hit['snippet']}")
+        print(f"  {hit['ref']}")
     return 0
 
 
@@ -3424,6 +3470,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_inspect(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "search":
+            return cmd_search(args)
         if args.cmd == "issues":
             return (cmd_issues_start(args) if args.issues_cmd == "start"
                     else cmd_issues(args))

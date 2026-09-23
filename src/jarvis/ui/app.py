@@ -781,6 +781,28 @@ def create_app() -> FastAPI:
                       featured=featured, rest=rest, rest_counts=rest_counts,
                       revealed=revealed)
 
+    @app.get("/search", response_class=HTMLResponse)
+    def search_page(request: Request, q: str = "", project: str = "", kind: str = ""):
+        """Find an artifact again — across the fleet, or inside one project.
+
+        The page the header box and the project page's box both submit to: a completed
+        work order was only reachable by expanding a project's settled count, which is
+        the UX this replaces (wo-edf5c425). `project` is carried on the form, so a
+        search started from a project page stays inside it and can be widened in one
+        click.
+        """
+        from .. import search as search_mod
+
+        projects = sorted(ops.registered_project_paths())
+        if project and project not in projects:
+            project = ""
+        kind = kind if kind in search_mod.KINDS else ""
+        hits = search_mod.search(q, project=project or None,
+                                 kinds=(kind,) if kind else None, limit=60)
+        return render(request, "search.html", active="search", q=q, project=project,
+                      kind=kind, hits=hits, counts=search_mod.counts(hits),
+                      projects=projects, kinds=search_mod.KINDS)
+
     @app.get("/project/{name}", response_class=HTMLResponse)
     def project(request: Request, name: str, hidden: str = "", show: str = "",
                 fo: str = ""):
