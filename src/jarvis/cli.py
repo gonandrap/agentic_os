@@ -1375,8 +1375,14 @@ def _print_provenance(acc: dict) -> None:
         if acc.get("resealed_at"):
             again = _time.strftime("%Y-%m-%d %H:%M",
                                    _time.localtime(acc["resealed_at"]))
-            print(f"  re-derived on {again} to add detail the original seal predates; "
-                  f"adopted only because it still saw every token the seal held")
+            was = (acc.get("corrected_from") or {}).get("total")
+            if was:
+                print(f"  re-derived on {again}: the seal counted {was:,} tokens, "
+                      f"each turn carrying the whole session's running total")
+            else:
+                print(f"  re-derived on {again} to add detail the original seal "
+                      f"predates; adopted only because it still saw every token the "
+                      f"seal held")
     elif acc.get("live"):
         print("  worked out just now, from records that are still live; sealed "
               "automatically once the order settles")

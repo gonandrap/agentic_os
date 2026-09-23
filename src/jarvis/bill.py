@@ -906,19 +906,73 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     the re-read loses its unrecorded turns entirely, re-derives the recorded ones to the
     current version, and would pass the test above while quietly dropping real spend —
     for ever, since the seal it overwrites was the last record of it. So the fresh
-    reading must also see no LESS than the seal did: any gap in `accuracy` that the
-    sealed bill did not already carry is evidence that has aged, not a correction.
+    reading must also see no LESS than the seal did: any gap in `accuracy` whose CAUSE
+    the sealed bill did not already carry is evidence that has aged, not a correction.
+
+    BY CAUSE AND NOT BY WORDING (`_gap_causes`), because the disclosures are prose and
+    prose gets rewritten. Splitting the version-1 line into a turn sentence and a call
+    sentence made every pre-split seal look, to a literal set difference, like a bill
+    that had just lost evidence — the permanent silent refusal this order exists to
+    remove, re-created by an edit to an English sentence.
+
+    IT ASKS ABOUT TURNS AND ONLY TURNS, which `total.usage_versions` cannot answer:
+    that set also holds the stamp of every `agent_calls` row on the bill, and an OS
+    call is a one-shot `claude -p` with no result JSON kept, so its version can never
+    be refreshed the way `ops._turn_usage` refreshes a turn's. Reading the mixed set
+    made every bill carrying a pre-fix OS call permanently ineligible — the defect this
+    docstring used to describe as working.
     """
     from . import claude_cli
 
-    was_gaps = set((sealed.get("accuracy") or {}).get("gaps") or [])
-    now_gaps = set((fresh.get("accuracy") or {}).get("gaps") or [])
-    if now_gaps - was_gaps:
+    if _gap_causes(fresh) - _gap_causes(sealed):
         return False
-    was = set(sealed["total"].get("usage_versions") or [])
-    now = set(fresh["total"].get("usage_versions") or [])
+    was = _turn_versions(sealed)
+    now = _turn_versions(fresh)
     superseded = {v for v in (*was, *now) if v < claude_cli.USAGE_SCHEMA_VERSION}
     return bool(was & superseded) and not (now & superseded)
+
+
+def _turn_versions(payload: dict[str, Any]) -> set[int]:
+    """Which reading produced the WORKER TURNS of one bill, at any level of it.
+
+    A version-independent figure is the difference between the two populations: the
+    v2-to-v3 correction is about diffing a RESUMED session's running totals, and a
+    one-shot OS call has no previous envelope to diff (`claude_cli.derive_turn_usage`),
+    so its stamp says which parser read it and nothing about its numbers.
+
+    Reads the turn rows every payload already carries, sealed ones included, so this
+    needed no new field and no `PAYLOAD_VERSION` bump. Unrecorded turns are skipped:
+    they have no envelope to have a version, and `_accuracy` discloses them separately.
+    """
+    versions = {row.get("usage_v") or 1
+                for row in payload.get("turn_rows") or [] if row.get("recorded")}
+    for order in payload.get("orders") or []:      # a feature order, one level down
+        versions |= _turn_versions(order)
+    return versions
+
+
+def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
+    """Which reading produced JARVIS'S OWN CALLS on one bill.
+
+    Kept apart from `_turn_versions` because the two versions mean different things
+    here. Version 2 is about diffing a RESUMED session and says nothing about a
+    one-shot call, which is why the guard must not read it. Version 1 is not about
+    sessions at all: it means the envelope carried no `modelUsage`, so the figure is
+    the lead agent's `usage` and misses anything the call spawned beneath it
+    (`claude_cli.derive_turn_usage`) — a real under-reading for a call, and disclosed
+    as one. No call can ever be corrected: a one-shot `claude -p` keeps no result JSON.
+
+    An envelope with no stamp counts as version 1, the same default `_turn_versions`
+    applies: the stamp arrived WITH the modelUsage fix, so a row that predates it was
+    read by the parser that missed subagents. A row with no envelope at all is skipped
+    — no reading was taken, so there is none to be old.
+    """
+    versions: set[int] = set()
+    for row in rows:
+        envelope = db.from_json(row.get("usage_json"), {}) or {}
+        if envelope:
+            versions.add(envelope.get("usage_v") or 1)
+    return versions
 
 
 def unseal(order: dict[str, Any]) -> dict[str, Any] | None:
@@ -958,8 +1012,35 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
     return payload
 
 
+# WHAT EACH DISCLOSURE BELOW IS ABOUT, as a key that outlives its wording. Changing a
+# sentence in `_accuracy` must not change what `_corrects_a_reading` believes a seal
+# could see. Add a row here whenever a gap is added, and keep the marker a phrase that
+# names the CAUSE rather than one that happens to read well.
+_GAP_CAUSES = (
+    ("transcript for the worker's session is gone", "no-transcript"),
+    # One cause, said twice: a turn's sentence and a call's. Both mean the same reading
+    # produced the figure, so a seal written before the split still covers the split.
+    ("modelUsage fix", "read-before-modelusage"),
+    ("per-turn fix", "read-before-per-turn"),
+    ("no longer have the result JSON", "estimated-from-transcript"),
+)
+
+
+def _gap_causes(payload: dict[str, Any]) -> set[str]:
+    """The causes one bill's `accuracy.gaps` disclose, whatever words they used.
+
+    An unrecognised sentence is its own cause, so a gap this table has not been taught
+    still counts as a gap — the guard stays strict by default and is only ever loosened
+    on purpose.
+    """
+    causes = set()
+    for gap in ((payload.get("accuracy") or {}).get("gaps") or []):
+        causes.add(next((cause for mark, cause in _GAP_CAUSES if mark in gap), gap))
+    return causes
+
+
 def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
-              session: Any) -> dict[str, Any]:
+              session: Any, calls: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
     """What this bill could not see — the disclaimer, computed rather than assumed.
 
     A bill sealed at completion is complete. One reconstructed later from whatever
@@ -970,7 +1051,17 @@ def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],
     if turn_rows and not session.found:
         gaps.append("Claude Code's transcript for the worker's session is gone, so any "
                     "turn without a result JSON of its own could not be counted at all.")
-    versions = payload["total"].get("usage_versions") or []
+    # Turn versions, not the bill's mixed set: an OS call's stamp is not a claim about
+    # a turn's reading and printing it here disclosed a ceiling that was not there
+    # (`_turn_versions`).
+    versions = _turn_versions({"turn_rows": turn_rows})
+    if 1 in _call_versions(calls):
+        # Said separately from the turn line below and worded for a CALL, because the
+        # two are true of different things and a reader cannot act on a sentence about
+        # turns when what is short is Jarvis's own spend.
+        gaps.append("Some of Jarvis's own calls on this order were counted before the "
+                    "modelUsage fix, so each is its lead agent's spend only and misses "
+                    "whatever it spawned beneath itself — a floor, not a total.")
     if 1 in versions:
         gaps.append("Some turns were counted before the modelUsage fix and their result "
                     "JSON is gone too, so their tokens are the old, low reading — a "
@@ -1044,7 +1135,7 @@ def for_work_order(project: str, path: Path, wo: dict[str, Any],
             f"Only the most recent {CALL_LIMIT} recorded calls are on this bill.")
     _annotate_turns(payload, turn_rows)
     payload["checks"] = reconcile(payload)
-    payload["accuracy"] = _accuracy(payload, turn_rows, session)
+    payload["accuracy"] = _accuracy(payload, turn_rows, session, calls)
     payload["floor_reason"] = ops.COST_FLOOR_NOTE
     return payload
 

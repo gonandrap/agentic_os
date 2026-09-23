@@ -179,9 +179,14 @@
   {%- if acc.sealed_at %}
     Sealed when this order settled, on {{ fmt_ts(acc.sealed_at) }}, and shown as sealed —
     the records behind it expire, this figure does not.
-    {%- if acc.resealed_at %} Re-derived on {{ fmt_ts(acc.resealed_at) }} to add detail
-    the original seal predates, and adopted only because recomputing still saw every
-    token the seal held.{% endif %}
+    {%- if acc.resealed_at %}
+      {%- if acc.corrected_from %} Re-derived on {{ fmt_ts(acc.resealed_at) }}: the seal
+      counted {{ "{:,}".format(acc.corrected_from.total) }} tokens, each turn carrying
+      the whole session's running total.
+      {%- else %} Re-derived on {{ fmt_ts(acc.resealed_at) }} to add detail
+      the original seal predates, and adopted only because recomputing still saw every
+      token the seal held.{% endif %}
+    {%- endif %}
   {%- elif acc.live %}
     Worked out just now, from records that are still live. It is sealed automatically
     once the order settles.

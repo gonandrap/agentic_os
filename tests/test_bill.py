@@ -39,7 +39,7 @@ def wo(store):
 
 def os_call(wo_id: str, kind: str = "neo_answer", *, label: str = "question",
             ts: float | None = None, cost: float = 0.02, output: int = 900,
-            question_id: int | None = 1) -> None:
+            question_id: int | None = 1, usage_v: int | None = None) -> None:
     """Record one OS-side call, optionally back-dated to a chosen moment.
 
     The timestamp is what the turn attribution keys on, so a test about attribution has
@@ -49,7 +49,8 @@ def os_call(wo_id: str, kind: str = "neo_answer", *, label: str = "question",
                        model="claude-opus-5", question_id=question_id,
                        usage={"total_cost_usd": cost, "input": 10,
                               "cache_write": 5_000, "cache_read": 20_000,
-                              "output": output})
+                              "output": output}
+                       | ({} if usage_v is None else {"usage_v": usage_v}))
     if ts is not None:
         central = CentralStore()
         try:
@@ -515,6 +516,194 @@ def test_a_seal_counted_as_the_session_is_corrected_downward(store, wo, transcri
     assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
 
 
+def test_a_correction_is_not_blocked_by_an_os_call_stamped_the_old_way(
+        store, wo, transcripts, tmp_path):
+    """The defect that made the correction above unreachable on every REAL bill.
+
+    An OS call is a one-shot `claude -p` and its result JSON is never kept, so the
+    version stamped on it can never be refreshed the way a turn's is. It was read as if
+    it spoke for a turn, which made a fresh bill look permanently mid-upgrade: 4,907 of
+    the fleet's 6,102 `agent_calls` rows carry version 2, so on wo-0a9ba9b3 — whose
+    seven turns had all re-derived to version 3 — the guard refused for ever and the
+    disclaimer announced a ceiling that was not there.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-os-call")
+    transcripts("sess-os-call", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=2)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    assert 2 in inflated["total"]["usage_versions"], "the OS call is not stamped"
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+    # ...and the same stamp no longer makes the bill disclose a ceiling it does not have.
+    assert b["accuracy"]["gaps"] == []
+
+
+def test_an_os_call_counted_before_the_modelusage_fix_is_still_disclosed(
+        store, wo, transcripts, tmp_path):
+    """Version 1 on a CALL is a real under-reading and survives the narrowing.
+
+    It does not mean what version 2 means: no resumed session, no running total, just
+    an envelope with no `modelUsage`, so the figure is the lead agent's spend and
+    misses anything the call ran below itself. Scoping the guard to turns must not take
+    that disclosure off the page — and it is worded for a call, because a sentence
+    about turns is not actionable when what is short is Jarvis's own spend.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-v1-call")
+    transcripts("sess-v1-call", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+
+    b = ops.bill(wo["id"], live=True)
+
+    assert [row["usage_v"] for row in b["turn_rows"]] == [3, 3], "the turns are current"
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if "lead agent's spend only" in gap], b["accuracy"]["gaps"]
+    # ...and it is not the sentence about turns, which is false of this bill.
+    assert not [gap for gap in b["accuracy"]["gaps"] if "Some turns were counted" in gap]
+    assert not b["accuracy"]["complete"]
+
+
+def test_a_version_one_os_call_does_not_block_the_correction_it_cannot_speak_for(
+        store, wo, transcripts, tmp_path):
+    """The disclosure above is not a veto: a call the seal already disclosed is not
+    evidence that aged, so the turns it sits beside still correct."""
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-v1-guard")
+    transcripts("sess-v1-guard", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+    assert [gap for gap in b["accuracy"]["gaps"] if "lead agent's spend only" in gap]
+
+
+def test_a_seal_that_worded_the_same_gap_the_old_way_still_corrects(
+        store, wo, transcripts, tmp_path):
+    """Re-wording a disclosure must not read as evidence that aged.
+
+    Before the version-1 line was split in two, a bill carrying a version-1 OS call
+    disclosed it with the sentence about TURNS. Every such seal is still out there. A
+    literal set difference sees the new call-worded sentence as a gap the seal never
+    had, refuses for ever and says nothing — this order's own defect, re-created by an
+    edit to an English sentence.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-reworded")
+    transcripts("sess-reworded", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    # What the OLD code wrote for this bill: the same cause, worded for a turn.
+    inflated["accuracy"]["gaps"] = [
+        "Some turns were counted before the modelUsage fix and their result JSON is "
+        "gone too, so their tokens are the old, low reading — a floor, not a total."]
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+
+
+def test_an_os_call_with_no_usage_version_at_all_counts_as_the_oldest_reading(
+        store, wo):
+    """The stamp arrived with the modelUsage fix, so a row without one predates it.
+
+    Silence about an unstamped call would be the same false 'complete' the stamped
+    version-1 case was given back.
+    """
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    os_call(wo["id"], ts=1_150)   # no `usage_v` at all
+
+    b = ops.bill(wo["id"], live=True)
+
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if "lead agent's spend only" in gap], b["accuracy"]["gaps"]
+    assert not b["accuracy"]["complete"]
+
+
+def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
+        store, wo, transcripts, tmp_path, capsys):
+    """Both renderers announced every re-derivation as detail 'adopted only because it
+    still saw every token the seal held'. On a correction that sentence is false about
+    the one bill it is printed beside, which is the shape of defect this order is
+    about — a plausible claim nobody can check."""
+    from jarvis import cli
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-said")
+    transcripts("sess-said", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    cli._print_provenance(ops.bill(wo["id"])["accuracy"])
+
+    printed = capsys.readouterr().out
+    assert "saw every token the seal held" not in printed
+    assert "the whole session's running total" in printed
+
+
 def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
         store, wo, transcripts, tmp_path):
     """The other way a bill gets smaller, and it must not pass for a correction.
@@ -537,6 +726,9 @@ def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
             for i, own in enumerate(turns, start=1)]
     rows.append(assistant_row("m3", write=900_000, read=900_000, out=9_000, at=1_405))
     transcripts("sess-pruned", rows)
+    # Carrying the same old OS-call stamp as the test above, so the two cases differ in
+    # nothing but the reason the bill shrank.
+    os_call(wo["id"], ts=1_150, usage_v=2)
     store.set_status(wo["id"], "completed")
     sealed = ops.bill(wo["id"], live=True)
     for row in sealed["turn_rows"]:
@@ -587,6 +779,60 @@ def test_a_feature_orders_bill_is_its_childrens_bills(store, transcripts):
     worker = next(line for line in b["actors"] if line["key"] == "worker")
     assert {c["key"].split("/")[-1] for c in worker["children"]} \
         == {planner["id"], child["id"]}
+
+
+def test_a_feature_seal_corrects_when_its_childrens_turns_were_read_the_old_way(
+        store, transcripts, tmp_path):
+    """The same correction one level up, where the turns are a level down.
+
+    A feature order's payload has no `turn_rows` of its own — its turns are its
+    children's — so the guard can only answer for it by recursing through `orders`.
+    Without that recursion a feature seal holds no version at all, the correction can
+    never fire, and it fails the silent way this order exists to kill.
+    """
+    from tests.test_turn_usage import spend
+
+    fo = store.create_feature_order("a feature sealed under the old reading", "")
+    child = store.create_work_order("build it", "", parent_id=fo["id"])
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, child, tmp_path, turns, [1.0, 2.5], session="sess-feature")
+    transcripts("sess-feature", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    store.set_status(child["id"], "completed")
+    inflated = ops.bill(fo["id"], live=True)
+    assert "turn_rows" not in inflated, "a feature carries its turns one level down"
+    for order in inflated["orders"]:
+        for row in order["turn_rows"]:
+            row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    store.seal_bill(fo["id"], json.dumps(inflated), feature=True)
+
+    b = ops.bill(fo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+
+
+def test_a_feature_discloses_a_floor_its_child_turns_were_counted_at(
+        store, transcripts):
+    """The other caller reads turns a level down too: narrowing `_accuracy` to turn
+    versions must not lose a disclosure a child really owes."""
+    fo = store.create_feature_order("a feature counted before the fix", "")
+    child = store.create_work_order("build it", "", parent_id=fo["id"])
+    store.conn.commit()
+    add_turn(store, child["id"], recorded_usage(0.05))  # no `usage_v`, no outfile
+
+    b = ops.bill(fo["id"])
+
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if gap.startswith(child["id"]) and "a floor, not a total" in gap], \
+        b["accuracy"]["gaps"]
+    assert not b["accuracy"]["complete"]
 
 
 # -- the version marker ----------------------------------------------------------------
