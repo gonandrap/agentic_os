@@ -753,6 +753,9 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- reasoning is — this table already ships, so a live database gets it only there.
     carried_head_sha TEXT NOT NULL DEFAULT '',
     carried_reason TEXT NOT NULL DEFAULT '',
+    -- Per-file digests of the diff this round judged, as JSON. Also in ADDED_COLUMNS,
+    -- where the reasoning is.
+    file_shas TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -1180,6 +1183,18 @@ ADDED_COLUMNS = {
         # so there is one spelling of "not carried" rather than two.
         "carried_head_sha": "TEXT NOT NULL DEFAULT ''",
         "carried_reason": "TEXT NOT NULL DEFAULT ''",
+        # WHAT EACH FILE LOOKED LIKE IN THE DIFF THIS ROUND JUDGED — `evidence.
+        # file_digests` as a JSON object, written beside `head_sha` and for the same
+        # reason: it is a fact about the packet, not about the verdict. The next
+        # submission diffs its own map against this one to learn which files the
+        # submitter actually moved, which no other column can say — every one of them is
+        # cumulative against the base (spec
+        # docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §3).
+        #
+        # DEFAULT '' MEANS "NOT RECORDED" and it FAILS OPEN: `unanswered_submission`
+        # reads an empty map as "I cannot tell what moved" and lets the panel judge, so
+        # every round written before this column existed costs a submitter nothing.
+        "file_shas": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -3672,6 +3687,40 @@ class ProjectStore:
         """
         self.conn.execute("UPDATE validation_rounds SET head_sha=? WHERE id=?",
                           (head_sha, round_id))
+
+    def set_validation_file_shas(self, round_id: int,
+                                 file_shas: Iterable[tuple[str, str]]) -> None:
+        """Record what each file looked like in the diff this round judged.
+
+        Written where `set_validation_head` is written and whatever the outcome, for that
+        method's reason: the next round has to be able to ask what moved since this one,
+        and a round that recorded nothing can only answer "I cannot tell".
+        """
+        self.conn.execute("UPDATE validation_rounds SET file_shas=? WHERE id=?",
+                          (db.to_json(dict(file_shas)), round_id))
+
+    @staticmethod
+    def validation_file_shas(round_row: Mapping[str, Any] | None) -> dict[str, str]:
+        """One round's per-file digests, `{}` when it recorded none.
+
+        A staticmethod over the ROW for `validated_head`'s reason (kn-08f2ff9b): the
+        caller already holds the row, and a re-fetch could straddle a new round.
+        """
+        raw = db.from_json(str((round_row or {}).get("file_shas") or ""), {})
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    def last_judged_round(self, *, wo_id: str | None = None,
+                          fo_id: str | None = None) -> dict[str, Any] | None:
+        """The most recent round a PANEL actually settled, or None.
+
+        `latest_validation_round` is the wrong question for a submitter check: the latest
+        row can be a `failed` transport round or a `void`, neither of which asked the
+        submitter for anything. Only `COUNTED_VALIDATION_OUTCOMES` told it something.
+        """
+        for row in reversed(self.validation_rounds(wo_id=wo_id, fo_id=fo_id)):
+            if str(row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES:
+                return row
+        return None
 
     @staticmethod
     def validated_head(round_row: dict[str, Any] | None) -> str | None:

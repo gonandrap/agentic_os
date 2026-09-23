@@ -1590,6 +1590,10 @@ class Daemon:
             # rejection that recorded nothing could not later say what it rejected. `""`
             # for a worktree packet, which never auto-merges — spec 2026-09-14 §5.2.
             store.set_validation_head(round_id, evidence_mod.judged_head(packet))
+            # Beside the head and for its reason: what the NEXT submission has to diff
+            # itself against to learn which files this round's feedback was answered in
+            # (spec docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §3).
+            store.set_validation_file_shas(round_id, packet.file_shas)
 
             # WAIT FOR CI RATHER THAN FOR THE WORKER TO PROVE THE SUITE ITSELF. Workers
             # are told to run the TARGETED tests and cite CI for the whole suite (the
@@ -1904,20 +1908,15 @@ class Daemon:
         pair on every reconcile tick — so a verdict of "do not bother the user" cannot
         take the attention item down, and the call would buy one suppressed sink message
         and nothing else. It becomes worth asking only if Neo may also SETTLE the unit.
-        """
-        from .invariants import VALIDATION_STUCK_BLOCKER
 
-        wo_id = wo["id"]
-        store.close_validation_round(round_id, "escalated", reason)
-        store.add_event(wo_id, "validation_escalated",
-                        {"round": n, "round_id": round_id, "reason": reason})
-        store.set_status(wo_id, "needs_review")
-        store.flag_attention(wo_id, VALIDATION_STUCK_BLOCKER)
-        store.add_notification(
-            title=VALIDATION_ESCALATED_TITLE.format(unit=wo_id, n=n),
-            body=escalation_body(reason), level="warning", wo_id=wo_id,
-            source="validation",
-        )
+        THE BODY MOVED TO `ops.escalate_validation_round` and this delegates, because
+        `ops.submit_for_validation` gives up the same way when a submitter has ignored
+        the panel's list twice running — and two give-ups that only look alike are two
+        attention flags that drift.
+        """
+        from . import ops
+
+        ops.escalate_validation_round(store, wo, round_id, n, reason)
 
     @staticmethod
     def _validation_held(store: ProjectStore, wo: dict, round_id: int, n: int,

@@ -90,6 +90,7 @@ mandate asking a model not to use one.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -812,6 +813,83 @@ def follow_ups(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     """The findings that may not. PARTITIONS with `blockers` — total and disjoint over
     any input, normalised or not, so a finding can never be both and never neither."""
     return [dict(f) for f in found if f.get("severity") != BLOCKER]
+
+
+#: A repo-relative path inside a blocker's prose — `src/jarvis/budget.py`,
+#: `tests/test_pr_recorded.py:41`, `docs/x.md`. At least one directory separator and an
+#: extension, because a bare `budget.py` is as often a sentence's subject as a citation
+#: and a single false path is what would make `unanswered_submission` bounce real work.
+#: The optional `:41` is matched and discarded: a line number is not part of the path.
+_CITED_PATH = re.compile(r"(?<![\w./-])((?:[\w.-]+/)+[\w.-]+\.[A-Za-z][\w]*)(?::\d+)?")
+
+
+def cited_paths(found: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Every repo path a round's blockers named, in the order they were named.
+
+    THE PREVIOUS ROUND'S OWN CITATIONS ARE THE CLASSIFIER, which is what lets
+    `unanswered_submission` stay mechanical: it never has to decide what production code
+    is, or whether a rejection was "about the tests". A round that rejected for missing
+    coverage cites test files and a round that rejected a behaviour cites the file the
+    behaviour is in, so "did the submitter touch anything this round asked about" answers
+    both questions with one comparison (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §4).
+
+    Title AND detail: a seat states the file in whichever it please, and reading only one
+    would silently halve the citations.
+    """
+    seen: dict[str, None] = {}
+    for f in found:
+        for text in (str(f.get("title") or ""), str(f.get("detail") or "")):
+            for m in _CITED_PATH.finditer(text):
+                seen.setdefault(m.group(1), None)
+    return tuple(seen)
+
+
+def unanswered_submission(previous: Mapping[str, Any] | None,
+                          blockers_raised: Sequence[Mapping[str, Any]],
+                          before: Mapping[str, str],
+                          now: Mapping[str, str]) -> tuple[str, ...] | None:
+    """Did this submission touch NOTHING the previous round asked about? The paths it
+    asked about if so, else None.
+
+    Not a second reviewer and deliberately incapable of becoming one: it reads no code,
+    judges no quality, and asks a single question a string comparison can answer. A
+    submission that touches ONE of the cited paths goes to the panel however badly it
+    answered — partial progress is the panel's to judge, and only a round that addressed
+    NONE of the list short-circuits (spec §5).
+
+    **EVERY UNCERTAINTY RETURNS None, which means "let the panel judge".** No previous
+    round, a previous round that was not a rejection, a round that recorded no file map
+    (every row written before the column existed), a submission whose own map is empty,
+    and blockers that cited no path at all — in each case this cannot tell, and the cost
+    of guessing wrong is bouncing work that was really done. The cost of failing open is
+    one panel round, which is what happens today.
+    """
+    if previous is None or str(previous.get("outcome") or "") != "rejected":
+        return None
+    cited = cited_paths(blockers_raised)
+    if not cited or not before or not now:
+        return None
+    from .evidence import changed_since
+
+    moved = changed_since(before, now)
+    if any(_touched(path, moved) for path in cited):
+        return None
+    return cited
+
+
+def _touched(cited: str, moved: frozenset[str]) -> bool:
+    """Is `cited` one of the paths that moved? Exact, or one a suffix of the other.
+
+    A seat writes the path it read in the diff and the diff writes the repo-relative one,
+    so they usually match exactly — but a seat quoting `jarvis/budget.py` for
+    `src/jarvis/budget.py` is naming the same file, and the suffix has to start at a
+    directory boundary or `store.py` would match `project_store.py`.
+    """
+    for path in moved:
+        if path == cited or path.endswith("/" + cited) or cited.endswith("/" + path):
+            return True
+    return False
 
 
 def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:

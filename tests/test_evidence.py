@@ -446,3 +446,68 @@ def test_only_the_round_machine_collects_evidence():
                  if p.name != "evidence.py" and _imports(p) & names]
     assert importers == ["daemon.py", "landing.py", "ops.py", "validation.py"]
     assert "collect_work_order" not in (src / "landing.py").read_text()
+
+
+# ------------------------------------------------- the per-file digest map (file_shas)
+
+
+def test_two_files_get_different_digests_and_only_the_edited_one_moves(env):
+    """The map's whole job: `validation.unanswered_submission` asks what MOVED between
+    two rounds, so a digest that also moved when a NEIGHBOUR changed would answer that
+    question wrong in both directions."""
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
+    (env.worktree / "lib.py").write_text(_body("lib", 30, "edited"))
+    _git(env.worktree, "commit", "-aqm", "both")
+    first = dict(env.collect().file_shas)
+    assert set(first) == {"app.py", "lib.py"}
+    assert first["app.py"] != first["lib.py"]
+
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited twice"))
+    _git(env.worktree, "commit", "-aqm", "one of them")
+    second = dict(env.collect().file_shas)
+    assert second["app.py"] != first["app.py"]
+    assert second["lib.py"] == first["lib.py"]
+
+
+def test_a_rename_is_keyed_on_the_new_path_and_the_map_matches_files(env):
+    """The docstring's claim, and what makes the map usable beside `files`: a citation
+    is compared against these keys, so a key `packet.files` does not know is a path no
+    seat ever wrote."""
+    (env.worktree / "pkg").mkdir()
+    _git(env.worktree, "mv", "lib.py", "pkg/lib.py")
+    _git(env.worktree, "commit", "-qm", "moved")
+    packet = env.collect()
+    shas = dict(packet.file_shas)
+    assert "pkg/lib.py" in shas
+    assert set(shas) == set(packet.files)
+
+
+def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
+    """`file_digests` runs before `_truncate`, and that ordering is the whole
+    correctness of the map: built from the kept text it would say every dropped file
+    stopped changing, which reads as "the submitter touched nothing" and bounces a round
+    that did the work."""
+    (env.worktree / "app.py").write_text(_body("app", 30, "edited"))
+    (env.worktree / "lib.py").write_text(_body("lib", 30, "edited"))
+    _git(env.worktree, "commit", "-aqm", "both")
+
+    whole = dict(env.collect().file_shas)
+    packet = env.collect(diff_chars=900)
+    assert packet.diff_truncated and packet.dropped_files
+    shas = dict(packet.file_shas)
+    for path in packet.dropped_files:
+        assert path not in packet.diff, "a dropped file is not in the kept text"
+        assert shas.get(path), f"{path} lost its digest to truncation"
+    # PRESENT is not enough: a map built from the kept text could still key every path
+    # and give the dropped ones some constant. Truncation must change the map not at all.
+    assert shas == whole
+    assert set(shas) == set(packet.files)
+
+    # ...and the digest of a DROPPED file still moves when that file does, which is the
+    # direction `unanswered_submission` asks in. Without it the pair above is inert.
+    dropped = packet.dropped_files[0]
+    (env.worktree / dropped).write_text(_body(dropped.split(".")[0], 30, "again"))
+    _git(env.worktree, "commit", "-aqm", "the dropped one")
+    after = env.collect(diff_chars=900)
+    assert dropped in after.dropped_files and dropped not in after.diff
+    assert dict(after.file_shas)[dropped] != shas[dropped]
