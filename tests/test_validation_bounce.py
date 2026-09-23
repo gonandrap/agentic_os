@@ -119,6 +119,34 @@ def test_blockers_that_cite_nothing_let_the_panel_judge():
         {"outcome": "rejected"}, found, {"a/b.py": "1"}, {"a/b.py": "1"}) is None
 
 
+@pytest.mark.parametrize("cited,moved,touched", [
+    ("src/jarvis/budget.py", "src/jarvis/budget.py", True),       # the usual case
+    ("jarvis/budget.py", "src/jarvis/budget.py", True),           # a seat quoting short
+    ("src/jarvis/budget.py", "jarvis/budget.py", True),           # and the other way
+    ("src/jarvis/project_store.py", "store.py", False),           # the cut is at a
+    ("src/store.py", "src/project_store.py", False),              # separator, or this
+    ("src/jarvis/budget.py", "src/jarvis/budgets.py", False),     # pair would match
+])
+def test_a_citation_matches_a_moved_path_only_at_a_directory_boundary(cited, moved,
+                                                                      touched):
+    """`_touched` decides whether real work is bounced. A suffix that did not have to
+    start at a separator would match `store.py` against `project_store.py` and let a
+    round that answered nothing through; an exact-only rule would bounce the seat that
+    quoted the path without its `src/` prefix."""
+    assert validation._touched(cited, frozenset({moved, "unrelated/x.py"})) is touched
+
+
+def test_the_short_citation_reaches_the_rule_and_not_just_the_helper():
+    """The suffix branch is only worth anything if `unanswered_submission` uses it."""
+    found = [{"title": "jarvis/budget.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"a.py": "1"},
+        {"src/jarvis/budget.py": "2"}) is None
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"a.py": "1"},
+        {"src/jarvis/budgets.py": "2"}) == ("jarvis/budget.py",)
+
+
 def test_one_cited_path_touched_is_enough():
     """SOME of the list goes to the panel — only NONE short-circuits (spec §5)."""
     found = [{"title": "a/b.py and a/c.py are wrong", "detail": ""}]
@@ -341,6 +369,12 @@ def test_the_third_bounce_asks_the_user_and_the_flag_survives_a_reconcile(fleet)
         # The flag is RE-DERIVED every tick; a give-up with no round behind it loses it.
         assert VALIDATION_STUCK_BLOCKER in true_blockers(
             store, store.get_work_order(wo["id"]))
+        # The escalated round is a ROUND, so it carries the map like any other: the next
+        # submission reads it through `last_judged_round` and would fail open on a blank.
+        given_up = store.last_judged_round(wo_id=wo["id"])
+        assert int(given_up["round"]) == 2
+        shas = ProjectStore.validation_file_shas(given_up)
+        assert "notes/notes.py" in shas and "src/app.py" in shas
     finally:
         store.close()
 

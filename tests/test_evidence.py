@@ -491,10 +491,23 @@ def test_the_map_covers_a_file_whose_patch_was_DROPPED_by_truncation(env):
     (env.worktree / "lib.py").write_text(_body("lib", 30, "edited"))
     _git(env.worktree, "commit", "-aqm", "both")
 
+    whole = dict(env.collect().file_shas)
     packet = env.collect(diff_chars=900)
     assert packet.diff_truncated and packet.dropped_files
     shas = dict(packet.file_shas)
     for path in packet.dropped_files:
         assert path not in packet.diff, "a dropped file is not in the kept text"
         assert shas.get(path), f"{path} lost its digest to truncation"
+    # PRESENT is not enough: a map built from the kept text could still key every path
+    # and give the dropped ones some constant. Truncation must change the map not at all.
+    assert shas == whole
     assert set(shas) == set(packet.files)
+
+    # ...and the digest of a DROPPED file still moves when that file does, which is the
+    # direction `unanswered_submission` asks in. Without it the pair above is inert.
+    dropped = packet.dropped_files[0]
+    (env.worktree / dropped).write_text(_body(dropped.split(".")[0], 30, "again"))
+    _git(env.worktree, "commit", "-aqm", "the dropped one")
+    after = env.collect(diff_chars=900)
+    assert dropped in after.dropped_files and dropped not in after.diff
+    assert dict(after.file_shas)[dropped] != shas[dropped]

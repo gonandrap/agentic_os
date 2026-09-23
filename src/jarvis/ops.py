@@ -2751,6 +2751,14 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
 
     A FORCED ROUND IS NEVER BOUNCED, for `Daemon._repeat_submission`'s reason: there is
     no submitter to send anything back to.
+
+    THE COMPLETE CALLER SET, because `None` is a new answer they all have to be able to
+    meet: `finish` (the only one that can see it, and the one that passes `panel_open`);
+    `force_validation` and `rejudge_for_head`, both forced, so both still get a row; and
+    `_land_after_acceptance`, which submits only through `_validates_on_review` — i.e.
+    only when there is NO round on record — and a bounce needs a previous judged round,
+    so that path cannot reach one either. A new caller joins that contract or handles
+    `None`.
     """
     from . import evidence as evidence_mod
     from . import specs
