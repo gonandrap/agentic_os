@@ -906,8 +906,14 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     the re-read loses its unrecorded turns entirely, re-derives the recorded ones to the
     current version, and would pass the test above while quietly dropping real spend —
     for ever, since the seal it overwrites was the last record of it. So the fresh
-    reading must also see no LESS than the seal did: any gap in `accuracy` that the
-    sealed bill did not already carry is evidence that has aged, not a correction.
+    reading must also see no LESS than the seal did: any gap in `accuracy` whose CAUSE
+    the sealed bill did not already carry is evidence that has aged, not a correction.
+
+    BY CAUSE AND NOT BY WORDING (`_gap_causes`), because the disclosures are prose and
+    prose gets rewritten. Splitting the version-1 line into a turn sentence and a call
+    sentence made every pre-split seal look, to a literal set difference, like a bill
+    that had just lost evidence — the permanent silent refusal this order exists to
+    remove, re-created by an edit to an English sentence.
 
     IT ASKS ABOUT TURNS AND ONLY TURNS, which `total.usage_versions` cannot answer:
     that set also holds the stamp of every `agent_calls` row on the bill, and an OS
@@ -918,9 +924,7 @@ def _corrects_a_reading(sealed: dict[str, Any], fresh: dict[str, Any]) -> bool:
     """
     from . import claude_cli
 
-    was_gaps = set((sealed.get("accuracy") or {}).get("gaps") or [])
-    now_gaps = set((fresh.get("accuracy") or {}).get("gaps") or [])
-    if now_gaps - was_gaps:
+    if _gap_causes(fresh) - _gap_causes(sealed):
         return False
     was = _turn_versions(sealed)
     now = _turn_versions(fresh)
@@ -957,12 +961,17 @@ def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
     the lead agent's `usage` and misses anything the call spawned beneath it
     (`claude_cli.derive_turn_usage`) — a real under-reading for a call, and disclosed
     as one. No call can ever be corrected: a one-shot `claude -p` keeps no result JSON.
+
+    An envelope with no stamp counts as version 1, the same default `_turn_versions`
+    applies: the stamp arrived WITH the modelUsage fix, so a row that predates it was
+    read by the parser that missed subagents. A row with no envelope at all is skipped
+    — no reading was taken, so there is none to be old.
     """
     versions: set[int] = set()
     for row in rows:
-        version = (db.from_json(row.get("usage_json"), {}) or {}).get("usage_v")
-        if version is not None:
-            versions.add(version)
+        envelope = db.from_json(row.get("usage_json"), {}) or {}
+        if envelope:
+            versions.add(envelope.get("usage_v") or 1)
     return versions
 
 
@@ -1001,6 +1010,33 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
     payload["accuracy"]["sealed_at"] = db.now()
     payload["accuracy"]["live"] = False
     return payload
+
+
+# WHAT EACH DISCLOSURE BELOW IS ABOUT, as a key that outlives its wording. Changing a
+# sentence in `_accuracy` must not change what `_corrects_a_reading` believes a seal
+# could see. Add a row here whenever a gap is added, and keep the marker a phrase that
+# names the CAUSE rather than one that happens to read well.
+_GAP_CAUSES = (
+    ("transcript for the worker's session is gone", "no-transcript"),
+    # One cause, said twice: a turn's sentence and a call's. Both mean the same reading
+    # produced the figure, so a seal written before the split still covers the split.
+    ("modelUsage fix", "read-before-modelusage"),
+    ("per-turn fix", "read-before-per-turn"),
+    ("no longer have the result JSON", "estimated-from-transcript"),
+)
+
+
+def _gap_causes(payload: dict[str, Any]) -> set[str]:
+    """The causes one bill's `accuracy.gaps` disclose, whatever words they used.
+
+    An unrecognised sentence is its own cause, so a gap this table has not been taught
+    still counts as a gap — the guard stays strict by default and is only ever loosened
+    on purpose.
+    """
+    causes = set()
+    for gap in ((payload.get("accuracy") or {}).get("gaps") or []):
+        causes.add(next((cause for mark, cause in _GAP_CAUSES if mark in gap), gap))
+    return causes
 
 
 def _accuracy(payload: dict[str, Any], turn_rows: Sequence[dict[str, Any]],

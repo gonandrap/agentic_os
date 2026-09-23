@@ -616,6 +616,62 @@ def test_a_version_one_os_call_does_not_block_the_correction_it_cannot_speak_for
     assert [gap for gap in b["accuracy"]["gaps"] if "lead agent's spend only" in gap]
 
 
+def test_a_seal_that_worded_the_same_gap_the_old_way_still_corrects(
+        store, wo, transcripts, tmp_path):
+    """Re-wording a disclosure must not read as evidence that aged.
+
+    Before the version-1 line was split in two, a bill carrying a version-1 OS call
+    disclosed it with the sentence about TURNS. Every such seal is still out there. A
+    literal set difference sees the new call-worded sentence as a gap the seal never
+    had, refuses for ever and says nothing — this order's own defect, re-created by an
+    edit to an English sentence.
+    """
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-reworded")
+    transcripts("sess-reworded", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    os_call(wo["id"], ts=1_150, usage_v=1)
+    store.set_status(wo["id"], "completed")
+    inflated = ops.bill(wo["id"], live=True)
+    for row in inflated["turn_rows"]:
+        row["usage_v"] = 2
+    inflated["payload_v"] = bill_mod.PAYLOAD_VERSION - 1
+    inflated["total"]["tokens"] = {k: v * 3 for k, v in
+                                   inflated["total"]["tokens"].items()}
+    # What the OLD code wrote for this bill: the same cause, worded for a turn.
+    inflated["accuracy"]["gaps"] = [
+        "Some turns were counted before the modelUsage fix and their result JSON is "
+        "gone too, so their tokens are the old, low reading — a floor, not a total."]
+    store.seal_bill(wo["id"], json.dumps(inflated))
+
+    b = ops.bill(wo["id"])
+
+    assert b["payload_v"] == bill_mod.PAYLOAD_VERSION
+    assert b["accuracy"]["corrected_from"]["total"] > b["total"]["tokens"]["total"]
+
+
+def test_an_os_call_with_no_usage_version_at_all_counts_as_the_oldest_reading(
+        store, wo):
+    """The stamp arrived with the modelUsage fix, so a row without one predates it.
+
+    Silence about an unstamped call would be the same false 'complete' the stamped
+    version-1 case was given back.
+    """
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    os_call(wo["id"], ts=1_150)   # no `usage_v` at all
+
+    b = ops.bill(wo["id"], live=True)
+
+    assert [gap for gap in b["accuracy"]["gaps"]
+            if "lead agent's spend only" in gap], b["accuracy"]["gaps"]
+    assert not b["accuracy"]["complete"]
+
+
 def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
         store, wo, transcripts, tmp_path, capsys):
     """Both renderers announced every re-derivation as detail 'adopted only because it
