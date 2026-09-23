@@ -1338,7 +1338,7 @@ def check_repaired_work_rejoins_the_merge_queue(store: ProjectStore) -> Iterator
             detail="repaired pull request left out of the merge queue by a stale "
                    "pre-repair status snapshot",
             repaired=True,
-            repair="status set to waiting_pr_merge; attention re-derived",
+            repair="status set to waiting_pr_merge; attention cleared",
             context={"was": "needs_review", "reason": was,
                      "now": store.get_work_order(wo["id"])["attention_reason"]},
         )

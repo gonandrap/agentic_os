@@ -299,3 +299,100 @@ def test_the_user_is_asked_for_nothing_at_all(started, project, fake_gh, repaire
     assert not row["needs_attention"]
     assert true_blockers(store, row, now=long_after) == []
     assert ops.os_status()["attention"] == []
+
+
+# -- the merge hold is only ever lifted by the repair that caused it -----------------
+
+
+def test_a_later_user_turn_keeps_the_review(started, project, fake_gh, repaired,
+                                            fake_claude, settle_turns):
+    """The bound `repaired_since_finish` does NOT give: it says an episode closed after
+    the finish, never that the episode is why the order is in `needs_review` NOW. A turn
+    the user opened that ends without `jarvis wo finish` is its own hold, and lifting it
+    would merge unattended."""
+    store = ProjectStore(project)
+    fake_gh.set_pr(PR, "OPEN")
+    started.tick_count = 0                      # a tick that polls: clears the episode
+    poll(started, store)
+    assert store.get_work_order(repaired["id"])["status"] == "waiting_pr_merge"
+
+    ops.send_message(repaired["id"], "drop the exporter before this merges")
+    started.tick_count = 1                      # a tick that delivers but does not poll
+    started.tick()
+    assert settle_turns(store)
+    store.set_status(repaired["id"], "needs_review")   # the turn ended without finishing
+
+    assert store.turn_opened_by(store.latest_turn(repaired["id"])) == "jarvis"
+    assert not ops.resettle_after_repair(store, repaired["id"])
+    assert [v.invariant for v in check_project(store)
+            if v.invariant == "INV-REPAIR-RESETTLED"] == []
+
+    started.tick_count = 0                      # a tick that polls: still no re-settle
+    poll(started, store)
+
+    assert store.get_work_order(repaired["id"])["status"] == "needs_review"
+    # One, from the first poll — the order is not put back in the merge queue a second
+    # time, so nothing auto-merges it while the user's instruction is unanswered.
+    assert len(store.events_of_kind(repaired["id"], "pr_repair_resettled")) == 1
+
+
+def test_an_escalated_gate_keeps_it_out_of_the_merge_queue(started, project, fake_gh,
+                                                           repaired):
+    """A gate Neo handed to the user is a blocker at any status, so it is derived on the
+    row the move WOULD produce, before anything is written."""
+    store = ProjectStore(project)
+    approval = store.add_approval(repaired["id"], "release", "scripts/deploy.sh 0.5.4")
+    store.mark_approval_escalated(approval["id"], "no justification was filed")
+    fake_gh.set_pr(PR, "OPEN")
+
+    poll(started, store)
+
+    row = store.get_work_order(repaired["id"])
+    assert row["status"] == "needs_review"
+    assert true_blockers(store, row)[0].startswith("gate approval needed")
+
+
+def test_a_panel_that_gave_up_keeps_the_review(started, project, fake_gh, repaired):
+    store = ProjectStore(project)
+    rnd = store.open_validation_round(wo_id=repaired["id"], fingerprint="abc")
+    store.close_validation_round(rnd["id"], "escalated", reason="three rounds, no deal")
+    fake_gh.set_pr(PR, "OPEN")
+
+    poll(started, store)
+
+    assert store.get_work_order(repaired["id"])["status"] == "needs_review"
+
+
+def test_unlanded_work_keeps_the_review(started, project, fake_gh, repaired):
+    """`ops.park_unlanded`'s episode: code on nothing but its own branch."""
+    store = ProjectStore(project)
+    store.add_event(repaired["id"], "work_unlanded", {"was": "needs_review"})
+    fake_gh.set_pr(PR, "OPEN")
+
+    poll(started, store)
+
+    assert store.get_work_order(repaired["id"])["status"] == "needs_review"
+
+
+def test_a_queued_message_holds_the_resettle(started, project, fake_gh, repaired):
+    """Something is already on its way to the worker; the turn it opens decides."""
+    store = ProjectStore(project)
+    ops.send_message(repaired["id"], "one more thing")
+    fake_gh.set_pr(PR, "OPEN")
+
+    poll(started, store)
+
+    assert store.get_work_order(repaired["id"])["status"] != "waiting_pr_merge"
+
+
+def test_the_other_repairs_open_episode_holds_the_resettle(started, project, fake_gh,
+                                                           repaired):
+    """Two repairs run independently, and an open one owns the status while it is."""
+    store = ProjectStore(project)
+    checks = next(r for r in ops.PR_REPAIRS if r.name == "checks")
+    store.add_event(repaired["id"], checks.event("nudged"),
+                    {"pr_url": PR, "attempt": 1, "was": "needs_review"})
+    fake_gh.set_pr(PR, "OPEN")
+
+    assert not ops.resettle_after_repair(store, repaired["id"])
+    assert store.get_work_order(repaired["id"])["status"] == "needs_review"

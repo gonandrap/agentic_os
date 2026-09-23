@@ -4105,9 +4105,9 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
 
     ONLY OUT OF `needs_review`, and only when the whole of that status's triage in
     `true_blockers` says nobody owes anything: `failed` and `waiting_input` mean
-    something the repair never addressed. The attention flag is RE-DERIVED rather than
-    cleared — an escalated gate is a blocker at any status (`record_pr_closed` is the
-    precedent).
+    something the repair never addressed. Every blocker of the row it WOULD become is
+    derived first and any one of them refuses the move, so the flag that comes down
+    afterwards is always empty by construction.
     """
     wo = store.get_work_order(wo_id)
     if (wo["status"] != "needs_review" or not wo.get("result_summary")
@@ -4115,22 +4115,36 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
         return False
     if not repaired_since_finish(store, wo_id):
         return False
+    # THE REPAIR MUST BE WHY IT IS HERE NOW, not merely the last thing that closed.
+    # `repaired_since_finish` says an episode opened and closed after the finish; it says
+    # nothing about the turns AFTER it. A user-opened turn that ends without `jarvis wo
+    # finish` puts the order into `needs_review` on its own account, and this function
+    # lifts a merge hold, so without this every later hold fails open into an unattended
+    # merge.
+    if store.turn_opened_by(store.latest_turn(wo_id)) not in invariants.PR_REPAIR_SOURCES:
+        return False
     # The other repair's episode may still be open, and it owns the status while it is.
     if pr_repair_origin(store, wo_id) or store.queued_messages(wo_id):
         return False
+    # The `needs_review` triage in `true_blockers` — the probe below cannot see these,
+    # because they are derived under the status this function is trying to leave.
     if (store.pending_assumptions(wo_id)
             or invariants.validation_escalated(store, wo)
             or store.work_unlanded_open(wo_id)):
         return False
+    # JUDGE THE ROW IT WOULD BECOME, BEFORE WRITING ANYTHING. An escalated gate is a
+    # blocker at any status, so re-deriving the flag after `set_status` would leave a
+    # flagged order already back in the merge queue — the poll acts on the status, not
+    # on the flag. Probed through the one function that owns blockers rather than
+    # re-listing them here (kn-78346a2d).
+    probe = dict(wo)
+    probe["status"] = "waiting_pr_merge"
+    if true_blockers(store, probe):
+        return False
     store.set_status(wo_id, "waiting_pr_merge")
     store.add_event(wo_id, "pr_repair_resettled",
                     {"pr_url": wo.get("pr_url"), "was": wo["status"]})
-    fresh = store.get_work_order(wo_id)
-    blockers = true_blockers(store, fresh)
-    if blockers:
-        store.flag_attention(wo_id, blockers[0])
-    else:
-        store.clear_attention(wo_id)
+    store.clear_attention(wo_id)
     return True
 
 

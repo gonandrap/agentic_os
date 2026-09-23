@@ -252,9 +252,18 @@ delivered (`repaired_since_finish` — otherwise this reaches every `needs_revie
 holding a pull request), and only when the whole of §4's triage says nobody owes
 anything. `INV-REPAIR-RESETTLED` runs the same derivation every tick, which is what
 reaches the orders the shipped bug already stranded — their episodes are closed, so no
-poll will ever call `clear_pr_repair` on them again. The flag is **re-derived from
-`true_blockers`, not cleared**, for §4.1's reason one level over: an escalated gate is a
-blocker at any status.
+poll will ever call `clear_pr_repair` on them again.
+
+This function LIFTS A MERGE HOLD, so its bounds are the safety argument and neither is
+optional. `repaired_since_finish` says an episode closed after the finish; it says
+nothing about the turns after it, so the **latest turn must itself be a repair turn**
+(`turn_opened_by ∈ PR_REPAIR_SOURCES`). Without that, a user-opened turn that ends
+without `jarvis wo finish` — its own hold, on its own account — fails open into an
+unattended merge. And every blocker of the row the move WOULD produce is derived through
+`true_blockers` **before** `set_status`, any one of them refusing the move: an escalated
+gate is a blocker at any status (§4.1 one level over), and a flag re-derived afterwards
+would be a flag on an order already back in the merge queue, where the poll acts on the
+status and not on the flag.
 
 Two further consequences of the same "closing the episode is when the snapshot expires"
 reading, both issue #705:
