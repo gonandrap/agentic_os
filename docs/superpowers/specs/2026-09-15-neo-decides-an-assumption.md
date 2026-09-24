@@ -201,10 +201,20 @@ conditions, all of which must hold:
 Two of those are not in the obvious list and are the ones worth reading.
 
 **Condition 2 — `needs_review`, the analogue of auto-merge's `waiting_pr_merge`.** An
-assumption recorded mid-run is not judged, because the work it was part of does not exist
+assumption recorded mid-run is not SETTLED, because the work it was part of does not exist
 yet: a reviewer would be ruling on an intention, with no result summary and no diff. It is
 also the only status that means the user owes a decision, so it is the only one where
 taking that decision off them is worth anything.
+
+> **AMENDED 2026-09-23, and only the second half of it.** A mid-run assumption IS now
+> judged — provisionally, by `autoreview.decide_early`, whose verdict lands in the
+> `provisional_*` columns and settles nothing — and a disagreement is sent to the running
+> worker as guidance. The argument above is not overturned: ruling on an intention buys
+> exactly one thing, which is the worker finding out early, and a provisional approval is
+> re-asked against the diff before it settles. **Condition 2 of `decide` is not relaxed by
+> any of it**; it is the only guard on the settle path, and a `running` order that got
+> past it would land.
+> [2026-09-23-an-assumption-judged-while-the-worker-still-runs.md](2026-09-23-an-assumption-judged-while-the-worker-still-runs.md).
 
 **Condition 4 — the panel's give-up.** `ops.land_when_cleared` LANDS an `escalated` round;
 its docstring says the only caller that can reach it with one is `review_work_order`, i.e.
@@ -240,11 +250,17 @@ linked to the very question being delivered. `asked_question_id` excludes exactl
 one; a link to a *different* question still holds, because two rulings on one assumption
 is a state nobody designed and not one to settle under.
 
-This is also why `_note_autoreview_held`'s four exclusions are suspended when settling.
-They all rest on "this order was never a candidate", which is true of the ask pass — it
-lists `needs_review` and nothing else. At the settle site `status` means the user
-**cancelled** the order and `disabled` means they **revoked the permission**, and those
-are the two the record most needs.
+This is also why `_note_autoreview_held`'s exclusions are suspended when settling. They all
+rest on "this order was never a candidate", which is true of an ask pass — it lists one
+status and nothing else. At the settle site `status` means the user **cancelled** the order
+and `disabled` means they **revoked the permission**, and those are the two the record most
+needs.
+
+> **AMENDED 2026-09-23.** There are two ask passes now, so the exclusion list is DERIVED
+> PER PASS (`Daemon._holds_not_recorded`) instead of being one shared tuple. `status` was
+> excluded on the stated ground that the pass "lists `needs_review` only" — a sentence
+> about one candidate list, which shared with the early pass would hide a real hold behind
+> an argument for a different pass.
 
 ## 6. Failure directions — every one ends in "the user decides it, as they do today"
 
@@ -256,7 +272,8 @@ are the two the record most needs.
 | Neo's call fails | `drain_queue` marks the question `failed` and delivers `escalate: True`; `read_ruling` requires an explicit approval, so nothing is accepted. |
 | Neo's reply will not parse | `neo._unparseable_verdict` escalates. Same path. |
 | Neo answers `approve` but marks `stakes: high` | `read_ruling` overrides it, the question is re-marked `escalated`, and the user decides. |
-| Neo answers `deny` without escalating | escalates, carrying Neo's reason. |
+| Neo answers `deny` without escalating | on a PARKED order, escalates, carrying Neo's reason. On a RUNNING one it is an OBJECTION: recorded as `provisional_verdict='object'` and sent to the worker (2026-09-23 spec §5.3, §6). It settles nothing either way, and the user still decides at `needs_review`. |
+| an early ruling arrives after the worker finished | recorded provisionally all the same, never settled: the pass that asked is read off the `autoreview_asked` event, not from the status at delivery, so the race cannot settle a verdict formed with no diff. |
 | the user reviews it first | the delivery arm sees a non-pending assumption and drops the ruling; `invariants.check_neo_escalations_are_live` closes the question behind them. |
 | the work order is deleted | `NeoStore.purge_work_order` takes its questions with it. |
 | Neo answers `approve` and **omits `stakes` entirely** | `read_ruling` reads the allowlist, not `== "high"`, so `""` is not routine: it escalates and the record says the stakes were never classified. Written as a blocklist this was the row that produced an acceptance. |
