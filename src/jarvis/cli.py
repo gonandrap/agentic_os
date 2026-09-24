@@ -1041,6 +1041,14 @@ def build_parser() -> argparse.ArgumentParser:
     # `issues.PRIORITY_RUBRIC` is the one definition and argparse renders it verbatim.
     br.add_argument("--priority", "-p", required=True, choices=list(_PRIORITIES),
                     help="how bad this is for the FLEET. " + _PRIORITY_RUBRIC)
+    # A SCHEDULING DECISION, kept out of --priority on purpose: the rating stays an
+    # honest description of the defect (`issues.route_filing`).
+    br.add_argument("--expedite", action="store_true",
+                    help="work on it NOW, whatever the priority: the issue is filed as "
+                         "usual and a work order is dispatched on it immediately, "
+                         "instead of waiting on the tracker (or, for critical/blocker, "
+                         "on Neo's re-assessment — which still runs and still settles "
+                         "the rating, so an unconfirmed claim ships no release)")
     br.add_argument("--steps", default="", help="optional steps to reproduce")
     br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
     br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
@@ -3395,7 +3403,7 @@ def cmd_bug(args: argparse.Namespace) -> int:
     from .bugreport import pickup_note, report_bug
     result = report_bug(title=args.title, description=args.description,
                         expected=args.expected, actual=args.actual, steps=args.steps,
-                        priority=args.priority,
+                        priority=args.priority, expedite=args.expedite,
                         project=args.project, wo_id=args.wo_id)
     if args.json:
         _print(result, True)

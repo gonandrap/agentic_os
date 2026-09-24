@@ -79,9 +79,11 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json):
             finally:
                 store.close()
 
-        def file_bug(self, title="wo send is lost", priority="blocker"):
+        def file_bug(self, title="wo send is lost", priority="blocker",
+                     expedite=False):
             return bugreport.report_bug(title=title, description="d",
-                                        expected="e", actual="a", priority=priority)
+                                        expected="e", actual="a", priority=priority,
+                                        expedite=expedite)
 
         def _last_triage(self):
             from jarvis.neo_store import NeoStore
@@ -1320,3 +1322,169 @@ def test_jarvis_issues_still_lists_and_start_is_a_subcommand(fleet, capsys):
     capsys.readouterr()
     assert cli.main(["issues", "start", fleet.issue_url]) == 0
     assert fleet.issue_url in capsys.readouterr().out
+
+
+# -- expediting a filing --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_expediting_a_non_dispatching_bug_dispatches_it_now(fleet, level):
+    """The flag's whole reason to exist: work starts at a level that commits the fleet
+    to nothing, without the rating being inflated to buy it."""
+    from jarvis import ops
+    from jarvis.neo_store import NeoStore
+
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    assert pickup["wo_id"] and pickup["expedited"]
+    assert pickup["wo_id"] == fleet.wo_id()
+
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_url"] == fleet.issue_url and wo["issue_priority"] == level
+    assert "expedited" in wo["description"].lower()
+    labels = fleet.gh.issue()["labels"]
+    assert f"priority: {level}" in labels, "expediting is not a re-rating"
+    assert "in progress" in labels
+
+    neo = NeoStore()
+    try:
+        assert not [q for q in neo.list_questions() if q.get("kind") == "triage"], \
+            "a level that is not re-assessed is not re-assessed for being expedited"
+    finally:
+        neo.close()
+
+
+@pytest.mark.parametrize("level", ["critical", "blocker"])
+def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
+    """The claim is still re-assessed — the label is what everyone else reads — but the
+    work no longer waits on the verdict."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    assert pickup["wo_id"] == fleet.wo_id() != ""
+    assert pickup["neo_question_id"], "the rating is still a claim and still checked"
+    assert "in parallel" in pickup["reason"]
+
+    # The work is dispatched; the RATING is not granted. Only a verdict writes one on,
+    # because this column alone is what ships a release when the fix lands.
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert not (wo["issue_priority"] or ""), "an unconfirmed claim is not a rating"
+    assert f"priority: {level}" in fleet.gh.issue()["labels"], \
+        "but the tracker still shows what was claimed"
+
+
+@pytest.mark.parametrize("level", ["critical", "blocker"])
+def test_an_expedited_claim_that_lands_first_ships_no_release(fleet, level):
+    """The race the flag creates: a one-line fix can land before Neo answers. Nothing
+    but a verdict may cut a release, so landing first ships none."""
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    fleet.land(pickup["wo_id"])
+    assert fleet.releases() == [], "an unconfirmed claim may not ship a release"
+
+
+def test_a_claim_neo_could_not_be_asked_about_ships_no_release(monkeypatch, fleet):
+    """Neo unreachable is the case the whole route fails closed on, and expediting only
+    moves WHEN the work happens — never whether the claim was checked."""
+    monkeypatch.setattr(issues, "ask_triage",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("neo is off")))
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    assert pickup["wo_id"] and "NOT re-assessed" in pickup["reason"]
+
+    fleet.land(pickup["wo_id"])
+    assert fleet.releases() == [], "nothing is shipped off a claim nobody could check"
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_a_verdict_that_arrives_after_the_fix_landed_ships_nothing(fleet, approve):
+    """A verdict can only decide what has not happened yet. The work landed unrated, so
+    no release was cut, and neither ruling reaches back for one — INCLUDING the confirm.
+    Failing closed in both directions is the choice: a release the fleet restarts for is
+    the user's to ask for (`scripts/shipit.sh`) once the moment to cut it automatically
+    has gone. The label is still corrected, which is what the tracker is for."""
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.land(pickup["wo_id"])
+    fleet.triage(approve=approve, answer="" if approve else "medium", reason="r")
+
+    assert fleet.releases() == []
+    want = "blocker" if approve else "medium"
+    assert f"priority: {want}" in fleet.gh.issue()["labels"]
+
+
+def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
+    """Neo may move the rating; it may not stop work the user asked for. And the tracker
+    may not be told no work order was created when one is running."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=False, answer="medium", reason="bounded to one command")
+
+    assert fleet.wo_id() == pickup["wo_id"], "the expedited work order survives"
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: medium" in labels and "priority: blocker" not in labels
+    body = "\n".join(fleet.gh.issue()["comments"])
+    assert pickup["wo_id"] in body
+    assert "No work order was created" not in body
+
+    # THE HALF THE LABEL DOES NOT COVER: the work order carried the CLAIM, and a release
+    # on landing is cut from that column — `daemon.sync_issues`, guarded by `dispatches`.
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_priority"] == "medium", "the claim may not outlive the verdict"
+    assert not issues.dispatches(wo["issue_priority"]), \
+        "a downgraded claim must not ship a release when the fix lands"
+
+
+def test_a_downgraded_expedited_fix_lands_without_a_release(fleet):
+    """The same fact through the daemon rather than through the column: the landing
+    sweep is what would have cut the release."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=False, answer="medium", reason="bounded to one command")
+    fleet.land(pickup["wo_id"])
+
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_state"] == issues.CLOSED, "the fix still lands and still closes it"
+    assert fleet.releases() == [], "a `medium` bug does not ship a release"
+
+
+def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
+    """The other verdict, and the other half of the rule: a CONFIRMED blocker is a
+    rating, so the work order gets it and landing ships the release it earned."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=True)
+
+    assert fleet.wo_id() == pickup["wo_id"], "no second work order for one issue"
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_priority"] == "blocker"
+    assert "priority: blocker" in fleet.gh.issue()["labels"]
+
+    fleet.land(pickup["wo_id"])
+    assert len(fleet.releases()) == 1, "a confirmed blocker still ships on landing"
+
+
+def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):
+    """The filing is the half that must never be lost: if the dispatch half fails, the
+    issue still exists and the note says how to start the work by hand."""
+    monkeypatch.setattr(issues, "promote_confirmed",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db is gone")))
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+
+    assert not pickup["wo_id"] and not fleet.wo_id()
+    assert "db is gone" in pickup["reason"]
+    assert "jarvis issues start" in pickup["reason"]
+    assert "priority: blocker" in fleet.gh.issue()["labels"]
+    assert pickup["neo_question_id"], "the claim is still re-assessed"
+
+
+@pytest.mark.parametrize("level", ["low", "blocker"])
+def test_filing_without_the_flag_is_unchanged(fleet, level):
+    """The default is today's behaviour at both ends of the rubric."""
+    pickup = fleet.file_bug(priority=level)["pickup"]
+    assert not pickup["wo_id"] and not pickup.get("expedited")
+    assert not fleet.wo_id()
+    assert "in progress" not in fleet.gh.issue()["labels"]
+
+
+def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
+    """A reporting agent reads one line, and the id has to be in it."""
+    assert cli.main(["bug", "report", "t", "-d", "d", "-e", "e", "-a", "a",
+                     "-p", "low", "--expedite"]) == 0
+    out = capsys.readouterr().out
+    assert fleet.wo_id() in out and "expedited" in out

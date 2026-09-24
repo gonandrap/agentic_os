@@ -320,7 +320,8 @@ def _rubric() -> str:
     return PRIORITY_RUBRIC
 
 
-def _route(url: str, title: str, body: str, priority: str) -> dict[str, Any]:
+def _route(url: str, title: str, body: str, priority: str,
+           expedite: bool = False) -> dict[str, Any]:
     """Put the freshly filed issue on the OS's rails.
 
     Deliberately cannot fail the filing. The issue exists by the time this runs, so an
@@ -330,7 +331,7 @@ def _route(url: str, title: str, body: str, priority: str) -> dict[str, Any]:
     """
     from .issues import route_filing
     try:
-        return route_filing(url, title, body, priority)
+        return route_filing(url, title, body, priority, expedite=expedite)
     except Exception as e:  # noqa: BLE001 — see the docstring: the issue is already filed
         return {"wo_id": "", "backlog_id": "", "project": "", "priority": priority,
                 "reason": f"the OS could not route it ({e}) — it is filed and untracked"}
@@ -346,7 +347,10 @@ def pickup_note(pickup: dict[str, Any]) -> str:
     """
     level = pickup.get("priority") or "?"
     if pickup.get("wo_id"):
-        head = (f"`{level}` confirmed — work order {pickup['wo_id']} in "
+        # `expedited` and `confirmed` are different facts about the same work order: one
+        # says the user asked for it now, the other that Neo agreed with the rating.
+        verb = "expedited" if pickup.get("expedited") else "confirmed"
+        head = (f"`{level}` {verb} — work order {pickup['wo_id']} in "
                 f"{pickup.get('project') or '?'}")
     elif pickup.get("project"):
         head = f"`{level}`"
@@ -390,7 +394,7 @@ def _notify(project: str, title: str, url: str, version: str, wo_id: str,
 
 def report_bug(*, title: str, description: str, expected: str, actual: str,
                priority: str = "", steps: str = "", project: str = "",
-               wo_id: str = "") -> dict[str, Any]:
+               wo_id: str = "", expedite: bool = False) -> dict[str, Any]:
     """File a Jarvis OS bug, put it on the OS's rails, and tell the user about it.
 
     **`priority` IS REQUIRED AND IS NEVER INFERRED** (the user's ruling of 2026-09-14).
@@ -399,6 +403,10 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     direction or the other: `critical` lets a typo commit the fleet to a release, and
     `low` silently buries a report the filer knew was urgent. Refusing costs the caller
     one word and `issues.PRIORITY_RUBRIC` tells them which.
+
+    `expedite` dispatches a work order on the issue immediately, at ANY priority, and
+    is the only thing that can. It is a scheduling decision and leaves the rating alone
+    — see `issues.route_filing`, which holds what it does and does not skip.
 
     Raises BugReportError if the priority is missing or unknown, or if the ISSUE could
     not be created — in which case nobody is notified. Nothing after that raises: by then
@@ -429,7 +437,7 @@ def report_bug(*, title: str, description: str, expected: str, actual: str,
     url = create_issue(title, body, repo)
     # Between creating the issue and telling anyone about it, so the ping says what the
     # tracker actually shows rather than what it was about to show (issue #240).
-    pickup = _route(url, title, body, priority)
+    pickup = _route(url, title, body, priority, expedite=expedite)
     _notify(project, title, url, version, wo_id, pickup)
     return {"url": url, "title": title, "repo": repo, "version": version,
             "project": project, "wo_id": wo_id, "pickup": pickup}
