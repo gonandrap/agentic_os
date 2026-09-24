@@ -4828,6 +4828,35 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
             "settled": not pending}
 
 
+def record_provisional_verdict(store: ProjectStore, wo: dict[str, Any],
+                               assumption: dict[str, Any], *, verdict: str, reason: str,
+                               model: str, stakes: str, question_id: int,
+                               config_version_id: str | None = None) -> None:
+    """THE OS's verdict on an assumption while the worker is still typing. Settles nothing.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §5.3. Beside `accept_assumption` and deliberately NOT inside it: that one stamps
+    `decided_by`, writes `autoreview_accepted` and lands the work order behind it, and
+    every one of those three is wrong for a ruling on an intention. This writes the
+    `provisional_*` columns and one event, and `status` stays `pending` — so to
+    `pending_assumptions`, `invariants.true_blockers`, `automerge.decide` and the user's
+    own review, nothing has changed.
+
+    **BOTH VERDICTS LAND HERE, INCLUDING `object`, AND NOTHING IS SENT.** Recording an
+    objection and sending it are two acts in that order (§6.1): the send is
+    `file_assumption_objection`'s, driven off the column this writes, so the record cannot
+    be behind the wire.
+    """
+    store.record_provisional(
+        assumption["id"], verdict=verdict, reason=reason, model=model, stakes=stakes,
+        config_version=(config_version_id if config_version_id is not None
+                        else current_config_version()))
+    store.add_event(wo["id"], "autoreview_provisional", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "verdict": verdict, "reason": reason, "model": model, "stakes": stakes,
+        "neo_question_id": question_id, "decided_by": ASSUMPTION_DECIDER_OS})
+
+
 def review_work_order(wo_id: str, accept: bool = True,
                       feedback: str = "") -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order.
