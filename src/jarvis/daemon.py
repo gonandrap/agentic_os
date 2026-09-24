@@ -1519,6 +1519,11 @@ class Daemon:
             # Nothing would be judged; every seat would be refused free and instantly,
             # and the round would only have to be held anyway. Held BEFORE the first
             # refusal rather than after it, the way `dispatch_pending` holds a worker.
+            # RECORDED, not merely skipped: a bare return wrote nothing at all, so for
+            # the whole of a three-hour window the round's newest recorded reason stayed
+            # whatever held it last and every surface said the panel was still reading
+            # (GitHub issue #714).
+            self._hold_rounds_for_outage(project, store, state)
             return
         for wo in store.work_orders_awaiting_validation():
             wo_id = wo["id"]
@@ -1549,6 +1554,71 @@ class Daemon:
             if store.latest_validation_round(wo_id=orphan["id"]) is None:
                 log.warning("[%s] %s is validating with no round on record",
                             project.name, orphan["id"])
+
+    def _hold_rounds_for_outage(self, project: ProjectSpec, store: ProjectStore,
+                                state: fleet.Fleet) -> None:
+        """Write down that the account's window — not this round — is why nobody judged.
+
+        The same `validation_failed` event `_validation_held` writes, so every reader of
+        a hold reads this one too and no surface learns a second shape. What differs is
+        only the carrier of the moment: an ACCOUNT outage states it (`fleet.Outage`),
+        where that one is told it by the refusal a seat actually got.
+
+        ONCE PER WINDOW, not once per tick: at a 5s tick a three-hour outage would
+        otherwise write two thousand identical events per round. The existing hold is
+        what dedupes — a round already held to this moment or later has nothing to learn.
+
+        A round in flight is skipped: it was submitted before the window shut, and the
+        pool thread owns its outcome.
+        """
+        reopens = state.outage.reopens_at  # type: ignore[union-attr]
+        for wo in store.work_orders_awaiting_validation():
+            wo_id = wo["id"]
+            if wo_id in self.validating:
+                continue
+            round_row = store.latest_validation_round(wo_id=wo_id)
+            if round_row is None:  # pragma: no cover - the query selected on this round
+                continue
+            n = int(round_row["round"])
+            if validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
+                                     n) >= reopens:
+                continue
+            store.add_event(wo_id, "validation_failed",
+                            {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                             "reopens_at": reopens,
+                             "error": state.outage.message[:500]})  # type: ignore[union-attr]
+            log.info("[%s] %s round %s held by the account's usage window until %s",
+                     project.name, wo_id, n, reopens)
+
+    def _hold_feature_rounds_for_outage(self, project: ProjectSpec, store: ProjectStore,
+                                        state: fleet.Fleet) -> None:
+        """`_hold_rounds_for_outage` for feature rounds — read that one; this is its twin.
+
+        The only difference is the carrier, the same one `_feature_held` has:
+        `wo_events.wo_id` is a foreign key into `work_orders`, so a feature's events live
+        on its manager's timeline (`ops.feature_event`).
+        """
+        from . import ops
+
+        reopens = state.outage.reopens_at  # type: ignore[union-attr]
+        for fo in store.list_feature_orders(statuses=("validating",)):
+            fo_id = fo["id"]
+            if fo_id in self.validating:
+                continue
+            round_row = store.latest_validation_round(fo_id=fo_id)
+            if (round_row is None
+                    or round_row["outcome"] not in RUNNABLE_VALIDATION_OUTCOMES):
+                continue
+            n = int(round_row["round"])
+            events = ops.feature_events_of_kind(store, fo_id, "validation_failed")
+            if validation_hold_until(events, n) >= reopens:
+                continue
+            ops.feature_event(store, fo_id, "validation_failed",
+                              {"round": n, "cause": VALIDATION_HELD_CAUSE,
+                               "reopens_at": reopens, "feature_order": fo_id,
+                               "error": state.outage.message[:500]})  # type: ignore[union-attr]
+            log.info("[%s] feature %s round %s held by the account's usage window "
+                     "until %s", project.name, fo_id, n, reopens)
 
     def _validate_work_order(self, project: ProjectSpec, wo_id: str,
                              round_id: int) -> None:
@@ -2093,7 +2163,10 @@ class Daemon:
         from . import ops
 
         if state is not None and state.shut():
-            return  # see `validation_tick`: every seat would be refused, free and instantly
+            # Recorded on the manager's timeline, exactly as `validation_tick` records it
+            # on the work order's — see there (GitHub issue #714).
+            self._hold_feature_rounds_for_outage(project, store, state)
+            return
         for fo in store.list_feature_orders(statuses=("validating",)):
             fo_id = fo["id"]
             if fo_id in self.validating:

@@ -193,7 +193,8 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     shut again writes a second event for the same round number, and taking the earlier
     moment would send the round straight back into a closed window every tick.
 
-    TWO CAUSES HOLD, and the caller is told apart from neither: a spent usage window
+    TWO CAUSES HOLD, and a caller wanting the moment alone is told apart from neither
+    (`validation_hold` below is for the ones that must be): a spent usage window
     (`VALIDATION_HELD_CAUSE`) and GitHub still running the checks
     (`VALIDATION_CI_CAUSE`). They are different facts about why nobody is judging yet and
     identical in what the tick must do about it, so the vocabulary is
@@ -206,13 +207,27 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     order, whose events live on its manager's timeline and come back through
     `ops.feature_events_of_kind`. One home, two carriers (GitHub issue #235).
     """
-    held = 0.0
+    return validation_hold(events, round_no)[0]
+
+
+def validation_hold(events: Iterable[Any], round_no: int) -> tuple[float, str]:
+    """The moment above AND THE CAUSE that won it — (0.0, "") when nothing holds.
+
+    The scheduler needs only the moment; a RENDERER needs the cause, because the two
+    holds read to a person as opposite things (GitHub issue #714): a spent usage window
+    names when it reopens, and CI is simply not done yet. Same "newest wins" rule, so
+    the sentence a surface prints is always the hold the tick is actually honouring.
+    """
+    held, cause = 0.0, ""
     for e in events:
         payload = db.from_json(e["payload"], {})
         if (payload.get("round") == round_no
                 and payload.get("cause") in VALIDATION_HOLDING_CAUSES):
-            held = max(held, float(payload.get("reopens_at") or 0.0))
-    return held
+            when = float(payload.get("reopens_at") or 0.0)
+            if when >= held:
+                held, cause = when, str(payload["cause"])
+    return held, cause
+
 
 # What one seat proposed. "" is a seat that offered none — it ran, but said nothing the
 # arbiter can count.

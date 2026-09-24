@@ -2167,8 +2167,12 @@ def cmd_wo(args: argparse.Namespace) -> int:
                     include_hidden=args.include_hidden,
                 )
                 # Derived inside the store's lifetime: the label reads the dependencies'
-                # rows, so it cannot be computed after the connection is closed.
-                labels = {wo["id"]: invariants.status_label(store, wo) for wo in wos}
+                # rows, so it cannot be computed after the connection is closed. The
+                # fleet reading is one per project, and taken only when a listed order
+                # could be held by the account's window (issue #714).
+                account = ops.fleet_if_held(wos)
+                labels = {wo["id"]: invariants.status_label(store, wo, account)
+                          for wo in wos}
             finally:
                 store.close()
             for wo in wos:
@@ -2212,7 +2216,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             messages = store.list_messages(args.wo_id)
             detail = {
                 "project": name, **wo,
-                "status_label": invariants.status_label(store, wo),
+                "status_label": invariants.status_label(store, wo,
+                                                        ops.fleet_if_held([wo])),
                 "blocked_by": store.unfinished_dependencies(args.wo_id),
                 # What has already been dismissed on this order, decoded. Always
                 # present, empty or not: it is the only durable record of why a work

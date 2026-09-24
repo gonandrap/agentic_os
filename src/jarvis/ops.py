@@ -825,6 +825,22 @@ def blocked_by(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
     return store.unfinished_dependencies(wo["id"])
 
 
+def fleet_if_held(wos: Iterable[dict[str, Any]]) -> "fleet.Fleet | None":
+    """The account's state, for surfaces that render work orders an outage could hold.
+
+    ONE READ FOR A WHOLE LISTING, and only when it can change a word: `fleet.current`
+    opens every project's store, which is not a cost to pay per row, nor on a page where
+    nothing is in `FLEET_HELD_STATUSES`. None when the catalog cannot be resolved — a
+    surface that cannot answer "is the account up" still has to render (issue #714).
+    """
+    if not any(wo["status"] in invariants.FLEET_HELD_STATUSES for wo in wos):
+        return None
+    try:
+        return fleet.current(resolve_catalog())
+    except (OpsError, CatalogError):
+        return None
+
+
 def find_work_order(wo_id: str, project_name: str | None = None
                     ) -> tuple[str, Path, dict[str, Any]]:
     """Locate a work order across all registered projects."""

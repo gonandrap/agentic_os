@@ -57,7 +57,8 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
-    validation_hold_until,
+    VALIDATION_HELD_CAUSE,
+    validation_hold,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -856,11 +857,25 @@ def usage_hold_note(until: float) -> str:
             f"{clock(until)}")
 
 
+#: The OTHER hold, and it names no moment on purpose — `reopens_at` on a CI hold is the
+#: recheck interval, not a deadline GitHub stated, so printing it promises a minute that
+#: means nothing. The timeline says it this way already (`timeline.py`, `ci_pending`) and
+#: this is the label's half of the same sentence.
+CI_HOLD_NOTE = "waiting for GitHub to finish running the checks"
+
+
 def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
-    """`usage_hold_note` for a round that is actually held, or "" for one that is not."""
-    until = validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
-                                  round_no)
-    return usage_hold_note(until) if until > time.time() else ""
+    """Why this round is not being judged, or "" for a round that is not held.
+
+    THE CAUSE DECIDES THE SENTENCE. Rendering `usage_hold_note` for both of them told
+    every reader that a round merely waiting on CI was out of usage budget — untrue, and
+    untrue in the direction that makes a fleet look broken (GitHub issue #714).
+    """
+    until, cause = validation_hold(store.events_of_kind(wo_id, "validation_failed"),
+                                   round_no)
+    if until <= time.time():
+        return ""
+    return usage_hold_note(until) if cause == VALIDATION_HELD_CAUSE else CI_HOLD_NOTE
 
 
 def parallel_round_note(store: ProjectStore, wo_id: str) -> str:
@@ -910,6 +925,31 @@ def base_red_note(store: ProjectStore, wo_id: str) -> str:
     return BASE_RED_NOTE.format(base=payload.get("base") or "its base")
 
 
+#: Statuses an ACCOUNT-WIDE outage actually holds: the OS itself would start a turn or a
+#: validation seat for one of these if the window were open. `needs_review` and
+#: `waiting_pr_merge` are deliberately absent — the user and GitHub hold those, not the
+#: window (GitHub issue #714, Neo question 563).
+FLEET_HELD_STATUSES = ("pending", "dispatching", "running", "validating")
+
+
+def fleet_hold_note(wo: dict[str, Any], fleet: Fleet | None) -> str:
+    """"the Claude usage window is spent, reopening at …" for an order the window holds.
+
+    THE OUTAGE IS A FACT ABOUT THE ACCOUNT (`fleet.Outage`), and `pause_note` beside this
+    one can only see a refusal THIS work order owns — so an order that was between turns
+    when the window shut said nothing about it for three hours while its neighbours,
+    which happened to be mid-turn, said it plainly (GitHub issue #714).
+
+    Never overrides a more specific note: a refused turn names its own retry, and a held
+    round names the review. This is the answer for the orders that have neither.
+    """
+    if fleet is None or not fleet.shut():
+        return ""
+    if wo["status"] not in FLEET_HELD_STATUSES:
+        return ""
+    return fleet.blocked()
+
+
 def status_label(store: ProjectStore, wo: dict[str, Any],
                  fleet: Fleet | None = None) -> str:
     """How this work order's status should read to a human.
@@ -935,10 +975,13 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         label = f"validating — review round {round_no} of {DEFAULT_VALIDATION_MAX_ROUNDS}"
         # Why nothing is happening, when the answer is a spent window rather than a slow
         # reviewer. Without it the label promises a review that is in fact waiting hours.
-        held = validation_hold_note(store, wo["id"], int(round_no))
+        # The round's own hold first; the account-wide one when the round has recorded
+        # nothing yet — the window can shut between two ticks.
+        held = (validation_hold_note(store, wo["id"], int(round_no))
+                or fleet_hold_note(wo, fleet))
         return f"{label} — {held}" if held else label
     if wo["status"] in ACTIVE_STATUSES:
-        note = pause_note(store, wo) or neo_wait_note(wo)
+        note = pause_note(store, wo) or neo_wait_note(wo) or fleet_hold_note(wo, fleet)
         return f"{wo['status']} — {note}" if note else wo["status"]
     # OUT OF MONEY, and ABOVE the pause note: a work order can hold a booked retry AND
     # be over its budget, and only one of the two is going to happen. `NOT_RETRIED` is

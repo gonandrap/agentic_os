@@ -14,7 +14,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .. import bill, fleet, invariants, ops, specs, uilog, wiring
-from ..catalog import CatalogError
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS
@@ -36,19 +35,14 @@ from ..timeline import build_conversation, build_timeline, count_debug
 TEMPLATES = Path(__file__).parent / "templates"
 
 
-def _fleet_if_pending(wo: dict) -> "fleet.Fleet | None":
-    """The account's state, but ONLY for a `pending` order (src/jarvis/fleet.py).
+def _fleet_if_held(wos: list[dict]) -> "fleet.Fleet | None":
+    """The account's state for these orders, or None — `ops.fleet_if_held`.
 
-    Nothing else's label can change with it, and reading it opens every project's store —
-    not a cost to pay on every page view. None when the catalog cannot be resolved: a
-    page that cannot answer "why is it waiting" still has to render.
+    A call rather than a page-local rule: the CLI listings ask the same question, and a
+    page that answered it for itself is how two surfaces come to disagree about the same
+    work order. Was `pending`-only, which is the narrowness issue #714 is about.
     """
-    if wo["status"] != "pending":
-        return None
-    try:
-        return fleet.current(ops.resolve_catalog())
-    except (ops.OpsError, CatalogError):
-        return None
+    return ops.fleet_if_held(wos)
 
 
 STATUS_META = {
@@ -848,6 +842,12 @@ def create_app() -> FastAPI:
             blocked = {k: v for k, v in blocked.items() if v}
             # Same lifetime, same reason: the note reads this work order's last turn.
             pauses = {wo["id"]: invariants.pause_note(store, wo) for wo in wos}
+            # ...and the account-wide one, for the orders that own no refusal of their
+            # own. One fleet read for the page, below the per-order note (issue #714).
+            account = _fleet_if_held(wos)
+            for wo in wos:
+                if not pauses.get(wo["id"]):
+                    pauses[wo["id"]] = invariants.fleet_hold_note(wo, account)
             pauses = {k: v for k, v in pauses.items() if v}
             # Inside the store's lifetime like every other read on this page. Empty,
             # and therefore invisible, for a project that has never linked an issue.
@@ -958,7 +958,11 @@ def create_app() -> FastAPI:
             approvals = store.list_approvals(wo_id)
             # Why a `running` work order has nothing running. Same idea as the gate
             # line above: the reason it stopped belongs on the page it stopped on.
-            pause = invariants.pause_note(store, wo)
+            # ONE read for the page, and both readers below take it: the pause note and
+            # the status label must not disagree about the account (issue #714).
+            account = _fleet_if_held([wo])
+            pause = (invariants.pause_note(store, wo)
+                     or invariants.fleet_hold_note(wo, account))
             # And why a `waiting_input` one is not in fact waiting on the reader. Both
             # notes are display; `true_blockers` decides what actually costs attention.
             waiting = ops.waiting_on(store, wo)
@@ -971,7 +975,7 @@ def create_app() -> FastAPI:
             # other surface derives it from. The header used to build its own wording
             # out of STATUS_META alone, which is how a listing and a header came to
             # disagree about the same work order once before (PR 65).
-            label = invariants.status_label(store, wo, _fleet_if_pending(wo))
+            label = invariants.status_label(store, wo, account)
             validation = ops.validation_detail(store, wo_id=wo_id)
             # THE WHOLE ORDER'S LIST, not one round's. See `_issues.html`.
             issue_index = ops.issue_index(store, wo_id)
