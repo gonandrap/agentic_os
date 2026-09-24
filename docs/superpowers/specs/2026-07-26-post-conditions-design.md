@@ -77,6 +77,7 @@ tick — otherwise the timeline and the inbox become the noise they exist to cut
 | `INV-ASSUMPTION-PERSISTED` | every `assumption` event has a matching row | rebuild the row from the event payload (content-matched, so never duplicates) |
 | `INV-ATTENTION-REASON` | a flagged order's reason names the real blocker | rewrite to the derived reason |
 | `INV-ATTENTION-PHANTOM` | a completed/cancelled order is not flagged | clear the flag |
+| `INV-ATTENTION-PREMATURE` | a pre-delivery order is not flagged over assumptions the OS reviews itself | clear the flag |
 | `INV-ATTENTION-MISSING` | an order that needs the user says so | raise the flag with the derived reason |
 | `INV-ATTENTION-BLANK` | a flagged order has a non-empty reason | fill from the derivation, else report |
 

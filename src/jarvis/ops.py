@@ -1329,12 +1329,20 @@ def _project_permission_mode(project_name: str) -> str | None:
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
-    """Record an assumption: DB row + ASSUMPTIONS.md append + review flag."""
+    """Record an assumption: DB row + ASSUMPTIONS.md append + review flag.
+
+    THE FLAG IS NOT UNCONDITIONAL. `invariants.neo_reviews_later` is the same predicate
+    `true_blockers` derives with, asked here so the write and the derivation cannot
+    disagree for the seconds before the next reconcile tick (issue #711).
+    """
+    from .invariants import neo_reviews_later
+
     name, path, wo = find_work_order(wo_id)
     store = ProjectStore(path)
     try:
         store.add_assumption(wo_id, content)
-        store.flag_attention(wo_id, "assumptions pending review")
+        if not neo_reviews_later(store, wo):
+            store.flag_attention(wo_id, "assumptions pending review")
     finally:
         store.close()
     md = path / "ASSUMPTIONS.md"
@@ -7630,6 +7638,32 @@ def inspect_config_at(project_path: Path) -> Any:
         return catalog.os.inspect
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def auto_review_at(project_path: Path) -> bool:
+    """Will the OS decide this project's assumptions ITSELF, rather than the user?
+
+    `Daemon.auto_review`'s two guards, read by path for the caller that holds a store and
+    no name (`inspect_config_at`'s reason). Both, because Neo is the reviewer: a fleet
+    with `os.neo.enabled` off files questions nothing drains, so its assumptions are the
+    user's after all. One catalog read, so the two guards cannot answer separately.
+
+    False on any unreadable catalog — the safe direction here is the user being asked for
+    a decision the OS might have taken, never the reverse.
+    """
+    try:
+        catalog = resolve_catalog()
+        if not catalog.os.neo.enabled:
+            return False
+        target = Path(project_path).resolve()
+        cfg = catalog.os.validation
+        for spec in catalog.projects:
+            if Path(spec.path).resolve() == target:
+                cfg = spec.validation
+                break
+        return bool(cfg.enabled and cfg.auto_review)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return False
 
 
 def schedule_config_at(project_path: Path, catalog: Catalog | None = None) -> Any:

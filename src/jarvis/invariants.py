@@ -91,6 +91,16 @@ BLOCKED_STATUSES = ("waiting_input", "needs_review", "failed", "pending",
                     # An order that spent its budget. Only the user can decide whether to
                     # fund another turn, so nothing else will ever move it.
                     "budget_exhausted")
+#: Statuses a work order can still reach `needs_review` from under its own steam — it
+#: has not delivered yet. `autoreview.decide`'s condition 2 is the reason this tuple
+#: exists: Neo judges an assumption only in `needs_review`, so in a project that has
+#: opted in, an assumption recorded here is Neo's to decide on delivery and not the
+#: user's to decide now (GitHub issue #711). Every other status is absent deliberately —
+#: `failed`, `budget_exhausted`, `waiting_pr_merge` and the terminal pair never reach
+#: Neo's review, so an assumption pending in one of them IS the user's.
+PRE_DELIVERY_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
+                         "validating")
+
 # Statuses where nothing can possibly be pending: the work order is over.
 TERMINAL_STATUSES = ("completed", "cancelled")
 
@@ -494,6 +504,29 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
         store.latest_validation_round(wo_id=wo["id"])) != head
 
 
+def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Are this order's pending assumptions Neo's to decide on delivery, not the user's?
+
+    Issue #711: a worker recording an assumption mid-turn flagged "Needs you" for the
+    rest of the turn, in a project whose assumptions the OS decides itself. Nothing was
+    owed — `Daemon.auto_review` only looks at `needs_review` — and the order read as
+    stalled while the worker was still typing.
+
+    NOT a suppression that outlives the turn: the moment the order parks in
+    `needs_review` this is False again, so either Neo settles the assumptions or the
+    blocker comes straight back — including every case Neo holds (`autoreview.decide`
+    conditions 4-7).
+
+    The catalog read sits behind the caller's `pending` check, which is empty for almost
+    every work order on almost every tick (`parked_reason`'s ordering note).
+    """
+    if wo["status"] not in PRE_DELIVERY_STATUSES:
+        return False
+    from .ops import auto_review_at
+
+    return auto_review_at(store.project_path)
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone.
@@ -505,7 +538,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     """
     blockers: list[str] = []
     pending = store.pending_assumptions(wo["id"])
-    if pending:
+    if pending and not neo_reviews_later(store, wo):
         n = len(pending)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
     # A privileged action Neo declined to decide on. Nobody else can open that gate, and
@@ -1436,6 +1469,40 @@ def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
             wo_id=wo["id"],
             detail=f"{wo['status']} work order still flagged "
                    f"({wo.get('attention_reason') or 'no reason'})",
+            repaired=True,
+            repair="attention cleared",
+        )
+
+
+def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-ATTENTION-PREMATURE — an assumption flag Neo, not the user, is going to answer.
+
+    The self-heal half of issue #711: every order flagged before the fix, and any flagged
+    by a route that does not ask `neo_reviews_later`, drops the flag on the next tick
+    rather than needing a hand-clear.
+
+    NARROWER THAN "true_blockers is empty", deliberately. A flag raised by a Claude Code
+    hook carries a reason this module cannot derive — that is the case
+    INV-ATTENTION-REASON refuses to clobber — so clearing every underivable flag here
+    would delete the more specific line. Only a reason that NAMES assumptions is touched,
+    and only while `neo_reviews_later` holds.
+
+    Repairable: clear the flag. The assumptions themselves are untouched and still on
+    `jarvis wo show`.
+    """
+    for wo in store.list_work_orders(statuses=PRE_DELIVERY_STATUSES, include_hidden=True):
+        if not wo["needs_attention"]:
+            continue
+        if not _mentions_assumptions(wo.get("attention_reason")):
+            continue
+        if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+            continue
+        store.clear_attention(wo["id"])
+        yield Violation(
+            invariant="INV-ATTENTION-PREMATURE",
+            wo_id=wo["id"],
+            detail=f"{wo['status']} work order asked for you over assumptions the OS "
+                   f"reviews itself on delivery",
             repaired=True,
             repair="attention cleared",
         )
@@ -3361,6 +3428,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_adhoc_not_governed,      # retire before the flag checks judge the leftovers
     check_legacy_adhoc_retired,    # ...and before them, let go of what nothing tracks
     check_no_phantom_attention,
+    check_assumption_flags_are_owed,  # ...and its pre-delivery sibling. Order-free
+                                   # against INV-ATTENTION-MISSING, which derives the
+                                   # same `true_blockers` and so will not put back what
+                                   # this clears — beside its sibling because they are
+                                   # one question asked of two sets of statuses
     check_messages_are_delivered,  # before INV-ATTENTION-MISSING, which skips anything
                                    # already flagged: whichever sees it first raises the
                                    # same `true_blockers[0]`, so the flag goes up once
