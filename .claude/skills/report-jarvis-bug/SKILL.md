@@ -84,8 +84,10 @@ and `high` are not re-assessed — they wait on the tracker until someone runs
 immediately, at any priority — `jarvis issues start` in the same step. It is a
 SCHEDULING decision and changes nothing about the rating, which is the point: never
 inflate a priority to get a bug worked on, expedite it instead. On `critical`/`blocker`
-Neo still re-assesses the claim alongside, so the `priority:` label can still move; the
-work no longer waits for it.
+Neo still re-assesses the claim alongside and still settles the RATING: the `priority:`
+label moves, and so does the work order's own copy of it — a claim downgraded to
+`medium` no longer ships a release when the fix lands. What the verdict no longer
+decides is whether the work happens.
 
 **The user's call, not yours.** Expedite when they asked for this bug now, or when the
 bug is blocking the work order you are in and you are the one who will be waiting.

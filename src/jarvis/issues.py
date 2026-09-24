@@ -813,10 +813,12 @@ This bug is `{priority}` on the tracker and the filing EXPEDITED it: work starts
 whatever the rating says.{tail}"""
 
 #: `EXPEDITED_WHY`'s tail on a `critical`/`blocker` filing. Expediting does not skip the
-#: re-assessment, it only stops the work waiting for it — so the worker is told the label
-#: can move under it, and that nothing about the work order moves with it.
-EXPEDITED_TRIAGE_TAIL = """ Neo is re-assessing that rating in parallel, so the \
-`priority:` label may change; this work order does not."""
+#: re-assessment, it only stops the work WAITING for it — so the worker is told the
+#: rating can still move under it, in both places it is written down.
+EXPEDITED_TRIAGE_TAIL = """ Neo is re-assessing that rating in parallel: the \
+`priority:` label may change, and so may this work order's own copy of it — a downgrade \
+takes back the release that landing this at the claimed level would have cut. What does \
+NOT change is that the work is yours to do now."""
 
 #: THE ROUTE OUT, written once. Every surface that tells the user a bug was not
 #: dispatched names this — the notification, the filing note, the tracker comment — and
@@ -908,20 +910,25 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                              f"`{START_COMMAND.format(url=issue_url)}`")
         return out
 
+    # `expedite` appends to the sentence above; a plain filing has none and writes its
+    # own. Two different statements, kept apart so neither reads as the other.
     try:
         out["neo_question_id"] = ask_triage(spec.name, issue_url, title, body, priority)
-        out["reason"] += (
-            f"; Neo is re-assessing the `{priority}` claim in parallel and can only move "
-            f"the label" if expedite else
-            f"`{priority}` claimed — Neo is re-assessing it against the "
-            f"rubric; a work order is created only if Neo confirms")
+        if expedite:
+            out["reason"] += (f"; Neo is re-assessing the `{priority}` claim in "
+                              f"parallel and can still move the rating, not the work")
+        else:
+            out["reason"] = (f"`{priority}` claimed — Neo is re-assessing it against the "
+                             f"rubric; a work order is created only if Neo confirms")
     except Exception as e:  # noqa: BLE001 — the issue exists whatever happens here
-        out["reason"] += (
-            f"; the `{priority}` claim was NOT re-assessed — Neo could not be asked "
-            f"({e}), so the `priority:` label is the filing agent's own" if expedite else
-            f"`{priority}` claimed but NOT confirmed — Neo could not be "
-            f"asked ({e}). Nothing was dispatched; start it yourself with "
-            f"`{START_COMMAND.format(url=issue_url)}`.")
+        if expedite:
+            out["reason"] += (f"; the `{priority}` claim was NOT re-assessed — Neo could "
+                              f"not be asked ({e}), so the `priority:` label is the "
+                              f"filing agent's own")
+        else:
+            out["reason"] = (f"`{priority}` claimed but NOT confirmed — Neo could not be "
+                             f"asked ({e}). Nothing was dispatched; start it yourself "
+                             f"with `{START_COMMAND.format(url=issue_url)}`.")
     return out
 
 
@@ -1112,8 +1119,11 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     * **confirmed** (`verdict: approve`) — the work order is created and the backlog item
       is marked promoted. A release follows when the fix LANDS, which is `sync_issues`'
       job and not this one.
-    * **downgraded** (`verdict: deny`) — the priority label is corrected and the item
-      stays in the backlog for the user to promote when they choose.
+    * **downgraded** (`verdict: deny`) — the priority label is corrected and nothing is
+      dispatched. If an EXPEDITED filing already dispatched one, that work order stays
+      (the flag is a scheduling decision the verdict has no say in) but its
+      `issue_priority` is corrected too, so the claim cannot leave a release behind it —
+      `settle_work_order_priority`.
     * **unconfirmed** (escalated, or output nobody could parse) — nothing at all, not
       even a tracker comment: no verdict was reached, so there is no second level to put
       beside the claim. The claim stands on the record as a claim and the user is told.
@@ -1177,6 +1187,12 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     # An EXPEDITED filing already has one, so "no work order was created" would be the
     # tracker saying something untrue about a downgrade that dispatched nothing itself.
     out["existing_wo_id"] = out["wo_id"] or live_work_order(spec, url)
+    if out["existing_wo_id"] and out["settled"] != claimed:
+        # BEFORE the comment, and never only the label: an expedited filing dispatched
+        # its work order carrying the CLAIMED level, and a release on landing is cut
+        # from that column (`daemon.sync_issues`). See `settle_work_order_priority`.
+        out["repriced_wo_id"] = settle_work_order_priority(
+            spec, out["existing_wo_id"], claimed, out["settled"])
     try:
         set_priority_label(url, out["settled"])
         comment(url, triage_comment(
@@ -1188,6 +1204,34 @@ def settle_triage(catalog: Any, q: dict[str, Any], verdict: dict[str, Any]
     except GitHubError as e:
         out["comment_error"] = str(e)
     return out
+
+
+def settle_work_order_priority(spec: Any, wo_id: str, claimed: str,
+                               settled: str) -> str:
+    """Move a live work order's `issue_priority` to the level Neo settled on.
+
+    **A CLAIM MAY NOT BUY A RELEASE.** An expedited filing dispatches before the verdict
+    exists, so its work order carries the level the filing agent CLAIMED — and
+    `daemon.sync_issues` cuts a release when the fix lands off exactly that column. Left
+    alone, `-p blocker --expedite` would ship a release for a bug Neo rated `medium`,
+    which is the one check the re-assessment exists to be. Returns the id it rewrote, or
+    `""` if the row was gone.
+    """
+    from .project_store import ProjectStore
+
+    store = ProjectStore(spec.path)
+    try:
+        store.get_work_order(wo_id)
+    except KeyError:
+        store.close()
+        return ""
+    try:
+        store.update_work_order(wo_id, issue_priority=settled)
+        store.add_event(wo_id, "triage_settled",
+                        {"claimed": claimed, "settled": settled})
+    finally:
+        store.close()
+    return wo_id
 
 
 def live_work_order(spec: Any, issue_url: str) -> str:
@@ -1217,9 +1261,12 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "") -> str:
     order hands that one back; one whose work orders have all settled is free to get
     another, which is exactly what a reopened issue needs.
 
-    `why` is the brief's second paragraph, so `start_work` can reuse every other thing
-    this does — that dedupe, `issue_url`/`issue_priority`, the in-progress label — without
-    telling its worker a release is coming.
+    `why` is the brief's second paragraph, so the OTHER two routes in — `start_work`, and
+    an EXPEDITED filing (`route_filing`) — reuse every other thing this does: that dedupe,
+    `issue_url`/`issue_priority`, the in-progress label. Only a confirmed
+    `critical`/`blocker` is told a release is coming, and an expedited claim's
+    `issue_priority` is rewritten if Neo later downgrades it
+    (`settle_work_order_priority`).
     """
     from .ops import create_work_order
     from .project_store import ProjectStore

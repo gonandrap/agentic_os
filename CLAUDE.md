@@ -365,9 +365,12 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # honest description of the defect instead of
                                            # being inflated to buy attention. On
                                            # critical/blocker it does NOT skip Neo: the
-                                           # re-assessment still runs alongside and can
-                                           # still move the `priority:` label, but it can
-                                           # no longer decide whether work happens.
+                                           # re-assessment still runs alongside and still
+                                           # settles the RATING — the `priority:` label
+                                           # and the work order's own copy of it, so a
+                                           # downgrade takes back the release the claim
+                                           # would have shipped on landing. What it can
+                                           # no longer decide is whether work happens.
 jarvis config wiring [project]             # which of the USER'S OWN MCP servers, skills
                                            # and plugins reach this project's workers.
                                            # Everything is wired by default, including

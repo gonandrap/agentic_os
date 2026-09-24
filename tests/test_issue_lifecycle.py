@@ -1364,8 +1364,9 @@ def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
 
 
 def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
-    """Neo may move the label; it may not stop work the user asked for. And the tracker
+    """Neo may move the rating; it may not stop work the user asked for. And the tracker
     may not be told no work order was created when one is running."""
+    from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=False, answer="medium", reason="bounded to one command")
 
@@ -1375,6 +1376,54 @@ def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
     body = "\n".join(fleet.gh.issue()["comments"])
     assert pickup["wo_id"] in body
     assert "No work order was created" not in body
+
+    # THE HALF THE LABEL DOES NOT COVER: the work order carried the CLAIM, and a release
+    # on landing is cut from that column — `daemon.sync_issues`, guarded by `dispatches`.
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_priority"] == "medium", "the claim may not outlive the verdict"
+    assert not issues.dispatches(wo["issue_priority"]), \
+        "a downgraded claim must not ship a release when the fix lands"
+
+
+def test_a_downgraded_expedited_fix_lands_without_a_release(fleet):
+    """The same fact through the daemon rather than through the column: the landing
+    sweep is what would have cut the release."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=False, answer="medium", reason="bounded to one command")
+    fleet.land(pickup["wo_id"])
+
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_state"] == issues.CLOSED, "the fix still lands and still closes it"
+    assert fleet.releases() == [], "a `medium` bug does not ship a release"
+
+
+def test_neo_confirming_an_expedited_claim_leaves_it_alone(fleet):
+    """The other verdict: nothing is re-priced, no second work order is created, and the
+    release a confirmed `blocker` earns still follows."""
+    from jarvis import ops
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=True)
+
+    assert fleet.wo_id() == pickup["wo_id"], "no second work order for one issue"
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_priority"] == "blocker"
+    assert "priority: blocker" in fleet.gh.issue()["labels"]
+    assert issues.dispatches(wo["issue_priority"])
+
+
+def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):
+    """The filing is the half that must never be lost: if the dispatch half fails, the
+    issue still exists and the note says how to start the work by hand."""
+    monkeypatch.setattr(issues, "promote_confirmed",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db is gone")))
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+
+    assert not pickup["wo_id"] and not fleet.wo_id()
+    assert "db is gone" in pickup["reason"]
+    assert "jarvis issues start" in pickup["reason"]
+    assert "priority: blocker" in fleet.gh.issue()["labels"]
+    assert pickup["neo_question_id"], "the claim is still re-assessed"
 
 
 @pytest.mark.parametrize("level", ["low", "blocker"])
