@@ -1360,6 +1360,43 @@ def test_a_feature_round_met_by_a_usage_window_waits_rather_than_spending_a_retr
         store.close()
 
 
+def test_a_feature_round_the_shut_window_skips_records_the_hold(fleet):
+    """GitHub issue #714 on the feature side. `feature_validation_tick` returns before
+    the first seat when the account is shut — correctly — and used to write nothing, so
+    a feature parked for a whole window had no recorded reason for any of it.
+
+    The twin is tests/test_usage_window_is_account_wide.py; the difference is only the
+    carrier, the manager's timeline (`_hold_feature_rounds_for_outage`)."""
+    from jarvis import fleet as fleet_mod
+    from jarvis.project_store import VALIDATION_HELD_CAUSE, validation_hold
+
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        fleet.daemon.settle_features(fleet.spec, store)
+        assert store.get_feature_order(fo_id)["status"] == "validating"
+
+        state = fleet_mod.Fleet(3, 0, fleet_mod.Outage(
+            project="proj_a", wo_id="wo-1", reopens_at=time.time() + 3600,
+            message="You've hit your session limit · resets 11:50pm"))
+        for _ in range(3):
+            fleet.daemon.feature_validation_tick(fleet.spec, store, state)
+
+        assert validator.calls == [], "a seat was called into a closed window"
+        assert store.latest_validation_round(fo_id=fo_id)["outcome"] == "pending"
+        events = ops.feature_events_of_kind(store, fo_id, "validation_failed")
+        assert len(events) == 1, "one event per round per window"
+        until, cause = validation_hold(events, 1)
+        assert cause == VALIDATION_HELD_CAUSE
+        assert until == pytest.approx(state.outage.reopens_at)
+    finally:
+        store.close()
+
+
 def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
     """GitHub issue #581 on the feature side, and the case that argued the shape of the
     fix: this hold's event lives on the MANAGER's timeline, so nothing reading the
