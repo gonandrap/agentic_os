@@ -11,13 +11,15 @@ Spike: §3 of
 Script: `scripts/spike_peer_message.py` (hand-run; CANNOT run under pytest — the root
 `conftest.py` gate points `JARVIS_CLAUDE_BIN` at a stub that exits 1).
 
-## Verdict: WORKS. 5/5 trials, plus 2/2 with `--autocompact 100000`.
+## Verdict: DELIVERY WORKS (5/5 trials, plus 2/2 with `--autocompact 100000`).
+## SENDER IDENTITY: NOT VERIFIED. Ship the queue path.
 
 Receiver argv mirrored `claude_cli.turn_args()`/`spawn_turn()`: `-p --output-format json
 --session-id <uuid> -n "[WO …] …" --permission-mode auto`, detached
-(`start_new_session=True`), `stdin=DEVNULL`. Mid-turn is proven by construction: a `-p`
-session gets one turn and exits, so a message in that turn's result arrived between tool
-calls.
+(`start_new_session=True`), `stdin=DEVNULL`. ONE DELIBERATE DIFFERENCE: `--session-id` on
+a FRESH session, where a real worker's later turns use `--resume`. A resumed session is
+NOT covered by these numbers. Mid-turn is proven by construction: a `-p` session gets one
+turn and exits, so a message in that turn's result arrived between tool calls.
 
 1. **Mid-turn delivery under `-p`: YES.** Delivered between `Bash` calls, no new turn.
    Receiver was on sleep call 4 of 12 every time.
@@ -28,7 +30,9 @@ calls.
    `queue-operation`/`enqueue`, an `attachment` row (`attachment.origin`), and a
    `queue-operation`/`remove` with **`"reason": "absorbed_mid_turn"`** — the exact string
    to look for. So `usage.read_session`, `bill` and `jarvis inspect` do NOT go blind.
-4. **Sender identity: YES, and refusable — via a hook, not via a setting.** See below.
+4. **Sender identity: NOT VERIFIED.** A hook CAN refuse a sender that is not on a pid
+   allow-list, and a forged `from-name` does not help the forger — measured. But nothing
+   measured says the PID in the envelope cannot itself be forged. See below.
 
 ## The cost claim is real
 
@@ -44,9 +48,25 @@ from-name="…" from-mode="prompting">` envelope wrapped in a `<system-reminder>
 `from-name` is **self-declared and forgeable by any same-UID session** — do not trust it.
 
 The transcript's `attachment.origin` carries `verifiedPeerPid` and
-`verifiedPeerProcStart`, kernel-verified by the CLI over the unix socket. Measured: the
-pid in the socket path equals `verifiedPeerPid` (2195073 both), so the pid in the
-envelope the hook sees is trustworthy.
+`verifiedPeerProcStart`. In two HONEST trials the socket-path pid equalled
+`verifiedPeerPid` (2195073; 2870319). **Agreement, not verification** — no trial made a
+sender present another process's pid, so DO NOT call the envelope pid trustworthy.
+
+**A hook never sees `verifiedPeerPid`.** Measured: the `UserPromptSubmit` payload is
+exactly `{cwd, hook_event_name, permission_mode, prompt, prompt_id, session_id,
+session_title, transcript_path}`. The only sender fact a hook can read is the envelope
+TEXT; the kernel-verified fields land in the transcript, too late to answer with.
+
+`--mode identity` (1 trial each, 2026-09-24): honest sender, pid published to the hook's
+allow-list — absorbed mid-turn, receiver stopped at call 4 of 12. Forger, same binary,
+same self-declared `-n jarvis-daemon`, pid not published — REFUSED, receiver ran all 12
+calls, `received: false`.
+
+NOT MEASURED, and it is what blocks the peer path: a same-UID process presenting a `from`
+path naming ANOTHER pid. Discovery is `~/.claude/sessions/<pid>.json` (plain per-session
+files carrying `name` and `messagingSocketPath`); a fabricated entry there was NOT listed
+by a real sender's `ListAgents` and its socket was never contacted, so the wire protocol
+was never captured and no raw forging client was written.
 
 **`UserPromptSubmit` FIRES on an absorbed peer message** (this corrects the auto-memory's
 "no hook fires on receive"). Its payload's `prompt` is the raw
@@ -55,15 +75,17 @@ Grepping the 2.1.281 binary finds no peer-specific hook event — `UserPromptSub
 seam.
 
 **A `UserPromptSubmit` hook exiting 2 REFUSES the message**: measured, the receiver ran
-all 8 sleep calls and reported `received: false`. So `jarvis _hook` can authenticate a
-sender by pid and drop anything that is not the daemon.
+all 8 sleep calls and reported `received: false`. That is the seam `jarvis _hook` would
+sit in — but it can only be as trustworthy as the envelope pid, which is the open
+question above.
 
 ## The off switches — and the one that bites
 
 - `DISABLE_TELEMETRY=1` on BOTH sender and receiver does **NOT** disable peer messaging on
-  2.1.281. The docs-era claim (DISABLE_TELEMETRY / DO_NOT_TRACK /
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC / DISABLE_GROWTHBOOK switch the feature off) is
-  stale for at least the first of them. Do not gate the feature on reading those.
+  2.1.281. ONE variable, ONE measurement: `DO_NOT_TRACK`,
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and `DISABLE_GROWTHBOOK` were NOT tested.
+  What follows is only that the docs-era list of four is wrong about at least one, so
+  reading it is no substitute for testing the one you care about.
 - `crossSessionInbound: "refuse"` in the RECEIVER's settings **does** drop it silently.
 
 **SENDER-SIDE SUCCESS IS NOT A DELIVERY RECEIPT.** Against a refusing receiver
