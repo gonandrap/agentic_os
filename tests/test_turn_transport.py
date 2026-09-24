@@ -419,3 +419,109 @@ def _poll_until_settled(store, timeout: float = 15.0) -> list[dict]:
             return settled
         time.sleep(0.05)
     return []
+
+
+# -- the transport is DECLARED, not assumed --------------------------------------------
+# §3 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. Every rule that
+# depends on a turn being one-shot reads this key rather than hardcoding today's answer —
+# hardcode it and the day `spawn_background` acquires a production caller, every refusal
+# below becomes a lie the OS tells its own workers.
+
+
+def _worker_env(project, *, wo: dict | None = None, **worker) -> dict:
+    """The env block of the settings file a real dispatch writes. Every rule in §3,
+    §4 and §7 of the spec reads one of these keys at hook time, so they are asserted
+    here — where dispatch actually writes them — and not only where hooks read them."""
+    from jarvis.catalog import ProjectSpec, WorkerDefaults
+    from jarvis.dispatch import _write_worker_settings
+
+    spec = ProjectSpec(name="proj_a", path=project, description="",
+                       worker=WorkerDefaults(**worker))
+    out = _write_worker_settings(spec, wo or {"id": "wo-tt01", "title": "t"})
+    return json.loads(out.read_text())["env"]
+
+
+def test_worker_settings_declare_headless_transport(project, jarvis_home) -> None:
+    assert _worker_env(project)[claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_HEADLESS
+
+
+def test_transport_value_comes_from_claude_cli_constant(project, jarvis_home) -> None:
+    """The argument the file already makes for `PROMPT_CACHE_5M_ENV`: the launcher and
+    the settings file must not be able to disagree about what a turn is."""
+    import inspect
+
+    from jarvis import dispatch
+
+    assert claude_cli.TRANSPORT_HEADLESS == "headless"
+    source = inspect.getsource(dispatch._write_worker_settings)
+    assert '"headless"' not in source and "'headless'" not in source
+
+
+def test_background_spawn_declares_background_transport(project, monkeypatch) -> None:
+    """The other transport names itself too, or §4 would refuse a job in the one session
+    where nothing kills it."""
+    seen: dict = {}
+
+    def fake_run(args, cwd=None, timeout=120, env_extra=None):
+        seen["env_extra"] = env_extra
+        return "job id: bg-1"
+
+    monkeypatch.setattr(claude_cli, "_run", fake_run)
+    claude_cli.spawn_background("do it", project, "[WO wo-tt01] t")
+
+    assert seen["env_extra"][claude_cli.TURN_TRANSPORT_ENV] \
+        == claude_cli.TRANSPORT_BACKGROUND
+
+
+def test_worker_settings_carry_the_require_crew_switch(project, jarvis_home) -> None:
+    """The off switch the default-true refusal is defended by. Proven at the settings
+    file, because that is the only place the value crosses from the catalog to the
+    hook."""
+    assert _worker_env(project)["JARVIS_REQUIRE_CREW"] == "1"
+    assert _worker_env(project, require_crew=False)["JARVIS_REQUIRE_CREW"] == "0"
+
+
+def test_worker_settings_carry_the_work_orders_kind(project, jarvis_home) -> None:
+    for kind in ("worker", "planner", "manager"):
+        env = _worker_env(project, wo={"id": "wo-tt02", "title": "t", "kind": kind})
+        assert env["JARVIS_WO_KIND"] == kind
+    # absent in the row is the ordinary worker, never an empty string a hook would
+    # compare unequal to "worker" and silently skip the refusal for.
+    assert _worker_env(project)["JARVIS_WO_KIND"] == "worker"
+    assert _worker_env(project, wo={"id": "wo-tt03", "title": "t",
+                                    "kind": None})["JARVIS_WO_KIND"] == "worker"
+
+
+def test_the_hook_reads_the_keys_dispatch_writes(project, jarvis_home) -> None:
+    """The two halves cannot drift: what `_write_worker_settings` writes is exactly
+    what `hooks` looks up."""
+    from jarvis import hooks
+
+    env = _worker_env(project)
+    for key in (hooks.TURN_TRANSPORT_ENV, hooks.REQUIRE_CREW_ENV, hooks.WO_KIND_ENV):
+        assert key in env, key
+
+
+def test_env_extra_reaches_the_subprocess_environment(monkeypatch, tmp_path) -> None:
+    """`spawn_background`'s transport declaration is only true if `_run` forwards it.
+    Asserted against the real `_run`, with `subprocess.run` as the seam — the other
+    background test monkeypatches `_run` itself and so could not have caught a drop."""
+    seen: dict = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "job id: bg-1"
+        stderr = ""
+
+    def fake_subprocess_run(argv, **kw):
+        seen["env"] = kw["env"]
+        return _Proc()
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", fake_subprocess_run)
+    monkeypatch.setattr(claude_cli, "claude_bin", lambda: "claude")
+    claude_cli.spawn_background("do it", tmp_path, "[WO wo-tt01] t")
+
+    assert seen["env"][claude_cli.TURN_TRANSPORT_ENV] == claude_cli.TRANSPORT_BACKGROUND
+    # and the ambient environment still rides along, or the turn loses PATH
+    assert "PATH" in seen["env"]

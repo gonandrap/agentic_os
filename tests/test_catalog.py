@@ -427,3 +427,22 @@ def test_the_guard_rail_on_the_floor_is_itself_configurable():
     assert raised.os.cold_prefix_floor == DEFAULT_COLD_PREFIX_FLOOR_MAX + 50_000
     with pytest.raises(CatalogError, match="cold_prefix_floor_max"):
         parse_catalog({"os": {"cold_prefix_floor_max": 0}, "projects": []})
+
+
+def test_worker_require_crew_defaults_true():
+    """§7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md: the crew
+    is the default, and turning it off is a project's deliberate opt-out."""
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.projects[0].worker.require_crew is True
+
+
+def test_worker_require_crew_parsed():
+    cat = parse_catalog({"projects": [
+        {"name": "a", "path": "/tmp/a", "worker": {"require_crew": False}},
+        {"name": "b", "path": "/tmp/b", "worker": {"require_crew": True}},
+    ]})
+    assert cat.projects[0].worker.require_crew is False
+    assert cat.projects[1].worker.require_crew is True
+    with pytest.raises(CatalogError, match="require_crew"):
+        parse_catalog({"projects": [
+            {"name": "a", "path": "/tmp/a", "worker": {"require_crew": "no"}}]})

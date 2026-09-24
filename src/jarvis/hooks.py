@@ -337,6 +337,168 @@ def finish_summary_decision(payload: dict[str, Any],
     )
 
 
+#: The transport declaration (`claude_cli.TURN_TRANSPORT_ENV` and its two values) and the
+#: crew keys, spelled rather than imported: `import jarvis.claude_cli` costs 56ms against
+#: this module's 27ms, and this hook runs on every Bash call and every file write.
+#: `tests/test_background_refusal.py` builds its env from the constants and asserts
+#: against these, so the two cannot drift silently.
+TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
+TRANSPORT_HEADLESS = "headless"
+REQUIRE_CREW_ENV = "JARVIS_REQUIRE_CREW"
+WO_KIND_ENV = "JARVIS_WO_KIND"
+
+#: Everything the shell backgrounds a job with, other than a bare `&`. In COMMAND
+#: position only, so `grep -r nohup src/` is not a detached job.
+_BACKGROUNDING_WORD = re.compile(
+    r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
+
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
+_SHELL_COMMENT = re.compile(r"(?:(?<=^)|(?<=\s))#[^\n]*")
+
+
+def _mask_shell_text(command: str) -> str:
+    """The command with quoted spans and comments blanked, positions preserved.
+
+    An `&` inside a string or a comment is prose. This is the whole difficulty of the
+    shell half of §4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
+    """
+    masked = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
+    return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
+
+
+def backgrounds_through_shell(command: str) -> bool:
+    """Whether this command starts a job the shell detaches from the turn.
+
+    NOT matched, and each of these is an ordinary foreground command: `&&`, `&>`, `&>>`,
+    `2>&1`. `&` counts only as a statement terminator.
+    """
+    masked = _mask_shell_text(command)
+    if _BACKGROUNDING_WORD.search(masked):
+        return True
+    for i, char in enumerate(masked):
+        if char != "&":
+            continue
+        before = masked[i - 1] if i else ""
+        after = masked[i + 1] if i + 1 < len(masked) else ""
+        if "&" in (before, after) or after == ">" or before in "><":
+            continue
+        return True
+    return False
+
+
+def background_task_decision(payload: dict[str, Any],
+                             env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a job this turn cannot outlive, before it starts.
+
+    §4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. The contract
+    has forbidden backgrounding in prose since TEMPLATE_VERSION v10 and wo-d81fcc15 did
+    it anyway, on two consecutive turns, the second costing 62 hours of wall clock
+    (issue #575) — kn-6dcaf055 is the class, `finish_summary_decision` above is the same
+    shape for the same reason.
+
+    Conditional on the DECLARED transport, never on a hardcoded belief that a turn is
+    one-shot: `spawn_background` is supervisor-owned and the notifications DO arrive
+    there. Absent key = not a Jarvis worker = no-op.
+
+    A subagent's calls are covered without a second mechanism: PreToolUse fires on them
+    under the parent session.
+    """
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
+    if payload.get("tool_name") != "Bash":
+        return None
+    tool_input = payload.get("tool_input") or {}
+    if not (tool_input.get("run_in_background")
+            or backgrounds_through_shell(tool_input.get("command", ""))):
+        return None
+    return _deny(
+        "Re-run this in the FOREGROUND: this turn is one `claude -p` process, ending it "
+        "kills whatever you left running, and nothing wakes you when a background job "
+        "finishes. Wait for the command here instead — the fix costs you nothing but "
+        "the wait, and there is no notification coming."
+    )
+
+
+def crew_edit_decision(payload: dict[str, Any],
+                       env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse the LEAD's own file edits, so the delegation is a control and not prose.
+
+    §7 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. The
+    discriminator is the ABSENCE of `agent_type` on the payload (see the comment at the
+    gate's `_open_request` call below): PreToolUse carries it for a seat's calls.
+
+    The hole, stated in the spec and worth restating here: Bash is not denied, so a
+    heredoc or `sed -i` writes a file anyway. A wall for the tool surface, a speed bump
+    for the shell — the lead needs the shell for git, pytest and every `jarvis …`
+    command, and a lead that routes around this has decided to rather than forgotten.
+    """
+    if payload.get("agent_type"):
+        return None  # a seat, which is exactly what this rule wants
+    if not (env.get("JARVIS_WO_ID") and env.get(TURN_TRANSPORT_ENV)):
+        return None
+    if env.get(WO_KIND_ENV) != "worker" or env.get(REQUIRE_CREW_ENV) != "1":
+        return None
+    cwd = payload.get("cwd") or ""
+    if "/.claude/worktrees/" not in cwd:
+        return None
+    tool_input = payload.get("tool_input") or {}
+    file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
+    try:
+        rel = Path(file_path).resolve().relative_to(Path(cwd).resolve())
+    except ValueError:
+        return None  # outside the worktree: refused elsewhere, not this rule's business
+    if ".jarvis" in rel.parts:
+        return None  # generated state the lead owns
+    seat = "jarvis-spec-writer" if "specs" in rel.parts else "jarvis-implementer"
+    return _deny(
+        f"Delegate this write to `{seat}`. You are the LEAD: git, the pull request, "
+        f"every `jarvis …` command, the work-order record and REVIEW of what each seat "
+        f"produced are yours; the spec and the code are not. Send the seat the full "
+        f"context — it inherits none of your briefing — and read what it hands back "
+        f"before you commit it."
+    )
+
+
+#: A spec's two load-bearing sections, matched on the HEADING alone.
+_SPEC_PROBLEM = re.compile(r"problem|what is broken", re.IGNORECASE)
+_SPEC_FIX = re.compile(r"\bfix\b|solution", re.IGNORECASE)
+
+
+def spec_shape_decision(payload: dict[str, Any],
+                        env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a spec file that has no problem section and no fix section.
+
+    §8 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md. At `jarvis wo
+    finish` the spec is committed and in the pull request, so the correction costs a
+    validation round and a re-delivery; here it costs one retry inside the same turn.
+
+    `Write` only: an Edit payload carries a fragment, not the document, so the same test
+    there would refuse every legitimate incremental edit to a conforming spec.
+    """
+    # kind == worker, so a PLANNER's design doc is untouched: a feature spec is cut into
+    # sections a child work order each implements and is validated by `plans` on its own
+    # terms (§8 — the user's ruling that feature orders are a different shape).
+    if (not env.get("JARVIS_WO_ID") or payload.get("tool_name") != "Write"
+            or env.get(WO_KIND_ENV) != "worker"):
+        return None
+    tool_input = payload.get("tool_input") or {}
+    path = Path(tool_input.get("file_path") or "")
+    if "specs" not in path.parts or path.suffix != ".md":
+        return None
+    headings = [m.group(1) for m in _HEADING.finditer(tool_input.get("content") or "")]
+    missing = [name for name, pattern in (("problem", _SPEC_PROBLEM), ("fix", _SPEC_FIX))
+               if not any(pattern.search(h) for h in headings)]
+    if not missing:
+        return None
+    return _deny(
+        f"This spec has no {' and no '.join(missing)} section. A spec states WHAT IS "
+        f"BROKEN with evidence — ids, `file:line`, measured facts — and only then HOW "
+        f"it is fixed: the mechanism, where it lives, and why there. Name the ROOT "
+        f"CAUSE, and say plainly if you are fixing a symptom on purpose. Add the "
+        f"headings and write the sections; do not retitle what is already there."
+    )
+
+
 def _allow(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -688,6 +850,11 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:
             return overlong
+        # Before the auto-allow for the same reason as the cap above it (§4 of
+        # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md).
+        detached = background_task_decision(payload, env)
+        if detached is not None:
+            return detached
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
@@ -696,6 +863,15 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         narrowed = under_review_decision(payload, env)
         if narrowed is not None:
             return narrowed
+        # After the narrowing (a narrowed session is the stricter state) and before the
+        # worktree auto-allow, which would otherwise make both unreachable. §7 and §8 of
+        # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
+        undelegated = crew_edit_decision(payload, env)
+        if undelegated is not None:
+            return undelegated
+        shapeless = spec_shape_decision(payload, env)
+        if shapeless is not None:
+            return shapeless
         cwd = payload.get("cwd") or ""
         file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
         if cwd and "/.claude/worktrees/" in cwd:
