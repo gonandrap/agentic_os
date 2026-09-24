@@ -112,15 +112,25 @@ HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 
-#: The confirmation pass's own four (spec §7), beside the seven `decide` already has.
+#: The confirmation pass's own five (spec §7), beside the seven `decide` already has.
 #: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
 #: approved nothing, so no second call is spent on one and the user decides it;
 #: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
-#: retried next tick, which is why it is the one hold here the record still writes down.
+#: retried next tick; `evidence_secret` is `decide_evidence`'s, over the DIFF.
+#:
+#: FOUR OF THE FIVE REACH THE RECORD, and which ones is not arbitrary (kn-22ba6087: a
+#: guard that returns early must still record why). `objected`, `unjudged`,
+#: `objection_in_flight` and `evidence_secret` are all facts about a row the OS LOOKED AT
+#: and did not act on, and `objection_in_flight` and `evidence_secret` most of all —
+#: without the line there is nothing on the record saying why an assumption the feature
+#: was switched on for is still sitting with the user. `confirming` is the only one
+#: suppressed, on `asked`'s list in `Daemon._note_autoreview_held` and for `asked`'s
+#: reason: the question IS filed, which is the pass working.
 HELD_UNJUDGED = "unjudged"
 HELD_OBJECTED = "objected"
 HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
+HELD_EVIDENCE_SECRET = "evidence_secret"
 
 #: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
 #: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
@@ -222,6 +232,160 @@ def high_stakes_marker(text: str) -> str:
     return ""
 
 
+# -- the second net's second gate: a diff the OS will not copy into a question ---------
+
+#: SECRET-SHAPED EVIDENCE, and it is deliberately NOT part of `HIGH_STAKES`.
+#:
+#: WHY IT EXISTS: `_confirm_question` interpolates the diff, the diff stat and the result
+#: summary, and `neo.ask` PERSISTS that text as a question row `/neo` and `jarvis neo
+#: list` display. A diff that adds a credential therefore lands in a store and on a
+#: surface the ask pass never put diff content on. kn-deef42ea — a redaction decision is
+#: also a filing decision: if the text may not travel, the row must not either, so the
+#: hold is the whole answer here and there is no withhold-and-file.
+#:
+#: **WHY IT IS NARROW WHERE `HIGH_STAKES` IS WIDE, AND THE DIRECTIONS ARE OPPOSITE.**
+#: `HIGH_STAKES` reads ONE ASSUMPTION'S SENTENCE, where a false positive costs the user a
+#: review action they were making anyway — so it errs wide. This reads A WHOLE DIFF OF
+#: THIS REPO, where a false positive holds the confirmation and the wide net would hold
+#: nearly every one: "credential", "production" and "delete" are in almost every change
+#: this codebase makes. That is the feature switched off, silently, which is the
+#: expensive direction here — and it is Neo's own reason (question 593) for refusing to
+#: run `high_stakes_marker` over the diff and ruling for this shape instead. There is no
+#: redaction in `evidence.py`, `validation.py` or `panel.py` to reuse: the panel sends
+#: full diffs to its seat prompts, so this rule is invented here rather than borrowed.
+#:
+#: Three shapes, and each is a SHAPE rather than a word: an added line assigning a
+#: real-looking value to a secret-named thing, a key or auth block, and a path that only
+#: secrets live at.
+SECRET_EVIDENCE = (
+    r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----",
+    r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+",
+    r"\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+\S+",
+)
+
+#: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record. The marker is
+#: rendered on the timeline and on `jarvis wo show`, so it names the shape and never
+#: quotes the match — see `secret_marker`.
+SECRET_EVIDENCE_NAMES = (
+    "an added private key block",
+    "an added ssh key line",
+    "an added Authorization header value",
+)
+
+#: A VALUE THAT IS NOT A SECRET, however secret its name. The commonest added line in
+#: any repo is the one that names a credential without carrying one — an empty default, a
+#: type annotation, a read from the environment, a `changeme` in an example config — and
+#: holding on those would be the wide net by another route.
+SECRET_PLACEHOLDERS = (
+    r"none|null|nil|nan|true|false|str|int|bool|x+|\.+|-+|_+",
+    r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample",
+    r"example|examples|test|testing|secret|password|passwd|token|key|value",
+    r"your[-_].*|my[-_].*|some[-_].*|the[-_].*",
+)
+
+#: PATHS ONLY SECRETS LIVE AT. Matched on the stat and the diff HEADERS, never on prose:
+#: the path is evidence on its own, and reading the file to find out whether this `.env`
+#: really holds anything would be the same mistake one layer down.
+SECRET_PATHS = (
+    r"(?:^|/)\.env(?:\.[\w.-]+)?$",
+    r"\.(?:pem|key|p12|pfx|jks|keystore)$",
+    r"(?:^|/)id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$",
+    r"(?:^|/)credentials(?:\.[\w-]+)?$",
+    r"(?:^|/)\.(?:netrc|npmrc|pypirc|pgpass)$",
+    r"(?:^|/)secrets?\.[\w-]+$",
+    r"service[-_]account[\w-]*\.json$",
+)
+
+#: The words that make an assignment's LEFT SIDE a secret's name, matched against the
+#: identifier's PARTS rather than as substrings: `monkey` and `keyword` must not be a
+#: `key`, and `AWS_SECRET_ACCESS_KEY` and `apiKey` must both be one.
+SECRET_NAME_PARTS = frozenset({
+    "key", "keys", "apikey", "accesskey", "privatekey", "secretkey", "seckey",
+    "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
+    "password", "passwd", "passphrase", "pwd", "credential", "credentials",
+})
+
+#: One added line assigning something. `(?!\+\+)` because `+++ b/path` is a HEADER and
+#: not a line the diff adds; `^\+` because a REMOVED secret (`-`) is the change doing the
+#: right thing. The name stops at the separator and carries no quotes or brackets, so a
+#: regex literal or a comment never parses as one.
+_ASSIGNMENT_RE = re.compile(
+    r"^\+(?!\+\+)[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?:=>|:=|=|:)[ \t]*"
+    r"(?P<value>[^\r\n]*?)[ \t]*[,;]?[ \t]*$")
+
+#: The charset a credential is spelled in. Anything else — a space, a bracket, a call, a
+#: `+` concatenation — means the right side is an EXPRESSION, and an expression is not a
+#: value: `os.environ["API_KEY"]` names a secret and contains none.
+_SECRET_VALUE_CHARS = re.compile(r"[A-Za-z0-9+/=._~-]+")
+
+_SECRET_EVIDENCE_RE = [re.compile(p, re.IGNORECASE) for p in SECRET_EVIDENCE]
+_SECRET_PATH_RE = [re.compile(p, re.IGNORECASE) for p in SECRET_PATHS]
+_PLACEHOLDER_RE = re.compile("|".join(SECRET_PLACEHOLDERS), re.IGNORECASE)
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _names_a_secret(identifier: str) -> bool:
+    parts = [p.lower() for p in _WORD_SPLIT_RE.split(identifier) if p]
+    return any(p in SECRET_NAME_PARTS for p in parts)
+
+
+def _secret_value(raw: str) -> bool:
+    """Is this assignment's right side a REAL-LOOKING credential? See `secret_marker`."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    if len(value) < 6 or not _SECRET_VALUE_CHARS.fullmatch(value):
+        return False
+    if _PLACEHOLDER_RE.fullmatch(value):
+        return False
+    has_digit = any(c.isdigit() for c in value)
+    has_alpha = any(c.isalpha() for c in value)
+    # A digit beside letters, or sheer length. Neither alone: `evidence_secret` is this
+    # module's own constant and `2026-09-23` is a date, and both are added every week.
+    return (has_digit and has_alpha) or len(value) >= 20
+
+
+def _paths(stat: str, diff: str) -> list[str]:
+    """Every path the stat and the diff HEADERS name. Prose is not read."""
+    found = [line.split("|")[0].strip() for line in (stat or "").splitlines()]
+    for line in (diff or "").splitlines():
+        if line.startswith(("--- ", "+++ ", "diff --git ", "rename to ", "copy to ")):
+            for token in line.split()[1:]:
+                found.append(re.sub(r"^[ab]/", "", token))
+    return [p for p in found if p and p not in ("a", "b", "/dev/null")]
+
+
+def secret_marker(stat: str, diff: str) -> str:
+    """The secret-shaped thing this evidence carries, NAMED and never quoted. Pure.
+
+    **THE RETURN VALUE IS RENDERED** — on the timeline, in the hold's reason and on
+    `jarvis wo show` — so it must never contain the match. Returning the matched text,
+    the way `high_stakes_marker` does over one sentence, would move the credential out of
+    the question store and into the event store, which is the same defect one table
+    along. So: the offending PATH (safe — it is a filename, and the user needs it to know
+    which change is being held), or a fixed phrase naming the SHAPE.
+
+    Three nets, cheapest first, and all three read ADDED lines only. A removed secret is
+    the change doing the right thing and holding on it would punish the one diff that
+    fixes the problem.
+    """
+    for path in _paths(stat, diff):
+        for pattern in _SECRET_PATH_RE:
+            if pattern.search(path):
+                return path[:200]
+    for line in (diff or "").splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        for pattern, name in zip(_SECRET_EVIDENCE_RE, SECRET_EVIDENCE_NAMES):
+            if pattern.search(line):
+                return name
+        m = _ASSIGNMENT_RE.match(line)
+        if m and _names_a_secret(m.group("name")) and _secret_value(m.group("value")):
+            return f"an added line assigning {m.group('name')[:60]}"
+    return ""
+
+
 @dataclass(frozen=True)
 class Decision:
     """Armed to ask Neo, or held with a reason a person can read. Nothing else.
@@ -258,6 +422,40 @@ class Ruling:
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
+
+
+def decide_evidence(assumption: dict[str, Any], stat: str, diff: str) -> Decision:
+    """May the OS put THIS DIFF into a stored question? PURE — no store, no model.
+
+    **THE SECOND GATE, AND THERE ARE TWO BECAUSE THEY SEE DIFFERENT THINGS.**
+    `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and
+    cannot see a diff; this is the gate over the EVIDENCE, and it runs after the packet
+    is collected and before a single character of it reaches `neo.ask`. Folding it into
+    `decide_confirm` would mean handing that function a diff it has no other use for, on
+    every call site including the ask pass that has none.
+
+    HELD MEANS NO QUESTION IS FILED. Not "filed with the diff withheld": a confirmation
+    with no diff in it is the cheap design Neo refused in question 549, and filing the
+    row at all is the filing decision kn-deef42ea says the redaction decision IS. The
+    assumption stays pending and is the user's — exactly what happens today on a fleet
+    that never switched this on.
+
+    Carries `assumption_id` and `n` like every other hold, so
+    `Daemon._note_autoreview_held` dedupes per assumption instead of writing a line every
+    reconcile tick.
+    """
+    aid = int(assumption.get("id") or 0)
+    n = int(assumption.get("n") or 0)
+    fields = {"assumption_id": aid, "n": n}
+    marker = secret_marker(stat, diff)
+    if marker:
+        return _held(HELD_EVIDENCE_SECRET,
+                     f"the delivered diff carries {marker}, and the OS will not copy a "
+                     f"secret into a stored question — assumption #{n} is yours",
+                     **fields)
+    return Decision(armed=True, code="armed",
+                    reason=f"the diff for assumption #{n} carries nothing secret-shaped",
+                    **fields)
 
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
@@ -574,6 +772,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
     * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
       and the result summary. This is the fact that did not exist when the assumption was
       an intention, and confirming without it would be the cheap design Neo refused.
+      **`decide_evidence` HAS ALREADY PASSED THIS DIFF**, because `neo.ask` persists
+      everything below as a question row: a diff carrying a secret never reaches here.
 
     The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
     order's title and description, and the siblings through `sibling_line` — the

@@ -160,19 +160,26 @@ def _git(cwd, *args: str) -> str:
                           capture_output=True, text=True).stdout
 
 
-def with_diff(started, **kw):
+DEFAULT_FILES = {"render.py": "def _render_row():\n    return 1\n"}
+
+
+def with_diff(started, *, files: dict[str, str] | None = None, **kw):
     """A parked order whose worker worktree really has a commit in it.
 
     `park` alone leaves the repository empty, and `evidence.collect_work_order` answers
     an empty packet for one — which this section ASKS on anyway. So the diff has to be
     real here or the test would pass with the evidence never collected at all.
+
+    `files` is what the commit CONTAINS, because the evidence gate reads the diff itself:
+    the secret tests need a diff whose text and whose paths they choose.
     """
     path = started.catalog.project("proj_a").path
     _git(path, "add", "-A")
     _git(path, "commit", "-qm", "base")
     worktree = path / ".claude" / "worktrees" / "wt"
     _git(path, "worktree", "add", "-q", "-b", "wo-branch", str(worktree))
-    (worktree / "render.py").write_text("def _render_row():\n    return 1\n")
+    for name, body in (files or DEFAULT_FILES).items():
+        (worktree / name).write_text(body)
     _git(worktree, "add", "-A")
     _git(worktree, "commit", "-qm", "the change under review")
     store, wo = park(started, auto_review=True, **kw)
@@ -340,7 +347,11 @@ def test_a_verdict_that_does_not_confirm_leaves_the_assumption_with_the_user(sta
 @pytest.mark.parametrize("marker", ["FORCE_FAIL", "FORCE_GARBAGE"])
 def test_a_failure_is_never_a_confirmation(started, marker):
     """The transport failing and the model answering something else are the same fact
-    here: nothing was confirmed, so nothing settles."""
+    here: nothing was confirmed, so nothing settles.
+
+    The FORCE_FAIL half has two claims of its own, one test each below: the question
+    stays RETRYABLE, and no `autoreview_unconfirmed` event is written.
+    """
     store, wo = with_diff(started, assumptions=(f"{marker} — {ROUTINE}",))
     provisional(store, wo)
     ask(started, store)
@@ -350,3 +361,222 @@ def test_a_failure_is_never_a_confirmation(started, marker):
     row = store.all_assumptions(wo["id"])[0]
     assert row["status"] == "pending" and not row["decided_by"]
     assert events(store, wo["id"], "autoreview_confirmed") == []
+
+
+def test_a_failed_call_leaves_the_confirmation_queued_for_retry(started):
+    """A MODEL THAT WAS NEVER REACHED HAS MADE NO JUDGEMENT (pinned fleet learning).
+
+    `neo.drain_queue` hands a crashed call back through `NeoStore.release_claim`, which
+    requeues it with `attempts` incremented and only writes `failed` once the retries are
+    spent. Pinned here because the failure mode it replaces — `failed` at `attempts=0`
+    with an escalation synthesised from the crash — reached the user as a ruling Neo
+    never made (question 388), and this pass files the questions it would happen to.
+    """
+    store, wo = with_diff(started, assumptions=(f"FORCE_FAIL — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    (confirmation,) = questions()
+
+    drain(started)
+
+    row = next(q for q in questions() if q["id"] == confirmation["id"])
+    assert row["status"] == "queued"
+    assert row["status"] not in ("failed", "answered", "escalated")
+    assert not row["answer"]
+
+
+def test_a_failed_call_writes_no_unconfirmed_event(started):
+    """A DIFFERENT CLAIM from "nothing settled": `autoreview_unconfirmed` records that
+    Neo looked at the delivered result and would not confirm its own earlier reading. A
+    call that never happened produced no such reading, and writing the event would put
+    that judgement on the record in Neo's name."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_FAIL — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+
+    drain(started)
+
+    assert events(store, wo["id"], "autoreview_unconfirmed") == []
+
+
+# -- the second gate: a diff the OS will not copy into a stored question ---------------
+#
+# `decide_confirm` is pure over a ROW and cannot see a diff. This is the gate over the
+# EVIDENCE, and it exists because `neo.ask` PERSISTS the question text: a diff that adds
+# a credential would land in the question store and on `/neo` and `jarvis neo list`,
+# surfaces the ask pass never put diff content on (kn-deef42ea — a redaction decision is
+# also a filing decision). Neo, question 593, chose this narrow net over running
+# `high_stakes_marker` on the diff.
+
+SECRET_VALUE = "sk-live-9f2b7c41d8e3a6"
+SECRET_BODY = f'api_key = "{SECRET_VALUE}"\n'
+
+#: The negative control's body, and it is the test that stops this becoming the wide
+#: net: every word here is this repo's daily vocabulary.
+PROSE_BODY = (
+    "# the credential check runs before the production deploy path\n"
+    "def _render_row(row):\n"
+    '    """Delete the row from the render list, never from the database."""\n'
+    "    return row\n"
+)
+
+
+def held_codes(store, wo_id: str) -> list[str]:
+    return [e["code"] for e in events(store, wo_id, "autoreview_held")]
+
+
+def test_a_secret_shaped_added_line_is_never_copied_into_a_stored_question(started):
+    """THE BLOCKING FINDING. No question is filed at all — the assumption stays pending
+    and is the user's, exactly as it is without this feature. Filing the question with
+    the diff withheld is the cheap design Neo refused in question 549."""
+    store, wo = with_diff(started, files={"settings.py": SECRET_BODY})
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    assert all(SECRET_VALUE not in q["question"] for q in questions())
+    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
+    assert SECRET_VALUE not in held["reason"]
+
+
+def test_a_secret_shaped_path_holds_it_whatever_the_body_says(started):
+    """The path is evidence on its own: a work order that adds a `.env` is one whose
+    diff the OS will not store, and reading the file to find out would be the same
+    mistake one layer down."""
+    store, wo = with_diff(started, files={".env": "GREETING=hello\n"})
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
+    assert ".env" in held["reason"]
+
+
+def test_this_repos_own_everyday_diff_still_arms_and_still_asks(started):
+    """THE NEGATIVE CONTROL, and without it a net that holds everything passes. Running
+    `high_stakes_marker` over a diff was REJECTED (Neo, question 593) for exactly this:
+    "credential", "production" and "delete" appear in nearly every change this repo
+    makes, so that net would hold almost every confirmation and switch the pass off
+    silently."""
+    store, wo = with_diff(started, files={"render.py": PROSE_BODY})
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "render.py" in confirmation["question"]
+    assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
+
+
+# -- `secret_marker`: pure, and it never repeats the secret ----------------------------
+
+
+@pytest.mark.parametrize("line", [
+    '+api_key = "sk-live-9f2b7c41d8e3a6"',
+    "+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7K9bPxRfiCY1EXAMPLEKEY2",
+    '+    self.client_secret = "7f3a9b2c5d8e1f4a6b0c"',
+    "+export GITHUB_TOKEN=ghp_9aF3kLm2Qr7Xz1Bv6Nt0",
+    "+-----BEGIN RSA PRIVATE KEY-----",
+    "+ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC9x2 user@host",
+    "+Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.aGk",
+    "+Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==",
+])
+def test_secret_shaped_added_lines_fire(line):
+    assert autoreview.secret_marker("", line)
+
+
+@pytest.mark.parametrize("line", [
+    '+api_key = ""',
+    "+api_key = ''",
+    "+api_key = None",
+    "+api_key: str",
+    '+password = "changeme"',
+    '+client_secret = "<your-secret-here>"',
+    '+api_key = "${API_KEY}"',
+    '+api_key = os.environ["API_KEY"]',
+    '+token = os.getenv("TOKEN")',
+    '+api_key = "REDACTED"',
+    '+api_key = "example"',
+    # This module's own code, which names secrets for a living.
+    '+HELD_EVIDENCE_SECRET = "evidence_secret"',
+    '+    r"credential|secret|password|\\bapi[ -]?key\\b"',
+    "+    marker = high_stakes_marker(text)",
+    "+# the api key is read from the environment, never committed",
+])
+def test_placeholders_and_prose_do_not_fire(line):
+    assert autoreview.secret_marker("", line) == ""
+
+
+def test_a_removed_secret_line_does_not_fire():
+    """A removed secret is the change doing the right thing, and holding the pass on it
+    would punish the only diff that fixes one."""
+    assert autoreview.secret_marker("", f'-api_key = "{SECRET_VALUE}"') == ""
+
+
+def test_a_diff_header_is_not_read_as_an_added_line():
+    """`+++ b/path` starts with `+` and is not a line the diff adds — so the assignment
+    net must not read one, whatever the rest of the header says."""
+    assert autoreview.secret_marker("", f'+++ b/api_token = "{SECRET_VALUE}"') == ""
+
+
+def test_the_marker_never_carries_the_secret_itself():
+    """IT IS RENDERED on the timeline and on `jarvis wo show`. A marker quoting the
+    value would move the secret from the question store to the event store."""
+    marker = autoreview.secret_marker("", f'+api_key = "{SECRET_VALUE}"')
+    assert marker and SECRET_VALUE not in marker
+    assert not any(c in marker for c in ("9f2b", "sk-live"))
+
+
+@pytest.mark.parametrize("path", [
+    " .env | 2 +-",
+    " config/.env.production | 2 +-",
+    " certs/server.pem | 2 +-",
+    " certs/server.key | 2 +-",
+    " keystore.p12 | 2 +-",
+    " keystore.pfx | 2 +-",
+    " deploy/id_rsa | 2 +-",
+    " deploy/id_ed25519 | 2 +-",
+    " infra/.aws/credentials | 2 +-",
+    " home/.netrc | 2 +-",
+    " home/.npmrc | 2 +-",
+    " app/secrets.yaml | 2 +-",
+    " gcp-service-account-prod.json | 2 +-",
+])
+def test_secret_shaped_paths_fire_from_the_stat(path):
+    assert autoreview.secret_marker(path, "")
+
+
+@pytest.mark.parametrize("path", [
+    " src/jarvis/autoreview.py | 40 ++++",
+    " tests/test_autoreview_confirm.py | 12 +-",
+    " docs/keyboard-shortcuts.md | 3 +-",
+    " src/jarvis/ui/templates/_question.html | 2 +-",
+])
+def test_this_repos_own_paths_do_not_fire(path):
+    assert autoreview.secret_marker(path, "") == ""
+
+
+def test_a_secret_shaped_path_in_a_diff_header_fires_too():
+    assert ".env" in autoreview.secret_marker("", "diff --git a/.env b/.env\n")
+
+
+# -- `decide_evidence`: the hold it returns --------------------------------------------
+
+
+def test_decide_evidence_arms_on_an_ordinary_diff():
+    d = autoreview.decide_evidence(judged(), " render.py | 2 +-", "+    return 1\n")
+    assert d.armed and d.assumption_id == 3 and d.n == 2
+
+
+def test_decide_evidence_holds_and_carries_the_row_it_is_about():
+    """`assumption_id` and `n` so `_note_autoreview_held` dedupes per assumption, as
+    every other hold does — otherwise one work order records this every tick."""
+    d = autoreview.decide_evidence(judged(), "", f'+api_key = "{SECRET_VALUE}"')
+    assert d.code == autoreview.HELD_EVIDENCE_SECRET
+    assert d.assumption_id == 3 and d.n == 2
+    assert SECRET_VALUE not in d.reason

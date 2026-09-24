@@ -4694,6 +4694,12 @@ class Daemon:
                 # reach GitHub, and an order whose every row holds must not pay for it.
                 if packet is None:
                     packet = self._confirmation_evidence(project, wo, cfg)
+                # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
+                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
+                evidence_ok = autoreview.decide_evidence(a, packet[0], packet[1])
+                if not evidence_ok.armed:
+                    self._note_autoreview_held(store, wo["id"], evidence_ok)
+                    continue
                 autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
                                                 assumptions, stat=packet[0],
                                                 diff=packet[1])
@@ -4745,7 +4751,7 @@ class Daemon:
         themselves, which is what they did for every assumption before this existed, and
         the work order is already on their list carrying `assumptions pending review`.
 
-        FOUR HOLDS ARE NOT RECORDED, and all four are things the reader would be told
+        FIVE HOLDS ARE NOT RECORDED, and all five are things the reader would be told
         about a mechanism that was never a candidate — the asymmetry `_note_automerge_held`
         names, where a missing hold event says nothing and a spurious one is deduped for
         ever and then rendered:
@@ -4762,14 +4768,15 @@ class Daemon:
         an assumption it is at that moment putting to Neo would land on every row the
         feature touches.
 
-        **`objection_in_flight` IS RECORDED, and `objected` with it** (kn-22ba6087: a
-        guard that returns early must still record why). Both are facts about a row the
-        OS looked at and did not act on, which is the opposite of "never a candidate" —
-        and `objection_in_flight` above all, because it means NOT YET: an early verdict
-        with an objection still on a wire, and no other explanation on the record for why
-        nothing has happened to it.
+        **`objection_in_flight` IS RECORDED, and `objected` and `evidence_secret` with
+        it** (kn-22ba6087: a guard that returns early must still record why). All three
+        are facts about a row the OS looked at and did not act on, which is the opposite
+        of "never a candidate" — `objection_in_flight` because it means NOT YET, an early
+        verdict with an objection still on a wire; `evidence_secret` because the hold is
+        the ONLY thing on the record saying why a work order the feature was switched on
+        for is still waiting for a person, and it names the file, never the secret.
 
-        **`settling=True` SUSPENDS ALL FOUR, and the difference is not cosmetic.** Every
+        **`settling=True` SUSPENDS ALL FIVE, and the difference is not cosmetic.** Every
         exclusion above rests on "this order was never a candidate" — true of the ask
         pass, which lists `needs_review` and nothing else. The settle site re-runs the
         same table against state read after the model call, and there `status` means the
