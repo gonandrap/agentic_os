@@ -139,7 +139,8 @@ HELD_JUDGED = "judged_early"
 #: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
 #: approved nothing, so no second call is spent on one and the user decides it;
 #: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
-#: retried next tick; `evidence_secret` is `decide_evidence`'s, over the DIFF.
+#: retried next tick; `evidence_secret` is `decide_evidence`'s, over BOTH texts the
+#: question would carry — the diff and the result summary.
 #:
 #: FOUR OF THE FIVE REACH THE RECORD, and which ones is not arbitrary (kn-22ba6087: a
 #: guard that returns early must still record why). `objected`, `unjudged`,
@@ -277,22 +278,28 @@ def high_stakes_marker(text: str) -> str:
 #: redaction in `evidence.py`, `validation.py` or `panel.py` to reuse: the panel sends
 #: full diffs to its seat prompts, so this rule is invented here rather than borrowed.
 #:
-#: Three shapes, and each is a SHAPE rather than a word: an added line assigning a
-#: real-looking value to a secret-named thing, a key or auth block, and a path that only
-#: secrets live at.
+#: Three shapes, and each is a SHAPE rather than a word: a line assigning a real-looking
+#: value to a secret-named thing, a key or auth block, and a path that only secrets live
+#: at.
 SECRET_EVIDENCE = (
     r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----",
     r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+",
-    r"\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+\S+",
+    # `["\']?` on BOTH sides of the colon and nowhere else: `"Authorization": "Bearer
+    # …"` is the header written as a JSON or dict entry, and the quote before the colon
+    # is the only reason the bare pattern missed it. Widening past the quote would start
+    # matching prose that merely says the word.
+    r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
 )
 
 #: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record. The marker is
 #: rendered on the timeline and on `jarvis wo show`, so it names the shape and never
-#: quotes the match — see `secret_marker`.
+#: quotes the match — see `secret_marker`. The names say no more than the shape because
+#: the same scanner reads a diff and a result summary; WHICH of the two carried it is
+#: the hold's to say, in `decide_evidence`.
 SECRET_EVIDENCE_NAMES = (
-    "an added private key block",
-    "an added ssh key line",
-    "an added Authorization header value",
+    "a private key block",
+    "an ssh key line",
+    "an Authorization header value",
 )
 
 #: A VALUE THAT IS NOT A SECRET, however secret its name. The commonest added line in
@@ -328,13 +335,21 @@ SECRET_NAME_PARTS = frozenset({
     "password", "passwd", "passphrase", "pwd", "credential", "credentials",
 })
 
-#: One added line assigning something. `(?!\+\+)` because `+++ b/path` is a HEADER and
-#: not a line the diff adds; `^\+` because a REMOVED secret (`-`) is the change doing the
-#: right thing. The name stops at the separator and carries no quotes or brackets, so a
-#: regex literal or a comment never parses as one.
+#: One line assigning something. Read over a line the CALLER has already vouched for —
+#: an added diff line with its `+` stripped, or a line of the result summary — because a
+#: removed secret (`-`) is the change doing the right thing and `+++ b/path` is a header.
+#:
+#: The name may be QUOTED, and that is the whole widening: `"api_key": "sk-live-…"` is
+#: the JSON and Python-dict shape, which is how an added credential is most often
+#: spelled, and the bare pattern could not match it. A quoted name is still an
+#: IDENTIFIER — same charset, same closing quote as the opening one, still the whole
+#: name up to the separator — so a regex literal, a comment or a sentence still never
+#: parses as one, and the VALUE test below is untouched: `"api_key": ""` and
+#: `"api_key": "changeme"` do not fire.
 _ASSIGNMENT_RE = re.compile(
-    r"^\+(?!\+\+)[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
-    r"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?:=>|:=|=|:)[ \t]*"
+    r"^[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
+    r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
+    r"[ \t]*(?:=>|:=|=|:)[ \t]*"
     r"(?P<value>[^\r\n]*?)[ \t]*[,;]?[ \t]*$")
 
 #: The charset a credential is spelled in. Anything else — a space, a bracket, a call, a
@@ -400,12 +415,38 @@ def secret_marker(stat: str, diff: str) -> str:
     for line in (diff or "").splitlines():
         if not line.startswith("+") or line.startswith("+++"):
             continue
-        for pattern, name in zip(_SECRET_EVIDENCE_RE, SECRET_EVIDENCE_NAMES):
-            if pattern.search(line):
-                return name
-        m = _ASSIGNMENT_RE.match(line)
-        if m and _names_a_secret(m.group("name")) and _secret_value(m.group("value")):
-            return f"an added line assigning {m.group('name')[:60]}"
+        marker = _line_marker(line[1:])
+        if marker:
+            return marker
+    return ""
+
+
+def secret_marker_text(text: str) -> str:
+    """The same nets over PLAIN TEXT — the result summary. Named, never quoted. Pure.
+
+    ONE scanner, two callers. The worker's summary is prose it typed, so there is no `+`
+    to require and no header to skip; `secret_marker` strips the `+` and everything after
+    is this function. Writing the rules twice is how the two copies drift.
+
+    The PATH net is deliberately NOT run here. A path is evidence in a diff — the change
+    touched `.env` — but in prose it is a mention, and a summary that says it edited
+    `.env.example` is the commonest sentence in this repo's records.
+    """
+    for line in (text or "").splitlines():
+        marker = _line_marker(line)
+        if marker:
+            return marker
+    return ""
+
+
+def _line_marker(line: str) -> str:
+    """One line, no diff marker. The shape it carries, or `""`."""
+    for pattern, name in zip(_SECRET_EVIDENCE_RE, SECRET_EVIDENCE_NAMES):
+        if pattern.search(line):
+            return name
+    m = _ASSIGNMENT_RE.match(line)
+    if m and _names_a_secret(m.group("name")) and _secret_value(m.group("value")):
+        return f"a line assigning {m.group('name')[:60]}"
     return ""
 
 
@@ -447,8 +488,9 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
 
 
-def decide_evidence(assumption: dict[str, Any], stat: str, diff: str) -> Decision:
-    """May the OS put THIS DIFF into a stored question? PURE — no store, no model.
+def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
+                    summary: str = "") -> Decision:
+    """May the OS put THIS EVIDENCE into a stored question? PURE — no store, no model.
 
     **THE SECOND GATE, AND THERE ARE TWO BECAUSE THEY SEE DIFFERENT THINGS.**
     `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and
@@ -463,6 +505,11 @@ def decide_evidence(assumption: dict[str, Any], stat: str, diff: str) -> Decisio
     assumption stays pending and is the user's — exactly what happens today on a fleet
     that never switched this on.
 
+    BOTH TEXTS THE QUESTION CARRIES, because `_confirm_question` interpolates the diff
+    AND `wo["result_summary"]` — a worker that quotes the credential it wired up puts it
+    in the question store by the route the diff was gated on. The hold NAMES which of
+    the two it was: the user has to know which text to go and read.
+
     Carries `assumption_id` and `n` like every other hold, so
     `Daemon._note_autoreview_held` dedupes per assumption instead of writing a line every
     reconcile tick.
@@ -476,8 +523,18 @@ def decide_evidence(assumption: dict[str, Any], stat: str, diff: str) -> Decisio
                      f"the delivered diff carries {marker}, and the OS will not copy a "
                      f"secret into a stored question — assumption #{n} is yours",
                      **fields)
+    marker = secret_marker_text(summary)
+    if marker:
+        # WHICH TEXT, named: the user has to know where to go and look, and the summary
+        # and the diff are two different places.
+        return _held(HELD_EVIDENCE_SECRET,
+                     f"the work order's result summary carries {marker}, and the OS "
+                     f"will not copy a secret into a stored question — assumption #{n} "
+                     f"is yours",
+                     **fields)
     return Decision(armed=True, code="armed",
-                    reason=f"the diff for assumption #{n} carries nothing secret-shaped",
+                    reason=f"the evidence for assumption #{n} carries nothing "
+                           f"secret-shaped",
                     **fields)
 
 
@@ -909,8 +966,9 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
     * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
       and the result summary. This is the fact that did not exist when the assumption was
       an intention, and confirming without it would be the cheap design Neo refused.
-      **`decide_evidence` HAS ALREADY PASSED THIS DIFF**, because `neo.ask` persists
-      everything below as a question row: a diff carrying a secret never reaches here.
+      **`decide_evidence` HAS ALREADY PASSED BOTH**, because `neo.ask` persists
+      everything below as a question row: neither a diff nor a summary carrying a secret
+      reaches here.
 
     The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
     order's title and description, and the siblings through `sibling_line` — the

@@ -4778,7 +4778,8 @@ class Daemon:
                     packet = self._confirmation_evidence(project, wo, cfg)
                 # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
                 # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
-                evidence_ok = autoreview.decide_evidence(a, packet[0], packet[1])
+                evidence_ok = autoreview.decide_evidence(
+                    a, packet[0], packet[1], summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)

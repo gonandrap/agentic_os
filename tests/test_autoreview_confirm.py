@@ -2,7 +2,7 @@
 
 docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md §7.
 
-Three properties carry the section, and each gets its own block:
+Four properties carry the section, and each gets its own block:
 
 * **`decide` RUNS UNCHANGED UNDERNEATH.** A provisional verdict is not a ticket past any
   of its seven conditions, so every one of them is exercised again on a row that carries
@@ -14,6 +14,9 @@ Three properties carry the section, and each gets its own block:
 * **THE OBJECTION GATE IS A RETRY, NOT A REFUSAL.** §6.6 withdraws on the transition into
   `needs_review`; an outstanding objection means "not yet" and costs the assumption
   nothing.
+* **THE EVIDENCE IS GATED BEFORE IT IS STORED.** The confirmation question is the first
+  one carrying a diff and a result summary, and `neo.ask` PERSISTS it. Both texts go
+  through `decide_evidence`, and a hit files no question at all.
 """
 
 from __future__ import annotations
@@ -139,7 +142,11 @@ EARLY_QUESTION = 99
 
 def provisional(store, wo, *, verdict: str = "accept",
                 reason: str = PROVISIONAL_REASON) -> dict:
-    """Stamp §5's verdict by hand. Section 5 has not landed; its COLUMNS have (§4).
+    """Stamp §5's verdict by hand, rather than running §5's pass to produce one.
+
+    §5 has landed, and driving it here would make every test below depend on what the
+    early pass happens to decide — this section is about what the CONFIRMATION does with
+    a verdict that already exists.
 
     The early QUESTION is linked too, at an id no test ever files, because that link is
     what condition 6 trips on: a fixture without it would leave the escape hatch
@@ -171,8 +178,8 @@ def with_diff(started, **kw):
     an empty packet for one — which this section ASKS on anyway. So the diff has to be
     real here or the end-to-end test would pass with the evidence never collected at all.
 
-    WHAT THE COLLECTOR MAKES OF IT depends on the machine: see `stub_evidence`. Nothing
-    driven through this fixture may assert on the diff's text.
+    The diff it collects is not this fixture's to promise: tests about question TEXT
+    state theirs through `stub_evidence` instead.
     """
     path = started.catalog.project("proj_a").path
     _git(path, "add", "-A")
@@ -191,12 +198,12 @@ def with_diff(started, **kw):
 def stub_evidence(monkeypatch, stat: str, diff: str) -> None:
     """Drive the pass through a chosen `(stat, diff)`, the seam that method exists for.
 
-    THE DIFF UNDER `with_diff` IS NOT THE SAME IN EVERY ENVIRONMENT. The collector
-    resolves a base through `evidence.base_ref`, whose last guess is the literal name
-    `main`; a machine whose `init.defaultBranch` is `master` has no rung that answers, so
-    the collector diffs the working tree against HEAD and a fixture that COMMITTED its
-    change collects nothing. Tests about question TEXT must not be able to fail that way,
-    so they state the diff they mean.
+    A test about what the question CONTAINS should state the diff it means. Deriving it
+    from a fixture repository put the environment in the assertion once already: before
+    `make_git_project` pinned `-b main`, a machine defaulting to `master` matched no rung
+    of `evidence.base_ref`'s ladder and collected an empty diff, and four tests here
+    failed on CI only. The pin fixed that; stating the diff keeps these tests out of the
+    question.
     """
     monkeypatch.setattr(Daemon, "_confirmation_evidence",
                         lambda self, project, wo, cfg: (stat, diff))
@@ -449,14 +456,14 @@ def test_a_failed_call_writes_no_unconfirmed_event(started):
     assert events(store, wo["id"], "autoreview_unconfirmed") == []
 
 
-# -- the second gate: a diff the OS will not copy into a stored question ---------------
+# -- the second gate: evidence the OS will not copy into a stored question -------------
 #
-# `decide_confirm` is pure over a ROW and cannot see a diff. This is the gate over the
-# EVIDENCE, and it exists because `neo.ask` PERSISTS the question text: a diff that adds
-# a credential would land in the question store and on `/neo` and `jarvis neo list`,
-# surfaces the ask pass never put diff content on (kn-deef42ea — a redaction decision is
-# also a filing decision). Neo, question 593, chose this narrow net over running
-# `high_stakes_marker` on the diff.
+# `decide_confirm` is pure over a ROW and cannot see the evidence. This is the gate over
+# it, and it exists because `neo.ask` PERSISTS the question text: a diff that adds a
+# credential — or a result summary that quotes one — would land in the question store and
+# on `/neo` and `jarvis neo list`, surfaces the ask pass never put delivered content on
+# (kn-deef42ea — a redaction decision is also a filing decision). Neo, question 593,
+# chose this narrow net over running `high_stakes_marker` on the diff.
 
 SECRET_VALUE = "sk-live-9f2b7c41d8e3a6"
 SECRET_BODY = f'api_key = "{SECRET_VALUE}"\n'
@@ -469,6 +476,15 @@ PROSE_BODY = (
     '    """Delete the row from the render list, never from the database."""\n'
     "    return row\n"
 )
+
+#: A RESULT SUMMARY carrying a credential — plain text, no `+` prefix, because nothing
+#: strips a diff marker off the worker's own prose.
+SECRET_SUMMARY = ("wired the client to the vendor and committed the settings:\n"
+                  f'api_key = "{SECRET_VALUE}"')
+
+#: The summary net's negative control: the prose a worker on this repo actually files.
+PROSE_SUMMARY = ("deleted the old credential check and moved the production deploy path "
+                 "behind a flag; no key or token value changed")
 
 
 def held_codes(store, wo_id: str) -> list[str]:
@@ -527,11 +543,91 @@ def test_this_repos_own_everyday_diff_still_arms_and_still_asks(started, monkeyp
     assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
 
 
+def test_a_secret_shaped_result_summary_is_never_copied_into_a_stored_question(
+        started, monkeypatch):
+    """THE SECOND BLOCKING FINDING: the diff is not the only text the question carries.
+
+    `_confirm_question` interpolates `result_summary` raw, and the worker wrote that
+    text — a summary quoting the credential it wired up reaches the question store by
+    exactly the route the diff was gated on.
+    """
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
+    store.update_work_order(wo["id"], result_summary=SECRET_SUMMARY)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    assert all(SECRET_VALUE not in q["question"] for q in questions())
+    assert store.all_assumptions(wo["id"])[0]["status"] == "pending"
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_EVIDENCE_SECRET
+    # WHICH TEXT to go and read: the summary, not the diff.
+    assert "result summary" in held["reason"] and "diff" not in held["reason"]
+    assert SECRET_VALUE not in held["reason"]
+
+
+def test_an_ordinary_result_summary_still_arms_and_still_asks(started, monkeypatch):
+    """THE NEGATIVE CONTROL for the summary net, and without it this is the wide net by
+    another route: "credential", "production" and "delete" are what a worker on this
+    repo writes in every summary it files."""
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
+    store.update_work_order(wo["id"], result_summary=PROSE_SUMMARY)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "production deploy path" in confirmation["question"]
+    assert autoreview.HELD_EVIDENCE_SECRET not in held_codes(store, wo["id"])
+
+
+def test_the_evidence_hold_is_written_once_however_many_ticks_run(started, monkeypatch):
+    """`decide_evidence` carries `assumption_id` and `n` so `_note_autoreview_held`
+    dedupes per assumption. The reconciler runs this pass every tick, so without the
+    dedupe one held work order writes a timeline line a minute."""
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("settings.py", SECRET_BODY))
+    provisional(store, wo)
+
+    ask(started, store)
+    first = [c for c in held_codes(store, wo["id"])
+             if c == autoreview.HELD_EVIDENCE_SECRET]
+    ask(started, store)
+    second = [c for c in held_codes(store, wo["id"])
+              if c == autoreview.HELD_EVIDENCE_SECRET]
+
+    assert len(first) == 1 and len(second) == 1
+
+
+def test_the_objection_hold_is_written_once_however_many_ticks_run(started):
+    """The same claim for the other hold that is NOT suppressed. An objection sits in
+    flight until the worker reads it, which is many ticks."""
+    store, wo = with_diff(started)
+    row = provisional(store, wo)
+    store.record_objection(row["id"], envelope_id=1, transport="queue", sent_ts=1.0)
+
+    ask(started, store)
+    first = [c for c in held_codes(store, wo["id"])
+             if c == autoreview.HELD_OBJECTION_IN_FLIGHT]
+    ask(started, store)
+    second = [c for c in held_codes(store, wo["id"])
+              if c == autoreview.HELD_OBJECTION_IN_FLIGHT]
+
+    assert len(first) == 1 and len(second) == 1
+
+
 # -- `secret_marker`: pure, and it never repeats the secret ----------------------------
 
 
 @pytest.mark.parametrize("line", [
     '+api_key = "sk-live-9f2b7c41d8e3a6"',
+    # THE COMMONEST ADDED CREDENTIAL: a JSON or Python-dict line, where the name is
+    # quoted and the separator is a colon.
+    '+  "api_key": "sk-live-9f2b7c41d8e3a6",',
+    '+  "Authorization": "Bearer sk-live-9f2b7c41d8e3a6"',
     "+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI7K9bPxRfiCY1EXAMPLEKEY2",
     '+    self.client_secret = "7f3a9b2c5d8e1f4a6b0c"',
     "+export GITHUB_TOKEN=ghp_9aF3kLm2Qr7Xz1Bv6Nt0",
@@ -546,6 +642,9 @@ def test_secret_shaped_added_lines_fire(line):
 
 @pytest.mark.parametrize("line", [
     '+api_key = ""',
+    # The quoted name is widened for; the VALUE test is not.
+    '+  "api_key": "",',
+    '+  "api_key": "changeme",',
     "+api_key = ''",
     "+api_key = None",
     "+api_key: str",
@@ -625,6 +724,21 @@ def test_a_secret_shaped_path_in_a_diff_header_fires_too():
 def test_decide_evidence_arms_on_an_ordinary_diff():
     d = autoreview.decide_evidence(judged(), " render.py | 2 +-", "+    return 1\n")
     assert d.armed and d.assumption_id == 3 and d.n == 2
+
+
+def test_decide_evidence_reads_the_summary_as_plain_text():
+    """No `+` prefix and no diff: the summary is prose the worker typed, and the same
+    line scanner reads it."""
+    d = autoreview.decide_evidence(judged(), "", "+    return 1\n",
+                                   summary=SECRET_SUMMARY)
+    assert d.code == autoreview.HELD_EVIDENCE_SECRET
+    assert "result summary" in d.reason and SECRET_VALUE not in d.reason
+
+
+def test_decide_evidence_arms_on_an_ordinary_summary():
+    d = autoreview.decide_evidence(judged(), " render.py | 2 +-", "+    return 1\n",
+                                   summary=PROSE_SUMMARY)
+    assert d.armed
 
 
 def test_decide_evidence_holds_and_carries_the_row_it_is_about():
