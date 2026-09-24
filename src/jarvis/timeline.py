@@ -334,7 +334,8 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         verb = "accepted" if p.get("accepted") else "rejected"
         count = p.get("count")
         return f"Assumptions {verb}", f"{count} assumption(s)" if count else ""
-    # Auto-review's four, and they belong directly under `reviewed` because they are the
+    # Auto-review's (`ops.AUTOREVIEW_EVENTS`, all of them), and they belong directly
+    # under `reviewed` because they are the
     # same act by a different hand. THE VERB SAYS WHO: "accepted" above is the user, so
     # every line here names the OS, on the surface that narrates what happened to a work
     # order. `ops.autoreview_state` renders only the NEWEST of these as its one-line
@@ -364,6 +365,39 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 p.get("reason") or "no reason recorded")
     if kind == "autoreview_held":
         return (f"The OS would not decide assumption #{p.get('n')}",
+                p.get("reason") or "no reason recorded")
+    # ...and the early pass's five (docs/superpowers/specs/2026-09-23-an-assumption-
+    # judged-while-the-worker-still-runs.md §4.4). Same rule as above — THE VERB SAYS
+    # WHO — plus one this half must never lose: an early verdict SETTLES NOTHING, and a
+    # line that reads like a decision would tell the user their gate had opened when it
+    # had not.
+    if kind == "autoreview_provisional":
+        verdict = p.get("verdict") or "judged"
+        model = p.get("model") or "model not recorded"
+        return (f"The OS read assumption #{p.get('n')} while the worker was still "
+                f"typing: {verdict}, provisionally (Neo, {model}) — nothing settled",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_objected":
+        # The transport is in the detail, not the label: "the worker was told" is the
+        # claim, and it is only true once `autoreview_objection_withdrawn` has not
+        # happened — which is the next line when it does.
+        how = p.get("transport") or "queue"
+        return (f"The OS objected to assumption #{p.get('n')} and sent it to the worker",
+                f"over the {how}: {p.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_objection_withdrawn":
+        return (f"Objection to assumption #{p.get('n')} withdrawn — the worker was "
+                f"never told",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_confirmed":
+        # `autoreview_accepted`'s words and its reason: the model belongs in the label,
+        # because "the OS accepted it" and "THIS model accepted it" are different claims.
+        model = p.get("model") or "model not recorded"
+        return (f"Assumption #{p.get('n')} confirmed against the result and accepted "
+                f"by the OS (Neo, {model}) — not by you",
+                p.get("reason") or "no reason recorded")
+    if kind == "autoreview_unconfirmed":
+        return (f"Assumption #{p.get('n')} left with you — the OS did not confirm its "
+                f"early reading once it saw the result",
                 p.get("reason") or "no reason recorded")
     if kind == "learning_captured":
         return "Learning captured", p.get("topic") or ""

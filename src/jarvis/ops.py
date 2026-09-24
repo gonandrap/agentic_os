@@ -2253,8 +2253,17 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
 #: Every event the automatic assumption review writes. `AUTOMERGE_EVENTS`' note applies
 #: verbatim: the order means nothing, and the list exists so that adding a kind is one
 #: edit rather than one edit and a forgotten renderer.
+#:
+#: The last five are the early pass's (docs/superpowers/specs/2026-09-23-an-assumption-
+#: judged-while-the-worker-still-runs.md §4.4). They are enumerated here, once, so that
+#: no section of that feature invents its own kind: a kind with no entry here is invisible
+#: to `autoreview_state` and `assumptions_with_rulings`, and a kind with no branch in
+#: `timeline` renders as generic "signal" prose that tells the reader nothing
+#: (kn-3f133363).
 AUTOREVIEW_EVENTS = ("autoreview_accepted", "autoreview_escalated", "autoreview_asked",
-                     "autoreview_held")
+                     "autoreview_held", "autoreview_provisional", "autoreview_objected",
+                     "autoreview_objection_withdrawn", "autoreview_confirmed",
+                     "autoreview_unconfirmed")
 
 
 def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
@@ -2305,8 +2314,20 @@ def assumption_decider(a: dict[str, Any]) -> str:
 
     `''` means the user (`ASSUMPTION_DECIDER_USER`'s note): every row written before the
     column existed was, by construction, the user's.
+
+    AN UNSETTLED ASSUMPTION CARRYING A PROVISIONAL VERDICT HAS NO DECIDER, and saying
+    "you" there would be the exact inversion this function exists to stop: the only thing
+    that has judged it is a model, and it judged an intention. The phrase names the
+    machine and says out loud that nothing is settled — still from this one renderer, so
+    the surfaces in §8 of the early-review spec cannot spell it two ways.
     """
-    by = str(a.get("decided_by") or "") or ASSUMPTION_DECIDER_USER
+    by = str(a.get("decided_by") or "")
+    if not by and str(a.get("status") or "") == "pending" \
+            and str(a.get("provisional_verdict") or ""):
+        model = a.get("provisional_model") or "model not recorded"
+        return f"nobody yet — the OS ({ASSUMPTION_DECIDER_OS}, {model}) has only a " \
+               f"provisional reading"
+    by = by or ASSUMPTION_DECIDER_USER
     if by == ASSUMPTION_DECIDER_USER:
         return "you"
     return f"the OS ({by}, {a.get('decided_model') or 'model not recorded'})"
@@ -2316,8 +2337,16 @@ def assumption_decider(a: dict[str, Any]) -> str:
 #: The ties are real, not defensive: `Daemon._deliver_assumption_verdict` writes a hold
 #: and an escalation in one pass, and the escalation is the one that says where the
 #: assumption ended up.
-_RULING_RANK = {"autoreview_accepted": 4, "autoreview_escalated": 3,
-                "autoreview_held": 2, "autoreview_asked": 1}
+#: The order is the LIFECYCLE, so a tie resolves to the later stage: asked, then judged
+#: provisionally, then objected, then withdrawn — and the delivery pass (§7), which is the
+#: only thing that settles, outranks everything the early pass said about an intention.
+#: Every kind in `AUTOREVIEW_EVENTS` needs an entry; `assumptions_with_rulings` indexes
+#: this dict directly and a missing one is a KeyError on the page.
+_RULING_RANK = {"autoreview_confirmed": 9, "autoreview_unconfirmed": 8,
+                "autoreview_accepted": 7, "autoreview_escalated": 6,
+                "autoreview_held": 5, "autoreview_objection_withdrawn": 4,
+                "autoreview_objected": 3, "autoreview_provisional": 2,
+                "autoreview_asked": 1}
 
 
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
@@ -2377,20 +2406,98 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
         return f"Held by the OS — {held}" if held else "Held by the OS"
     if kind == "autoreview_asked":
         return f"Asked Neo (question {question}), awaiting ruling"
+    if kind == "autoreview_unconfirmed":
+        # The early reading did not survive the diff, so the assumption is the user's and
+        # they need the sentence that says why — the same shape as an escalation, which
+        # is what this is. The early reading itself is `provisional_line`'s.
+        asked = f" (question {question})" if question else ""
+        return (f"Neo did not confirm its early reading{asked}"
+                f"{': ' + reason if reason else ''}")
+    # Every other early-pass kind is already on the ROW — `provisional_line` and
+    # `objection_line` read columns, which outlive an event and cannot go stale.
     return ""
 
 
+def _stamp(ts: Any) -> str:
+    """A timestamp a person can read. Local time, minutes: seconds tell nobody anything."""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+
+
+def provisional_line(a: dict[str, Any]) -> str:
+    """NEO'S EARLY READING of this assumption, in one line, or `''`.
+
+    Public and pure, for `assumption_line`'s reason: §8 of the early-review spec puts the
+    same fact on `jarvis wo show` and on the work-order page, and a fact spelled twice is
+    a fact that eventually disagrees with itself. `''` is every row nothing judged early
+    — every historical row, and every row in a project with early review off — and it
+    must render exactly as it did before this shipped.
+
+    It says PROVISIONALLY out loud on the accept side. An early verdict is an opinion
+    about an intention and settles nothing (§4.1); a reader who takes it for a decision
+    would think their gate had been opened when it has not.
+    """
+    verdict = str(a.get("provisional_verdict") or "")
+    if not verdict:
+        return ""
+    reason = str(a.get("provisional_reason") or "").strip()
+    model = a.get("provisional_model") or "model not recorded"
+    when = f" at {_stamp(a['provisional_ts'])}" if a.get("provisional_ts") else ""
+    verb = ("provisionally accepted by the OS" if verdict == "accept"
+            else "objected to by the OS")
+    return (f"{verb} (Neo, {model}){when}"
+            f"{' — ' + reason if reason else ''}")
+
+
+def objection_line(a: dict[str, Any]) -> str:
+    """THE OBJECTION SENT TO THE WORKER: how it travelled, and how it ended. Or `''`.
+
+    FOUR END STATES AND THEY ARE FOUR DIFFERENT THINGS TO A USER — in flight, delivered,
+    withdrawn because the order stopped first, and undeliverable — so rendering any two
+    of them the same is the defect this line exists to avoid (§8). Every objection the OS
+    ever sent is visible here, delivered or not: that is the user's stated requirement.
+
+    `objection_undeliverable` is the one fact NOT on the assumption row: §9 defines it
+    over the carrier (the message `failed`, or the envelope terminal and not delivered),
+    which takes two more reads. A caller that has done them passes the verdict in on the
+    row; one that has not gets "in flight", which is what the row alone can honestly say.
+    """
+    if not a.get("objection_envelope_id"):
+        return ""
+    transport = str(a.get("objection_transport") or "") or "queue"
+    sent = f" at {_stamp(a['objection_sent_ts'])}" if a.get("objection_sent_ts") else ""
+    head = f"objection sent to the worker over the {transport}{sent}"
+    if a.get("objection_delivered_ts"):
+        return f"{head}, delivered at {_stamp(a['objection_delivered_ts'])}"
+    if a.get("objection_withdrawn_ts"):
+        return (f"{head}, withdrawn at {_stamp(a['objection_withdrawn_ts'])} — the "
+                f"order stopped before it could be delivered")
+    if a.get("objection_undeliverable"):
+        return f"{head}, UNDELIVERABLE — the worker was never told"
+    return f"{head}, in flight"
+
+
 def assumption_line(a: dict[str, Any]) -> str:
-    """One assumption on one line, for `jarvis wo show`. Attribution from one renderer."""
+    """One assumption on one line, for `jarvis wo show`. Attribution from one renderer.
+
+    The early pass's facts ride on the PENDING branch and nowhere else, which is the
+    whole shape of the feature: a provisional verdict leaves the user owing a decision,
+    so the line still opens by saying so.
+    """
     n, status = a.get("n"), str(a.get("status") or "")
     content = str(a.get("content") or "")
     if status == "pending":
-        ruling = assumption_ruling_line(a)
+        parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
+                             objection_line(a)) if p]
         return (f"#{n} pending your review: {content}"
-                f"{' — ' + ruling if ruling else ''}")
+                f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()
+    # The early reading stays on a SETTLED row too: what the OS thought while the work
+    # ran and what it thought once it saw the result are two readings, and §7 hands the
+    # user both when they disagree.
+    tail = "; ".join(p for p in (provisional_line(a), objection_line(a)) if p)
     return (f"#{n} {status} by {assumption_decider(a)}"
-            f"{' — ' + reason if reason else ''}: {content}")
+            f"{' — ' + reason if reason else ''}: {content}"
+            f"{' — ' + tail if tail else ''}")
 
 
 def _autoreview_line(state: dict[str, Any]) -> str:
@@ -2406,6 +2513,25 @@ def _autoreview_line(state: dict[str, Any]) -> str:
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_asked":
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
+    # The early pass's five. Each gets a branch rather than falling through, because the
+    # fallthrough below says "held" — a kind with no branch would claim the OS refused to
+    # judge an assumption it had in fact judged.
+    if kind == "autoreview_provisional":
+        return (f"assumption #{n} provisionally {state.get('verdict') or 'judged'} by "
+                f"the OS while the worker runs — settles nothing")
+    if kind == "autoreview_objected":
+        return (f"the OS objected to assumption #{n} and told the worker — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_objection_withdrawn":
+        return (f"objection to assumption #{n} withdrawn undelivered — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_confirmed":
+        return (f"assumption #{n} confirmed against the result and accepted by the OS "
+                f"(Neo, {state.get('model') or 'model not recorded'}) — "
+                f"{state.get('reason') or 'no reason recorded'}")
+    if kind == "autoreview_unconfirmed":
+        return (f"assumption #{n} left with you — the OS did not confirm its early "
+                f"reading: {state.get('reason') or 'no reason recorded'}")
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
