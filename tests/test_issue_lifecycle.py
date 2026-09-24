@@ -1357,10 +1357,55 @@ def test_expediting_a_non_dispatching_bug_dispatches_it_now(fleet, level):
 def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
     """The claim is still re-assessed — the label is what everyone else reads — but the
     work no longer waits on the verdict."""
+    from jarvis import ops
     pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
     assert pickup["wo_id"] == fleet.wo_id() != ""
     assert pickup["neo_question_id"], "the rating is still a claim and still checked"
     assert "in parallel" in pickup["reason"]
+
+    # The work is dispatched; the RATING is not granted. Only a verdict writes one on,
+    # because this column alone is what ships a release when the fix lands.
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert not (wo["issue_priority"] or ""), "an unconfirmed claim is not a rating"
+    assert f"priority: {level}" in fleet.gh.issue()["labels"], \
+        "but the tracker still shows what was claimed"
+
+
+@pytest.mark.parametrize("level", ["critical", "blocker"])
+def test_an_expedited_claim_that_lands_first_ships_no_release(fleet, level):
+    """The race the flag creates: a one-line fix can land before Neo answers. Nothing
+    but a verdict may cut a release, so landing first ships none."""
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    fleet.land(pickup["wo_id"])
+    assert fleet.releases() == [], "an unconfirmed claim may not ship a release"
+
+
+def test_a_claim_neo_could_not_be_asked_about_ships_no_release(monkeypatch, fleet):
+    """Neo unreachable is the case the whole route fails closed on, and expediting only
+    moves WHEN the work happens — never whether the claim was checked."""
+    monkeypatch.setattr(issues, "ask_triage",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("neo is off")))
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    assert pickup["wo_id"] and "NOT re-assessed" in pickup["reason"]
+
+    fleet.land(pickup["wo_id"])
+    assert fleet.releases() == [], "nothing is shipped off a claim nobody could check"
+
+
+@pytest.mark.parametrize("approve", [False, True])
+def test_a_verdict_that_arrives_after_the_fix_landed_ships_nothing(fleet, approve):
+    """A verdict can only decide what has not happened yet. The work landed unrated, so
+    no release was cut, and neither ruling reaches back for one — INCLUDING the confirm.
+    Failing closed in both directions is the choice: a release the fleet restarts for is
+    the user's to ask for (`scripts/shipit.sh`) once the moment to cut it automatically
+    has gone. The label is still corrected, which is what the tracker is for."""
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.land(pickup["wo_id"])
+    fleet.triage(approve=approve, answer="" if approve else "medium", reason="r")
+
+    assert fleet.releases() == []
+    want = "blocker" if approve else "medium"
+    assert f"priority: {want}" in fleet.gh.issue()["labels"]
 
 
 def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
@@ -1398,9 +1443,9 @@ def test_a_downgraded_expedited_fix_lands_without_a_release(fleet):
     assert fleet.releases() == [], "a `medium` bug does not ship a release"
 
 
-def test_neo_confirming_an_expedited_claim_leaves_it_alone(fleet):
-    """The other verdict: nothing is re-priced, no second work order is created, and the
-    release a confirmed `blocker` earns still follows."""
+def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
+    """The other verdict, and the other half of the rule: a CONFIRMED blocker is a
+    rating, so the work order gets it and landing ships the release it earned."""
     from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=True)
@@ -1409,7 +1454,9 @@ def test_neo_confirming_an_expedited_claim_leaves_it_alone(fleet):
     _name, _path, wo = ops.find_work_order(pickup["wo_id"])
     assert wo["issue_priority"] == "blocker"
     assert "priority: blocker" in fleet.gh.issue()["labels"]
-    assert issues.dispatches(wo["issue_priority"])
+
+    fleet.land(pickup["wo_id"])
+    assert len(fleet.releases()) == 1, "a confirmed blocker still ships on landing"
 
 
 def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):

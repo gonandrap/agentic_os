@@ -1033,8 +1033,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="work on it NOW, whatever the priority: the issue is filed as "
                          "usual and a work order is dispatched on it immediately, "
                          "instead of waiting on the tracker (or, for critical/blocker, "
-                         "on Neo's re-assessment — which still runs and can still move "
-                         "the `priority:` label)")
+                         "on Neo's re-assessment — which still runs and still settles "
+                         "the rating, so an unconfirmed claim ships no release)")
     br.add_argument("--steps", default="", help="optional steps to reproduce")
     br.add_argument("--project", default="", help="reporting project (default: $JARVIS_PROJECT)")
     br.add_argument("--wo-id", default="", help="reporting work order (default: $JARVIS_WO_ID)")
