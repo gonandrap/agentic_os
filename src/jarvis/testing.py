@@ -2163,7 +2163,10 @@ FIXTURE_DESIGN_DOC_BODY = "\n".join([
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:
     path = root / name
     path.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    # `-b main`, not the machine's `init.defaultBranch`: `evidence.base_ref`'s last rung
+    # is the literal name `main`, so a fixture repo on `master` resolves no base and
+    # every diff collected from it is empty.
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
     if readme is not None:
         (path / "README.md").write_text(readme)
     doc = path / FIXTURE_DESIGN_DOC

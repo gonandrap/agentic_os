@@ -24,6 +24,7 @@ import subprocess
 import pytest
 
 from jarvis import autoreview, ops
+from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 
 # The fixtures are `test_autoreview.py`'s, imported rather than re-written: the two
@@ -163,22 +164,22 @@ def _git(cwd, *args: str) -> str:
 DEFAULT_FILES = {"render.py": "def _render_row():\n    return 1\n"}
 
 
-def with_diff(started, *, files: dict[str, str] | None = None, **kw):
+def with_diff(started, **kw):
     """A parked order whose worker worktree really has a commit in it.
 
     `park` alone leaves the repository empty, and `evidence.collect_work_order` answers
     an empty packet for one — which this section ASKS on anyway. So the diff has to be
-    real here or the test would pass with the evidence never collected at all.
+    real here or the end-to-end test would pass with the evidence never collected at all.
 
-    `files` is what the commit CONTAINS, because the evidence gate reads the diff itself:
-    the secret tests need a diff whose text and whose paths they choose.
+    WHAT THE COLLECTOR MAKES OF IT depends on the machine: see `stub_evidence`. Nothing
+    driven through this fixture may assert on the diff's text.
     """
     path = started.catalog.project("proj_a").path
     _git(path, "add", "-A")
     _git(path, "commit", "-qm", "base")
     worktree = path / ".claude" / "worktrees" / "wt"
     _git(path, "worktree", "add", "-q", "-b", "wo-branch", str(worktree))
-    for name, body in (files or DEFAULT_FILES).items():
+    for name, body in DEFAULT_FILES.items():
         (worktree / name).write_text(body)
     _git(worktree, "add", "-A")
     _git(worktree, "commit", "-qm", "the change under review")
@@ -187,11 +188,41 @@ def with_diff(started, *, files: dict[str, str] | None = None, **kw):
     return store, store.get_work_order(wo["id"])
 
 
-def test_the_confirmation_carries_the_diff_the_early_pass_never_had(started):
+def stub_evidence(monkeypatch, stat: str, diff: str) -> None:
+    """Drive the pass through a chosen `(stat, diff)`, the seam that method exists for.
+
+    THE DIFF UNDER `with_diff` IS NOT THE SAME IN EVERY ENVIRONMENT. The collector
+    resolves a base through `evidence.base_ref`, whose last guess is the literal name
+    `main`; a machine whose `init.defaultBranch` is `master` has no rung that answers, so
+    the collector diffs the working tree against HEAD and a fixture that COMMITTED its
+    change collects nothing. Tests about question TEXT must not be able to fail that way,
+    so they state the diff they mean.
+    """
+    monkeypatch.setattr(Daemon, "_confirmation_evidence",
+                        lambda self, project, wo, cfg: (stat, diff))
+
+
+def added(path: str, body: str) -> tuple[str, str]:
+    """`(stat, diff)` for one file added whole — the shape git prints, headers included.
+
+    The headers are not decoration: `secret_marker` reads paths off the stat AND off
+    `diff --git`, and must never read `+++ b/…` as an added line.
+    """
+    lines = body.splitlines()
+    n = len(lines)
+    stat = f" {path} | {n} +\n {n} file changed, {n} insertions(+)\n"
+    diff = (f"diff --git a/{path} b/{path}\n"
+            f"new file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+            f"@@ -0,0 +1,{n} @@\n" + "".join(f"+{line}\n" for line in lines))
+    return stat, diff
+
+
+def test_the_confirmation_carries_the_diff_the_early_pass_never_had(started, monkeypatch):
     """THE SECOND CALL IS THE FEATURE (Neo, question 549). The cheap design — confirm in
     code, re-ask only if something changed — was refused: a mid-turn verdict never had a
     result summary, so "something changed" is always true."""
-    store, wo = with_diff(started)
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", DEFAULT_FILES["render.py"]))
     provisional(store, wo)
 
     ask(started, store)
@@ -204,6 +235,25 @@ def test_the_confirmation_carries_the_diff_the_early_pass_never_had(started):
     row = store.all_assumptions(wo["id"])[0]
     assert row["confirm_question_id"] == confirmation["id"]
     assert row["neo_question_id"] == EARLY_QUESTION   # the early link is not overwritten
+
+
+def test_the_real_collector_still_reaches_the_question(started):
+    """THE END-TO-END ONE, through `evidence.collect_work_order` and a real worktree —
+    without it every claim above holds over a stub only.
+
+    It asserts what is true in EVERY git environment: the collected diff itself is not,
+    because the base the collector resolves depends on the machine's default branch.
+    """
+    store, wo = with_diff(started)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert confirmation["kind"] == autoreview.QUESTION_KIND
+    assert PROVISIONAL_REASON in confirmation["question"]
+    assert "opened a PR" in confirmation["question"]       # the result summary
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == confirmation["id"]
 
 
 def test_running_the_confirmation_pass_twice_asks_once(started):
@@ -425,11 +475,13 @@ def held_codes(store, wo_id: str) -> list[str]:
     return [e["code"] for e in events(store, wo_id, "autoreview_held")]
 
 
-def test_a_secret_shaped_added_line_is_never_copied_into_a_stored_question(started):
+def test_a_secret_shaped_added_line_is_never_copied_into_a_stored_question(
+        started, monkeypatch):
     """THE BLOCKING FINDING. No question is filed at all — the assumption stays pending
     and is the user's, exactly as it is without this feature. Filing the question with
     the diff withheld is the cheap design Neo refused in question 549."""
-    store, wo = with_diff(started, files={"settings.py": SECRET_BODY})
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("settings.py", SECRET_BODY))
     provisional(store, wo)
 
     ask(started, store)
@@ -442,11 +494,12 @@ def test_a_secret_shaped_added_line_is_never_copied_into_a_stored_question(start
     assert SECRET_VALUE not in held["reason"]
 
 
-def test_a_secret_shaped_path_holds_it_whatever_the_body_says(started):
+def test_a_secret_shaped_path_holds_it_whatever_the_body_says(started, monkeypatch):
     """The path is evidence on its own: a work order that adds a `.env` is one whose
     diff the OS will not store, and reading the file to find out would be the same
     mistake one layer down."""
-    store, wo = with_diff(started, files={".env": "GREETING=hello\n"})
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added(".env", "GREETING=hello\n"))
     provisional(store, wo)
 
     ask(started, store)
@@ -457,13 +510,14 @@ def test_a_secret_shaped_path_holds_it_whatever_the_body_says(started):
     assert ".env" in held["reason"]
 
 
-def test_this_repos_own_everyday_diff_still_arms_and_still_asks(started):
+def test_this_repos_own_everyday_diff_still_arms_and_still_asks(started, monkeypatch):
     """THE NEGATIVE CONTROL, and without it a net that holds everything passes. Running
     `high_stakes_marker` over a diff was REJECTED (Neo, question 593) for exactly this:
     "credential", "production" and "delete" appear in nearly every change this repo
     makes, so that net would hold almost every confirmation and switch the pass off
     silently."""
-    store, wo = with_diff(started, files={"render.py": PROSE_BODY})
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *added("render.py", PROSE_BODY))
     provisional(store, wo)
 
     ask(started, store)
