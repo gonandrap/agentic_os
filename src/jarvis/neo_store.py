@@ -8,6 +8,7 @@ distilled from them.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -521,6 +522,22 @@ class NeoStore:
         q += " ORDER BY ts DESC LIMIT ?"
         params.append(limit)
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def search_questions(self, words: Sequence[str], project: str = "",
+                         limit: int = 50) -> list[dict[str, Any]]:
+        """Questions matching `words`, answered ones included: a ruling the user wants
+        to find again is by definition already answered."""
+        expr, params = db.score_sql(words, {
+            "question": 3, "wo_id": 2, "answer": 1, "answer_reason": 1, "context": 1,
+            "review_feedback": 1,
+        })
+        q = [f"SELECT *, {expr} AS _score FROM questions WHERE _score > 0"]
+        if project:
+            q.append("AND project=?")
+            params.append(project)
+        q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
+        rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def counts(self) -> dict[str, int]:
         by_status = {

@@ -79,8 +79,9 @@ def test_core_contract_is_under_the_budget():
     assert len(core) < worker_brief.CORE_BUDGET_CHARS, (
         f"core contract is {len(core)} chars — over the "
         f"{worker_brief.CORE_BUDGET_CHARS} budget")
-    # The whole bare prompt shrank: it measured 6032 chars before the split.
-    assert len(p) < 4500, f"bare worker prompt is {len(p)} chars"
+    # The whole bare prompt shrank: it measured 6032 chars before the split. 4500 until
+    # the crew block (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) bought its place.
+    assert len(p) < 5000, f"bare worker prompt is {len(p)} chars"
 
 
 def test_index_names_every_section_and_says_fetching_is_one_command():
@@ -282,3 +283,69 @@ def test_cli_brief_bare_lists_the_sections(jarvis_home, capsys):
     assert rc == 0
     for name in SECTION_NAMES:
         assert name in out.out
+
+
+# -- the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) -------------------------
+
+def test_worker_core_names_both_crew_seats():
+    p = _prompt()
+    assert "jarvis-spec-writer" in p and "jarvis-implementer" in p
+    assert "# Your crew" in p
+
+
+def test_worker_core_keeps_git_the_pr_and_the_record_with_the_lead():
+    from jarvis import worker_brief
+    core = "\n".join(worker_brief.core_contract("wo-crew01", "t", "p1",
+                                                has_knowledge=False))
+    for kept in ("git", "pr", "`jarvis", "review"):
+        assert kept in core.lower()
+    # the lead's own editing is refused by a hook, so the block states the mechanism
+    assert "refused" in core.lower()
+
+
+def test_planner_prompt_names_no_crew_through_the_production_path():
+    """Not `core_contract(kind="planner")` — the real briefing a planner is dispatched
+    with. A planner never reaches the worker branch at all, so a unit test on the
+    argument would pass even if every planner were told to delegate to a seat it was
+    never handed."""
+    from jarvis.dispatch import build_worker_prompt
+    planner = dict(WO, id="wo-crew02", kind="planner")
+    out = build_worker_prompt(planner, SPEC)
+    assert "# Your crew" not in out
+    assert "jarvis-spec-writer" not in out and "jarvis-implementer" not in out
+
+
+def test_manager_prompt_names_no_crew_through_the_production_path():
+    from jarvis.dispatch import build_worker_prompt
+    manager = dict(WO, id="wo-crew03", kind="manager")
+    out = build_worker_prompt(manager, SPEC)
+    assert "# Your crew" not in out
+    assert "jarvis-spec-writer" not in out and "jarvis-implementer" not in out
+
+
+def test_the_same_path_with_kind_worker_does_carry_the_crew():
+    """The other half: the assertions above must fail for the right reason, not
+    because `build_worker_prompt` never emits the block for anyone."""
+    from jarvis.dispatch import build_worker_prompt
+    for kind in (None, "worker"):
+        wo = dict(WO, id="wo-crew04")
+        if kind:
+            wo["kind"] = kind
+        out = build_worker_prompt(wo, SPEC)
+        assert "# Your crew" in out
+        assert "jarvis-spec-writer" in out and "jarvis-implementer" in out
+
+
+def test_build_worker_prompt_passes_the_kind_down():
+    """`core_contract` takes `kind`; a production caller has to hand it over or the
+    default silently decides for every work order."""
+    import inspect
+
+    from jarvis import dispatch
+    source = inspect.getsource(dispatch.build_worker_prompt)
+    assert "kind=str(wo.get(\"kind\")" in source
+
+
+def test_template_version_bumped_for_crew():
+    from jarvis.bootstrap import TEMPLATE_VERSION
+    assert TEMPLATE_VERSION >= 12

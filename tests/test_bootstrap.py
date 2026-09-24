@@ -442,3 +442,14 @@ def test_this_repos_committed_operation_md_matches_its_generator():
     assert committed == rendered, (
         "this repo's committed OPERATION.md is not what the generator produces — "
         "run `jarvis adopt . --force-config` and commit the result")
+
+
+def test_install_agent_assets_returns_three_roots_for_worker(project, jarvis_home):
+    """Spec 2026-09-23-the-crew-a-worker-must-use.md SS5: skills, the crew, and nothing
+    of the planner's."""
+    from jarvis.bootstrap import install_agent_assets
+
+    roots = install_agent_assets(project, kind="worker")
+    assert [r.name for r in roots] == ["agent-skills", "agent-crew"]
+    assert [r.name for r in install_agent_assets(project, kind="planner")] == [
+        "agent-skills", "agent-seats"]

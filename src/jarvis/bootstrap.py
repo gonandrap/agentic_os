@@ -52,7 +52,10 @@ from .paths import project_state_dir
 # helps the workers whose repo has it.
 # v11 = the second exit (`jarvis gate contest`, beside `explain`) and the per-kind ask —
 # spec 2026-09-12 §3, §6. Prose is the whole mechanism, so it has to reach every repo.
-TEMPLATE_VERSION = 11
+# v12 = the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS5, SS6): the lead
+# delegates spec writing to `jarvis-spec-writer` and code to `jarvis-implementer`. The
+# division of labour is prose in the core contract, so it has to reach every managed repo.
+TEMPLATE_VERSION = 12
 ASSETS = Path(__file__).parent / "assets"
 
 
@@ -118,25 +121,31 @@ def install_agent_assets(project_path: Path, kind: str = "worker",
     So the OS keeps both inside the project's gitignored `.jarvis/` tree and points each
     worker at whichever it is entitled to on spawn.
 
-    **Two roots, not one, and the split is load-bearing.** Skills go to every worker;
-    the planning seats go to planners only (the design's decision 4 — an ordinary worker
-    is an individual with one job and gets no profile). Putting the seats in the skills
+    **A root per population, and the split is load-bearing.** Skills go to every worker;
+    the planning seats go to planners only; the crew (`jarvis-spec-writer`,
+    `jarvis-implementer`) goes to ordinary workers only. Putting the seats in the skills
     root and omitting them for workers would mean the worker path had to DELETE
     `agents/` to keep owning its whole generated tree — and that delete would land while
-    a concurrently-dispatched planner turn was reading it. Separate roots make the two
-    populations independent, so neither dispatch can disturb the other.
+    a concurrently-dispatched planner turn was reading it. Separate roots make the
+    populations independent, so no dispatch can disturb another's.
     """
-    roots = [_rebuild(ASSETS / "skills",
-                      project_state_dir(project_path) / "agent-skills", "skills")]
-    if kind == "planner":
-        root = _rebuild(ASSETS / "agents",
-                        project_state_dir(project_path) / "agent-seats", "agents")
+    def _seats(src: str, leaf: str) -> Path:
+        root = _rebuild(ASSETS / src, project_state_dir(project_path) / leaf, "agents")
         if not serena:
             # Safe to rewrite in place: `_rebuild` just dropped and recopied the whole
             # destination, and it is regenerated on every dispatch.
             for seat in (root / ".claude" / "agents").glob("*.md"):
                 seat.write_text(_strip_serena(seat.read_text()))
-        roots.append(root)
+        return root
+
+    roots = [_rebuild(ASSETS / "skills",
+                      project_state_dir(project_path) / "agent-skills", "skills")]
+    if kind == "planner":
+        roots.append(_seats("agents", "agent-seats"))
+    if kind == "worker":
+        # The crew an ordinary worker must delegate to — a THIRD root for the reason
+        # above (spec 2026-09-23-the-crew-a-worker-must-use.md SS5).
+        roots.append(_seats("worker-agents", "agent-crew"))
     return roots
 
 

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}{{ ('Search: ' + q) if q else 'Search' }} — Jarvis{% endblock %}
+{% block content %}
+
+<h2>Search{% if project %} <span class="kv mono">{{ project }}</span>{% endif %}</h2>
+
+<form class="panel search-form" method="get" action="/search">
+  <input type="text" name="q" value="{{ q }}" autofocus
+         placeholder="words, or an id like wo-1234abcd">
+  <select name="project" aria-label="project">
+    <option value="">every project</option>
+    {% for p in projects %}
+    <option value="{{ p }}" {{ 'selected' if p == project }}>{{ p }}</option>
+    {% endfor %}
+  </select>
+  <select name="kind" aria-label="kind">
+    <option value="">every kind</option>
+    {% for k in kinds %}
+    <option value="{{ k }}" {{ 'selected' if k == kind }}>{{ k.replace('_', ' ') }}</option>
+    {% endfor %}
+  </select>
+  <button class="primary">Search</button>
+</form>
+
+{% if q %}
+  {% if hits %}
+  <p class="sub">
+    {% for k, n in counts %}
+      {%- if k == kind -%}
+        <strong>{{ n }} {{ k.replace('_', ' ') }}</strong>
+      {%- else -%}
+        <a href="/search?q={{ q|urlencode }}{% if project %}&project={{ project|urlencode }}{% endif %}&kind={{ k }}"
+           title="Only the {{ k.replace('_', ' ') }} hits">{{ n }} {{ k.replace('_', ' ') }}</a>
+      {%- endif -%}
+      {{ ' · ' if not loop.last }}
+    {% endfor %}
+    {% if kind %} · <a href="/search?q={{ q|urlencode }}{% if project %}&project={{ project|urlencode }}{% endif %}">every kind</a>{% endif %}
+    {% if project %} · <a href="/search?q={{ q|urlencode }}{% if kind %}&kind={{ kind }}{% endif %}">search every project</a>{% endif %}
+  </p>
+  <div class="panel">
+    {% for h in hits %}
+    <div class="row search-hit">
+      <span class="st tone-muted" style="width: 8.5em">{{ h.kind.replace('_', ' ') }}</span>
+      <div class="grow">
+        <a href="{{ h.url }}"><strong>{{ h.title }}</strong></a>
+        <div class="sub">
+          <span class="mono">{{ h.id }}</span>
+          {% if h.project %}· <a href="/project/{{ h.project }}">{{ h.project }}</a>{% endif %}
+          {% if h.status %}· {{ h.status }}{% endif %}
+          {% if h.ts %}· {{ fmt_age(h.ts) }} ago{% endif %}
+        </div>
+        {% if h.snippet %}<div class="sub">{{ h.snippet }}</div>{% endif %}
+        <div class="sub mono">{{ h.ref }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="panel"><div class="empty">nothing matches “{{ q }}”{% if project %} in {{ project }}{% endif %}</div></div>
+  {% endif %}
+{% else %}
+<p class="sub">
+  Work orders, feature orders, Neo questions, alarms, gates, backlog items and knowledge
+  entries — settled ones included. Same verb in the terminal:
+  <code>jarvis search "&lt;words&gt;" [--project &lt;p&gt;]</code>.
+</p>
+{% endif %}
+
+{% endblock %}

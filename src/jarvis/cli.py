@@ -116,10 +116,18 @@ def _readable_issues(detail: dict[str, Any]) -> dict[str, Any]:
     index = row.pop("issues", None) or {}
     raised = [issue_line(i) for i in index.get("raised") or []]
     refs = [issue_line(i) for i in index.get("references") or []]
+    # NO ISSUE WAS OPENED FOR THESE and that is what the line has to say — the finding is
+    # whole on the record, and a reader who went looking for it on GitHub would find
+    # nothing (`ops.file_validation_follow_ups`).
+    kept = [f"internal only: {i.get('title') or ''}"
+            + (f" ({i['file']})" if i.get("file") else "")
+            for i in index.get("withheld") or []]
     if raised:
         row["follow_ups_raised"] = raised
     if refs:
         row["issues_referenced"] = refs
+    if kept:
+        row["follow_ups_kept"] = kept
     return row
 
 
@@ -313,6 +321,8 @@ class _VersionAction(argparse.Action):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from .search import KINDS as SEARCH_KINDS
+
     # Imported HERE rather than at module scope: `jarvis --help` is the one path that
     # needs the rubric, and `issues` pulls in `github` and `bugreport` behind it. Every
     # other CLI import in this file is deferred for the same reason.
@@ -380,6 +390,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "search",
+        help="find any artifact — work orders, feature orders, Neo questions, alarms, "
+             "gates, backlog items, knowledge — across the fleet or one project",
+    )
+    sp.add_argument("query", help="words to look for, or an id to jump to")
+    sp.add_argument("--project", help="one project (default: the whole fleet)")
+    sp.add_argument("--kind", action="append", choices=list(SEARCH_KINDS),
+                    help="restrict to one kind; repeatable")
+    sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
@@ -1384,8 +1406,14 @@ def _print_provenance(acc: dict) -> None:
         if acc.get("resealed_at"):
             again = _time.strftime("%Y-%m-%d %H:%M",
                                    _time.localtime(acc["resealed_at"]))
-            print(f"  re-derived on {again} to add detail the original seal predates; "
-                  f"adopted only because it still saw every token the seal held")
+            was = (acc.get("corrected_from") or {}).get("total")
+            if was:
+                print(f"  re-derived on {again}: the seal counted {was:,} tokens, "
+                      f"each turn carrying the whole session's running total")
+            else:
+                print(f"  re-derived on {again} to add detail the original seal "
+                      f"predates; adopted only because it still saw every token the "
+                      f"seal held")
     elif acc.get("live"):
         print("  worked out just now, from records that are still live; sealed "
               "automatically once the order settles")
@@ -1756,6 +1784,38 @@ def cmd_issues_start(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_search(args: argparse.Namespace) -> int:
+    """`jarvis search` — the find-it-again verb, over every record the OS keeps.
+
+    Settled work is the point, so nothing is filtered by status: the listings hide
+    completed orders behind a reveal, and hunting through that reveal is what this
+    replaces (wo-edf5c425). Kinds are grouped, because the count line is what tells the
+    user whether to narrow with --kind.
+    """
+    from . import search as search_mod
+
+    hits = search_mod.search(args.query, project=args.project,
+                             kinds=tuple(args.kind) if args.kind else None,
+                             limit=args.limit)
+    if args.json:
+        _print(hits, True)
+        return 0
+    if not hits:
+        where = f" in {args.project}" if args.project else ""
+        print(f"nothing matches {args.query!r}{where}")
+        return 0
+    print("  ".join(f"{kind} {n}" for kind, n in search_mod.counts(hits)))
+    for hit in hits:
+        status = f" [{hit['status']}]" if hit["status"] else ""
+        print(f"\n{hit['kind']}  {hit['id']}  ({hit['project']}){status}  "
+              f"{_age(hit['ts'])}")
+        print(f"  {hit['title']}")
+        if hit["snippet"]:
+            print(f"  {hit['snippet']}")
+        print(f"  {hit['ref']}")
+    return 0
+
+
 def cmd_issues(args: argparse.Namespace) -> int:
     """Which tracker issues the fleet keeps running into — the priority signal.
 
@@ -1779,8 +1839,12 @@ def cmd_issues(args: argparse.Namespace) -> int:
         return 0
     for row in rows:
         title = row["title"] or row["issue_url"]
-        print(f"{row['refs']:>3}  #{row['number']}  [{row['project']}] {title}")
-        print(f"     {row['issue_url']}")
+        where = "internal" if row.get("internal") else f"#{row['number']}"
+        print(f"{row['refs']:>3}  {where}  [{row['project']}] {title}")
+        # An internal follow-up is one the panel raised on a repository the OS could not
+        # establish is private, so nothing was published and there is no link to print.
+        print(f"     {row['issue_url']}" if row["issue_url"]
+              else "     kept on the internal record — no tracker issue was opened")
         who = ", ".join(f"{u['unit_id']} ({u['kind']})" for u in row["units"])
         print(f"     {who}")
     return 0
@@ -2347,6 +2411,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
                 for rnd in detail["validation_rounds"]:
                     print(f"  {ops.round_line(rnd)}")
             for heading, key in (("follow-ups raised", "follow_ups_raised"),
+                                 ("follow-ups kept internally", "follow_ups_kept"),
                                  ("issues referenced", "issues_referenced")):
                 if detail.get(key):
                     print(f"\n{heading}:")
@@ -3279,6 +3344,9 @@ def cmd_validation(args: argparse.Namespace) -> int:
         if dropped := follow_ups.get("dropped"):
             print(f"  {dropped} further follow-up(s) went over the per-round cap and "
                   f"were not filed; a later round may raise them again")
+        for item in follow_ups.get("withheld") or []:
+            print(f"  kept internally: {item.get('title') or ''} — no issue was opened "
+                  f"({follow_ups.get('reason') or 'the tracker may be public'})")
         if failed := follow_ups.get("failed"):
             why = follow_ups.get("reason") or "the tracker refused or was unreachable"
             print(f"  {failed} follow-up(s) could not be filed as issues — {why}")
@@ -3420,6 +3488,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_inspect(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "search":
+            return cmd_search(args)
         if args.cmd == "issues":
             return (cmd_issues_start(args) if args.issues_cmd == "start"
                     else cmd_issues(args))

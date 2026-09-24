@@ -48,7 +48,12 @@ PROJECT_PLACEHOLDER = "<project>"
 #: exactly: a worker that does not know a turn ends its process backgrounds a long job
 #: and signs off expecting a wake-up, and the damage — the work lost, the money spent —
 #: is done before any section could be fetched.
-CORE_BUDGET_CHARS = 3220
+#:
+#: Raised again for the "Your crew" block (spec 2026-09-23-the-crew-a-worker-must-use.md
+#: SS6), which passes the same test: a lead that does not know it has seats edits the tree
+#: itself, and the hook refuses the call — the confusion happens on the FIRST edit, before
+#: any section could be fetched.
+CORE_BUDGET_CHARS = 3800
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -191,7 +196,8 @@ def render_section(name: str, *, wo_id: str | None = None,
 # -- the core ---------------------------------------------------------------------------
 
 def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
-                  gate_names: tuple[str, ...] = ()) -> list[str]:
+                  gate_names: tuple[str, ...] = (),
+                  kind: str = "worker") -> list[str]:
     """The compressed operating contract: only the invariants a worker cannot be
     allowed to discover by fetching.
 
@@ -277,6 +283,21 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"know it works, and it is read beside your diff. Review feedback may come "
         f"back asking for more — do what it asks, then finish again with the "
         f"fuller account.",
+        # spec 2026-09-23-the-crew-a-worker-must-use.md SS6 — worker only; a planner
+        # has its own team prose in `dispatch._planner_prompt`.
+        *([
+            "",
+            "# Your crew",
+            "You are a LEAD with two subagents, and delegating is the job, not a "
+            "courtesy: spec writing goes to `jarvis-spec-writer`, code and tests go to "
+            "`jarvis-implementer` (TDD, failing test first).",
+            "- YOURS, and neither of theirs: git, the PR, every `jarvis` command, the "
+            "work-order record (messages, assumptions, the finish summary), and REVIEW "
+            "of what they hand back — it is a draft until you have read it.",
+            "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
+            "route the change through `jarvis-implementer` rather than arguing with "
+            "the tool.",
+        ] if kind == "worker" else []),
     ]
     return lines
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -105,15 +106,17 @@ BUDGET_SPENT_BLOCKER = ("budget spent — raise it with `jarvis wo budget <id> <
                         "or close the order")
 
 
-def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
-    """The attention line for a work order parked in `budget_exhausted`.
+@contextmanager
+def _billing_store() -> Iterator[Any]:
+    """A `CentralStore` for the Jarvis half of a bill, or None if it will not open.
 
-    Opens its own `CentralStore` for the Jarvis half of the bill and closes it again.
-    That cost is paid only by an order ALREADY in this status — a handful fleet-wide —
-    because the caller checks the status first; `true_blockers` runs against every work
-    order on every tick and must not open a second database for the ones with no budget.
+    EVERY READER OF A BUDGET FIGURE GOES THROUGH HERE. `budget.spent` reads the Jarvis
+    half — Neo answers, panel seats, digests — only from a CentralStore, so a caller
+    passing None prints the worker half alone against the whole cap and contradicts the
+    surfaces that opened one (issue #692: a status chip 7.58 under the cap on an order
+    parked for exceeding it).
 
-    A store that will not open DEGRADES rather than raises: the reason is then derived
+    A store that will not open DEGRADES rather than raises: the figure is then derived
     from the worker's turns alone, which understates the spend rather than inventing one,
     and an unopenable database must not take the whole attention list down with it.
     """
@@ -125,10 +128,22 @@ def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001 — see the docstring
         pass
     try:
-        out = budget.exhaustion(store, central, wo)
+        yield central
     finally:
         if central is not None:
             central.close()
+
+
+def budget_blocker(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The attention line for a work order parked in `budget_exhausted`.
+
+    The `CentralStore` it opens is paid for only by an order ALREADY in this status — a
+    handful fleet-wide — because the caller checks the status first; `true_blockers` runs
+    against every work order on every tick and must not open a second database for the
+    ones with no budget.
+    """
+    with _billing_store() as central:
+        out = budget.exhaustion(store, central, wo)
     # None means the accounting no longer says it is spent: the user raised the budget
     # and the tick that moves the status has not run yet.
     return out.reason if out else BUDGET_SPENT_BLOCKER
@@ -934,7 +949,10 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # every listing prints and "budget_exhausted" alone sends the reader to a second
     # command to learn the one thing they need: how much more it would take.
     if wo["status"] == budget.EXHAUSTED:
-        cap = budget.ceiling(store, None, wo)
+        # A real billing store, like every other reader of this figure: the label and
+        # the Budget line on the same page must not disagree by the Jarvis half.
+        with _billing_store() as central:
+            cap = budget.ceiling(store, central, wo)
         if cap is None:
             # The budget was cleared and the tick that moves the status has not run.
             return "budget spent — cleared, resuming shortly"

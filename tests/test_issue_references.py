@@ -27,7 +27,8 @@ from __future__ import annotations
 
 from jarvis import cli, issues, ops
 from tests.test_validation_follow_ups import (  # noqa: F401  (fixtures + helpers)
-    ORIGIN, REPO, SERIES, filed, fleet, judged, tracker, verdict)
+    ORIGIN, REPO, SERIES, filed, fleet, follow_up, judged, settle_again, tracker,
+    verdict)
 from tests.test_validation_loop import Validator, finish, write_catalog  # noqa: F401
 
 
@@ -72,19 +73,15 @@ def test_filing_a_follow_up_records_the_relation_as_well_as_the_footer(fleet, tr
 
 
 def test_the_order_lists_every_follow_up_across_every_round(fleet, tracker):  # noqa: F811
-    """THE CONSOLIDATION. Two rounds, two issues, ONE list with both — which is the thing
+    """THE CONSOLIDATION. Two settles, two issues, ONE list with both — which is the thing
     a per-round fragment cannot be however many rounds it renders."""
-    fleet.daemon.validator = Validator(verdict("rejected", "Name the retry budget",
-                                               reason="no test"))
+    fleet.daemon.validator = Validator(verdict("passed", "Name the retry budget"))
     wo = fleet.dispatch()
     fleet.change(wo["id"], "print('one')\n")
     finish(fleet, wo["id"])
     fleet.drain()
-    fleet.tick()
-    fleet.daemon.validator = Validator(verdict("passed", "Fold the two parsers"))
-    fleet.change(wo["id"], "print('two')\n")
-    finish(fleet, wo["id"])
-    fleet.drain()
+    # A SECOND SETTLE over the same order — what `jarvis validation force` produces.
+    settle_again(fleet, wo["id"], [follow_up("Fold the two parsers")])
 
     store = store_of(fleet)
     try:
@@ -93,20 +90,16 @@ def test_the_order_lists_every_follow_up_across_every_round(fleet, tracker):  # 
         store.close()
     assert [i["title"] for i in index["raised"]] == ["Name the retry budget",
                                                      "Fold the two parsers"]
-    assert {i["round"] for i in index["raised"]} == {1, 2}, \
-        "the rounds collapsed; a reader cannot tell which review raised which"
     assert index["references"] == []
 
 
 def test_the_list_reads_the_finding_even_when_the_tracker_may_not(fleet, tracker):  # noqa: F811
     """A PUBLIC TRACKER IS TOLD NOTHING, AND THE USER'S OWN LIST STILL READS.
 
-    wo-069d758e's rule: on a repository the OS cannot establish is private, the issue is
-    called `Validation follow-up vf-…` and the seat's words stay out of it. `tracked_issues`
-    caches that title because it is what is really on GitHub — so a list rendered off the
-    cache alone would be fifteen identical rows of a token, on exactly the tracker this
-    project has. The words never left the OS; they are on the filing event, and these
-    surfaces are the user's own.
+    wo-069d758e's rule was that the seat's words stay off a tracker the OS cannot
+    establish is private; wo-3619e6e4 took the issue with them, because `Validation
+    follow-up vf-…` over boilerplate is a row a reader can neither tell apart nor act on.
+    The finding is whole on the internal record and the order's own list still reads.
     """
     tracker.set_private(False)
     fleet.daemon.validator = Validator(verdict("passed", "Name the retry budget"))
@@ -122,10 +115,11 @@ def test_the_list_reads_the_finding_even_when_the_tracker_may_not(fleet, tracker
     finally:
         store.close()
 
-    assert [i["title"] for i in index["raised"]] == ["Name the retry budget"]
-    # ...and the cache was not quietly rewritten to say so. What GitHub was told is what
-    # is stored, because the sweep re-reads it and would disagree with anything else.
-    assert "Name the retry budget" not in rows[0]["title"]
+    assert index["raised"] == [], "an issue was opened on a tracker that may be public"
+    assert [i["title"] for i in index["withheld"]] == ["Name the retry budget"]
+    # ...and nothing was written into the tracker cache, which is a cache of what is
+    # really on GitHub: the sweep re-reads it and would disagree with anything else.
+    assert rows == []
 
 
 def test_wo_show_lists_the_follow_ups_and_still_withholds_the_seat(fleet, tracker,  # noqa: F811
@@ -391,10 +385,10 @@ def test_jarvis_issues_says_so_when_nothing_is_linked(fleet, capsys):  # noqa: F
 # -- 5. the per-round fragment kept what is genuinely per-round -----------------------
 
 
-def test_the_round_still_reports_what_it_could_not_file(fleet, fake_gh):  # noqa: F811
+def test_the_round_still_reports_what_never_became_an_issue(fleet, fake_gh):  # noqa: F811
     """WHAT MOVED AND WHAT DID NOT. The issues moved to the consolidated list; a finding
-    that never BECAME an issue cannot appear there, so the failure count stays on the
-    round that tried. Deleting it along with the links would lose the fact entirely."""
+    that never BECAME an issue cannot appear there, so what the round did with it stays
+    on the round that tried. Deleting it along with the links would lose the fact."""
     from fastapi.testclient import TestClient
 
     from jarvis.ui.app import create_app
@@ -406,5 +400,6 @@ def test_the_round_still_reports_what_it_could_not_file(fleet, fake_gh):  # noqa
         f"/wo/proj_a/{wo['id']}").text
     shown = " ".join(page.split())
 
-    assert "1 follow-up could not be filed as an issue" in shown
+    assert "1 follow-up was kept on the internal record" in shown
     assert "Raised by this order" not in shown, "an issue that does not exist is listed"
+    assert "Kept on the internal record" in shown, "the finding is nowhere on the page"

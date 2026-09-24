@@ -723,7 +723,8 @@ def test_search_finds_a_setting_from_any_node(page, server, project):
     """Reported item 5, and the rule that makes it useful: a search overrides the
     selected node, because not knowing the node is why anyone searches."""
     page.goto(f"{server}/config?scope=os&node=neo")
-    page.fill("input[name='q']", "autocompact")
+    # Scoped to the config bar: the header carries a search box of its own now.
+    page.fill("form.cfg-bar input[name='q']", "autocompact")
     page.click("form.cfg-bar button")
     shown = page.locator(".cfg-panel").inner_text()
     assert "defaults.autocompact_window" in shown
@@ -864,3 +865,35 @@ def test_a_dead_background_job_is_marked_void_on_the_page(page, server, daemon,
     assert "VOID" in said and "b51fl7bhe" in said
     assert "I'll report when it lands" in said
     assert said.index("VOID") < said.index("I'll report when it lands")
+
+
+def test_header_search_finds_a_finished_order(page, server, project):
+    """The case the feature exists for, driven the way the user drives it: type in the
+    header box, land on a completed order. Spec:
+    docs/superpowers/specs/2026-09-23-artifact-search.md."""
+    wo = ops.create_work_order("proj_a", "rotate the grafana dashboards")
+    ops.finish(wo["id"], "done")
+    page.goto(f"{server}/backlog")
+    page.fill("form.search-box input[name='q']", "grafana")
+    page.click("form.search-box button")
+
+    assert "/search?q=grafana" in page.url
+    hits = page.locator(".search-hit")
+    assert "rotate the grafana dashboards" in hits.first.inner_text()
+    assert f"jarvis wo show {wo['id']}" in hits.first.inner_text()
+    # /search carries no second box: the header one is hidden there.
+    assert page.locator("form.search-box").count() == 0
+    page.click(f".search-hit a:has-text('rotate the grafana dashboards')")
+    assert wo["id"] in page.url
+    _shot(page, "search-results")
+
+
+def test_the_project_page_box_searches_only_that_project(page, server, project):
+    ops.create_work_order("proj_a", "grafana rotation, proj_a")
+    page.goto(f"{server}/project/proj_a")
+    page.fill("form.search-form input[name='q']", "grafana")
+    page.click("form.search-form button")
+
+    assert "project=proj_a" in page.url
+    assert page.locator("select[name='project']").input_value() == "proj_a"
+    assert "grafana rotation, proj_a" in page.locator(".search-hit").first.inner_text()

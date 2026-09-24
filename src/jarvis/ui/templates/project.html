@@ -4,6 +4,13 @@
 {% block content %}
 
 <h2>{{ project_name }} <span class="kv mono">{{ path }}</span></h2>
+{# The header box searches the fleet; this one stays inside the project the user is
+   already looking at. Widening it again is one click, on the results page. #}
+<form class="panel search-form" method="get" action="/search">
+  <input type="hidden" name="project" value="{{ project_name }}">
+  <input type="text" name="q" placeholder="search {{ project_name }} — work orders, features, questions, alarms, gates">
+  <button>Search</button>
+</form>
 {# Everything open that the user can act on gets a row: a decision they owe (needs
    review, waiting on them), a running worker, a pull request waiting to be merged.
    Only work the OS has not started yet — pending, dispatching — collapses to a count,

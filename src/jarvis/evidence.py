@@ -80,7 +80,7 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from . import worker_session
 
@@ -185,6 +185,17 @@ class EvidencePacket:
     #: `validation_rounds` and `validation_opinions` and this module may not open a store.
     #: DELIBERATELY NOT in `fingerprint` — §5.5, and that function's exclusion table.
     history: tuple[dict, ...] = ()
+    #: `((path, digest), ...)`, sorted — ONE DIGEST PER CHANGED FILE, over that file's
+    #: own section of the UNTRUNCATED diff. `packet.files` cannot answer "what moved
+    #: since the last round": every field in this packet is cumulative against the base,
+    #: so a round that edits one file it already touched has the identical file list.
+    #: Comparing two rounds' maps is what `validation.unanswered` needs, and a round
+    #: persists this beside `head_sha` for the next one to read.
+    #:
+    #: A tuple of pairs rather than a dict because the packet is frozen and every other
+    #: field here is hashable. DELIBERATELY NOT in `fingerprint`: `diff_sha` already
+    #: covers exactly the same bytes, so hashing it in would add nothing and double-count.
+    file_shas: tuple[tuple[str, str], ...] = ()
 
 
 def fingerprint(packet: EvidencePacket) -> str:
@@ -343,6 +354,40 @@ def side_effects_digest(side_effects: Iterable[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def file_digests(diff: str) -> tuple[tuple[str, str], ...]:
+    """One digest per changed path, over that path's own section of `diff`.
+
+    Called with the UNTRUNCATED diff and nowhere else: a map built from the truncated
+    text would say the dropped files stopped changing, which is the one wrong answer
+    `validation.unanswered` must never be given — it would read as "the submitter
+    touched nothing" and bounce a round that did the work.
+
+    Keyed on the NEW path, falling back to the old one, exactly as `_dedupe` keys
+    `packet.files` — so a path in this map and a path in that tuple are the same string.
+    A rename therefore reads as a change to the new path, which is what it is.
+    """
+    out: dict[str, str] = {}
+    for new, old, text in _sections(diff):
+        path = new or old
+        if not path:
+            continue
+        out[path] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return tuple(sorted(out.items()))
+
+
+def changed_since(before: Mapping[str, str],
+                  now: Mapping[str, str]) -> frozenset[str]:
+    """Which paths moved between two rounds' `file_digests` maps.
+
+    A path whose digest differs, a path only `now` has, AND a path only `before` had —
+    reverting a file is a change to it, and a submitter answering "delete this" would
+    otherwise look like it did nothing.
+    """
+    return frozenset(
+        {p for p, sha in now.items() if before.get(p) != sha}
+        | {p for p in before if p not in now})
+
+
 def nothing_to_judge(packet: EvidencePacket) -> str:
     """Is there anything here for a REVIEWER? `""` yes, else `"void"` or `"escalate"`.
 
@@ -480,6 +525,9 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
             )
 
     effects = tuple(dict(e) for e in side_effects)
+    # BEFORE `_truncate`, and that ordering is the whole correctness of the map — see
+    # `file_digests`.
+    shas = file_digests(diff)
     kept, truncated, dropped = _truncate(diff, diff_chars, files)
     return EvidencePacket(
         unit="work_order",
@@ -509,6 +557,7 @@ def collect_work_order(project_path: Path, wo: dict[str, Any], *, declared: str,
              "status": str(a.get("status") or "pending")}
             for a in assumptions),
         history=_history(history),
+        file_shas=shas,
     )
 
 

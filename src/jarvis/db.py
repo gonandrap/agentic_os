@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -67,3 +67,36 @@ def from_json(value: str | None, default: Any = None) -> Any:
 
 def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
+
+
+# Substring matching makes a one- or two-letter word match almost every row ("in" is
+# inside "login"), so a query's short words are dropped — unless that is all it has, and
+# then they are all it can match on.
+MIN_SEARCH_WORD = 3
+
+
+def search_words(query: str) -> list[str]:
+    """The query as words. Empty means "no query" — a search verb, unlike a listing,
+    returns nothing for it rather than everything."""
+    words = [w.lower() for w in (query or "").split() if w.strip()]
+    return [w for w in words if len(w) >= MIN_SEARCH_WORD] or words
+
+
+def score_sql(words: Sequence[str], weights: Mapping[str, int]) -> tuple[str, list[str]]:
+    """A relevance expression: per query word, the heaviest column containing it, summed.
+
+    Word-OR, not phrase: an agent and a user both type phrases, and a row matching three
+    of four words is the hit they wanted (kn-c6e8fbf0). Weights are what keep a hit in a
+    title above one buried in a description — the CASE tests columns heaviest-first, so
+    each word scores once.
+    """
+    if not words:
+        return "0", []
+    cols = sorted(weights.items(), key=lambda kv: -kv[1])
+    params: list[str] = []
+    parts: list[str] = []
+    for word in words:
+        cases = " ".join(f"WHEN {col} LIKE ? THEN {wt}" for col, wt in cols)
+        parts.append(f"(CASE {cases} ELSE 0 END)")
+        params += [f"%{word}%"] * len(cols)
+    return "(" + " + ".join(parts) + ")", params

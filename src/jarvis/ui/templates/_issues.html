@@ -15,7 +15,7 @@
    filed in the last hour. #}
 
 {% macro unit(index, heading='h2') %}
-{% if index and (index.raised or index.references) %}
+{% if index and (index.raised or index.references or index.withheld) %}
 <{{ heading }} id="issues">Tracker issues</{{ heading }}>
 <div class="panel">
   {% if index.raised %}
@@ -24,6 +24,21 @@
       <strong>Raised by this order</strong>
       <span class="sub">{{ index.raised|length }} follow-up{{ '' if index.raised|length == 1 else 's' }}</span>
       {% for i in index.raised %}{{ line(i) }}{% endfor %}
+    </div>
+  </div>
+  {% endif %}
+  {% if index.withheld %}
+  <div class="row">
+    <div class="grow">
+      <strong>Kept on the internal record</strong>
+      <span class="sub">{{ index.withheld|length }} follow-up{{ '' if index.withheld|length == 1 else 's' }}
+        — no tracker issue was opened, because this repository is not one the OS could
+        establish is private</span>
+      {% for i in index.withheld %}
+      <div class="sub">{{ i.title }}{% if i.file %} <span class="mono">{{ i.file }}{%
+        if i.symbol %}:{{ i.symbol }}{% endif %}</span>{% endif %}
+        {% if i.round %}<span class="sub">· round {{ i.round }}</span>{% endif %}</div>
+      {% endfor %}
     </div>
   </div>
   {% endif %}
@@ -61,8 +76,11 @@
     <span class="st {{ 'tone-warn' if row.refs > 1 else 'tone-muted' }}">
       <span class="i">↗</span>{{ row.refs }}</span>
     <div class="grow">
-      <a href="{{ row.issue_url }}" class="mono" rel="noreferrer noopener"
-         target="_blank">#{{ row.number }}</a> {{ row.title or row.issue_url }}
+      {% if row.internal %}<span class="mono">internal</span>{% else %}<a
+         href="{{ row.issue_url }}" class="mono" rel="noreferrer noopener"
+         target="_blank">#{{ row.number }}</a>{% endif %} {{ row.title or row.issue_url }}
+      {% if row.internal %}<span class="sub">· kept on the internal record, not on the
+        tracker</span>{% endif %}
       <div class="sub">
         {% for u in row.units %}<a href="/wo/{{ project }}/{{ u.unit_id }}"
           class="mono">{{ u.unit_id }}</a> ({{ u.kind }}){{ ', ' if not loop.last }}{% endfor %}

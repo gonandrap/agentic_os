@@ -42,6 +42,17 @@ CLAUDE_BIN_ENV = "JARVIS_CLAUDE_BIN"
 PROMPT_CACHE_5M_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 
 
+#: WHICH TRANSPORT this session's turns run on, declared rather than assumed. Every rule
+#: that depends on a turn being one-shot (the PreToolUse backgrounding refusal, the crew
+#: rules) reads this key instead of hardcoding today's answer — hardcode it and the day
+#: `spawn_background` acquires a production caller, every refusal becomes a lie the OS
+#: tells its own workers. §3 of
+#: docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
+TURN_TRANSPORT_ENV = "JARVIS_TURN_TRANSPORT"
+TRANSPORT_HEADLESS = "headless"      # spawn_turn: `claude -p`, one-shot
+TRANSPORT_BACKGROUND = "background"  # spawn_background: `claude --bg`, supervisor-owned
+
+
 def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
     """The 5-minute cache flag, overlaid by whatever a caller asked for EXPLICITLY.
 
@@ -329,7 +340,10 @@ def spawn_background(
     # It also lets a prompt begin with a dash. Never append anything after this.
     args.append("--")
     args.append(prompt)
-    out = _run(args, cwd=cwd, timeout=120)
+    # This transport is supervisor-owned, and says so: §3 of
+    # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
+    out = _run(args, cwd=cwd, timeout=120,
+               env_extra={TURN_TRANSPORT_ENV: TRANSPORT_BACKGROUND})
     m = _JOB_ID_RE.search(out or "")
     return m.group(1) if m else None
 

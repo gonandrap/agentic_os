@@ -164,6 +164,18 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Measurements and the reversal criteria: kn-f94abf34, and docs/superpowers/
         # specs/2026-08-22-the-five-minute-write-everywhere.md.
         **claude_cli.PROMPT_CACHE_5M_ENV,
+        # WHAT A TURN IS, for every hook that would otherwise assume it. Taken from
+        # `claude_cli` for the reason the cache flag above is: the launcher and the
+        # settings file must not be able to disagree. §3 of docs/superpowers/specs/
+        # 2026-09-23-the-crew-a-worker-must-use.md.
+        claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        # Whether the lead must delegate its file edits to the crew (§7 of that spec).
+        # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
+        # write and must not parse the catalog to decide it has nothing to do.
+        "JARVIS_REQUIRE_CREW": "1" if project.worker.require_crew else "0",
+        # The crew is the ordinary worker's; a planner has its own team prose. Carried as
+        # env rather than read at hook time for the same reason as the key above.
+        "JARVIS_WO_KIND": str(wo.get("kind") or "worker"),
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
@@ -318,7 +330,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         ] if design_doc else []),
         "",
         *worker_brief.core_contract(wo["id"], wo["title"], project.name,
-                                    bool(knowledge), live_gates),
+                                    bool(knowledge), live_gates,
+                                    kind=str(wo.get("kind") or "worker")),
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),

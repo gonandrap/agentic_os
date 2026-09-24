@@ -13,7 +13,8 @@ round machine to act on. It is called; it is never messaged, and it messages nob
         "reason":  str,     # <= 1500 chars, second person, addressed to the submitter,
                             # empty ONLY when the outcome is "passed"
         "seats":   [{"seat", "status", "verdict", "reply", "model", "latency_ms"}, ...],
-        "follow_ups": [{"seat", "title", "detail", "round"}, ...],
+        "follow_ups": [{"seat", "title", "detail", "round",
+                        "file", "symbol", "failure"}, ...],
     }
 
 `follow_ups` is what the seats raised and judged the work SHIPPABLE WITHOUT. This module
@@ -89,6 +90,7 @@ mandate asking a model not to use one.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -761,8 +763,31 @@ def _parsed_findings(data: Mapping[str, Any]) -> list[dict[str, str]]:
         if not title and not detail:
             continue
         severity = BLOCKER if item.get("severity") == BLOCKER else FOLLOW_UP
-        out.append({"severity": severity, "title": title, "detail": detail})
+        out.append({"severity": severity, "title": title, "detail": detail,
+                    **_anchor(item)})
     return out
+
+
+#: What a follow-up must name before it can become a tracker issue, carried on the
+#: finding rather than read out of its prose. `file` and `symbol` are also the dedupe
+#: key, which raw title text could never be: a seat rewords the same nit every round.
+#: Spec §4.4: docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
+ANCHOR_KEYS = ("file", "symbol", "failure")
+
+#: How long each of them may be. A finding is a ticket, not a report.
+ANCHOR_LIMIT = 500
+
+
+def _anchor(item: Mapping[str, Any]) -> dict[str, str]:
+    """The three fields a follow-up names the wrong behaviour with.
+
+    ALWAYS ALL THREE, empty where the seat gave nothing — `NO_FOLLOW_UPS`'s rule, and
+    here it is also what makes `ops.follow_up_admissible` a test of content rather than
+    of shape: a seat on the old schema produces three empty strings and is inadmissible,
+    which is the right answer for a finding that names no code.
+    """
+    return {k: " ".join(str(item.get(k) or "").split())[:ANCHOR_LIMIT]
+            for k in ANCHOR_KEYS}
 
 
 def _synthesised(reason: str, asks: Sequence[str]) -> dict[str, str]:
@@ -775,7 +800,8 @@ def _synthesised(reason: str, asks: Sequence[str]) -> dict[str, str]:
     line = " ".join(reason.split()) or UNSTATED_REJECTION
     if len(line) > TITLE_LIMIT:
         line = line[:TITLE_LIMIT - 1].rsplit(" ", 1)[0] + "…"
-    return {"severity": BLOCKER, "title": line, "detail": _message(reason, asks)}
+    return {"severity": BLOCKER, "title": line, "detail": _message(reason, asks),
+            **_anchor({})}
 
 
 def blockers(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
@@ -787,6 +813,83 @@ def follow_ups(found: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     """The findings that may not. PARTITIONS with `blockers` — total and disjoint over
     any input, normalised or not, so a finding can never be both and never neither."""
     return [dict(f) for f in found if f.get("severity") != BLOCKER]
+
+
+#: A repo-relative path inside a blocker's prose — `src/jarvis/budget.py`,
+#: `tests/test_pr_recorded.py:41`, `docs/x.md`. At least one directory separator and an
+#: extension, because a bare `budget.py` is as often a sentence's subject as a citation
+#: and a single false path is what would make `unanswered_submission` bounce real work.
+#: The optional `:41` is matched and discarded: a line number is not part of the path.
+_CITED_PATH = re.compile(r"(?<![\w./-])((?:[\w.-]+/)+[\w.-]+\.[A-Za-z][\w]*)(?::\d+)?")
+
+
+def cited_paths(found: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Every repo path a round's blockers named, in the order they were named.
+
+    THE PREVIOUS ROUND'S OWN CITATIONS ARE THE CLASSIFIER, which is what lets
+    `unanswered_submission` stay mechanical: it never has to decide what production code
+    is, or whether a rejection was "about the tests". A round that rejected for missing
+    coverage cites test files and a round that rejected a behaviour cites the file the
+    behaviour is in, so "did the submitter touch anything this round asked about" answers
+    both questions with one comparison (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §4).
+
+    Title AND detail: a seat states the file in whichever it please, and reading only one
+    would silently halve the citations.
+    """
+    seen: dict[str, None] = {}
+    for f in found:
+        for text in (str(f.get("title") or ""), str(f.get("detail") or "")):
+            for m in _CITED_PATH.finditer(text):
+                seen.setdefault(m.group(1), None)
+    return tuple(seen)
+
+
+def unanswered_submission(previous: Mapping[str, Any] | None,
+                          blockers_raised: Sequence[Mapping[str, Any]],
+                          before: Mapping[str, str],
+                          now: Mapping[str, str]) -> tuple[str, ...] | None:
+    """Did this submission touch NOTHING the previous round asked about? The paths it
+    asked about if so, else None.
+
+    Not a second reviewer and deliberately incapable of becoming one: it reads no code,
+    judges no quality, and asks a single question a string comparison can answer. A
+    submission that touches ONE of the cited paths goes to the panel however badly it
+    answered — partial progress is the panel's to judge, and only a round that addressed
+    NONE of the list short-circuits (spec §5).
+
+    **EVERY UNCERTAINTY RETURNS None, which means "let the panel judge".** No previous
+    round, a previous round that was not a rejection, a round that recorded no file map
+    (every row written before the column existed), a submission whose own map is empty,
+    and blockers that cited no path at all — in each case this cannot tell, and the cost
+    of guessing wrong is bouncing work that was really done. The cost of failing open is
+    one panel round, which is what happens today.
+    """
+    if previous is None or str(previous.get("outcome") or "") != "rejected":
+        return None
+    cited = cited_paths(blockers_raised)
+    if not cited or not before or not now:
+        return None
+    from .evidence import changed_since
+
+    moved = changed_since(before, now)
+    if any(_touched(path, moved) for path in cited):
+        return None
+    return cited
+
+
+def _touched(cited: str, moved: frozenset[str]) -> bool:
+    """Is `cited` one of the paths that moved? Exact, or one a suffix of the other.
+
+    A seat writes the path it read in the diff and the diff writes the repo-relative one,
+    so they usually match exactly — but a seat quoting `jarvis/budget.py` for
+    `src/jarvis/budget.py` is naming the same file, and the suffix has to start at a
+    directory boundary or `store.py` would match `project_store.py`.
+    """
+    for path in moved:
+        if path == cited or path.endswith("/" + cited) or cited.endswith("/" + path):
+            return True
+    return False
 
 
 def arbitrate(opinions: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
@@ -979,7 +1082,8 @@ def _follow_ups(opinions: Sequence[seats.Opinion], round_no: int) -> list[dict[s
             continue
         row = {"seat": op.seat, "status": op.status, "reply": op.raw}
         out += [{"seat": op.seat, "title": f["title"], "detail": f["detail"],
-                 "round": round_no}
+                 "round": round_no,
+                 **{k: f.get(k, "") for k in ANCHOR_KEYS}}
                 for f in follow_ups(findings(row))]
     return out
 

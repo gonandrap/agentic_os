@@ -262,12 +262,15 @@ def test_a_planner_is_handed_exactly_these_seats_and_nothing_else(project):
     assert delivered == {f"{s}.md" for s in SEATS}
 
 
-def test_an_ordinary_worker_is_handed_no_seats(project):
-    """Design decision 4: ordinary workers get no profile. A worker is an individual with
-    exactly one job, and a role would be dressing up a session that has one."""
+def test_an_ordinary_worker_is_handed_no_planning_seats(project):
+    """Design decision 4 still holds for the PLANNING seats: a worker is not a planning
+    team. It does get the crew it must delegate to (spec
+    2026-09-23-the-crew-a-worker-must-use.md SS5), and the two never share a root."""
     roots = install_agent_assets(project, "worker")
 
-    assert not any((r / ".claude" / "agents").exists() for r in roots)
+    names = {p.name for r in roots for p in (r / ".claude" / "agents").glob("*.md")}
+    assert "jarvis-architect.md" not in names and "jarvis-test-lead.md" not in names
+    assert names == {"jarvis-spec-writer.md", "jarvis-implementer.md"}
     # ...and it still gets the skills, which are for everybody.
     assert any((r / ".claude" / "skills").is_dir() for r in roots)
 

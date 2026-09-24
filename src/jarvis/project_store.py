@@ -8,7 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -753,6 +753,9 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- reasoning is — this table already ships, so a live database gets it only there.
     carried_head_sha TEXT NOT NULL DEFAULT '',
     carried_reason TEXT NOT NULL DEFAULT '',
+    -- Per-file digests of the diff this round judged, as JSON. Also in ADDED_COLUMNS,
+    -- where the reasoning is.
+    file_shas TEXT NOT NULL DEFAULT '',
     CHECK ((wo_id IS NULL) <> (fo_id IS NULL))
 );
 -- PARTIAL unique indexes, NOT `UNIQUE (wo_id, fo_id, round)`. SQLite treats NULLs as
@@ -917,6 +920,27 @@ CREATE TABLE IF NOT EXISTS issue_links (
     announced_at REAL,
     PRIMARY KEY (issue_url, unit_id)
 );
+-- A FOLLOW-UP THE TRACKER MAY NOT CARRY. When the OS cannot establish the project's
+-- repository is private, a seat's words are not published (spec §9) — and an issue with
+-- the text withheld carries nothing a reader can act on, so none is opened at all. The
+-- finding lives here instead, in full, and the surfaces mark it internal-only.
+-- UNIQUE on (digest, unit_id): the same dedupe key the tracker half uses, so a repeat
+-- settle files nothing twice.
+CREATE TABLE IF NOT EXISTS internal_follow_ups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    round INTEGER NOT NULL DEFAULT 0,
+    seat TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    file TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL DEFAULT '',
+    failure TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    UNIQUE (digest, unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_internal_follow_ups_unit ON internal_follow_ups(unit_id);
 CREATE INDEX IF NOT EXISTS idx_issue_links_unit ON issue_links(unit_id);
 CREATE INDEX IF NOT EXISTS idx_turns_wo ON wo_turns(wo_id, seq);
 CREATE INDEX IF NOT EXISTS idx_turns_state ON wo_turns(state);
@@ -1159,6 +1183,18 @@ ADDED_COLUMNS = {
         # so there is one spelling of "not carried" rather than two.
         "carried_head_sha": "TEXT NOT NULL DEFAULT ''",
         "carried_reason": "TEXT NOT NULL DEFAULT ''",
+        # WHAT EACH FILE LOOKED LIKE IN THE DIFF THIS ROUND JUDGED — `evidence.
+        # file_digests` as a JSON object, written beside `head_sha` and for the same
+        # reason: it is a fact about the packet, not about the verdict. The next
+        # submission diffs its own map against this one to learn which files the
+        # submitter actually moved, which no other column can say — every one of them is
+        # cumulative against the base (spec
+        # docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §3).
+        #
+        # DEFAULT '' MEANS "NOT RECORDED" and it FAILS OPEN: `unanswered_submission`
+        # reads an empty map as "I cannot tell what moved" and lets the panel judge, so
+        # every round written before this column existed costs a submitter nothing.
+        "file_shas": "TEXT NOT NULL DEFAULT ''",
     },
     "approvals": {
         # Which SEAT attempted the command, when a subagent did. NULL means the session's
@@ -1561,6 +1597,34 @@ class ProjectStore:
                     "UPDATE tracked_issues SET state=?, checked_at=? WHERE issue_url=?",
                     (state, db.now(), issue_url))
 
+    def record_internal_follow_up(self, digest: str, unit_id: str, *, round: int = 0,
+                                  seat: str = "", title: str = "", detail: str = "",
+                                  file: str = "", symbol: str = "",
+                                  failure: str = "") -> bool:
+        """Keep a follow-up whose text may not be published. True if this one is new.
+
+        The tracker half of the same decision is `ops.file_validation_follow_ups`; this
+        is where a finding goes when the repository is not established private (spec §9)
+        — the whole finding, because the internal record is where it is read from.
+        """
+        with db.write_transaction(self.conn):
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO internal_follow_ups "
+                "(digest, unit_id, round, seat, title, detail, file, symbol, failure, "
+                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (digest, unit_id, round, seat, title, detail, file, symbol, failure,
+                 db.now()))
+            return cur.rowcount > 0
+
+    def internal_follow_ups(self, unit_id: str | None = None) -> list[dict[str, Any]]:
+        """Withheld follow-ups — one unit's, or the whole project's, oldest first."""
+        sql = "SELECT * FROM internal_follow_ups"
+        args: tuple[Any, ...] = ()
+        if unit_id:
+            sql += " WHERE unit_id=?"
+            args = (unit_id,)
+        return db.rows_to_dicts(self.conn.execute(sql + " ORDER BY id", args).fetchall())
+
     def record_issue_label(self, issue_url: str, count: int) -> None:
         """The `referenced: N` the OS last managed to put on the issue."""
         with db.write_transaction(self.conn):
@@ -1657,6 +1721,67 @@ class ProjectStore:
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_work_orders(self, words: Sequence[str],
+                           limit: int = 50) -> list[dict[str, Any]]:
+        """Work orders matching `words`, most relevant first — SETTLED ONES INCLUDED.
+
+        The listing verbs default to open and unhidden because they answer "what wants
+        me now"; search answers "where is that thing", and the completed order the user
+        is trying to find again is the case it exists for (wo-edf5c425).
+        """
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "description": 1, "result_summary": 1,
+            "attention_reason": 1, "branch": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT *, {expr} AS _score FROM work_orders "
+            "WHERE _score > 0 ORDER BY _score DESC, created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_feature_orders(self, words: Sequence[str],
+                              limit: int = 50) -> list[dict[str, Any]]:
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "description": 1, "attention_reason": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT *, {expr} AS _score FROM feature_orders "
+            "WHERE _score > 0 ORDER BY _score DESC, created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_alarms(self, words: Sequence[str],
+                      limit: int = 50) -> list[dict[str, Any]]:
+        """Alarms carry their work order's title, as `alarms_across` does: an alarm read
+        without the order it fired on says almost nothing."""
+        expr, params = db.score_sql(words, {
+            "a.id": 3, "a.kind": 2, "a.reason": 1, "a.note": 1, "a.verdict_reason": 1,
+            "w.title": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM wo_alarms a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_gates(self, words: Sequence[str],
+                     limit: int = 50) -> list[dict[str, Any]]:
+        expr, params = db.score_sql(words, {
+            "a.command": 3, "a.kind": 2, "a.wo_id": 2, "a.justification": 1,
+            "a.evidence": 1, "a.decision_reason": 1, "w.title": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM approvals a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
@@ -3623,6 +3748,40 @@ class ProjectStore:
         """
         self.conn.execute("UPDATE validation_rounds SET head_sha=? WHERE id=?",
                           (head_sha, round_id))
+
+    def set_validation_file_shas(self, round_id: int,
+                                 file_shas: Iterable[tuple[str, str]]) -> None:
+        """Record what each file looked like in the diff this round judged.
+
+        Written where `set_validation_head` is written and whatever the outcome, for that
+        method's reason: the next round has to be able to ask what moved since this one,
+        and a round that recorded nothing can only answer "I cannot tell".
+        """
+        self.conn.execute("UPDATE validation_rounds SET file_shas=? WHERE id=?",
+                          (db.to_json(dict(file_shas)), round_id))
+
+    @staticmethod
+    def validation_file_shas(round_row: Mapping[str, Any] | None) -> dict[str, str]:
+        """One round's per-file digests, `{}` when it recorded none.
+
+        A staticmethod over the ROW for `validated_head`'s reason (kn-08f2ff9b): the
+        caller already holds the row, and a re-fetch could straddle a new round.
+        """
+        raw = db.from_json(str((round_row or {}).get("file_shas") or ""), {})
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    def last_judged_round(self, *, wo_id: str | None = None,
+                          fo_id: str | None = None) -> dict[str, Any] | None:
+        """The most recent round a PANEL actually settled, or None.
+
+        `latest_validation_round` is the wrong question for a submitter check: the latest
+        row can be a `failed` transport round or a `void`, neither of which asked the
+        submitter for anything. Only `COUNTED_VALIDATION_OUTCOMES` told it something.
+        """
+        for row in reversed(self.validation_rounds(wo_id=wo_id, fo_id=fo_id)):
+            if str(row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES:
+                return row
+        return None
 
     @staticmethod
     def validated_head(round_row: dict[str, Any] | None) -> str | None:

@@ -364,6 +364,9 @@ class WorkerDefaults:
     # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
+    # Whether the lead must delegate file edits to its crew. §7 of
+    # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
+    require_crew: bool = True
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -392,13 +395,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
-# How many follow-up findings one round may file against the project backlog.
+# How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
-# A BOUND, NOT A JUDGEMENT. Title matching is the only dedupe available — a seat writes a
-# slightly different sentence for the same nit each round — so near-duplicate rows WILL
-# get through. 5 keeps that failure a handful of items a user drops in a minute rather
-# than a backlog nobody can read; findings past it are dropped and a later round may
-# raise them again. Spec §4.4:
+# PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
+# ROUND, a unit judged four times filed four times the cap — twenty issues on
+# wo-0a9ba9b3. What the order has already raised is subtracted before this bounds
+# anything.
+#
+# The near-duplicates this comment used to accept are gone with it: the dedupe keys on
+# the (file, symbol) a finding names plus its claim (`ops.follow_up_claim`), not on the
+# sentence a seat happened to write that round. Spec §4.4:
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
@@ -1789,6 +1795,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
+        require_crew = w.get("require_crew", True)
+        if not isinstance(require_crew, bool):
+            raise _err(f"project {name}: worker.require_crew must be true or false, "
+                       f"got {require_crew!r}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -1804,6 +1814,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             feature_budget_usd=_parse_budget(
                 w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
                 os_cfg.default_feature_budget_usd),
+            require_crew=require_crew,
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))
