@@ -710,7 +710,9 @@ CREATE TABLE IF NOT EXISTS assumptions (
     status TEXT NOT NULL DEFAULT 'pending' -- pending | accepted | rejected
     -- WHO settled it, why, under which model and configuration, and the Neo question
     -- that ruled. All in ADDED_COLUMNS, where the reasoning is — this table already
-    -- ships, so a live database gets them only there.
+    -- ships, so a live database gets them only there. So are the PROVISIONAL verdict
+    -- and the OBJECTION columns (§4.2 of the spec named in ADDED_COLUMNS), for the
+    -- same reason.
 );
 -- One judging round over one working unit — a work order or a feature order — by the
 -- validation panel. ONE table for both, not two: the two loops record identical facts,
@@ -887,6 +889,8 @@ CREATE TABLE IF NOT EXISTS envelopes (
     delivered_wo_id TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     note TEXT NOT NULL DEFAULT '',
+    -- WHICH `wo_messages` ROW THIS ENVELOPE BECAME. In ADDED_COLUMNS, where the
+    -- reasoning is — this table already ships.
     CHECK ((subject_wo_id IS NULL) <> (subject_fo_id IS NULL))
 );
 -- A TRACKER ISSUE THIS PROJECT IS LINKED TO, and what the OS last saw of it. Cached
@@ -1291,6 +1295,60 @@ ADDED_COLUMNS = {
         # `invariants.check_neo_escalations_are_live` to tell a live escalation from a
         # moot one.
         "neo_question_id": "INTEGER",
+        # THE VERDICT FORMED WHILE THE WORKER WAS STILL TYPING, and it settles NOTHING.
+        # `status` stays `pending` until the confirmation pass at delivery rules again —
+        # docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+        # runs.md §4.1, which is explicit that a `provisional` STATUS value would read as
+        # "not pending" at the eight-plus call sites that gate the user's review on it,
+        # and so would silently open that gate. Provisional state lives in columns
+        # instead: a surface that has not been taught about them is merely unaware,
+        # never wrong.
+        #
+        # EMPTY IS "NEVER JUDGED EARLY" — every row written before this existed, and
+        # every row in a project with early review off, which is most of the fleet. Those
+        # rows must render exactly as they do today.
+        "provisional_verdict": "TEXT NOT NULL DEFAULT ''",     # '' | accept | object
+        "provisional_reason": "TEXT NOT NULL DEFAULT ''",      # Neo's one line
+        # The model and the configuration behind the early verdict, for the reason
+        # `decided_model` / `decided_config_version` carry above: a machine judgement
+        # read months later is only judgeable if it names what produced it. The model is
+        # whatever the TRANSPORT reported, never what was asked for — those differ when a
+        # model is aliased or falls back, and the record wants the one that answered.
+        "provisional_model": "TEXT NOT NULL DEFAULT ''",
+        "provisional_stakes": "TEXT NOT NULL DEFAULT ''",      # or 'unclassified'
+        "provisional_ts": "REAL",
+        "provisional_config_version": "TEXT",
+        # THE SECOND Neo question, asked at delivery (§7). Separate from
+        # `neo_question_id` rather than overwriting it: that one points at the early
+        # question, "one question per assumption per pass" is the invariant being
+        # preserved, and reusing the column would erase what the OS thought while the
+        # work was still running — which is half of what the user reads afterwards.
+        "confirm_question_id": "INTEGER",
+        # THE OBJECTION SENT TO A RUNNING WORKER, identified by the ENVELOPE it IS.
+        # Not a `wo_messages` id: `bus.post` returns an envelope id, and the message row
+        # does not exist until `Daemon.deliver_envelopes` resolves that envelope on a
+        # later tick — so a message id could not be written at the moment the objection
+        # is recorded, and §6.1 requires the record to be complete BEFORE anything
+        # reaches a wire. `envelopes.delivered_msg_id` below closes the link forward.
+        "objection_envelope_id": "INTEGER",
+        "objection_transport": "TEXT NOT NULL DEFAULT ''",     # '' | queue | peer
+        # THREE TIMESTAMPS BECAUSE THEY ARE THREE FACTS. One boolean cannot tell "sent,
+        # still in flight" from "sent, never arrived" from "withdrawn, the order stopped
+        # first"; the user asked to see how and when an objection was delivered and
+        # whether it was, §8 renders each of those differently, and §9 raises attention
+        # on exactly one of them.
+        "objection_sent_ts": "REAL",
+        "objection_delivered_ts": "REAL",
+        "objection_withdrawn_ts": "REAL",
+    },
+    # WHICH MESSAGE AN ENVELOPE BECAME. An envelope records that it was delivered and to
+    # which work order, but not which `wo_messages` row carries its words — so nothing
+    # can follow the link forward to ask what happened to them. §8 (what the worker did
+    # about an objection) and §9 (is this objection undeliverable) both have to, and so
+    # will the next reader of the bus. NULL on every row written before this and on every
+    # envelope still queued, which is the honest answer in both cases.
+    "envelopes": {
+        "delivered_msg_id": "INTEGER",
     },
 }
 
@@ -1301,6 +1359,17 @@ ASSUMPTION_DECIDER_USER = "user"
 #: `assumptions.decided_by` when the OS did — `autoreview`. The one value that must never
 #: be mistaken for the user's, which is the whole reason the column exists.
 ASSUMPTION_DECIDER_OS = "neo"
+
+#: What an early verdict may say. NOT a `status` value and never written to `status` —
+#: see the `provisional_verdict` note in ADDED_COLUMNS. `object` is guidance to a running
+#: worker, not a machine rejection: the settlement verdict space is still ACCEPT or
+#: ESCALATE (§2 of both specs).
+PROVISIONAL_VERDICTS = ("accept", "object")
+
+#: How an objection reached the worker. `queue` always exists and is the fallback;
+#: `peer` is a mid-turn delivery. Recorded because "it was sent" and "it was sent in a
+#: way the worker could act on before its next turn boundary" are different claims.
+OBJECTION_TRANSPORTS = ("queue", "peer")
 
 #: `wo_messages.authored_by` when the OS could prove the human typed it. The ONLY value
 #: this column ever takes: everything else is unattributed (`''`), because a stamp that
@@ -3279,8 +3348,8 @@ class ProjectStore:
         with db.write_transaction(self.conn):
             msg_id = self.queue_message(wo_id, content, source=source)
             self.conn.execute(
-                "UPDATE envelopes SET state='delivered', delivered_wo_id=?, note=? "
-                "WHERE id=?", (wo_id, note, env_id))
+                "UPDATE envelopes SET state='delivered', delivered_wo_id=?, note=?, "
+                "delivered_msg_id=? WHERE id=?", (wo_id, note, msg_id, env_id))
         return msg_id
 
     def envelopes(self, subject_wo_id: str | None = None,
@@ -3588,6 +3657,11 @@ class ProjectStore:
         `n` is a position, never the row id, and is derived here rather than stored so
         that rows written before it existed still have one. See §4 of
         docs/superpowers/specs/2026-08-23-the-work-order-record.md.
+
+        `SELECT *`, and that is load-bearing rather than lazy: both surfaces in §8 of the
+        early-review spec read their rows from here, so every column added to the table
+        reaches them without a second edit — and a column left out of a projection here
+        would render as "never happened" on the page.
         """
         rows = self.conn.execute(
             "SELECT * FROM assumptions WHERE wo_id=? ORDER BY ts, id", (wo_id,)
@@ -3624,10 +3698,96 @@ class ProjectStore:
         The mirror of `approval_for_question` and `feature_order_for_question`, and it
         exists for their reason: Neo's database is OS-wide and knows nothing about a
         project's tables, so the back-link is resolved from this side.
+
+        BOTH QUESTION COLUMNS, not just the early one. An assumption can be asked about
+        twice — once while the worker ran, once at delivery to confirm (§7) — and the
+        drain that resolves a verdict back to its subject asks this one question. Reading
+        `neo_question_id` alone would resolve the confirmation question to nothing, and
+        the verdict would be dropped on the floor with the assumption left pending.
         """
-        row = self.conn.execute("SELECT * FROM assumptions WHERE neo_question_id=?",
-                                (question_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM assumptions WHERE neo_question_id=? OR confirm_question_id=?",
+            (question_id, question_id)).fetchone()
         return dict(row) if row else None
+
+    # -- the early (provisional) verdict and the objection -----------------------
+    #
+    # docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    # §4.3. These verbs exist beside `review_assumption` rather than inside it because
+    # they record something of a DIFFERENT KIND: `review_assumption` settles, and every
+    # one of these leaves `status='pending'` untouched on purpose (§4.1).
+
+    def record_provisional(self, assumption_id: int, *, verdict: str, reason: str = "",
+                           model: str = "", stakes: str = "",
+                           config_version: str | None = None) -> None:
+        """Stamp the verdict formed while the worker was still typing. Settles nothing.
+
+        `status` is not an argument here and must not become one: an early verdict is an
+        opinion about an intention, and the only thing allowed to settle an assumption is
+        the confirmation pass reading the diff (§7).
+        """
+        assert verdict in PROVISIONAL_VERDICTS, verdict
+        self.conn.execute(
+            """UPDATE assumptions SET provisional_verdict=?, provisional_reason=?,
+                   provisional_model=?, provisional_stakes=?, provisional_ts=?,
+                   provisional_config_version=? WHERE id=?""",
+            (verdict, reason, model, stakes or "unclassified", db.now(),
+             config_version, assumption_id))
+
+    def link_assumption_confirmation(self, assumption_id: int,
+                                     question_id: int) -> None:
+        """Link the SECOND question. `link_assumption_question` keeps the first."""
+        self.conn.execute("UPDATE assumptions SET confirm_question_id=? WHERE id=?",
+                          (question_id, assumption_id))
+
+    def record_objection(self, assumption_id: int, *, envelope_id: int,
+                         transport: str, sent_ts: float | None = None) -> None:
+        """Record that an objection was handed to a transport. Called BEFORE the send.
+
+        `sent_ts` is a parameter rather than `db.now()` so the caller can record the
+        moment it actually handed the message over; §6.1 is why it is recorded at all,
+        and it is the order of operations that matters — an objection that exists only on
+        a wire is one the record cannot explain.
+        """
+        assert transport in OBJECTION_TRANSPORTS, transport
+        self.conn.execute(
+            """UPDATE assumptions SET objection_envelope_id=?, objection_transport=?,
+                   objection_sent_ts=? WHERE id=?""",
+            (envelope_id, transport, db.now() if sent_ts is None else sent_ts,
+             assumption_id))
+
+    def mark_objection_delivered(self, assumption_id: int,
+                                 ts: float | None = None) -> None:
+        """The worker ACTUALLY received it — not that the OS sent it."""
+        self.conn.execute(
+            "UPDATE assumptions SET objection_delivered_ts=? WHERE id=?",
+            (db.now() if ts is None else ts, assumption_id))
+
+    def withdraw_objection(self, assumption_id: int, ts: float | None = None) -> None:
+        """The order stopped before the objection could be delivered (§6.6).
+
+        Never erases the objection: withdrawal stops a delivery, it does not unsay what
+        Neo said, and the user still reads it in full beside the assumption.
+        """
+        self.conn.execute(
+            "UPDATE assumptions SET objection_withdrawn_ts=? WHERE id=?",
+            (db.now() if ts is None else ts, assumption_id))
+
+    def outstanding_objections(self, wo_id: str) -> list[dict[str, Any]]:
+        """Objections that are neither delivered nor withdrawn — ONE query, two readers.
+
+        §6.6 withdraws from this list and §7 refuses to run while it is non-empty. Two
+        spellings of "outstanding" is two chances for one pass to settle an assumption
+        while the other still has a message in flight to the worker about it, which is
+        the contradiction that ordering exists to remove.
+
+        Filtered off `all_assumptions` rather than queried, so every row carries its `n`
+        — the number the withdrawal event and every surface name the assumption by.
+        """
+        return [a for a in self.all_assumptions(wo_id)
+                if a.get("objection_envelope_id") is not None
+                and a.get("objection_delivered_ts") is None
+                and a.get("objection_withdrawn_ts") is None]
 
     # -- validation rounds (see the validation-panel design) ----------------------
     #
