@@ -244,8 +244,17 @@
 <div class="panel">
   {# `a.n` from the store, never `loop.index`: this list can be filtered. #}
   {% for a in assumptions %}
+  {% set ruling = assumption_ruling_line(a) %}
   <div class="row"><span class="mono sub" style="min-width: 2.5em;">#{{ a.n }}</span>
-    <div class="grow">{{ a.content }}</div>
+    <div class="grow">{{ a.content }}
+      {# WHAT THE OS DID with it, as TEXT — a tooltip is a thing nobody reads, and a
+         pending assumption Neo has already escalated read as one nobody had looked at
+         (GitHub issue #712). Same shape as the pending gate above. #}
+      {% if ruling %}<div class="sub">{{ ruling }}{% if a.os_ruling
+            and a.os_ruling.neo_question_id %}
+        · <a href="/neo/question/{{ a.os_ruling.neo_question_id }}">question →</a>
+        {%- endif %}</div>{% endif %}
+    </div>
     {% if a.status != 'pending' %}
     {# WHO decided it, never just THAT it was decided: the OS can settle one itself now,
        and a badge that says only "accepted" credits a machine verdict to the reader.
@@ -253,8 +262,9 @@
        `jarvis wo show` — spelling it inline here would be a second renderer of the one
        attribution that must never be dropped, and the page is the surface somebody
        actually reads. #}
-    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}"
-          title="{{ a.decided_reason }}">
+    {# The badge is WHO; the reason is rendered above as text rather than hidden in a
+       `title=` nobody hovers. #}
+    <span class="st tone-{{ 'ok' if a.status == 'accepted' else 'bad' }}">
       <span class="i">{{ '✓' if a.status == 'accepted' else '✗' }}</span>{{ a.status }}
       by {{ assumption_decider(a) }}</span>
     {% endif %}

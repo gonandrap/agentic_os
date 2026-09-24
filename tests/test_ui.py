@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 
 import pytest
@@ -552,8 +553,42 @@ def test_the_page_says_which_assumptions_the_os_decided_and_which_you_did(client
     # the user's row does not borrow it.
     assert page.count("the OS (neo, claude-opus-5)") == 1
     assert page.count("claude-opus-5") == 1
-    # ...and the reason the OS gave is on the row it decided, for the hover.
+    # ...and the reason the OS gave is on the row it decided, as TEXT: it used to be a
+    # `title=` tooltip, which is a place nobody looks (GitHub issue #712).
     assert "a naming convention, not a decision" in page
+    assert 'title="a naming convention, not a decision"' not in page
+
+
+def test_a_pending_assumption_says_what_the_os_did_with_it(client, project):
+    """THE DEFECT of issue #712: an assumption Neo had escalated and one the keyword net
+    held both rendered as text and an age, indistinguishable from one nobody reviewed.
+
+    The events are written by hand here rather than driven through the daemon — the
+    claim is about the PAGE, and `tests/test_autoreview.py` owns the claim about which
+    event the mechanism writes.
+    """
+    wo = ops.create_work_order("proj_a", "task with three judgement calls")
+    store = ProjectStore(project)
+    escalated = store.add_assumption(wo["id"], "changed the CLI's default output")
+    held = store.add_assumption(wo["id"], "reused the production api key")
+    store.add_assumption(wo["id"], "nobody has looked at this one")
+    store.add_event(wo["id"], "autoreview_escalated", {
+        "assumption_id": escalated, "n": 1, "neo_question_id": 47,
+        "reason": "this is a surface others call"})
+    store.add_event(wo["id"], "autoreview_held", {
+        "assumption_id": held, "n": 2, "code": "high_stakes",
+        "reason": "assumption #2 mentions 'production' — the OS does not decide those"})
+    store.set_status(wo["id"], "needs_review")
+
+    # Unescaped: the quoted marker is the readable half of a hold and Jinja spells it
+    # `&#39;`, which is the browser's business and not this claim's.
+    page = html.unescape(" ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split()))
+
+    assert "Neo escalated (question 47): this is a surface others call" in page
+    assert '/neo/question/47' in page
+    assert "Held by the OS — mentions 'production'" in page
+    # The third assumption grows nothing: silence and a hold are different facts.
+    assert page.count("Held by the OS") == 1 and page.count("Neo escalated") == 1
 
 
 def test_the_page_and_jarvis_wo_show_cannot_disagree_about_who_decided(client, project):

@@ -691,6 +691,10 @@ def create_app() -> FastAPI:
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,
+        # And the OS's RULING on one, same reason one authority along: the page and
+        # `jarvis wo show` must not be able to disagree about whether an assumption was
+        # escalated, held or never looked at (GitHub issue #712).
+        assumption_ruling_line=ops.assumption_ruling_line,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
@@ -950,7 +954,7 @@ def create_app() -> FastAPI:
             events = store.list_events(wo_id)
             messages = store.list_messages(wo_id)
             # Both lists: `assumptions` is the record, `unreviewed` is the ask — §4.
-            assumptions = store.all_assumptions(wo_id)
+            assumptions = ops.assumptions_with_rulings(store, wo_id)
             unreviewed = store.pending_assumptions(wo_id)
             # A worker held at a gate looks identical to an idle one from here, so
             # the reason it stopped belongs on the page it stopped on.

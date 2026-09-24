@@ -2224,8 +2224,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # What was said, in order, whoever spoke — the worker's questions to
                 # Neo included, which `messages` alone never held.
                 "conversation": build_conversation(events, messages),
-                # Every assumption, each with its `n` and `status` — §4.
-                "assumptions": store.all_assumptions(args.wo_id),
+                # Every assumption, each with its `n`, its `status` and what the OS did
+                # with it (`os_ruling`) — §4 and GitHub issue #712.
+                "assumptions": ops.assumptions_with_rulings(store, args.wo_id),
                 # What this work order was allowed (or refused) permission to ship.
                 # `status` alone cannot say what happened — spec §2, §4.
                 "gates": [
