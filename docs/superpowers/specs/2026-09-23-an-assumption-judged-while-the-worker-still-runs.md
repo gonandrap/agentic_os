@@ -286,8 +286,11 @@ Read through `autoreview.read_ruling` exactly as today, with both nets armed.
 
 * **Neo AGREES** → `record_provisional(verdict="accept", …)` plus an
   `autoreview_provisional` event. Nothing settles. §7 decides it later.
-* **Neo DISAGREES** → `record_provisional(verdict="object", …)`, then §6 is called to
-  file and send the objection.
+* **Neo DISAGREES** → `record_provisional(verdict="object", …)` and **stop there**. §5
+  forms the verdict and writes it down; it does not file or send anything. Turning a
+  recorded `object` verdict into a filed, sent objection is §6's, hook and all — see §6.1.
+  **The seam is the recorded verdict, not a function call**, so the two sections meet in
+  the database rather than in an import, and each can be tested without the other.
 * **Anything else** (escalate, unparseable, non-routine stakes, transport failure) →
   exactly today's behaviour: no provisional verdict, the assumption stays pending, and the
   user decides at `needs_review`. An early pass that cannot form a verdict costs nothing
@@ -310,6 +313,12 @@ that it should write for that reader.
 
 `ops.file_assumption_objection(store, project_path, wo, assumption, *, reason, model,
 question_id) -> dict` returning `{"envelope_id", "transport", "sent_ts"}`.
+
+**And the hook that calls it is §6's too.** `Daemon.auto_review`'s early pass, having run
+§5, reads back the assumptions carrying `provisional_verdict='object'` with no objection
+recorded, and files one for each. One hook, in one section: if §5 called the filer
+directly and §6 also installed a hook, the drain would file twice, and the two children
+would collide on the same lines of `daemon.py`.
 
 Order of operations, and it is not negotiable: the timeline event and the envelope row
 exist in the database BEFORE anything touches a wire. **The objection must never exist
