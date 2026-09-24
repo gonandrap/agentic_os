@@ -274,18 +274,72 @@ def test_the_candidate_filter_is_a_superset_of_outstanding(started):
 
 
 def test_a_delivered_objection_is_never_withdrawn(started):
+    """§6.6, driven end to end: NOTHING here stamps delivery by hand.
+
+    A hand call to `mark_objection_delivered` tests the withdrawal pass against a state
+    the real path never produced — the gap the panel called out. So the turn goes out
+    through `deliver_messages` while the order runs, and only then does it stop.
+    """
+    project = spec(started)
+    store = ProjectStore(project.path)
+    wo, a = running_order(store)
+    store.set_status(wo["id"], "running", session_id="s-objection")  # else: no session
+    started.auto_review(project, store)
+    started.deliver_envelopes(project, store)
+    started.deliver_messages(project, store)      # the worker reads it, for real
+    store.set_status(wo["id"], "completed")
+
+    started.withdraw_stale_objections(project, store)
+
+    row = store.get_assumption(a["id"])
+    assert row["objection_delivered_ts"] is not None
+    assert row["objection_withdrawn_ts"] is None
+    env = store.get_envelope(int(row["objection_envelope_id"]))
+    [msg] = [m for m in store.list_messages(wo["id"])
+             if m["id"] == env["delivered_msg_id"]]
+    assert msg["status"] == "delivered"           # never rewritten to `withdrawn`
+    assert events(store, wo["id"], "autoreview_objection_withdrawn") == []
+
+
+def test_one_broken_candidate_never_costs_the_pass_the_rest(started):
+    """The `except` exists to keep one bad order cheap — so it must not itself raise."""
+    project = spec(started)
+    store = ProjectStore(project.path)
+    gone, _ = running_order(store)
+    started.auto_review(project, store)
+    live, a = running_order(store)
+    started.auto_review(project, store)
+    store.set_status(live["id"], "needs_review")
+    # the first candidate's work order no longer exists: `get_work_order` raises KeyError.
+    # The keys go off for the one statement — the orphan assumption row IS the state
+    # under test, and the cascade would take it with the order.
+    store.conn.commit()
+    store.conn.execute("PRAGMA foreign_keys=OFF")
+    store.conn.execute("DELETE FROM work_orders WHERE id=?", (gone["id"],))
+    store.conn.commit()
+    store.conn.execute("PRAGMA foreign_keys=ON")
+
+    started.withdraw_stale_objections(project, store)
+
+    assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is not None
+
+
+def test_withdrawal_never_rewrites_a_message_the_worker_already_read(started):
+    """The carrier half of §6.6, forced: a `delivered` row stays `delivered`.
+
+    Same rule as the envelope, which only ever moves from `queued`.
+    """
     project = spec(started)
     store = ProjectStore(project.path)
     wo, a = running_order(store)
     started.auto_review(project, store)
     started.deliver_envelopes(project, store)
-    store.mark_objection_delivered(a["id"])
-    store.set_status(wo["id"], "completed")
+    env = store.envelopes(subject_wo_id=wo["id"])[0]
+    store.mark_message(int(env["delivered_msg_id"]), "delivered")
 
-    started.withdraw_stale_objections(project, store)
+    started._withdraw_objection(store, wo["id"], envelope=env)
 
-    assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is None
-    assert events(store, wo["id"], "autoreview_objection_withdrawn") == []
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "delivered"
 
 
 def test_delivery_refuses_an_objection_to_an_order_that_stopped(started):

@@ -2655,6 +2655,7 @@ class Daemon:
         # would read it twice and pay a second boundary for the privilege.
         for msg_id in ids:
             store.mark_message(msg_id, "delivered")
+            self._stamp_objection_delivery(store, msg_id)
         store.add_event(wo["id"], "message_delivered",
                         {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
@@ -4785,6 +4786,22 @@ class Daemon:
                 log.exception("[%s] objections for %s could not be filed",
                               project.name, wo["id"])
 
+    def _stamp_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
+        """An objection that actually went out is DELIVERED, stamped here and nowhere.
+
+        §6.1/§6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-
+        worker-still-runs.md. The stamp is the only thing that keeps §6.6 from
+        withdrawing an objection the worker has already read, and it belongs at the
+        moment the turn went out: at queue time nothing has been sent, and before
+        `worker_session.send` returns a raise would have delivered nothing.
+        """
+        envelope = store.envelope_for_message(int(msg_id))
+        if not envelope or envelope["kind"] != "assumption_objection":
+            return
+        a = store.assumption_for_envelope(int(envelope["id"]))
+        if a is not None and a.get("objection_delivered_ts") is None:
+            store.mark_objection_delivered(int(a["id"]))
+
     def withdraw_stale_objections(self, project: ProjectSpec,
                                   store: ProjectStore) -> None:
         """Take back every objection whose order stopped before it was delivered (§6.6).
@@ -4818,7 +4835,7 @@ class Daemon:
                     self._withdraw_objection(store, wo_id, assumption=a)
             except Exception:  # noqa: BLE001 — one order must never stop the rest
                 log.exception("[%s] objections for %s could not be withdrawn",
-                              project.name, wo["id"])
+                              project.name, wo_id)
 
     def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
                             assumption: dict[str, Any] | None = None,
@@ -4845,7 +4862,12 @@ class Daemon:
                 store.mark_envelope(int(envelope["id"]), "withdrawn",
                                     note=OBJECTION_WITHDRAWN_REASON)
             if envelope.get("delivered_msg_id"):
-                store.mark_message(int(envelope["delivered_msg_id"]), "withdrawn")
+                # ONLY FROM `queued`, the envelope's own rule: a delivered message was
+                # read by the worker and rewriting it would put a lie on the record
+                # (§6.6, "a delivered objection is never withdrawn").
+                msg = store.get_message(int(envelope["delivered_msg_id"]))
+                if msg and msg["status"] == "queued":
+                    store.mark_message(int(envelope["delivered_msg_id"]), "withdrawn")
         if assumption is None:
             return  # the carrier is disarmed and nothing is outstanding to stamp
         store.withdraw_objection(int(assumption["id"]))

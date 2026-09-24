@@ -3334,6 +3334,16 @@ class ProjectStore:
                                 (env_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_message(self, msg_id: int) -> dict[str, Any] | None:
+        """One `wo_messages` row by id, or None. Read for its STATUS, mostly.
+
+        A status transition that is only legal from `queued` has to see the row first,
+        and every other reader here takes a work order id.
+        """
+        row = self.conn.execute("SELECT * FROM wo_messages WHERE id=?",
+                                (msg_id,)).fetchone()
+        return dict(row) if row else None
+
     def envelope_for_message(self, msg_id: int) -> dict[str, Any] | None:
         """The envelope a queued message came from, or None if it came from nobody.
 
@@ -3817,6 +3827,19 @@ class ProjectStore:
                    objection_sent_ts=? WHERE id=?""",
             (envelope_id, transport, db.now() if sent_ts is None else sent_ts,
              assumption_id))
+
+    def assumption_for_envelope(self, envelope_id: int) -> dict[str, Any] | None:
+        """The assumption whose objection rides that envelope, or None (§6.1).
+
+        THE LINK IS READ FROM THE ASSUMPTION SIDE because that is the only side it is
+        stored on: `assumptions.objection_envelope_id` is written when the objection is
+        filed, and the envelope carries no pointer back. Delivery starts from a message
+        id, so it walks message -> envelope -> here.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM assumptions WHERE objection_envelope_id=?",
+            (envelope_id,)).fetchone()
+        return dict(row) if row else None
 
     def mark_objection_delivered(self, assumption_id: int,
                                  ts: float | None = None) -> None:
