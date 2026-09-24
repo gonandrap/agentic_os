@@ -124,6 +124,17 @@ Reproduce the argv a real worker runs under, from `claude_cli.turn_args()` /
 detached with `start_new_session=True` and `stdin=DEVNULL`. A spike run in a friendlier
 shape answers a question nobody asked. Also check the message survives `--autocompact`.
 
+**This measurement cannot run under `pytest`, and must not try.** The root `conftest.py`
+gate points `JARVIS_CLAUDE_BIN` at a stub that exits 1, precisely so no test can reach the
+real binary. So this is a hand-run script, executed from the worktree, and its output is
+the evidence. A worker that fights the gate ends up measuring the stub and reporting its
+behaviour as the answer.
+
+**The bar for a positive result is a batch of at least five trials in which every one
+delivers mid-turn AND appears in the receiver's transcript.** Any mixed batch is `not
+reliable`, which §3.4 treats exactly as `does not`. Report the trial count and the success
+count, not a narrative.
+
 Check the settings that switch the feature off, because a fleet with any of them set gets
 the fallback and must not silently get nothing: `DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_GROWTHBOOK`, and the
@@ -319,6 +330,14 @@ this section may touch — the budget, no-session and retry holds all still appl
 peer message into a worker with no money or no session is no more deliverable than a
 queued one.
 
+**The peer sender is an injectable parameter, and that is a testability requirement rather
+than a style preference.** The test fake has no inbox and cannot receive a mid-turn
+message, so no test in this repository can assert that a peer message actually arrived.
+What a test CAN prove is selection and fallback: that a busy worker selects
+`transport="peer"` and calls the injected sender, and that the sender raising — or any of
+§3.3's disabling settings being set — falls back to `transport="queue"` with an identical
+recorded message. Hard-wire the send and the peer half of this section ships unverified.
+
 ### 6.5 What the worker did about it
 
 `objection_delivered_ts` says it arrived. What the worker DID is read from the record that
@@ -380,6 +399,13 @@ Per assumption, the user's explicit requirement, in this order:
 4. what the worker did in response — read forward from `objection_delivered_ts` (§6.5);
 5. the provisional approval and whether it was confirmed at delivery (§7), or withdrawn.
 
+**This section also owns the "waiting on the worker since …" line**, for an assumption
+whose objection was delivered and which the worker has not yet answered. §9 explains why
+it cannot live in attention derivation: `invariants.true_blockers` returns only what the
+USER owes, and this is the one state in the feature that is owed by somebody else. It is a
+fact about the assumption, so it belongs beside the assumption — here, or on
+`ops.autoreview_state`'s line, but in exactly one of them.
+
 Touches `cli._readable_autoreview`, the `wo show` payload assembly in `cli.py`, the
 assumptions block in `ui/templates/work_order.html`, and the `assumption_decider` jinja
 global in `ui/app.py`.
@@ -405,11 +431,21 @@ same lines beside it.
 
 What is left once #711 has landed, and it is all of it:
 
-* an assumption carrying a **provisional approval** is pending-but-not-waiting-on-anyone,
-  a state that does not exist before this feature and that nothing #711 writes can
-  anticipate;
-* an assumption with an **objection sent** is waiting on the WORKER, not on the user, and
-  the reason line should say so;
+* an assumption carrying a **provisional approval** raises no blocker. **Anchor this at
+  `needs_review`, not at `running`.** A work order parked in `needs_review` whose
+  assumption is pending with a provisional approval on it is one the OS is actively
+  confirming (§7) and the user owes nothing — a state that is genuinely new, that #711
+  cannot reach, and that is testable the day this lands. Anchored at `running` instead,
+  the row may be VACUOUS: if #711 removes the assumptions blocker for running orders
+  wholesale, the test passes against an empty diff, which is the worst kind of green. The
+  same test must carry its **negative control** — the identical row with
+  `provisional_verdict` empty still produces the blocker — so that a deleted line cannot
+  pass it either.
+* an assumption with an **objection sent and delivered** raises no blocker: it is waiting
+  on the worker, not on the user. **The "waiting on the worker since …" line is NOT
+  rendered here.** `true_blockers` returns only what the user owes, and its `[0]` IS the
+  attention reason — so a state that correctly raises no blocker has no reason line left
+  to carry a sentence. That line belongs to §8's assumptions block, which owns it.
 * an assumption whose objection was **sent and never delivered** IS the user's problem,
   and must raise attention — it is the one new row in this section that adds a blocker
   rather than removing one.
