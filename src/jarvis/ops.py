@@ -4921,6 +4921,57 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
             "settled": not pending}
 
 
+#: The one transport that ships. `peer` is in `OBJECTION_TRANSPORTS` and unused: §3's
+#: spike could not verify the sender's identity, and §6.4 says the peer path does not ship
+#: without it (Neo question 583).
+OBJECTION_TRANSPORT = "queue"
+
+
+def file_assumption_objection(store: ProjectStore, project_path: Path,
+                              wo: dict[str, Any], assumption: dict[str, Any], *,
+                              reason: str, model: str,
+                              question_id: int | None) -> dict[str, Any]:
+    """THE OS telling a RUNNING worker it disagrees with an assumption it just recorded.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §6.1. Takes an open store, `accept_assumption`'s way, because the only caller is the
+    daemon thread that already has one.
+
+    **THE ORDER IS THE POINT AND IT IS NOT NEGOTIABLE.** The envelope, the assumption row
+    and the timeline event are all written before anything can reach a wire: an objection
+    that exists only on the wire is one the record cannot explain, and a send that
+    succeeds after a crash leaves a worker acting on guidance nothing accounts for. The
+    message a worker reads does not exist yet when this returns — `bus.post` queues an
+    envelope and `Daemon.deliver_envelopes` turns it into a `wo_messages` row on a later
+    tick, which is why the row stores an ENVELOPE id.
+
+    **This is not an acceptance and not a rejection.** `assumptions.status` is untouched,
+    nothing here reaches `ops.accept_assumption`, and the settlement verdict space is
+    still ACCEPT or ESCALATE (§2 of both specs). It is guidance, and the user still owes
+    the decision.
+
+    Two side effects of the neighbouring send paths are deliberately NOT inherited (§6.3):
+    the message is unattributed (`authored_by=''`, because only the user's own words are
+    ever stamped) and the work order's attention is left exactly as it was.
+    """
+    wo_id = wo["id"]
+    envelope_id = bus.post(store, subject=bus.Subject(wo_id=wo_id),
+                           from_role="reviewer", to_role="implementor",
+                           payload=bus.AssumptionObjection(
+                               assumption_n=int(assumption.get("n") or 0),
+                               reason=reason, question_id=question_id))
+    sent_ts = db.now()
+    store.record_objection(assumption["id"], envelope_id=envelope_id,
+                           transport=OBJECTION_TRANSPORT, sent_ts=sent_ts)
+    store.add_event(wo_id, "autoreview_objected", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "transport": OBJECTION_TRANSPORT, "reason": reason, "model": model,
+        "question_id": question_id, "envelope_id": envelope_id,
+        "decided_by": ASSUMPTION_DECIDER_OS})
+    return {"envelope_id": envelope_id, "transport": OBJECTION_TRANSPORT,
+            "sent_ts": sent_ts}
+
+
 def review_work_order(wo_id: str, accept: bool = True,
                       feedback: str = "") -> dict[str, Any]:
     """Accept (or reject) all pending assumptions and settle the work order.

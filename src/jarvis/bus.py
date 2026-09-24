@@ -119,6 +119,21 @@ class ChildrenLanded:
     note: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class AssumptionObjection:
+    """The OS disagreeing with an assumption while the worker is still typing.
+
+    NOT `ReviewFeedback`: that payload's `round` and `outcome` describe a validation
+    round, and an objection is not one — it is guidance that settles nothing, sent to a
+    worker mid-task (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-
+    worker-still-runs.md §6.2).
+    """
+
+    assumption_n: int
+    reason: str
+    question_id: int | None = None
+
+
 #: kind -> the dataclass that IS that kind. Every entry in `ENVELOPE_KINDS` must appear
 #: here; a test walks the tuple rather than listing the kinds, so a kind added without a
 #: payload type fails the suite instead of producing an `undeliverable` row months later.
@@ -126,10 +141,11 @@ PAYLOADS: dict[str, type] = {
     "review_feedback": ReviewFeedback,
     "deferral_request": DeferralRequest,
     "children_landed": ChildrenLanded,
+    "assumption_objection": AssumptionObjection,
 }
 #: Every payload type, as one name. Widened rather than spelled out at each signature so
 #: that adding a kind is one entry in PAYLOADS and nothing else.
-Payload = ReviewFeedback | DeferralRequest | ChildrenLanded
+Payload = ReviewFeedback | DeferralRequest | ChildrenLanded | AssumptionObjection
 
 #: The reverse lookup `post` derives `kind` from. Built from PAYLOADS so the two cannot
 #: drift.
@@ -296,6 +312,18 @@ def render(payload: Payload, *, project: str = "",
             lines += ["", "What has to change:"]
             lines += [f"- {ask}" for ask in payload.asks]
         lines += ["", "Act on this and continue your work order."]
+        return "\n".join(lines)
+    if isinstance(payload, AssumptionObjection):
+        # §6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-
+        # still-runs.md: a running worker reads this mid-task.
+        lines = [f"The OS disagrees with assumption #{payload.assumption_n} you "
+                 f"recorded.", "", payload.reason, "",
+                 "This is the OS's own reading (Neo), not the user's words, and it "
+                 "settles nothing: the assumption is still pending their decision. Act "
+                 "on it in the work you are doing now — nothing is being reopened and "
+                 "you are not being asked to report back."]
+        if payload.question_id is not None:
+            lines += ["", f"(Neo question {payload.question_id})"]
         return "\n".join(lines)
     if isinstance(payload, ChildrenLanded):
         lines = [f"The work orders you filed after round {payload.round} have landed."]
