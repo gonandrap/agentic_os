@@ -471,6 +471,16 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: §9: the objection the OS sent about an assumption died on the way to the worker — its
+#: message spent its retries, or its envelope ended in a terminal state that is not
+#: `delivered`. Nobody but the user can move it now, because the worker was never told.
+#: SAYS "assumption" ON PURPOSE: INV-ATTENTION-REASON's strict branch and the
+#: `parked_reason` fallback both key off `_mentions_assumptions`, so a reason that did
+#: not name one would be rewritten within a tick. Same obligation as PR_CLOSED_BLOCKER:
+#: `true_blockers` re-derives it, free of any elapsed time.
+OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
+                                   "never reached the worker — decide it yourself")
+
 
 # -- the derivation everything else is checked against ------------------------------
 
@@ -533,6 +543,50 @@ def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return auto_review_at(store.project_path)
 
 
+def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
+    """Did the OS's objection about this assumption die on the way to the worker? (§9)
+
+    UNDELIVERABLE IS A STATE, NOT AN ELAPSED TIME, and there is deliberately no deadline:
+    a timeout would put a clock on how long a worker may think, and the OS has no basis
+    for that number. Two states say it and only two — the objection's `wo_messages` row
+    is `failed` (its retries are spent), or its envelope is terminal and not `delivered`.
+    `objection_delivered_ts` being NULL by itself is NEVER the trigger: that is the
+    normal case for the whole length of a turn.
+
+    The two reads sit behind the `objection_envelope_id` check, which is NULL on almost
+    every pending assumption on almost every tick (`parked_reason`'s ordering note).
+    """
+    env_id = a.get("objection_envelope_id")
+    if env_id is None:
+        return False
+    if a.get("objection_delivered_ts") or a.get("objection_withdrawn_ts"):
+        return False
+    env = store.get_envelope(int(env_id))
+    if env is None:
+        return False
+    msg_id = env.get("delivered_msg_id")
+    if msg_id is not None:
+        msg = store.get_message(int(msg_id))
+        if msg is not None and msg["status"] == "failed":
+            return True
+    # Terminal and not delivered: nobody filled the role, or nobody could act. `queued`
+    # is normal operation and `withdrawn` is §6.6 — the order stopped, nothing failed.
+    return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
+
+
+def _os_is_confirming(a: dict[str, Any]) -> bool:
+    """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
+
+    Two rows, and in both the user owes nothing: an accepted one is being confirmed
+    against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
+    answer. An objection still in flight is neither, so it is not here.
+    """
+    verdict = str(a.get("provisional_verdict") or "")
+    if verdict == "accept":
+        return True
+    return verdict == "object" and bool(a.get("objection_delivered_ts"))
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone.
@@ -544,8 +598,22 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     """
     blockers: list[str] = []
     pending = store.pending_assumptions(wo["id"])
-    if pending and not neo_reviews_later(store, wo):
-        n = len(pending)
+    # §9: FIRST, because it is the more specific fact about the same assumption.
+    if any(objection_undeliverable(store, a) for a in pending):
+        blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
+    owed = pending
+    if pending and wo["status"] == "needs_review":
+        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here,
+        # so the flag is re-read: a project that has since turned auto_review OFF never
+        # runs the confirmation pass, and suppressing the blocker then would be silence
+        # with nothing behind it. `failed` and `budget_exhausted` are deliberately NOT
+        # gated — no confirmation pass ever reaches them, so those assumptions ARE the
+        # user's.
+        from .ops import auto_review_at
+        if auto_review_at(store.project_path):
+            owed = [a for a in pending if not _os_is_confirming(a)]
+    if owed and not neo_reviews_later(store, wo):
+        n = len(owed)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
     # A privileged action Neo declined to decide on. Nobody else can open that gate, and
     # the work order cannot proceed past it.
@@ -1591,6 +1659,11 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
         if not _mentions_assumptions(wo.get("attention_reason")):
             continue
         if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+            continue
+        # An undeliverable objection raises a real blocker on a RUNNING order
+        # (`running` is in BLOCKED_STATUSES), so without this the flag is cleared here
+        # and INV-ATTENTION-MISSING re-raises it on the same tick, for ever.
+        if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
             continue
         store.clear_attention(wo["id"])
         yield Violation(
