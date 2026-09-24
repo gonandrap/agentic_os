@@ -139,6 +139,23 @@ dashboard, and no path that writes a verdict without an attribution.
   path shares no code with either: it has its own Neo question kind, its own persona, its
   own decision function, and it never touches the `approvals` table.
 
+### 3.1 The attention list has to say the same thing as condition 2 (issue #711)
+
+Condition 2 means Neo picks an assumption up on *delivery*. The attention flag did not
+know that: `ops.assume` raised it the moment a worker recorded one, and
+`invariants.true_blockers` re-derived it every tick, so a worker recording an assumption
+25 minutes into a turn put its order on the user's list for the rest of that turn over a
+decision the project had already delegated.
+
+`invariants.neo_reviews_later` is condition 1 and condition 2 asked from the attention
+side — `ops.auto_review_at` (the project's switch and Neo's own, by path) and
+`PRE_DELIVERY_STATUSES`. Both the write (`ops.assume`) and the derivation ask it, so they
+cannot disagree, and `INV-ATTENTION-PREMATURE` clears a flag raised by anything that does
+not. It suppresses nothing past delivery: in `needs_review` the predicate is false again,
+so every assumption Neo holds or escalates — conditions 4–7 — reaches the user exactly as
+before, and so does one left pending in `failed` or `budget_exhausted`, which Neo never
+sees.
+
 ## 4. The state
 
 | fact | where |
