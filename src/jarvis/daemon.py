@@ -1942,7 +1942,7 @@ class Daemon:
         round itself and `land_when_cleared` must not re-read what it wrote.
 
         NOTHING RE-DERIVES A FLAG HERE, which is the half a `set_status` alone would miss:
-        `invariants._validation_escalated` keys on `outcome == "escalated"`, so
+        `invariants.validation_escalated` keys on `outcome == "escalated"`, so
         `true_blockers` cannot put `VALIDATION_STUCK_BLOCKER` back on the next reconcile
         tick — and `void` is in none of the OPEN/RUNNABLE/COUNTED outcome sets, so no
         other machine picks the unit up either.

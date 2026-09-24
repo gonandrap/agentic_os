@@ -3955,7 +3955,7 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
     `void` and not `passed`, `rejected` or `failed`: nobody judged this and nothing is
     left undecided, which is precisely what that outcome means (`project_store.
     VALIDATION_OUTCOMES`). It costs the submitter no round, it is in none of the OPEN or
-    RUNNABLE sets, and `invariants._validation_escalated` cannot re-derive a give-up from
+    RUNNABLE sets, and `invariants.validation_escalated` cannot re-derive a give-up from
     it — so the round machine and the reconciler both let the work order go. THE SEATS
     MAY STILL BE READING, and that is the other half: `Daemon._validate_work_order`
     re-reads this outcome when its validator returns and drops the verdict rather than
@@ -4282,12 +4282,89 @@ def clear_pr_repair(store: ProjectStore, wo: dict[str, Any],
     Resets the attempt budget (spec §4) and takes down the give-up flag — but only that
     one, never a flag raised for something else. That last clause is what keeps a green
     build from clearing the review the user still owes.
+
+    ...and then RE-DERIVES the status, because closing the episode is the moment the
+    origin snapshot `settle_work_order` replayed becomes garbage — issue #705 defect 1.
     """
     if not store.pr_repair_attempts(wo["id"], repair.name):
         return False
     store.add_event(wo["id"], repair.event("cleared"), {"pr_url": wo.get("pr_url")})
     if wo["attention_reason"] == repair.blocker:
         store.clear_attention(wo["id"])
+    resettle_after_repair(store, wo["id"])
+    return True
+
+
+def repaired_since_finish(store: ProjectStore, wo_id: str) -> bool:
+    """Did a repair episode open AND close after this work order delivered?
+
+    The shape issue #705 describes and the bound on `resettle_after_repair`: without it
+    that function would re-derive the status of every `needs_review` order holding a
+    pull request, which is far wider than the defect and would move orders no repair ever
+    touched.
+    """
+    finished = store.events_of_kind(wo_id, "finished")
+    if not finished:
+        return False
+    since = float(finished[-1]["ts"])
+    return any(float(e["ts"]) > since
+               for repair in PR_REPAIRS
+               for e in store.events_of_kind(wo_id, repair.event("cleared")))
+
+
+def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
+    """Put a repaired work order back in the merge queue if nothing else holds it.
+
+    Issue #705 defect 1. `nudge_pr_repair` records the status the repair took the work
+    order out of and `Daemon.settle_work_order` restores it (Neo question 275) — but
+    that snapshot is taken when the nudge goes out, and the whole point of a repair is
+    that time passes. A `needs_review` order nudged about a conflict, whose assumptions
+    the user accepts mid-repair, was put back into `needs_review` for a reason that had
+    already gone, and `waiting_pr_merge` is the only status the auto-merge poll looks
+    at: the order left the merge queue for ever with a green, mergeable pull request.
+
+    ONLY OUT OF `needs_review`, and only when the whole of that status's triage in
+    `true_blockers` says nobody owes anything: `failed` and `waiting_input` mean
+    something the repair never addressed. Every blocker of the row it WOULD become is
+    derived first and any one of them refuses the move, so the flag that comes down
+    afterwards is always empty by construction.
+    """
+    wo = store.get_work_order(wo_id)
+    if (wo["status"] != "needs_review" or not wo.get("result_summary")
+            or not _awaiting_merge(wo)):
+        return False
+    if not repaired_since_finish(store, wo_id):
+        return False
+    # THE REPAIR MUST BE WHY IT IS HERE NOW, not merely the last thing that closed.
+    # `repaired_since_finish` says an episode opened and closed after the finish; it says
+    # nothing about the turns AFTER it. A user-opened turn that ends without `jarvis wo
+    # finish` puts the order into `needs_review` on its own account, and this function
+    # lifts a merge hold, so without this every later hold fails open into an unattended
+    # merge.
+    if store.turn_opened_by(store.latest_turn(wo_id)) not in invariants.PR_REPAIR_SOURCES:
+        return False
+    # The other repair's episode may still be open, and it owns the status while it is.
+    if pr_repair_origin(store, wo_id) or store.queued_messages(wo_id):
+        return False
+    # The `needs_review` triage in `true_blockers` — the probe below cannot see these,
+    # because they are derived under the status this function is trying to leave.
+    if (store.pending_assumptions(wo_id)
+            or invariants.validation_escalated(store, wo)
+            or store.work_unlanded_open(wo_id)):
+        return False
+    # JUDGE THE ROW IT WOULD BECOME, BEFORE WRITING ANYTHING. An escalated gate is a
+    # blocker at any status, so re-deriving the flag after `set_status` would leave a
+    # flagged order already back in the merge queue — the poll acts on the status, not
+    # on the flag. Probed through the one function that owns blockers rather than
+    # re-listing them here (kn-78346a2d).
+    probe = dict(wo)
+    probe["status"] = "waiting_pr_merge"
+    if true_blockers(store, probe):
+        return False
+    store.set_status(wo_id, "waiting_pr_merge")
+    store.add_event(wo_id, "pr_repair_resettled",
+                    {"pr_url": wo.get("pr_url"), "was": wo["status"]})
+    store.clear_attention(wo_id)
     return True
 
 

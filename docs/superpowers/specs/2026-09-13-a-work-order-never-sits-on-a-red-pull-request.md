@@ -236,6 +236,51 @@ The STATUS is deliberately untouched. Reopening a pull request is a button press
 decision: the work was refused, what to do about that is still the user's, and moving the
 order back to the merge queue would take the item off their list on GitHub's say-so.
 
+### 4.2 The origin is a snapshot, and closing the episode is when it expires
+
+Issue #705. §4's restoration is right at the moment the turn settles and wrong for ever
+afterwards: the origin is recorded when the nudge goes out, and the whole point of a
+repair is that time passes. On wo-dd8668fa the nudge went out while three assumptions
+were pending, the user accepted them mid-repair, and settlement put the order back into
+`needs_review` for a reason that had already gone. `waiting_pr_merge` is the only status
+the auto-merge poll looks at, so the order left the merge queue permanently with a green,
+mergeable pull request — 24h parked, a user session opened to ask what to do.
+
+So `ops.clear_pr_repair` re-derives, through `ops.resettle_after_repair`: out of
+`needs_review` only, only when a repair episode opened and closed after the order
+delivered (`repaired_since_finish` — otherwise this reaches every `needs_review` order
+holding a pull request), and only when the whole of §4's triage says nobody owes
+anything. `INV-REPAIR-RESETTLED` runs the same derivation every tick, which is what
+reaches the orders the shipped bug already stranded — their episodes are closed, so no
+poll will ever call `clear_pr_repair` on them again.
+
+This function LIFTS A MERGE HOLD, so its bounds are the safety argument and neither is
+optional. `repaired_since_finish` says an episode closed after the finish; it says
+nothing about the turns after it, so the **latest turn must itself be a repair turn**
+(`turn_opened_by ∈ PR_REPAIR_SOURCES`). Without that, a user-opened turn that ends
+without `jarvis wo finish` — its own hold, on its own account — fails open into an
+unattended merge. And every blocker of the row the move WOULD produce is derived through
+`true_blockers` **before** `set_status`, any one of them refusing the move: an escalated
+gate is a blocker at any status (§4.1 one level over), and a flag re-derived afterwards
+would be a flag on an order already back in the merge queue, where the poll acts on the
+status and not on the flag.
+
+Two further consequences of the same "closing the episode is when the snapshot expires"
+reading, both issue #705:
+
+* `INV-ATTENTION-REASON` is symmetrical. It repaired a reason that failed to name
+  pending assumptions and skipped the reverse by construction, so a count of assumptions
+  nobody still owed a decision on was immortal and printed first on `jarvis status`. XOR
+  rather than "either side mentions assumptions": both mentioning them is `ops.assume`'s
+  generic line against a real pending decision, which is true and merely vaguer.
+* `invariants.parked_reason` exempts a turn the OS itself opened with a repair nudge.
+  `PR_CONFLICT_NUDGE` and `PR_CHECKS_NUDGE` tell the worker in capitals not to call
+  `jarvis wo finish` again, so a turn newer than the finish is the guaranteed outcome of
+  the documented happy path — and `STALE_FINISH_BLOCKER` sent the user to `jarvis wo
+  send` against a worker whose pull request was already green. The predicate is
+  `ProjectStore.turn_opened_by`: `wo_messages.source` through `wo_turns.msg_id`, so a
+  turn a user's own message opened is still judged.
+
 ## 5. BEHIND: reported, never rebased
 
 **Decision: the OS says so and the worker acts; the OS never updates the branch itself.**
