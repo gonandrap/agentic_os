@@ -8,7 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -1721,6 +1721,67 @@ class ProjectStore:
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_work_orders(self, words: Sequence[str],
+                           limit: int = 50) -> list[dict[str, Any]]:
+        """Work orders matching `words`, most relevant first — SETTLED ONES INCLUDED.
+
+        The listing verbs default to open and unhidden because they answer "what wants
+        me now"; search answers "where is that thing", and the completed order the user
+        is trying to find again is the case it exists for (wo-edf5c425).
+        """
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "description": 1, "result_summary": 1,
+            "attention_reason": 1, "branch": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT *, {expr} AS _score FROM work_orders "
+            "WHERE _score > 0 ORDER BY _score DESC, created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_feature_orders(self, words: Sequence[str],
+                              limit: int = 50) -> list[dict[str, Any]]:
+        expr, params = db.score_sql(words, {
+            "id": 3, "title": 3, "description": 1, "attention_reason": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT *, {expr} AS _score FROM feature_orders "
+            "WHERE _score > 0 ORDER BY _score DESC, created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_alarms(self, words: Sequence[str],
+                      limit: int = 50) -> list[dict[str, Any]]:
+        """Alarms carry their work order's title, as `alarms_across` does: an alarm read
+        without the order it fired on says almost nothing."""
+        expr, params = db.score_sql(words, {
+            "a.id": 3, "a.kind": 2, "a.reason": 1, "a.note": 1, "a.verdict_reason": 1,
+            "w.title": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM wo_alarms a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def search_gates(self, words: Sequence[str],
+                     limit: int = 50) -> list[dict[str, Any]]:
+        expr, params = db.score_sql(words, {
+            "a.command": 3, "a.kind": 2, "a.wo_id": 2, "a.justification": 1,
+            "a.evidence": 1, "a.decision_reason": 1, "w.title": 1,
+        })
+        rows = self.conn.execute(
+            f"SELECT a.*, w.title AS wo_title, {expr} AS _score FROM approvals a "
+            "JOIN work_orders w ON w.id = a.wo_id "
+            "WHERE _score > 0 ORDER BY _score DESC, a.ts DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
