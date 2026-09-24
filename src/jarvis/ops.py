@@ -2304,12 +2304,82 @@ def assumption_decider(a: dict[str, Any]) -> str:
     return f"the OS ({by}, {a.get('decided_model') or 'model not recorded'})"
 
 
+#: HOW FINAL AN `autoreview` EVENT IS about the assumption it names, for ties on `ts`.
+#: The ties are real, not defensive: `Daemon._deliver_assumption_verdict` writes a hold
+#: and an escalation in one pass, and the escalation is the one that says where the
+#: assumption ended up.
+_RULING_RANK = {"autoreview_accepted": 4, "autoreview_escalated": 3,
+                "autoreview_held": 2, "autoreview_asked": 1}
+
+
+def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling`.
+
+    THE ONE DERIVATION, because the hold reason lives nowhere else. `autoreview_held` is
+    a timeline event and not a column (`Daemon._note_autoreview_held`), so a surface that
+    wants to say "held — mentions 'production'" has to read the events, and two surfaces
+    reading them apart is two chances to render a reviewed assumption as untouched —
+    GitHub issue #712. `jarvis wo show` and the work-order page take their rows from
+    here and render them with `assumption_ruling_line`.
+
+    NEWEST EVENT PER ASSUMPTION, never per work order: `autoreview_state`'s one line is
+    the mechanism's last act and says nothing about the assumption beside it.
+    """
+    from . import db
+
+    newest: dict[int, dict[str, Any]] = {}
+    for kind in AUTOREVIEW_EVENTS:
+        for event in store.events_of_kind(wo_id, kind):
+            payload = db.from_json(event["payload"], {})
+            aid = int(payload.get("assumption_id") or 0)
+            if not aid:
+                continue
+            # Payload first, so `kind` and `ts` are this function's own answers —
+            # `autoreview_state`'s note.
+            candidate = {**payload, "kind": kind, "ts": float(event["ts"])}
+            prev = newest.get(aid)
+            if prev is None or ((candidate["ts"], _RULING_RANK[kind])
+                                > (prev["ts"], _RULING_RANK[prev["kind"]])):
+                newest[aid] = candidate
+    return [{**a, "os_ruling": newest.get(int(a.get("id") or 0))}
+            for a in store.all_assumptions(wo_id)]
+
+
+def assumption_ruling_line(a: dict[str, Any]) -> str:
+    """WHAT THE OS DID with this assumption, in one line, or `''`. Pure, both surfaces.
+
+    Not the attribution — that is `assumption_decider`'s, and both surfaces already
+    render it. This is the REASONING beside it: the escalation the user has to answer,
+    the keyword hold, the question still out, or why a settled one was settled. `''`
+    means nothing has looked at this assumption, which is a different fact from a hold
+    and has to read as one.
+
+    The `#N ` prefix comes off a hold reason: the caller has just printed the number.
+    """
+    if str(a.get("status") or "") != "pending":
+        return str(a.get("decided_reason") or "").strip()
+    ruling = a.get("os_ruling") or {}
+    kind, reason = str(ruling.get("kind") or ""), str(ruling.get("reason") or "").strip()
+    question = ruling.get("neo_question_id")
+    if kind == "autoreview_escalated":
+        asked = f" (question {question})" if question else ""
+        return f"Neo escalated{asked}{': ' + reason if reason else ''}"
+    if kind == "autoreview_held":
+        held = re.sub(r"^assumption #\d+ ", "", reason)
+        return f"Held by the OS — {held}" if held else "Held by the OS"
+    if kind == "autoreview_asked":
+        return f"Asked Neo (question {question}), awaiting ruling"
+    return ""
+
+
 def assumption_line(a: dict[str, Any]) -> str:
     """One assumption on one line, for `jarvis wo show`. Attribution from one renderer."""
     n, status = a.get("n"), str(a.get("status") or "")
     content = str(a.get("content") or "")
     if status == "pending":
-        return f"#{n} pending your review: {content}"
+        ruling = assumption_ruling_line(a)
+        return (f"#{n} pending your review: {content}"
+                f"{' — ' + ruling if ruling else ''}")
     reason = str(a.get("decided_reason") or "").strip()
     return (f"#{n} {status} by {assumption_decider(a)}"
             f"{' — ' + reason if reason else ''}: {content}")

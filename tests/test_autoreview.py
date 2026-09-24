@@ -982,3 +982,91 @@ def test_another_projects_assumption_question_is_left_alone(started):
         assert neo_store.get(stranger["id"])["status"] == "escalated"
     finally:
         neo_store.close()
+
+
+# -- what the OS did with EACH assumption, on both surfaces (GitHub issue #712) --------
+
+
+def rulings(store, wo_id: str) -> list[str]:
+    """Every assumption's ruling line, in order, as a person reads it."""
+    return [ops.assumption_ruling_line(a)
+            for a in ops.assumptions_with_rulings(store, wo_id)]
+
+
+def test_a_held_assumption_says_what_held_it_and_an_asked_one_says_it_is_out(started):
+    """THE DEFECT: a pending assumption the OS had already ruled on read exactly like one
+    nobody had looked at. The hold reason is a timeline event and not a column, so this
+    is also the assertion that the derivation reaches the row."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=("reused the production api key", ROUTINE))
+
+    ask(started, store)
+
+    held, asked = rulings(store, wo["id"])
+    assert held.startswith("Held by the OS — mentions 'production'")
+    # The number is on the row already; repeating it inside the reason is not a ruling.
+    assert "assumption #1" not in held
+    (q,) = questions()
+    assert asked == f"Asked Neo (question {q['id']}), awaiting ruling"
+
+
+def test_an_escalation_carries_neos_reason_and_its_question(started):
+    """What the user has to decide, beside the assumption they have to decide it on —
+    instead of buried in the timeline."""
+    store, wo = park(started, auto_review=True)
+    ask(started, store)
+    (q,) = questions()
+
+    drain(started)
+
+    (line,) = rulings(store, wo["id"])
+    assert line.startswith(f"Neo escalated (question {q['id']}): ")
+    assert "assumption reviews escalate unless forced" in line
+
+
+def test_an_assumption_nobody_has_looked_at_says_nothing_at_all(started):
+    """`''` IS A FACT, and a different one from a hold: an opted-out project's
+    assumptions must not grow a line about a mechanism it does not have."""
+    store, wo = park(started, auto_review=False)
+
+    ask(started, store)
+
+    assert rulings(store, wo["id"]) == [""]
+
+
+def test_a_settled_assumption_carries_the_reason_it_was_settled(started):
+    """The acceptance reason is part of the ruling too — `jarvis wo show` had it and the
+    page hid it in a `title=`."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+
+    drain(started)
+
+    assert rulings(store, wo["id"]) == ["test-forced acceptance: a naming convention"]
+
+
+def test_wo_show_carries_every_ruling_and_not_just_the_last_one(started, capsys):
+    """THE SURFACE, and the half the summary line cannot do: `auto_review:` says what the
+    mechanism did LAST, so on a three-assumption order two rulings were invisible."""
+    from jarvis import cli
+
+    store, wo = park(started, auto_review=True,
+                     assumptions=("reused the production api key",
+                                  f"FORCE_ACCEPT — {ROUTINE}"))
+    ask(started, store)
+    drain(started)
+
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"]])
+    out = capsys.readouterr().out
+
+    held = [l for l in out.splitlines() if "production api key" in l]
+    assert held and "Held by the OS — mentions 'production'" in held[0]
+    assert "test-forced acceptance" in out
+
+    capsys.readouterr()
+    cli.main(["wo", "show", wo["id"], "--json"])
+    rows = json.loads(capsys.readouterr().out)["assumptions"]
+    # `--json` keeps the payload, not the prose: whoever reads it reads the event.
+    assert rows[0]["os_ruling"]["code"] == autoreview.HELD_HIGH_STAKES
