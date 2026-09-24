@@ -85,6 +85,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger("jarvisd")
 
+#: Why an objection was taken back, in the envelope's note, in the timeline event and in
+#: `ops.objection_line`. ONE string: the user reads it on three surfaces and a wording
+#: that depends on which pass withdrew it is a difference they would have to explain.
+#: §6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+#: runs.md.
+OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
+
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: Ask GitHub about parked pull requests every N ticks — ~2 minutes at the default 5s
@@ -769,6 +776,10 @@ class Daemon:
                     # a person, so the thing it saves is measured in the user's hours.
                     # It only ASKS — the ruling lands through the Neo drain below.
                     self.auto_review(project, store)
+                    # Beside it, and AFTER it: the same tick that files an objection is
+                    # the one that must take it back if the order it was filed against
+                    # has already stopped (§6.6).
+                    self.withdraw_stale_objections(project, store)
                     # Immediately before the check that reads it, in the same tick: the
                     # landing invariant is a pure timeline read, and this is the only
                     # thing that puts a pull-request fact on that timeline.
@@ -1471,6 +1482,14 @@ class Daemon:
             except KeyError:
                 store.mark_message(msg["id"], "failed")
                 continue
+            # BEFORE the holds, deliberately: a stopped order's hold would skip this
+            # message for ever instead of taking it back, and the delivery side is the
+            # one that must lose the race with the withdrawal pass (§6.6).
+            if wo["status"] != "running":
+                envelope = store.envelope_for_message(int(msg["id"]))
+                if envelope and envelope["kind"] == "assumption_objection":
+                    self._withdraw_objection(store, wo["id"], envelope=envelope)
+                    continue
             # Every per-work-order hold, in the one place that decides them
             # (`worker_session.delivery_hold`). Held, not dropped: the same queue sends
             # it as the next turn once the hold clears. The same call answers
@@ -2636,6 +2655,7 @@ class Daemon:
         # would read it twice and pay a second boundary for the privilege.
         for msg_id in ids:
             store.mark_message(msg_id, "delivered")
+            self._stamp_objection_delivery(store, msg_id)
         store.add_event(wo["id"], "message_delivered",
                         {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
@@ -4685,6 +4705,11 @@ class Daemon:
             return
         if not self.catalog.os.neo.enabled:
             return
+        # BEFORE the candidate list and outside it, because its subjects are `running`
+        # orders and everything below this line is about `needs_review` ones — under the
+        # `if not candidates: return` an objection would never be filed on a project
+        # whose parked orders happen to have nothing pending.
+        self._file_pending_objections(project, store)
         from .neo_store import NeoStore
 
         # Hidden orders are excluded by the default, and deliberately: the rule
@@ -4725,6 +4750,131 @@ class Daemon:
                                   wo["id"])
         finally:
             neo_store.close()
+
+    def _file_pending_objections(self, project: ProjectSpec,
+                                 store: ProjectStore) -> None:
+        """Send the early pass's disagreements to the workers still typing (§6.1).
+
+        docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+        runs.md. THE ONE HOOK: the early pass records `provisional_verdict='object'` on a
+        row and files nothing, and this reads those rows back and files exactly one
+        objection each. Two hooks would file twice, and the drain is what makes filing
+        idempotent — `objection_envelope_id` already set is the whole of the test.
+
+        RUNNING ORDERS ONLY, and that is §2's licence rather than an optimisation:
+        telling a worker something mid-task starts no turn it was not already taking,
+        and the moment the order stops that stops being true (§6.6 withdraws instead).
+
+        One work order's failure never costs the rest the pass — `auto_review`'s rule,
+        for its reason.
+        """
+        from . import ops
+
+        for wo in store.list_work_orders(statuses=("running",)):
+            try:
+                for a in store.all_assumptions(wo["id"]):
+                    if (str(a.get("provisional_verdict") or "") != "object"
+                            or a.get("objection_envelope_id") is not None
+                            or a.get("objection_withdrawn_ts") is not None):
+                        continue
+                    ops.file_assumption_objection(
+                        store, project.path, wo, a,
+                        reason=str(a.get("provisional_reason") or ""),
+                        model=str(a.get("provisional_model") or ""),
+                        question_id=a.get("neo_question_id"))
+            except Exception:  # noqa: BLE001 — one order must never stop the rest
+                log.exception("[%s] objections for %s could not be filed",
+                              project.name, wo["id"])
+
+    def _stamp_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
+        """An objection that actually went out is DELIVERED, stamped here and nowhere.
+
+        §6.1/§6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-
+        worker-still-runs.md. The stamp is the only thing that keeps §6.6 from
+        withdrawing an objection the worker has already read, and it belongs at the
+        moment the turn went out: at queue time nothing has been sent, and before
+        `worker_session.send` returns a raise would have delivered nothing.
+        """
+        envelope = store.envelope_for_message(int(msg_id))
+        if not envelope or envelope["kind"] != "assumption_objection":
+            return
+        a = store.assumption_for_envelope(int(envelope["id"]))
+        if a is not None and a.get("objection_delivered_ts") is None:
+            store.mark_objection_delivered(int(a["id"]))
+
+    def withdraw_stale_objections(self, project: ProjectSpec,
+                                  store: ProjectStore) -> None:
+        """Take back every objection whose order stopped before it was delivered (§6.6).
+
+        An objection queued for an order that is no longer `running` would arrive as a
+        fresh turn on an order nobody asked to reopen — the exact thing the parent spec
+        refused. There is no third option: an undelivered objection is either delivered
+        while the order runs or withdrawn, and one of the two is always recorded.
+
+        A DELIVERED OBJECTION IS NEVER WITHDRAWN: `outstanding_objections` is already
+        the "neither delivered nor withdrawn" query, and it is the only thing that
+        decides here. `work_orders_with_objections` is a candidate filter in front of it
+        and nothing more — one query instead of a full assumption read per work order
+        per reconcile tick, on a fleet where nearly no order ever carries an objection.
+
+        **`withdrawn` is a new value on two status columns, and every reader was checked
+        rather than assumed (§6.6).** `wo_messages.status`: `queued_messages` (and
+        `deliverable_messages` and `invariants.stuck_message` through it) selects
+        `status='queued'`, so a withdrawn row stops being deliverable and stops being an
+        invariant's problem; `list_messages`, `agent_replies` and `user_messages` filter
+        on direction and authorship, never status, so the words stay on the record.
+        `envelopes.state`: `queued_envelopes` — and so INV-ENVELOPE-STUCK — selects
+        `state='queued'`, while INV-ENVELOPE-LOST and `ops.validation_view` both key on
+        `undeliverable` alone, which withdrawal deliberately is not: nothing went wrong.
+        """
+        for wo_id in store.work_orders_with_objections():
+            try:
+                if store.get_work_order(wo_id)["status"] == "running":
+                    continue
+                for a in store.outstanding_objections(wo_id):
+                    self._withdraw_objection(store, wo_id, assumption=a)
+            except Exception:  # noqa: BLE001 — one order must never stop the rest
+                log.exception("[%s] objections for %s could not be withdrawn",
+                              project.name, wo_id)
+
+    def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
+                            assumption: dict[str, Any] | None = None,
+                            envelope: dict[str, Any] | None = None) -> None:
+        """Disarm the carrier FIRST, then stamp the withdrawal (§6.6, in that order).
+
+        The envelope and the message are what can still become a turn; the timestamp and
+        the event are only the record of it. Written the other way round, a daemon that
+        died in between would leave a work order that reads as withdrawn with a live
+        message still queued for its worker.
+
+        Called from both sides of the race — the reconcile pass, which starts from the
+        assumption, and `deliver_messages`, which starts from the envelope — so it takes
+        either end and resolves the other.
+        """
+        if envelope is None and assumption and assumption.get("objection_envelope_id"):
+            envelope = store.get_envelope(int(assumption["objection_envelope_id"]))
+        if assumption is None and envelope is not None:
+            assumption = next(
+                (a for a in store.outstanding_objections(wo_id)
+                 if a.get("objection_envelope_id") == envelope["id"]), None)
+        if envelope is not None:
+            if envelope["state"] == "queued":
+                store.mark_envelope(int(envelope["id"]), "withdrawn",
+                                    note=OBJECTION_WITHDRAWN_REASON)
+            if envelope.get("delivered_msg_id"):
+                # ONLY FROM `queued`, the envelope's own rule: a delivered message was
+                # read by the worker and rewriting it would put a lie on the record
+                # (§6.6, "a delivered objection is never withdrawn").
+                msg = store.get_message(int(envelope["delivered_msg_id"]))
+                if msg and msg["status"] == "queued":
+                    store.mark_message(int(envelope["delivered_msg_id"]), "withdrawn")
+        if assumption is None:
+            return  # the carrier is disarmed and nothing is outstanding to stamp
+        store.withdraw_objection(int(assumption["id"]))
+        store.add_event(wo_id, "autoreview_objection_withdrawn", {
+            "assumption_id": assumption["id"], "n": assumption.get("n"),
+            "reason": OBJECTION_WITHDRAWN_REASON,
+            "envelope_id": assumption.get("objection_envelope_id")})
 
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
