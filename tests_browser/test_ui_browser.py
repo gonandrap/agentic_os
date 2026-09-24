@@ -3,7 +3,7 @@ real forms, real navigation, headless Chromium."""
 
 from __future__ import annotations
 
-from jarvis import ops
+from jarvis import background, ops
 from jarvis.project_store import ProjectStore
 
 
@@ -836,6 +836,35 @@ def test_a_typo_in_the_budget_box_never_costs_the_description(page, server, proj
         assert store.list_work_orders() == []
     finally:
         store.close()
+
+
+def test_a_dead_background_job_is_marked_void_on_the_page(page, server, daemon,
+                                                          project):
+    """The promise and its retraction, on the surface the user actually reads.
+
+    Issue #575: the message is what a user decides from, and a dead job described as
+    live is worse than no message. The words stay — the record is what the worker said
+    — and the void sits above them. Spec
+    docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md §3.
+    """
+    wo = ops.create_work_order("proj_a", "long suite")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        msg_id = store.record_agent_reply(
+            wo["id"], "Suite is running in the background; I'll report when it lands.")
+        store.add_event(wo["id"], background.EVENT,
+                        {"seq": 1, "msg_id": msg_id,
+                         "jobs": [{"id": "b51fl7bhe", "command": "uv run pytest"}]})
+    finally:
+        store.close()
+
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    said = page.locator("#tab-conversation").inner_text()
+
+    assert "VOID" in said and "b51fl7bhe" in said
+    assert "I'll report when it lands" in said
+    assert said.index("VOID") < said.index("I'll report when it lands")
 
 
 def test_header_search_finds_a_finished_order(page, server, project):
