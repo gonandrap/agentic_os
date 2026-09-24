@@ -79,9 +79,11 @@ def fleet(jarvis_home, fake_claude, fake_gh, tmp_path, project, claude_json):
             finally:
                 store.close()
 
-        def file_bug(self, title="wo send is lost", priority="blocker"):
+        def file_bug(self, title="wo send is lost", priority="blocker",
+                     expedite=False):
             return bugreport.report_bug(title=title, description="d",
-                                        expected="e", actual="a", priority=priority)
+                                        expected="e", actual="a", priority=priority,
+                                        expedite=expedite)
 
         def _last_triage(self):
             from jarvis.neo_store import NeoStore
@@ -1320,3 +1322,73 @@ def test_jarvis_issues_still_lists_and_start_is_a_subcommand(fleet, capsys):
     capsys.readouterr()
     assert cli.main(["issues", "start", fleet.issue_url]) == 0
     assert fleet.issue_url in capsys.readouterr().out
+
+
+# -- expediting a filing --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_expediting_a_non_dispatching_bug_dispatches_it_now(fleet, level):
+    """The flag's whole reason to exist: work starts at a level that commits the fleet
+    to nothing, without the rating being inflated to buy it."""
+    from jarvis import ops
+    from jarvis.neo_store import NeoStore
+
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    assert pickup["wo_id"] and pickup["expedited"]
+    assert pickup["wo_id"] == fleet.wo_id()
+
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert wo["issue_url"] == fleet.issue_url and wo["issue_priority"] == level
+    assert "expedited" in wo["description"].lower()
+    labels = fleet.gh.issue()["labels"]
+    assert f"priority: {level}" in labels, "expediting is not a re-rating"
+    assert "in progress" in labels
+
+    neo = NeoStore()
+    try:
+        assert not [q for q in neo.list_questions() if q.get("kind") == "triage"], \
+            "a level that is not re-assessed is not re-assessed for being expedited"
+    finally:
+        neo.close()
+
+
+@pytest.mark.parametrize("level", ["critical", "blocker"])
+def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
+    """The claim is still re-assessed — the label is what everyone else reads — but the
+    work no longer waits on the verdict."""
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    assert pickup["wo_id"] == fleet.wo_id() != ""
+    assert pickup["neo_question_id"], "the rating is still a claim and still checked"
+    assert "in parallel" in pickup["reason"]
+
+
+def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
+    """Neo may move the label; it may not stop work the user asked for. And the tracker
+    may not be told no work order was created when one is running."""
+    pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
+    fleet.triage(approve=False, answer="medium", reason="bounded to one command")
+
+    assert fleet.wo_id() == pickup["wo_id"], "the expedited work order survives"
+    labels = fleet.gh.issue()["labels"]
+    assert "priority: medium" in labels and "priority: blocker" not in labels
+    body = "\n".join(fleet.gh.issue()["comments"])
+    assert pickup["wo_id"] in body
+    assert "No work order was created" not in body
+
+
+@pytest.mark.parametrize("level", ["low", "blocker"])
+def test_filing_without_the_flag_is_unchanged(fleet, level):
+    """The default is today's behaviour at both ends of the rubric."""
+    pickup = fleet.file_bug(priority=level)["pickup"]
+    assert not pickup["wo_id"] and not pickup.get("expedited")
+    assert not fleet.wo_id()
+    assert "in progress" not in fleet.gh.issue()["labels"]
+
+
+def test_the_cli_prints_the_work_order_it_expedited(fleet, capsys):
+    """A reporting agent reads one line, and the id has to be in it."""
+    assert cli.main(["bug", "report", "t", "-d", "d", "-e", "e", "-a", "a",
+                     "-p", "low", "--expedite"]) == 0
+    out = capsys.readouterr().out
+    assert fleet.wo_id() in out and "expedited" in out

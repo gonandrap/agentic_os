@@ -355,6 +355,19 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # work order and the PR on it — once the code
                                            # lands, so never close one by hand: you would
                                            # be racing the daemon.
+                                           # --expedite is the ONE way to jump that
+                                           # queue, and it is a SCHEDULING decision, not
+                                           # a rating: at ANY priority it files the issue
+                                           # as usual AND dispatches a work order on it
+                                           # immediately — the same thing `jarvis issues
+                                           # start` would do, in one step, printed as the
+                                           # wo-id. Use it so the priority can stay an
+                                           # honest description of the defect instead of
+                                           # being inflated to buy attention. On
+                                           # critical/blocker it does NOT skip Neo: the
+                                           # re-assessment still runs alongside and can
+                                           # still move the `priority:` label, but it can
+                                           # no longer decide whether work happens.
 jarvis config wiring [project]             # which of the USER'S OWN MCP servers, skills
                                            # and plugins reach this project's workers.
                                            # Everything is wired by default, including

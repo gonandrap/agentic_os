@@ -75,7 +75,21 @@ UNTRUE — not how irritating it was.
 CLAIM and Neo re-assesses it against this same rubric before anything acts on it. Claim
 one honestly when it fits; a claim Neo downgrades is queued like any other bug and
 costs nothing but the disagreement, which is a signal the user wants. `low`, `medium`
-and `high` are not re-assessed — they queue in the backlog for the user to promote.
+and `high` are not re-assessed — they wait on the tracker until someone runs
+`jarvis issues start <issue-url>`.
+
+### `--expedite`: work on it now
+
+`--expedite` files the issue exactly as above and dispatches a work order on it
+immediately, at any priority — `jarvis issues start` in the same step. It is a
+SCHEDULING decision and changes nothing about the rating, which is the point: never
+inflate a priority to get a bug worked on, expedite it instead. On `critical`/`blocker`
+Neo still re-assesses the claim alongside, so the `priority:` label can still move; the
+work no longer waits for it.
+
+**The user's call, not yours.** Expedite when they asked for this bug now, or when the
+bug is blocking the work order you are in and you are the one who will be waiting.
+Otherwise file it and carry on — a bug every agent expedites is a queue again.
 
 The running Jarvis OS version, your project and your work order id are attached
 automatically — do not put them in the text.
@@ -95,8 +109,9 @@ jarvis bug report "wo send silently drops messages when the worker is idle" \
   --steps "1. Create a work order and let the worker go idle. 2. Run jarvis wo send <id> \"hello\". 3. Run jarvis wo show <id>."
 ```
 
-The command prints the issue URL, and under it one line saying what happened next: a
-backlog id, or that Neo is re-assessing your claim, or a work order id. It never rounds
+The command prints the issue URL, and under it one line saying what happened next: that
+the bug waits on the tracker, or that Neo is re-assessing your claim, or the id of the
+work order it dispatched. It never rounds
 your claim up to a decision — a `critical` whose re-assessment is still queued says so.
 Mention both lines in your final answer, then get back to your work order.
 
