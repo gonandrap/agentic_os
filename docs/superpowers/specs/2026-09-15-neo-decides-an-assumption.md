@@ -72,6 +72,17 @@ is a model that cannot be relied on to volunteer its own doubt.
    earlier and **not a second vocabulary for it**. A match HOLDS: the assumption stays
    pending and the work order stays exactly where it is today, so a false positive costs
    the user precisely what every assumption costs them now.
+
+   **Every entry matches an ACT, not a word** (issue #713). `release`, `live`, `drop`,
+   `migrate` and `schema` are everyday vocabulary in a repo that builds a release tool,
+   and bare word-boundary patterns held the routine assumptions the feature exists to
+   decide — "on the next release", "words under 3 characters are dropped", "not verified
+   against the live CLI". A false positive is cheap ONCE; a net that fires on ordinary
+   engineering prose is indistinguishable from the net being off. One sense-level
+   carve-out sits beside the list (`HIGH_STAKES_SENSE_CARVE_OUTS`): `token` stays bare,
+   because a hard-coded one is a credential, but this OS measures itself in tokens, so
+   the economics sense — input/output/cache/prompt tokens, token count/budget/cost/usage
+   — does not match.
 2. **`stakes`**, which Neo must classify on every answer *separately from its verdict*, and
    which `autoreview.read_ruling` honours **over an acceptance**. A backstop a reviewer can
    wave through is not one — the same argument that makes the child cap override Neo on a

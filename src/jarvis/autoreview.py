@@ -123,21 +123,70 @@ HELD_HIGH_STAKES = "high_stakes"
 #: false negative is the only expensive direction — which is why the list errs wide and why
 #: `read_ruling` is a second net behind it rather than the same one again.
 #:
+#: **EVERY ENTRY MATCHES AN ACT, NOT A WORD** (issue #713). `release`, `live`, `drop`,
+#: `migrate` and `schema` are everyday vocabulary in a repo that builds a release tool, so
+#: bare word-boundary patterns held a large share of ROUTINE assumptions — "on the next
+#: release", "words under 3 characters are dropped", "not verified against the live CLI" —
+#: and a net that holds the routine ones defeats the feature it guards. Erring wide is
+#: still the rule; erring wide on VOCABULARY is not, because it is indistinguishable from
+#: the net being off.
+#:
 #: Word boundaries on both sides: `\bkey\b` must not fire on "monkey", and a substring
 #: match would make the list unreadable as the rule it is meant to be.
 HIGH_STAKES = (
     r"credential|secret|password|\bapi[ -]?key\b|\btoken\b|\bauth\b",
-    r"\bproduction\b|\bprod\b|\blive\b",
-    r"\bdelet|\bdestroy|\bdrop(ped|ping)?\b|\btruncat|\birreversib|\bpurge",
-    r"\bmigrat|\bschema\b|\bbackfill",
+    # `live` only as a live THING; `production`/`prod` name it on their own.
+    r"\bproduction\b|\bprod\b"
+    r"|\blive\s+(?:credential|key|secret|token|data|database|db|environment|env|"
+    r"traffic|system|server|fleet|user|account|customer|instance|deployment|service)"
+    r"|\bgo(?:es|ing|ne)?\s+live\b",
+    # `drop` only with a data object AFTER it — "dropped from the record" is not one.
+    r"\bdelet|\bdestroy|\btruncat|\birreversib|\bpurge"
+    r"|\bdrop(?:s|ped|ping)?\s+(?:(?:the|a|an|all|this|these|its)\s+)?"
+    r"(?:(?!from\b|in\b|into\b|out\b|off\b|on\b|to\b|by\b|for\b|at\b|when\b|"
+    r"during\b|because\b|so\b)\w+\s+){0,2}"
+    r"(?:tables?|columns?|databases?|db|indexe?s?|rows?|records?|data|"
+    r"collections?|buckets?|volumes?)\b",
+    # The noun `migration` IS the act. The verb needs its object, and `schema` needs a
+    # verb: "migrate to the new helper" and "the schema of the reply" are neither.
+    r"\bmigrations?\b|\bbackfill"
+    r"|\bmigrat(?:e|es|ed|ing)\s+(?:(?:the|a|an|all)\s+)?(?:\w+\s+){0,2}"
+    r"(?:database|db|schema|tables?|data|rows?|users?|production|prod)\b"
+    r"|\bschema\s+(?:change|migration|edit|rewrite)|\bchange\s+the\s+schema\b"
+    r"|\balter\s+(?:the\s+)?(?:table|column|schema)|\bALTER\s+TABLE\b"
+    r"|\b(?:add|adds|adding|drop|drops|dropping|rename|renames|renaming)\s+"
+    r"(?:a|the)\s+column\b",
     r"\bbill(ed|ing|s)?\b|\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b|\bspend",
-    r"\bpublish|\bdeploy|\brelease[ds]?\b|\bship(ped|ping)?\b to ",
+    # Shipping something somewhere — not the noun "the next release".
+    r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b|\bdeploy\w*\s+(?:\S+\s+){0,3}?to\b"
+    r"|\b(?:cut|cuts|cutting|ship|ships|shipped|shipping|make|makes|making)\s+"
+    r"(?:a|the|another)\s+release\b"
+    r"|\brelease\w*\s+(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|customers?|"
+    r"the\s+fleet|pypi|npm)\b"
+    r"|\b(?:ship|ships|shipped|shipping|push|pushes|pushed|pushing)\s+"
+    r"(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|customers?|the\s+fleet|"
+    r"main|master|pypi|npm)\b",
     r"\bpii\b|\bgdpr\b|personal data|\bpersonally identifiable",
     r"\blicen[cs]e|\blegal\b|\bcopyright\b",
     r"breaking change|backward(s)? incompatible",
 )
 
+#: THE ONE CARVE-OUT, and it is a sense of a word rather than a word (Neo, question 562).
+#: `token` stays bare — "I hard-coded the token in settings.json" must still be held — but
+#: this repo MEASURES ITSELF IN TOKENS, so every assumption about a cache write or a
+#: prompt's size tripped the credential row. A match that lies entirely inside one of
+#: these spans is not a match. Only `token` has this problem; do not grow the list into a
+#: general excuse register.
+HIGH_STAKES_SENSE_CARVE_OUTS = (
+    r"\b(?:input|output|cached?|cache[ -](?:read|write)|prompt|completion|re-?write|"
+    r"total|context|thinking)\s+tokens?\b",
+    r"\btokens?\s+(?:count|counts|budget|budgets|cost|costs|usage|economics|spend|"
+    r"accounting|limit|limits|per\b|used\b)",
+    r"\b\d+[km]?\s+tokens?\b",
+)
+
 _HIGH_STAKES_RE = re.compile("|".join(HIGH_STAKES), re.IGNORECASE)
+_CARVE_OUT_RE = re.compile("|".join(HIGH_STAKES_SENSE_CARVE_OUTS), re.IGNORECASE)
 
 
 def high_stakes_marker(text: str) -> str:
@@ -147,8 +196,14 @@ def high_stakes_marker(text: str) -> str:
     "held — 'production' is a word the OS does not rule on" is actionable, and "high
     stakes" is not.
     """
-    m = _HIGH_STAKES_RE.search(text or "")
-    return m.group(0) if m else ""
+    text = text or ""
+    carved = [m.span() for m in _CARVE_OUT_RE.finditer(text)]
+    for m in _HIGH_STAKES_RE.finditer(text):
+        start, end = m.span()
+        if any(a <= start and end <= b for a, b in carved):
+            continue
+        return m.group(0)
+    return ""
 
 
 @dataclass(frozen=True)

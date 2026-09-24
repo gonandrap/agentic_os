@@ -145,6 +145,54 @@ def test_ordinary_mechanical_calls_pass_the_net(text):
     assert decide(assumption=assumption(content=text)).armed
 
 
+@pytest.mark.parametrize("text", [
+    # The three observed in production, issue #713.
+    "the lead-edit refusal is on for every project on the next release",
+    "Query words under 3 characters are dropped",
+    "not verified against the live CLI",
+    # The same defect in the rest of the repo's everyday vocabulary.
+    "migrate the call sites to the new helper",
+    "the schema of the JSON reply is unchanged",
+    "dropped from the record once the user acks it",
+    "released the lock before returning",
+    "ship the fix in this PR",
+])
+def test_engineering_prose_is_not_an_act(text):
+    """A WORD IS NOT AN ACT. `release`, `live`, `drop`, `migrate` and `schema` are this
+    repo's daily vocabulary, so bare word patterns held the routine assumptions the
+    feature exists to decide — which is indistinguishable from the net being off."""
+    assert autoreview.high_stakes_marker(text) == ""
+    assert decide(assumption=assumption(content=text)).armed
+
+
+@pytest.mark.parametrize("text", [
+    "hard-coded the API credential in the settings file",
+    "drop the users table and recreate it from the fixture",
+    "deploy to production without waiting for the second review",
+    "delete the backups older than 30 days",
+    "reads the live credentials from the environment",
+    "cut a release once this lands",
+    "migrate the database to the new schema in place",
+])
+def test_the_act_is_still_held(text):
+    """The pair to the above, and the expensive direction: narrowing the patterns to the
+    ACT must not narrow them past the act."""
+    assert decide(assumption=assumption(content=text)).code == \
+        autoreview.HELD_HIGH_STAKES
+
+
+@pytest.mark.parametrize("text, held", [
+    ("the re-write tax re-sends 300k input tokens on every turn", False),
+    ("token usage is reported per turn, not per work order", False),
+    ("the cache-write price is charged on the prompt tokens", True),  # `price`
+    ("I hard-coded the token in settings.json", True),
+])
+def test_the_token_carve_out_is_a_sense_not_a_word(text, held):
+    """`token` stays bare — a hard-coded one is a credential — but this repo MEASURES
+    ITSELF IN TOKENS, so the economics sense is carved out (Neo, question 562)."""
+    assert bool(autoreview.high_stakes_marker(text)) is held
+
+
 SECRET = "reused the production api key rather than minting a second one"
 
 
