@@ -4662,23 +4662,74 @@ class Daemon:
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
                                assumptions: list[dict]) -> None:
-        """One work order's assumptions, each decided on its own. See `auto_review`."""
+        """One work order's assumptions, each decided on its own. See `auto_review`.
+
+        TWO PASSES, one per row, and which one a row takes is decided by the row: an
+        assumption carrying an early verdict is CONFIRMED against the delivered result
+        (spec §7), everything else is asked about for the first time. A work order can
+        hold both kinds at once — §5 judges what it can while the worker runs — so this
+        is per assumption and not per order.
+        """
         from . import autoreview, ops
 
         # ONE read of the round and one of the refusal history for the whole list: both
         # are facts about the ORDER rather than about an assumption, and re-reading them
         # per row would let the validator — running on another thread — change the answer
-        # half way down a list that is meant to be judged against one state.
+        # half way down a list that is meant to be judged against one state. The
+        # outstanding objections are the same kind of fact and are read the same way.
         latest = store.latest_validation_round(wo_id=wo["id"])
         outcome = str((latest or {}).get("outcome") or "")
         answered = ops.refusal_answered(store, wo["id"])
+        objecting = bool(store.outstanding_objections(wo["id"]))
+        packet = None
         for a in assumptions:
+            if str(a.get("provisional_verdict") or ""):
+                decision = autoreview.decide_confirm(
+                    a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
+                    objections_outstanding=objecting)
+                if not decision.armed:
+                    self._note_autoreview_held(store, wo["id"], decision)
+                    continue
+                # LAZILY, and once per work order: collecting evidence runs git and may
+                # reach GitHub, and an order whose every row holds must not pay for it.
+                if packet is None:
+                    packet = self._confirmation_evidence(project, wo, cfg)
+                autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
+                                                assumptions, stat=packet[0],
+                                                diff=packet[1])
+                continue
             decision = autoreview.decide(a, wo, cfg, round_outcome=outcome,
                                          refusal_answered=answered)
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions)
+
+    def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
+                               cfg: Any) -> tuple[str, str]:
+        """The diff the confirmation question carries. `(stat, diff)`, never raising.
+
+        `evidence.collect_work_order` does not raise by contract, and this wraps it
+        anyway: one unreadable repository must not cost the work order its pass, and the
+        failure mode of a throw here is an assumption parked for ever.
+
+        **AN EMPTY DIFF STILL ASKS.** The result summary alone is more than the early
+        pass had, and refusing to confirm because git said nothing would leave a settled
+        verdict unusable on exactly the orders that are hardest to read.
+
+        `cfg.diff_chars` is the project's resolved validation config — the same value and
+        the same spelling `ops.submit_for_validation` passes.
+        """
+        from . import evidence
+
+        try:
+            packet = evidence.collect_work_order(
+                project.path, wo, declared="", diff_chars=cfg.diff_chars)
+            return str(packet.stat or ""), str(packet.diff or "")
+        except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
+            log.exception("[%s] evidence for confirming %s's assumptions failed",
+                          project.name, wo["id"])
+            return "", ""
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False) -> None:
@@ -4706,6 +4757,18 @@ class Daemon:
           decided thing is noise on every work order the user has ever reviewed;
         * `asked` — the question is already filed, which is the pass working.
 
+        **`confirming` JOINS `asked`, for `asked`'s reason**: the confirmation question
+        is filed, which is the pass working, and a line saying the OS declined to decide
+        an assumption it is at that moment putting to Neo would land on every row the
+        feature touches.
+
+        **`objection_in_flight` IS RECORDED, and `objected` with it** (kn-22ba6087: a
+        guard that returns early must still record why). Both are facts about a row the
+        OS looked at and did not act on, which is the opposite of "never a candidate" —
+        and `objection_in_flight` above all, because it means NOT YET: an early verdict
+        with an objection still on a wire, and no other explanation on the record for why
+        nothing has happened to it.
+
         **`settling=True` SUSPENDS ALL FOUR, and the difference is not cosmetic.** Every
         exclusion above rests on "this order was never a candidate" — true of the ask
         pass, which lists `needs_review` and nothing else. The settle site re-runs the
@@ -4719,7 +4782,8 @@ class Daemon:
 
         if not settling and decision.code in (
                 autoreview.HELD_DISABLED, autoreview.HELD_STATUS,
-                autoreview.HELD_SETTLED, autoreview.HELD_ASKED):
+                autoreview.HELD_SETTLED, autoreview.HELD_ASKED,
+                autoreview.HELD_CONFIRMING):
             return
         key = (decision.assumption_id, decision.code)
         for event in store.events_of_kind(wo_id, "autoreview_held"):
@@ -4782,6 +4846,14 @@ class Daemon:
                          if a["id"] == assumption["id"]), assumption)
         ruling = autoreview.read_ruling(verdict,
                                         default_model=self.catalog.os.neo.model)
+        # WHICH PASS THIS VERDICT ANSWERS IS A FACT RECORDED AT ASK TIME, read back off
+        # the link and never re-derived. The work order's live status and the provisional
+        # column both keep changing under a verdict that is already in flight; the
+        # question id does not (spec §7.2).
+        confirming = int(assumption.get("confirm_question_id") or 0) == int(q["id"])
+        prior = {"provisional_verdict": assumption.get("provisional_verdict") or "",
+                 "provisional_reason": assumption.get("provisional_reason") or "",
+                 "provisional_model": assumption.get("provisional_model") or ""}
         if not ruling.accept:
             if not verdict.get("escalate"):
                 # NEO ANSWERED AND THE ANSWER IS NOT WHAT HAPPENS, so `drain_queue` has
@@ -4792,11 +4864,18 @@ class Daemon:
                 # rejection, so it becomes an escalation) and an acceptance this module
                 # overrode on stakes.
                 neo_store.mark(q["id"], "escalated", reason=ruling.reason)
-            pstore.add_event(wo["id"], "autoreview_escalated", {
+            payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
-                "overridden": ruling.overridden})
+                "overridden": ruling.overridden}
+            # An UNCONFIRMED early verdict is not an ordinary escalation and the user
+            # reads the difference: both readings go on the record, what Neo thought
+            # while the work ran and what it thought once it saw the result (§7.3).
+            pstore.add_event(
+                wo["id"], "autoreview_unconfirmed" if confirming
+                else "autoreview_escalated",
+                {**payload, **prior} if confirming else payload)
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
             return
@@ -4820,7 +4899,12 @@ class Daemon:
             numbered, wo, project.validation,
             round_outcome=str((latest or {}).get("outcome") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
-            asked_question_id=int(q["id"]))
+            # On a CONFIRMATION the question being delivered is not the one condition 6
+            # would trip on: `neo_question_id` still points at the early question, so
+            # that is the id to exclude, or every confirmed assumption would be dropped
+            # as "already with Neo" on its own first pass.
+            asked_question_id=int((assumption.get("neo_question_id") or q["id"])
+                                  if confirming else q["id"]))
         if not still.armed:
             # Escalated rather than left `answered`: the assumption is the user's again,
             # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
@@ -4846,6 +4930,15 @@ class Daemon:
             log.exception("accepting assumption %s of %s failed", assumption["id"],
                           wo["id"])
             return
+        if confirming:
+            # BOTH events on one assumption is the designed state, not a duplicate:
+            # `ops._RULING_RANK` already ranks `autoreview_confirmed` above
+            # `autoreview_accepted`, and the user reads that the early reading was put
+            # back to Neo against the diff before anything settled.
+            pstore.add_event(wo["id"], "autoreview_confirmed", {
+                "assumption_id": assumption["id"], "n": numbered.get("n"),
+                "reason": ruling.reason, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"], **prior})
         log.info("auto-review accepted assumption #%s of %s (%s left) — %s",
                  numbered.get("n"), wo["id"], out["pending"], out["status"])
         if not out["settled"]:

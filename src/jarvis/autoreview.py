@@ -112,6 +112,22 @@ HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 
+#: The confirmation pass's own four (spec §7), beside the seven `decide` already has.
+#: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
+#: approved nothing, so no second call is spent on one and the user decides it;
+#: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
+#: retried next tick, which is why it is the one hold here the record still writes down.
+HELD_UNJUDGED = "unjudged"
+HELD_OBJECTED = "objected"
+HELD_CONFIRMING = "confirming"
+HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
+
+#: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
+#: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
+#: and asserts them at the write.
+PROVISIONAL_ACCEPT = "accept"
+PROVISIONAL_OBJECT = "object"
+
 #: THE FIRST NET, and it is deliberately not a taste filter. Every entry is the code form
 #: of a clause `neo.PERSONA` already tells Neo to escalate on — production or live
 #: credentials, spending money, deleting or publishing anything, legal and people matters —
@@ -330,6 +346,62 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                     reason=f"assumption #{n} is routine enough to put to Neo", **fields)
 
 
+def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
+                   round_outcome: str = "", refusal_answered: bool = True,
+                   objections_outstanding: bool = False) -> Decision:
+    """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §7. A provisional approval is an opinion about an intention; at `needs_review` the
+    intention has become a diff and a result summary, and only then may it settle.
+
+    Four gates of its own, then **`decide` itself, unchanged and in full**. A provisional
+    verdict is not a ticket past any of its seven conditions: the early pass judged an
+    intention, so it cannot buy the order past a panel that gave up, a permission the
+    project revoked, or the high-stakes net.
+
+    * no `accept` to confirm — `unjudged` (nothing judged it) or `objected`. An early
+      `object` approved NOTHING, so there is nothing to confirm and no question is asked
+      on one: the user decides it, with the objection in front of them.
+    * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
+      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.**
+    * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
+      Means NOT YET and costs nothing: retried next tick. Without it the two passes race
+      on one assumption, one settling it while the other has a message to the worker in
+      flight about it.
+
+    **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
+    own docstring documents for condition 6. `neo_question_id` points at the EARLY
+    question and always will, so without it every confirmation would hold as "already
+    with Neo" and this pass would never run once.
+    """
+    verdict = str(assumption.get("provisional_verdict") or "")
+    aid = int(assumption.get("id") or 0)
+    n = int(assumption.get("n") or 0)
+    fields = {"assumption_id": aid, "n": n}
+    if not verdict:
+        return _held(HELD_UNJUDGED,
+                     f"assumption #{n} carries no early verdict — there is nothing to "
+                     f"confirm", **fields)
+    if verdict != PROVISIONAL_ACCEPT:
+        return _held(HELD_OBJECTED,
+                     f"Neo objected to assumption #{n} while the work ran — it approved "
+                     f"nothing, so there is nothing to confirm and it is yours",
+                     **fields)
+    confirming = int(assumption.get("confirm_question_id") or 0)
+    if confirming:
+        return _held(HELD_CONFIRMING,
+                     f"assumption #{n} is already with Neo to confirm "
+                     f"(question {confirming})", **fields)
+    if objections_outstanding:
+        return _held(HELD_OBJECTION_IN_FLIGHT,
+                     "an objection on this work order has not reached the worker or "
+                     "been withdrawn yet — confirming is retried once it has", **fields)
+    return decide(assumption, wo, cfg, round_outcome=round_outcome,
+                  refusal_answered=refusal_answered,
+                  asked_question_id=int(assumption.get("neo_question_id") or 0))
+
+
 def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
     """What Neo's reply means for one assumption. PURE — the second of the two nets.
 
@@ -486,6 +558,90 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
         "the user), `stakes` (`routine` or `high`) and a one-line `reason`.",
     ])
+
+
+def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
+                      siblings: list[dict[str, Any]], stat: str, diff: str) -> str:
+    """What the reviewer reads at DELIVERY. Everything the early pass could not have.
+
+    Each block earns its place, and the two new ones are the whole point of the second
+    call (Neo, question 549):
+
+    * **the provisional verdict, its reason and its model, labelled as mid-turn.** The
+      reviewer is being asked to confirm a READING, not to rule from scratch, and one
+      formed with no diff in front of it is evidence rather than authority — saying so is
+      what stops the earlier line being read as a decision already taken.
+    * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
+      and the result summary. This is the fact that did not exist when the assumption was
+      an intention, and confirming without it would be the cheap design Neo refused.
+
+    The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
+    order's title and description, and the siblings through `sibling_line` — the
+    high-stakes net applies to the context list here exactly as it does there, because
+    the net is about text reaching a model, not about which pass is asking.
+
+    The ANSWER SHAPE is `_ruling_question`'s, unchanged, so `read_ruling` reads this
+    reply with both nets armed and no second parser exists to disagree with it.
+    """
+    n = assumption.get("n")
+    others = "\n".join(sibling_line(s) for s in siblings
+                       if s["id"] != assumption["id"]) or "  (none)"
+    return "\n\n".join([
+        f"ASSUMPTION REVIEW — CONFIRM an earlier reading of assumption #{n} of "
+        f"{wo['id']} in {project}, against the result that has now been delivered, and "
+        f"rule on nothing else.",
+        f"# The assumption\n{assumption.get('content') or '(empty)'}",
+        f"# The reading formed WHILE THE WORKER WAS STILL TYPING\n"
+        f"verdict: {assumption.get('provisional_verdict') or '(none)'} "
+        f"(model: {assumption.get('provisional_model') or 'unknown'})\n"
+        f"{assumption.get('provisional_reason') or '(no reason recorded)'}\n"
+        f"That reading had NO diff and NO result summary in front of it. You do.",
+        f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
+        f"{(wo.get('description') or '')[:2000]}",
+        f"# What the worker says it delivered\n"
+        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}",
+        f"# What changed\n{stat or '(no files reported)'}\n\n{diff or '(no diff)'}",
+        f"# The work order's other assumptions, for context only — do not rule on these\n"
+        f"{others}",
+        "You are CONFIRMING that earlier reading against the delivered result. "
+        "Confirming settles this assumption in the user's name; anything else leaves it "
+        "with them, carrying both readings.",
+        "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
+        "to the user), `stakes` (`routine` or `high`) and a one-line `reason`.",
+    ])
+
+
+def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
+                         assumption: dict[str, Any], siblings: list[dict[str, Any]],
+                         *, stat: str = "", diff: str = "") -> dict[str, Any]:
+    """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
+
+    `propose`'s mirror, and the differences are the two that matter: the link is
+    `confirm_question_id` — `neo_question_id` already points at the early question and
+    overwriting it would lose which reading came from where — and the `autoreview_asked`
+    payload carries `confirm: True`.
+
+    **THE PASS IS WRITTEN DOWN AT ASK TIME** (kn-e29d10fe). Re-deriving later from the
+    row ("it has a provisional verdict, so this must have been the confirmation") reads a
+    column that keeps changing under it. §5 writes `early` into the same payload field
+    for the same reason.
+
+    Reuses `QUESTION_KIND` and `ASSUMPTION_REVIEWER_PERSONA`: the persona is per KIND
+    (`neo.py:180`), and a new kind is seven edits in other people's modules
+    (kn-4edb0eb7).
+    """
+    question = neo.ask(project, wo["id"],
+                       _confirm_question(project, wo, assumption, siblings, stat, diff),
+                       context=f"{wo.get('title') or ''}\n"
+                               f"{(wo.get('description') or '')[:800]}",
+                       kind=QUESTION_KIND)
+    store.link_assumption_confirmation(assumption["id"], question["id"])
+    store.add_event(wo["id"], "autoreview_asked", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "neo_question_id": question["id"], "confirm": True})
+    log.info("auto-review asked Neo to confirm assumption #%s of %s as question %s",
+             assumption.get("n"), wo["id"], question["id"])
+    return question
 
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
