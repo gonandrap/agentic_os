@@ -60,7 +60,12 @@ Every clause of the parent spec's §2 holds unchanged and is not reopened:
   reopen"*). A running worker has asked for nothing to be reopened; it is mid-task, and
   telling it something mid-task starts no turn it was not already taking. That distinction
   is the whole licence for this feature, and it evaporates the moment the order is not
-  running — so an objection is never filed against a settled order.
+  running — so an objection is never filed against a settled order, **and an objection
+  already filed but not yet delivered is WITHDRAWN when the order leaves `running`
+  (§6.6) rather than delivered late.** A queued objection that arrives after the worker
+  stopped would start a turn on an order nobody asked to reopen, which is the exact thing
+  the parent spec refused. There is no third option: an undelivered objection is either
+  delivered while the order runs or withdrawn, and one of the two is always recorded.
 * **Both high-stakes nets stay armed, in both passes.** `autoreview.HIGH_STAKES` matched
   against the text before any model call, and `ROUTINE_STAKES` read as an ALLOWLIST on
   the reply. A high-stakes assumption is never judged early, never objected to, and never
@@ -108,7 +113,7 @@ deliver into a receiver that is MID-TURN, between its tool calls, with no new tu
 context re-write. Jarvis workers are already addressable: `dispatch` names each session
 `[WO <id>] <title>`.
 
-Three unknowns, none of them answered by the release notes:
+Four unknowns, none of them answered by the release notes:
 
 1. **Does mid-turn delivery work under `-p`?** Workers are headless.
 2. **Is `SendMessage` — or the inbox socket a `-p` session is said to bind while
@@ -116,6 +121,10 @@ Three unknowns, none of them answered by the release notes:
 3. **Does a delivered message appear in the receiver's transcript?** If it does not,
    `usage.read_session`, `bill` and `jarvis inspect` all go blind on it, and an objection
    that cost tokens would be invisible to every cost surface the OS has.
+4. **Does the receiver learn WHO sent it, and can it refuse an unknown sender?** §6.4
+   requires this: the peer path opens an inbound channel into a running worker, and
+   guidance is the most valuable thing on the machine to be able to forge. A "yes" on
+   unknowns 1–3 with a "no" here still means the peer transport does not ship.
 
 ### 3.3 How to test it so the answer is about the right process
 
@@ -187,14 +196,27 @@ row that predates it).
 | `provisional_ts` | `REAL` | when the early verdict was formed |
 | `provisional_config_version` | `TEXT` | the configuration it was formed under |
 | `confirm_question_id` | `INTEGER` | the SECOND Neo question, asked at delivery (§7) |
-| `objection_msg_id` | `INTEGER` | the `wo_messages` row the objection IS |
+| `objection_envelope_id` | `INTEGER` | the `envelopes` row the objection IS (§6.2) |
 | `objection_transport` | `TEXT NOT NULL DEFAULT ''` | `''` \| `queue` \| `peer` |
 | `objection_sent_ts` | `REAL` | when the OS handed it to the transport |
 | `objection_delivered_ts` | `REAL` | when the worker actually received it, or NULL |
+| `objection_withdrawn_ts` | `REAL` | when the objection was withdrawn undelivered (§6.6) |
 
-`objection_sent_ts` and `objection_delivered_ts` are two facts and not one: the user's
-requirement is to see *how and when it was delivered, and whether it was delivered*, and a
-single boolean cannot say "sent, never arrived" — which is the row that matters most.
+`objection_sent_ts`, `objection_delivered_ts` and `objection_withdrawn_ts` are three facts
+and not one: the user's requirement is to see *how and when it was delivered, and whether
+it was delivered*, and a single boolean cannot tell "sent, still in flight" from "sent,
+never arrived" from "withdrawn, the worker stopped first" — and §9 raises attention on
+exactly one of those three.
+
+**The identity is the ENVELOPE, not the message row, and the reason is timing.**
+`bus.post` returns an envelope id; the `wo_messages` row does not exist until
+`Daemon.deliver_envelopes` resolves that envelope on a later tick, so a
+`objection_msg_id` column could not be filled at the moment the objection is recorded —
+and §6.1 requires the record to be complete before anything is sent. One additive column
+closes the gap for everyone: `envelopes.delivered_msg_id`, in
+`ProjectStore.ADDED_COLUMNS["envelopes"]`, written where `bus.deliver` calls
+`queue_message`. An envelope today cannot say what it became; §8 and §9 both need to
+follow that link, and so will the next reader of the bus.
 
 ### 4.3 Store verbs
 
@@ -203,8 +225,12 @@ Beside `review_assumption`, `link_assumption_question` and `assumption_for_quest
 
 * `record_provisional(assumption_id, *, verdict, reason, model, stakes, config_version)`
 * `link_assumption_confirmation(assumption_id, question_id)`
-* `record_objection(assumption_id, *, msg_id, transport, sent_ts)` and
-  `mark_objection_delivered(assumption_id, ts)`
+* `record_objection(assumption_id, *, envelope_id, transport, sent_ts)`,
+  `mark_objection_delivered(assumption_id, ts)` and
+  `withdraw_objection(assumption_id, ts)`
+* `outstanding_objections(wo_id)` — the assumptions whose objection is neither delivered
+  nor withdrawn. §6.6 withdraws from this list and §7 refuses to run while it is non-empty,
+  so both sections read one query and cannot disagree about what "outstanding" means.
 * `assumption_for_question(question_id)` **must resolve BOTH columns.** It is a single-row
   lookup by question id today and the confirmation question would resolve to nothing.
 * `all_assumptions(wo_id)` carries every new column through, because it is what both
@@ -212,9 +238,10 @@ Beside `review_assumption`, `link_assumption_question` and `assumption_for_quest
 
 ### 4.4 Event kinds and the renderers
 
-Four kinds, added to `ops.AUTOREVIEW_EVENTS` (and `timeline`'s label/debug tables as the
+Five kinds, added to `ops.AUTOREVIEW_EVENTS` (and `timeline`'s label/debug tables as the
 existing ones are) so that no section invents its own: `autoreview_provisional`,
-`autoreview_objected`, `autoreview_confirmed`, `autoreview_unconfirmed`.
+`autoreview_objected`, `autoreview_objection_withdrawn`, `autoreview_confirmed`,
+`autoreview_unconfirmed`.
 
 `ops.assumption_line` and `ops.assumption_decider` are widened here, once. They exist
 because the attribution must have exactly ONE renderer — `work_order.html` says so in a
@@ -282,9 +309,9 @@ that it should write for that reader.
 ### 6.1 Record, then send. Never the other way round
 
 `ops.file_assumption_objection(store, project_path, wo, assumption, *, reason, model,
-question_id) -> dict` returning `{"msg_id", "transport", "sent_ts"}`.
+question_id) -> dict` returning `{"envelope_id", "transport", "sent_ts"}`.
 
-Order of operations, and it is not negotiable: the timeline event and the message row
+Order of operations, and it is not negotiable: the timeline event and the envelope row
 exist in the database BEFORE anything touches a wire. **The objection must never exist
 only on the wire.** A send that fails leaves a complete record of what was said and that
 it did not arrive; a send that succeeds after a crash leaves a worker acting on guidance
@@ -297,6 +324,10 @@ payload=…)`. The bus exists precisely so that no entity addresses another dire
 delivery already rides `store.queue_message` in one transaction, and
 `Daemon.deliver_envelopes` already turns the queue. A direct `queue_message` call is the
 shortcut the bus was built to stop.
+
+`bus.post` returns the ENVELOPE id and nothing else — it never resolves, on purpose — so
+that is what §4.2 stores and what `envelopes.delivered_msg_id` links forward to a
+`wo_messages` row once the daemon turns the queue.
 
 `ReviewFeedback` is the wrong payload — its `round` and `outcome` fields describe a
 validation round and an objection is not one. Add `AssumptionObjection(assumption_n: int,
@@ -317,7 +348,10 @@ two cannot drift.
 
 The queue path ships regardless: record, post to the bus, `transport="queue"`, delivered
 at the next turn boundary by `Daemon.deliver_messages`. This is the whole feature working,
-late.
+late — **and for a headless worker "late" is often "never", because its next turn boundary
+is usually the end of its run.** That is not a defect to be papered over; it is why §6.6
+exists and why the queue path's honest outcome on a short order is a withdrawal rather
+than a late delivery.
 
 If §3 came back positive, the same function delivers via peer messaging when the worker is
 mid-turn — `transport="peer"`, `objection_delivered_ts` stamped from the send's own
@@ -338,12 +372,58 @@ What a test CAN prove is selection and fallback: that a busy worker selects
 §3.3's disabling settings being set — falls back to `transport="queue"` with an identical
 recorded message. Hard-wire the send and the peer half of this section ships unverified.
 
+**The peer path opens an inbound channel into a running worker, and §3 must report whether
+that channel says who is talking.** A worker that accepts a mid-turn message accepts it
+from whatever can reach its inbox socket, and an objection is guidance a worker acts on —
+the most valuable thing on the machine to be able to forge. So §3 answers a fourth
+question alongside its three: **does the receiver learn the sender's identity, and can a
+receiver refuse an unknown one** (`crossSessionInbound`'s `accept` / `hold` / `refuse`)?
+If it cannot, the peer transport does not ship, whatever the delivery trials said — the
+queue path is not a degraded mode here, it is the one whose sender is the daemon by
+construction. If it can, every objection carries a sender the worker can check and the
+worker's briefing tells it to act only on a message from the OS. The standing
+`PreToolUse` allowlist on `SendMessage` is filed on the backlog and is a fleet-wide
+policy, not this feature's to build.
+
 ### 6.5 What the worker did about it
 
 `objection_delivered_ts` says it arrived. What the worker DID is read from the record that
 already exists: the events on the work order's timeline after that timestamp, and any
 later assumption or `wo finish` summary. Nothing new is stored for this; §8 renders it by
 reading forward from the delivery.
+
+### 6.6 An undelivered objection is withdrawn when the order stops running
+
+The one rule for the case §2's licence does not cover, and every other section defers to
+it.
+
+**Trigger.** On a reconcile tick, an assumption is in `outstanding_objections(wo_id)`
+(objection recorded, `objection_delivered_ts` NULL, `objection_withdrawn_ts` NULL) and its
+work order is no longer `running`.
+
+**Action, in this order.** Mark the objection's carrier undeliverable, so it can never
+become a turn: the envelope if it is still `queued`, and the `wo_messages` row it resolved
+to if it already has one, both moved to a **`withdrawn`** state. Then stamp
+`objection_withdrawn_ts` and write `autoreview_objection_withdrawn`, naming the assumption
+and the reason ("the order stopped before it could be delivered"). The message content is
+never erased: withdrawal stops a delivery, it does not unsay the objection, and §8 still
+shows it in full.
+
+`wo_messages.status` gains `withdrawn` beside `queued | delivered | failed`, and that is
+safe in the way §4.1's status change would not have been: every queue reader selects
+`status='queued'`, so a withdrawn row simply stops being deliverable and stops being
+`invariants.stuck_message`'s problem. Whoever does this greps every reader of that column
+and of `envelopes.state` and confirms it, rather than assuming it.
+
+**Belt as well as braces.** `Daemon.deliver_messages` also refuses to deliver an
+`AssumptionObjection` to a work order that is not `running`, and marks it withdrawn there.
+The tick that withdraws and the pass that delivers are two passes over the same rows and
+they race; the delivery side is the one that must lose.
+
+**Never withdraw a delivered objection**, and never withdraw on a status the order can
+come back from within the same tick. The test that matters is the pair: an order that
+stops with an objection still queued ends `withdrawn` and the worker is never sent a turn;
+an order still running keeps it outstanding, however long it has been queued.
 
 ## 7. Confirmation at delivery, before anything settles
 
@@ -356,6 +436,14 @@ refused, on the ground that a mid-turn verdict never had a result summary in the
 place, so "something changed" is always true and the cheap path either degenerates into
 the expensive one or confirms a diff that no model ever read. That would defeat the
 requirement exactly.
+
+**It runs after §6.6, never beside it.** A work order arriving at `needs_review` left
+`running` to get there, so every outstanding objection on it is withdrawn on that same
+transition. The confirmation pass is therefore gated on `outstanding_objections(wo_id)`
+being empty, and a non-empty list means "not yet" and costs nothing: it is retried on the
+next tick, after the withdrawal has run. Without that gate the two passes race on one
+assumption — one settling it while the other still has a message in flight to the worker
+about it — which is the contradiction this ordering exists to remove.
 
 So, when a work order with provisional verdicts reaches `needs_review`:
 
@@ -376,10 +464,19 @@ So, when a work order with provisional verdicts reaches `needs_review`:
    the user's, carrying both readings: what Neo thought while the work ran and what it
    thought once it saw the result.
 
-A provisional verdict of `object` never settles anything here. The worker was told; either
-it acted, in which case the assumption it re-records is a new row judged on its own, or it
-did not, in which case the user sees the objection and the unchanged assumption side by
-side and decides.
+A provisional verdict of `object` never settles anything here, and **no confirmation
+question is asked on one** — there is nothing to confirm, because nothing was ever
+approved. It is the user's, three ways:
+
+* **delivered.** The worker was told; either it acted, in which case the assumption it
+  re-records is a new row judged on its own, or it did not, in which case the user sees the
+  objection and the unchanged assumption side by side and decides.
+* **withdrawn (§6.6).** The worker was never told. The user sees the objection, marked
+  withdrawn, and decides with it in front of them — which is exactly today's behaviour
+  plus Neo's reading, and strictly better than the worker receiving guidance after it
+  stopped.
+* **undeliverable (§9).** The same, and it additionally raises attention, because a
+  transport that failed is a fact about the OS rather than about the assumption.
 
 ## 8. The assumptions view
 
@@ -393,9 +490,12 @@ Per assumption, the user's explicit requirement, in this order:
 1. its text and its status;
 2. Neo's verdict and its reasoning — the provisional one, with its model and timestamp;
 3. **the objection sent to the worker**, in full: how it was delivered (`peer` or
-   `queue`), when it was sent, and whether it was actually delivered. *Every Neo → worker
-   objection is captured and visible here* — that is the user's stated requirement and the
-   acceptance test for this section;
+   `queue`), when it was sent, and which of **four** states it ended in — *in flight*,
+   *delivered at <ts>*, *withdrawn at <ts>, the order stopped first* (§6.6), or
+   *undeliverable* (§9). They are four different things to a user and rendering any two of
+   them the same is the defect. *Every Neo → worker objection is captured and visible
+   here, delivered or not* — that is the user's stated requirement and the acceptance test
+   for this section;
 4. what the worker did in response — read forward from `objection_delivered_ts` (§6.5);
 5. the provisional approval and whether it was confirmed at delivery (§7), or withdrawn.
 
@@ -446,9 +546,22 @@ What is left once #711 has landed, and it is all of it:
   rendered here.** `true_blockers` returns only what the user owes, and its `[0]` IS the
   attention reason — so a state that correctly raises no blocker has no reason line left
   to carry a sentence. That line belongs to §8's assumptions block, which owns it.
-* an assumption whose objection was **sent and never delivered** IS the user's problem,
-  and must raise attention — it is the one new row in this section that adds a blocker
-  rather than removing one.
+* an assumption whose objection is **UNDELIVERABLE** IS the user's problem, and must raise
+  attention — it is the one new row in this section that adds a blocker rather than
+  removing one. **Undeliverable is a state, not an elapsed time**, and the trigger is
+  written so that normal queue operation cannot reach it: the objection's `wo_messages`
+  row is `failed` (`mark_message_failed`, retries exhausted), or its envelope is in a
+  terminal state that is not `delivered`. A peer send that raised is NOT this — it fell
+  back to the queue and the queue is trying.
+
+  Three states explicitly do NOT raise it, and a test asserts each: an objection still
+  `queued` on a running order (this is the normal case for the whole length of a turn, and
+  raising here would reverse part 3 of the brief and light "Needs you" on every objection
+  the OS ever sent); an objection `withdrawn` under §6.6 (nothing failed — the order
+  stopped, which it is allowed to do, and §8 shows it); and `objection_delivered_ts` being
+  NULL by itself, which is the ambiguous fact and must never be read as the trigger. There
+  is deliberately **no deadline**: a timeout would put a clock on how long a worker may
+  think, and the OS has no basis for that number.
 
 `invariants.true_blockers` is the single source of truth and the only place this may be
 done. `check_attention_reason_is_true` (INV-ATTENTION-REASON) REWRITES on the next tick any
@@ -468,10 +581,12 @@ Every row ends where the parent spec's do: the user decides it, as they do today
 | the daemon is down | nothing asks; the assumption stays pending, exactly as now |
 | `os.neo.enabled` is off | no early pass, as with the existing one |
 | `validation.auto_review` is off | no early pass, no objection; this is most of the fleet |
-| the spike failed | `transport="queue"`; the objection arrives at the next turn boundary |
+| the spike failed, or the peer channel cannot identify its sender | `transport="queue"`; the objection arrives at the next turn boundary, or is withdrawn if there is not one |
 | peer send raises | fall back to the queue, same row, `transport` records which was used |
-| the objection is recorded and never delivered | `objection_delivered_ts` is NULL, §9 raises attention, §8 shows it |
-| the worker finishes before the objection lands | the order is not running; no objection is filed, and the queued one is delivered as a turn on a settled order exactly as `wo send` is today |
+| the objection is queued and the worker is still running | nothing: it is in flight, §8 says so, §9 raises nothing |
+| the worker finishes before the objection lands | §6.6 withdraws it: the carrier is marked `withdrawn` and NO turn is ever started on the settled order; §8 shows the objection and that it was withdrawn; §7 asks no confirmation question and the user decides |
+| the objection's carrier fails outright (retries exhausted, or a terminal envelope state) | undeliverable: §9 raises attention, §8 shows it, the assumption is the user's |
+| the order stops between the withdrawal tick and the delivery pass | the delivery pass refuses an objection to a non-`running` order and withdraws it there (§6.6); the two passes race and delivery always loses |
 | Neo's early call fails or will not parse | no provisional verdict; the assumption is judged at `needs_review` as today |
 | Neo objects, the worker ignores it | the assumption is never confirmed early; §7 asks again with the diff, and the user sees both readings |
 | the confirmation call fails | nothing settles; `autoreview_unconfirmed`, the user decides |
