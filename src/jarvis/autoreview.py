@@ -44,6 +44,24 @@ line, and each fails toward the user:
   in force (`assumptions.decided_by`, and §4). `jarvis wo show` must never present a
   machine decision as the user's.
 
+**THE MID-RUN CASE IS JUDGED TOO, AND A MID-RUN VERDICT SETTLES NOTHING.**
+docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+reverses one ruling that used to be in print here: that an assumption recorded mid-run is
+not judged at all. The argument for it — a reviewer would be ruling on an INTENTION, with
+no result summary and no diff — is not overturned, it is answered. `decide_early` arms a
+SECOND pass over `running` orders whose verdict is written to the `provisional_*` columns
+and to nothing else: `assumptions.status` stays `pending`, `ops.accept_assumption` is not
+called, and every caller that reads a pending assumption reads one. What the early pass
+buys is the one thing a verdict on an intention is good for — the worker learns while it
+can still act on it. The settle is still `decide`'s, still at `needs_review`, and a
+provisional approval is re-asked against the diff before it settles (§7).
+
+So the two functions fail in opposite directions and that is why there are two: a wrong
+`decide_early` spends a model call and tells a worker something, a wrong `decide` settles a
+decision that was the user's. **`decide`'s condition 2 is therefore never relaxed** — it is
+the only guard on `ops.accept_assumption` -> `ops.land_when_cleared`, and a running work
+order that got past it would LAND.
+
 The interaction with auto-merge is the whole point and it needs no code: once the
 assumptions are settled they are not pending, so `automerge.decide`'s condition 3 passes on
 its own. That condition is NOT weakened — it still holds on a genuinely pending assumption,
@@ -111,6 +129,11 @@ HELD_PANEL_GAVE_UP = "panel_gave_up"
 HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
+#: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
+#: has already formed a verdict on. Its own token rather than `HELD_SETTLED`, because
+#: `settled` is a fact about the user's decision and this one is explicitly not
+#: (`provisional_verdict` settles nothing — §4.1 of the 2026-09-23 spec).
+HELD_JUDGED = "judged_early"
 
 #: The confirmation pass's own five (spec §7), beside the seven `decide` already has.
 #: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
@@ -471,9 +494,11 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
     1. the project has opted in AND the panel is on (`cfg.auto_review and cfg.enabled`);
     2. the work order is parked in `needs_review` — the one status that means the user
-       owes a decision, and the analogue of `automerge.decide`'s `waiting_pr_merge`. An
-       assumption recorded mid-run is NOT judged: the work it was part of does not exist
-       yet, so a reviewer would be ruling on an intention;
+       owes a decision, and the analogue of `automerge.decide`'s `waiting_pr_merge`. **A
+       mid-run assumption is not SETTLED here and this condition is never relaxed**: the
+       reviewer would be ruling on an intention, and this function is the only guard on
+       the settle path. It is judged PROVISIONALLY instead, by `decide_early`, which
+       writes a verdict that settles nothing;
     3. the assumption is still pending — nobody has settled it;
     4. the PANEL HAS NOT GIVEN UP on this work order. `ops.land_when_cleared` lands an
        `escalated` round, and the only caller that could reach it with one is the user
@@ -600,6 +625,84 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                   asked_question_id=int(assumption.get("neo_question_id") or 0))
 
 
+def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
+                 round_outcome: str = "", refusal_answered: bool = True,
+                 asked_question_id: int | None = None) -> Decision:
+    """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? PURE.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §5.1. `decide`'s shape, its nets and its vocabulary — and a separate function, because
+    the two guard opposite acts. What this one arms is an ASK whose verdict lands in the
+    `provisional_*` columns; what `decide` arms is the settle. Relaxing `decide`'s
+    condition 2 instead of writing this would have let a RUNNING work order reach
+    `ops.accept_assumption` and land behind it, which is the one failure this feature
+    cannot have.
+
+    The conditions, all of which must hold:
+
+    1. the project has opted in AND the panel is on — `decide`'s condition 1 verbatim,
+       asserted here as well as in `Daemon.auto_review` for `two-gates-not-a-chain`'s
+       reason;
+    2. the work order is `running`. Not "is not settled": an order that is `pending`,
+       `blocked` or `waiting_pr_merge` has no worker at a keyboard, so an objection to it
+       would start a turn nobody asked for — the precise act the parent spec refused;
+    3. the assumption is still pending, and
+    4. this pass has not already formed a verdict on it (`provisional_verdict`). One
+       early verdict per assumption: a second would overwrite what the OS thought first,
+       and it is what §7 confirms against;
+    5. the PANEL HAS NOT GIVEN UP, 6. no refusal of the user's is outstanding and 7. it is
+       not already with Neo, each for `decide`'s reason at the same number;
+    8. `high_stakes_marker` finds nothing in its text. **Both nets stay armed in this
+       pass** (§2): the regex before any call, `read_ruling`'s allowlist on the reply.
+
+    `asked_question_id` is here for `decide`'s reason and is unused by any caller today —
+    this pass has no settle site to re-check against, and a second call excluding its own
+    question is what §7 does with `confirm_question_id`. It stays in the signature so the
+    two functions are called the same way, and `None` and `0` mean the same thing.
+    """
+    if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
+        return _held(HELD_DISABLED,
+                     "this project has not given the OS permission to decide its "
+                     "assumptions (`validation.auto_review`)")
+    status = str(wo.get("status") or "")
+    if status != "running":
+        return _held(HELD_STATUS,
+                     f"the work order is {status or 'in no status'}, not running — there "
+                     f"is no worker to tell")
+
+    aid = int(assumption.get("id") or 0)
+    n = int(assumption.get("n") or 0)
+    fields = {"assumption_id": aid, "n": n}
+    if str(assumption.get("status") or "") != "pending":
+        return _held(HELD_SETTLED,
+                     f"assumption #{n} is already {assumption.get('status')}", **fields)
+    if str(assumption.get("provisional_verdict") or ""):
+        return _held(HELD_JUDGED,
+                     f"assumption #{n} already carries an early verdict "
+                     f"({assumption.get('provisional_verdict')})", **fields)
+    if str(round_outcome or "").lower() == "escalated":
+        return _held(HELD_PANEL_GAVE_UP,
+                     "the validation panel gave up and put this work order in front of "
+                     "you — the OS does not rule on its assumptions while it waits for "
+                     "you", **fields)
+    if not refusal_answered:
+        return _held(HELD_REFUSAL_UNANSWERED,
+                     "you refused an assumption on this work order and the worker has "
+                     "not delivered again since", **fields)
+    asked = int(assumption.get("neo_question_id") or 0)
+    if asked and asked != int(asked_question_id or 0):
+        return _held(HELD_ASKED,
+                     f"assumption #{n} is already with Neo (question {asked})", **fields)
+    marker = high_stakes_marker(str(assumption.get("content") or ""))
+    if marker:
+        return _held(HELD_HIGH_STAKES,
+                     f"assumption #{n} mentions {marker!r} — the OS does not decide "
+                     f"those for you, whatever it thinks of them", **fields)
+    return Decision(armed=True, code="armed",
+                    reason=f"assumption #{n} is routine enough to put to Neo while the "
+                           f"worker can still act on it", **fields)
+
+
 def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
     """What Neo's reply means for one assumption. PURE — the second of the two nets.
 
@@ -665,14 +768,24 @@ An assumption is a worker saying: "you did not specify this, I had to decide it,
 is what I chose." Until now every one of them waited for the user. Your job is to take the
 ROUTINE ones off their desk and leave the rest exactly where they are.
 
-YOU HAVE TWO ANSWERS. There is no third.
+YOUR ANSWERS, and which are open to you depends on what the question tells you about
+the work order:
 - ACCEPT — `{"escalate": false, "verdict": "approve", "stakes": "routine", "reason": "…"}`.
   The worker's call is one the user would have made, or one that costs nothing either way.
 - ESCALATE — `{"escalate": true, "verdict": "deny", "stakes": "…", "reason": "…"}`. The
   user decides this one.
-You CANNOT reject an assumption. Rejecting means sending a finished worker back to redo
-work, which is not yours to order. If you think the call was WRONG, escalate and say so in
-`reason` — the user will read it and reject it themselves.
+- OBJECT — `{"escalate": false, "verdict": "deny", "stakes": "routine", "reason": "…"}`,
+  and **only when the question says the work order is STILL RUNNING.** Your `reason` is
+  then delivered to that worker as guidance while it is mid-task.
+
+YOU CANNOT REJECT AN ASSUMPTION AND OBJECTING IS NOT REJECTING. Nothing you answer
+settles anything by itself: an acceptance on a running order is PROVISIONAL and you will
+be asked again once the work exists, and an objection leaves the assumption exactly where
+it was — pending, and the user's to decide. What an objection buys is the one thing a
+ruling on an intention is good for: the worker finds out now instead of building on it for
+the rest of its turn. On a work order that has FINISHED there is no worker to tell, so
+your two answers there are accept and escalate, and a disagreement is an escalation
+carrying your reading.
 
 ACCEPT when the assumption is mechanical or conventional: naming, file layout, test
 placement, comment and docstring style, branch and commit shape, which of two equivalent
@@ -702,9 +815,16 @@ WHEN IN ANY DOUBT, ESCALATE. The cost of escalating wrongly is one review action
 was going to make anyway. The cost of accepting wrongly is a decision they never made,
 shipped in their name.
 
-`reason` is ONE LINE. On an acceptance it says why the call was routine; on an escalation
-it says what the user has to decide. It is read on the work order's record, not by the
-worker — the worker has finished and nothing you say here reaches it.
+RULING ON A RUNNING ORDER MEANS RULING ON AN INTENTION. There is no diff and no result
+summary, because the work does not exist yet; the question says so where the summary would
+be. Judge what the worker says it decided, and if your ruling would turn on a result you
+cannot see, escalate rather than guess.
+
+`reason` is ONE LINE, and WHO READS IT DEPENDS ON YOUR ANSWER. On an acceptance it says
+why the call was routine and the user reads it on the record. On an escalation it says
+what the user has to decide. **On an objection the WORKER reads it, mid-task** — so write
+it to that reader: say what is wrong with the call and what to do instead, in the
+imperative, with no preamble and nothing about the machinery that sent it.
 """
 
 
@@ -731,7 +851,7 @@ def sibling_line(s: dict[str, Any]) -> str:
 
 
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                     siblings: list[dict[str, Any]]) -> str:
+                     siblings: list[dict[str, Any]], *, early: bool = False) -> str:
     """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
 
     The siblings are here because an assumption is sometimes only defensible given
@@ -743,18 +863,35 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
                        if s["id"] != assumption["id"]) or "  (none)"
+    # THE REVIEWER IS TOLD WHICH PASS THIS IS: it decides which answers are open to it
+    # (`ASSUMPTION_REVIEWER_PERSONA`) and who reads its `reason`. "(nothing recorded)"
+    # where the result belongs would read as a worker that delivered nothing, which is a
+    # different and much worse fact than a worker still typing.
+    delivered = (
+        "# THE WORK ORDER IS STILL RUNNING\nThe worker is mid-task: there is no diff and "
+        "no result summary yet, and you are ruling on an intention. Your `reason` reaches "
+        "that worker if you object, and an acceptance here is provisional — you will be "
+        "asked again once the work exists."
+        if early else
+        f"# What the worker says it delivered\n"
+        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}")
+    answers = (
+        "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to OBJECT — "
+        "your `reason` goes to the worker), `stakes` (`routine` or `high`) and a one-line "
+        "`reason`. Set `escalate` true to leave it to the user instead."
+        if early else
+        "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
+        "the user), `stakes` (`routine` or `high`) and a one-line `reason`.")
     return "\n\n".join([
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
         f"# The assumption\n{assumption.get('content') or '(empty)'}",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
         f"{(wo.get('description') or '')[:2000]}",
-        f"# What the worker says it delivered\n"
-        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}",
+        delivered,
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
-        "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
-        "the user), `stakes` (`routine` or `high`) and a one-line `reason`.",
+        answers,
     ])
 
 
@@ -845,7 +982,8 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
 
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
-            assumption: dict[str, Any], siblings: list[dict[str, Any]]) -> dict[str, Any]:
+            assumption: dict[str, Any], siblings: list[dict[str, Any]], *,
+            early: bool = False) -> dict[str, Any]:
     """Put ONE assumption to Neo. Returns the question row.
 
     Idempotency is `assumptions.neo_question_id` and it is checked in `decide` (condition
@@ -853,16 +991,24 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     than a silent `None` — one question per assumption, for its whole life. A question
     that Neo escalated is therefore never re-asked: the user holds it, and asking again
     every reconcile tick would be the OS lobbying them.
+
+    **`early` IS WRITTEN ON THE EVENT, AND THAT IS HOW THE VERDICT IS ROUTED BACK.** The
+    ruling arrives minutes later through the Neo drain, by which time the work order may
+    already have left `running` — and the two passes mean opposite things: an early ruling
+    may only be recorded provisionally, a parked one settles. Live status cannot tell them
+    apart after that race, `kind` is shared deliberately (a new one is seven edits) and
+    neither pass may have a column of its own, so which pass asked is written down where
+    it is known for certain: here. `Daemon._asked_early` reads it back.
     """
     question = neo.ask(project, wo["id"],
-                       _ruling_question(project, wo, assumption, siblings),
+                       _ruling_question(project, wo, assumption, siblings, early=early),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)
     store.link_assumption_question(assumption["id"], question["id"])
     store.add_event(wo["id"], "autoreview_asked", {
         "assumption_id": assumption["id"], "n": assumption.get("n"),
-        "neo_question_id": question["id"]})
+        "neo_question_id": question["id"], "early": early})
     log.info("auto-review asked Neo about assumption #%s of %s as question %s",
              assumption.get("n"), wo["id"], question["id"])
     return question

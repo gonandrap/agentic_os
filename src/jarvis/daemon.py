@@ -54,8 +54,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection, notify,
-               worker_session)
+from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
+               notify, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -345,6 +345,39 @@ CACHE_1H_INBOX_TITLE = {
     inspection.CACHE_1H_FOREIGN_ALARM:
         "Hand-opened Claude sessions are buying the one-hour cache write",
 }
+
+
+def _holds_not_recorded(early: bool) -> tuple[str, ...]:
+    """Which `autoreview` holds this PASS must not write to the timeline.
+
+    **DERIVED PER PASS, NEVER SHARED** (docs/superpowers/specs/2026-09-23-an-assumption-
+    judged-while-the-worker-still-runs.md §5.2). The parked pass suppressed `status` on the
+    stated ground that it was "unreachable from this pass, which lists `needs_review`
+    only" — a sentence about ONE candidate list. A second pass now lists `running` orders,
+    and a suppression list shared between them would carry that justification into a pass
+    it was never true of, hiding a real hold behind an argument for a different one.
+
+    Each entry is a hold the reader would only be told about a mechanism that was never a
+    candidate: the project never opted in, the assumption is already decided, the question
+    is already filed — or, on the early pass, an early verdict already exists, which is
+    that pass working exactly as designed and would otherwise accrue an event per tick for
+    the rest of the worker's run.
+
+    **`status` IS SUPPRESSED ON THE PARKED PASS ONLY**, where the original argument still
+    holds word for word. On the early pass it is recorded: it would mean that pass had
+    listed an order that is not running, which is a defect in this file and the one thing
+    the reader must not have hidden from them.
+
+    **`confirming` IS THE PARKED PASS'S TOO**: the confirmation question is already filed,
+    which is that pass working, and the early pass cannot produce the code at all — only
+    the confirmation branch calls `decide_confirm`.
+    """
+    from . import autoreview
+
+    shared = (autoreview.HELD_DISABLED, autoreview.HELD_SETTLED, autoreview.HELD_ASKED)
+    if early:
+        return shared + (autoreview.HELD_JUDGED,)
+    return shared + (autoreview.HELD_STATUS, autoreview.HELD_CONFIRMING)
 
 
 def escalation_body(reason: str) -> str:
@@ -2549,12 +2582,28 @@ class Daemon:
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
         ids = [m["id"] for m in msgs]
+        anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
         # them has happened yet — and the next tick delivers them into a conversation
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
             return
+        # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
+        # whose last turn died on a background job used to re-enter the identical turn
+        # shape knowing nothing, and the worker backgrounded and signed off again —
+        # twice, on wo-d81fcc15. As a MESSAGE of its own rather than a header wrapped
+        # around the user's, which is what keeps the rule below true (spec §4 of
+        # docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
+        note = background.resume_note(store, wo, msgs)
+        if note:
+            msgs = [{"id": store.queue_message(wo["id"], note,
+                                               source=background.SOURCE),
+                     "content": note, "source": background.SOURCE}, *msgs]
+            # NOT `ids[0]`, which the turn is anchored to below: the cost of a turn is
+            # charged to the ASK, and the ask is the user's message, not the OS's note
+            # about the last one.
+            ids = [m["id"] for m in msgs]
         log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
         store.add_event(wo["id"], "delivering", {"msg_ids": ids})
         # A blank line between messages and nothing else. Anything framing them — a
@@ -2562,7 +2611,7 @@ class Daemon:
         # instruction from the user, and the user wrote none of it.
         text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
+            turn = worker_session.send(store, project, wo, text, msg_id=anchor)
         except budget_mod.BudgetExhausted as e:
             # The messages stay QUEUED, not `failed`: nothing is wrong with them and the
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
@@ -2659,11 +2708,12 @@ class Daemon:
                     # ever do (§3).
                     self._deliver_alarm_verdict(central, pstore, q, verdict)
                 elif q.get("kind") == "assumption":
-                    # Above it for the alarm's reason, and one more of its own: the
-                    # worker this question is about finished long before it was asked,
-                    # so a queued message would start a turn on an order nobody asked to
-                    # reopen — `gates.apply_decision`'s `auto_merge` guard, one authority
-                    # along.
+                    # Above it for the alarm's reason, and one more of its own: this
+                    # branch never messages the worker off the escalate path. A worker
+                    # that has FINISHED must not be sent a turn nobody asked to reopen
+                    # (`gates.apply_decision`'s `auto_merge` guard); a worker still
+                    # RUNNING may be told, and that message is §6's, filed off the
+                    # provisional verdict this records — never from here.
                     self._deliver_assumption_verdict(central, store, pstore, q, verdict)
                 elif verdict["escalate"]:
                     # A headline, never the verbatim question: this row's job is to get
@@ -4080,6 +4130,16 @@ class Daemon:
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 
+            # THE OS SENDS IT BACK ITSELF WHEN IT KNOWS WHY IT STOPPED. A turn that
+            # ended on a background job it had just killed is a stall with a known cure
+            # and a worker still holding the whole conversation, so making the user type
+            # `resume` is the bug rather than the fix (Neo, question 500). Twice, then
+            # this falls through and the work order parks exactly as it always did.
+            # Nothing is re-nudged while the message waits: the `queued_messages` guard
+            # above returns before this on every tick until the turn goes out.
+            if background.nudge(store, fresh):
+                return
+
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
@@ -4638,21 +4698,32 @@ class Daemon:
         #
         # `all_assumptions` once per candidate, reused for the decision, the numbering
         # and the siblings the question carries.
-        candidates = []
-        for wo in store.list_work_orders(statuses=("needs_review",)):
-            rows = store.all_assumptions(wo["id"])
-            if any(a["status"] == "pending" for a in rows):
-                candidates.append((wo, rows))
+        #
+        # TWO PASSES, TWO STATUSES, TWO DECISION FUNCTIONS. The `needs_review` list and
+        # everything it does are exactly as before; the `running` list is the early pass
+        # (docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+        # runs.md §5.2), whose verdict is provisional and settles nothing. A row that
+        # already carries one is skipped here as well as held in `decide_early`, so a
+        # long-running order with judged assumptions costs one query rather than a hold
+        # event per tick.
+        candidates: list[tuple[dict, list[dict], bool]] = []
+        for early, status in ((False, "needs_review"), (True, "running")):
+            for wo in store.list_work_orders(statuses=(status,)):
+                rows = store.all_assumptions(wo["id"])
+                if any(a["status"] == "pending"
+                       and not (early and a.get("provisional_verdict"))
+                       for a in rows):
+                    candidates.append((wo, rows, early))
         if not candidates:
             return
         # A sqlite connection belongs to the thread that made it
         # (`_validate_work_order`'s reason), so it is opened and closed here.
         neo_store = NeoStore()
         try:
-            for wo, assumptions in candidates:
+            for wo, assumptions, early in candidates:
                 try:
                     self._review_assumptions_of(project, store, neo_store, wo, cfg,
-                                                assumptions)
+                                                assumptions, early=early)
                 except Exception:  # noqa: BLE001 — one order must never stop the rest
                     log.exception("[%s] auto-review of %s failed", project.name,
                                   wo["id"])
@@ -4661,14 +4732,20 @@ class Daemon:
 
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
-                               assumptions: list[dict]) -> None:
+                               assumptions: list[dict], *, early: bool = False) -> None:
         """One work order's assumptions, each decided on its own. See `auto_review`.
 
-        TWO PASSES, one per row, and which one a row takes is decided by the row: an
-        assumption carrying an early verdict is CONFIRMED against the delivered result
-        (spec §7), everything else is asked about for the first time. A work order can
-        hold both kinds at once — §5 judges what it can while the worker runs — so this
-        is per assumption and not per order.
+        `early` picks the decision function AND the suppression list, and the two must
+        travel together: `autoreview.decide` guards the settle at `needs_review`,
+        `decide_early` guards an ask on a `running` order, and each pass can reach holds
+        the other cannot.
+
+        Within the PARKED pass a second choice is made per ROW: an assumption that
+        already carries an early verdict is CONFIRMED against the delivered result (spec
+        §7) instead of being asked about for the first time. A work order can hold both
+        kinds at once — §5 judges what it can while the worker runs — so that branch is
+        per assumption and not per order. **The confirmation branch belongs to the parked
+        pass only**: until the work is delivered there is no result to confirm against.
         """
         from . import autoreview, ops
 
@@ -4682,13 +4759,18 @@ class Daemon:
         answered = ops.refusal_answered(store, wo["id"])
         objecting = bool(store.outstanding_objections(wo["id"]))
         packet = None
+        rule = autoreview.decide_early if early else autoreview.decide
+        suppress = _holds_not_recorded(early)
         for a in assumptions:
-            if str(a.get("provisional_verdict") or ""):
+            # `not early` is the third guard on this branch, after `auto_review`'s
+            # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
+            if not early and str(a.get("provisional_verdict") or ""):
                 decision = autoreview.decide_confirm(
                     a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
                     objections_outstanding=objecting)
                 if not decision.armed:
-                    self._note_autoreview_held(store, wo["id"], decision)
+                    self._note_autoreview_held(store, wo["id"], decision,
+                                               suppress=suppress)
                     continue
                 # LAZILY, and once per work order: collecting evidence runs git and may
                 # reach GitHub, and an order whose every row holds must not pay for it.
@@ -4698,18 +4780,21 @@ class Daemon:
                 # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
                 evidence_ok = autoreview.decide_evidence(a, packet[0], packet[1])
                 if not evidence_ok.armed:
-                    self._note_autoreview_held(store, wo["id"], evidence_ok)
+                    self._note_autoreview_held(store, wo["id"], evidence_ok,
+                                               suppress=suppress)
                     continue
                 autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
                                                 assumptions, stat=packet[0],
                                                 diff=packet[1])
                 continue
-            decision = autoreview.decide(a, wo, cfg, round_outcome=outcome,
-                                         refusal_answered=answered)
+            decision = rule(a, wo, cfg, round_outcome=outcome,
+                            refusal_answered=answered)
             if not decision.armed:
-                self._note_autoreview_held(store, wo["id"], decision)
+                self._note_autoreview_held(store, wo["id"], decision,
+                                           suppress=suppress)
                 continue
-            autoreview.propose(store, neo_store, project.name, wo, a, assumptions)
+            autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
+                               early=early)
 
     def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
                                cfg: Any) -> tuple[str, str]:
@@ -4738,7 +4823,8 @@ class Daemon:
             return "", ""
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
-                              decision: Any, *, settling: bool = False) -> None:
+                              decision: Any, *, settling: bool = False,
+                              suppress: tuple[str, ...] | None = None) -> None:
         """Record ONCE, per (assumption, reason), that the OS declined to decide.
 
         `_note_automerge_held`'s reasoning verbatim: the pass runs every reconcile tick
@@ -4751,21 +4837,16 @@ class Daemon:
         themselves, which is what they did for every assumption before this existed, and
         the work order is already on their list carrying `assumptions pending review`.
 
-        FIVE HOLDS ARE NOT RECORDED, and all five are things the reader would be told
-        about a mechanism that was never a candidate — the asymmetry `_note_automerge_held`
-        names, where a missing hold event says nothing and a spurious one is deduped for
-        ever and then rendered:
+        WHICH HOLDS ARE NOT RECORDED IS THE CALLER'S ANSWER AND NOT THIS FUNCTION'S —
+        `_holds_not_recorded` derives it per pass, and every entry is something the reader
+        would be told about a mechanism that was never a candidate (the asymmetry
+        `_note_automerge_held` names, where a missing hold event says nothing and a
+        spurious one is deduped for ever and then rendered). `suppress=None` records
+        everything, which is what the settle site wants.
 
-        * `disabled` — the project never opted in, so its timeline must not carry a line
-          about a mechanism it does not have;
-        * `status` — unreachable from this pass, which lists `needs_review` only;
-        * `settled` — the assumption is decided, and saying the OS declined to decide a
-          decided thing is noise on every work order the user has ever reviewed;
-        * `asked` — the question is already filed, which is the pass working.
-
-        **`confirming` JOINS `asked`, for `asked`'s reason**: the confirmation question
-        is filed, which is the pass working, and a line saying the OS declined to decide
-        an assumption it is at that moment putting to Neo would land on every row the
+        **`confirming` IS SUPPRESSED FOR `asked`'s REASON**: the confirmation question is
+        filed, which is that pass working, and a line saying the OS declined to decide an
+        assumption it is at that moment putting to Neo would land on every row the
         feature touches.
 
         **`objection_in_flight` IS RECORDED, and `objected` and `evidence_secret` with
@@ -4776,21 +4857,18 @@ class Daemon:
         the ONLY thing on the record saying why a work order the feature was switched on
         for is still waiting for a person, and it names the file, never the secret.
 
-        **`settling=True` SUSPENDS ALL FIVE, and the difference is not cosmetic.** Every
-        exclusion above rests on "this order was never a candidate" — true of the ask
-        pass, which lists `needs_review` and nothing else. The settle site re-runs the
+        **`settling=True` SUSPENDS THE WHOLE LIST, and the difference is not cosmetic.**
+        Every exclusion rests on "this order was never a candidate" — true of an ask
+        pass, which lists one status. The settle site re-runs the
         same table against state read after the model call, and there `status` means the
         user CANCELLED the order between the ask and the ruling and `disabled` means they
         revoked the permission. Those are the two the record most needs, and dropping
         them would leave the OS's decision not to act as the one thing it never wrote
         down.
         """
-        from . import autoreview, db
+        from . import db
 
-        if not settling and decision.code in (
-                autoreview.HELD_DISABLED, autoreview.HELD_STATUS,
-                autoreview.HELD_SETTLED, autoreview.HELD_ASKED,
-                autoreview.HELD_CONFIRMING):
+        if not settling and decision.code in (suppress or ()):
             return
         key = (decision.assumption_id, decision.code)
         for event in store.events_of_kind(wo_id, "autoreview_held"):
@@ -4851,6 +4929,15 @@ class Daemon:
         # (`all_assumptions`), so the row fetched by question id does not carry one.
         numbered = next((a for a in pstore.all_assumptions(wo["id"])
                          if a["id"] == assumption["id"]), assumption)
+        if self._asked_early(pstore, wo["id"], int(q["id"])):
+            # THE EARLY PASS ASKED THIS ONE, so its answer may only be RECORDED. Routed
+            # on what the ask wrote down rather than on the status read now: the worker
+            # can finish while Neo thinks, and an early ruling that then settled would
+            # settle a judgement formed with no diff in front of it — the thing §7 exists
+            # to stop. Nothing below this line runs for it.
+            self._record_early_assumption_verdict(neo_store, pstore, wo, numbered, q,
+                                                  verdict)
+            return
         ruling = autoreview.read_ruling(verdict,
                                         default_model=self.catalog.os.neo.model)
         # WHICH PASS THIS VERDICT ANSWERS IS A FACT RECORDED AT ASK TIME, read back off
@@ -4961,6 +5048,76 @@ class Daemon:
                  f"If any of it was wrong: jarvis neo review {q['id']} "
                  f"--correct \"…\" teaches Neo not to do it again.",
             wo_id=wo["id"])
+
+    def _asked_early(self, pstore: ProjectStore, wo_id: str, question_id: int) -> bool:
+        """Was this assumption question filed by the EARLY pass? From the record, not now.
+
+        `autoreview.propose` writes `early` on the `autoreview_asked` event, and this is
+        the read back — see that function for why the fact cannot be re-derived at
+        delivery. Absent on every event written before this feature, which is the honest
+        answer for all of them: those questions were all asked at `needs_review`.
+        """
+        from . import db
+
+        for event in pstore.events_of_kind(wo_id, "autoreview_asked"):
+            payload = db.from_json(event["payload"], {})
+            if int(payload.get("neo_question_id") or 0) == question_id:
+                return bool(payload.get("early"))
+        return False
+
+    def _record_early_assumption_verdict(self, neo_store: Any, pstore: ProjectStore,
+                                         wo: dict, assumption: dict, q: dict,
+                                         verdict: dict) -> None:
+        """Neo's ruling on an assumption it was asked about mid-run. Settles NOTHING.
+
+        docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs
+        .md §5.3. Two of the three outcomes are written to the `provisional_*` columns and
+        the third is exactly today's behaviour:
+
+        * an ACCEPTANCE is provisional — §7 re-asks it against the diff before anything
+          settles, and until then the assumption is byte-for-byte a pending one;
+        * a DISAGREEMENT is recorded as `object` and **that is where this stops.** Turning
+          it into a message the worker receives is §6's, off the column: one hook, in one
+          place, so the drain cannot file twice;
+        * anything else — escalated, unparseable, a stakes the OS cannot read as routine,
+          a model that was never reached — records NO provisional verdict, leaves the
+          assumption pending and puts it in front of the user with Neo's reading, which is
+          what it did before this feature existed. An early pass that cannot form a
+          verdict costs nothing and changes nothing.
+
+        **`overridden` IS NOT AN OBJECTION.** `read_ruling` returns the same `accept=False`
+        for "Neo declined" and "Neo accepted and the stakes net would not take it", and
+        both nets stay armed in this pass (§2): a high-stakes assumption is never objected
+        to, so the `stakes` allowlist is asked here as well and an override escalates.
+        """
+        from . import autoreview, ops
+
+        ruling = autoreview.read_ruling(verdict,
+                                        default_model=self.catalog.os.neo.model)
+        objected = (not ruling.accept and not ruling.overridden
+                    and not verdict.get("escalate")
+                    and ruling.stakes in autoreview.ROUTINE_STAKES)
+        if not (ruling.accept or objected):
+            if not verdict.get("escalate"):
+                # `_deliver_assumption_verdict`'s branch, for its reason: Neo answered and
+                # the answer is not what happens, so the record has to say whose this is.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+            pstore.add_event(wo["id"], "autoreview_escalated", {
+                "assumption_id": assumption["id"], "n": assumption.get("n"),
+                "reason": ruling.reason, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"],
+                "overridden": ruling.overridden, "early": True})
+            log.info("early review left assumption #%s of %s with the user: %s",
+                     assumption.get("n"), wo["id"], ruling.reason)
+            return
+        ops.record_provisional_verdict(
+            pstore, wo, assumption,
+            verdict="accept" if ruling.accept else "object",
+            reason=ruling.reason, model=ruling.model, stakes=ruling.stakes,
+            question_id=int(q["id"]))
+        log.info("early review judged assumption #%s of %s provisionally %s — %s",
+                 assumption.get("n"), wo["id"],
+                 "accept" if ruling.accept else "object", ruling.reason)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
                             wo: dict, decision: Any) -> None:

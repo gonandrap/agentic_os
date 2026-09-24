@@ -417,6 +417,13 @@
       {%- set line = turn_lines.get(turn.msg_id) %}
       {%- if line %} · <span class="mono">{{ bill_ui.money(line.cost.list_usd) }}
         · {{ fmt_tok(line.tokens.total) }} tokens</span>{% endif %}</div>
+    {# ABOVE the words, never instead of them: the record is what the worker said, and
+       this is what the OS found out afterwards. Spec §3 of
+       docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md. #}
+    {# `kv` and not `st`: a status line is `white-space: nowrap`, and this is a
+       sentence — clipped at the panel edge it would lose the half that says the job
+       is dead. #}
+    {% if turn.void %}<p class="kv tone-warn">{{ turn.void }}</p>{% endif %}
     <div style="white-space: pre-wrap;">{{ turn.content }}</div>
     {% if line %}
     <details style="margin-top: 6px;">
