@@ -346,3 +346,37 @@ def test_a_question_neo_has_answered_leaves_nothing_to_diagnose(started, project
 
     assert result["waiting_on"] == "queued_message"
     assert result["nudged"] is False
+
+
+def a_child_of_an_unratified_plan(store, *, status: str) -> tuple[str, str]:
+    """`(child id, planner id)` — a feature whose planner owes the user a decision.
+
+    docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.3.
+    """
+    fo = store.create_feature_order("CSV export", description="an exporter")
+    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
+    kid = store.create_work_order("build it", parent_id=fo["id"], status=status)
+    store.add_assumption(planner["id"], "the exporter writes CSV, not JSON")
+    return kid["id"], planner["id"]
+
+
+def test_resume_auto_names_the_plan_hold(started, project):
+    """"not dispatched yet" and "nothing is running to nudge" are both true and useless:
+    the way through is a ruling on the PLANNER, so the diagnosis names it."""
+    store = ProjectStore(project)
+    kid_id, planner_id = a_child_of_an_unratified_plan(store, status="pending")
+
+    result = ops.resume_in_auto(kid_id)
+
+    assert result["waiting_on"] == "plan_assumptions"
+    assert result["nudged"] is False
+    assert planner_id in result["diagnosis"]
+    assert f"jarvis wo review {planner_id}" in result["diagnosis"]
+
+    # ...and the child parked behind the MERGE hold, which the catch-all would answer.
+    parked_id, _ = a_child_of_an_unratified_plan(store, status="waiting_pr_merge")
+    parked = ops.resume_in_auto(parked_id)
+
+    assert parked["waiting_on"] == "plan_assumptions"
+    assert "nothing is running to nudge" not in parked["diagnosis"]

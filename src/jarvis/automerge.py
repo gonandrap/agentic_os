@@ -87,6 +87,11 @@ MERGE_TIMEOUT = 60
 HELD_DISABLED = "disabled"
 HELD_STATUS = "status"
 HELD_ASSUMPTIONS = "assumptions"
+#: ITS OWN CODE, never folded into `HELD_ASSUMPTIONS`: the dedupe key above would drop
+#: the second of the two as a repeat of the first, and the user's command differs —
+#: `jarvis wo review <this order>` against `<the planner>` (spec
+#: docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4).
+HELD_PLAN_ASSUMPTIONS = "plan_assumptions"
 HELD_NOT_PASSED = "not_passed"
 HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
@@ -161,7 +166,8 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
 
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
            *, validated_head: str | None,
-           pending_assumptions: bool = False) -> Decision:
+           pending_assumptions: bool = False,
+           plan_assumptions: str = "") -> Decision:
     """May the OS merge this pull request right now? PURE — no store, no clock, no `gh`.
 
     Dicts and one `github.PullRequest` in, armed-or-held-with-a-reason out. Pure for
@@ -176,7 +182,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
 
     1. the project has opted in AND the panel is on (`cfg.auto_merge and cfg.enabled`);
     2. the work order is parked in `waiting_pr_merge`;
-    3. it owes the user no assumption decision;
+    3. it owes the user no assumption decision — nor does the PLAN it implements, when
+       it is a feature's child (`ProjectStore.plan_hold`, spec §2.4);
     4. `ProjectStore.validated_head` yields a commit — which is one fact, not two: the
        latest round settled `passed` AND it recorded which commit it judged;
     5. that commit IS the live head;
@@ -219,6 +226,14 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         return _held(HELD_ASSUMPTIONS,
                      "an assumption is still waiting for the user, and the machine does "
                      "not merge over a decision a person owes")
+    # Directly after the order's OWN decision, which is the more specific fact about the
+    # artifact in hand. A planner id rather than a bool so the reason can name the work
+    # order the user has to review, and `decide` stays pure (spec §2.4).
+    if plan_assumptions:
+        return _held(HELD_PLAN_ASSUMPTIONS,
+                     f"the plan this work order implements is still waiting on you — "
+                     f"assumptions on {plan_assumptions}, and the machine does not "
+                     f"merge over a decision a person owes")
 
     outcome = str((round_row or {}).get("outcome") or "")
     n = int((round_row or {}).get("round") or 0)
@@ -280,7 +295,8 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
 
 
 def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any,
-                        cfg: Any, *, pending_assumptions: bool = False) -> bool:
+                        cfg: Any, *, pending_assumptions: bool = False,
+                        plan_assumptions: str = "") -> bool:
     """Would this pull request merge right now if a round had judged the head it has?
 
     PURE, and it re-derives no condition: it asks `decide` the same question with the
@@ -293,12 +309,18 @@ def only_the_head_moved(round_row: dict[str, Any] | None, wo: dict[str, Any], pr
     Substituting the head satisfies conditions 4 and 5 by construction, so on any other
     hold this would answer about a round that never passed — `HELD_NOT_PASSED` is a
     verdict the panel meant to stand, and nothing here may read it as a near miss.
+
+    `plan_assumptions` is unreachable in practice — the plan hold returns before the sha
+    checks, so `HELD_SHA_MOVED` cannot be the code — and is taken beside its neighbour
+    anyway: the OS must not open a fresh validation round on behalf of a plan the user
+    has not ratified (spec §2.4).
     """
     head = str(pr.head_oid or "")
     if not head:
         return False
     return decide(round_row, wo, pr, cfg, validated_head=head,
-                  pending_assumptions=pending_assumptions).armed
+                  pending_assumptions=pending_assumptions,
+                  plan_assumptions=plan_assumptions).armed
 
 
 def merge_command(pr_url: str, sha: str) -> str:

@@ -1200,6 +1200,16 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "validating", "stalled": False,
                 "detail": f"the validation panel is judging it — the verdict settles "
                           f"the work order by itself{round_note}"}
+    # ABOVE both catch-alls below, which answer "not dispatched yet — no worker exists to
+    # nudge" and "nothing is running to nudge": true, useless, and confidently wrong about
+    # the way through. A nudge cannot move this; the user's ruling on the PLANNER can, so
+    # `stalled` stays False (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.3).
+    hold = store.plan_hold(wo)
+    if hold:
+        return {"what": "plan_assumptions", "stalled": False,
+                "detail": f"its feature's plan is waiting on you — {hold['n']} "
+                          f"assumption(s) on {hold['planner_id']}; "
+                          f"`jarvis wo review {hold['planner_id']}`"}
     if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
@@ -2394,8 +2404,31 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
-    return [{**a, "os_ruling": newest.get(int(a.get("id") or 0))}
+    rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0))}
             for a in store.all_assumptions(wo_id)]
+    # Children of this plan that have already landed, for the rows that are still the
+    # user's. Only when something is pending and this order is a planner, so every other
+    # call costs nothing (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.6).
+    over = (_overtaken(store, wo_id)
+            if any(str(a.get("status") or "") == "pending" for a in rows) else None)
+    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None}
+            for a in rows]
+
+
+def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
+    """`{"merged": n, "of": m}` when children of the plan this planner produced have
+    already landed, else None.
+
+    From the TIMELINE, never from `work_orders.pr_state` — kn-dbc4971d, that column is
+    stale by construction. `pr_merged` is written by `complete_merged`, the single
+    close-out for a hand-merge and an auto-merge alike, so one read covers both routes.
+    """
+    fo = store.feature_order_for_planner(wo_id)
+    if fo is None or fo.get("plan_wo_id") != wo_id:
+        return None
+    children = store.feature_children(fo["id"])
+    merged = sum(1 for c in children if store.events_of_kind(c["id"], "pr_merged"))
+    return {"merged": merged, "of": len(children)} if merged else None
 
 
 def assumption_ruling_line(a: dict[str, Any]) -> str:
@@ -2432,6 +2465,20 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     # Every other early-pass kind is already on the ROW — `provisional_line` and
     # `objection_line` read columns, which outlive an event and cannot go stale.
     return ""
+
+
+def overtaken_line(a: dict[str, Any]) -> str:
+    """CHILDREN OF THIS PLAN THAT ALREADY MERGED, in one line, or `''`. Pure, both
+    surfaces.
+
+    The fact the user needs in order to rule, never a ruling: the assumption stays
+    pending, and what changes is what a rejection now costs them (spec §2.6).
+    """
+    over = a.get("overtaken") or {}
+    if not over:
+        return ""
+    return (f"{over['merged']} of {over['of']} children have already merged — rejecting "
+            f"this now means a follow-up fix, not an unwind")
 
 
 def _stamp(ts: Any) -> str:
@@ -2503,7 +2550,7 @@ def assumption_line(a: dict[str, Any]) -> str:
     content = str(a.get("content") or "")
     if status == "pending":
         parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
-                             objection_line(a)) if p]
+                             objection_line(a), overtaken_line(a)) if p]
         return (f"#{n} pending your review: {content}"
                 f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()

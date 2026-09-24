@@ -254,6 +254,10 @@
             and a.os_ruling.neo_question_id %}
         · <a href="/neo/question/{{ a.os_ruling.neo_question_id }}">question →</a>
         {%- endif %}</div>{% endif %}
+      {# Children of this plan that merged while the question waited. What a rejection
+         now costs, so the user can rule knowing it. #}
+      {% set overtaken = overtaken_line(a) %}
+      {% if overtaken %}<div class="sub">{{ overtaken }}</div>{% endif %}
     </div>
     {% if a.status != 'pending' %}
     {# WHO decided it, never just THAT it was decided: the OS can settle one itself now,

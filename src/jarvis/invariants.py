@@ -1076,6 +1076,16 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
+    # ABOVE the dependency and slot labels, inverting their order: those two clear
+    # themselves, and this one clears only when a person rules on the plan. Of the three
+    # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
+    # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
+    hold = store.plan_hold(wo)
+    if hold:
+        n = hold["n"]
+        return (f"pending — blocked by {hold['fo_id']}'s plan ({n} "
+                f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
+                f"review — `jarvis wo review {hold['planner_id']}`)")
     blockers = store.unfinished_dependencies(wo["id"])
     if blockers:
         return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
