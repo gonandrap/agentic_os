@@ -3297,7 +3297,8 @@ class Daemon:
 
         `waiting_input` is in `OPEN_STATUSES` and belongs here on purpose — an order
         parked behind a message nobody will send is exactly what `waiting-on-nobody`
-        exists to catch, and it is invisible to every cost heuristic.
+        exists to catch, and it is invisible to every cost heuristic. It is swept on the
+        longer window rather than dropped, which is why `due` is handed the status (§4.2).
         """
         from . import health
 
@@ -3321,7 +3322,8 @@ class Daemon:
             attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
                                  float(row.get("created_at") or 0.0),
-                                 last_attempt=attempt)
+                                 last_attempt=attempt,
+                                 status=str(row.get("status") or ""))
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])

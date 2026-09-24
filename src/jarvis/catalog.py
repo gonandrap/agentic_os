@@ -914,6 +914,10 @@ DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES = 30
 #: worth looking at (§4's `stale` clause).
 DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES = 720
 
+#: The same window for a unit parked waiting on a human (`health.PARKED_STATUSES`), where
+#: the fingerprint cannot move and the stale clause therefore IS the cadence — §4.2.
+DEFAULT_SUPERVISOR_HEALTH_PARKED_STALE_MINUTES = 2880
+
 #: The per-tick ceiling: the sweep is the standing cost of watching, so it is bounded
 #: before it is enabled rather than after a bill arrives.
 DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK = 4
@@ -978,6 +982,7 @@ class SupervisorConfig:
     health_every_ticks: int = DEFAULT_SUPERVISOR_HEALTH_EVERY_TICKS
     health_min_interval_minutes: int = DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES
     health_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES
+    health_parked_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_PARKED_STALE_MINUTES
     health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
     max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
     probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
