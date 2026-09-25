@@ -2243,11 +2243,23 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     The exception is `automerge_merged`: nothing follows a merge, so it wins over
     anything later. Nothing writes a later row today; it is asserted rather than assumed
     because the cost of being wrong is a completed work order claiming to be held.
+
+    **AND A REFUSAL IS STICKY FOR THE COMMIT IT JUDGED** — spec 2026-09-24 fix 4a. One
+    tick of GitHub answering `mergeable: UNKNOWN` wrote a hold stamped after a denial, and
+    `Daemon._note_automerge_held` dedupes per (sha, code, reason) so no newer row ever
+    overtook it back: the line said the merge was held on mergeability, for ever, over a
+    reviewer's refusal. A verdict is a permanent fact about one commit and a hold a
+    transient one, so the transient must not bury it — but only about the SAME commit: a
+    hold on a different head means the head moved, which is a new submission the denial
+    does not describe. An APPROVAL gains no stickiness at all, which is the case the
+    paragraph above exists for.
     """
     from . import db
+    from .automerge import decided_sha
 
     newest: dict[str, Any] | None = None
     terminal: dict[str, Any] | None = None
+    decided: dict[str, Any] | None = None
     for kind in AUTOMERGE_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
         if not rows:
@@ -2258,8 +2270,16 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
                      "kind": kind, "ts": float(rows[-1]["ts"])}
         if kind == AUTOMERGE_TERMINAL:
             terminal = candidate
-        elif newest is None or candidate["ts"] > newest["ts"]:
-            newest = candidate
+        else:
+            if kind == "automerge_decided":
+                decided = candidate
+            if newest is None or candidate["ts"] > newest["ts"]:
+                newest = candidate
+    if (newest is not None and newest["kind"] == "automerge_held"
+            and decided is not None and decided.get("decision") != "approved"
+            and decided_sha(decided)
+            and decided_sha(decided) == str(newest.get("head_sha") or "")):
+        newest = decided
     newest = terminal or newest
     if newest is None:
         return None

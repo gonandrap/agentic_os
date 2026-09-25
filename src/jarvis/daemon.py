@@ -4616,7 +4616,9 @@ class Daemon:
             neo_store = NeoStore()
             try:
                 automerge.propose(store, neo_store, project.name, wo, decision,
-                                  checks=tuple(c["name"] for c in pr.checks))
+                                  # Whole, with each conclusion — spec 2026-09-24 fix 2.
+                                  checks=pr.checks,
+                                  protection=self._protection_fact(project, pr))
             finally:
                 neo_store.close()
             return
@@ -5193,6 +5195,29 @@ class Daemon:
                      project.name, wo["id"], out["judged_sha"][:10],
                      out["head_sha"][:10], out["round"])
 
+    def _protection_fact(self, project: ProjectSpec, pr: Any) -> str:
+        """What the merge request may say about branch protection. `""` says nothing.
+
+        docs/superpowers/specs/2026-09-24-an-auto-merge-request-that-proves-itself.md
+        fix 3, branch A (Neo question 601). Read on the tick that PROPOSES — once per
+        judged commit, guarded by `latest_approval_for` — so the extra round trip is not
+        on the two-minute path. AN UNREADABLE PROTECTION API BLOCKS NOTHING: the request
+        is still filed, saying only that the OS could not read it.
+        """
+        from . import automerge, github
+
+        owner_repo = github.origin_repo(project.path)
+        if owner_repo is None or not pr.base_ref:
+            return ""
+        try:
+            protection = github.branch_protection(owner_repo, pr.base_ref,
+                                                  cwd=project.path)
+        except github.GitHubError as exc:
+            log.info("[%s] branch protection on %s unreadable: %s", project.name,
+                     pr.base_ref, exc)
+            protection = automerge.PROTECTION_UNREADABLE
+        return automerge.protection_fact(protection, pr.base_ref)
+
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
         """Record ONCE, per (commit, reason), that the OS declined to merge.
@@ -5216,7 +5241,10 @@ class Daemon:
         **DELIBERATELY NOT AN ATTENTION ITEM.** A held auto-merge means the user merges
         this one by hand, which is what they did for every pull request before this
         existed. A heal-loop push invalidating a pass is ordinary, and the attention list
-        is not a place to put ordinary.
+        is not a place to put ordinary. TRUE OF A HOLD ONLY: a hold is transient and the
+        next tick may clear it, while a reviewer's REFUSAL is final for a commit nothing
+        re-proposes and is flagged by `invariants.automerge_denied` (spec 2026-09-24
+        fix 4b).
 
         **TWO HOLDS ARE NOT RECORDED**, and they are the two `Daemon.auto_merge` already
         returned on, so neither is reachable from the poll. They are dropped here as well

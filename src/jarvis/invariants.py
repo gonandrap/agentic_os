@@ -288,8 +288,10 @@ REJUDGE_DECLINED_EVENT = "validation_rejudge_declined"
 #: What a work order says when its pull request is green and mergeable, its verdict names
 #: an older commit, and the OS has run out of rounds to bind a new one with. THE ONLY
 #: `sha_moved` STALL THAT REACHES THE USER: every other one the OS now re-judges itself,
-#: silently, which is why a held auto-merge is still deliberately not an attention item
-#: (`Daemon._note_automerge_held`).
+#: silently, which is why a HELD auto-merge is still deliberately not an attention item
+#: (`Daemon._note_automerge_held`). A hold is transient — the next tick may clear it — and
+#: a REFUSAL is not: it is a reviewer's final answer about a commit nothing will re-propose,
+#: and AUTOMERGE_DENIED_BLOCKER below is its attention item (spec 2026-09-24 fix 4b).
 #:
 #: Re-derived below from the timeline rather than raised where the decline is written —
 #: kn-089de524: a flag written on a reconciler's path re-raises itself every tick and
@@ -298,6 +300,29 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "to bind a new one — merge it yourself, re-judge it "
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
+
+#: What a work order says when the reviewer REFUSED the automatic merge of the commit the
+#: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
+#: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
+#: row `automerge.record_verdict` writes is a notification, not a flag.
+#:
+#: NAMES THE REFUSAL, not the absent merge, and ends with all three routes — they answer
+#: three different situations: the reviewer was over-cautious, the reviewer was right
+#: about the code, and the pull request is one nobody will land.
+#:
+#: NAMES NO REFUSER: the attribution already rides on the record, in `ops._automerge_line`'s
+#: "{decision} by {by}" for `automerge_decided`, and the two verdict paths have different
+#: deciders — Neo deciding, and the USER denying a request Neo escalated write the same row,
+#: so naming one here would tell the user Neo refused their own decision.
+#:
+#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on PARKED_BLOCKER's rule: `ack_attention`
+#: stores this verbatim and INV-ATTENTION-REASON compares it, so a reason that ticked or
+#: that named a commit could never be acknowledged.
+AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepted was "
+                            "refused, so nothing will land this pull request by itself "
+                            "— merge it by hand, push a fix and re-judge it "
+                            "(`jarvis validation force`), or close it with "
+                            "`jarvis wo done`")
 
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
@@ -510,6 +535,48 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
         store.latest_validation_round(wo_id=wo["id"])) != head
 
 
+def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Was this order's automatic merge REFUSED, on the commit the panel still names?
+
+    Shaped on `rejudge_exhausted` above and derived for the same reason: `record_verdict`
+    runs on the daemon's verdict-delivery arm, so a flag written there re-raises itself
+    every tick over `jarvis wo ack` (kn-089de524). Spec 2026-09-24 fix 4b.
+
+    THREE FACTS. The newest verdict is `denied` or `dismissed` — both, because `apply`
+    refuses on anything but `approved`, so a dismissal stalls the order exactly as a
+    denial does while meaning the reviewer reached for the wrong verb. The commit that
+    verdict was bound to is still the one the panel's verdict names, read from the single
+    source `decide` is forbidden to re-derive. And nothing has moved past it: a
+    `sha_moved` hold newer than the verdict, on a different commit, is a push, and the
+    re-judge path owns the order from there — which is what makes the flag self-clearing
+    within a tick rather than permanent.
+
+    An ESCALATED request writes no `automerge_decided` row and reaches the user through
+    `store.escalated_approvals` above, so it is never double-flagged.
+    """
+    from .automerge import decided_sha
+
+    decided = store.events_of_kind(wo["id"], "automerge_decided")
+    if not decided:
+        return False
+    verdict = db.from_json(decided[-1]["payload"], {})
+    if str(verdict.get("decision") or "") not in ("denied", "dismissed"):
+        return False
+    sha = decided_sha(verdict)
+    # A row carrying neither `head_sha` nor a command to parse one from is not a verdict
+    # anyone can act on: it predates the record this flag depends on, and is ignored.
+    if not sha or store.validated_head(
+            store.latest_validation_round(wo_id=wo["id"])) != sha:
+        return False
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if held and float(held[-1]["ts"]) > float(decided[-1]["ts"]):
+        newest = db.from_json(held[-1]["payload"], {})
+        if (str(newest.get("code") or "") == HELD_SHA_MOVED
+                and str(newest.get("head_sha") or "") != sha):
+            return False
+    return True
+
+
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's?
 
@@ -659,6 +726,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
+    # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
+    # Gated on the status for the same reason as the branch above, and ordered after it
+    # documentarily: the two cannot both be true — that one needs the newest hold to be
+    # `sha_moved` on the judged head, this one needs no such hold.
+    if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
+        blockers.append(AUTOMERGE_DENIED_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
