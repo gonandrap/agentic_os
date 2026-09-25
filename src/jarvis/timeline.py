@@ -334,6 +334,12 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         by = f" by {p['by']}" if p.get("by") else ""
         return (f"The {p.get('remedy') or 'proposed'} remedy was refused{by}",
                 p.get("reason") or "")
+    # The analyst's terminal action (`ops.submit_findings`). Labelled here because an
+    # unlabelled kind renders as a bare string beside a JSON blob — kn-3f133363.
+    if kind == "findings_submitted":
+        n = p.get("findings")
+        return ("Findings submitted",
+                f"{n} finding(s) on {p.get('improvement_order') or ''}".strip())
     if kind == "assumption":
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
