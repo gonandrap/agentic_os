@@ -4583,15 +4583,23 @@ class Daemon:
         # hold is deduped for ever on a reason that was never true.
         round_row = store.latest_validation_round(wo_id=wo_id)
         pending = bool(store.pending_assumptions(wo_id))
+        # ONE read, passed to both readers below — `round_row`'s discipline, for the same
+        # reason: a second read can disagree with the first by a microsecond and produce
+        # a hold that was never true, deduped for ever
+        # (docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md
+        # §2.4). Nothing is poked when it clears: the next poll re-decides from scratch.
+        hold = store.plan_hold(wo)
+        plan_assumptions = str((hold or {}).get("planner_id") or "")
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
-            pending_assumptions=pending)
+            pending_assumptions=pending, plan_assumptions=plan_assumptions)
         if not decision.armed:
             self._note_automerge_held(store, wo_id, decision)
             if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and automerge.only_the_head_moved(round_row, wo, pr, cfg,
-                                                      pending_assumptions=pending)):
+                    and automerge.only_the_head_moved(
+                        round_row, wo, pr, cfg, pending_assumptions=pending,
+                        plan_assumptions=plan_assumptions)):
                 self._rejudge_moved_head(project, store, wo, decision)
             return
         if record_only:

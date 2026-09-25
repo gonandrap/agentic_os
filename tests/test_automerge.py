@@ -1198,6 +1198,94 @@ def test_a_user_merging_by_hand_is_unaffected_and_still_completes_the_order(
     assert store.events_of_kind(wo["id"], "automerge_merged") == []
 
 
+# -- the plan behind the work order -----------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.4. A
+# child owing nothing itself must not land the plan it implements while the plan is
+# unratified.
+
+
+PLANNER = "wo-9f8e7d6c"
+
+
+def under_an_unratified_plan(store, wo, *, assumptions: int = 1) -> str:
+    """Make this work order a child of a feature whose planner owes a decision."""
+    fo = store.create_feature_order("CSV export", description="an exporter")
+    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
+    store.update_work_order(wo["id"], parent_id=fo["id"])
+    for i in range(assumptions):
+        store.add_assumption(planner["id"], f"the exporter writes CSV ({i})")
+    return planner["id"]
+
+
+def test_a_plan_assumption_holds_the_merge():
+    decision = decide(rnd(), plan_assumptions=PLANNER)
+    assert not decision.armed and decision.code == automerge.HELD_PLAN_ASSUMPTIONS
+    assert PLANNER in decision.reason
+
+
+def test_the_plan_hold_is_not_the_orders_own_assumption_hold():
+    """`_note_automerge_held` dedupes on (head sha, code, reason), so folding the two
+    would drop the second — kn-0aba30f0, issue #263. And the user's command differs:
+    `jarvis wo review` on this order against on the planner."""
+    own = decide(rnd(), pending_assumptions=True)
+    plan = decide(rnd(), plan_assumptions=PLANNER)
+
+    assert own.code != plan.code
+    assert own.reason != plan.reason
+    assert PLANNER in plan.reason and PLANNER not in own.reason
+
+
+def test_the_plan_hold_is_read_once_per_poll(started, project, fake_gh, monkeypatch):
+    """`round_row`'s discipline: two reads can disagree by a microsecond and produce a
+    hold that was never true, deduped for ever. The moved head exercises both readers —
+    `decide` and `only_the_head_moved` — off the one value."""
+    store, wo = arm(started, project, auto_merge=True)
+    under_an_unratified_plan(store, wo, assumptions=0)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=PUSHED)
+    reads = []
+    real = ProjectStore.plan_hold
+    monkeypatch.setattr(ProjectStore, "plan_hold",
+                        lambda self, row: (reads.append(row["id"]), real(self, row))[1])
+
+    poll(started, store)
+
+    assert reads == [wo["id"]]
+
+
+def test_a_child_whose_plan_is_clear_still_arms(started, project, fake_gh):
+    """NEGATIVE. Being a child of a feature holds nothing by itself."""
+    store, wo = arm(started, project, auto_merge=True)
+    under_an_unratified_plan(store, wo, assumptions=0)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+
+    assert [a["kind"] for a in store.list_approvals(wo["id"])] == [gates.AUTO_MERGE]
+
+
+def test_a_ruled_plan_merges_on_the_next_poll(started, project, fake_gh):
+    """§2.5: the ruling is the user's last command. `poll_pull_requests` re-decides from
+    scratch every two minutes, so nothing pokes and nothing latches."""
+    store, wo = arm(started, project, auto_merge=True)
+    planner_id = under_an_unratified_plan(store, wo)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+    assert store.list_approvals(wo["id"]) == []
+
+    ops.review_work_order(planner_id)
+    poll(started, store)
+    approval = store.list_approvals(wo["id"])[0]
+    gates.apply_decision(store, approval["id"], "approved", "the panel read it", "neo",
+                         project="proj_a")
+    poll(started, store)
+
+    assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+
+
 # -- the request proves itself ---------------------------------------------------------
 #
 # docs/superpowers/specs/2026-09-24-an-auto-merge-request-that-proves-itself.md, fixes

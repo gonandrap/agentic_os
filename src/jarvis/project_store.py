@@ -1968,6 +1968,34 @@ class ProjectStore:
             "UPDATE work_orders SET dispatch_attempts=0, retry_after=NULL WHERE id=?",
             (wo_id,))
 
+    def plan_hold(self, wo: dict[str, Any]) -> dict[str, Any] | None:
+        """`{"fo_id", "planner_id", "n"}` when this child's plan is unratified, else None.
+
+        docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.1.
+        Shape copied from `invariants._slot_cap`: a parentless work order — nearly all of
+        them — is answered from the row already in hand and costs no query.
+
+        `kind != 'worker'` exits first for the planner's own sake: it is dispatched
+        before the plan exists, so holding it on its own assumptions would deadlock the
+        feature permanently. Same exemption `max_parallel` makes, and stronger.
+
+        Readers: `invariants.status_label`, `ops.waiting_on`, `Daemon.auto_merge`,
+        `ops.assumptions_with_rulings`. `claim_next_pending` duplicates the SQL rather
+        than calling this — it must stay inside the atomic UPDATE — and
+        `test_plan_hold_and_the_claim_query_agree` pins the two together.
+        """
+        parent = wo.get("parent_id")
+        if not parent or wo.get("kind") != "worker":
+            return None
+        row = self.conn.execute(
+            """SELECT f.plan_wo_id planner, COUNT(a.id) n
+               FROM feature_orders f JOIN assumptions a ON a.wo_id = f.plan_wo_id
+               WHERE f.id = ? AND a.status = 'pending'""", (parent,)).fetchone()
+        # An aggregate over no rows still returns one, with a NULL planner and n=0.
+        if row is None or not row["n"]:
+            return None
+        return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
+
     def claim_next_pending(self) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
 
@@ -1985,13 +2013,26 @@ class ProjectStore:
            its children are, not one of them, so capping it against its own children
            would be capping a feature against itself.
 
-        3. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
+        3. **Its feature's PLAN is still waiting on the user** — any pending assumption
+           on the planner (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.2).
+           Here rather than in `Daemon.dispatch_pending` because this is the row
+           SELECTION: a held child is passed over inside the statement that picks the
+           next row, so a younger unblocked order is still claimed on the same call, and
+           nothing is written. Filtering in the caller would mean either releasing a
+           claim it has already written or spending the whole `max_concurrent` ceiling
+           re-claiming the same held row inside one tick.
+           `w.kind = 'worker'` keeps the PLANNER dispatchable: it is created and
+           dispatched before the plan exists, so holding it on its own assumptions would
+           deadlock the feature permanently. `plan_hold` is the same rule for the
+           readers that render it.
+
+        4. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
            written by `release_dispatch_claim`. Without it the caller's `while` loop
            re-claims the order it has just failed to launch, on the next iteration, and
            spends the whole ceiling inside one tick.
 
         For the overwhelming majority of work orders — no dependencies, no parent, never
-        a failed launch — all three subqueries are vacuously true and this is the query it
+        a failed launch — all four subqueries are vacuously true and this is the query it
         always was.
         """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
@@ -2017,6 +2058,11 @@ class ProjectStore:
                                          AND s.status IN ({marks})
                                    )
                              )
+                             AND NOT (w.kind = 'worker' AND EXISTS (
+                                 SELECT 1 FROM feature_orders f
+                                 JOIN assumptions a ON a.wo_id = f.plan_wo_id
+                                 WHERE f.id = w.parent_id AND a.status = 'pending'
+                             ))
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
             , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),

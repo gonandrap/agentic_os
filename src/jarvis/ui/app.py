@@ -689,6 +689,10 @@ def create_app() -> FastAPI:
         # `jarvis wo show` must not be able to disagree about whether an assumption was
         # escalated, held or never looked at (GitHub issue #712).
         assumption_ruling_line=ops.assumption_ruling_line,
+        # And what has already LANDED under a plan the user has not ratified — the fact
+        # a rejection's cost turns on, on both surfaces for the same reason (spec
+        # docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md).
+        overtaken_line=ops.overtaken_line,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
