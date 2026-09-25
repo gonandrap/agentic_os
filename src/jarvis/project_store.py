@@ -388,11 +388,17 @@ def resume_spends_slot(wo: Mapping[str, Any]) -> bool:
 # CHECK on `to_role` would turn adding a role into a schema migration, which is exactly
 # the cost this design exists to avoid.
 ENVELOPE_ROLES = ("reviewer", "implementor", "manager", "reconciler")
-ENVELOPE_KINDS = ("review_feedback", "deferral_request", "children_landed")
+ENVELOPE_KINDS = ("review_feedback", "deferral_request", "children_landed",
+                  "assumption_objection")
 # queued -> delivered (a work order filled the role and was sent the message)
 #        -> handled_by_router (nobody filled it and the router acted itself)
 #        -> undeliverable (nobody filled it and nobody could act — see bus.deliver)
-ENVELOPE_STATES = ("queued", "delivered", "handled_by_router", "undeliverable")
+#        -> withdrawn (the sender took it back before it was routed — §6.6 of
+#           docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-
+#           still-runs.md. A terminal state and NOT a failure: nothing went wrong, the
+#           message simply stopped being one anybody should receive)
+ENVELOPE_STATES = ("queued", "delivered", "handled_by_router", "undeliverable",
+                   "withdrawn")
 
 # Feature order lifecycle. Deliberately NOT a copy of WO_STATUSES: a feature order never
 # runs a session of its own, so most of a work order's states are meaningless for it.
@@ -688,7 +694,7 @@ CREATE TABLE IF NOT EXISTS wo_messages (
     direction TEXT NOT NULL,            -- user_to_agent | agent_to_user
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT 'jarvis',  -- jarvis | ui | direct
-    status TEXT NOT NULL DEFAULT 'queued',  -- queued | delivered | failed
+    status TEXT NOT NULL DEFAULT 'queued',  -- queued | delivered | failed | withdrawn
     delivered_at REAL,
     authored_by TEXT NOT NULL DEFAULT ''    -- MESSAGE_AUTHOR_USER, or '' for unknown
 );
@@ -3363,6 +3369,40 @@ class ProjectStore:
         )
         return int(cur.lastrowid)
 
+    def get_envelope(self, env_id: int) -> dict[str, Any] | None:
+        """One envelope by id, or None. The way an OBJECTION reaches its carrier.
+
+        `assumptions.objection_envelope_id` is the only link stored (§4.2: the message
+        row does not exist when the objection is recorded), so anything asking what
+        became of an objection starts here and follows `delivered_msg_id` forward.
+        """
+        row = self.conn.execute("SELECT * FROM envelopes WHERE id=?",
+                                (env_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_message(self, msg_id: int) -> dict[str, Any] | None:
+        """One `wo_messages` row by id, or None. Read for its STATUS, mostly.
+
+        A status transition that is only legal from `queued` has to see the row first,
+        and every other reader here takes a work order id.
+        """
+        row = self.conn.execute("SELECT * FROM wo_messages WHERE id=?",
+                                (msg_id,)).fetchone()
+        return dict(row) if row else None
+
+    def envelope_for_message(self, msg_id: int) -> dict[str, Any] | None:
+        """The envelope a queued message came from, or None if it came from nobody.
+
+        THE LINK IS READ FROM THE ENVELOPE SIDE because that is the only side it exists
+        on: `wo_messages` has no column pointing back at an envelope, and adding one
+        would be a second copy of a relationship `envelopes.delivered_msg_id` already
+        owns. A message posted by `jarvis wo send` has no envelope at all, which is what
+        None means.
+        """
+        row = self.conn.execute("SELECT * FROM envelopes WHERE delivered_msg_id=?",
+                                (msg_id,)).fetchone()
+        return dict(row) if row else None
+
     def queued_envelopes(self, limit: int = 200) -> list[dict[str, Any]]:
         """Undelivered envelopes, oldest first.
 
@@ -3834,6 +3874,19 @@ class ProjectStore:
             (envelope_id, transport, db.now() if sent_ts is None else sent_ts,
              assumption_id))
 
+    def assumption_for_envelope(self, envelope_id: int) -> dict[str, Any] | None:
+        """The assumption whose objection rides that envelope, or None (§6.1).
+
+        THE LINK IS READ FROM THE ASSUMPTION SIDE because that is the only side it is
+        stored on: `assumptions.objection_envelope_id` is written when the objection is
+        filed, and the envelope carries no pointer back. Delivery starts from a message
+        id, so it walks message -> envelope -> here.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM assumptions WHERE objection_envelope_id=?",
+            (envelope_id,)).fetchone()
+        return dict(row) if row else None
+
     def mark_objection_delivered(self, assumption_id: int,
                                  ts: float | None = None) -> None:
         """The worker ACTUALLY received it — not that the OS sent it."""
@@ -3850,6 +3903,26 @@ class ProjectStore:
         self.conn.execute(
             "UPDATE assumptions SET objection_withdrawn_ts=? WHERE id=?",
             (db.now() if ts is None else ts, assumption_id))
+
+    def work_orders_with_objections(self) -> list[str]:
+        """Every work order an objection was ever filed against — ONE query.
+
+        A CANDIDATE FILTER AND DELIBERATELY COARSER THAN `outstanding_objections`, which
+        is the point: it is a superset, so it can never become a second spelling of
+        "outstanding" (that method's docstring says why two spellings are dangerous).
+        The decision still belongs to `outstanding_objections`, asked per candidate.
+
+        What it buys is the common case: nearly no order in a fleet ever carries an
+        objection, and the withdrawal pass would otherwise read every assumption of
+        every work order on every reconcile tick to learn that.
+
+        Blind to `hidden`, like the column it reads — a hidden order that stopped with an
+        objection queued still has to have it withdrawn.
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT wo_id FROM assumptions "
+            "WHERE objection_envelope_id IS NOT NULL").fetchall()
+        return [str(r["wo_id"]) for r in rows]
 
     def outstanding_objections(self, wo_id: str) -> list[dict[str, Any]]:
         """Objections that are neither delivered nor withdrawn — ONE query, two readers.

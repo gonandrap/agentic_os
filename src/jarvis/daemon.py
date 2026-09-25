@@ -54,8 +54,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import (bugreport, bus, claude_cli, db, fleet, holds, inspection, notify,
-               worker_session)
+from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
+               notify, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -84,6 +84,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .evidence import EvidencePacket
 
 log = logging.getLogger("jarvisd")
+
+#: Why an objection was taken back, in the envelope's note, in the timeline event and in
+#: `ops.objection_line`. ONE string: the user reads it on three surfaces and a wording
+#: that depends on which pass withdrew it is a difference they would have to explain.
+#: §6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+#: runs.md.
+OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
@@ -367,13 +374,17 @@ def _holds_not_recorded(early: bool) -> tuple[str, ...]:
     holds word for word. On the early pass it is recorded: it would mean that pass had
     listed an order that is not running, which is a defect in this file and the one thing
     the reader must not have hidden from them.
+
+    **`confirming` IS THE PARKED PASS'S TOO**: the confirmation question is already filed,
+    which is that pass working, and the early pass cannot produce the code at all — only
+    the confirmation branch calls `decide_confirm`.
     """
     from . import autoreview
 
     shared = (autoreview.HELD_DISABLED, autoreview.HELD_SETTLED, autoreview.HELD_ASKED)
     if early:
         return shared + (autoreview.HELD_JUDGED,)
-    return shared + (autoreview.HELD_STATUS,)
+    return shared + (autoreview.HELD_STATUS, autoreview.HELD_CONFIRMING)
 
 
 def escalation_body(reason: str) -> str:
@@ -769,6 +780,10 @@ class Daemon:
                     # a person, so the thing it saves is measured in the user's hours.
                     # It only ASKS — the ruling lands through the Neo drain below.
                     self.auto_review(project, store)
+                    # Beside it, and AFTER it: the same tick that files an objection is
+                    # the one that must take it back if the order it was filed against
+                    # has already stopped (§6.6).
+                    self.withdraw_stale_objections(project, store)
                     # Immediately before the check that reads it, in the same tick: the
                     # landing invariant is a pure timeline read, and this is the only
                     # thing that puts a pull-request fact on that timeline.
@@ -1471,6 +1486,14 @@ class Daemon:
             except KeyError:
                 store.mark_message(msg["id"], "failed")
                 continue
+            # BEFORE the holds, deliberately: a stopped order's hold would skip this
+            # message for ever instead of taking it back, and the delivery side is the
+            # one that must lose the race with the withdrawal pass (§6.6).
+            if wo["status"] != "running":
+                envelope = store.envelope_for_message(int(msg["id"]))
+                if envelope and envelope["kind"] == "assumption_objection":
+                    self._withdraw_objection(store, wo["id"], envelope=envelope)
+                    continue
             # Every per-work-order hold, in the one place that decides them
             # (`worker_session.delivery_hold`). Held, not dropped: the same queue sends
             # it as the next turn once the hold clears. The same call answers
@@ -2578,12 +2601,28 @@ class Daemon:
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                  msgs: list[dict[str, Any]]) -> None:
         ids = [m["id"] for m in msgs]
+        anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
         # them has happened yet — and the next tick delivers them into a conversation
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
             return
+        # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
+        # whose last turn died on a background job used to re-enter the identical turn
+        # shape knowing nothing, and the worker backgrounded and signed off again —
+        # twice, on wo-d81fcc15. As a MESSAGE of its own rather than a header wrapped
+        # around the user's, which is what keeps the rule below true (spec §4 of
+        # docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
+        note = background.resume_note(store, wo, msgs)
+        if note:
+            msgs = [{"id": store.queue_message(wo["id"], note,
+                                               source=background.SOURCE),
+                     "content": note, "source": background.SOURCE}, *msgs]
+            # NOT `ids[0]`, which the turn is anchored to below: the cost of a turn is
+            # charged to the ASK, and the ask is the user's message, not the OS's note
+            # about the last one.
+            ids = [m["id"] for m in msgs]
         log.info("[%s] delivering message(s) %s to %s", project.name, ids, wo["id"])
         store.add_event(wo["id"], "delivering", {"msg_ids": ids})
         # A blank line between messages and nothing else. Anything framing them — a
@@ -2591,7 +2630,7 @@ class Daemon:
         # instruction from the user, and the user wrote none of it.
         text = "\n\n".join(m["content"] for m in msgs)
         try:
-            turn = worker_session.send(store, project, wo, text, msg_id=ids[0])
+            turn = worker_session.send(store, project, wo, text, msg_id=anchor)
         except budget_mod.BudgetExhausted as e:
             # The messages stay QUEUED, not `failed`: nothing is wrong with them and the
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
@@ -2620,6 +2659,7 @@ class Daemon:
         # would read it twice and pay a second boundary for the privilege.
         for msg_id in ids:
             store.mark_message(msg_id, "delivered")
+            self._stamp_objection_delivery(store, msg_id)
         store.add_event(wo["id"], "message_delivered",
                         {"msg_ids": ids, "turn": turn["seq"]})
         # The work order is moving again, whatever it had settled into. A user who sends
@@ -4110,6 +4150,16 @@ class Daemon:
         else:
             from .invariants import IDLE_NO_FINISH_BLOCKER
 
+            # THE OS SENDS IT BACK ITSELF WHEN IT KNOWS WHY IT STOPPED. A turn that
+            # ended on a background job it had just killed is a stall with a known cure
+            # and a worker still holding the whole conversation, so making the user type
+            # `resume` is the bug rather than the fix (Neo, question 500). Twice, then
+            # this falls through and the work order parks exactly as it always did.
+            # Nothing is re-nudged while the message waits: the `queued_messages` guard
+            # above returns before this on every tick until the turn goes out.
+            if background.nudge(store, fresh):
+                return
+
             store.set_status(wo["id"], "needs_review")
             store.flag_attention(wo["id"], IDLE_NO_FINISH_BLOCKER)
 
@@ -4578,7 +4628,9 @@ class Daemon:
             neo_store = NeoStore()
             try:
                 automerge.propose(store, neo_store, project.name, wo, decision,
-                                  checks=tuple(c["name"] for c in pr.checks))
+                                  # Whole, with each conclusion — spec 2026-09-24 fix 2.
+                                  checks=pr.checks,
+                                  protection=self._protection_fact(project, pr))
             finally:
                 neo_store.close()
             return
@@ -4667,6 +4719,11 @@ class Daemon:
             return
         if not self.catalog.os.neo.enabled:
             return
+        # BEFORE the candidate list and outside it, because its subjects are `running`
+        # orders and everything below this line is about `needs_review` ones — under the
+        # `if not candidates: return` an objection would never be filed on a project
+        # whose parked orders happen to have nothing pending.
+        self._file_pending_objections(project, store)
         from .neo_store import NeoStore
 
         # Hidden orders are excluded by the default, and deliberately: the rule
@@ -4708,6 +4765,131 @@ class Daemon:
         finally:
             neo_store.close()
 
+    def _file_pending_objections(self, project: ProjectSpec,
+                                 store: ProjectStore) -> None:
+        """Send the early pass's disagreements to the workers still typing (§6.1).
+
+        docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+        runs.md. THE ONE HOOK: the early pass records `provisional_verdict='object'` on a
+        row and files nothing, and this reads those rows back and files exactly one
+        objection each. Two hooks would file twice, and the drain is what makes filing
+        idempotent — `objection_envelope_id` already set is the whole of the test.
+
+        RUNNING ORDERS ONLY, and that is §2's licence rather than an optimisation:
+        telling a worker something mid-task starts no turn it was not already taking,
+        and the moment the order stops that stops being true (§6.6 withdraws instead).
+
+        One work order's failure never costs the rest the pass — `auto_review`'s rule,
+        for its reason.
+        """
+        from . import ops
+
+        for wo in store.list_work_orders(statuses=("running",)):
+            try:
+                for a in store.all_assumptions(wo["id"]):
+                    if (str(a.get("provisional_verdict") or "") != "object"
+                            or a.get("objection_envelope_id") is not None
+                            or a.get("objection_withdrawn_ts") is not None):
+                        continue
+                    ops.file_assumption_objection(
+                        store, project.path, wo, a,
+                        reason=str(a.get("provisional_reason") or ""),
+                        model=str(a.get("provisional_model") or ""),
+                        question_id=a.get("neo_question_id"))
+            except Exception:  # noqa: BLE001 — one order must never stop the rest
+                log.exception("[%s] objections for %s could not be filed",
+                              project.name, wo["id"])
+
+    def _stamp_objection_delivery(self, store: ProjectStore, msg_id: int) -> None:
+        """An objection that actually went out is DELIVERED, stamped here and nowhere.
+
+        §6.1/§6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-
+        worker-still-runs.md. The stamp is the only thing that keeps §6.6 from
+        withdrawing an objection the worker has already read, and it belongs at the
+        moment the turn went out: at queue time nothing has been sent, and before
+        `worker_session.send` returns a raise would have delivered nothing.
+        """
+        envelope = store.envelope_for_message(int(msg_id))
+        if not envelope or envelope["kind"] != "assumption_objection":
+            return
+        a = store.assumption_for_envelope(int(envelope["id"]))
+        if a is not None and a.get("objection_delivered_ts") is None:
+            store.mark_objection_delivered(int(a["id"]))
+
+    def withdraw_stale_objections(self, project: ProjectSpec,
+                                  store: ProjectStore) -> None:
+        """Take back every objection whose order stopped before it was delivered (§6.6).
+
+        An objection queued for an order that is no longer `running` would arrive as a
+        fresh turn on an order nobody asked to reopen — the exact thing the parent spec
+        refused. There is no third option: an undelivered objection is either delivered
+        while the order runs or withdrawn, and one of the two is always recorded.
+
+        A DELIVERED OBJECTION IS NEVER WITHDRAWN: `outstanding_objections` is already
+        the "neither delivered nor withdrawn" query, and it is the only thing that
+        decides here. `work_orders_with_objections` is a candidate filter in front of it
+        and nothing more — one query instead of a full assumption read per work order
+        per reconcile tick, on a fleet where nearly no order ever carries an objection.
+
+        **`withdrawn` is a new value on two status columns, and every reader was checked
+        rather than assumed (§6.6).** `wo_messages.status`: `queued_messages` (and
+        `deliverable_messages` and `invariants.stuck_message` through it) selects
+        `status='queued'`, so a withdrawn row stops being deliverable and stops being an
+        invariant's problem; `list_messages`, `agent_replies` and `user_messages` filter
+        on direction and authorship, never status, so the words stay on the record.
+        `envelopes.state`: `queued_envelopes` — and so INV-ENVELOPE-STUCK — selects
+        `state='queued'`, while INV-ENVELOPE-LOST and `ops.validation_view` both key on
+        `undeliverable` alone, which withdrawal deliberately is not: nothing went wrong.
+        """
+        for wo_id in store.work_orders_with_objections():
+            try:
+                if store.get_work_order(wo_id)["status"] == "running":
+                    continue
+                for a in store.outstanding_objections(wo_id):
+                    self._withdraw_objection(store, wo_id, assumption=a)
+            except Exception:  # noqa: BLE001 — one order must never stop the rest
+                log.exception("[%s] objections for %s could not be withdrawn",
+                              project.name, wo_id)
+
+    def _withdraw_objection(self, store: ProjectStore, wo_id: str, *,
+                            assumption: dict[str, Any] | None = None,
+                            envelope: dict[str, Any] | None = None) -> None:
+        """Disarm the carrier FIRST, then stamp the withdrawal (§6.6, in that order).
+
+        The envelope and the message are what can still become a turn; the timestamp and
+        the event are only the record of it. Written the other way round, a daemon that
+        died in between would leave a work order that reads as withdrawn with a live
+        message still queued for its worker.
+
+        Called from both sides of the race — the reconcile pass, which starts from the
+        assumption, and `deliver_messages`, which starts from the envelope — so it takes
+        either end and resolves the other.
+        """
+        if envelope is None and assumption and assumption.get("objection_envelope_id"):
+            envelope = store.get_envelope(int(assumption["objection_envelope_id"]))
+        if assumption is None and envelope is not None:
+            assumption = next(
+                (a for a in store.outstanding_objections(wo_id)
+                 if a.get("objection_envelope_id") == envelope["id"]), None)
+        if envelope is not None:
+            if envelope["state"] == "queued":
+                store.mark_envelope(int(envelope["id"]), "withdrawn",
+                                    note=OBJECTION_WITHDRAWN_REASON)
+            if envelope.get("delivered_msg_id"):
+                # ONLY FROM `queued`, the envelope's own rule: a delivered message was
+                # read by the worker and rewriting it would put a lie on the record
+                # (§6.6, "a delivered objection is never withdrawn").
+                msg = store.get_message(int(envelope["delivered_msg_id"]))
+                if msg and msg["status"] == "queued":
+                    store.mark_message(int(envelope["delivered_msg_id"]), "withdrawn")
+        if assumption is None:
+            return  # the carrier is disarmed and nothing is outstanding to stamp
+        store.withdraw_objection(int(assumption["id"]))
+        store.add_event(wo_id, "autoreview_objection_withdrawn", {
+            "assumption_id": assumption["id"], "n": assumption.get("n"),
+            "reason": OBJECTION_WITHDRAWN_REASON,
+            "envelope_id": assumption.get("objection_envelope_id")})
+
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
                                assumptions: list[dict], *, early: bool = False) -> None:
@@ -4717,19 +4899,55 @@ class Daemon:
         travel together: `autoreview.decide` guards the settle at `needs_review`,
         `decide_early` guards an ask on a `running` order, and each pass can reach holds
         the other cannot.
+
+        Within the PARKED pass a second choice is made per ROW: an assumption that
+        already carries an early verdict is CONFIRMED against the delivered result (spec
+        §7) instead of being asked about for the first time. A work order can hold both
+        kinds at once — §5 judges what it can while the worker runs — so that branch is
+        per assumption and not per order. **The confirmation branch belongs to the parked
+        pass only**: until the work is delivered there is no result to confirm against.
         """
         from . import autoreview, ops
 
         # ONE read of the round and one of the refusal history for the whole list: both
         # are facts about the ORDER rather than about an assumption, and re-reading them
         # per row would let the validator — running on another thread — change the answer
-        # half way down a list that is meant to be judged against one state.
+        # half way down a list that is meant to be judged against one state. The
+        # outstanding objections are the same kind of fact and are read the same way.
         latest = store.latest_validation_round(wo_id=wo["id"])
         outcome = str((latest or {}).get("outcome") or "")
         answered = ops.refusal_answered(store, wo["id"])
+        objecting = bool(store.outstanding_objections(wo["id"]))
+        packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
+            # `not early` is the third guard on this branch, after `auto_review`'s
+            # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
+            if not early and str(a.get("provisional_verdict") or ""):
+                decision = autoreview.decide_confirm(
+                    a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
+                    objections_outstanding=objecting)
+                if not decision.armed:
+                    self._note_autoreview_held(store, wo["id"], decision,
+                                               suppress=suppress)
+                    continue
+                # LAZILY, and once per work order: collecting evidence runs git and may
+                # reach GitHub, and an order whose every row holds must not pay for it.
+                if packet is None:
+                    packet = self._confirmation_evidence(project, wo, cfg)
+                # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
+                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
+                evidence_ok = autoreview.decide_evidence(
+                    a, packet[0], packet[1], summary=str(wo.get("result_summary") or ""))
+                if not evidence_ok.armed:
+                    self._note_autoreview_held(store, wo["id"], evidence_ok,
+                                               suppress=suppress)
+                    continue
+                autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
+                                                assumptions, stat=packet[0],
+                                                diff=packet[1])
+                continue
             decision = rule(a, wo, cfg, round_outcome=outcome,
                             refusal_answered=answered)
             if not decision.armed:
@@ -4738,6 +4956,32 @@ class Daemon:
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early)
+
+    def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
+                               cfg: Any) -> tuple[str, str]:
+        """The diff the confirmation question carries. `(stat, diff)`, never raising.
+
+        `evidence.collect_work_order` does not raise by contract, and this wraps it
+        anyway: one unreadable repository must not cost the work order its pass, and the
+        failure mode of a throw here is an assumption parked for ever.
+
+        **AN EMPTY DIFF STILL ASKS.** The result summary alone is more than the early
+        pass had, and refusing to confirm because git said nothing would leave a settled
+        verdict unusable on exactly the orders that are hardest to read.
+
+        `cfg.diff_chars` is the project's resolved validation config — the same value and
+        the same spelling `ops.submit_for_validation` passes.
+        """
+        from . import evidence
+
+        try:
+            packet = evidence.collect_work_order(
+                project.path, wo, declared="", diff_chars=cfg.diff_chars)
+            return str(packet.stat or ""), str(packet.diff or "")
+        except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
+            log.exception("[%s] evidence for confirming %s's assumptions failed",
+                          project.name, wo["id"])
+            return "", ""
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
@@ -4760,6 +5004,19 @@ class Daemon:
         `_note_automerge_held` names, where a missing hold event says nothing and a
         spurious one is deduped for ever and then rendered). `suppress=None` records
         everything, which is what the settle site wants.
+
+        **`confirming` IS SUPPRESSED FOR `asked`'s REASON**: the confirmation question is
+        filed, which is that pass working, and a line saying the OS declined to decide an
+        assumption it is at that moment putting to Neo would land on every row the
+        feature touches.
+
+        **`objection_in_flight` IS RECORDED, and `objected` and `evidence_secret` with
+        it** (kn-22ba6087: a guard that returns early must still record why). All three
+        are facts about a row the OS looked at and did not act on, which is the opposite
+        of "never a candidate" — `objection_in_flight` because it means NOT YET, an early
+        verdict with an objection still on a wire; `evidence_secret` because the hold is
+        the ONLY thing on the record saying why a work order the feature was switched on
+        for is still waiting for a person, and it names the file, never the secret.
 
         **`settling=True` SUSPENDS THE WHOLE LIST, and the difference is not cosmetic.**
         Every exclusion rests on "this order was never a candidate" — true of an ask
@@ -4844,6 +5101,14 @@ class Daemon:
             return
         ruling = autoreview.read_ruling(verdict,
                                         default_model=self.catalog.os.neo.model)
+        # WHICH PASS THIS VERDICT ANSWERS IS A FACT RECORDED AT ASK TIME, read back off
+        # the link and never re-derived. The work order's live status and the provisional
+        # column both keep changing under a verdict that is already in flight; the
+        # question id does not (spec §7.2).
+        confirming = int(assumption.get("confirm_question_id") or 0) == int(q["id"])
+        prior = {"provisional_verdict": assumption.get("provisional_verdict") or "",
+                 "provisional_reason": assumption.get("provisional_reason") or "",
+                 "provisional_model": assumption.get("provisional_model") or ""}
         if not ruling.accept:
             if not verdict.get("escalate"):
                 # NEO ANSWERED AND THE ANSWER IS NOT WHAT HAPPENS, so `drain_queue` has
@@ -4854,11 +5119,18 @@ class Daemon:
                 # rejection, so it becomes an escalation) and an acceptance this module
                 # overrode on stakes.
                 neo_store.mark(q["id"], "escalated", reason=ruling.reason)
-            pstore.add_event(wo["id"], "autoreview_escalated", {
+            payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
-                "overridden": ruling.overridden})
+                "overridden": ruling.overridden}
+            # An UNCONFIRMED early verdict is not an ordinary escalation and the user
+            # reads the difference: both readings go on the record, what Neo thought
+            # while the work ran and what it thought once it saw the result (§7.3).
+            pstore.add_event(
+                wo["id"], "autoreview_unconfirmed" if confirming
+                else "autoreview_escalated",
+                {**payload, **prior} if confirming else payload)
             log.info("auto-review left assumption #%s of %s with the user: %s",
                      numbered.get("n"), wo["id"], ruling.reason)
             return
@@ -4882,7 +5154,12 @@ class Daemon:
             numbered, wo, project.validation,
             round_outcome=str((latest or {}).get("outcome") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
-            asked_question_id=int(q["id"]))
+            # On a CONFIRMATION the question being delivered is not the one condition 6
+            # would trip on: `neo_question_id` still points at the early question, so
+            # that is the id to exclude, or every confirmed assumption would be dropped
+            # as "already with Neo" on its own first pass.
+            asked_question_id=int((assumption.get("neo_question_id") or q["id"])
+                                  if confirming else q["id"]))
         if not still.armed:
             # Escalated rather than left `answered`: the assumption is the user's again,
             # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
@@ -4908,6 +5185,15 @@ class Daemon:
             log.exception("accepting assumption %s of %s failed", assumption["id"],
                           wo["id"])
             return
+        if confirming:
+            # BOTH events on one assumption is the designed state, not a duplicate:
+            # `ops._RULING_RANK` already ranks `autoreview_confirmed` above
+            # `autoreview_accepted`, and the user reads that the early reading was put
+            # back to Neo against the diff before anything settled.
+            pstore.add_event(wo["id"], "autoreview_confirmed", {
+                "assumption_id": assumption["id"], "n": numbered.get("n"),
+                "reason": ruling.reason, "stakes": ruling.stakes,
+                "model": ruling.model, "neo_question_id": q["id"], **prior})
         log.info("auto-review accepted assumption #%s of %s (%s left) — %s",
                  numbered.get("n"), wo["id"], out["pending"], out["status"])
         if not out["settled"]:
@@ -5025,6 +5311,29 @@ class Daemon:
                      project.name, wo["id"], out["judged_sha"][:10],
                      out["head_sha"][:10], out["round"])
 
+    def _protection_fact(self, project: ProjectSpec, pr: Any) -> str:
+        """What the merge request may say about branch protection. `""` says nothing.
+
+        docs/superpowers/specs/2026-09-24-an-auto-merge-request-that-proves-itself.md
+        fix 3, branch A (Neo question 601). Read on the tick that PROPOSES — once per
+        judged commit, guarded by `latest_approval_for` — so the extra round trip is not
+        on the two-minute path. AN UNREADABLE PROTECTION API BLOCKS NOTHING: the request
+        is still filed, saying only that the OS could not read it.
+        """
+        from . import automerge, github
+
+        owner_repo = github.origin_repo(project.path)
+        if owner_repo is None or not pr.base_ref:
+            return ""
+        try:
+            protection = github.branch_protection(owner_repo, pr.base_ref,
+                                                  cwd=project.path)
+        except github.GitHubError as exc:
+            log.info("[%s] branch protection on %s unreadable: %s", project.name,
+                     pr.base_ref, exc)
+            protection = automerge.PROTECTION_UNREADABLE
+        return automerge.protection_fact(protection, pr.base_ref)
+
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
         """Record ONCE, per (commit, reason), that the OS declined to merge.
@@ -5048,7 +5357,10 @@ class Daemon:
         **DELIBERATELY NOT AN ATTENTION ITEM.** A held auto-merge means the user merges
         this one by hand, which is what they did for every pull request before this
         existed. A heal-loop push invalidating a pass is ordinary, and the attention list
-        is not a place to put ordinary.
+        is not a place to put ordinary. TRUE OF A HOLD ONLY: a hold is transient and the
+        next tick may clear it, while a reviewer's REFUSAL is final for a commit nothing
+        re-proposes and is flagged by `invariants.automerge_denied` (spec 2026-09-24
+        fix 4b).
 
         **TWO HOLDS ARE NOT RECORDED**, and they are the two `Daemon.auto_merge` already
         returned on, so neither is reachable from the poll. They are dropped here as well

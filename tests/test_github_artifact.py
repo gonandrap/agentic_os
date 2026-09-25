@@ -60,6 +60,82 @@ def test_every_gh_command_this_module_builds_is_a_declared_read_verb():
         f"{sorted(git_verbs - set(github.LOCAL_GIT_READS))}")
 
 
+def test_every_api_call_this_module_builds_is_a_get_and_can_be_nothing_else():
+    """`gh api` is the one verb whose name does not say what it does — the same string
+    reads a branch's protection or opens a pull request, on a flag. So the method is
+    pinned as the first two arguments and asserted here; `ci.VERBS` states it the same
+    way. Spec 2026-09-24 fix 3, Neo question 601 condition 1.
+    """
+    tree = ast.parse(Path(github.__file__).read_text())
+    apis = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.List) or len(node.elts) < 2:
+            continue
+        words = [e.value if isinstance(e, ast.Constant) else None for e in node.elts]
+        if words[0] == "api":
+            apis.append(words)
+    assert apis, "no `gh api` argument list found — has the reader been removed?"
+    for words in apis:
+        assert words[1:3] == ["--method", "GET"], words
+        for mutating in ("-X", "--request", "-f", "-F", "--input"):
+            assert mutating not in words, f"{mutating} in {words}"
+
+
+def test_the_api_carve_out_refuses_an_argument_list_that_is_not_a_get():
+    """kn-67364b3a: an assertion never shown to refuse anything is not known to be one."""
+    for source in ('x = ["api", "repos/o/r/branches/main/protection"]',
+                   'x = ["api", "--method", "PUT", path]',
+                   'x = ["api", "--method", "GET", path, "-f", "k=v"]'):
+        words = next([e.value if isinstance(e, ast.Constant) else None
+                      for e in n.elts]
+                     for n in ast.walk(ast.parse(source)) if isinstance(n, ast.List))
+        assert (words[1:3] == ["--method", "GET"]
+                and not {"-X", "--request", "-f", "-F", "--input"} & set(
+                    w for w in words if w)) is False, source
+
+
+# ------------------------------------------------------------------ branch protection
+
+
+def test_a_protected_branch_reports_the_checks_github_requires(fake_gh, tmp_path):
+    """The only fact the auto-merge request states, and it comes off the payload."""
+    fake_gh.set_protection("main", ["unit (3.13)", "evals"])
+
+    protection = github.branch_protection(("acme", "proj"), "main")
+
+    assert protection is not None
+    assert protection.required_checks == ("unit (3.13)", "evals")
+
+
+def test_only_a_404_that_says_the_branch_is_not_protected_reads_as_unprotected(fake_gh):
+    """GitHub answers `Branch not protected (HTTP 404)` and nothing else may be read as
+    it — Neo question 601 condition 2."""
+    assert github.branch_protection(("acme", "proj"), "main") is None
+
+
+@pytest.mark.parametrize("failure", ["gh: Resource not accessible (HTTP 403)",
+                                     "gh: Bad credentials (HTTP 401)",
+                                     "gh: Server Error (HTTP 500)"])
+def test_any_other_failure_is_unreadable_and_never_no_protection(fake_gh, failure):
+    fake_gh.refuse_protection(failure)
+    with pytest.raises(github.GitHubError):
+        github.branch_protection(("acme", "proj"), "main")
+
+
+def test_a_branch_name_that_could_be_read_as_a_flag_never_becomes_a_path(fake_gh):
+    with pytest.raises(github.GitHubError):
+        github.branch_protection(("acme", "proj"), "--method")
+    assert fake_gh.calls == []
+
+
+def test_the_protection_read_is_the_declared_get(fake_gh):
+    fake_gh.set_protection("main", [])
+    github.branch_protection(("acme", "proj"), "main")
+    argv = fake_gh.calls[-1]["argv"]
+    assert argv[:3] == ["api", "--method", "GET"]
+    assert argv[3] == "repos/acme/proj/branches/main/protection"
+
+
 @pytest.mark.parametrize("source, allowed", [
     ('x = ["gh-placeholder", "pr", "view", url]', False),   # not a real gh shape
     ('x = ["git", "-C", str(p), "remote", "get-url", "origin"]', True),

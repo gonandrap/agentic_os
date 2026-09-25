@@ -57,7 +57,13 @@ GH_TIMEOUT = 30
 #: subset of this one. A write verb added here would have to be added deliberately, in a
 #: commit that also changes the test — which is the whole mechanism: see the module
 #: docstring for why the panel's blind review depends on it.
-READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"))
+#:
+#: `("api", "--method")` IS THAT SHAPE ON PURPOSE, `ci.VERBS`' reason: `gh api` is the
+#: one verb whose name does not say what it does — the same string reads a branch's
+#: protection or merges a pull request, on a flag. The method is pinned as the second
+#: argument, so the allowlist entry itself says the call is a GET and the AST test can
+#: assert it (Neo question 601, condition 1).
+READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"), ("api", "--method"))
 
 #: The LOCAL git subcommands this module runs, held to the same standard by the same
 #: test. `origin_repo` shells out to git to learn which repository this checkout belongs
@@ -401,6 +407,67 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         checks=read_checks(payload),
         head_oid=str(payload.get("headRefOid") or ""),
     )
+
+
+#: A branch ref that may become a path segment. Anchored, and the first character is
+#: alphanumeric so no ref can be read as a `gh` flag — `checked_pr_url`'s reason, for the
+#: one other remote-written string that reaches an argument list here.
+BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+#: GitHub's own 404 body for a branch nobody protects. THE ONLY ANSWER THAT READS AS "no
+#: protection": a 403, any other error and a timeout say the OS could not read the API,
+#: which is a different fact and must never render as this one (Neo question 601).
+NOT_PROTECTED_RE = re.compile(r"not protected", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class BranchProtection:
+    """What protects a branch, reduced to the one fact the auto-merge request states.
+
+    `required_checks` and nothing else: the request tells a reviewer whether anything
+    OTHER than the gate is checking the merge, and every further field would be a claim
+    somebody has to keep true (spec 2026-09-24 fix 3).
+    """
+
+    required_checks: tuple[str, ...] = ()
+
+
+def branch_protection(owner_repo: tuple[str, str], base: str,
+                      cwd: Path | None = None) -> BranchProtection | None:
+    """What protects `base`. `None` means GitHub said it is not protected.
+
+    Raises `GitHubError` on every other outcome, INCLUDING a 403 and a timeout: the
+    caller must be able to tell "unprotected" from "unreadable", because the first is a
+    fact about the repository and the second is a fact about the OS's tick. See
+    `NOT_PROTECTED_RE`, and `automerge.protection_fact` for the three sentences.
+
+    A GET, pinned in the argument list rather than left to `gh`'s default —
+    `READ_ONLY_VERBS`.
+    """
+    owner, repo = owner_repo
+    if not BRANCH_RE.match(base or ""):
+        raise GitHubError(f"{base!r} is not a branch this may ask about",
+                          GitHubError.URL_REFUSED)
+    path = f"repos/{owner}/{repo}/branches/{base}/protection"
+    try:
+        stdout = _run(["api", "--method", "GET", path], url=path, cwd=cwd,
+                      missing_hint="so Jarvis cannot read branch protection")
+    except GhUnavailable:
+        raise
+    except GitHubError as e:
+        if NOT_PROTECTED_RE.search(str(e)):
+            return None
+        raise
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise GitHubError(f"`gh api {path}` returned no JSON ({stdout[:200]!r})",
+                          GitHubError.UNREADABLE) from e
+    required = payload.get("required_status_checks") or {}
+    names = [str(c) for c in (required.get("contexts") or [])]
+    names += [str(c.get("context") or "") for c in (required.get("checks") or [])
+              if isinstance(c, dict)]
+    return BranchProtection(required_checks=tuple(dict.fromkeys(n for n in names if n)))
 
 
 #: The fields of one `gh pr view --json …` for the PANEL, which needs the pull request

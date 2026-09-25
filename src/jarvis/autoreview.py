@@ -135,6 +135,33 @@ HELD_HIGH_STAKES = "high_stakes"
 #: (`provisional_verdict` settles nothing — §4.1 of the 2026-09-23 spec).
 HELD_JUDGED = "judged_early"
 
+#: The confirmation pass's own five (spec §7), beside the seven `decide` already has.
+#: `unjudged` and `objected` mean there is nothing to confirm — an early `object`
+#: approved nothing, so no second call is spent on one and the user decides it;
+#: `confirming` is the question already filed; `objection_in_flight` means NOT YET and is
+#: retried next tick; `evidence_secret` is `decide_evidence`'s, over BOTH texts the
+#: question would carry — the diff and the result summary.
+#:
+#: FOUR OF THE FIVE REACH THE RECORD, and which ones is not arbitrary (kn-22ba6087: a
+#: guard that returns early must still record why). `objected`, `unjudged`,
+#: `objection_in_flight` and `evidence_secret` are all facts about a row the OS LOOKED AT
+#: and did not act on, and `objection_in_flight` and `evidence_secret` most of all —
+#: without the line there is nothing on the record saying why an assumption the feature
+#: was switched on for is still sitting with the user. `confirming` is the only one
+#: suppressed, on `asked`'s list in `Daemon._note_autoreview_held` and for `asked`'s
+#: reason: the question IS filed, which is the pass working.
+HELD_UNJUDGED = "unjudged"
+HELD_OBJECTED = "objected"
+HELD_CONFIRMING = "confirming"
+HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
+HELD_EVIDENCE_SECRET = "evidence_secret"
+
+#: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
+#: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
+#: and asserts them at the write.
+PROVISIONAL_ACCEPT = "accept"
+PROVISIONAL_OBJECT = "object"
+
 #: THE FIRST NET, and it is deliberately not a taste filter. Every entry is the code form
 #: of a clause `neo.PERSONA` already tells Neo to escalate on — production or live
 #: credentials, spending money, deleting or publishing anything, legal and people matters —
@@ -229,6 +256,200 @@ def high_stakes_marker(text: str) -> str:
     return ""
 
 
+# -- the second net's second gate: a diff the OS will not copy into a question ---------
+
+#: SECRET-SHAPED EVIDENCE, and it is deliberately NOT part of `HIGH_STAKES`.
+#:
+#: WHY IT EXISTS: `_confirm_question` interpolates the diff, the diff stat and the result
+#: summary, and `neo.ask` PERSISTS that text as a question row `/neo` and `jarvis neo
+#: list` display. A diff that adds a credential therefore lands in a store and on a
+#: surface the ask pass never put diff content on. kn-deef42ea — a redaction decision is
+#: also a filing decision: if the text may not travel, the row must not either, so the
+#: hold is the whole answer here and there is no withhold-and-file.
+#:
+#: **WHY IT IS NARROW WHERE `HIGH_STAKES` IS WIDE, AND THE DIRECTIONS ARE OPPOSITE.**
+#: `HIGH_STAKES` reads ONE ASSUMPTION'S SENTENCE, where a false positive costs the user a
+#: review action they were making anyway — so it errs wide. This reads A WHOLE DIFF OF
+#: THIS REPO, where a false positive holds the confirmation and the wide net would hold
+#: nearly every one: "credential", "production" and "delete" are in almost every change
+#: this codebase makes. That is the feature switched off, silently, which is the
+#: expensive direction here — and it is Neo's own reason (question 593) for refusing to
+#: run `high_stakes_marker` over the diff and ruling for this shape instead. There is no
+#: redaction in `evidence.py`, `validation.py` or `panel.py` to reuse: the panel sends
+#: full diffs to its seat prompts, so this rule is invented here rather than borrowed.
+#:
+#: Three shapes, and each is a SHAPE rather than a word: a line assigning a real-looking
+#: value to a secret-named thing, a key or auth block, and a path that only secrets live
+#: at.
+SECRET_EVIDENCE = (
+    r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----",
+    r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+",
+    # `["\']?` on BOTH sides of the colon and nowhere else: `"Authorization": "Bearer
+    # …"` is the header written as a JSON or dict entry, and the quote before the colon
+    # is the only reason the bare pattern missed it. Widening past the quote would start
+    # matching prose that merely says the word.
+    r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
+)
+
+#: What each of `SECRET_EVIDENCE`'s shapes is CALLED on the record. The marker is
+#: rendered on the timeline and on `jarvis wo show`, so it names the shape and never
+#: quotes the match — see `secret_marker`. The names say no more than the shape because
+#: the same scanner reads a diff and a result summary; WHICH of the two carried it is
+#: the hold's to say, in `decide_evidence`.
+SECRET_EVIDENCE_NAMES = (
+    "a private key block",
+    "an ssh key line",
+    "an Authorization header value",
+)
+
+#: A VALUE THAT IS NOT A SECRET, however secret its name. The commonest added line in
+#: any repo is the one that names a credential without carrying one — an empty default, a
+#: type annotation, a read from the environment, a `changeme` in an example config — and
+#: holding on those would be the wide net by another route.
+SECRET_PLACEHOLDERS = (
+    r"none|null|nil|nan|true|false|str|int|bool|x+|\.+|-+|_+",
+    r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample",
+    r"example|examples|test|testing|secret|password|passwd|token|key|value",
+    r"your[-_].*|my[-_].*|some[-_].*|the[-_].*",
+)
+
+#: PATHS ONLY SECRETS LIVE AT. Matched on the stat and the diff HEADERS, never on prose:
+#: the path is evidence on its own, and reading the file to find out whether this `.env`
+#: really holds anything would be the same mistake one layer down.
+SECRET_PATHS = (
+    r"(?:^|/)\.env(?:\.[\w.-]+)?$",
+    r"\.(?:pem|key|p12|pfx|jks|keystore)$",
+    r"(?:^|/)id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?$",
+    r"(?:^|/)credentials(?:\.[\w-]+)?$",
+    r"(?:^|/)\.(?:netrc|npmrc|pypirc|pgpass)$",
+    r"(?:^|/)secrets?\.[\w-]+$",
+    r"service[-_]account[\w-]*\.json$",
+)
+
+#: The words that make an assignment's LEFT SIDE a secret's name, matched against the
+#: identifier's PARTS rather than as substrings: `monkey` and `keyword` must not be a
+#: `key`, and `AWS_SECRET_ACCESS_KEY` and `apiKey` must both be one.
+SECRET_NAME_PARTS = frozenset({
+    "key", "keys", "apikey", "accesskey", "privatekey", "secretkey", "seckey",
+    "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
+    "password", "passwd", "passphrase", "pwd", "credential", "credentials",
+})
+
+#: One line assigning something. Read over a line the CALLER has already vouched for —
+#: an added diff line with its `+` stripped, or a line of the result summary — because a
+#: removed secret (`-`) is the change doing the right thing and `+++ b/path` is a header.
+#:
+#: The name may be QUOTED, and that is the whole widening: `"api_key": "sk-live-…"` is
+#: the JSON and Python-dict shape, which is how an added credential is most often
+#: spelled, and the bare pattern could not match it. A quoted name is still an
+#: IDENTIFIER — same charset, same closing quote as the opening one, still the whole
+#: name up to the separator — so a regex literal, a comment or a sentence still never
+#: parses as one, and the VALUE test below is untouched: `"api_key": ""` and
+#: `"api_key": "changeme"` do not fire.
+_ASSIGNMENT_RE = re.compile(
+    r"^[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
+    r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
+    r"[ \t]*(?:=>|:=|=|:)[ \t]*"
+    r"(?P<value>[^\r\n]*?)[ \t]*[,;]?[ \t]*$")
+
+#: The charset a credential is spelled in. Anything else — a space, a bracket, a call, a
+#: `+` concatenation — means the right side is an EXPRESSION, and an expression is not a
+#: value: `os.environ["API_KEY"]` names a secret and contains none.
+_SECRET_VALUE_CHARS = re.compile(r"[A-Za-z0-9+/=._~-]+")
+
+_SECRET_EVIDENCE_RE = [re.compile(p, re.IGNORECASE) for p in SECRET_EVIDENCE]
+_SECRET_PATH_RE = [re.compile(p, re.IGNORECASE) for p in SECRET_PATHS]
+_PLACEHOLDER_RE = re.compile("|".join(SECRET_PLACEHOLDERS), re.IGNORECASE)
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _names_a_secret(identifier: str) -> bool:
+    parts = [p.lower() for p in _WORD_SPLIT_RE.split(identifier) if p]
+    return any(p in SECRET_NAME_PARTS for p in parts)
+
+
+def _secret_value(raw: str) -> bool:
+    """Is this assignment's right side a REAL-LOOKING credential? See `secret_marker`."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    if len(value) < 6 or not _SECRET_VALUE_CHARS.fullmatch(value):
+        return False
+    if _PLACEHOLDER_RE.fullmatch(value):
+        return False
+    has_digit = any(c.isdigit() for c in value)
+    has_alpha = any(c.isalpha() for c in value)
+    # A digit beside letters, or sheer length. Neither alone: `evidence_secret` is this
+    # module's own constant and `2026-09-23` is a date, and both are added every week.
+    return (has_digit and has_alpha) or len(value) >= 20
+
+
+def _paths(stat: str, diff: str) -> list[str]:
+    """Every path the stat and the diff HEADERS name. Prose is not read."""
+    found = [line.split("|")[0].strip() for line in (stat or "").splitlines()]
+    for line in (diff or "").splitlines():
+        if line.startswith(("--- ", "+++ ", "diff --git ", "rename to ", "copy to ")):
+            for token in line.split()[1:]:
+                found.append(re.sub(r"^[ab]/", "", token))
+    return [p for p in found if p and p not in ("a", "b", "/dev/null")]
+
+
+def secret_marker(stat: str, diff: str) -> str:
+    """The secret-shaped thing this evidence carries, NAMED and never quoted. Pure.
+
+    **THE RETURN VALUE IS RENDERED** — on the timeline, in the hold's reason and on
+    `jarvis wo show` — so it must never contain the match. Returning the matched text,
+    the way `high_stakes_marker` does over one sentence, would move the credential out of
+    the question store and into the event store, which is the same defect one table
+    along. So: the offending PATH (safe — it is a filename, and the user needs it to know
+    which change is being held), or a fixed phrase naming the SHAPE.
+
+    Three nets, cheapest first, and all three read ADDED lines only. A removed secret is
+    the change doing the right thing and holding on it would punish the one diff that
+    fixes the problem.
+    """
+    for path in _paths(stat, diff):
+        for pattern in _SECRET_PATH_RE:
+            if pattern.search(path):
+                return path[:200]
+    for line in (diff or "").splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        marker = _line_marker(line[1:])
+        if marker:
+            return marker
+    return ""
+
+
+def secret_marker_text(text: str) -> str:
+    """The same nets over PLAIN TEXT — the result summary. Named, never quoted. Pure.
+
+    ONE scanner, two callers. The worker's summary is prose it typed, so there is no `+`
+    to require and no header to skip; `secret_marker` strips the `+` and everything after
+    is this function. Writing the rules twice is how the two copies drift.
+
+    The PATH net is deliberately NOT run here. A path is evidence in a diff — the change
+    touched `.env` — but in prose it is a mention, and a summary that says it edited
+    `.env.example` is the commonest sentence in this repo's records.
+    """
+    for line in (text or "").splitlines():
+        marker = _line_marker(line)
+        if marker:
+            return marker
+    return ""
+
+
+def _line_marker(line: str) -> str:
+    """One line, no diff marker. The shape it carries, or `""`."""
+    for pattern, name in zip(_SECRET_EVIDENCE_RE, SECRET_EVIDENCE_NAMES):
+        if pattern.search(line):
+            return name
+    m = _ASSIGNMENT_RE.match(line)
+    if m and _names_a_secret(m.group("name")) and _secret_value(m.group("value")):
+        return f"a line assigning {m.group('name')[:60]}"
+    return ""
+
+
 @dataclass(frozen=True)
 class Decision:
     """Armed to ask Neo, or held with a reason a person can read. Nothing else.
@@ -265,6 +486,56 @@ class Ruling:
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
+
+
+def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
+                    summary: str = "") -> Decision:
+    """May the OS put THIS EVIDENCE into a stored question? PURE — no store, no model.
+
+    **THE SECOND GATE, AND THERE ARE TWO BECAUSE THEY SEE DIFFERENT THINGS.**
+    `decide_confirm` is pure over a ROW — an assumption, a work order, a config — and
+    cannot see a diff; this is the gate over the EVIDENCE, and it runs after the packet
+    is collected and before a single character of it reaches `neo.ask`. Folding it into
+    `decide_confirm` would mean handing that function a diff it has no other use for, on
+    every call site including the ask pass that has none.
+
+    HELD MEANS NO QUESTION IS FILED. Not "filed with the diff withheld": a confirmation
+    with no diff in it is the cheap design Neo refused in question 549, and filing the
+    row at all is the filing decision kn-deef42ea says the redaction decision IS. The
+    assumption stays pending and is the user's — exactly what happens today on a fleet
+    that never switched this on.
+
+    BOTH TEXTS THE QUESTION CARRIES, because `_confirm_question` interpolates the diff
+    AND `wo["result_summary"]` — a worker that quotes the credential it wired up puts it
+    in the question store by the route the diff was gated on. The hold NAMES which of
+    the two it was: the user has to know which text to go and read.
+
+    Carries `assumption_id` and `n` like every other hold, so
+    `Daemon._note_autoreview_held` dedupes per assumption instead of writing a line every
+    reconcile tick.
+    """
+    aid = int(assumption.get("id") or 0)
+    n = int(assumption.get("n") or 0)
+    fields = {"assumption_id": aid, "n": n}
+    marker = secret_marker(stat, diff)
+    if marker:
+        return _held(HELD_EVIDENCE_SECRET,
+                     f"the delivered diff carries {marker}, and the OS will not copy a "
+                     f"secret into a stored question — assumption #{n} is yours",
+                     **fields)
+    marker = secret_marker_text(summary)
+    if marker:
+        # WHICH TEXT, named: the user has to know where to go and look, and the summary
+        # and the diff are two different places.
+        return _held(HELD_EVIDENCE_SECRET,
+                     f"the work order's result summary carries {marker}, and the OS "
+                     f"will not copy a secret into a stored question — assumption #{n} "
+                     f"is yours",
+                     **fields)
+    return Decision(armed=True, code="armed",
+                    reason=f"the evidence for assumption #{n} carries nothing "
+                           f"secret-shaped",
+                    **fields)
 
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
@@ -353,6 +624,62 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      f"those for you, whatever it thinks of them", **fields)
     return Decision(armed=True, code="armed",
                     reason=f"assumption #{n} is routine enough to put to Neo", **fields)
+
+
+def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
+                   round_outcome: str = "", refusal_answered: bool = True,
+                   objections_outstanding: bool = False) -> Decision:
+    """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §7. A provisional approval is an opinion about an intention; at `needs_review` the
+    intention has become a diff and a result summary, and only then may it settle.
+
+    Four gates of its own, then **`decide` itself, unchanged and in full**. A provisional
+    verdict is not a ticket past any of its seven conditions: the early pass judged an
+    intention, so it cannot buy the order past a panel that gave up, a permission the
+    project revoked, or the high-stakes net.
+
+    * no `accept` to confirm — `unjudged` (nothing judged it) or `objected`. An early
+      `object` approved NOTHING, so there is nothing to confirm and no question is asked
+      on one: the user decides it, with the objection in front of them.
+    * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
+      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.**
+    * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
+      Means NOT YET and costs nothing: retried next tick. Without it the two passes race
+      on one assumption, one settling it while the other has a message to the worker in
+      flight about it.
+
+    **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
+    own docstring documents for condition 6. `neo_question_id` points at the EARLY
+    question and always will, so without it every confirmation would hold as "already
+    with Neo" and this pass would never run once.
+    """
+    verdict = str(assumption.get("provisional_verdict") or "")
+    aid = int(assumption.get("id") or 0)
+    n = int(assumption.get("n") or 0)
+    fields = {"assumption_id": aid, "n": n}
+    if not verdict:
+        return _held(HELD_UNJUDGED,
+                     f"assumption #{n} carries no early verdict — there is nothing to "
+                     f"confirm", **fields)
+    if verdict != PROVISIONAL_ACCEPT:
+        return _held(HELD_OBJECTED,
+                     f"Neo objected to assumption #{n} while the work ran — it approved "
+                     f"nothing, so there is nothing to confirm and it is yours",
+                     **fields)
+    confirming = int(assumption.get("confirm_question_id") or 0)
+    if confirming:
+        return _held(HELD_CONFIRMING,
+                     f"assumption #{n} is already with Neo to confirm "
+                     f"(question {confirming})", **fields)
+    if objections_outstanding:
+        return _held(HELD_OBJECTION_IN_FLIGHT,
+                     "an objection on this work order has not reached the worker or "
+                     "been withdrawn yet — confirming is retried once it has", **fields)
+    return decide(assumption, wo, cfg, round_outcome=round_outcome,
+                  refusal_answered=refusal_answered,
+                  asked_question_id=int(assumption.get("neo_question_id") or 0))
 
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
@@ -623,6 +950,93 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         f"{others}",
         answers,
     ])
+
+
+def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
+                      siblings: list[dict[str, Any]], stat: str, diff: str) -> str:
+    """What the reviewer reads at DELIVERY. Everything the early pass could not have.
+
+    Each block earns its place, and the two new ones are the whole point of the second
+    call (Neo, question 549):
+
+    * **the provisional verdict, its reason and its model, labelled as mid-turn.** The
+      reviewer is being asked to confirm a READING, not to rule from scratch, and one
+      formed with no diff in front of it is evidence rather than authority — saying so is
+      what stops the earlier line being read as a decision already taken.
+    * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
+      and the result summary. This is the fact that did not exist when the assumption was
+      an intention, and confirming without it would be the cheap design Neo refused.
+      **`decide_evidence` HAS ALREADY PASSED BOTH**, because `neo.ask` persists
+      everything below as a question row: neither a diff nor a summary carrying a secret
+      reaches here.
+
+    The rest mirrors `_ruling_question` deliberately: the assumption quoted, the work
+    order's title and description, and the siblings through `sibling_line` — the
+    high-stakes net applies to the context list here exactly as it does there, because
+    the net is about text reaching a model, not about which pass is asking.
+
+    The ANSWER SHAPE is `_ruling_question`'s, unchanged, so `read_ruling` reads this
+    reply with both nets armed and no second parser exists to disagree with it.
+    """
+    n = assumption.get("n")
+    others = "\n".join(sibling_line(s) for s in siblings
+                       if s["id"] != assumption["id"]) or "  (none)"
+    return "\n\n".join([
+        f"ASSUMPTION REVIEW — CONFIRM an earlier reading of assumption #{n} of "
+        f"{wo['id']} in {project}, against the result that has now been delivered, and "
+        f"rule on nothing else.",
+        f"# The assumption\n{assumption.get('content') or '(empty)'}",
+        f"# The reading formed WHILE THE WORKER WAS STILL TYPING\n"
+        f"verdict: {assumption.get('provisional_verdict') or '(none)'} "
+        f"(model: {assumption.get('provisional_model') or 'unknown'})\n"
+        f"{assumption.get('provisional_reason') or '(no reason recorded)'}\n"
+        f"That reading had NO diff and NO result summary in front of it. You do.",
+        f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
+        f"{(wo.get('description') or '')[:2000]}",
+        f"# What the worker says it delivered\n"
+        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}",
+        f"# What changed\n{stat or '(no files reported)'}\n\n{diff or '(no diff)'}",
+        f"# The work order's other assumptions, for context only — do not rule on these\n"
+        f"{others}",
+        "You are CONFIRMING that earlier reading against the delivered result. "
+        "Confirming settles this assumption in the user's name; anything else leaves it "
+        "with them, carrying both readings.",
+        "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
+        "to the user), `stakes` (`routine` or `high`) and a one-line `reason`.",
+    ])
+
+
+def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
+                         assumption: dict[str, Any], siblings: list[dict[str, Any]],
+                         *, stat: str = "", diff: str = "") -> dict[str, Any]:
+    """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
+
+    `propose`'s mirror, and the differences are the two that matter: the link is
+    `confirm_question_id` — `neo_question_id` already points at the early question and
+    overwriting it would lose which reading came from where — and the `autoreview_asked`
+    payload carries `confirm: True`.
+
+    **THE PASS IS WRITTEN DOWN AT ASK TIME** (kn-e29d10fe). Re-deriving later from the
+    row ("it has a provisional verdict, so this must have been the confirmation") reads a
+    column that keeps changing under it. §5 writes `early` into the same payload field
+    for the same reason.
+
+    Reuses `QUESTION_KIND` and `ASSUMPTION_REVIEWER_PERSONA`: the persona is per KIND
+    (`neo.py:180`), and a new kind is seven edits in other people's modules
+    (kn-4edb0eb7).
+    """
+    question = neo.ask(project, wo["id"],
+                       _confirm_question(project, wo, assumption, siblings, stat, diff),
+                       context=f"{wo.get('title') or ''}\n"
+                               f"{(wo.get('description') or '')[:800]}",
+                       kind=QUESTION_KIND)
+    store.link_assumption_confirmation(assumption["id"], question["id"])
+    store.add_event(wo["id"], "autoreview_asked", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "neo_question_id": question["id"], "confirm": True})
+    log.info("auto-review asked Neo to confirm assumption #%s of %s as question %s",
+             assumption.get("n"), wo["id"], question["id"])
+    return question
 
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],

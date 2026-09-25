@@ -2253,11 +2253,23 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     The exception is `automerge_merged`: nothing follows a merge, so it wins over
     anything later. Nothing writes a later row today; it is asserted rather than assumed
     because the cost of being wrong is a completed work order claiming to be held.
+
+    **AND A REFUSAL IS STICKY FOR THE COMMIT IT JUDGED** — spec 2026-09-24 fix 4a. One
+    tick of GitHub answering `mergeable: UNKNOWN` wrote a hold stamped after a denial, and
+    `Daemon._note_automerge_held` dedupes per (sha, code, reason) so no newer row ever
+    overtook it back: the line said the merge was held on mergeability, for ever, over a
+    reviewer's refusal. A verdict is a permanent fact about one commit and a hold a
+    transient one, so the transient must not bury it — but only about the SAME commit: a
+    hold on a different head means the head moved, which is a new submission the denial
+    does not describe. An APPROVAL gains no stickiness at all, which is the case the
+    paragraph above exists for.
     """
     from . import db
+    from .automerge import decided_sha
 
     newest: dict[str, Any] | None = None
     terminal: dict[str, Any] | None = None
+    decided: dict[str, Any] | None = None
     for kind in AUTOMERGE_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
         if not rows:
@@ -2268,8 +2280,16 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
                      "kind": kind, "ts": float(rows[-1]["ts"])}
         if kind == AUTOMERGE_TERMINAL:
             terminal = candidate
-        elif newest is None or candidate["ts"] > newest["ts"]:
-            newest = candidate
+        else:
+            if kind == "automerge_decided":
+                decided = candidate
+            if newest is None or candidate["ts"] > newest["ts"]:
+                newest = candidate
+    if (newest is not None and newest["kind"] == "automerge_held"
+            and decided is not None and decided.get("decision") != "approved"
+            and decided_sha(decided)
+            and decided_sha(decided) == str(newest.get("head_sha") or "")):
+        newest = decided
     newest = terminal or newest
     if newest is None:
         return None
@@ -4966,6 +4986,57 @@ def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any
     return {"wo_id": wo_id, "assumption_id": assumption["id"],
             "n": assumption.get("n"), "status": status, "pending": len(pending),
             "settled": not pending}
+
+
+#: The one transport that ships. `peer` is in `OBJECTION_TRANSPORTS` and unused: §3's
+#: spike could not verify the sender's identity, and §6.4 says the peer path does not ship
+#: without it (Neo question 583).
+OBJECTION_TRANSPORT = "queue"
+
+
+def file_assumption_objection(store: ProjectStore, project_path: Path,
+                              wo: dict[str, Any], assumption: dict[str, Any], *,
+                              reason: str, model: str,
+                              question_id: int | None) -> dict[str, Any]:
+    """THE OS telling a RUNNING worker it disagrees with an assumption it just recorded.
+
+    docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
+    §6.1. Takes an open store, `accept_assumption`'s way, because the only caller is the
+    daemon thread that already has one.
+
+    **THE ORDER IS THE POINT AND IT IS NOT NEGOTIABLE.** The envelope, the assumption row
+    and the timeline event are all written before anything can reach a wire: an objection
+    that exists only on the wire is one the record cannot explain, and a send that
+    succeeds after a crash leaves a worker acting on guidance nothing accounts for. The
+    message a worker reads does not exist yet when this returns — `bus.post` queues an
+    envelope and `Daemon.deliver_envelopes` turns it into a `wo_messages` row on a later
+    tick, which is why the row stores an ENVELOPE id.
+
+    **This is not an acceptance and not a rejection.** `assumptions.status` is untouched,
+    nothing here reaches `ops.accept_assumption`, and the settlement verdict space is
+    still ACCEPT or ESCALATE (§2 of both specs). It is guidance, and the user still owes
+    the decision.
+
+    Two side effects of the neighbouring send paths are deliberately NOT inherited (§6.3):
+    the message is unattributed (`authored_by=''`, because only the user's own words are
+    ever stamped) and the work order's attention is left exactly as it was.
+    """
+    wo_id = wo["id"]
+    envelope_id = bus.post(store, subject=bus.Subject(wo_id=wo_id),
+                           from_role="reviewer", to_role="implementor",
+                           payload=bus.AssumptionObjection(
+                               assumption_n=int(assumption.get("n") or 0),
+                               reason=reason, question_id=question_id))
+    sent_ts = db.now()
+    store.record_objection(assumption["id"], envelope_id=envelope_id,
+                           transport=OBJECTION_TRANSPORT, sent_ts=sent_ts)
+    store.add_event(wo_id, "autoreview_objected", {
+        "assumption_id": assumption["id"], "n": assumption.get("n"),
+        "transport": OBJECTION_TRANSPORT, "reason": reason, "model": model,
+        "question_id": question_id, "envelope_id": envelope_id,
+        "decided_by": ASSUMPTION_DECIDER_OS})
+    return {"envelope_id": envelope_id, "transport": OBJECTION_TRANSPORT,
+            "sent_ts": sent_ts}
 
 
 def record_provisional_verdict(store: ProjectStore, wo: dict[str, Any],
