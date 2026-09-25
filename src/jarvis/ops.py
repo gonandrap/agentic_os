@@ -4137,6 +4137,13 @@ def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
             "pr_url": wo.get("pr_url")}
 
 
+#: Baked into every repair nudge, not a format field, so a new nudge cannot omit it.
+#: The dispatch brief states the same rule (kn-356c724b).
+TARGETED_TESTS_LINE = ("run only the tests covering the files you touched (NOT the "
+                       "full suite — that is CI's job, and it runs it on more "
+                       "interpreters than you can)")
+
+
 #: The nudge the user used to type by hand, written once so it can be complete: what is
 #: wrong, what to do, what NOT to do, and how many attempts are left. Spec §3.
 PR_CONFLICT_NUDGE = """\
@@ -4145,7 +4152,7 @@ stands. GitHub reports it as CONFLICTING; nobody typed this message, Jarvis noti
 while polling for the merge.
 
 Resolve them: in your worktree, `git fetch origin`, merge `origin/{base}` into your \
-branch, fix every conflict, run this project's tests, and push. Do NOT rebase or \
+branch, fix every conflict, """ + TARGETED_TESTS_LINE + """, and push. Do NOT rebase or \
 force-push — a forced branch update is refused by the permission classifier. If the \
 conflict is not resolvable from this branch (for instance the branch it was opened \
 against has itself been merged), say so plainly in your final message rather than \
@@ -4168,8 +4175,9 @@ Your pull request {url} has failing checks and must not be merged as it stands. 
 reports these as failed: {failing}. Nobody typed this message — Jarvis noticed while \
 polling the pull request.
 
-Fix them: in your worktree, reproduce each failure locally, fix the cause, run this \
-project's tests, and push. If a check fails for a reason that is not yours to fix (an \
+Fix them: in your worktree, reproduce each failure locally, fix the cause, \
+""" + TARGETED_TESTS_LINE + """, and push. If a check fails for a reason that is not \
+yours to fix (an \
 infrastructure outage, a flake, a required check this branch cannot satisfy), say so \
 plainly in your final message rather than fighting it: that is a call for the user. Do \
 NOT rebase or force-push — a forced branch update is refused by the permission \

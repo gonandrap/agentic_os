@@ -9,6 +9,7 @@ stale-finish check reported the OS's own repair turn as a worker that gave up (3
 
 from __future__ import annotations
 
+import string
 import time
 
 import pytest
@@ -423,3 +424,32 @@ def test_the_other_repairs_open_episode_holds_the_resettle(started, project, fak
 
     assert not ops.resettle_after_repair(store, repaired["id"])
     assert store.get_work_order(repaired["id"])["status"] == "needs_review"
+
+
+# -- every repair nudge obeys the targeted-tests ruling (kn-356c724b) ----------------
+
+
+@pytest.mark.parametrize("repair", ops.PR_REPAIRS, ids=lambda r: r.name)
+def test_every_repair_nudge_asks_for_targeted_tests_only(repair):
+    """A repair turn's nudge is often the last instruction in its context, so it cannot
+    contradict the dispatch brief by asking for the full suite."""
+    assert ops.TARGETED_TESTS_LINE in repair.template
+    assert "run this project's tests" not in repair.template
+
+
+@pytest.mark.parametrize("repair", ops.PR_REPAIRS, ids=lambda r: r.name)
+def test_every_repair_nudge_still_renders(started, project, repaired, repair):
+    """Baking the line in must not leave an unresolved placeholder in any template."""
+    store = ProjectStore(project)
+    supplied = {"url", "attempt", "max_attempts"}
+    fields = {name: f"<{name}>"
+              for _, name, _, _ in string.Formatter().parse(repair.template)
+              if name and name not in supplied}
+
+    out = ops.nudge_pr_repair(store, store.get_work_order(repaired["id"]), repair,
+                              **fields)
+
+    assert out["nudged"]
+    msg = store.queued_messages(repaired["id"])[-1]["content"]
+    assert "{" not in msg and "}" not in msg
+    assert ops.TARGETED_TESTS_LINE in msg
