@@ -91,8 +91,12 @@ And one new rule, which is the axis the whole feature turns on:
 
 ## 3. The spike: can a message reach a headless worker mid-turn
 
-**This section is a research task and its deliverable is evidence, not a yes.** It decides
-the transport §6 uses, and nothing else in the feature waits on it.
+**Measured, and the answer shipped the queue path.** wo-fd4dfba5, PR #719, Claude Code
+2.1.281, 2026-09-24 — `scripts/spike_peer_message.py` and
+`docs/superpowers/specs/2026-09-24-spike-peer-message-delivery.md`. A measurement of an
+external tool expires when that tool ships a version (kn-df5574d3), so both the date and
+the version are part of the finding. What follows is what the trials showed; §6.4
+describes the transport that exists.
 
 ### 3.1 What is true today, and why it is the problem
 
@@ -103,64 +107,55 @@ earliest a message can reach a worker is the next turn boundary. It then arrives
 FRESH TURN, which re-sends the whole accumulated conversation at the 1.25x cache-write
 rate — ~12% of this project's entire token spend goes on exactly that boundary.
 
-So today an objection is both late and expensive. That is the honest fallback, and it is
-good enough to ship the feature on; the spike asks whether there is something better.
+So an objection is both late and expensive. That is the path that shipped: late and
+expensive beats a channel whose sender the OS cannot check.
 
-### 3.2 The claim to test
+### 3.2 What the trials measured
 
-Claude Code native cross-session messaging (`SendMessage`, CC 2.1.224+) is documented to
-deliver into a receiver that is MID-TURN, between its tool calls, with no new turn and no
-context re-write. Jarvis workers are already addressable: `dispatch` names each session
-`[WO <id>] <title>`.
+Claude Code native cross-session messaging (`SendMessage`, CC 2.1.224+). Jarvis workers
+are already addressable: `dispatch` names each session `[WO <id>] <title>`. Four unknowns
+went in; three came back yes and the fourth came back no.
 
-Four unknowns, none of them answered by the release notes:
+1. **Delivery under `-p` works: 7/7 trials** — 5 plain and 2 with `--autocompact 100000`,
+   the receiver's argv mirroring `claude_cli.turn_args()` / `spawn_turn()`. **Mid-turn is
+   proven by construction**: a `-p` session gets one turn and exits, so a message it
+   absorbed at all was absorbed inside that turn.
+2. **It is cheap.** 447–451 cache-WRITE tokens against 38,678 cache READ: the prefix is
+   not re-written, unlike the queue path's fresh-turn boundary.
+3. **It is visible to the cost surfaces.** The receiver's transcript carries a
+   queue-operation row with `reason=absorbed_mid_turn`, so `usage.read_session`, `bill`
+   and `jarvis inspect` can all see it.
+4. **IDENTITY IS NOT VERIFIED, and that is why the peer path did not ship.** §3.2's
+   fourth unknown was always a veto: a "no" there means no peer transport whatever the
+   delivery trials said. The from-name is self-declared. The pid in the uds path matched
+   `verifiedPeerPid` in two HONEST trials — agreement, not verification, and no forgery
+   trial was run. A `UserPromptSubmit` hook never sees `verifiedPeerPid`: its payload is
+   only `cwd`, `hook_event_name`, `permission_mode`, `prompt`, `prompt_id`, `session_id`,
+   `session_title`, `transcript_path` — so the one sender fact a hook can read is the
+   envelope TEXT. The hook DOES fire on an absorbed peer message and exit 2 refuses it,
+   and a pid allow-list refused an unregistered sender declaring `-n jarvis-daemon` (1/1)
+   while absorbing the registered one (1/1). That is a filter over a self-declared name,
+   not an identity.
 
-1. **Does mid-turn delivery work under `-p`?** Workers are headless.
-2. **Is `SendMessage` — or the inbox socket a `-p` session is said to bind while
-   running — actually available in that mode?**
-3. **Does a delivered message appear in the receiver's transcript?** If it does not,
-   `usage.read_session`, `bill` and `jarvis inspect` all go blind on it, and an objection
-   that cost tokens would be invisible to every cost surface the OS has.
-4. **Does the receiver learn WHO sent it, and can it refuse an unknown sender?** §6.4
-   requires this: the peer path opens an inbound channel into a running worker, and
-   guidance is the most valuable thing on the machine to be able to forge. A "yes" on
-   unknowns 1–3 with a "no" here still means the peer transport does not ship.
+### 3.3 The decisive finding: a send is not a receipt
 
-### 3.3 How to test it so the answer is about the right process
+Against a receiver with `crossSessionInbound=refuse`, `SendMessage` still returns
+`{"success":true, ..., "msg_id":...}`. The refusal arrives as a LATER inbound message, and
+a headless `claude -p` sender has already exited before it can be received — so the
+refusal is invisible from the sending side **every time** (kn-cb484a19). §6.4's original
+design stamped `objection_delivered_ts` from the send's own report; that would have
+written a fact the OS does not have.
 
-Reproduce the argv a real worker runs under, from `claude_cli.turn_args()` /
-`spawn_turn()`: `claude -p --output-format json --resume <uuid> -n "[WO <id>] …" …`,
-detached with `start_new_session=True` and `stdin=DEVNULL`. A spike run in a friendlier
-shape answers a question nobody asked. Also check the message survives `--autocompact`.
+### 3.4 Outcome, and the off-switches stated honestly
 
-**This measurement cannot run under `pytest`, and must not try.** The root `conftest.py`
-gate points `JARVIS_CLAUDE_BIN` at a stub that exits 1, precisely so no test can reach the
-real binary. So this is a hand-run script, executed from the worktree, and its output is
-the evidence. A worker that fights the gate ends up measuring the stub and reporting its
-behaviour as the answer.
+**The queue path shipped and the peer path did not.** Not because delivery failed — it
+did not fail once — but on unknown 4 and on §3.3. "Works sometimes" is not a transport,
+and neither is "arrives, probably, from someone".
 
-**The bar for a positive result is a batch of at least five trials in which every one
-delivers mid-turn AND appears in the receiver's transcript.** Any mixed batch is `not
-reliable`, which §3.4 treats exactly as `does not`. Report the trial count and the success
-count, not a narrative.
-
-Check the settings that switch the feature off, because a fleet with any of them set gets
-the fallback and must not silently get nothing: `DISABLE_TELEMETRY`, `DO_NOT_TRACK`,
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_GROWTHBOOK`, and the
-`crossSessionInbound` setting (`accept` / `hold` / `refuse`).
-
-### 3.4 Outcomes
-
-**"Inconclusive" is an acceptable and expected result.** "Works sometimes" is not a
-transport, and reporting it as one would be worse than reporting a failure. Three
-outcomes: it works (§6 ships the peer path with the queue as fallback); it does not (§6
-ships the queue path alone); it is not reliable (same as "it does not", recorded as such).
-
-The findings go in a Serena memory (`write_memory`, amending
-`cross-session-messaging-facts`, whose "unverified — spike needed" list is exactly these
-three unknowns) and back into this section of this file, so the next reader gets the
-measurement and not the question. A measurement of an external tool expires when that tool
-ships a version: date it and name the CC version measured (kn-df5574d3).
+The off-switches were only partly measured, and the gap is part of the finding:
+`DISABLE_TELEMETRY=1` on BOTH ends does NOT disable peer messaging on 2.1.281 — one
+variable, one trial. `DO_NOT_TRACK`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and
+`DISABLE_GROWTHBOOK` were NOT tested and nothing is known about them.
 
 ## 4. The state
 
@@ -355,44 +350,23 @@ two cannot drift.
 
 ### 6.4 The transport, and the fallback that always exists
 
-The queue path ships regardless: record, post to the bus, `transport="queue"`, delivered
-at the next turn boundary by `Daemon.deliver_messages`. This is the whole feature working,
-late — **and for a headless worker "late" is often "never", because its next turn boundary
-is usually the end of its run.** That is not a defect to be papered over; it is why §6.6
-exists and why the queue path's honest outcome on a short order is a withdrawal rather
-than a late delivery.
+**One transport shipped: the queue.** Record, post to the bus, `transport="queue"`,
+delivered at the next turn boundary by `Daemon.deliver_messages`. This is the whole
+feature working, late — **and for a headless worker "late" is often "never", because its
+next turn boundary is usually the end of its run.** That is not a defect to be papered
+over; it is why §6.6 exists and why the queue path's honest outcome on a short order is a
+withdrawal rather than a late delivery.
 
-If §3 came back positive, the same function delivers via peer messaging when the worker is
-mid-turn — `transport="peer"`, `objection_delivered_ts` stamped from the send's own
-report — and falls back to the queue on any error, on any of the disabling settings being
-set, and whenever the worker is not actually running. **One call site, one function**: the
-peer path changes how an already-recorded objection travels and nothing about how it is
-authored. The single line that forbids mid-turn delivery today is
-`worker_session.delivery_hold`'s `HOLD_TURN_IN_FLIGHT` branch, and it is the only hold
-this section may touch — the budget, no-session and retry holds all still apply, because a
-peer message into a worker with no money or no session is no more deliverable than a
-queued one.
+The peer path did not ship, on §3's two findings. The receiver cannot verify who is
+talking, and an objection is guidance a worker acts on — the most valuable thing on the
+machine to be able to forge. And a send that returns `success:true` is not a delivery
+receipt (§3.3), so stamping `objection_delivered_ts` from the send's own report would have
+written a fact the OS does not have. `peer` stays in `OBJECTION_TRANSPORTS` and has no
+caller; the queue path is not a degraded mode here, it is the one whose sender is the
+daemon by construction.
 
-**The peer sender is an injectable parameter, and that is a testability requirement rather
-than a style preference.** The test fake has no inbox and cannot receive a mid-turn
-message, so no test in this repository can assert that a peer message actually arrived.
-What a test CAN prove is selection and fallback: that a busy worker selects
-`transport="peer"` and calls the injected sender, and that the sender raising — or any of
-§3.3's disabling settings being set — falls back to `transport="queue"` with an identical
-recorded message. Hard-wire the send and the peer half of this section ships unverified.
-
-**The peer path opens an inbound channel into a running worker, and §3 must report whether
-that channel says who is talking.** A worker that accepts a mid-turn message accepts it
-from whatever can reach its inbox socket, and an objection is guidance a worker acts on —
-the most valuable thing on the machine to be able to forge. So §3 answers a fourth
-question alongside its three: **does the receiver learn the sender's identity, and can a
-receiver refuse an unknown one** (`crossSessionInbound`'s `accept` / `hold` / `refuse`)?
-If it cannot, the peer transport does not ship, whatever the delivery trials said — the
-queue path is not a degraded mode here, it is the one whose sender is the daemon by
-construction. If it can, every objection carries a sender the worker can check and the
-worker's briefing tells it to act only on a message from the OS. The standing
-`PreToolUse` allowlist on `SendMessage` is filed on the backlog and is a fleet-wide
-policy, not this feature's to build.
+`worker_session.delivery_hold` is therefore untouched: every hold still applies, including
+the `HOLD_TURN_IN_FLIGHT` branch a peer transport would have had to bypass.
 
 ### 6.5 What the worker did about it
 
