@@ -267,7 +267,9 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # `manager` is a long-lived coordinator session that owns one feature order's
 # follow-through: it stays open for the whole feature, receives what its children
 # report and decides what happens next, instead of finishing a job and exiting.
-WO_KINDS = ("worker", "planner", "manager")
+# `analyst` is an improvement order's planner-shaped child: one session that reads
+# records and hands back a diagnosis — §3.1 of the improvement-orders spec.
+WO_KINDS = ("worker", "planner", "manager", "analyst")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
@@ -1084,7 +1086,7 @@ ADDED_COLUMNS = {
         # feature order. `ALTER TABLE ADD COLUMN` may carry a REFERENCES clause only
         # while the column defaults to NULL, which it does.
         "parent_id": "TEXT REFERENCES feature_orders(id)",
-        # `worker` or `planner` — see WO_KINDS.
+        # `worker`, `planner`, `manager` or `analyst` — see WO_KINDS.
         "kind": "TEXT NOT NULL DEFAULT 'worker'",
         # Which section of the parent feature's spec this child implements, as the plan
         # named it (a heading number or its text). NULL for every standalone work order
