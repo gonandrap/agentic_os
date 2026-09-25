@@ -362,10 +362,9 @@ def test_delivery_refuses_an_objection_to_an_order_that_stopped(started):
 
 # -- the joint: §6.6's withdrawal and §7's gate ----------------------------------------
 
-#: Routine text, and the FORCE_ACCEPT marker sits PAST character 200 on purpose:
-#: `autoreview.sibling_line` truncates there, so the marker never leaks into the prompt
-#: for the assumption beside this one. Otherwise the fake reads `FORCE_ACCEPT` first
-#: (src/jarvis/testing.py) and both rows come back accepted.
+#: Routine text, and the FORCE_ACCEPT marker sits PAST character 200 on purpose, so it
+#: never leaks into the prompt for the assumption beside this one. The test asserts that
+#: cut itself (`autoreview.sibling_line`) rather than trusting this comment.
 ACCEPTED_TEXT = (
     "named the helper `_render_row`, matching the two beside it, and kept its arguments "
     "in the order the three callers already pass them, so a reader of any one call site "
@@ -423,6 +422,10 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
               for a in store.all_assumptions(wo_id)}
         return by["object"], by["accept"]
 
+    # ACCEPTED_TEXT only works while `sibling_line`'s 200-char cut hides its marker: if
+    # the cut moves, the fake accepts BOTH rows, so fail here and say why.
+    assert "FORCE_ACCEPT" not in autoreview.sibling_line(rows()[1])
+
     # tick 1: the early pass asks, the drain rules, and NOTHING settles (§5).
     tick(started, project, store)
     objected, accepted = rows()
@@ -454,7 +457,9 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
 
     # The worker finishes MID-TICK. `ops.finish` is its own process writing, so the
     # status really can flip between the delivery half of a tick and its reconcile half —
-    # and that race is what §7's gate exists for.
+    # and that race is what §7's gate exists for. The flip is the ONLY effect of
+    # `ops.finish` this test depends on, and the real one would drag a validation round
+    # and an evidence collection into a test about the objection.
     store.set_status(wo_id, "needs_review")
 
     # tick 3, reconcile half: the gate holds, THEN §6.6 withdraws.
@@ -473,6 +478,13 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
     assert store.queued_messages(wo_id) == []
     assert store.latest_turn(wo_id) is None        # no turn, first assertion
+
+    # The hold was belt and the withdrawal is braces: give the order a session so
+    # `delivery_hold` lifts, and the withdrawn message is STILL not deliverable.
+    store.set_status(wo_id, "needs_review", session_id="s-joint")
+    tick(started, project, store, reconcile=False, drain=False)
+    assert store.latest_turn(wo_id) is None
+    assert store.deliverable_messages(wo_id) == []
 
     # tick 4: the gate is open, so the accepted row alone is confirmed and settled.
     tick(started, project, store, drain=False)

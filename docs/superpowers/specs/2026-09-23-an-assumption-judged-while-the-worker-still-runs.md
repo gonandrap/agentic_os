@@ -126,8 +126,8 @@ went in; three came back yes and the fourth came back no.
    queue-operation row with `reason=absorbed_mid_turn`, so `usage.read_session`, `bill`
    and `jarvis inspect` can all see it.
 4. **IDENTITY IS NOT VERIFIED, and that is why the peer path did not ship.** §3.2's
-   fourth unknown was always a veto: a "no" there means no peer transport whatever the
-   delivery trials said. The from-name is self-declared. The pid in the uds path matched
+   This fourth unknown was always a veto: a "no" here means no peer transport whatever
+   the delivery trials said. The from-name is self-declared. The pid in the uds path matched
    `verifiedPeerPid` in two HONEST trials — agreement, not verification, and no forgery
    trial was run. A `UserPromptSubmit` hook never sees `verifiedPeerPid`: its payload is
    only `cwd`, `hook_event_name`, `permission_mode`, `prompt`, `prompt_id`, `session_id`,
@@ -156,6 +156,11 @@ The off-switches were only partly measured, and the gap is part of the finding:
 `DISABLE_TELEMETRY=1` on BOTH ends does NOT disable peer messaging on 2.1.281 — one
 variable, one trial. `DO_NOT_TRACK`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and
 `DISABLE_GROWTHBOOK` were NOT tested and nothing is known about them.
+
+`crossSessionInbound` is the off-switch that DOES work: a receiver set to `refuse` does
+not get the message (`accept` / `hold` / `refuse`). It is an off-switch for the receiver
+and not a signal for the OS — §3.3's finding is that the sender cannot tell, because the
+send still reports `success:true` and the refusal arrives too late to be read.
 
 ## 4. The state
 
@@ -361,9 +366,17 @@ The peer path did not ship, on §3's two findings. The receiver cannot verify wh
 talking, and an objection is guidance a worker acts on — the most valuable thing on the
 machine to be able to forge. And a send that returns `success:true` is not a delivery
 receipt (§3.3), so stamping `objection_delivered_ts` from the send's own report would have
-written a fact the OS does not have. `peer` stays in `OBJECTION_TRANSPORTS` and has no
-caller; the queue path is not a degraded mode here, it is the one whose sender is the
-daemon by construction.
+written a fact the OS does not have. `peer` stays in `OBJECTION_TRANSPORTS`
+(src/jarvis/project_store.py:1427) and has no caller; the queue path is not a degraded
+mode here, it is the one whose sender is the daemon by construction.
+
+**The only guard is that tuple's membership check.** `ProjectStore.record_objection`
+asserts `transport in OBJECTION_TRANSPORTS` (src/jarvis/project_store.py:3935), which
+rejects a typo or an invented transport name — and lets `peer` through, since `peer` is
+in the tuple. So nothing in the store stops a `peer` value being written; what stops it
+is that no caller passes one. Removing `peer` from the tuple would turn the assertion
+into a real guard, and is not proposed here: the value is recorded history for any row
+that ever carried it, and an assertion is off under `python -O` anyway.
 
 `worker_session.delivery_hold` is therefore untouched: every hold still applies, including
 the `HOLD_TURN_IN_FLIGHT` branch a peer transport would have had to bypass.
