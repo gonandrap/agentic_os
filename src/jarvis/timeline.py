@@ -37,6 +37,7 @@ DEBUG_KINDS = frozenset({
     "turn_ended",               # that turn's process finished and its reply was captured
     "session_released",         # a legacy background agent handed its session over
     "hook_ignored",             # a hook from a session that is not this work order's
+    "tool_managed_paths",       # which tool-owned files the worktree's index now hides
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
     # Same moment as the message carrying the answer, so the message is the entry — §5.

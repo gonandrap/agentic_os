@@ -66,7 +66,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """
     import json as _json
 
-    from . import agent_usage, concision, wiring
+    from . import agent_usage, concision, hooks, wiring
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -176,6 +176,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # The crew is the ordinary worker's; a planner has its own team prose. Carried as
         # env rather than read at hook time for the same reason as the key above.
         "JARVIS_WO_KIND": str(wo.get("kind") or "worker"),
+        # The tracked files an installed TOOL rewrites, which the worktree's index is told
+        # not to report (`hooks.mark_tool_managed_paths`). Env for `JARVIS_GATES`' reason,
+        # and the sharper one the constant states: the `SessionStart` hook must not import
+        # `jarvis.catalog` to read a value fixed at spawn. The project spec is already
+        # resolved against the OS config, so this list is the answer for this project and
+        # the hook consults nothing else.
+        hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
+            list(project.worktree.tool_managed_paths)),
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
