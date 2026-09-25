@@ -2269,6 +2269,34 @@ def project(tmp_path, claude_json):
 
 
 @pytest.fixture()
+def improvement_order(project):
+    """A filed improvement order in the `project` fixture's project: evidence refs, no
+    analyst, no report.
+
+    Shared rather than re-filed per test file — §2.7 of
+    docs/superpowers/specs/2026-09-23-improvement-orders.md: every later piece of the
+    feature needs "an improvement order that exists", and divergent local copies are how
+    a suite starts disagreeing with itself. Written through the store rather than
+    `ops.create_improvement_order` so it costs no started OS.
+    """
+    from .ops import EVIDENCE_REFS_KEY
+    from .project_store import ProjectStore
+
+    store = ProjectStore(project)
+    try:
+        return store.create_feature_order(
+            "first turns re-read the same module",
+            description=("Three work orders in a row spent their first turn re-reading "
+                         "the dispatch path because nothing told them where it lives."),
+            kind="improvement",
+            metadata={EVIDENCE_REFS_KEY: ["wo-11111111", "#42",
+                                          "https://example.invalid/x"]},
+        )
+    finally:
+        store.close()
+
+
+@pytest.fixture()
 def catalog_file(tmp_path, project):
     data = {
         "os": {

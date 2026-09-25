@@ -6,6 +6,7 @@ from jarvis.testing import (  # noqa: F401
     fake_claude,
     fake_gh,
     fake_systemd,
+    improvement_order,
     jarvis_home,
     make_git_project,
     project,
