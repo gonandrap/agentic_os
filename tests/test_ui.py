@@ -1752,6 +1752,127 @@ def test_the_project_page_lists_feature_orders_without_repeating_the_tree(featur
     assert page.count(f"/fo/proj_a/{fo['id']}") == 1
 
 
+# -- improvement orders --------------------------------------------------------------
+#
+# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md: the page opens on the
+# counts, then the evidence, then one card per finding — because a report is only
+# judgeable next to what it was quoted from, and the decision is taken where it is read.
+
+
+@pytest.fixture()
+def improvement(client, project, improvement_order):
+    """An improvement order in `plan_review` with the shared findings report on it."""
+    from jarvis.testing import a_report
+
+    store = ProjectStore(project)
+    try:
+        analyst = store.create_work_order("analyse it", description="the observation",
+                                          kind="planner", status="running")
+        store.update_feature_order(improvement_order["id"], plan_wo_id=analyst["id"],
+                                   status="planning")
+    finally:
+        store.close()
+    ops.submit_findings(improvement_order["id"], a_report())
+    return client, ops.show_improvement_order(improvement_order["id"]), analyst
+
+
+def test_the_improvement_page_opens_on_counts_then_evidence_and_the_analyst(improvement):
+    client, io, analyst = improvement
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+
+    assert "2 findings" in page and "2 pending" in page
+    assert "Three work orders in a row spent their first turn" in page  # observation
+    for ref in ("wo-11111111", "#42", "https://example.invalid/x"):
+        assert html.escape(ref) in page
+    assert f"/wo/proj_a/{analyst['id']}" in page
+    # Its LIVE status, not the one it was created with: `submit_findings` settles the
+    # analyst, and a page still calling it running would be the stale half of the link.
+    assert io["analyst"]["status"] in page
+
+
+def test_a_finding_card_shows_all_five_fields_and_its_proposed_orders(improvement):
+    client, io, _ = improvement
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+
+    assert "first-turn-reads" in page
+    assert "before touching the dispatch path" in page             # symptom
+    assert "so every worker rediscovers the module layout" in page  # root_cause
+    assert "leaves every worker still reading the same files" in page  # why_insufficient
+    assert "generated from the committed code map" in page         # recommendation
+    assert "41 tool calls, 38 of them Read" in page                # evidence
+    assert "name the entry point in every dispatch brief" in page  # proposed order
+
+
+def test_an_accepted_finding_lists_the_orders_it_filed(improvement):
+    client, io, _ = improvement
+    ops.review_findings(io["id"], accept=("first-turn-reads",), project_name="proj_a")
+
+    detail = ops.show_improvement_order(io["id"])
+    filed = detail["filed_orders"]["first-turn-reads"]
+    page = client.get(f"/io/proj_a/{io['id']}").text
+
+    assert filed, "the accepted finding filed nothing to link to"
+    for order in filed:
+        link = f"/wo/proj_a/{order['id']}"
+        assert link in page
+        # The status has to ride on the filed order's OWN row: an accepted finding that
+        # says what was proposed and not what became of it is the missing half (§5.3.1).
+        row = page[page.index(link):page.index(link) + 400]
+        assert order["status"] in row
+
+
+def test_a_pending_finding_carries_both_decisions_and_a_required_reason(improvement):
+    client, io, _ = improvement
+
+    page = client.get(f"/io/proj_a/{io['id']}").text
+
+    assert f"/io/proj_a/{io['id']}/review" in page
+    assert 'value="accept"' in page and 'value="reject"' in page
+    textarea = page[page.index("<textarea"):page.index("</textarea>")]
+    assert "required" in textarea
+
+
+def test_accepting_a_finding_from_the_browser_decides_it(improvement):
+    client, io, _ = improvement
+
+    res = client.post(f"/io/proj_a/{io['id']}/review",
+                      data={"key": "first-turn-reads", "decision": "accept",
+                            "reason": ""})
+
+    assert res.status_code == 303
+    assert ops.show_improvement_order(io["id"])["by_decision"]["accepted"] == 1
+
+
+def test_rejecting_a_finding_with_no_reason_says_so_instead_of_failing(improvement):
+    """The reason is what the knowledge entry and the analyst read, so a bare rejection
+    is a decision nobody can learn from. The refusal reaches the page, not a 500."""
+    client, io, _ = improvement
+
+    res = client.post(f"/io/proj_a/{io['id']}/review",
+                      data={"key": "first-turn-reads", "decision": "reject",
+                            "reason": ""})
+
+    assert res.status_code == 303
+    assert "error=" in res.headers["location"]
+    assert ops.show_improvement_order(io["id"])["by_decision"]["pending"] == 2
+    page = client.get(res.headers["location"]).text
+    assert "the entire teaching signal" in page   # ops' own refusal, on the page
+
+
+def test_the_project_page_lists_improvement_orders_without_expanding_findings(improvement):
+    client, io, _ = improvement
+
+    page = client.get("/project/proj_a").text
+
+    assert page.count(f"/io/proj_a/{io['id']}") == 1
+    assert "Improvement orders" in page
+    assert "findings awaiting you" in page   # the kind-aware label, not `plan_review`
+    # Counts, not trees: the findings are what the order's own page is for.
+    assert "before touching the dispatch path" not in page
+
+
 def _settle_feature(project, title, status):
     """A feature order in a terminal status, with no ceremony about how it got there."""
     fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "

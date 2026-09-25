@@ -77,6 +77,20 @@
   {% else %}
   <div class="empty">this feature order has no work orders yet</div>
   {% endfor %}
+  {# Not a link and not an order: without it the rows above visibly sum to less than
+     the headline, with nothing on the page saying why. #}
+  {% if bill.own %}
+  <div class="row">
+    <span class="mono" style="width: 76px; text-align: right;">
+      {{ bill_ui.money(bill.own.cost.list_usd) }}</span>
+    <div class="grow">
+      {{ own_label }}
+      <div class="sub mono">{{ bill.id }} ·
+        {{ fmt_tok(bill.own.tokens.total) }} tokens ·
+        {{ bill.own.calls }} call{{ 's' if bill.own.calls != 1 }}</div>
+    </div>
+  </div>
+  {% endif %}
 </div>
 {% else %}
 

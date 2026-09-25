@@ -565,6 +565,13 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                             + ", ".join(_child_note(k, parked_by_id) for k in kids)
                         )
                     progress = feature_progress(store, fo)
+                    # §6.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md: an
+                    # improvement order's reason is `findings.review_headline` word for
+                    # word — it already leads with counts and already names the command,
+                    # and "0/1 done" about a one-child family displaces those counts with
+                    # noise. Feature orders keep the prefix and `jarvis fo show`.
+                    improvement = (fo.get("kind") or "feature") == "improvement"
+                    body = "; ".join(reasons)
                     attention.append({
                         "project": p["name"], "wo_id": None, "fo_id": fo_id,
                         "title": fo["title"],
@@ -573,9 +580,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         # feature order's label is unchanged by construction.
                         "status": (f"{fo.get('kind') or 'feature'}:"
                                    f"{feature_status_label(fo.get('kind'), fo['status'])}"),
-                        "reason": f"{progress['label']} — " + "; ".join(reasons),
+                        "reason": body if improvement
+                                  else f"{progress['label']} — {body}",
                         "rolled_up": [k["id"] for k in kids],
-                        "decide": f"jarvis fo show {fo_id}",
+                        "decide": (f"jarvis io review {fo_id}" if improvement
+                                   else f"jarvis fo show {fo_id}"),
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
