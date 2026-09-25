@@ -948,6 +948,14 @@ class Daemon:
         same call that files the planner, so a tick that crashes between the two leaves
         the feature order `pending` and simply files it again next time. The opposite
         ordering would strand a feature order in `planning` with no planner.
+
+        An IMPROVEMENT order gets the same treatment from a sibling loop below: its
+        analyst is its planner-shaped child — one work order, `kind='analyst'`, the
+        observation verbatim — and leaving `pending` last is what makes a crashed tick
+        re-file it rather than strand the order with no analyst. A sibling loop rather
+        than one loop over both kinds, because `list_feature_orders` filters kind
+        POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
+        undo that. See §3.1.
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -967,6 +975,23 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] planning %s: opened %s", project.name, fo["id"], wo["id"])
+
+        for fo in store.list_feature_orders(statuses=("pending",), kind="improvement"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Analyse: {fo['title']}"[:200],
+                    # The observation verbatim — the analyst CONTRACT is composed at
+                    # dispatch (dispatch._analyst_prompt), exactly as the planner's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="analyst", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad improvement order must not stop the rest
+                log.exception("[%s] could not open an analyst for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close out feature orders whose children have all landed, or one of which has

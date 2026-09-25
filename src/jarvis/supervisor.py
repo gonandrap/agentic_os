@@ -301,16 +301,24 @@ def _what_it_is(wo: dict[str, Any]) -> str:
     """What KIND of session is burning, in the judge's words.
 
     Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
-    the running ones), but `WO_KINDS` has three members and two of them belong to a
-    FEATURE order — so "a work order" alone hides the thing that most changes what normal
-    looks like. A planner reading a whole codebase for an hour is doing its job; a worker
-    doing the same on a one-file fix is not. Reported as evidence rather than instructed
-    in the persona, because a judge told to weigh something it cannot see is being asked
-    to guess (PR 173 review).
+    the running ones), but `WO_KINDS` has four members: two belong to a FEATURE order and
+    one to an IMPROVEMENT order, so "a work order" alone hides the thing that most
+    changes what normal looks like. A planner reading a whole codebase for an hour is
+    doing its job; a worker doing the same on a one-file fix is not. Reported as evidence
+    rather than instructed in the persona, because a judge told to weigh something it
+    cannot see is being asked to guess (PR 173 review).
     """
     parent = wo.get("parent_id")
     kind = wo.get("kind") or "worker"
     belongs = f" of feature order {parent}" if parent else ""
+    if kind == "analyst":
+        # §3.1 of the improvement-orders spec: it reads records and writes no code, so
+        # read-heavy is normal and product-code edits are the abnormality worth naming.
+        owns = f" of improvement order {parent}" if parent else ""
+        return (f"the ANALYST{owns} — one session reading OS "
+                f"records through the CLI to diagnose a root cause, so it is expected "
+                f"to be read-heavy; a long GENERATING stretch, or any sign of it "
+                f"editing product code, is not")
     if kind == "planner":
         return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
                 f"a single ask into work orders, so it is expected to be long and "

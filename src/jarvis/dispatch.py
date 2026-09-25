@@ -266,20 +266,27 @@ def materialize_design_doc(store: ProjectStore, project: ProjectSpec,
 
 
 def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
-    """The feature a MANAGER owns, with its live children. None for anything else.
+    """The parent order a MANAGER or an ANALYST needs. None for anything else.
 
     Read at dispatch rather than snapshotted at creation, and passed in rather than
     looked up inside `build_worker_prompt`, for the same two reasons
     `materialize_design_doc` is shaped this way: the prompt builder stays a pure function
     of its arguments, and the manager's children change under it — it files more of them
     as the feature runs, so anything frozen at release would be wrong by its second turn.
+
+    An ANALYST gets the row and an EMPTY `children` list rather than its parent's
+    children: an improvement order has none, and the orders it proposes are filed
+    independently (§1.3 of the improvement-orders spec). Same key so the manager path is
+    untouched.
     """
-    if wo.get("kind") != "manager" or not wo.get("parent_id"):
+    if wo.get("kind") not in ("manager", "analyst") or not wo.get("parent_id"):
         return None
     try:
         fo = store.get_feature_order(wo["parent_id"])
     except KeyError:
         return None  # a briefing is not the place to raise on a deleted parent
+    if wo.get("kind") == "analyst":
+        return {"fo": fo, "children": []}
     return {"fo": fo, "children": store.feature_children(fo["id"])}
 
 
@@ -289,20 +296,25 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         feature: dict[str, Any] | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
-    Three kinds of work order get three shapes. A WORKER opens with the minimum — its
+    Four kinds of work order get four shapes. A WORKER opens with the minimum — its
     identity, the work order, a compressed contract of only the load-bearing
     invariants — plus an index of the full briefings it can fetch on demand with
     `jarvis brief <section>` (single-sourced in `worker_brief`, so the CLI and this
     prompt cannot drift). A PLANNER keeps its full prompt: one session per feature,
     already reviewed as a unit. A MANAGER gets neither: it writes no product code, so
     every line of the worker contract about worktrees, pull requests and finishing would
-    be an instruction to do something it must not do. The surfaces around the contract —
-    the pre-approval marker and the knowledge index — are identical for all three.
+    be an instruction to do something it must not do. An ANALYST is the same case for the
+    same reason (§3.1 of the improvement-orders spec): falling through to the worker
+    contract would tell it to open a pull request, which is the one thing it must never
+    do. The surfaces around the contract — the pre-approval marker and the knowledge
+    index — are identical for all four.
     """
     if wo.get("kind") == "planner":
         return _planner_prompt(wo, project, knowledge)
     if wo.get("kind") == "manager":
         return _manager_prompt(wo, project, knowledge, feature)
+    if wo.get("kind") == "analyst":
+        return _analyst_prompt(wo, project, knowledge, feature)
     from . import wiring, worker_brief
     from .gates import KINDS
 
@@ -612,6 +624,196 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "Work autonomously toward a submitted plan. User feedback may arrive as new user "
         "turns; treat it as authoritative.",
+    ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+
+
+def _evidence_checklist(refs: list[str]) -> list[str]:
+    """One line per stored evidence ref, each naming the command that reads that shape.
+
+    §3.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: resolution is the
+    analyst's job, naming the verb is the OS's, so the analyst does not spend its first
+    turn guessing which command reads which kind of reference. An UNRECOGNISED ref is
+    still listed, with a note to work out how to read it — dropping it would hide
+    evidence the user chose to attach. A ref that does not resolve is a FINDING about the
+    OS's records, not an error here.
+    """
+    lines = []
+    for ref in refs:
+        ref = str(ref).strip()
+        if not ref:
+            continue
+        if ref.startswith("wo-"):
+            how = f"`jarvis wo show {ref}`"
+        elif ref.startswith("fo-"):
+            how = f"`jarvis fo show {ref}`"
+        elif ref.startswith("io-"):
+            how = f"`jarvis io show {ref}`"
+        elif ref.startswith("al-"):
+            how = "`jarvis alarms` — find this alarm in the list"
+        elif ref.startswith("#") and ref[1:].isdigit():
+            how = f"`gh issue view {ref[1:]}`"
+        elif "://" in ref:
+            how = (f"`gh pr view {ref}`" if "/pull/" in ref
+                   else "fetch it")
+        else:
+            how = "work out how to read it, and say so in the report if you cannot"
+        lines.append(f"- [ ] {ref} — {how}")
+    return lines
+
+
+def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
+                    knowledge: KnowledgeBrief | None = None,
+                    feature: dict[str, Any] | None = None) -> str:
+    """The briefing for an improvement order's analyst — §3.2 of
+    docs/superpowers/specs/2026-09-23-improvement-orders.md.
+
+    STATIC, unlike a child of a feature order: there is no spec to build an agent type
+    from, so `specs.install_agent` is never called for an improvement order. It carries
+    `_common_briefing` — the knowledge index and the navigation ranking — because it
+    reads records and code for a living.
+
+    "You analyse, you do not build" is PROSE, not enforcement, and that is worth stating
+    plainly rather than leaving for someone to discover. Same reason as the planner's: an
+    analyst is a work order, not a subagent, so its only lever is the `permissions.deny`
+    path `_write_worker_settings` writes — and a deny broad enough to stop product code
+    also stops it writing the `report.json` it is REQUIRED to submit.
+
+    It gets no planning seats (`bootstrap.install_agent_assets` gives those to
+    `kind == "planner"` only). A diagnosis is one reading of one record set; the seats
+    exist to argue about a DECOMPOSITION, and they have no `Bash`, so they could not read
+    the evidence anyway.
+    """
+    from . import db
+    from .ops import EVIDENCE_REFS_KEY  # lazy: ops imports dispatch
+
+    io_id = wo.get("parent_id") or "?"
+    fo = (feature or {}).get("fo") or {}
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    refs = list(metadata.get(EVIDENCE_REFS_KEY) or [])
+    parts = [
+        f"You are the ANALYST for Jarvis improvement order `{io_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        f"# The observation: {wo['title']}",
+        "",
+        wo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "# Your job: a diagnosis, not a fix",
+        "You are an ANALYST. You do not fix anything. You produce a diagnosis. A session "
+        "that returns a working fix has FAILED even if the fix is good — the improvement "
+        "order exists because the cheapest fix that turns a symptom green keeps winning, "
+        "and one more of those is not what is wanted here.",
+        "",
+        "**Argue against the obvious fix.** For every finding, state the cheapest fix "
+        "that would turn the symptom green and say why it is insufficient. If a "
+        "finding's recommendation IS that cheapest fix, say so, and say why that is "
+        "nevertheless the right call.",
+        "",
+        "# Read the evidence through the CLI, never the databases",
+        "Every record you need has a verb. Do not open a SQLite file, and do not read "
+        "state under `.jarvis/` by hand:",
+        "- `jarvis wo show <id>` / `jarvis wo list [project]` — a work order and its "
+        "timeline, messages and assumptions",
+        "- `jarvis inspect <wo-id|fo-id>` — where the time went, turn by turn",
+        "- `jarvis validation show <wo-id|fo-id>` — every panel seat's verdict and reply",
+        "- `jarvis cost <project|wo-id|fo-id>` — what it cost, split worker vs Jarvis",
+        "- `jarvis alarms [project]` — turns the OS raised while they burned",
+        "- `jarvis issues [project]` — tracker issues the fleet keeps hitting",
+        "- `jarvis learn search \"<term>\"` / `jarvis learn show <id>` — what the fleet "
+        "already knows",
+        "- `gh pr view <url>` / `gh pr diff <url>` — a pull request and what it changed",
+        *(["",
+           "## The evidence you were given",
+           "Read every one of these before you write anything. A ref that does not "
+           "resolve is itself a FINDING about the OS's records — report it, do not stop:",
+           *_evidence_checklist(refs)] if refs else []),
+        "",
+        "# Quote your evidence, verbatim",
+        "A root cause asserted without a verbatim line — from a timeline, an `inspect` "
+        "reading, a validation transcript, a diff — is an opinion, not a finding. "
+        "Paraphrase is not a quote. Copy the line as it is printed, and name the command "
+        "that printed it.",
+        "",
+        "# The report",
+        "Write it to a JSON file in your worktree and submit it with the command below, "
+        "which IS your finish. Do not run `jarvis wo finish` — submitting the report "
+        "settles this work order for you. `--from-file` and not an inline argument, "
+        "because the gate classifier's quote-blanking fails on nested and mixed quoting "
+        "and a report is full of repo paths and quoted log lines.",
+        "",
+        f"    jarvis io report {io_id} --from-file report.json",
+        "",
+        "```json",
+        "{",
+        '  "summary": "one line: what is going wrong, across all findings",',
+        '  "justification": "top-level and optional: why this needed more than 6 '
+        'findings",',
+        '  "findings": [',
+        "    {",
+        '      "key": "background-jobs",',
+        '      "symptom": "what was observed, and where",',
+        '      "root_cause": "why it happens, in mechanism terms",',
+        '      "evidence": [',
+        '        {"source": "jarvis wo show wo-dd8668fa", "quote": "the verbatim line"}',
+        "      ],",
+        '      "why_insufficient": "the cheapest green-making fix, and why it is wrong",',
+        '      "recommendation": "what to do instead",',
+        '      "proposed_orders": [',
+        '        {"type": "work", "project": "<project>", "title": "...",',
+        '         "description": "the full brief, standing alone"}',
+        "      ]",
+        "    }",
+        "  ]",
+        "}",
+        "```",
+        "",
+        "`key` is a short lowercase slug, unique within the report — it is how the user "
+        "and the dashboard address one finding. `type` is `work` or `feature`. "
+        "`proposed_orders` MAY be empty: \"do nothing, and here is why\" is a legitimate "
+        "recommendation, and inventing work to fill the list is worse than an empty one.",
+        "",
+        "The validator names every problem at once, so one revision fixes all of them.",
+        "",
+        "# Scope",
+        # §4.3 of the improvement-orders spec owns this cap; `findings.MAX_FINDINGS` is
+        # the constant that enforces it. Written literally rather than imported: the
+        # validator module is a sibling's and importing it would couple dispatch to it.
+        "- At most 6 findings, ranked worst first, unless your report carries a "
+        "top-level `justification` saying why it cannot be fewer. This is the ATTENTION "
+        "cap: a report the user will not read changes nothing.",
+        "- You PROPOSE orders. You do not file them — no `jarvis wo create`, no "
+        "`jarvis fo create`. The user decides each finding, and the OS files what they "
+        "accept.",
+        "- You write no product code, and you open NO pull request. Reading code and "
+        "writing a throwaway script to understand it is fine and expected; shipping "
+        "anything is not the job. This is stated as prose and nothing enforces it — you "
+        "must be able to write `report.json`, so no permission rule can separate the two.",
+        "",
+        "# Operating contract",
+        f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
+        f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
+        f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
+        f"Record every one, including the small ones.",
+        "- Work only inside your worktree (you start in it).",
+        *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
+           f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
+           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
+        "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
+        "on.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user decides from that record — they will never open this session. End every "
+        "turn with the complete answer: what you found, what you could not read, what "
+        "you are unsure about, and absolute paths.",
+        "",
+        "Work autonomously toward a submitted report. User feedback may arrive as new "
+        "user turns; treat it as authoritative.",
     ]
     return "\n".join(_common_briefing(parts, wo, project, knowledge))
 

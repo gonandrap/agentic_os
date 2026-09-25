@@ -327,13 +327,15 @@ def test_only_the_documented_outcomes_and_statuses_are_accepted(project):
         store.record_validation_opinion(rnd["id"], "architect", verdict="approve")
 
 
-def test_the_manager_is_the_third_and_only_other_work_order_kind(project):
+def test_the_manager_and_the_analyst_are_the_only_other_work_order_kinds(project):
     store = ProjectStore(project)
-    assert WO_KINDS == ("worker", "planner", "manager")
+    assert WO_KINDS == ("worker", "planner", "manager", "analyst")
 
     manager = store.create_work_order("own the feature", kind="manager")
+    analyst = store.create_work_order("plan the improvement", kind="analyst")
 
     assert store.get_work_order(manager["id"])["kind"] == "manager"
+    assert store.get_work_order(analyst["id"])["kind"] == "analyst"
     with pytest.raises(AssertionError):
         store.create_work_order("x", kind="supervisor")
 
