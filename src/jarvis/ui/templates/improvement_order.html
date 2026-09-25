@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}{{ io.id }} — Jarvis{% endblock %}
+{% block content %}
+{# §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md. Counts first, then
+   the observation and the evidence, then one card per finding: a finding is only
+   judgeable next to the record it was quoted from, and this is where it is decided. #}
+{% set m = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
+{% set findings = io.report.findings or [] %}
+
+<h2><span class="mono">{{ io.id }}</span> {{ io.title }}</h2>
+<p class="sub">
+  {# The kind-aware word, from `ops`: `plan_review` on an improvement order means
+     findings are awaiting the user, and a page spelling that itself would be a second
+     label table. #}
+  <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ io.status_label }}</span>
+  · <a href="/project/{{ project }}">{{ project }}</a>
+  · {{ io.findings }} findings
+  · {{ io.by_decision.pending }} pending
+  · {{ io.by_decision.accepted }} accepted
+  · {{ io.by_decision.rejected }} rejected
+  · {{ fmt_age(io.created_at) }}
+  · <a href="/cost/{{ project }}/{{ io.id }}">its bill →</a>
+</p>
+
+{% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
+
+{% if io.needs_attention %}
+<div class="panel"><div class="row tone-warn">◭ {{ io.attention_reason }}</div></div>
+{% endif %}
+
+<h3>The observation</h3>
+<div class="panel"><div class="row"><div class="grow">{{ io.observation }}</div></div></div>
+
+{% if io.evidence_refs %}
+{# The refs as the user typed them — unresolved on purpose (§2.6): one that does not
+   resolve is a finding about the OS's records, not an error on this page. #}
+<p class="sub">evidence: {% for ref in io.evidence_refs %}
+  <span class="mono">{{ ref }}</span>{{ ', ' if not loop.last }}{% endfor %}</p>
+{% endif %}
+
+{% if io.analyst %}
+<p class="sub">analyst:
+  <a class="mono" href="/wo/{{ project }}/{{ io.analyst.id }}">{{ io.analyst.id }}</a>
+  ({{ io.analyst.status }})
+  {% if io.analyst.result_summary %}— {{ io.analyst.result_summary }}{% endif %}
+</p>
+{% endif %}
+
+{% if io.report.summary %}
+<h3>Findings — {{ io.report.summary }}</h3>
+{% else %}
+<h3>Findings</h3>
+{% endif %}
+{% for f in findings %}
+{% set status = f.status or 'pending' %}
+<div class="panel">
+  <div class="row">
+    <div class="grow">
+      <span class="mono">{{ f.key }}</span> <strong>{{ f.symptom }}</strong>
+      <div class="sub">root cause: {{ f.root_cause }}</div>
+      <div class="sub">why the obvious fix is not enough: {{ f.why_insufficient }}</div>
+      <div class="sub">recommendation: {{ f.recommendation }}</div>
+      {% for e in f.evidence or [] %}
+      <div class="sub"><span class="mono">{{ e.source }}</span> — “{{ e.quote }}”</div>
+      {% endfor %}
+      {% for o in f.proposed_orders or [] %}
+      <div class="sub">proposes {{ o.type }} order in {{ o.project or project }}:
+        <strong>{{ o.title }}</strong> — {{ o.description }}</div>
+      {% endfor %}
+      {% if f.filing_error %}
+      <div class="sub tone-bad">✗ {{ f.filing_error }} — accepting again retries it</div>
+      {% endif %}
+      {% if status == 'accepted' %}
+      {# The other end of the back-link, and REQUIRED by §5.3.1: without it an accepted
+         finding says what was proposed and never what became of it. Statuses come off
+         `filed_orders`, which resolved them once. #}
+      <div class="sub">✓ accepted{% if f.feedback %} — {{ f.feedback }}{% endif %}</div>
+      {% for o in io.filed_orders.get(f.key) or [] %}
+      <div class="sub">filed:
+        <a class="mono" href="/{{ 'fo' if o.type == 'feature' else 'wo' }}/{{ o.project or project }}/{{ o.id }}">{{ o.id }}</a>
+        {{ o.title }} ({{ o.status }})</div>
+      {% endfor %}
+      {% elif status == 'rejected' %}
+      <div class="sub">✗ rejected{% if f.feedback %} — {{ f.feedback }}{% endif %}</div>
+      {% endif %}
+    </div>
+  </div>
+  {% if status == 'pending' or f.filing_error %}
+  {# The decision is taken where the finding is read. Both forms post to the one review
+     route, which holds no logic of its own. #}
+  <div class="row">
+    <form class="inline" method="post" action="/io/{{ project }}/{{ io.id }}/review">
+      <input type="hidden" name="key" value="{{ f.key }}">
+      <button name="decision" value="accept">Accept — file its orders</button>
+    </form>
+  </div>
+  <div class="row">
+    <form method="post" action="/io/{{ project }}/{{ io.id }}/review">
+      <input type="hidden" name="key" value="{{ f.key }}">
+      {# `required`: `ops.review_findings` refuses a reasonless rejection, and the reason
+         is the only thing the analyst and the knowledge entry ever read. #}
+      <textarea name="reason" rows="2" required
+                placeholder="why this finding is wrong (required to reject it)"></textarea>
+      <button name="decision" value="reject">Reject it</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<div class="panel"><div class="empty">
+  no report yet — the analyst is still working, and an order in analysis asks nothing
+</div></div>
+{% endfor %}
+
+{% endblock %}
