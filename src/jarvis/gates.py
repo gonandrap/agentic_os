@@ -61,6 +61,19 @@ from .gate_rules import (  # re-exported: this is still the module callers impor
     reads_only,
     scannable,
 )
+from .provenance import (
+    CONTEXT_LIMIT,
+    DESCRIPTION_LIMIT,
+    EVIDENCE_LIMIT,
+    TITLE_LIMIT,
+    WO_DESCRIPTION,
+    WO_DESCRIPTION_WHOSE,
+    WO_TITLE,
+    WO_TITLE_WHOSE,
+    Borrowed,
+    borrowed_context,
+    borrowed_sections,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .central_store import CentralStore
@@ -777,17 +790,24 @@ def build_request_question(action: GatedAction, wo: dict[str, Any],
         "Exact command it will run (approval authorises this command and nothing else):",
         f"    {action.command}",
         "",
-        f"Work order: {wo.get('title') or '(untitled)'}",
+        f"Work order: {wo['id']}",
+        "",
     ]
-    description = (wo.get("description") or "").strip()
-    if description:
-        parts += ["Work order description:", description[:1200]]
-    parts += ["", "The worker's justification:",
-              justification.strip() or "(the worker gave none — treat that as a red flag)"]
-    if evidence.strip():
-        # Labelled with what THIS gate asked for — §6.
-        parts += ["", f"Evidence the worker supplied ({asks(action.kind)[1]}):",
-                  evidence.strip()[:2000]]
+    # EVERY UNTRUSTED FIELD THIS BUILDER RENDERS, enumerated — spec 2026-09-24 fix 1.
+    # The TITLE is one of them: whoever filed the order wrote it.
+    parts += borrowed_sections((
+        Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
+                 limit=TITLE_LIMIT, absent="The work order has no title."),
+        Borrowed(label=WO_DESCRIPTION, whose=WO_DESCRIPTION_WHOSE,
+                 text=wo.get("description") or "", limit=DESCRIPTION_LIMIT),
+        Borrowed(label="the worker's justification for this request",
+                 whose=f"the worker of {wo['id']}", text=justification,
+                 absent="The worker gave no justification — treat that as a red flag."),
+        # Labelled with what THIS gate asked for — 2026-09-12 §6.
+        Borrowed(label=f"the evidence the worker supplied ({asks(action.kind)[1]})",
+                 whose=f"the worker of {wo['id']}", text=evidence,
+                 limit=EVIDENCE_LIMIT),
+    ))
     parts += render_user_messages(user_messages)
     parts += render_history(history)
     parts += [
@@ -839,14 +859,22 @@ def build_contest_question(action: GatedAction, wo: dict[str, Any], argument: st
     parts += describe_match(action.command, action.matched)
     parts += [
         "",
-        f"Work order: {wo.get('title') or '(untitled)'}",
+        f"Work order: {wo['id']}",
+        "",
     ]
-    description = (wo.get("description") or "").strip()
-    if description:
-        parts += ["Work order description:", description[:1200]]
-    parts += ["", "The worker's argument that this is a false positive:",
-              argument.strip() or "(the worker gave none — deny it; there is nothing "
-                                  "here to review)"]
+    # The same enumeration, on the same rule — spec 2026-09-24 fix 1, and the open
+    # question that spec left, which the lead's assumption settled: this builder renders
+    # borrowed text by the same route, so it sits inside the boundary.
+    parts += borrowed_sections((
+        Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
+                 limit=TITLE_LIMIT, absent="The work order has no title."),
+        Borrowed(label=WO_DESCRIPTION, whose=WO_DESCRIPTION_WHOSE,
+                 text=wo.get("description") or "", limit=DESCRIPTION_LIMIT),
+        Borrowed(label="the worker's argument that this is a false positive",
+                 whose=f"the worker of {wo['id']}", text=argument,
+                 absent="The worker gave no argument — deny it; there is nothing here "
+                        "to review."),
+    ))
     parts += render_user_messages(user_messages)
     parts += render_history(history)
     parts += [
@@ -933,7 +961,12 @@ def queue_for_review(store: ProjectStore, neo: Any, project: str, wo: dict[str, 
     """
     question = neo.ask(
         project, wo["id"], question_text(store, wo, action, approval),
-        context=f"{wo.get('title') or ''}\n{(wo.get('description') or '')[:800]}",
+        # Spec 2026-09-24 fix 1: `context=` is the field that carried the defect.
+        context=borrowed_context((
+            Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
+                     limit=TITLE_LIMIT),
+            Borrowed(label=WO_DESCRIPTION, whose=WO_DESCRIPTION_WHOSE,
+                     text=wo.get("description") or "", limit=CONTEXT_LIMIT))),
         kind="approval",
     )
     store.start_review(approval["id"], question["id"])

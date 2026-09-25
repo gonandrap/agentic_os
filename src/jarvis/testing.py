@@ -1249,13 +1249,31 @@ elif argv[:2] == ["pr", "update-branch"]:
         json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
 elif argv[:2] == ["api", "--method"]:
-    # `gh api --method GET repos/<o>/<r>/commits/<sha> --jq .parents[].sha`. Only the
-    # commit read the OS makes; anything else is an unhandled argv, deliberately, so a
-    # second API call cannot appear here without the fixture noticing.
+    # The TWO API reads the OS makes — a commit's parents, and a branch's protection.
+    # Anything else is an unhandled argv, deliberately, so a third API call cannot appear
+    # here without the fixture noticing.
     path = argv[3] if len(argv) > 3 else ""
-    if argv[2] != "GET" or "/commits/" not in path:
+    if argv[2] != "GET" or not ("/commits/" in path or path.endswith("/protection")):
         sys.stderr.write(f"fake gh: unhandled api call {argv}\n")
         sys.exit(2)
+    if path.endswith("/protection"):
+        # An unregistered branch answers GitHub's own 404 body, which is the state this
+        # repository is really in; `FAKE_GH_FAIL_PROTECTION` is every other failure.
+        refuse = os.environ.get("FAKE_GH_FAIL_PROTECTION")
+        if refuse:
+            sys.stderr.write(refuse + "\n")
+            sys.exit(1)
+        branch = path.split("/branches/", 1)[1].rsplit("/", 1)[0]
+        try:
+            with open(os.path.join(state_dir, "protection.json")) as f:
+                rules = json.load(f)
+        except (OSError, ValueError):
+            rules = {}
+        if branch not in rules:
+            sys.stderr.write("gh: Branch not protected (HTTP 404)\n")
+            sys.exit(1)
+        print(json.dumps({"required_status_checks": {"contexts": rules[branch]}}))
+        sys.exit(0)
     sha = path.rsplit("/", 1)[-1]
     try:
         with open(os.path.join(state_dir, "commits.json")) as f:
@@ -1745,6 +1763,20 @@ def fake_gh(tmp_path, monkeypatch):
             rows = json.loads(path.read_text()) if path.exists() else {}
             rows[sha] = {"parents": list(parents)}
             path.write_text(json.dumps(rows))
+
+        def set_protection(self, branch: str, checks: list[str]) -> None:
+            """Protect `branch`, requiring `checks`. Unregistered branches answer the
+            404 GitHub answers for a branch nobody protects — the default, because that
+            is the state of the repository the auto-merge request ships against."""
+            path = gdir / "protection.json"
+            rules = json.loads(path.read_text()) if path.exists() else {}
+            rules[branch] = list(checks)
+            path.write_text(json.dumps(rules))
+
+        def refuse_protection(self, message: str) -> None:
+            """Fail the protection read and NOTHING else — a 403, say. `fail()` is the
+            wrong tool: it fails `pr view` too, so the poll never reaches the read."""
+            monkeypatch.setenv("FAKE_GH_FAIL_PROTECTION", message)
 
         def base_sha(self, sha: str) -> None:
             """The base commit `gh pr update-branch` merges in — parent 1 of the result."""
