@@ -140,8 +140,9 @@ returning a dict, with both renderers consuming that dict verbatim.
 
 **Everything this feature adds is metered, and everything it writes is gated.** Every
 surface below is metered through §10, every WRITE any of them makes is gated by §10's
-configuration, and §10 lands before any of them. The detail is there; this spec says each
-thing once.
+configuration, and §10 lands LAST, retrofitting both the meter and the gate onto what the
+earlier sections built, so no section is blocked waiting for it. The detail is there; this
+spec says each thing once.
 
 ---
 
@@ -514,9 +515,17 @@ that any child of this feature may edit, and it belongs to this one.
 
 ## 10. What observability costs, and who turns it on
 
-**This section lands FIRST of every child, even though it is numbered last.** Section order
-in this spec is reading order, not build order: §§3–7 each depend on the gate and the meter
-defined here, so a reader who takes the numbering for a schedule has it backwards.
+**This section lands LAST of every child, after §§3–7.** The meter can only wrap report
+functions that exist: wrapping `ops.live_report`, `ops.inspect_report`, `ops.context_report`
+and `ops.diagnose` in ONE place, once they are all in the tree, beats four separate workers
+each remembering to instrument their own — one of them would forget, and a meter with a
+hole in it reports a number lower than the truth, which is worse than no number at all. The
+gate has exactly one consumer, §5's per-turn write, and switching that off is a single
+guard this section adds to code §5 already landed, not a contract §5 has to be built
+against. So nothing waits on §10: §§3, 4, 5, 6 and 9 have no dependency on each other or on
+this section, and §7 and §10 both follow the first four. Section order in this spec is
+still reading order and still not build order — it just now runs the other way from what a
+reader might have assumed.
 
 **The gate.** A new `ObservabilityConfig` dataclass, added to the fleet-level config
 dataclass AND the project-level one, exactly the way `InspectConfig` already appears in
@@ -533,21 +542,25 @@ config. Default `normal`.
 arithmetic over files Claude Code already wrote — they collect nothing, and gating a
 read-only computation would buy the user nothing while costing them the very view they
 opened. §5's per-turn ingredient row is the one real collection this feature adds, and it
-is the thing `off` switches off. Say it plainly, on the surface and in the config's own
-docstring: `off` does not disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the
-debug page. `full` is the level at which §5 records, and at which the meter below records
-its per-report rows.
+is the thing `off` switches off — this section retrofits that guard into the write path §5
+already landed, and §5 itself is written with no knowledge of the config. Say it plainly,
+on the surface and in the config's own docstring: `off` does not disable `jarvis watch`,
+`jarvis inspect`, `jarvis wo why` or the debug page. `full` is the level at which §5
+records, and at which the meter below records its per-report rows.
 
 **The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
 lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,
-`ops.context_report`, `ops.diagnose`, and §5's dispatch-time write — is wrapped so each
-invocation records one row through the EXISTING `agent_usage` seam (`agent_usage.record` /
-`agent_usage.recorder`, `src/jarvis/agent_usage.py`), under new kinds, against the work
-order it was run for. Wall clock is recorded; tokens are recorded as they are actually
-reported, which for a pure-arithmetic path is zero. **That is the point.** The claim
+`ops.context_report`, `ops.diagnose`, and §5's dispatch-time write — is wrapped at its own
+definition, by this section, after all four exist, so that each invocation records one row
+through the EXISTING `agent_usage` seam (`agent_usage.record` / `agent_usage.recorder`,
+`src/jarvis/agent_usage.py`), under new kinds, against the work order it was run for. Wall
+clock is recorded; tokens are recorded as they are actually reported, which for a
+pure-arithmetic path is zero. **That is the point.** The claim
 "debugging is mechanical" becomes a measured zero in the bill rather than an assertion in
 this spec, and if any of these paths ever gains a model call, the row stops reading zero on
-its own and nobody has to remember to instrument it.
+its own and nobody has to remember to instrument it. Wrapping at the definition is also why
+§7 needs no edit: its dashboard page calls those same `ops` functions, so it is metered
+automatically, with no change to §7's routes.
 
 **The bill line.** `agent_usage` rows already reach `jarvis cost` and the /cost page
 through `bill.py`'s `_call_items` / `_agent_items`, and `WORKER_SUBPROCESS` is the existing
