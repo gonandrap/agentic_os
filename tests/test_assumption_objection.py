@@ -410,9 +410,10 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     wo_row = ops.create_work_order("proj_a", "an order with two readings",
                                    description="d")
     store = ProjectStore(project.path)
-    # NO session_id: `worker_session.delivery_hold` then holds the objection for ever, so
-    # no turn can start and the objection stays outstanding until §6.6 takes it back.
-    store.set_status(wo_row["id"], "running")
+    store.set_status(wo_row["id"], "running", session_id="s-joint")
+    # The worker is MID-TURN: that is when it records an assumption, and it is why the
+    # bus cannot hand it anything (`worker_session.delivery_hold` -> HOLD_TURN_IN_FLIGHT).
+    turn = store.create_turn(wo_row["id"], "dispatch", "the dispatch prompt")
     wo_id = wo_row["id"]
     ops.assume(wo_id, OBJECTED_TEXT)
     ops.assume(wo_id, ACCEPTED_TEXT)
@@ -453,14 +454,12 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     env = store.get_envelope(int(env["id"]))       # `delivered_msg_id` is set by routing
     [msg] = [m for m in store.list_messages(wo_id) if m["id"] == env["delivered_msg_id"]]
     assert msg["status"] == "queued"
-    assert store.latest_turn(wo_id) is None
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]
 
-    # The worker finishes MID-TICK. `ops.finish` is its own process writing, so the
-    # status really can flip between the delivery half of a tick and its reconcile half —
-    # and that race is what §7's gate exists for. The flip is the ONLY effect of
-    # `ops.finish` this test depends on, and the real one would drag a validation round
-    # and an evidence collection into a test about the objection.
-    store.set_status(wo_id, "needs_review")
+    # The worker finishes MID-TICK — its own process writing, between the delivery half
+    # of a tick and the reconcile half. That race is what §7's gate exists for.
+    assert ops.finish(wo_id, "two readings recorded")["status"] == "needs_review"
+    store.finish_turn(turn["id"], "done")           # ...and its process exits
 
     # tick 3, reconcile half: the gate holds, THEN §6.6 withdraws.
     tick(started, project, store, poll=False, drain=False)
@@ -477,13 +476,13 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     assert withdrawn["reason"] == "the order stopped before it could be delivered"
     assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
     assert store.queued_messages(wo_id) == []
-    assert store.latest_turn(wo_id) is None        # no turn, first assertion
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]   # no second turn, ever
+    assert [t for t in store.list_turns(wo_id) if t["msg_id"]] == []
 
-    # The hold was belt and the withdrawal is braces: give the order a session so
-    # `delivery_hold` lifts, and the withdrawn message is STILL not deliverable.
-    store.set_status(wo_id, "needs_review", session_id="s-joint")
+    # The hold was belt and the withdrawal is braces: the turn has ENDED, so no hold is
+    # left at all, and the withdrawn message is STILL not deliverable.
     tick(started, project, store, reconcile=False, drain=False)
-    assert store.latest_turn(wo_id) is None
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]
     assert store.deliverable_messages(wo_id) == []
 
     # tick 4: the gate is open, so the accepted row alone is confirmed and settled.
@@ -499,7 +498,7 @@ def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
     [confirmed] = events(store, wo_id, "autoreview_confirmed")
     assert confirmed["neo_question_id"] == confirming[0]["id"]
     assert objected["status"] == "pending" and objected["decided_by"] == ""
-    assert store.latest_turn(wo_id) is None        # no turn, second assertion
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]   # still no second turn
 
     # kn-640e7f6c: a WITHDRAWN objection is not an undeliverable one — nothing failed.
     blockers = invariants.true_blockers(store, store.get_work_order(wo_id))
