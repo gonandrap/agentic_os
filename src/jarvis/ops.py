@@ -5449,6 +5449,85 @@ def cancel_improvement_order(io_id: str, project_name: str | None = None
     return cancel_feature_order(io_id, project_name)
 
 
+def submit_findings(io_id: str, doc: Any,
+                    project_name: str | None = None) -> dict[str, Any]:
+    """(Analysts) hand back the findings report. The analyst's terminal action.
+
+    Modelled step for step on `submit_plan`, and THE ORDER OF THE STEPS IS THE DESIGN
+    (§4.1). The report is validated first, so a bad one costs the analyst one revision
+    and nothing else — nothing stored, no user attention spent, no state to unwind. Then
+    it is stored and the order is parked for review. Only then is the analyst's work
+    order settled: `jarvis io report` IS its `jarvis wo finish`, which is why the analyst
+    briefing tells it not to call the latter.
+
+    That last step is CONDITIONAL, which is the one place this parts company with
+    `submit_plan`. A resubmission arrives while the order is `plan_review`, by which time
+    the analyst has already been settled once, and settling an already-settled work order
+    is not an idempotent no-op in this codebase. So a second submission leaves the
+    settled analyst alone and omits `analyst` from the return value.
+    """
+    from . import findings
+
+    name, path, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo plan")
+    if fo["status"] not in ("planning", "plan_review"):
+        raise OpsError(
+            f"{io_id} is {fo['status']}, so it is not waiting for a report "
+            f"(a report can be submitted while it is `planning`, or resubmitted while "
+            f"it is `plan_review`)"
+        )
+    try:
+        report = findings.parse_report(doc)
+    except findings.FindingsError as e:
+        raise OpsError(
+            f"the report was not accepted, and nothing was stored. Fix all of these and "
+            f"resubmit:\n  - " + "\n  - ".join(e.problems)
+        ) from e
+
+    for finding in report["findings"]:
+        finding["status"] = "pending"
+
+    store = ProjectStore(path)
+    try:
+        # The WHOLE document, replacing whatever was there: a resubmission discards every
+        # decision already recorded on the old findings. The status refusal above is what
+        # keeps that safe — nothing can be resubmitted once the order has left
+        # `plan_review`, which it does as soon as the last finding is decided.
+        store.update_feature_order(io_id, plan=db.to_json(report))
+        store.set_feature_status(io_id, "plan_review")
+        # EXACTLY ONE attention item, raised HERE, at the transition, and nothing
+        # re-derives it on a tick (§6.2 and kn-089de524: a flag written on a re-deriving
+        # path re-raises itself and overwrites the user's ack).
+        store.flag_feature_attention(io_id, findings.review_headline(fo, report))
+        analyst_open = False
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "findings_submitted", {
+                "improvement_order": io_id, "findings": len(report["findings"]),
+            })
+            try:
+                analyst = store.get_work_order(fo["plan_wo_id"])
+                analyst_open = analyst["status"] in OPEN_STATUSES
+            except KeyError:
+                analyst_open = False  # deleted out from under it; the link was released
+    finally:
+        store.close()
+
+    out: dict[str, Any] = {
+        "project": name, "io_id": io_id, "status": "plan_review",
+        "findings": len(report["findings"]),
+        "note": "queued for the user's decision — end your turn. If it is sent back, the "
+                "reason arrives as your next user turn and you revise from this session.",
+    }
+    if analyst_open:
+        # Only while it is still open. A resubmission lands here with the analyst already
+        # settled, and settling a settled work order is not an idempotent no-op.
+        out["analyst"] = finish(
+            fo["plan_wo_id"],
+            f"submitted findings for {io_id}: {len(report['findings'])} findings",
+        )
+    return out
+
+
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """The feature order, its plan and its children — the tree, in one call."""
     from . import plans

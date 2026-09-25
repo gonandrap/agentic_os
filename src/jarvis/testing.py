@@ -2296,6 +2296,76 @@ def improvement_order(project):
         store.close()
 
 
+def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]:
+    """One finding `findings.parse_report` accepts, every field overridable.
+
+    Prose is over `findings.MIN_FIELD_CHARS`, quotes over `findings.MIN_QUOTE_CHARS` and
+    every proposed description clears `plans._description_problems`, so a test that wants
+    a rejection breaks exactly one field and nothing else drags the report down with it.
+    """
+    finding = {
+        "key": key,
+        "symptom": ("Three work orders in a row opened with the same eight file reads "
+                    "before touching the dispatch path they were sent to change."),
+        "root_cause": ("The dispatch brief names no entry point, so every worker "
+                       "rediscovers the module layout from the repository root."),
+        "evidence": [
+            {"source": "jarvis inspect wo-11111111",
+             "quote": "turn 1: 41 tool calls, 38 of them Read, 0 edits"},
+            {"source": "jarvis cost proj_a",
+             "quote": "first turns account for 46% of this project's token spend"},
+        ],
+        "why_insufficient": ("Raising the turn budget makes the first turn affordable "
+                             "and leaves every worker still reading the same files."),
+        "recommendation": ("Name the entry point and the owning module in the dispatch "
+                           "brief, generated from the committed code map."),
+        "proposed_orders": [
+            {"type": "work", "project": "proj_a",
+             "title": "name the entry point in every dispatch brief",
+             "description": ("Add the owning module and entry-point symbol to the "
+                             "dispatch brief a worker is spawned with, read from the "
+                             "committed code map. A worker sees this brief and nothing "
+                             "else, so the names have to be spelled out in it.")},
+        ],
+    }
+    finding.update(overrides)
+    return finding
+
+
+def a_report(**overrides: Any) -> dict[str, Any]:
+    """A findings report `findings.parse_report` accepts — the shared document.
+
+    §4.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: every later piece of
+    this feature needs "a stored report", and divergent local copies are how a suite
+    starts disagreeing with itself. Every field is overridable so one test can break
+    exactly one thing: `a_report()`, `a_report(summary="")`, `a_report(findings=[...])`.
+
+    Asserts nothing: it builds a document and hands it back.
+    """
+    report: dict[str, Any] = {
+        "summary": "Workers pay for the same rediscovery on every first turn.",
+        "findings": [
+            a_finding("first-turn-reads"),
+            a_finding(
+                "stale-code-map",
+                symptom=("The committed code map still names three modules that were "
+                         "split apart two releases ago, so it misdirects readers."),
+                root_cause=("Nothing regenerates the map when a module moves; it is "
+                            "written by hand whenever somebody remembers to."),
+                recommendation=("Regenerate the map from the symbol index on every "
+                                "release and fail the release when it drifts."),
+                why_insufficient=("Editing the three stale entries fixes today's map "
+                                  "and leaves the next rename to rot the same way."),
+                evidence=[{"source": "git log --stat src/jarvis/",
+                           "quote": "src/jarvis/gates.py split into gates/ 2 releases ago"}],
+                proposed_orders=[],
+            ),
+        ],
+    }
+    report.update(overrides)
+    return report
+
+
 @pytest.fixture()
 def catalog_file(tmp_path, project):
     data = {

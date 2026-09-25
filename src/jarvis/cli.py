@@ -755,6 +755,16 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("io_id")
     i.add_argument("--project")
 
+    i = io.add_parser("report", help="(analysts) submit the findings report — the "
+                                     "analyst's terminal action, and what settles its "
+                                     "work order")
+    i.add_argument("io_id")
+    i.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the report, as JSON. A file rather than an argument on purpose: "
+                        "a report is a long string full of quoted output, which is "
+                        "exactly what trips the privileged-action classifier")
+    i.add_argument("--project")
+
     i = io.add_parser("cancel", help="stop an improvement order and its analyst")
     i.add_argument("io_id")
     i.add_argument("--project")
@@ -2600,6 +2610,17 @@ def cmd_io(args: argparse.Namespace) -> int:
                 print(f"\nanalyst: {a['id']} ({a['status']})")
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+
+    elif args.io_cmd == "report":
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise ops.OpsError(f"no such report file: {path}")
+        try:
+            doc = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+        _print(ops.submit_findings(args.io_id, doc, project_name=args.project),
+               args.json)
 
     elif args.io_cmd == "cancel":
         _print(ops.cancel_improvement_order(args.io_id, args.project), args.json)
