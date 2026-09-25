@@ -138,6 +138,11 @@ surface will disagree with. That is how a listing and a header once came to disa
 the same work order (PR 65), and it is why every section below specifies an `ops` function
 returning a dict, with both renderers consuming that dict verbatim.
 
+**Everything this feature adds is metered, and everything it writes is gated.** Every
+surface below is metered through §10, every WRITE any of them makes is gated by §10's
+configuration, and §10 lands before any of them. The detail is there; this spec says each
+thing once.
+
 ---
 
 ## 3. The live turn snapshot: `jarvis watch` and `ops.live_report`
@@ -397,24 +402,8 @@ must not 500 the page — `uilog` turns a dashboard 500 into an inbox item and
 Filed to the backlog where a backlog item is the right home. Listed here so nobody
 re-proposes them mid-feature.
 
-**OTEL: rejected PROVISIONALLY, and §9 is the measurement that confirms or overturns it.**
-The feature order suggested integrating Claude Code's OpenTelemetry export first. Nothing
-in this tree mentions OTEL today. Four reasons to decline: (1) the export is metrics and log events — session, token and cost counters,
-tool-decision events, aggregated on a flush interval — and carries no tool parameters, no
-cache-write cause, no context composition and no per-call `modelUsage` breakdown; every one
-of those is already parsed with strictly more fidelity by `usage.py` and `inspection.py`,
-including the 1h-versus-5m cache-write split that a counter cannot express. (2) A collector
-is a new long-lived process, a new port and a new failure mode against a core that is
-deliberately stdlib-only, with many concurrent headless workers each exporting. (3) Metrics
-flush on an interval, so a turn that *dies* — the case most worth debugging — may never
-flush; the transcript is on disk throughout. (4) The cost of keeping the door open is one
-line: the env seam is `claude_cli.spawn_turn`'s `env = {**os.environ, **cache_env()}`.
-Adding OTEL later is a dict, not an architecture. **The honest caveat: every word of that
-is reasoned, not measured** — nobody ran `claude` with `CLAUDE_CODE_ENABLE_TELEMETRY=1` and
-enumerated what arrives. The feature order asked for OTEL to be *assessed* first, and a
-reasoned-only rejection does not answer that ask. So the measurement is §9, it runs
-alongside the other five and gates none of them, and **the four reasons above stand only
-for as long as §9 does not contradict them.**
+**OTEL is not out of scope here, and it is not rejected.** Whether Claude Code's
+OpenTelemetry export earns a place in this tree is UNDECIDED, and §9 owns that decision.
 
 **Hook-recorded tool spans, and any live-state table. Rejected on the merits, not deferred
 for size.** `PostToolUse` is already matched in `assets/settings.base.json`, so a hook would
@@ -445,20 +434,41 @@ transcripts per refresh multiplies the read cost for a rare case.
 on the dashboard home. Genuinely useful, purely additive on top of §3, and droppable.
 Backlogged.
 
-**Changing the bill.** `bill.py` is correct after six fixed issues and is sealed on
-settlement (`kn-3629fa87`). This feature links to it and does not touch it.
+**Changing the bill's arithmetic.** `bill.py` is correct after six fixed issues and is
+sealed on settlement (`kn-3629fa87`). Its existing lines, its arithmetic and that seal are
+untouched. The one change this feature makes to the bill is the observability class §10
+adds, and it arrives the way every other kind already does — as `agent_usage` rows read by
+the reporting `bill.py` already has, not as new maths inside `bill.py`.
 
 ---
 
-## 9. OTEL: measure what it actually emits, then confirm or overturn §8
+## 9. OTEL: the decision, and the measurement that settles it
 
-**This section produces a finding, not a feature.** §8 rejects OTEL integration on four
-reasoned grounds and admits none of them was measured. The feature order asked for OTEL to
-be assessed *first*. This section is that assessment, run in parallel with §§3–7, gating
-none of them, and it ends by either confirming §8's rejection with evidence or overturning
-it with evidence. **Either outcome is a success.** A spike that confirms the prior is worth
-exactly as much as one that overturns it, and a worker who feels pressure to produce a
-recommendation has misunderstood the job.
+**This section produces a decision, not a feature.** The feature order asked for Claude
+Code's OpenTelemetry export to be assessed *first*, and nothing in this tree mentions OTEL
+today. The deliverable is a verdict — adopt, decline, or adopt in part — carried by
+evidence and reached here, not a confirmation of a decision taken anywhere else in this
+spec. It runs in parallel with §§3–7 and gates none of them. **A decline is as full a
+success as an adoption.** A measurement that lands where the planner expected is worth
+exactly as much as one that does not, and a worker who feels pressure to produce a
+recommendation in either direction has misunderstood the job.
+
+**The prior this measurement tests, and it is reasoned, not measured.** The planner
+expected a decline and wrote down why. What follows is the hypothesis the six questions
+below are pointed at — each reason is confirmed or contradicted by what actually arrives —
+and it is explicitly **not a verdict**. (1) The export is metrics and log events — session,
+token and cost counters, tool-decision events, aggregated on a flush interval — and carries
+no tool parameters, no cache-write cause, no context composition and no per-call
+`modelUsage` breakdown; every one of those is already parsed with strictly more fidelity by
+`usage.py` and `inspection.py`, including the 1h-versus-5m cache-write split that a counter
+cannot express. (2) A collector is a new long-lived process, a new port and a new failure
+mode against a core that is deliberately stdlib-only, with many concurrent headless workers
+each exporting. (3) Metrics flush on an interval, so a turn that *dies* — the case most
+worth debugging — may never flush; the transcript is on disk throughout. (4) The cost of
+keeping the door open is one line: the env seam is `claude_cli.spawn_turn`'s
+`env = {**os.environ, **cache_env()}`. Adding OTEL later is a dict, not an architecture.
+**Nobody ran `claude` with `CLAUDE_CODE_ENABLE_TELEMETRY=1` and enumerated what arrives**,
+which is exactly why those four reasons settle nothing on their own.
 
 **Timebox: one session.** If the measurement is not in hand by then, report what was
 measured and what was not. Do not extend into building an integration.
@@ -483,7 +493,7 @@ this repository — read it before you start.
 4. Does any carry **context composition** — the share of the window taken by the system
    prompt, skills or agents? (§5 exists only because the transcript does not.)
 5. What is the **flush interval**, and does anything arrive from a turn that is **killed
-   mid-flight**? This is §8's third reason and the one most likely to be wrong.
+   mid-flight**? This is the third reason above and the one most likely to be wrong.
 6. What does it cost to run: process count, port, failure modes with many concurrent
    headless workers.
 
@@ -493,10 +503,71 @@ containing both. **Write no production code.** If the finding is that OTEL adds 
 the transcript does not, the deliverable is still the finding — file the integration as a
 separate feature order and say so; do not start building it in this session.
 
-**Amend §8 in the same pull request**, either to cite this measurement in place of the
-"reasoned, not measured" caveat, or to strike the reasons the measurement contradicts.
-That edit to §8 is the only part of this spec any child may change, and it belongs to this
-one.
+**Write the decision into §8 in the same pull request.** On a decline, §8 gains a new
+entry — declined, and here is the measurement that declined it — carrying the evidence and
+striking whichever of the four reasons above the measurement contradicts. On an adopt, or
+an adopt in part, §8 gains one line saying OTEL has moved out of this feature into a named
+follow-on feature order, with that order's id. §8 is the only prose outside this section
+that any child of this feature may edit, and it belongs to this one.
+
+---
+
+## 10. What observability costs, and who turns it on
+
+**This section lands FIRST of every child, even though it is numbered last.** Section order
+in this spec is reading order, not build order: §§3–7 each depend on the gate and the meter
+defined here, so a reader who takes the numbering for a schedule has it backwards.
+
+**The gate.** A new `ObservabilityConfig` dataclass, added to the fleet-level config
+dataclass AND the project-level one, exactly the way `InspectConfig` already appears in
+both (`src/jarvis/catalog.py` lines 1009 and 1118). The project object is built on the
+fleet object as its base, so one caller reads one field and never consults two objects —
+copy that construction and do not invent a second lookup. One field to start: `level`, one
+of `off`, `normal`, `full`. A per-order override lives in a new `work_orders` column,
+following `budget_usd`'s precedent in `ProjectStore.ADDED_COLUMNS` — nullable, and NULL
+means "this order has no answer", which is **not** the same as `off`. Precedence is stated
+as a rule and tested as one: the order column, else the project config, else the fleet
+config. Default `normal`.
+
+**What the gate actually governs, and what it must not.** Only WRITING. §§3, 4, 6 and 7 are
+arithmetic over files Claude Code already wrote — they collect nothing, and gating a
+read-only computation would buy the user nothing while costing them the very view they
+opened. §5's per-turn ingredient row is the one real collection this feature adds, and it
+is the thing `off` switches off. Say it plainly, on the surface and in the config's own
+docstring: `off` does not disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the
+debug page. `full` is the level at which §5 records, and at which the meter below records
+its per-report rows.
+
+**The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
+lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,
+`ops.context_report`, `ops.diagnose`, and §5's dispatch-time write — is wrapped so each
+invocation records one row through the EXISTING `agent_usage` seam (`agent_usage.record` /
+`agent_usage.recorder`, `src/jarvis/agent_usage.py`), under new kinds, against the work
+order it was run for. Wall clock is recorded; tokens are recorded as they are actually
+reported, which for a pure-arithmetic path is zero. **That is the point.** The claim
+"debugging is mechanical" becomes a measured zero in the bill rather than an assertion in
+this spec, and if any of these paths ever gains a model call, the row stops reading zero on
+its own and nobody has to remember to instrument it.
+
+**The bill line.** `agent_usage` rows already reach `jarvis cost` and the /cost page
+through `bill.py`'s `_call_items` / `_agent_items`, and `WORKER_SUBPROCESS` is the existing
+precedent for reporting a kind as its OWN CLASS rather than folding it into Jarvis's
+overhead. Observability is a third class beside the worker's turns and Jarvis's overhead,
+for the same reason: money the user spent *looking at* the order is not money spent *doing*
+the order, and a bill that mixes them answers neither question. A class whose dollars are
+zero and whose count and wall clock are not is the honest rendering of a mechanical path.
+Call that out on the surface, because a reviewer will otherwise read a `0.00` line as a
+bug.
+
+**What it must not do.** Accounting is an observer — `agent_usage`'s own module docstring
+says so. A failed meter row never fails the report it was measuring, and never fails the
+work order. `bill.py`'s settlement seal and its existing arithmetic are unchanged: this is
+a new kind arriving through a path the bill already has, not new maths. The gate is never
+consulted to decide whether a READ may proceed.
+
+**Absent is not zero, here too.** An order that ran before this landed has no observability
+rows. The class renders as *not recorded*, never as `0.00` spent — §2's standing rule
+governs this section's own numbers exactly as it governs every other section's.
 
 ---
 
