@@ -4522,6 +4522,14 @@ class Daemon:
                 continue
             found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
             store.add_event(wo_id, "landing_seen", found.record())
+            # THE MERGE ITSELF, as an event and never as `pr_state` — kn-dbc4971d keeps
+            # that column's two writers, and `ops.complete_merged` would `close_out` an
+            # order that is already `completed`. Once only: two events are two merge lines
+            # on every surface. 2026-09-25-a-gate-records-the-pull-request.md §5.
+            if pr.state == "MERGED" and not store.events_of_kind(wo_id, "pr_merged"):
+                store.add_event(wo_id, "pr_merged", {
+                    "pr_url": str(wo["pr_url"]), "head_oid": pr.head_oid,
+                    "merged_at": pr.merged_at, "source": "landing_sweep"})
             log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
 
     def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:

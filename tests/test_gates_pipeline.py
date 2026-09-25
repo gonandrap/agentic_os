@@ -270,6 +270,42 @@ def test_user_can_refuse_an_escalated_gate(fleet):
     assert fleet.approval()["status"] == "denied"
 
 
+def test_an_approved_merge_leaves_the_pull_request_on_the_record(fleet):
+    """Issue #742 through the whole loop: a worker's merge request, Neo's drain, and the
+    column a planner's settlement would otherwise never write."""
+    pr = "https://github.com/acme/proj/pull/735"
+    ops.request_gate_approval(fleet.wo_id, f"gh pr merge {pr} --squash",
+                              why="FORCE_APPROVE — checks are green")
+    fleet.daemon._neo_drain()
+
+    assert fleet.approval()["status"] == "approved"
+    store = fleet.store()
+    try:
+        assert store.get_work_order(fleet.wo_id)["pr_url"] == pr
+        [event] = store.events_of_kind(fleet.wo_id, "pr_url_recorded")
+        payload = json.loads(event["payload"])
+        assert payload["pr_url"] == pr
+        assert payload["source"] == "gate"
+    finally:
+        store.close()
+
+
+def test_a_dismissal_records_no_pull_request(fleet):
+    """A dismissal asserts the command was not a privileged action at all."""
+    pr = "https://github.com/acme/proj/pull/735"
+    ops.request_gate_approval(fleet.wo_id, f"gh pr merge {pr} --squash", why="please")
+    approval = fleet.approval()
+    ops.decide_gate(approval["id"], verdict="dismissed",
+                    reason="this is quoted in a PR body, it merges nothing")
+
+    store = fleet.store()
+    try:
+        assert not store.get_work_order(fleet.wo_id)["pr_url"]
+        assert store.events_of_kind(fleet.wo_id, "pr_url_recorded") == []
+    finally:
+        store.close()
+
+
 def test_denial_requires_a_reason(fleet):
     ops.request_gate_approval(fleet.wo_id, "./scripts/shipit.sh", why="please")
     approval = fleet.approval()

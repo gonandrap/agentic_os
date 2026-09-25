@@ -119,6 +119,10 @@ EXEMPTIBLE_POSITIONS = (HEREDOC, QUOTED)
 
 SOURCES = ("builtin", "neo", "user")
 
+#: The worker's own merge, named rather than spelled: the one kind that can supply a
+#: pull request the record does not already have (2026-09-25 spec §1).
+PR_MERGE = "pr_merge"
+
 #: The gate kind the OS files against ITSELF. Named here rather than spelled at the six
 #: call sites that branch on it, because a typo in one of them silently restores the
 #: worker-messaging path this kind exists to switch off (§5).

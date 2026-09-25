@@ -570,6 +570,118 @@ def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, proj
     assert json.loads(event["payload"])["head_oid"] == sha
 
 
+def test_the_sweep_records_the_merge_it_saw_and_never_settles_the_order(
+        started, project, fake_gh):
+    """The merge, on the record, without `pr_state` gaining a writer — 2026-09-25 spec §5.
+
+    The `pr_url` a gate recorded reaches this sweep and nothing else; `complete_merged` is
+    the wrong tool here, because every order in this population is `completed` already and
+    that function runs `close_out` over it.
+    """
+    sha = "9f1c2ab4d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-20T10:00:00Z", head_oid=sha)
+
+    _refresh(started, project)
+
+    [event] = _events(project, wo["id"], "pr_merged")
+    payload = json.loads(event["payload"])
+    assert payload["pr_url"] == PR
+    assert payload["head_oid"] == sha
+    assert payload["merged_at"] == "2026-09-20T10:00:00Z"
+    # Distinguishable from the merge that ENDED an order (`complete_merged`).
+    assert payload["source"] == "landing_sweep"
+    store = ProjectStore(project)
+    try:
+        fresh = store.get_work_order(wo["id"])
+    finally:
+        store.close()
+    assert fresh["status"] == "completed"
+    assert fresh["pr_state"] is None    # kn-dbc4971d: no new writer
+    assert _events(project, wo["id"], "landing_seen")
+
+
+def test_the_sweep_records_the_merge_once_and_never_a_second_time(
+        started, project, fake_gh):
+    """`timeline.build_timeline` renders every `pr_merged` it finds: two events are two
+    merge lines on `jarvis wo show` for ever."""
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", head_oid="abc1234")
+    _refresh(started, project)
+
+    store = ProjectStore(project)
+    try:
+        store.conn.execute(
+            "UPDATE wo_events SET ts = ts - ? WHERE wo_id = ? AND kind = 'landing_seen'",
+            (landing.FRESH_FOR_SECONDS + 1, wo["id"]))
+        store.conn.commit()
+    finally:
+        store.close()
+    _refresh(started, project)
+
+    assert len(_pr_reads(fake_gh)) == 2      # it did ask again…
+    assert len(_events(project, wo["id"], "pr_merged")) == 1     # …and wrote once
+
+
+def test_a_pull_request_that_has_not_merged_records_no_merge(started, project, fake_gh):
+    wo = _delivered(project, "launcher contract", OTHER_PR, code="launcher")
+    fake_gh.set_pr(OTHER_PR, "OPEN")
+
+    _refresh(started, project)
+
+    assert _events(project, wo["id"], "pr_merged") == []
+
+
+def test_both_surfaces_say_the_pull_request_merged_off_the_same_derivation(
+        started, project, fake_gh, capsys):
+    """The issue's Expected: `pr_url …/pull/735` with state MERGED, on `wo show`.
+
+    From the event, never from `pr_state` (kn-dbc4971d), and through the one helper the
+    dashboard also calls — a derivation duplicated across those two files is how they
+    drift. 2026-09-25 spec §7.
+    """
+    from jarvis import cli
+
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", head_oid="abc1234")
+    _refresh(started, project)
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["pr_url"] == PR
+    assert document["merge_state"]["state"] == "MERGED"
+    assert document["merge_state"]["head_oid"] == "abc1234"
+
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    assert "MERGED" in capsys.readouterr().out
+
+
+def test_an_order_whose_pull_request_nothing_has_looked_at_claims_no_state(
+        started, project, capsys):
+    """"Nothing has looked yet" is not "did not merge" — `landing.py`'s own rule."""
+    from jarvis import cli
+
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["merge_state"] == {"pr_url": PR, "state": "", "head_oid": "",
+                                       "merged_at": None, "source": ""}
+    assert "MERGED" not in capsys.readouterr().out
+
+
+def test_an_order_with_no_pull_request_gains_no_merge_line_at_all(started, project,
+                                                                 capsys):
+    from jarvis import cli
+
+    wo = _order(project, "a planner", code="")
+    ops.finish(wo["id"], "wrote no code")
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    assert "merge_state" not in json.loads(capsys.readouterr().out)
+
+
 def test_the_check_is_silent_until_the_sweep_has_run_and_never_guesses(
         started, project, fake_gh):
     """The invariant is a pure timeline read, so an order nothing has looked at yet is

@@ -2509,3 +2509,33 @@ def test_the_browser_side_pattern_never_rejects_what_the_server_accepts(client):
         assert re.fullmatch(pattern, good), f"{pattern!r} rejects {good!r}"
     for bad in ("lots", "nan", "inf", "five dollars", "$"):
         assert not re.fullmatch(pattern, bad), f"{pattern!r} accepts {bad!r}"
+
+
+def test_the_work_order_page_says_the_pull_request_merged(client, daemon, project):
+    """The dashboard half of the 2026-09-25 spec §7 — off `ops.merge_state`, the same
+    derivation `jarvis wo show` reads, and off the event rather than `pr_state`."""
+    pr = "https://github.com/acme/proj/pull/735"
+    wo = ops.create_work_order("proj_a", "the cap")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], pr_url=pr)
+        store.set_status(wo["id"], "completed")
+        store.add_event(wo["id"], "pr_merged", {"pr_url": pr, "head_oid": "abc1234",
+                                                "merged_at": "2026-09-20T10:00:00Z",
+                                                "source": "landing_sweep"})
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert pr in page
+    assert "MERGED" in page
+
+
+def test_a_work_order_with_no_pull_request_says_nothing_about_merging(client, daemon,
+                                                                     project):
+    wo = ops.create_work_order("proj_a", "a planner")
+    daemon.tick()
+
+    assert "MERGED" not in client.get(f"/wo/proj_a/{wo['id']}").text
