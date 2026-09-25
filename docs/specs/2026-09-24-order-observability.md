@@ -59,6 +59,28 @@ The ranking above is the design input. Class 1 outnumbers everything, so the dia
 report (§6) is a first-class child and not a footnote on the debug page. Class 2 says the
 new surfaces must *show the underlying rows*, not a prettier total.
 
+**Each class, the section that exposes it, and whether it needs a new FIX TOOL.** The
+feature order asked for fix tooling as well as visibility; this is the accounting for it,
+and the answer is one new tool, one class partly served, three argued as needing none.
+
+- **Class 1 (parked, nothing says why — 8 issues). Exposed by §6. NEEDS A FIX TOOL, and
+  §11 is it.** Largest class, and the one where seeing the blocker and clearing it are two
+  different acts: §6's diagnosis names the thing that has to happen next and stops there,
+  so the user still has to carry it to a second command.
+- **Class 2 (bill wrong or useless — 6 issues). Exposed by §4 and §7. No fix tool.** The
+  arithmetic bugs are already fixed; what remained was a visibility gap, and §4 and §7
+  close it by showing the underlying rows.
+- **Class 3 (state inconsistency, no self-heal — 5 issues). Exposed by §6 and §7. Partly
+  served by §11**, where the inconsistency is a blocker a shipped remedy already covers.
+  The rest are OS defects and are fixed as issues, not by a user-facing tool: a tool that
+  patches inconsistent state hides the defect that produced it.
+- **Class 4 (the OS's own model calls failing silently — 2 issues). Exposed by §6**, which
+  surfaces a failed `agent_usage` row as UNREACHABLE. **No fix tool:** the remedy for a
+  failed OS call is to re-ask, and every one of those paths already has its own re-ask
+  command.
+- **Class 5 (gate recogniser false positives — 5 issues). Already served by `jarvis gate
+  explain`.** This feature adds nothing, and no fix tool.
+
 ## 2. What already exists, and the standing rules this feature must not break
 
 Read this before proposing anything. Most of what the feature order asks for is already
@@ -235,6 +257,16 @@ the nesting depth actually supported: `_subagent_labels` globs one directory lev
 subagent spawned *by* a subagent may not be reachable. Check it, and say in the payload
 which depth was read rather than implying completeness.
 
+A subagent's transcript is a transcript, so it also yields cache writes and context size on
+the same arithmetic as the parent's: `inspection.classify_writes` runs over it exactly as
+it runs over the parent, and its `Turn.context_peak` is available the same way. That is
+what answers the feature order's "when the user is paying a write-cache" for subagents.
+**A subagent's writes are reported as the SUBAGENT's own and are never folded into the
+parent's classification** — a parent turn that merely waited on a join did not pay that
+write, and attributing it upward names the wrong turn as the prefix break. The partition
+rule above governs here unchanged: attaching a subagent must not change the parent turn's
+own totals.
+
 **There is no real subagent transcript in this repository, and you must not create one.**
 `tests/data/transcripts/-wo-5a6b2d6d/…/subagents/` holds `.meta.json` files only; the
 transcripts themselves were dropped by `scripts/redact_transcript.py`. Eleven existing
@@ -302,6 +334,15 @@ way to prove that in CI. Say exactly this in the pull request rather than a stro
 were never recorded and cannot be recovered. An order that predates this landing renders
 "not recorded for this order" — not an empty table, which a reader will report as a bug.
 
+**What this section does NOT cover, and it is a boundary rather than an oversight.**
+Per-subagent context COMPOSITION, and its delta, are out of reach. §5 measures at dispatch
+because Jarvis builds the worker's prompt; Jarvis does not build a subagent's prompt —
+Claude Code does, inside the session, and writes no record of what went into it (§2's third
+measured fact). So for subagents the ask is answered by §4's transcript arithmetic, which
+gives their tokens, tool calls, cache writes and context peak, and it is DECLINED for
+composition, for that reason. A reader asking "where is subagent context" gets §4 for the
+numbers and this paragraph for why there is no ingredient list behind them.
+
 **CLI surface:** `jarvis wo context <wo-id>` (`--json`, `--turn N`).
 
 ## 6. Why is this order not moving: the diagnosis report
@@ -350,8 +391,9 @@ functions**; a diagnosis that disagrees with the status label is worse than no d
 reporting how it settled.
 
 **The boundary.** This report explains and offers; it never acts. It files nothing,
-unblocks nothing and sends nothing. The acting path is `remedies.py`, which is a closed
-registry behind a Neo approval and a grant, and is out of this feature entirely (§8).
+unblocks nothing and sends nothing. The acting path is `remedies.py`, a closed registry
+behind a Neo approval and a one-use grant; §11 is the user-facing entry point to it, a
+separate command and a separate child, and it adds nothing to that registry (§8).
 
 ## 7. The debugging view: the dashboard page and the JSON behind it
 
@@ -417,10 +459,15 @@ one thing Jarvis alone witnesses, which is §5.
 `probes.RESERVED_IDS` — a probe id may not shadow an alarm kind — so adding kinds drags the
 supervisor into this feature. The existing alarms keep firing unchanged.
 
-**Any acting or repair path.** This feature explains; `remedies.py` acts, behind a Neo
-approval and a one-use grant. The feature order asked for "tools to fix those identified
-issues"; the fix affordance delivered here is §6's literal, pre-validated commands, which
-is the largest honest step. Automating them is a separate feature.
+**Any NEW remedy, and any automation that acts without the grant.** `remedies.py`'s
+`REMEDIES` registry, its `catalog.RemedyConfig` allow-list default and its `self_heal`
+grant requirement all stay exactly as they are, and this feature adds no remedy to them.
+What §11 adds is a user-facing ENTRY POINT to the remedies that already ship — the same
+three, behind the same Neo approval and the same one-use grant, reached from the diagnosis
+instead of only from the supervisor acting on an alarm. A blocker no shipped remedy covers
+still gets §6's literal, pre-validated command and nothing more. Out of scope: adding a
+remedy to the registry, widening an allow-list, and any path that acts without an approved,
+unexpired, unspent grant.
 
 **Retroactive context composition.** Impossible: the ingredients of past orders were never
 recorded. §5 is forward-only and says so on the surface.
@@ -527,6 +574,24 @@ this section, and §7 and §10 both follow the first four. Section order in this
 still reading order and still not build order — it just now runs the other way from what a
 reader might have assumed.
 
+**Where this section came from.** Not planner scope drift: it answers two review comments
+the user left on this feature order, quoted verbatim as the source.
+
+> "the spec doesn't mention cost of live debugging, so the question is: how much of that is
+> mechanical vs model calls? Sounds like it is mostly mechanical, but I want to be
+> explicitely measured, so the bill view of the order should include how much cost was
+> incurred in collecting and generating debug data"
+
+> "Debug data should be collected based on configuration, the spec doesn't say so. Make
+> sure that there is a config (default by os, project can override, as well as order by
+> parameter, with that precedence) that gates debugging info"
+
+The first comment is the METER; the second is the GATE. **They are two separate things and
+this section keeps them apart, because conflating them is what makes the rest of the text
+read as a contradiction.** The gate governs exactly one write, §5's per-turn ingredient
+row. The meter observes all five paths, four of which are reads, and it is never switched
+off: a meter the user can disable cannot answer the question the meter exists to answer.
+
 **The gate.** A new `ObservabilityConfig` dataclass, added to the fleet-level config
 dataclass AND the project-level one, exactly the way `InspectConfig` already appears in
 both (`src/jarvis/catalog.py` lines 1009 and 1118). The project object is built on the
@@ -545,8 +610,17 @@ opened. §5's per-turn ingredient row is the one real collection this feature ad
 is the thing `off` switches off — this section retrofits that guard into the write path §5
 already landed, and §5 itself is written with no knowledge of the config. Say it plainly,
 on the surface and in the config's own docstring: `off` does not disable `jarvis watch`,
-`jarvis inspect`, `jarvis wo why` or the debug page. `full` is the level at which §5
-records, and at which the meter below records its per-report rows.
+`jarvis inspect`, `jarvis wo why` or the debug page.
+
+**The three levels, concretely.** `off` means §5 writes no per-turn ingredient row, and
+changes NOTHING else. The consequence a user notices: an order run at `off` has no context
+ledger afterwards, so `jarvis wo context` reports it as not recorded — §5's forward-only
+wording, now for a second reason — and every other surface is unaffected. `normal` is the
+default and records that row. `full` records it and additionally records whatever the child
+determines is worth recording beyond the ingredient list; if that turns out to be nothing,
+`full` and `normal` collapse, and the child says so rather than inventing a difference to
+justify a third level. The meter below is not on this scale at all: it records at every
+level.
 
 **The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
 lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,
@@ -576,11 +650,58 @@ bug.
 says so. A failed meter row never fails the report it was measuring, and never fails the
 work order. `bill.py`'s settlement seal and its existing arithmetic are unchanged: this is
 a new kind arriving through a path the bill already has, not new maths. The gate is never
-consulted to decide whether a READ may proceed.
+consulted to decide whether a READ may proceed, and the meter over those reads has no off
+switch — the two are separate, as above.
 
 **Absent is not zero, here too.** An order that ran before this landed has no observability
 rows. The class renders as *not recorded*, never as `0.00` spent — §2's standing rule
 governs this section's own numbers exactly as it governs every other section's.
+
+---
+
+## 11. Clearing the blocker the diagnosis just named
+
+**The question this answers:** "§6 told me what this order is waiting on — now clear it."
+The feature order says outright that "tools to fix those identified issues is also in
+scope". §6 explains; this acts, and it acts with no authority §6 did not already have.
+
+**What it is.** `jarvis wo fix <wo-id>`, and the same control on §7's debug page. It takes
+the blocker §6's diagnosis named, matches it against the SHIPPED remedies, and proposes the
+one that fits — the proposal, its subject, and what approving it will do. One `ops`
+function returning a dict, both surfaces rendering that dict verbatim, exactly like every
+other section here.
+
+**It adds no authority, and that is the whole design.** Read `src/jarvis/remedies.py`'s
+module docstring before touching this: the `REMEDIES` registry is CLOSED and
+`tuple(REMEDIES) == SHIPPED_REMEDIES` is asserted, so adding one is a reviewed diff;
+`catalog.RemedyConfig` ships off with an empty allow-list on every project; a remedy rides
+an approved, unexpired, unspent `self_heal` grant consumed through `gates.open_gate`; and
+an AST walk in `tests/test_remedies.py` pins every acting call inside a handler. **§11 adds
+NO remedy to that registry, widens no allow-list, and skips no grant.** The only new thing
+is the ENTRY POINT: today a remedy is reachable only from the supervisor acting on an
+alarm, and this lets the user reach the same three — `nudge`, `unblock`, `file_work_order`
+— from the diagnosis they are already looking at. A section that needed a new remedy would
+be a different and much larger section, carrying a registry diff and its own approval
+story. This is not that section.
+
+**What it refuses.** `remedies.py` excludes cancelling a turn, `set_status`, `wo done`,
+`fo resume` and killing a process, on purpose, and its docstring calls that a boundary
+rather than an oversight. **§11 inherits every one of those exclusions verbatim and must
+not route around them** — not with a new remedy, and not with an `ops` helper that does the
+same thing under another name. When the diagnosis names a blocker no shipped remedy covers,
+the honest output is §6's pre-validated command for the user to run themselves, labelled as
+exactly that: a command for them, not an act the OS is offering to take. Never a silent
+no-op, and never an invented remedy.
+
+**Where it comes from.** §1's class 1 — parked with nothing saying why — is the largest of
+the 47 at eight issues, and it is the class where naming the blocker and clearing it are
+separate acts. Class 3 is partly served here, in the cases where the inconsistency is a
+blocker a shipped remedy already covers.
+
+**Absent is not zero, here too.** An order with no blocker, and an order whose project has
+remedies switched off, each say so in those words and offer nothing. Neither renders an
+empty list: a reader reads an empty list as "nothing to do" when the truth is "nothing is
+armed here".
 
 ---
 
