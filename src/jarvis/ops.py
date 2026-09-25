@@ -56,6 +56,8 @@ from .project_store import (
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     ProjectStore,
+    feature_status_label,
+    is_feature_order_id,
     validation_standing,
 )
 
@@ -565,7 +567,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     progress = feature_progress(store, fo)
                     attention.append({
                         "project": p["name"], "wo_id": None, "fo_id": fo_id,
-                        "title": fo["title"], "status": f"feature:{fo['status']}",
+                        "title": fo["title"],
+                        # Kind-aware through the ONE mapping in project_store — §2.2 of
+                        # docs/superpowers/specs/2026-09-23-improvement-orders.md. A
+                        # feature order's label is unchanged by construction.
+                        "status": (f"{fo.get('kind') or 'feature'}:"
+                                   f"{feature_status_label(fo.get('kind'), fo['status'])}"),
                         "reason": f"{progress['label']} — " + "; ".join(reasons),
                         "rolled_up": [k["id"] for k in kids],
                         "decide": f"jarvis fo show {fo_id}",
@@ -2116,7 +2123,7 @@ def _filed_titles(store: ProjectStore, unit_id: str) -> dict[str, str]:
     Off the events, so it costs a query and no network. Which kind of unit the id names
     is read off the id, `validation_view`'s idiom.
     """
-    kind = {"fo_id": unit_id} if unit_id.startswith("fo-") else {"wo_id": unit_id}
+    kind = {"fo_id": unit_id} if is_feature_order_id(unit_id) else {"wo_id": unit_id}
     out: dict[str, str] = {}
     for payload in filed_follow_ups(store, **kind).values():  # type: ignore[arg-type]
         for item in payload.get("filed") or []:
@@ -2625,7 +2632,7 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
     anything else a work order — so the caller never has to say, and one command can
     serve both.
     """
-    if unit_id.startswith("fo-"):
+    if is_feature_order_id(unit_id):
         name, path, row = find_feature_order(unit_id, project_name)
         subject: dict[str, str | None] = {"fo_id": unit_id}
         unit = "feature"
@@ -5236,7 +5243,8 @@ def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_feature_orders(project_name: str | None = None,
-                        include_settled: bool = False) -> list[dict[str, Any]]:
+                        include_settled: bool = False,
+                        kind: str = "feature") -> list[dict[str, Any]]:
     paths = registered_project_paths()
     if project_name:
         if project_name not in paths:
@@ -5249,12 +5257,141 @@ def list_feature_orders(project_name: str | None = None,
         store = ProjectStore(path)
         try:
             statuses = None if include_settled else FO_OPEN_STATUSES
-            for fo in store.list_feature_orders(statuses=statuses):
+            for fo in store.list_feature_orders(statuses=statuses, kind=kind):
                 out.append({"project": name, **fo,
+                            "status_label": feature_status_label(kind, fo["status"]),
                             "progress": feature_progress(store, fo)})
         finally:
             store.close()
     return out
+
+
+# -- improvement orders ---------------------------------------------------------------
+#
+# Section 2 of docs/superpowers/specs/2026-09-23-improvement-orders.md. An improvement
+# order is a `feature_orders` row with `kind='improvement'`, so everything here that can
+# be the feature-order function IS the feature-order function, kind-guarded.
+
+#: `feature_orders.metadata` key: the `--ref` strings exactly as the user typed them.
+#: Unresolved and unvalidated on purpose — a reference that does not resolve is a FINDING
+#: about the OS's records, not a CLI error (§2.6).
+EVIDENCE_REFS_KEY = "evidence_refs"
+
+
+def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
+    """Refuse a row of the wrong kind, naming the command that WOULD work.
+
+    §2.4 of the improvement-orders spec: the two surfaces share a table, so every verb
+    that means something different for the other kind has to say so rather than act.
+    """
+    actual = fo.get("kind") or "feature"
+    if actual == kind:
+        return
+    other = "an improvement order" if actual == "improvement" else "a feature order"
+    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] == 'i' else 'a'} "
+                   f"{kind} order — use `{verb} {fo['id']}` instead")
+
+
+def create_improvement_order(project_name: str, title: str, description: str = "",
+                             refs: Sequence[str] = (),
+                             budget_usd: float | None = None,
+                             origin: str = "jarvis") -> dict[str, Any]:
+    """File an observation for an analyst to investigate. Nothing runs here.
+
+    Same shape as `create_feature_order`, down to the budget default, because the whole
+    point of the `jarvis io` surface is that a user who knows `jarvis fo` already knows
+    it (§2.6). One refusal it adds: no evidence.
+    """
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    refs = [r for r in (s.strip() for s in refs) if r]
+    if not (description or "").strip():
+        raise OpsError(
+            f"an improvement order needs an observation: the analyst's first reader is "
+            f"a fresh session with no memory of the conversation that produced it. Use "
+            f"`jarvis io create {project_name} \"{title[:40]}\" -d \"...\"`."
+        )
+    if not refs:
+        raise OpsError(
+            f"an improvement order with no evidence is a request for an opinion. Name "
+            f"what you saw — a wo-/fo-/io-/al- id, #<issue>, a URL, or free text: "
+            f"`jarvis io create {project_name} \"{title[:40]}\" -d \"...\" --ref <id>`."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(
+            title=title, description=description, origin=origin,
+            kind="improvement",
+            metadata={EVIDENCE_REFS_KEY: refs},
+            # The family here is the order plus its analyst, and the family arithmetic is
+            # already correct with no children — §2.6, which is why this is the FEATURE
+            # default and not the per-work-order one.
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.feature_default_for(_spec_or_none(project_name))))
+    finally:
+        store.close()
+
+
+def list_improvement_orders(project_name: str | None = None,
+                            include_settled: bool = False) -> list[dict[str, Any]]:
+    """`jarvis io list`. The feature-order listing with the other kind asked for —
+    behaviour is identical, so a copy would only be a second thing to keep in step."""
+    return list_feature_orders(project_name, include_settled=include_settled,
+                               kind="improvement")
+
+
+def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io show` — COUNTS FIRST, then the observation and the evidence.
+
+    Not `show_feature_order` with a flag: that renders a plan, a child tree and a
+    progress label, and an improvement order has none of those. The per-finding blocks
+    are section 4.4's renderer and deliberately absent here.
+    """
+    name, path, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo show")
+    # `plan` is NULL until the analyst reports, which is the NORMAL state in this
+    # section — so every read of it is defensive rather than trusting.
+    report = db.from_json(fo.get("plan"), None) or {}
+    findings = report.get("findings") or [] if isinstance(report, dict) else []
+    by_decision = {"accepted": 0, "rejected": 0, "pending": 0}
+    for f in findings:
+        status = (f or {}).get("status") or "pending" if isinstance(f, dict) else "pending"
+        by_decision[status if status in by_decision else "pending"] += 1
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    store = ProjectStore(path)
+    try:
+        analyst = None
+        if fo.get("plan_wo_id"):
+            try:
+                a = store.get_work_order(fo["plan_wo_id"])
+                analyst = {k: a[k] for k in ("id", "title", "status", "result_summary")}
+            except KeyError:
+                analyst = None  # deleted out from under it; the link was released
+        alarms = store.alarms_for_feature(io_id)
+    finally:
+        store.close()
+    return {
+        "project": name, **fo,
+        "findings": len(findings),
+        "by_decision": by_decision,
+        "observation": fo["description"],
+        "evidence_refs": list(metadata.get(EVIDENCE_REFS_KEY) or []),
+        "analyst": analyst,
+        "status_label": feature_status_label("improvement", fo["status"]),
+        "alarms": alarms,
+    }
+
+
+def cancel_improvement_order(io_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis io cancel`. The feature-order path unchanged: it stops every non-terminal
+    work order the row owns — here just the analyst — and settles it. Orders already
+    filed from accepted findings are independent by construction and are not touched."""
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo cancel")
+    return cancel_feature_order(io_id, project_name)
 
 
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -5330,6 +5467,7 @@ def submit_plan(fo_id: str, doc: Any,
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    _require_kind(fo, "feature", "jarvis io report")
     if fo["status"] not in ("planning", "plan_review"):
         raise OpsError(
             f"{fo_id} is {fo['status']}, so it is not waiting for a plan "
@@ -5446,6 +5584,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    _require_kind(fo, "feature", "jarvis io review")
     if fo["status"] != "plan_review":
         raise OpsError(f"{fo_id} is {fo['status']}, not awaiting a plan review")
     if not accept and not feedback.strip():
@@ -5643,6 +5782,8 @@ def resume_feature_order(fo_id: str, fix: str = "",
     from .invariants import dead_feature_children
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    # An improvement order has no children to revive — §2.4 of the improvement-orders spec.
+    _require_kind(fo, "feature", "jarvis io show")
     if fo["status"] != "failed":
         raise OpsError(
             f"{fo_id} is {fo['status']}, not failed — `fo resume` revives a feature a "
