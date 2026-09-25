@@ -1579,13 +1579,18 @@ def _print_bill(bill: dict) -> None:
                           ("agents", "agent by agent — the lead, then what it spawned"),
                           ("orders", "the orders under it")):
         lines = bill.get(view) or []
-        if not lines:
+        own = bill.get("own") if view == "orders" else None
+        if not lines and not own:
             continue
         print(f"\n{caption}:")
         print(f"{'$':>9} {'tokens':>8}")
         if view == "orders":
             for order in lines:
                 _print_bill_line(order["total"])
+            if own:
+                # Relabelled: its label is the parent's id, which beside the child ids
+                # would read as one more order rather than as the parent's own spend.
+                _print_bill_line({**own, "label": bill_mod.OWN_LABEL})
             continue
         for line in lines:
             _print_bill_line(line)

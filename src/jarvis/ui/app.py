@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .. import bill, fleet, invariants, ops, specs, uilog, wiring
+from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS
@@ -1130,7 +1131,7 @@ def create_app() -> FastAPI:
         scale = max([t.get("context_window") or 0 for t in turn_rows]
                     + [t.get("context_peak") or 0 for t in turn_rows] + [1])
         return render(request, "bill.html", active="cost", bill=bill, project=name,
-                      turn_rows=turn_rows, bar_scale=scale)
+                      turn_rows=turn_rows, bar_scale=scale, own_label=OWN_LABEL)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):
