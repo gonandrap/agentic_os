@@ -762,7 +762,8 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       parent_id: str | None = None,
                       issue_url: str | None = None,
                       issue_priority: str | None = None,
-                      budget_usd: float | None = None) -> dict[str, Any]:
+                      budget_usd: float | None = None,
+                      metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
     `budget_usd` caps what the order may spend; None falls back to the project's catalog
@@ -804,6 +805,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             append_system_prompt=append_system_prompt, backlog_id=backlog_id,
             depends_on=depends_on, parent_id=parent_id, issue_url=issue_url,
             issue_priority=issue_priority,
+            # AT CREATION, never a follow-up write: the daemon can claim and dispatch a
+            # new work order before a second statement would land, and a worker that
+            # cannot read where it came from is why `origin_io` exists (§5.3.1).
+            metadata=metadata,
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
         )
@@ -5166,7 +5171,8 @@ def create_feature_order(project_name: str, title: str, description: str = "",
                          origin: str = "jarvis",
                          backlog_id: str | None = None,
                          max_parallel: int | None = None,
-                         budget_usd: float | None = None) -> dict[str, Any]:
+                         budget_usd: float | None = None,
+                         metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File the coarse ask. Nothing is decomposed here — the daemon opens a planner.
 
     Deliberately the same shape as `create_work_order`, because the whole point of the
@@ -5200,7 +5206,7 @@ def create_feature_order(project_name: str, title: str, description: str = "",
     try:
         return store.create_feature_order(
             title=title, description=description, origin=origin, backlog_id=backlog_id,
-            max_parallel=max_parallel,
+            max_parallel=max_parallel, metadata=metadata,
             # A FAMILY budget, so it takes the family default and never the
             # per-work-order one — `catalog.DEFAULT_FEATURE_BUDGET_USD` says why they are
             # two settings rather than one scaled from the other.
@@ -5332,6 +5338,13 @@ def list_feature_orders(project_name: str | None = None,
 #: about the OS's records, not a CLI error (§2.6).
 EVIDENCE_REFS_KEY = "evidence_refs"
 
+#: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding:
+#: the improvement order it came from. The back-link's machine-readable half — the human
+#: half is the first line of the description (§5.3.1). A filed order is never a child:
+#: `work_orders.parent_id` references `feature_orders(id)`, so a `type='feature'` proposal
+#: has no parent slot at all (§5.3).
+ORIGIN_IO_KEY = "origin_io"
+
 
 def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
     """Refuse a row of the wrong kind, naming the command that WOULD work.
@@ -5431,12 +5444,48 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
         "project": name, **fo,
         "findings": len(findings),
         "by_decision": by_decision,
+        "report": report if isinstance(report, dict) else {},
+        "filed_orders": _filed_orders(findings),
         "observation": fo["description"],
         "evidence_refs": list(metadata.get(EVIDENCE_REFS_KEY) or []),
         "analyst": analyst,
         "status_label": feature_status_label("improvement", fo["status"]),
         "alarms": alarms,
     }
+
+
+def _filed_orders(findings: list[Any]) -> dict[str, list[dict[str, Any]]]:
+    """Every order each accepted finding filed, with its CURRENT status (§5.3.1).
+
+    Read LIVE from the stores rather than from the snapshot taken at filing, because the
+    question the list answers is which of the proposed fixes are done, running or still
+    pending. A fan-out across project stores: a proposal's fix is frequently in another
+    project, which is the whole reason a filed order is not a child (§5.3).
+
+    An id that no longer resolves renders as `deleted` rather than vanishing — a link
+    that quietly disappears reads as a filing that never happened.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        rows = []
+        for order in finding.get("created_orders") or []:
+            status = "deleted"
+            try:
+                if order.get("type") == "feature":
+                    _n, _p, row = find_feature_order(order["id"])
+                else:
+                    _n, _p, row = find_work_order(order["id"])
+                status = row["status"]
+            except OpsError:
+                pass
+            rows.append({"id": order.get("id"), "type": order.get("type"),
+                         "title": order.get("title"), "project": order.get("project"),
+                         "status": status})
+        if rows:
+            out[finding.get("key", "")] = rows
+    return out
 
 
 def cancel_improvement_order(io_id: str, project_name: str | None = None
@@ -5526,6 +5575,209 @@ def submit_findings(io_id: str, doc: Any,
             f"submitted findings for {io_id}: {len(report['findings'])} findings",
         )
     return out
+
+
+def review_findings(io_id: str, accept: Sequence[str] = (),
+                    reject: dict[str, str] | None = None, feedback: str = "",
+                    decided_by: str = "user", accept_all: bool = False,
+                    project_name: str | None = None) -> dict[str, Any]:
+    """Decide a findings report, finding by finding. `jarvis io review`.
+
+    A SEPARATE function from `review_plan` and not an extension of it (§5.1): that one
+    takes a single `accept: bool` for a whole plan, this one is per finding, and forcing
+    both through one signature re-opens exactly the "two chances to disagree about what
+    releasing means" risk that made `review_plan` one function.
+
+    The failure policy is kn-652456b8's durable/best-effort split, with one correction.
+    The DECISION and the knowledge write are durable; a proposed order that cannot be
+    filed records the error on the finding and leaves the decision standing. But a filing
+    failure is NEVER SILENT: it keeps the attention flag up, naming the finding and the
+    error, raises an inbox row, and holds the order in `plan_review` so re-accepting that
+    finding retries the filing — the one case in which an already-decided finding may be
+    decided again (§5.2).
+    """
+    from . import findings
+    from .neo_store import NeoStore
+
+    rejections = dict(reject or {})
+    accepted_keys = list(accept)
+    name, path, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo approve")
+    if fo["status"] != "plan_review":
+        raise OpsError(
+            f"{io_id} is {fo['status']}, not awaiting a findings review — "
+            f"`jarvis io show {io_id}` for where it stands"
+        )
+    report = db.from_json(fo.get("plan"), None)
+    if not isinstance(report, dict) or not report.get("findings"):
+        raise OpsError(
+            f"{io_id} has no stored findings report to review — its analyst has not "
+            f"reported yet. `jarvis io show {io_id}`."
+        )
+    by_key = {f["key"]: f for f in report["findings"]}
+
+    if accept_all and rejections:
+        raise OpsError(
+            "--accept-all cannot be combined with --reject: one reason covering a "
+            "blanket rejection is a rejection nobody can learn from. Name each finding "
+            "with --accept/--reject instead."
+        )
+    if accept_all:
+        accepted_keys = [k for k, f in by_key.items()
+                         if (f.get("status") or "pending") == "pending"
+                         or f.get("filing_error")]
+    unknown = [k for k in (*accepted_keys, *rejections) if k not in by_key]
+    if unknown:
+        raise OpsError(
+            f"no finding {unknown[0]!r} on {io_id} — the keys are: "
+            f"{', '.join(by_key)}"
+        )
+    both = [k for k in accepted_keys if k in rejections]
+    if both:
+        raise OpsError(f"{both[0]!r} is in both --accept and --reject — decide it once")
+    blank = [k for k, reason in rejections.items() if not (reason or "").strip()]
+    if blank:
+        raise OpsError(
+            f"rejecting {blank[0]!r} needs --feedback: the reason is the entire teaching "
+            f"signal, and Neo learns nothing from a refusal with no argument"
+        )
+    if not accepted_keys and not rejections:
+        raise OpsError(
+            f"name at least one finding: `jarvis io review {io_id} --accept <key>` or "
+            f"`--reject <key> --feedback \"why\"` (the keys are: {', '.join(by_key)})"
+        )
+    for key in (*accepted_keys, *rejections):
+        f = by_key[key]
+        if (f.get("status") or "pending") == "pending":
+            continue
+        # The ONE re-decision allowed: a finding whose decision stands but whose orders
+        # did not file (§5.2).
+        if key in accepted_keys and f.get("filing_error"):
+            continue
+        raise OpsError(
+            f"{key!r} is already {f['status']} on {io_id} — a decision is taken once. "
+            f"`jarvis io show {io_id}` for what was decided."
+        )
+
+    created: list[dict[str, Any]] = []
+    learnings: list[str] = []
+    errors: list[dict[str, str]] = []
+    for key in accepted_keys:
+        f = by_key[key]
+        if not f.get("knowledge_id"):
+            # Through `learn_add` and never `CentralStore.add_knowledge` — §5.4: it is
+            # what attributes the write and records the timeline side effect
+            # (kn-652456b8). A retry after a filing failure finds the id already here
+            # and writes no second entry.
+            entry = learn_add(findings.knowledge_text(f), project=name,
+                              topic="os-failure-mode", tags=io_id,
+                              wo_id=fo.get("plan_wo_id") or "")
+            f["knowledge_id"] = entry["id"]
+            learnings.append(entry["id"])
+        filed = f.setdefault("created_orders", [])
+        done = {o.get("index") for o in filed}
+        error = ""
+        for i, order in enumerate(f.get("proposed_orders") or []):
+            if i in done:
+                continue
+            target = (order.get("project") or "").strip() or name
+            order_type = order.get("type") or "work"
+            # FIRST LINE names the improvement order: the worker sees this description
+            # and nothing else, and this is the readable half of the back-link (§5.3.1).
+            description = (
+                f"Filed from improvement order {io_id} — run `jarvis io show {io_id}` "
+                f"for the root cause this fixes.\n\n{order.get('description', '')}"
+            )
+            try:
+                if order_type == "feature":
+                    row = create_feature_order(target, order.get("title", ""),
+                                               description=description,
+                                               metadata={ORIGIN_IO_KEY: io_id})
+                else:
+                    row = create_work_order(target, order.get("title", ""),
+                                            description=description, parent_id=None,
+                                            metadata={ORIGIN_IO_KEY: io_id})
+            except OpsError as e:
+                error = str(e)
+                errors.append({"key": key, "error": error})
+                break
+            filed.append({"index": i, "id": row["id"], "type": order_type,
+                          "title": order.get("title", ""), "project": target})
+            created.append({"id": row["id"], "type": order_type,
+                            "title": order.get("title", "")})
+        if error:
+            f["filing_error"] = error
+        else:
+            f.pop("filing_error", None)
+        # The DECISION is written once. A retry of a finding that failed to file touches
+        # `created_orders` and `filing_error` and nothing else — §5.2: the decision
+        # stands, and re-stamping it would replace the user's reasoning and the moment
+        # they gave it with the retry's empty feedback and today's clock.
+        if f.get("status") != "accepted":
+            f.update(status="accepted", decided_by=decided_by, decided_at=db.now(),
+                     feedback=feedback)
+
+    if rejections:
+        neo = NeoStore()
+        try:
+            for key, reason in rejections.items():
+                f = by_key[key]
+                f.update(status="rejected", decided_by=decided_by, decided_at=db.now(),
+                         feedback=reason)
+                neo.add_learning(
+                    findings.rejection_learning(fo, f, reason, decided_by),
+                    project=name, source="review")
+        finally:
+            neo.close()
+
+    pending = [f for f in report["findings"]
+               if (f.get("status") or "pending") == "pending"]
+    stuck = [f for f in report["findings"] if f.get("filing_error")]
+    status = "completed" if not pending and not stuck else "plan_review"
+    reason = ""
+
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(io_id, plan=db.to_json(report))
+        # THE FLAG MOVES ONLY HERE, at the transition, and nothing re-derives it on a
+        # tick — kn-089de524: a flag written on a re-deriving path re-raises itself and
+        # overwrites the user's ack.
+        if status == "completed":
+            store.set_feature_status(io_id, "completed")
+            store.clear_feature_attention(io_id)
+        elif stuck:
+            reason = (
+                f"{io_id}: {len(stuck)} accepted finding(s) could not be filed — "
+                f"{stuck[0]['key']}: {stuck[0]['filing_error']} — retry with "
+                f"`jarvis io review {io_id} --accept {stuck[0]['key']}`"
+            )
+            store.flag_feature_attention(io_id, reason)
+        else:
+            store.flag_feature_attention(io_id, findings.review_headline(fo, report))
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "findings_reviewed", {
+                "improvement_order": io_id, "by": decided_by,
+                "accepted": accepted_keys, "rejected": sorted(rejections),
+                "created": [c["id"] for c in created],
+                "errors": [e["error"] for e in errors],
+            })
+    finally:
+        store.close()
+
+    if stuck:
+        # §5.2: a filing failure reaches the user's SINKS, not just a return value
+        # nobody reads.
+        central = CentralStore()
+        try:
+            central.add_inbox(
+                project=name, level="warning",
+                title=f"{io_id}: a finding you accepted could not be filed",
+                body=reason, wo_id=fo.get("plan_wo_id") or None)
+        finally:
+            central.close()
+
+    return {"project": name, "io_id": io_id, "status": status, "created": created,
+            "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
 
 
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:

@@ -340,6 +340,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         n = p.get("findings")
         return ("Findings submitted",
                 f"{n} finding(s) on {p.get('improvement_order') or ''}".strip())
+    if kind == "findings_reviewed":
+        a, r = len(p.get("accepted") or []), len(p.get("rejected") or [])
+        filed = len(p.get("created") or [])
+        return (f"Findings reviewed by {p.get('by') or 'the user'}",
+                f"{a} accepted, {r} rejected, {filed} order(s) filed")
     if kind == "assumption":
         n = p.get("n")  # the number, not the text — §4
         return (f"Assumption #{n} recorded" if n else "Assumption recorded"), ""
