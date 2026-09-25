@@ -301,6 +301,39 @@ def test_base_sha_reaches_a_database_that_already_has_feature_orders(tmp_path):
         store.close()
 
 
+def test_kind_reaches_a_database_that_already_has_feature_orders(tmp_path):
+    """Same construction as `base_sha` above, and the same reason.
+
+    Per `kn-c712a5d6` the column is untested until a test WRITES both values and a test
+    reads a row that PREDATES it — so this asserts the aged row reads back exactly
+    `'feature'` AND that the behaviour that value unlocks still holds: it is still in
+    `jarvis fo list`'s store verb, whose filter is now positive on `kind`.
+    """
+    proj = tmp_path / "legacy"
+    (proj / ".jarvis").mkdir(parents=True)
+    store = ProjectStore(proj)                      # today's schema...
+    aged = store.create_feature_order("CSV export", description="the whole ask")
+    store.close()
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE feature_orders DROP COLUMN kind")       # ...aged
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        assert "kind" in schema_of(store.conn)["feature_orders"]
+        assert store.get_feature_order(aged["id"])["kind"] == "feature"
+        assert [r["id"] for r in store.list_feature_orders()] == [aged["id"]]
+        # and both values round-trip on the upgraded database
+        io = store.create_feature_order("slow turns", description="what I saw",
+                                        kind="improvement")
+        assert store.get_feature_order(io["id"])["kind"] == "improvement"
+        assert [r["id"] for r in store.list_feature_orders(kind="improvement")] \
+            == [io["id"]]
+    finally:
+        store.close()
+
+
 def test_the_validation_tables_and_their_partial_indexes_arrive_on_an_upgrade(tmp_path):
     """A new TABLE arrives for free on `CREATE TABLE IF NOT EXISTS` — its INDEXES only
     do if they are in `SCHEMA` too, and the whole polymorphic design rests on two

@@ -697,6 +697,10 @@ def create_app() -> FastAPI:
         provisional_line=ops.provisional_line,
         objection_line=ops.objection_line,
         objection_response_line=ops.objection_response_line,
+        # And what has already LANDED under a plan the user has not ratified — the fact
+        # a rejection's cost turns on, on both surfaces for the same reason (spec
+        # docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md).
+        overtaken_line=ops.overtaken_line,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,

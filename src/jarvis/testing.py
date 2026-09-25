@@ -1249,13 +1249,31 @@ elif argv[:2] == ["pr", "update-branch"]:
         json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
 elif argv[:2] == ["api", "--method"]:
-    # `gh api --method GET repos/<o>/<r>/commits/<sha> --jq .parents[].sha`. Only the
-    # commit read the OS makes; anything else is an unhandled argv, deliberately, so a
-    # second API call cannot appear here without the fixture noticing.
+    # The TWO API reads the OS makes — a commit's parents, and a branch's protection.
+    # Anything else is an unhandled argv, deliberately, so a third API call cannot appear
+    # here without the fixture noticing.
     path = argv[3] if len(argv) > 3 else ""
-    if argv[2] != "GET" or "/commits/" not in path:
+    if argv[2] != "GET" or not ("/commits/" in path or path.endswith("/protection")):
         sys.stderr.write(f"fake gh: unhandled api call {argv}\n")
         sys.exit(2)
+    if path.endswith("/protection"):
+        # An unregistered branch answers GitHub's own 404 body, which is the state this
+        # repository is really in; `FAKE_GH_FAIL_PROTECTION` is every other failure.
+        refuse = os.environ.get("FAKE_GH_FAIL_PROTECTION")
+        if refuse:
+            sys.stderr.write(refuse + "\n")
+            sys.exit(1)
+        branch = path.split("/branches/", 1)[1].rsplit("/", 1)[0]
+        try:
+            with open(os.path.join(state_dir, "protection.json")) as f:
+                rules = json.load(f)
+        except (OSError, ValueError):
+            rules = {}
+        if branch not in rules:
+            sys.stderr.write("gh: Branch not protected (HTTP 404)\n")
+            sys.exit(1)
+        print(json.dumps({"required_status_checks": {"contexts": rules[branch]}}))
+        sys.exit(0)
     sha = path.rsplit("/", 1)[-1]
     try:
         with open(os.path.join(state_dir, "commits.json")) as f:
@@ -1746,6 +1764,20 @@ def fake_gh(tmp_path, monkeypatch):
             rows[sha] = {"parents": list(parents)}
             path.write_text(json.dumps(rows))
 
+        def set_protection(self, branch: str, checks: list[str]) -> None:
+            """Protect `branch`, requiring `checks`. Unregistered branches answer the
+            404 GitHub answers for a branch nobody protects — the default, because that
+            is the state of the repository the auto-merge request ships against."""
+            path = gdir / "protection.json"
+            rules = json.loads(path.read_text()) if path.exists() else {}
+            rules[branch] = list(checks)
+            path.write_text(json.dumps(rules))
+
+        def refuse_protection(self, message: str) -> None:
+            """Fail the protection read and NOTHING else — a 403, say. `fail()` is the
+            wrong tool: it fails `pr view` too, so the poll never reaches the read."""
+            monkeypatch.setenv("FAKE_GH_FAIL_PROTECTION", message)
+
         def base_sha(self, sha: str) -> None:
             """The base commit `gh pr update-branch` merges in — parent 1 of the result."""
             monkeypatch.setenv("FAKE_GH_BASE_SHA", sha)
@@ -2163,7 +2195,10 @@ FIXTURE_DESIGN_DOC_BODY = "\n".join([
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:
     path = root / name
     path.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    # `-b main`, not the machine's `init.defaultBranch`: `evidence.base_ref`'s last rung
+    # is the literal name `main`, so a fixture repo on `master` resolves no base and
+    # every diff collected from it is empty.
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
     if readme is not None:
         (path / "README.md").write_text(readme)
     doc = path / FIXTURE_DESIGN_DOC
@@ -2231,6 +2266,34 @@ def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
     claude_json(p)  # trusted, like a real project the user works in
     return p
+
+
+@pytest.fixture()
+def improvement_order(project):
+    """A filed improvement order in the `project` fixture's project: evidence refs, no
+    analyst, no report.
+
+    Shared rather than re-filed per test file — §2.7 of
+    docs/superpowers/specs/2026-09-23-improvement-orders.md: every later piece of the
+    feature needs "an improvement order that exists", and divergent local copies are how
+    a suite starts disagreeing with itself. Written through the store rather than
+    `ops.create_improvement_order` so it costs no started OS.
+    """
+    from .ops import EVIDENCE_REFS_KEY
+    from .project_store import ProjectStore
+
+    store = ProjectStore(project)
+    try:
+        return store.create_feature_order(
+            "first turns re-read the same module",
+            description=("Three work orders in a row spent their first turn re-reading "
+                         "the dispatch path because nothing told them where it lives."),
+            kind="improvement",
+            metadata={EVIDENCE_REFS_KEY: ["wo-11111111", "#42",
+                                          "https://example.invalid/x"]},
+        )
+    finally:
+        store.close()
 
 
 @pytest.fixture()

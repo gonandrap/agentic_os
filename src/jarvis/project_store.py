@@ -426,6 +426,30 @@ FO_OPEN_STATUSES = ("pending", "planning", "plan_review", "executing", "validati
                     "budget_exhausted")
 FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 
+# What a `feature_orders` row IS. An improvement order reuses the table, the statuses and
+# three of its columns rather than earning a table of its own — §2.1 of
+# docs/superpowers/specs/2026-09-23-improvement-orders.md says what that reuse buys.
+FO_KINDS = ("feature", "improvement")
+
+# Kind-aware status LABELS. In this leaf module, beside the statuses they rename, because
+# all three renderers already import it and "one mapping" is then a property rather than a
+# wish — §2.2 of the spec above, which is also why no `IO_STATUSES` tuple exists. A kind
+# with no override falls through, so feature-order labels are unchanged by construction.
+FO_STATUS_LABELS: dict[str, dict[str, str]] = {
+    "improvement": {"planning": "analysing", "plan_review": "findings awaiting you"},
+}
+
+
+def feature_status_label(kind: str | None, status: str) -> str:
+    """What to PRINT for a feature-order status, given the row's kind."""
+    return FO_STATUS_LABELS.get(kind or "feature", {}).get(status, status)
+
+
+def is_feature_order_id(unit_id: str) -> bool:
+    """Does this id name a `feature_orders` row? The one shared predicate — §2.5 of the
+    spec above, which exists because three sites had grown their own `fo-` literal."""
+    return unit_id.startswith(("fo-", "io-"))
+
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
@@ -575,10 +599,12 @@ CREATE TABLE IF NOT EXISTS feature_orders (
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
+    -- FO_KINDS. Also in ADDED_COLUMNS, where the reasoning is.
+    kind TEXT NOT NULL DEFAULT 'feature',
     origin TEXT NOT NULL DEFAULT 'jarvis',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    plan_wo_id TEXT REFERENCES work_orders(id),   -- the planner
+    plan_wo_id TEXT REFERENCES work_orders(id),   -- the planner, or the ANALYST
     plan TEXT,                              -- the submitted plan, as JSON
     -- The Neo question reviewing the submitted plan. The back-link lives here rather
     -- than a `fo_id` on the question, mirroring `approvals.neo_question_id`: Neo's
@@ -1116,6 +1142,12 @@ ADDED_COLUMNS = {
         # out of the unreserved remainder at the moment it is dispatched
         # (`budget.reserve`). NULL is no ceiling, exactly as before this shipped.
         "budget_usd": "REAL",
+        # WHICH KIND OF ORDER THIS ROW IS — FO_KINDS. The DEFAULT is what makes the
+        # migration free: `feature_orders` already ships, so a live database gets the
+        # column only here, and every pre-existing row reads back as `kind='feature'`
+        # with no backfill pass (§2.1 of the improvement-orders spec named above the
+        # FO_KINDS tuple).
+        "kind": "TEXT NOT NULL DEFAULT 'feature'",
     },
     "wo_turns": {
         # See the CREATE TABLE comment. Live databases already have `wo_turns`, so the
@@ -1968,6 +2000,34 @@ class ProjectStore:
             "UPDATE work_orders SET dispatch_attempts=0, retry_after=NULL WHERE id=?",
             (wo_id,))
 
+    def plan_hold(self, wo: dict[str, Any]) -> dict[str, Any] | None:
+        """`{"fo_id", "planner_id", "n"}` when this child's plan is unratified, else None.
+
+        docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md §2.1.
+        Shape copied from `invariants._slot_cap`: a parentless work order — nearly all of
+        them — is answered from the row already in hand and costs no query.
+
+        `kind != 'worker'` exits first for the planner's own sake: it is dispatched
+        before the plan exists, so holding it on its own assumptions would deadlock the
+        feature permanently. Same exemption `max_parallel` makes, and stronger.
+
+        Readers: `invariants.status_label`, `ops.waiting_on`, `Daemon.auto_merge`,
+        `ops.assumptions_with_rulings`. `claim_next_pending` duplicates the SQL rather
+        than calling this — it must stay inside the atomic UPDATE — and
+        `test_plan_hold_and_the_claim_query_agree` pins the two together.
+        """
+        parent = wo.get("parent_id")
+        if not parent or wo.get("kind") != "worker":
+            return None
+        row = self.conn.execute(
+            """SELECT f.plan_wo_id planner, COUNT(a.id) n
+               FROM feature_orders f JOIN assumptions a ON a.wo_id = f.plan_wo_id
+               WHERE f.id = ? AND a.status = 'pending'""", (parent,)).fetchone()
+        # An aggregate over no rows still returns one, with a NULL planner and n=0.
+        if row is None or not row["n"]:
+            return None
+        return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
+
     def claim_next_pending(self) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
 
@@ -1985,13 +2045,26 @@ class ProjectStore:
            its children are, not one of them, so capping it against its own children
            would be capping a feature against itself.
 
-        3. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
+        3. **Its feature's PLAN is still waiting on the user** — any pending assumption
+           on the planner (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.2).
+           Here rather than in `Daemon.dispatch_pending` because this is the row
+           SELECTION: a held child is passed over inside the statement that picks the
+           next row, so a younger unblocked order is still claimed on the same call, and
+           nothing is written. Filtering in the caller would mean either releasing a
+           claim it has already written or spending the whole `max_concurrent` ceiling
+           re-claiming the same held row inside one tick.
+           `w.kind = 'worker'` keeps the PLANNER dispatchable: it is created and
+           dispatched before the plan exists, so holding it on its own assumptions would
+           deadlock the feature permanently. `plan_hold` is the same rule for the
+           readers that render it.
+
+        4. **A dispatch that could not reach `claude` is backing off** — `retry_after`,
            written by `release_dispatch_claim`. Without it the caller's `while` loop
            re-claims the order it has just failed to launch, on the next iteration, and
            spends the whole ceiling inside one tick.
 
         For the overwhelming majority of work orders — no dependencies, no parent, never
-        a failed launch — all three subqueries are vacuously true and this is the query it
+        a failed launch — all four subqueries are vacuously true and this is the query it
         always was.
         """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
@@ -2017,6 +2090,11 @@ class ProjectStore:
                                          AND s.status IN ({marks})
                                    )
                              )
+                             AND NOT (w.kind = 'worker' AND EXISTS (
+                                 SELECT 1 FROM feature_orders f
+                                 JOIN assumptions a ON a.wo_id = f.plan_wo_id
+                                 WHERE f.id = w.parent_id AND a.status = 'pending'
+                             ))
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
             , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
@@ -2332,17 +2410,21 @@ class ProjectStore:
                              metadata: dict[str, Any] | None = None,
                              fo_id: str | None = None,
                              max_parallel: int | None = None,
-                             budget_usd: float | None = None) -> dict[str, Any]:
+                             budget_usd: float | None = None,
+                             kind: str = "feature") -> dict[str, Any]:
         assert origin in WO_ORIGINS, origin
+        assert kind in FO_KINDS, kind
         assert max_parallel is None or max_parallel >= 1, max_parallel
-        fo_id = fo_id or db.new_id("fo")
+        # An improvement order carries its own prefix so that every id in the OS still
+        # says what it names on sight — §2.1 of the improvement-orders spec.
+        fo_id = fo_id or db.new_id("io" if kind == "improvement" else "fo")
         ts = db.now()
         self.conn.execute(
-            """INSERT INTO feature_orders (id, title, description, status, origin,
+            """INSERT INTO feature_orders (id, title, description, status, kind, origin,
                    created_at, updated_at, backlog_id, metadata, max_parallel,
                    budget_usd)
-               VALUES (?,?,?,'pending',?,?,?,?,?,?,?)""",
-            (fo_id, title, description, origin, ts, ts, backlog_id,
+               VALUES (?,?,?,'pending',?,?,?,?,?,?,?,?)""",
+            (fo_id, title, description, kind, origin, ts, ts, backlog_id,
              db.to_json(metadata or {}), max_parallel, budget_usd),
         )
         return self.get_feature_order(fo_id)
@@ -2356,24 +2438,45 @@ class ProjectStore:
         return dict(row)
 
     def list_feature_orders(self, statuses: tuple[str, ...] | None = None,
-                            limit: int = 200) -> list[dict[str, Any]]:
-        where = f" WHERE status IN ({','.join('?' for _ in statuses)})" if statuses else ""
+                            limit: int = 200,
+                            kind: str | None = "feature") -> list[dict[str, Any]]:
+        """`kind` DEFAULTS to 'feature', and that default is the whole point: nothing read
+        this column before improvement orders existed, so defaulting to "everything" is
+        what would make the leak silent (§2.4 of the improvement-orders spec). POSITIVE
+        filter, never a negated one, so the next kind is excluded for free. None = both."""
+        clauses, params = [], []
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' for _ in statuses)})")
+            params += list(statuses)
+        if kind is not None:
+            clauses.append("kind=?")
+            params.append(kind)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
             f"SELECT * FROM feature_orders{where} ORDER BY created_at DESC LIMIT ?",
-            (*(statuses or ()), limit),
+            (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
 
-    def feature_status_counts(self) -> dict[str, int]:
+    def feature_status_counts(self, kind: str | None = "feature") -> dict[str, int]:
         """How many feature orders sit in each status. Counted in SQL, like
-        `status_counts` and for the same reason: `list_feature_orders` is capped."""
+        `status_counts` and for the same reason: `list_feature_orders` is capped.
+
+        Same positive `kind` filter and same default: the two kinds' counts must not
+        merge (§2.4 of the improvement-orders spec)."""
+        where, params = ("", ()) if kind is None else (" WHERE kind=?", (kind,))
         rows = self.conn.execute(
-            "SELECT status, COUNT(*) AS n FROM feature_orders GROUP BY status"
+            f"SELECT status, COUNT(*) AS n FROM feature_orders{where} GROUP BY status",
+            params,
         ).fetchall()
         return {row["status"]: int(row["n"]) for row in rows}
 
     def flagged_feature_orders(self) -> list[dict[str, Any]]:
-        """Every feature order asking for the user, whatever its status.
+        """Every feature order asking for the user, whatever its status OR KIND.
+
+        UNFILTERED by kind on purpose: an improvement order needing the user is exactly
+        as much an attention item as a feature order is, so the kind filter goes on the
+        listings and NOT on the attention path (§2.4 of the improvement-orders spec).
 
         Deliberately not filtered by `FO_OPEN_STATUSES`: `failed` is a SETTLED status and
         it is also the one a feature order raises its flag in — `settle_features` marks
@@ -2582,15 +2685,21 @@ class ProjectStore:
             kind="manager",
         )
 
-    def feature_summary(self) -> dict[str, Any]:
-        """How many feature orders sit in each status, and how many want the user."""
+    def feature_summary(self, kind: str | None = "feature") -> dict[str, Any]:
+        """How many feature orders sit in each status, and how many want the user.
+
+        Same positive `kind` filter and same default as `feature_status_counts` — §2.4
+        of the improvement-orders spec."""
+        where, params = ("", ()) if kind is None else (" WHERE kind=?", (kind,))
         by_status = {
             r["status"]: int(r["n"]) for r in self.conn.execute(
-                "SELECT status, COUNT(*) AS n FROM feature_orders GROUP BY status"
+                f"SELECT status, COUNT(*) AS n FROM feature_orders{where} "
+                f"GROUP BY status", params
             ).fetchall()
         }
         attention = self.conn.execute(
             "SELECT COUNT(*) c FROM feature_orders WHERE needs_attention=1"
+            + (" AND kind=?" if kind is not None else ""), params
         ).fetchone()["c"]
         return {"by_status": by_status, "needs_attention": int(attention)}
 

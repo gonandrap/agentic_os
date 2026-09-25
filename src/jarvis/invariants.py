@@ -288,8 +288,10 @@ REJUDGE_DECLINED_EVENT = "validation_rejudge_declined"
 #: What a work order says when its pull request is green and mergeable, its verdict names
 #: an older commit, and the OS has run out of rounds to bind a new one with. THE ONLY
 #: `sha_moved` STALL THAT REACHES THE USER: every other one the OS now re-judges itself,
-#: silently, which is why a held auto-merge is still deliberately not an attention item
-#: (`Daemon._note_automerge_held`).
+#: silently, which is why a HELD auto-merge is still deliberately not an attention item
+#: (`Daemon._note_automerge_held`). A hold is transient — the next tick may clear it — and
+#: a REFUSAL is not: it is a reviewer's final answer about a commit nothing will re-propose,
+#: and AUTOMERGE_DENIED_BLOCKER below is its attention item (spec 2026-09-24 fix 4b).
 #:
 #: Re-derived below from the timeline rather than raised where the decline is written —
 #: kn-089de524: a flag written on a reconciler's path re-raises itself every tick and
@@ -298,6 +300,29 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "to bind a new one — merge it yourself, re-judge it "
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
+
+#: What a work order says when the reviewer REFUSED the automatic merge of the commit the
+#: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
+#: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
+#: row `automerge.record_verdict` writes is a notification, not a flag.
+#:
+#: NAMES THE REFUSAL, not the absent merge, and ends with all three routes — they answer
+#: three different situations: the reviewer was over-cautious, the reviewer was right
+#: about the code, and the pull request is one nobody will land.
+#:
+#: NAMES NO REFUSER: the attribution already rides on the record, in `ops._automerge_line`'s
+#: "{decision} by {by}" for `automerge_decided`, and the two verdict paths have different
+#: deciders — Neo deciding, and the USER denying a request Neo escalated write the same row,
+#: so naming one here would tell the user Neo refused their own decision.
+#:
+#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on PARKED_BLOCKER's rule: `ack_attention`
+#: stores this verbatim and INV-ATTENTION-REASON compares it, so a reason that ticked or
+#: that named a commit could never be acknowledged.
+AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepted was "
+                            "refused, so nothing will land this pull request by itself "
+                            "— merge it by hand, push a fix and re-judge it "
+                            "(`jarvis validation force`), or close it with "
+                            "`jarvis wo done`")
 
 #: What a work order says when the validation panel gave up on it: it kept resubmitting
 #: and the panel kept rejecting, until the round budget ran out. Nothing automatic is
@@ -471,6 +496,16 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: §9: the objection the OS sent about an assumption died on the way to the worker — its
+#: message spent its retries, or its envelope ended in a terminal state that is not
+#: `delivered`. Nobody but the user can move it now, because the worker was never told.
+#: SAYS "assumption" ON PURPOSE: INV-ATTENTION-REASON's strict branch and the
+#: `parked_reason` fallback both key off `_mentions_assumptions`, so a reason that did
+#: not name one would be rewritten within a tick. Same obligation as PR_CLOSED_BLOCKER:
+#: `true_blockers` re-derives it, free of any elapsed time.
+OBJECTION_UNDELIVERABLE_BLOCKER = ("the OS objected to an assumption and the objection "
+                                   "never reached the worker — decide it yourself")
+
 
 # -- the derivation everything else is checked against ------------------------------
 
@@ -510,6 +545,48 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
         store.latest_validation_round(wo_id=wo["id"])) != head
 
 
+def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Was this order's automatic merge REFUSED, on the commit the panel still names?
+
+    Shaped on `rejudge_exhausted` above and derived for the same reason: `record_verdict`
+    runs on the daemon's verdict-delivery arm, so a flag written there re-raises itself
+    every tick over `jarvis wo ack` (kn-089de524). Spec 2026-09-24 fix 4b.
+
+    THREE FACTS. The newest verdict is `denied` or `dismissed` — both, because `apply`
+    refuses on anything but `approved`, so a dismissal stalls the order exactly as a
+    denial does while meaning the reviewer reached for the wrong verb. The commit that
+    verdict was bound to is still the one the panel's verdict names, read from the single
+    source `decide` is forbidden to re-derive. And nothing has moved past it: a
+    `sha_moved` hold newer than the verdict, on a different commit, is a push, and the
+    re-judge path owns the order from there — which is what makes the flag self-clearing
+    within a tick rather than permanent.
+
+    An ESCALATED request writes no `automerge_decided` row and reaches the user through
+    `store.escalated_approvals` above, so it is never double-flagged.
+    """
+    from .automerge import decided_sha
+
+    decided = store.events_of_kind(wo["id"], "automerge_decided")
+    if not decided:
+        return False
+    verdict = db.from_json(decided[-1]["payload"], {})
+    if str(verdict.get("decision") or "") not in ("denied", "dismissed"):
+        return False
+    sha = decided_sha(verdict)
+    # A row carrying neither `head_sha` nor a command to parse one from is not a verdict
+    # anyone can act on: it predates the record this flag depends on, and is ignored.
+    if not sha or store.validated_head(
+            store.latest_validation_round(wo_id=wo["id"])) != sha:
+        return False
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if held and float(held[-1]["ts"]) > float(decided[-1]["ts"]):
+        newest = db.from_json(held[-1]["payload"], {})
+        if (str(newest.get("code") or "") == HELD_SHA_MOVED
+                and str(newest.get("head_sha") or "") != sha):
+            return False
+    return True
+
+
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's?
 
@@ -533,6 +610,50 @@ def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return auto_review_at(store.project_path)
 
 
+def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
+    """Did the OS's objection about this assumption die on the way to the worker? (§9)
+
+    UNDELIVERABLE IS A STATE, NOT AN ELAPSED TIME, and there is deliberately no deadline:
+    a timeout would put a clock on how long a worker may think, and the OS has no basis
+    for that number. Two states say it and only two — the objection's `wo_messages` row
+    is `failed` (its retries are spent), or its envelope is terminal and not `delivered`.
+    `objection_delivered_ts` being NULL by itself is NEVER the trigger: that is the
+    normal case for the whole length of a turn.
+
+    The two reads sit behind the `objection_envelope_id` check, which is NULL on almost
+    every pending assumption on almost every tick (`parked_reason`'s ordering note).
+    """
+    env_id = a.get("objection_envelope_id")
+    if env_id is None:
+        return False
+    if a.get("objection_delivered_ts") or a.get("objection_withdrawn_ts"):
+        return False
+    env = store.get_envelope(int(env_id))
+    if env is None:
+        return False
+    msg_id = env.get("delivered_msg_id")
+    if msg_id is not None:
+        msg = store.get_message(int(msg_id))
+        if msg is not None and msg["status"] == "failed":
+            return True
+    # Terminal and not delivered: nobody filled the role, or nobody could act. `queued`
+    # is normal operation and `withdrawn` is §6.6 — the order stopped, nothing failed.
+    return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
+
+
+def _os_is_confirming(a: dict[str, Any]) -> bool:
+    """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
+
+    Two rows, and in both the user owes nothing: an accepted one is being confirmed
+    against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
+    answer. An objection still in flight is neither, so it is not here.
+    """
+    verdict = str(a.get("provisional_verdict") or "")
+    if verdict == "accept":
+        return True
+    return verdict == "object" and bool(a.get("objection_delivered_ts"))
+
+
 def true_blockers(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> list[str]:
     """The reasons this work order genuinely needs the user, derived from state alone.
@@ -544,8 +665,22 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     """
     blockers: list[str] = []
     pending = store.pending_assumptions(wo["id"])
-    if pending and not neo_reviews_later(store, wo):
-        n = len(pending)
+    # §9: FIRST, because it is the more specific fact about the same assumption.
+    if any(objection_undeliverable(store, a) for a in pending):
+        blockers.append(OBJECTION_UNDELIVERABLE_BLOCKER)
+    owed = pending
+    if pending and wo["status"] == "needs_review":
+        # `neo_reviews_later` covers the PRE-DELIVERY statuses (#711) and is False here,
+        # so the flag is re-read: a project that has since turned auto_review OFF never
+        # runs the confirmation pass, and suppressing the blocker then would be silence
+        # with nothing behind it. `failed` and `budget_exhausted` are deliberately NOT
+        # gated — no confirmation pass ever reaches them, so those assumptions ARE the
+        # user's.
+        from .ops import auto_review_at
+        if auto_review_at(store.project_path):
+            owed = [a for a in pending if not _os_is_confirming(a)]
+    if owed and not neo_reviews_later(store, wo):
+        n = len(owed)
         blockers.append(f"{n} assumption{'s' if n != 1 else ''} pending your review")
     # A privileged action Neo declined to decide on. Nobody else can open that gate, and
     # the work order cannot proceed past it.
@@ -659,6 +794,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
+    # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
+    # Gated on the status for the same reason as the branch above, and ordered after it
+    # documentarily: the two cannot both be true — that one needs the newest hold to be
+    # `sha_moved` on the judged head, this one needs no such hold.
+    if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
+        blockers.append(AUTOMERGE_DENIED_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
@@ -1076,6 +1218,16 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
             return f"{wo['status']} — {note}"
     if wo["status"] != "pending":
         return wo["status"]
+    # ABOVE the dependency and slot labels, inverting their order: those two clear
+    # themselves, and this one clears only when a person rules on the plan. Of the three
+    # true sentences it is the one naming a move (spec §2.3). Flagless — `true_blockers`
+    # gets no branch, so INV-ATTENTION-MISSING stays quiet without an exception.
+    hold = store.plan_hold(wo)
+    if hold:
+        n = hold["n"]
+        return (f"pending — blocked by {hold['fo_id']}'s plan ({n} "
+                f"assumption{'' if n == 1 else 's'} await{'s' if n == 1 else ''} your "
+                f"review — `jarvis wo review {hold['planner_id']}`)")
     blockers = store.unfinished_dependencies(wo["id"])
     if blockers:
         return f"pending — blocked by {', '.join(dep['id'] for dep in blockers)}"
@@ -1591,6 +1743,11 @@ def check_assumption_flags_are_owed(store: ProjectStore) -> Iterator[Violation]:
         if not _mentions_assumptions(wo.get("attention_reason")):
             continue
         if not (store.pending_assumptions(wo["id"]) and neo_reviews_later(store, wo)):
+            continue
+        # An undeliverable objection raises a real blocker on a RUNNING order
+        # (`running` is in BLOCKED_STATUSES), so without this the flag is cleared here
+        # and INV-ATTENTION-MISSING re-raises it on the same tick, for ever.
+        if any(_mentions_assumptions(b) for b in true_blockers(store, wo)):
             continue
         store.clear_attention(wo["id"])
         yield Violation(

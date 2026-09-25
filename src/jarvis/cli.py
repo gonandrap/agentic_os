@@ -720,6 +720,56 @@ def build_parser() -> argparse.ArgumentParser:
                         "already done")
     f.add_argument("--project")
 
+    # improvement orders -----------------------------------------------------------------
+    # Modelled on `fo` verb for verb, and placed right after it: a user who knows the
+    # feature-order surface must not have to learn a second shape — §2.6 of
+    # docs/superpowers/specs/2026-09-23-improvement-orders.md.
+    io = sub.add_parser(
+        "io",
+        help="improvement orders: an observation about the fleet that an analyst "
+             "investigates and reports findings on",
+    ).add_subparsers(dest="io_cmd", required=True)
+
+    i = io.add_parser("create", help="file an observation — the OS opens an analyst for "
+                                     "it and the findings come back for your decision")
+    i.add_argument("project")
+    i.add_argument("title")
+    i.add_argument("--description", "-d", default="",
+                   help="what you observed. Required: the analyst sees only this text")
+    i.add_argument("--ref", dest="refs", action="append", default=[], metavar="REF",
+                   help="evidence, repeatable and REQUIRED: a wo-/fo-/io-/al- id, "
+                        "#<issue>, a URL, or free text. Stored verbatim and resolved by "
+                        "the analyst — a reference that does not resolve is a finding "
+                        "about the OS's records, not an error here")
+    i.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    i.add_argument("--budget", metavar="USD",
+                   help="cap the whole order — it and its analyst — at N dollars. Omit "
+                        "for no ceiling")
+
+    i = io.add_parser("list", help="improvement orders and where each one stands")
+    i.add_argument("project", nargs="?")
+    i.add_argument("--all", action="store_true", help="include settled ones")
+
+    i = io.add_parser("show", help="one improvement order: the counts, the observation "
+                                   "and the evidence it was filed with")
+    i.add_argument("io_id")
+    i.add_argument("--project")
+
+    i = io.add_parser("cancel", help="stop an improvement order and its analyst")
+    i.add_argument("io_id")
+    i.add_argument("--project")
+
+    i = io.add_parser("budget", help="show, set, raise or clear an improvement order's "
+                                     "budget")
+    i.add_argument("io_id")
+    i.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars. Omit to just show it")
+    i.add_argument("--clear", action="store_true", help="remove the ceiling")
+    i.add_argument("--project")
+
+    for i in io.choices.values():
+        i.add_argument("--json", action="store_true", help="machine-readable output")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -2000,8 +2050,12 @@ def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
     target = args.target
     # One argument, three kinds of thing. Ids are prefixed and projects are not, so
-    # this never has to guess: anything that is not `wo-…`/`fo-…` is a project name.
-    is_id = bool(target) and target.split("-")[0] in ("wo", "fo")
+    # this never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project
+    # name. The feature-order half goes through the shared predicate rather than a third
+    # literal — §2.5 of docs/superpowers/specs/2026-09-23-improvement-orders.md.
+    from .project_store import is_feature_order_id
+
+    is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target))
     if is_id:
         # One order asks "where did MY tokens go", which is the bill's question. The
         # fleet view below asks "which orders cost the most", which is the report's.
@@ -2486,6 +2540,78 @@ def cmd_fo(args: argparse.Namespace) -> int:
             if out["fix_wo_id"] else
             "no work filed; the feature settles on what its children already say"
         )}, args.json)
+
+    return 0
+
+
+#: `jarvis io list`/`show` reuse the feature icons — the statuses ARE the feature-order
+#: statuses (§2.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md); only their
+#: LABELS differ, and those come from `project_store.feature_status_label`.
+def cmd_io(args: argparse.Namespace) -> int:
+    from . import ops
+
+    if args.io_cmd == "create":
+        io = ops.create_improvement_order(args.project, args.title,
+                                          description=args.description,
+                                          refs=args.refs, origin=args.origin,
+                                          budget_usd=_budget_arg(args))
+        _print({"created": io["id"], "project": args.project, "status": io["status"],
+                **({"budget_usd": io["budget_usd"]} if io.get("budget_usd") else {}),
+                "note": "nothing is filed from an improvement order until you decide "
+                        "on its findings"}, args.json)
+
+    elif args.io_cmd == "list":
+        rows = ops.list_improvement_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no improvement orders")
+        else:
+            for io in rows:
+                icon = FO_ICON.get(io["status"], "•")
+                att = " ⚠" if io["needs_attention"] else ""
+                print(f"{icon} {io['id']} [{io['project']}] {io['title']} "
+                      f"({io['status_label']}, {_age(io['created_at'])}){att}")
+
+    elif args.io_cmd == "show":
+        detail = ops.show_improvement_order(args.io_id, args.project)
+        detail["budget"] = ops.feature_order_budget(args.io_id, detail["project"])
+        if args.json:
+            _print(detail, True)
+        else:
+            # COUNTS FIRST — §2.6. The per-finding blocks are section 4.4's renderer.
+            d = detail["by_decision"]
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['title']} ({detail['status_label']})")
+            print(f"\n{detail['findings']} findings: {d['accepted']} accepted, "
+                  f"{d['rejected']} rejected, {d['pending']} awaiting you")
+            print(f"\n{detail['observation']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["evidence_refs"]:
+                print("evidence:")
+                for ref in detail["evidence_refs"]:
+                    print(f"  {ref}")
+            if detail["budget"]["budget_usd"]:
+                b = detail["budget"]
+                print(f"\nbudget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
+            if detail["analyst"]:
+                a = detail["analyst"]
+                print(f"\nanalyst: {a['id']} ({a['status']})")
+            if detail["alarms"]:
+                print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+
+    elif args.io_cmd == "cancel":
+        _print(ops.cancel_improvement_order(args.io_id, args.project), args.json)
+
+    elif args.io_cmd == "budget":
+        # The family here is the order plus its analyst, so the feature-order arithmetic
+        # is already correct with no children — §2.6, which is why nothing is reimplemented.
+        if args.amount is None and not args.clear:
+            _print(ops.feature_order_budget(args.io_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_feature_budget(args.io_id, amount, args.project), args.json)
 
     return 0
 
@@ -3515,6 +3641,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_wo(args)
         if args.cmd == "fo":
             return cmd_fo(args)
+        if args.cmd == "io":
+            return cmd_io(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "config":

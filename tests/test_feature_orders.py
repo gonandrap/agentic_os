@@ -604,3 +604,206 @@ def test_the_cli_refuses_a_plan_file_that_is_not_json(planning, tmp_path, capsys
     assert cli.main(["fo", "plan", fo["id"], "--from-file", str(path)]) == 1
 
     assert "not valid JSON" in capsys.readouterr().err
+
+
+# -- a planner assumption holds its feature --------------------------------------------
+#
+# docs/superpowers/specs/2026-09-24-a-planner-assumption-holds-its-feature.md. The
+# assumption is attached to a work order and the unit it governs is the feature, so a
+# child of an unratified plan is neither dispatched nor merged. Derived, silent, and it
+# writes nothing: the held child stays `pending`, as a dependency-blocked one does.
+
+
+def a_released_feature(daemon, store, *keys: str) -> dict:
+    """A feature whose children exist, are independent, and have not been dispatched."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(*[child(k, extra="FORCE_APPROVE") for k in keys]))
+    return released(daemon, store, fo["id"])
+
+
+def a_bare_feature(store, *, status: str = "pending", assumptions: int = 1,
+                   planner_status: str = "completed") -> tuple[dict, dict, dict]:
+    """`(feature, planner, child)` built from rows — no planner session, no plan.
+
+    What the hold reads is a `plan_wo_id` and a pending assumption row; the plan
+    machinery decides nothing here.
+    """
+    fo = store.create_feature_order("CSV export", description=ASK)
+    planner = store.create_work_order("plan it", kind="planner", parent_id=fo["id"],
+                                      status=planner_status)
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"], status="executing")
+    kid = store.create_work_order("build it", parent_id=fo["id"], status=status)
+    for i in range(assumptions):
+        store.add_assumption(planner["id"], f"the exporter writes CSV, not JSON ({i})")
+    return fo, planner, kid
+
+
+def test_a_planner_assumption_holds_its_features_children(started, store):
+    fo = a_released_feature(started, store, "schema")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+
+    assert store.claim_next_pending() is None
+    kid = store.feature_children(fo["id"])[0]
+    hold = store.plan_hold(store.get_work_order(kid["id"]))
+    assert hold == {"fo_id": fo["id"], "planner_id": fo["plan_wo_id"], "n": 1}
+
+
+def test_a_held_child_does_not_starve_the_queue(started, store):
+    """The property §2.2 rests on: the filter is in the ROW SELECTION, so the held child
+    is passed over inside the statement that picks the next row."""
+    held = a_released_feature(started, store, "schema")
+    store.add_assumption(held["plan_wo_id"], "the export table gets a new column")
+    clear = a_released_feature(started, store, "api")
+    other = ops.create_work_order("proj_a", "unrelated", description="something else")
+
+    claimed = [store.claim_next_pending(), store.claim_next_pending()]
+
+    assert [c["id"] for c in claimed] == [store.feature_children(clear["id"])[0]["id"],
+                                          other["id"]]
+    assert store.claim_next_pending() is None
+    assert store.feature_children(held["id"])[0]["status"] == "pending"
+
+
+def test_the_planner_itself_is_never_held_by_its_own_assumptions(started, store):
+    """Holding it would deadlock the feature for ever: the planner is dispatched before
+    the plan exists, and it is the only thing that can produce one."""
+    _, planner, _ = a_bare_feature(store, planner_status="pending")
+
+    assert store.claim_next_pending()["id"] == planner["id"]
+    assert store.plan_hold(store.get_work_order(planner["id"])) is None
+
+
+def test_a_running_child_is_untouched_by_a_new_plan_hold(started, store):
+    """The hold is on STARTING and on LANDING. Work in flight is not wrong yet (§4.4)."""
+    _, planner, kid = a_bare_feature(store, status="running", assumptions=0)
+    store.update_work_order(kid["id"], session_id="sess-1")
+    store.add_assumption(planner["id"], "the export table gets a new column")
+
+    started.dispatch_pending(started.catalog.project("proj_a"), store)
+
+    row = store.get_work_order(kid["id"])
+    assert row["status"] == "running" and row["session_id"] == "sess-1"
+    assert store.queued_messages(kid["id"]) == []
+    assert store.plan_hold(row) is not None
+
+
+def test_plan_hold_and_the_claim_query_agree(started, store):
+    """The guard on §2.1's one duplication: the claim filter cannot call `plan_hold` (it
+    must stay inside the atomic UPDATE), so the two are pinned against each other."""
+    _, _, held_kid = a_bare_feature(store)
+    _, _, clear_kid = a_bare_feature(store, assumptions=0)
+    _, planner, _ = a_bare_feature(store, planner_status="pending")
+    loose = ops.create_work_order("proj_a", "unrelated", description="something else")
+    matrix = [("held child", held_kid), ("clear child", clear_kid),
+              ("the planner", planner), ("no feature", loose)]
+
+    for label, wo in matrix:
+        for _, other in matrix:
+            store.update_work_order(
+                other["id"], status="pending" if other is wo else "completed")
+        claimed = store.claim_next_pending()
+        row = store.get_work_order(wo["id"])
+        assert (store.plan_hold(row) is None) == (claimed is not None), label
+
+
+def test_a_planner_with_no_pending_assumptions_holds_nothing(started, store):
+    """NEGATIVE. A settled assumption is not a decision anyone owes."""
+    fo = a_released_feature(started, store, "schema")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+    ops.review_work_order(fo["plan_wo_id"])
+
+    kid = store.feature_children(fo["id"])[0]
+    assert store.plan_hold(store.get_work_order(kid["id"])) is None
+    assert store.claim_next_pending()["id"] == kid["id"]
+
+
+def test_a_work_order_with_no_feature_holds_nothing(started, store):
+    """NEGATIVE. Parentless — nearly every work order — and answered from the row."""
+    a_bare_feature(store)
+    loose = ops.create_work_order("proj_a", "an ordinary job")
+
+    assert store.plan_hold(store.get_work_order(loose["id"])) is None
+    assert store.claim_next_pending()["id"] == loose["id"]
+
+
+def test_ruling_the_last_assumption_dispatches_on_the_next_tick(started, store):
+    """§2.5: nothing pokes anything. `dispatch_pending` runs every tick, and that is the
+    whole self-healing story — one command from the user, no second."""
+    fo = a_released_feature(started, store, "schema")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+    started.tick()
+    assert store.feature_children(fo["id"])[0]["status"] == "pending"
+
+    ops.review_work_order(fo["plan_wo_id"])
+    started.tick()
+
+    assert store.feature_children(fo["id"])[0]["status"] != "pending"
+
+
+def test_a_held_child_raises_no_attention(started, store):
+    """Waiting is not an attention item — the rule a dependency edge and a slot already
+    follow. `true_blockers` gets no branch, so INV-ATTENTION-MISSING stays quiet."""
+    from jarvis import invariants
+
+    fo = a_released_feature(started, store, "schema")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+
+    kid = store.get_work_order(store.feature_children(fo["id"])[0]["id"])
+    assert invariants.true_blockers(store, kid) == []
+    assert [v for v in invariants.check_blocked_work_is_surfaced(store)
+            if kid["id"] in str(v)] == []
+    assert not kid["needs_attention"]
+
+
+def test_the_hold_reads_as_blocked_by_the_plan(started, store):
+    """Ranked above the dependency and slot labels: of the three true sentences it is the
+    one naming a move a person has to make."""
+    from jarvis import invariants
+
+    fo = a_released_feature(started, store, "schema")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+    store.add_assumption(fo["plan_wo_id"], "the command takes --format")
+
+    kid = store.get_work_order(store.feature_children(fo["id"])[0]["id"])
+    label = invariants.status_label(store, kid)
+
+    assert label.startswith("pending — blocked by ")
+    assert fo["id"] in label and "2 assumptions" in label
+    assert f"jarvis wo review {fo['plan_wo_id']}" in label
+
+
+# -- the note: children already merged (§2.6) ------------------------------------------
+
+
+def test_an_overtaken_assumption_says_children_already_merged(started, store):
+    """The fact the user needs in order to rule — never a ruling. The row stays pending:
+    the OS answering the user's own question is the bug, one level up (§4.3)."""
+    fo = a_released_feature(started, store, "schema", "api", "docs")
+    planner_id = fo["plan_wo_id"]
+    store.add_assumption(planner_id, "the export table gets a new column")
+    merged = store.feature_children(fo["id"])[0]
+    store.add_event(merged["id"], "pr_merged", {})
+
+    row = ops.assumptions_with_rulings(store, planner_id)[0]
+
+    assert row["overtaken"] == {"merged": 1, "of": 3}
+    assert ops.overtaken_line(row) == (
+        "1 of 3 children have already merged — rejecting this now means a follow-up "
+        "fix, not an unwind")
+    assert "already merged" in ops.assumption_line(row)
+    assert store.all_assumptions(planner_id)[0]["status"] == "pending"
+
+
+def test_no_overtaken_note_when_no_child_has_merged(started, store):
+    """NEGATIVE, both ways: nothing landed, and a work order that is not a planner."""
+    fo = a_released_feature(started, store, "schema", "api")
+    store.add_assumption(fo["plan_wo_id"], "the export table gets a new column")
+    plain = ops.create_work_order("proj_a", "an ordinary job")
+    store.add_assumption(plain["id"], "the exporter writes CSV")
+
+    row = ops.assumptions_with_rulings(store, fo["plan_wo_id"])[0]
+    assert row["overtaken"] is None
+    assert ops.overtaken_line(row) == ""
+
+    assert ops.assumptions_with_rulings(store, plain["id"])[0]["overtaken"] is None

@@ -56,6 +56,8 @@ from .project_store import (
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     ProjectStore,
+    feature_status_label,
+    is_feature_order_id,
     validation_standing,
 )
 
@@ -565,7 +567,12 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     progress = feature_progress(store, fo)
                     attention.append({
                         "project": p["name"], "wo_id": None, "fo_id": fo_id,
-                        "title": fo["title"], "status": f"feature:{fo['status']}",
+                        "title": fo["title"],
+                        # Kind-aware through the ONE mapping in project_store — §2.2 of
+                        # docs/superpowers/specs/2026-09-23-improvement-orders.md. A
+                        # feature order's label is unchanged by construction.
+                        "status": (f"{fo.get('kind') or 'feature'}:"
+                                   f"{feature_status_label(fo.get('kind'), fo['status'])}"),
                         "reason": f"{progress['label']} — " + "; ".join(reasons),
                         "rolled_up": [k["id"] for k in kids],
                         "decide": f"jarvis fo show {fo_id}",
@@ -1200,6 +1207,16 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
         return {"what": "validating", "stalled": False,
                 "detail": f"the validation panel is judging it — the verdict settles "
                           f"the work order by itself{round_note}"}
+    # ABOVE both catch-alls below, which answer "not dispatched yet — no worker exists to
+    # nudge" and "nothing is running to nudge": true, useless, and confidently wrong about
+    # the way through. A nudge cannot move this; the user's ruling on the PLANNER can, so
+    # `stalled` stays False (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.3).
+    hold = store.plan_hold(wo)
+    if hold:
+        return {"what": "plan_assumptions", "stalled": False,
+                "detail": f"its feature's plan is waiting on you — {hold['n']} "
+                          f"assumption(s) on {hold['planner_id']}; "
+                          f"`jarvis wo review {hold['planner_id']}`"}
     if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
@@ -2116,7 +2133,7 @@ def _filed_titles(store: ProjectStore, unit_id: str) -> dict[str, str]:
     Off the events, so it costs a query and no network. Which kind of unit the id names
     is read off the id, `validation_view`'s idiom.
     """
-    kind = {"fo_id": unit_id} if unit_id.startswith("fo-") else {"wo_id": unit_id}
+    kind = {"fo_id": unit_id} if is_feature_order_id(unit_id) else {"wo_id": unit_id}
     out: dict[str, str] = {}
     for payload in filed_follow_ups(store, **kind).values():  # type: ignore[arg-type]
         for item in payload.get("filed") or []:
@@ -2243,11 +2260,23 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     The exception is `automerge_merged`: nothing follows a merge, so it wins over
     anything later. Nothing writes a later row today; it is asserted rather than assumed
     because the cost of being wrong is a completed work order claiming to be held.
+
+    **AND A REFUSAL IS STICKY FOR THE COMMIT IT JUDGED** — spec 2026-09-24 fix 4a. One
+    tick of GitHub answering `mergeable: UNKNOWN` wrote a hold stamped after a denial, and
+    `Daemon._note_automerge_held` dedupes per (sha, code, reason) so no newer row ever
+    overtook it back: the line said the merge was held on mergeability, for ever, over a
+    reviewer's refusal. A verdict is a permanent fact about one commit and a hold a
+    transient one, so the transient must not bury it — but only about the SAME commit: a
+    hold on a different head means the head moved, which is a new submission the denial
+    does not describe. An APPROVAL gains no stickiness at all, which is the case the
+    paragraph above exists for.
     """
     from . import db
+    from .automerge import decided_sha
 
     newest: dict[str, Any] | None = None
     terminal: dict[str, Any] | None = None
+    decided: dict[str, Any] | None = None
     for kind in AUTOMERGE_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
         if not rows:
@@ -2258,8 +2287,16 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
                      "kind": kind, "ts": float(rows[-1]["ts"])}
         if kind == AUTOMERGE_TERMINAL:
             terminal = candidate
-        elif newest is None or candidate["ts"] > newest["ts"]:
-            newest = candidate
+        else:
+            if kind == "automerge_decided":
+                decided = candidate
+            if newest is None or candidate["ts"] > newest["ts"]:
+                newest = candidate
+    if (newest is not None and newest["kind"] == "automerge_held"
+            and decided is not None and decided.get("decision") != "approved"
+            and decided_sha(decided)
+            and decided_sha(decided) == str(newest.get("head_sha") or "")):
+        newest = decided
     newest = terminal or newest
     if newest is None:
         return None
@@ -2400,50 +2437,42 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
-    rows = store.all_assumptions(wo_id)
-    return [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
+    base = store.all_assumptions(wo_id)
+    rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
              # Both derivations read the carrier and the timeline, so they are asked only
              # of the rows that carry an objection at all — which is nearly none, and is
-             # why a project that never objected pays nothing for this.
+             # why a project that never objected pays nothing for this. The undeliverable
+             # verdict is NOT derived here: §9's `invariants.objection_undeliverable` is
+             # the derivation that landed, and attention and this view must never be able
+             # to disagree about whether a transport failed.
              "objection_undeliverable": (bool(a.get("objection_envelope_id"))
-                                         and objection_undeliverable(store, a)),
-             "objection_response": (objection_response(store, a, rows=rows)
+                                         and invariants.objection_undeliverable(store, a)),
+             "objection_response": (objection_response(store, a, rows=base)
                                     if a.get("objection_delivered_ts") else None)}
+            for a in base]
+    # Children of this plan that have already landed, for the rows that are still the
+    # user's. Only when something is pending and this order is a planner, so every other
+    # call costs nothing (spec 2026-09-24-a-planner-assumption-holds-its-feature §2.6).
+    over = (_overtaken(store, wo_id)
+            if any(str(a.get("status") or "") == "pending" for a in rows) else None)
+    return [{**a, "overtaken": over if str(a.get("status") or "") == "pending" else None}
             for a in rows]
 
 
-def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
-    """Did the objection's CARRIER give up — was the worker never going to be told?
+def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
+    """`{"merged": n, "of": m}` when children of the plan this planner produced have
+    already landed, else None.
 
-    §9's trigger, and §9 REUSES THIS HELPER rather than re-deriving it: attention and the
-    assumptions view must not be able to disagree about whether a transport failed, and a
-    second walk of the same three rows is how they would. `objection_line` renders the
-    flag this returns; nothing else computes it.
-
-    True when the objection's `wo_messages` row is `failed` (`record_delivery_failure`
-    spent its attempts), or its envelope is in a terminal state that is neither
-    `delivered` nor `withdrawn`.
-
-    FALSE FOR THREE STATES THAT LOOK SIMILAR AND ARE NOT: an envelope still `queued`
-    (the normal case for the whole length of a turn — reading it as a failure would light
-    "Needs you" on every objection the OS ever sent), an envelope `withdrawn` under §6.6
-    (nothing failed: the order stopped, which it is allowed to do), and a row with no
-    `objection_envelope_id` at all, which is every historical assumption.
+    From the TIMELINE, never from `work_orders.pr_state` — kn-dbc4971d, that column is
+    stale by construction. `pr_merged` is written by `complete_merged`, the single
+    close-out for a hand-merge and an auto-merge alike, so one read covers both routes.
     """
-    env_id = a.get("objection_envelope_id")
-    if not env_id:
-        return False
-    env = store.get_envelope(int(env_id))
-    if env is None:
-        return False
-    msg_id = env.get("delivered_msg_id")
-    if msg_id:
-        msg = store.get_message(int(msg_id))
-        if msg is not None and str(msg.get("status") or "") == "failed":
-            return True
-    # `queued` is not terminal; `delivered` and `withdrawn` are terminal and are not
-    # failures. Everything else in `ENVELOPE_STATES` is a carrier that stopped.
-    return str(env.get("state") or "") not in ("queued", "delivered", "withdrawn")
+    fo = store.feature_order_for_planner(wo_id)
+    if fo is None or fo.get("plan_wo_id") != wo_id:
+        return None
+    children = store.feature_children(fo["id"])
+    merged = sum(1 for c in children if store.events_of_kind(c["id"], "pr_merged"))
+    return {"merged": merged, "of": len(children)} if merged else None
 
 
 #: The acts that count as THE WORKER ANSWERING an objection, and the verb each is rendered
@@ -2565,6 +2594,20 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
     return ""
 
 
+def overtaken_line(a: dict[str, Any]) -> str:
+    """CHILDREN OF THIS PLAN THAT ALREADY MERGED, in one line, or `''`. Pure, both
+    surfaces.
+
+    The fact the user needs in order to rule, never a ruling: the assumption stays
+    pending, and what changes is what a rejection now costs them (spec §2.6).
+    """
+    over = a.get("overtaken") or {}
+    if not over:
+        return ""
+    return (f"{over['merged']} of {over['of']} children have already merged — rejecting "
+            f"this now means a follow-up fix, not an unwind")
+
+
 def _stamp(ts: Any) -> str:
     """A timestamp a person can read. Local time, minutes: seconds tell nobody anything."""
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
@@ -2634,7 +2677,8 @@ def assumption_line(a: dict[str, Any]) -> str:
     content = str(a.get("content") or "")
     if status == "pending":
         parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
-                             objection_line(a), objection_response_line(a)) if p]
+                             objection_line(a), objection_response_line(a),
+                             overtaken_line(a)) if p]
         return (f"#{n} pending your review: {content}"
                 f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()
@@ -2737,7 +2781,7 @@ def validation_view(unit_id: str, project_name: str | None = None) -> dict[str, 
     anything else a work order — so the caller never has to say, and one command can
     serve both.
     """
-    if unit_id.startswith("fo-"):
+    if is_feature_order_id(unit_id):
         name, path, row = find_feature_order(unit_id, project_name)
         subject: dict[str, str | None] = {"fo_id": unit_id}
         unit = "feature"
@@ -4202,6 +4246,13 @@ def record_pr_closed(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
             "pr_url": wo.get("pr_url")}
 
 
+#: Baked into every repair nudge, not a format field, so a new nudge cannot omit it.
+#: The dispatch brief states the same rule (kn-356c724b).
+TARGETED_TESTS_LINE = ("run only the tests covering the files you touched (NOT the "
+                       "full suite — that is CI's job, and it runs it on more "
+                       "interpreters than you can)")
+
+
 #: The nudge the user used to type by hand, written once so it can be complete: what is
 #: wrong, what to do, what NOT to do, and how many attempts are left. Spec §3.
 PR_CONFLICT_NUDGE = """\
@@ -4210,7 +4261,7 @@ stands. GitHub reports it as CONFLICTING; nobody typed this message, Jarvis noti
 while polling for the merge.
 
 Resolve them: in your worktree, `git fetch origin`, merge `origin/{base}` into your \
-branch, fix every conflict, run this project's tests, and push. Do NOT rebase or \
+branch, fix every conflict, """ + TARGETED_TESTS_LINE + """, and push. Do NOT rebase or \
 force-push — a forced branch update is refused by the permission classifier. If the \
 conflict is not resolvable from this branch (for instance the branch it was opened \
 against has itself been merged), say so plainly in your final message rather than \
@@ -4233,8 +4284,9 @@ Your pull request {url} has failing checks and must not be merged as it stands. 
 reports these as failed: {failing}. Nobody typed this message — Jarvis noticed while \
 polling the pull request.
 
-Fix them: in your worktree, reproduce each failure locally, fix the cause, run this \
-project's tests, and push. If a check fails for a reason that is not yours to fix (an \
+Fix them: in your worktree, reproduce each failure locally, fix the cause, \
+""" + TARGETED_TESTS_LINE + """, and push. If a check fails for a reason that is not \
+yours to fix (an \
 infrastructure outage, a flake, a required check this branch cannot satisfy), say so \
 plainly in your final message rather than fighting it: that is a call for the user. Do \
 NOT rebase or force-push — a forced branch update is refused by the permission \
@@ -5348,7 +5400,8 @@ def feature_progress(store: ProjectStore, fo: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_feature_orders(project_name: str | None = None,
-                        include_settled: bool = False) -> list[dict[str, Any]]:
+                        include_settled: bool = False,
+                        kind: str = "feature") -> list[dict[str, Any]]:
     paths = registered_project_paths()
     if project_name:
         if project_name not in paths:
@@ -5361,12 +5414,141 @@ def list_feature_orders(project_name: str | None = None,
         store = ProjectStore(path)
         try:
             statuses = None if include_settled else FO_OPEN_STATUSES
-            for fo in store.list_feature_orders(statuses=statuses):
+            for fo in store.list_feature_orders(statuses=statuses, kind=kind):
                 out.append({"project": name, **fo,
+                            "status_label": feature_status_label(kind, fo["status"]),
                             "progress": feature_progress(store, fo)})
         finally:
             store.close()
     return out
+
+
+# -- improvement orders ---------------------------------------------------------------
+#
+# Section 2 of docs/superpowers/specs/2026-09-23-improvement-orders.md. An improvement
+# order is a `feature_orders` row with `kind='improvement'`, so everything here that can
+# be the feature-order function IS the feature-order function, kind-guarded.
+
+#: `feature_orders.metadata` key: the `--ref` strings exactly as the user typed them.
+#: Unresolved and unvalidated on purpose — a reference that does not resolve is a FINDING
+#: about the OS's records, not a CLI error (§2.6).
+EVIDENCE_REFS_KEY = "evidence_refs"
+
+
+def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
+    """Refuse a row of the wrong kind, naming the command that WOULD work.
+
+    §2.4 of the improvement-orders spec: the two surfaces share a table, so every verb
+    that means something different for the other kind has to say so rather than act.
+    """
+    actual = fo.get("kind") or "feature"
+    if actual == kind:
+        return
+    other = "an improvement order" if actual == "improvement" else "a feature order"
+    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] == 'i' else 'a'} "
+                   f"{kind} order — use `{verb} {fo['id']}` instead")
+
+
+def create_improvement_order(project_name: str, title: str, description: str = "",
+                             refs: Sequence[str] = (),
+                             budget_usd: float | None = None,
+                             origin: str = "jarvis") -> dict[str, Any]:
+    """File an observation for an analyst to investigate. Nothing runs here.
+
+    Same shape as `create_feature_order`, down to the budget default, because the whole
+    point of the `jarvis io` surface is that a user who knows `jarvis fo` already knows
+    it (§2.6). One refusal it adds: no evidence.
+    """
+    paths = registered_project_paths()
+    if project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    refs = [r for r in (s.strip() for s in refs) if r]
+    if not (description or "").strip():
+        raise OpsError(
+            f"an improvement order needs an observation: the analyst's first reader is "
+            f"a fresh session with no memory of the conversation that produced it. Use "
+            f"`jarvis io create {project_name} \"{title[:40]}\" -d \"...\"`."
+        )
+    if not refs:
+        raise OpsError(
+            f"an improvement order with no evidence is a request for an opinion. Name "
+            f"what you saw — a wo-/fo-/io-/al- id, #<issue>, a URL, or free text: "
+            f"`jarvis io create {project_name} \"{title[:40]}\" -d \"...\" --ref <id>`."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(
+            title=title, description=description, origin=origin,
+            kind="improvement",
+            metadata={EVIDENCE_REFS_KEY: refs},
+            # The family here is the order plus its analyst, and the family arithmetic is
+            # already correct with no children — §2.6, which is why this is the FEATURE
+            # default and not the per-work-order one.
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.feature_default_for(_spec_or_none(project_name))))
+    finally:
+        store.close()
+
+
+def list_improvement_orders(project_name: str | None = None,
+                            include_settled: bool = False) -> list[dict[str, Any]]:
+    """`jarvis io list`. The feature-order listing with the other kind asked for —
+    behaviour is identical, so a copy would only be a second thing to keep in step."""
+    return list_feature_orders(project_name, include_settled=include_settled,
+                               kind="improvement")
+
+
+def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io show` — COUNTS FIRST, then the observation and the evidence.
+
+    Not `show_feature_order` with a flag: that renders a plan, a child tree and a
+    progress label, and an improvement order has none of those. The per-finding blocks
+    are section 4.4's renderer and deliberately absent here.
+    """
+    name, path, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo show")
+    # `plan` is NULL until the analyst reports, which is the NORMAL state in this
+    # section — so every read of it is defensive rather than trusting.
+    report = db.from_json(fo.get("plan"), None) or {}
+    findings = report.get("findings") or [] if isinstance(report, dict) else []
+    by_decision = {"accepted": 0, "rejected": 0, "pending": 0}
+    for f in findings:
+        status = (f or {}).get("status") or "pending" if isinstance(f, dict) else "pending"
+        by_decision[status if status in by_decision else "pending"] += 1
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    store = ProjectStore(path)
+    try:
+        analyst = None
+        if fo.get("plan_wo_id"):
+            try:
+                a = store.get_work_order(fo["plan_wo_id"])
+                analyst = {k: a[k] for k in ("id", "title", "status", "result_summary")}
+            except KeyError:
+                analyst = None  # deleted out from under it; the link was released
+        alarms = store.alarms_for_feature(io_id)
+    finally:
+        store.close()
+    return {
+        "project": name, **fo,
+        "findings": len(findings),
+        "by_decision": by_decision,
+        "observation": fo["description"],
+        "evidence_refs": list(metadata.get(EVIDENCE_REFS_KEY) or []),
+        "analyst": analyst,
+        "status_label": feature_status_label("improvement", fo["status"]),
+        "alarms": alarms,
+    }
+
+
+def cancel_improvement_order(io_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis io cancel`. The feature-order path unchanged: it stops every non-terminal
+    work order the row owns — here just the analyst — and settles it. Orders already
+    filed from accepted findings are independent by construction and are not touched."""
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo cancel")
+    return cancel_feature_order(io_id, project_name)
 
 
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:
@@ -5442,6 +5624,7 @@ def submit_plan(fo_id: str, doc: Any,
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    _require_kind(fo, "feature", "jarvis io report")
     if fo["status"] not in ("planning", "plan_review"):
         raise OpsError(
             f"{fo_id} is {fo['status']}, so it is not waiting for a plan "
@@ -5558,6 +5741,7 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
     from .neo_store import NeoStore
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    _require_kind(fo, "feature", "jarvis io review")
     if fo["status"] != "plan_review":
         raise OpsError(f"{fo_id} is {fo['status']}, not awaiting a plan review")
     if not accept and not feedback.strip():
@@ -5755,6 +5939,8 @@ def resume_feature_order(fo_id: str, fix: str = "",
     from .invariants import dead_feature_children
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    # An improvement order has no children to revive — §2.4 of the improvement-orders spec.
+    _require_kind(fo, "feature", "jarvis io show")
     if fo["status"] != "failed":
         raise OpsError(
             f"{fo_id} is {fo['status']}, not failed — `fo resume` revives a feature a "

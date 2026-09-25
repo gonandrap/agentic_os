@@ -26,7 +26,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import cli, ops  # noqa: E402
+from jarvis import cli, invariants, ops  # noqa: E402
 from jarvis.project_store import (ADDED_COLUMNS, ASSUMPTION_DECIDER_OS,  # noqa: E402
                                   ProjectStore)
 from jarvis.ui.app import create_app  # noqa: E402
@@ -174,7 +174,7 @@ def test_undeliverable_is_a_carrier_state_and_only_those(project, kwargs, expect
     store = ProjectStore(project)
     _, row = objecting_order(store, **kwargs)
 
-    assert ops.objection_undeliverable(store, row) is expected
+    assert invariants.objection_undeliverable(store, row) is expected
     assert row["objection_undeliverable"] is expected
 
 
@@ -184,7 +184,7 @@ def test_a_row_with_no_objection_is_never_undeliverable(project):
     wo = store.create_work_order(title="an order with no objection", description="d")
     aid = store.add_assumption(wo["id"], "nothing was ever objected to")
 
-    assert ops.objection_undeliverable(store, row_of(store, wo["id"], aid)) is False
+    assert invariants.objection_undeliverable(store, row_of(store, wo["id"], aid)) is False
 
 
 # -- what the worker did, and the waiting line ------------------------------------------
