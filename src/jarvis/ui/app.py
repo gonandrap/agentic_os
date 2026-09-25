@@ -689,6 +689,14 @@ def create_app() -> FastAPI:
         # `jarvis wo show` must not be able to disagree about whether an assumption was
         # escalated, held or never looked at (GitHub issue #712).
         assumption_ruling_line=ops.assumption_ruling_line,
+        # The early pass's three facts, same reason again (§8 of the early-review spec):
+        # Neo's provisional reading, the objection sent to the worker and what the worker
+        # did about it. The page renders what `jarvis wo show` prints, from these
+        # functions — a phrase spelled in the template would be a second renderer, and
+        # the one that drops "provisionally" is the one somebody reads.
+        provisional_line=ops.provisional_line,
+        objection_line=ops.objection_line,
+        objection_response_line=ops.objection_response_line,
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,

@@ -2377,6 +2377,12 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
 
     NEWEST EVENT PER ASSUMPTION, never per work order: `autoreview_state`'s one line is
     the mechanism's last act and says nothing about the assumption beside it.
+
+    IT IS ALSO THE ONE ROW-ENRICHMENT POINT, and that is why the two facts §8 needs but
+    the row cannot hold — `objection_undeliverable` and `objection_response` — are
+    attached here: `jarvis wo show` (cli.py) and the work-order page (ui/app.py) both take
+    their rows from this function, so a fact derived here reaches both surfaces and a
+    fact derived on one of them reaches one.
     """
     from . import db
 
@@ -2394,8 +2400,133 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
-    return [{**a, "os_ruling": newest.get(int(a.get("id") or 0))}
-            for a in store.all_assumptions(wo_id)]
+    rows = store.all_assumptions(wo_id)
+    return [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
+             # Both derivations read the carrier and the timeline, so they are asked only
+             # of the rows that carry an objection at all — which is nearly none, and is
+             # why a project that never objected pays nothing for this.
+             "objection_undeliverable": (bool(a.get("objection_envelope_id"))
+                                         and objection_undeliverable(store, a)),
+             "objection_response": (objection_response(store, a, rows=rows)
+                                    if a.get("objection_delivered_ts") else None)}
+            for a in rows]
+
+
+def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
+    """Did the objection's CARRIER give up — was the worker never going to be told?
+
+    §9's trigger, and §9 REUSES THIS HELPER rather than re-deriving it: attention and the
+    assumptions view must not be able to disagree about whether a transport failed, and a
+    second walk of the same three rows is how they would. `objection_line` renders the
+    flag this returns; nothing else computes it.
+
+    True when the objection's `wo_messages` row is `failed` (`record_delivery_failure`
+    spent its attempts), or its envelope is in a terminal state that is neither
+    `delivered` nor `withdrawn`.
+
+    FALSE FOR THREE STATES THAT LOOK SIMILAR AND ARE NOT: an envelope still `queued`
+    (the normal case for the whole length of a turn — reading it as a failure would light
+    "Needs you" on every objection the OS ever sent), an envelope `withdrawn` under §6.6
+    (nothing failed: the order stopped, which it is allowed to do), and a row with no
+    `objection_envelope_id` at all, which is every historical assumption.
+    """
+    env_id = a.get("objection_envelope_id")
+    if not env_id:
+        return False
+    env = store.get_envelope(int(env_id))
+    if env is None:
+        return False
+    msg_id = env.get("delivered_msg_id")
+    if msg_id:
+        msg = store.get_message(int(msg_id))
+        if msg is not None and str(msg.get("status") or "") == "failed":
+            return True
+    # `queued` is not terminal; `delivered` and `withdrawn` are terminal and are not
+    # failures. Everything else in `ENVELOPE_STATES` is a carrier that stopped.
+    return str(env.get("state") or "") not in ("queued", "delivered", "withdrawn")
+
+
+#: The acts that count as THE WORKER ANSWERING an objection, and the verb each is rendered
+#: with. A daemon-written event is not among them and must never be: an OS event after the
+#: delivery proves nothing about the worker, and reading one as an answer would silently
+#: retire the "waiting on the worker" line §8 owns.
+_WORKER_ACT_VERB = {"assumption": "the worker recorded another assumption",
+                    "message": "the worker replied",
+                    "question_asked": "the worker asked Neo",
+                    "finished": "the worker finished",
+                    "abandoned": "the worker abandoned the order"}
+
+
+def objection_response(store: ProjectStore, a: dict[str, Any], *,
+                       rows: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """THE FIRST THING THE WORKER DID after the objection reached it, or None.
+
+    §6.5: nothing is stored for this, it is read forward from `objection_delivered_ts`
+    over the record that already exists. None means the objection was never delivered, or
+    it was and the worker has not acted yet — which `objection_response_line` renders as
+    the "waiting on the worker since …" line.
+
+    FOUR ACTS AND ONLY FOUR (`_WORKER_ACT_VERB`): a later assumption, a message the
+    worker sent (`agent_to_user`), a question it asked Neo, or its finishing/abandoning
+    the order. `rows` lets the caller pass the assumptions it has already read.
+    """
+    from . import db
+
+    delivered = a.get("objection_delivered_ts")
+    if not delivered:
+        return None
+    delivered, wo_id = float(delivered), str(a.get("wo_id") or "")
+    acts: list[dict[str, Any]] = []
+    for other in (rows if rows is not None else store.all_assumptions(wo_id)):
+        if int(other.get("id") or 0) != int(a.get("id") or 0) \
+                and float(other.get("ts") or 0.0) > delivered:
+            acts.append({"kind": "assumption", "ts": float(other["ts"]),
+                         "detail": str(other.get("content") or "")})
+    for msg in store.agent_replies(wo_id):
+        if float(msg.get("ts") or 0.0) > delivered:
+            acts.append({"kind": "message", "ts": float(msg["ts"]),
+                         "detail": str(msg.get("content") or "")})
+    for kind in ("question_asked", "finished", "abandoned"):
+        for event in store.events_of_kind(wo_id, kind):
+            if float(event["ts"]) <= delivered:
+                continue
+            payload = db.from_json(event["payload"], {})
+            detail = str(payload.get("question") or payload.get("summary")
+                         or payload.get("reason") or "")
+            question = payload.get("neo_question_id")
+            acts.append({"kind": kind, "ts": float(event["ts"]), "detail": detail,
+                         **({"neo_question_id": question} if question else {})})
+    if not acts:
+        return None
+    # THE FIRST act, not the last: the question is what the worker did about the
+    # objection, and everything after that is the rest of its run.
+    return min(acts, key=lambda act: act["ts"])
+
+
+def objection_response_line(a: dict[str, Any]) -> str:
+    """WHAT THE WORKER DID about the objection, or that it still owes an answer. Or `''`.
+
+    Pure and public for `provisional_line`'s reason: §8 puts this fact on `jarvis wo show`
+    and on the work-order page, and §8 owns the "waiting on the worker since …" sentence
+    outright — `invariants.true_blockers` returns only what the USER owes, and this is the
+    one state in the feature owed by somebody else (§9).
+
+    `''` is every row whose objection was never delivered: in flight, withdrawn, and
+    every historical row. A worker cannot owe an answer to a message it never received.
+    """
+    delivered = a.get("objection_delivered_ts")
+    if not delivered:
+        return ""
+    act = a.get("objection_response") or None
+    if not act:
+        return f"waiting on the worker since {_stamp(delivered)}"
+    verb = _WORKER_ACT_VERB.get(str(act.get("kind") or ""), "the worker acted")
+    question = act.get("neo_question_id")
+    detail = " ".join(str(act.get("detail") or "").split())
+    if len(detail) > 120:
+        detail = detail[:117] + "…"
+    return (f"{verb}{f' (question {question})' if question else ''} "
+            f"at {_stamp(act['ts'])}{' — ' + detail if detail else ''}")
 
 
 def assumption_ruling_line(a: dict[str, Any]) -> str:
@@ -2503,14 +2634,15 @@ def assumption_line(a: dict[str, Any]) -> str:
     content = str(a.get("content") or "")
     if status == "pending":
         parts = [p for p in (assumption_ruling_line(a), provisional_line(a),
-                             objection_line(a)) if p]
+                             objection_line(a), objection_response_line(a)) if p]
         return (f"#{n} pending your review: {content}"
                 f"{' — ' + '; '.join(parts) if parts else ''}")
     reason = str(a.get("decided_reason") or "").strip()
     # The early reading stays on a SETTLED row too: what the OS thought while the work
     # ran and what it thought once it saw the result are two readings, and §7 hands the
     # user both when they disagree.
-    tail = "; ".join(p for p in (provisional_line(a), objection_line(a)) if p)
+    tail = "; ".join(p for p in (provisional_line(a), objection_line(a),
+                                 objection_response_line(a)) if p)
     return (f"#{n} {status} by {assumption_decider(a)}"
             f"{' — ' + reason if reason else ''}: {content}"
             f"{' — ' + tail if tail else ''}")
