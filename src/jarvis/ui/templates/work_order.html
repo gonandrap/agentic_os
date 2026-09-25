@@ -254,6 +254,18 @@
             and a.os_ruling.neo_question_id %}
         · <a href="/neo/question/{{ a.os_ruling.neo_question_id }}">question →</a>
         {%- endif %}</div>{% endif %}
+      {# NEO'S EARLY READING, THE OBJECTION AND WHAT THE WORKER DID, in the order §8 of
+         docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
+         runs.md asks for. Every phrase comes from `ops`, the same functions
+         `jarvis wo show` prints: a sentence written here would be a second renderer of
+         facts the two surfaces must not be able to disagree about. Each is `''` on a row
+         the early pass never touched, which is every historical one. #}
+      {% set provisional = provisional_line(a) %}
+      {% if provisional %}<div class="sub">{{ provisional }}</div>{% endif %}
+      {% set objection = objection_line(a) %}
+      {% if objection %}<div class="sub">{{ objection }}</div>{% endif %}
+      {% set response = objection_response_line(a) %}
+      {% if response %}<div class="sub">{{ response }}</div>{% endif %}
       {# Children of this plan that merged while the question waited. What a rejection
          now costs, so the user can rule knowing it. #}
       {% set overtaken = overtaken_line(a) %}
