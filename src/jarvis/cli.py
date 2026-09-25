@@ -765,6 +765,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "exactly what trips the privileged-action classifier")
     i.add_argument("--project")
 
+    i = io.add_parser("review", help="decide the findings, one by one — accepting one "
+                                     "writes its root cause to the knowledge base and "
+                                     "files the orders it proposed")
+    i.add_argument("io_id")
+    i.add_argument("--accept", dest="accept", action="append", default=[],
+                   metavar="KEY",
+                   help="a finding key to accept, repeatable: its root cause becomes a "
+                        "knowledge entry and each order it proposed is filed")
+    i.add_argument("--reject", dest="reject", action="append", default=[],
+                   metavar="KEY",
+                   help="a finding key to reject, repeatable. Needs --feedback: the "
+                        "reason is what teaches Neo, and it is the whole signal")
+    i.add_argument("--feedback", default="",
+                   help="your reasoning. On --reject it becomes a Neo learning scoped "
+                        "to the project")
+    i.add_argument("--accept-all", dest="accept_all", action="store_true",
+                   help="accept every finding still awaiting you. Cannot be combined "
+                        "with --reject")
+    i.add_argument("--project")
+
     i = io.add_parser("cancel", help="stop an improvement order and its analyst")
     i.add_argument("io_id")
     i.add_argument("--project")
@@ -2558,7 +2578,7 @@ def cmd_fo(args: argparse.Namespace) -> int:
 #: statuses (§2.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md); only their
 #: LABELS differ, and those come from `project_store.feature_status_label`.
 def cmd_io(args: argparse.Namespace) -> int:
-    from . import ops
+    from . import findings, ops
 
     if args.io_cmd == "create":
         io = ops.create_improvement_order(args.project, args.title,
@@ -2610,6 +2630,21 @@ def cmd_io(args: argparse.Namespace) -> int:
                 print(f"\nanalyst: {a['id']} ({a['status']})")
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+            if detail["report"].get("findings"):
+                # §4.4's renderer, with each accepted finding's filed orders and their
+                # LIVE status resolved once by `show_improvement_order` — so this and the
+                # dashboard cannot disagree about what a diagnosis produced (§5.3.1).
+                print()
+                for line in findings.render_report(detail["report"],
+                                                   detail["filed_orders"]):
+                    print(line)
+
+    elif args.io_cmd == "review":
+        _print(ops.review_findings(args.io_id, accept=args.accept,
+                                   reject={k: args.feedback for k in args.reject},
+                                   feedback=args.feedback,
+                                   accept_all=args.accept_all,
+                                   project_name=args.project), args.json)
 
     elif args.io_cmd == "report":
         path = Path(args.from_file)

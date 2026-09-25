@@ -246,11 +246,58 @@ def _parse_orders(key: str, raw: Any, problems: list[str]) -> list[dict[str, str
     return out
 
 
-def render_finding(finding: dict[str, Any]) -> list[str]:
+def knowledge_text(finding: dict[str, Any]) -> str:
+    """The knowledge-base entry an accepted finding becomes (§5.4).
+
+    THE FIRST LINE IS THE ROOT CAUSE STATED AS A RULE, alone on its line and with its
+    whitespace collapsed. Per kn-8656d497 and kn-0281d10b an entry body never reaches a
+    worker's prompt — an index of first lines does, truncated to 160 characters — so the
+    first line is the only part most workers ever see unprompted, and a first line that
+    said "This finding is about…" would spend the whole budget saying nothing.
+    """
+    root = " ".join(str(finding.get("root_cause") or "").split())
+    lines = [root, ""]
+    lines += [f"Symptom: {finding.get('symptom', '')}", ""]
+    lines += [f"The cheap fix, and why it is insufficient: "
+              f"{finding.get('why_insufficient', '')}", ""]
+    lines += [f"Recommendation: {finding.get('recommendation', '')}"]
+    evidence = finding.get("evidence") or []
+    if evidence:
+        lines += ["", "Evidence:"]
+        # Attributed on the quote's OWN line: a source a line away is one the reader has
+        # to reassemble. Same rule as `render_finding`.
+        lines += [f"  - {item.get('quote', '')!r} ({item.get('source', '')})"
+                  for item in evidence]
+    orders = finding.get("proposed_orders") or []
+    if orders:
+        lines += ["", "Proposed orders:"]
+        lines += [f"  - ({o.get('type', '')}) {o.get('title', '')}" for o in orders]
+    return "\n".join(lines)
+
+
+def rejection_learning(io: dict[str, Any], finding: dict[str, Any], feedback: str,
+                       decided_by: str = "user") -> str:
+    """What Neo is taught when the user refuses a finding (§5.5).
+
+    Shaped like `neo.learning_from_assumption_review`, because it is the same teaching
+    signal from the same user at the same kind of moment: what was claimed, and what the
+    user said about it.
+    """
+    root = " ".join(str(finding.get("root_cause") or "").split())
+    return (f"On improvement order \"{str(io.get('title', ''))[:120]}\" an analyst found: "
+            f"\"{root[:300]}\". The user rejected that ({decided_by}): {feedback}")
+
+
+def render_finding(finding: dict[str, Any],
+                   filed: list[dict[str, Any]] | None = None) -> list[str]:
     """One finding as lines a human reads: the argument, the record behind it, the work.
 
     Every quote is attributed to its source on the same line, because a quote whose
     source is a line away is one the reader has to reassemble.
+
+    `filed` is the orders this finding actually produced, with their CURRENT status,
+    resolved by `ops.show_improvement_order` — §5.3.1: a back-link nothing renders is a
+    column, not a link. Optional, so every caller from before review existed is unchanged.
     """
     lines = [
         f"  symptom: {finding.get('symptom', '')}",
@@ -275,10 +322,19 @@ def render_finding(finding: dict[str, Any]) -> list[str]:
             lines.append(f"    - ({order.get('type', '')}){project} "
                          f"{order.get('title', '')}")
             lines.append(f"      {order.get('description', '')}")
+    if filed:
+        lines.append("  filed orders:")
+        for order in filed:
+            project = f" [{order['project']}]" if order.get("project") else ""
+            lines.append(f"    - {order.get('id', '')} ({order.get('type', '')})"
+                         f"{project} {order.get('title', '')} — "
+                         f"{order.get('status', '')}")
     return lines
 
 
-def render_report(report: dict[str, Any]) -> list[str]:
+def render_report(report: dict[str, Any],
+                  filed_orders: dict[str, list[dict[str, Any]]] | None = None
+                  ) -> list[str]:
     """The report as lines a human reads — `jarvis io show`'s view, and the dashboard's.
 
     One renderer, so the two surfaces cannot drift: two places rendering a report
@@ -295,7 +351,8 @@ def render_report(report: dict[str, Any]) -> list[str]:
     for finding in report.get("findings") or []:
         status = finding.get("status") or "pending"
         lines.append(f"- [{finding.get('key', '')}] {status}")
-        lines += render_finding(finding)
+        lines += render_finding(finding,
+                                (filed_orders or {}).get(finding.get("key", "")))
     return lines
 
 
