@@ -133,15 +133,10 @@ def _alarm(wo_id: str) -> dict:
 
 def _supervisor_calls(fake_claude) -> list[dict]:
     """Every `claude` invocation that was a supervisor review, identified the way the
-    fake identifies one: by the persona in `--append-system-prompt`."""
-    out = []
-    for call in fake_claude.calls:
-        argv = call.get("argv") or []
-        if "--append-system-prompt" in argv:
-            system = argv[argv.index("--append-system-prompt") + 1]
-            if supervisor.SUPERVISOR_PERSONA.splitlines()[0] in system:
-                out.append(call)
-    return out
+    fake identifies one: by the persona in its system prompt."""
+    return [call for call in fake_claude.calls
+            if supervisor.SUPERVISOR_PERSONA.splitlines()[0]
+            in (call.get("system_prompt_seen") or "")]
 
 
 def _agent_calls(kind: str) -> list[dict]:

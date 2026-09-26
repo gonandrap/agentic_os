@@ -264,7 +264,7 @@ def test_attempts_one_makes_exactly_one_call_even_on_garbage(fake_claude, tmp_pa
     assert len(calls) == 1, "attempts=1 must never ask twice"
     argv = calls[0]["argv"]
     assert argv[argv.index("-p") + 1] == "FORCE_GARBAGE please decide"
-    assert "--append-system-prompt" in argv and "--model" in argv
+    assert "--system-prompt" in argv and "--model" in argv
 
 
 def test_attempts_two_makes_exactly_two_calls_on_garbage(fake_claude, tmp_path):
@@ -282,7 +282,7 @@ def test_the_retry_appends_the_complaint_to_the_user_prompt_only(fake_claude, tm
         "FORCE_GARBAGE decide this", validate=_needs_ok,
         system_prompt=system, cwd=tmp_path, attempts=2, on_invalid=lambda raw: None)
 
-    first, second = (c["argv"] for c in _headless_calls(fake_claude))
+    first, second = _headless_calls(fake_claude)
 
     def opt(argv, name):
         return argv[argv.index(name) + 1]
@@ -290,14 +290,14 @@ def test_the_retry_appends_the_complaint_to_the_user_prompt_only(fake_claude, tm
     # The system prompt is BYTE-identical across attempts. A retry that rewrote it would
     # cost a full Anthropic prompt-cache miss, which is the whole reason Neo's prompt is
     # built the way it is.
-    assert opt(first, "--append-system-prompt") == system
-    assert opt(second, "--append-system-prompt") == system
+    assert first["system_prompt_seen"] == system
+    assert second["system_prompt_seen"] == system
 
     # The complaint rides in the user prompt, after the original question.
-    assert opt(first, "-p") == "FORCE_GARBAGE decide this"
-    assert opt(second, "-p").startswith("FORCE_GARBAGE decide this\n\n")
-    assert structured.RETRY_NOTE in opt(second, "-p")
-    assert "no JSON object in the reply" in opt(second, "-p")
+    assert opt(first["argv"], "-p") == "FORCE_GARBAGE decide this"
+    assert opt(second["argv"], "-p").startswith("FORCE_GARBAGE decide this\n\n")
+    assert structured.RETRY_NOTE in opt(second["argv"], "-p")
+    assert "no JSON object in the reply" in opt(second["argv"], "-p")
 
 
 def test_a_retry_that_succeeds_stops_there():

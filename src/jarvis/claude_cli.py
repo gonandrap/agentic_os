@@ -79,19 +79,56 @@ class ClaudeCliError(RuntimeError):
 
 
 @contextlib.contextmanager
-def _system_prompt_arg(system_prompt: str | None) -> Iterator[list[str]]:
-    """The flags that carry a system prompt, and the temporary file when it needs one."""
+def _prompt_file(text: str) -> Iterator[str]:
+    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="jarvis-system-",
+                                     encoding="utf-8", delete=True) as fh:
+        fh.write(text)
+        fh.flush()
+        yield fh.name
+
+
+@contextlib.contextmanager
+def _system_prompt_arg(system_prompt: str | None, *,
+                       keep_default_context: bool = False) -> Iterator[list[str]]:
+    """The flags that carry a system prompt, and the temporary file when it needs one.
+
+    REPLACES the CLI's default prompt unless `keep_default_context`. Spec:
+    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+    """
     if not system_prompt:
         yield []
         return
-    if len(system_prompt.encode()) <= SYSTEM_PROMPT_ARGV_LIMIT:
-        yield ["--append-system-prompt", system_prompt]
+    raw = system_prompt.encode()
+    if keep_default_context:
+        if len(raw) <= SYSTEM_PROMPT_ARGV_LIMIT:
+            yield ["--append-system-prompt", system_prompt]
+            return
+        with _prompt_file(system_prompt) as name:
+            yield ["--append-system-prompt-file", name]
         return
-    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="jarvis-system-",
+    if len(raw) <= SYSTEM_PROMPT_ARGV_LIMIT:
+        yield ["--system-prompt", system_prompt]
+        return
+    # No `--system-prompt-file` exists on CLI 2.1.282, so past the argv ceiling the
+    # CALLER'S OWN bytes split across both doors — a stub that talks about the prompt
+    # measured as an injection attempt and the model refused it.
+    cut = SYSTEM_PROMPT_ARGV_LIMIT
+    while cut > 0 and raw[cut] & 0xC0 == 0x80:  # never cut a UTF-8 sequence in half
+        cut -= 1
+    with _prompt_file(raw[cut:].decode()) as name:
+        yield ["--system-prompt", raw[:cut].decode(),
+               "--append-system-prompt-file", name]
+
+
+@contextlib.contextmanager
+def _empty_mcp_config() -> Iterator[list[str]]:
+    """`--mcp-config` naming a server-free file: `--strict-mcp-config` alone still
+    leaves the user's configured servers' schemas in the request."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="jarvis-mcp-",
                                      encoding="utf-8", delete=True) as fh:
-        fh.write(system_prompt)
+        json.dump({"mcpServers": {}}, fh)
         fh.flush()
-        yield ["--append-system-prompt-file", fh.name]
+        yield ["--mcp-config", fh.name]
 
 
 def claude_bin() -> str:
@@ -1506,7 +1543,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                         timeout: int = 300, tools: str | None = None,
                         attribute: bool = True, record: Any = None,
                         permission_mode: str | None = None,
-                        env_extra: dict[str, str] | None = None) -> HeadlessResult:
+                        env_extra: dict[str, str] | None = None,
+                        settings: Path | str | None = None,
+                        keep_default_context: bool = False) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
 
     The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
@@ -1547,22 +1586,38 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     workers; `env_extra` is how the sandbox gets on its PATH. Note it does NOT
     suppress attribution: a measured subject still spends the work order's tokens,
     and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
+
+    THE CALL STARTS FROM NOTHING: `system_prompt` REPLACES the CLI's default prompt, and
+    a prompt-only call (`tools=""`) also loses the user's setting sources, MCP servers
+    and skills. A tooled callee keeps them, because they carry its permissions — Neo's
+    carve-out, question 670. `keep_default_context` appends instead, and is for an eval
+    whose SUBJECT is that default environment (only
+    `evals/llm/test_navigation_judgment.py`, which measures whether a worker reaches for
+    Serena); `settings` passes `--settings` for the same one. Spec:
+    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
     """
-    args: list[str] = ["-p", prompt, "--output-format", "json"]
+    args: list[str] = ["-p", prompt, "--output-format", "json",
+                       "--no-session-persistence"]
     if model:
         args += ["--model", model]
+    if settings:
+        args += ["--settings", str(settings)]
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
-    if tools == "":
-        # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's schemas
-        # in the request, reachable. See spec §4: a seat asked to name its tools listed
-        # eleven Google Drive verbs. "Judges the prompt and only the prompt" is what
-        # `tools=""` means, so the two ship together.
-        args += ["--strict-mcp-config"]
     if permission_mode:
         args += ["--permission-mode", permission_mode]
-    with _system_prompt_arg(system_prompt) as extra:
-        out = _run(args + extra, cwd=cwd, timeout=timeout, env_extra=env_extra)
+    with contextlib.ExitStack() as stack:
+        if tools == "":
+            # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's
+            # schemas in the request, reachable. See spec §4: a seat asked to name its
+            # tools listed eleven Google Drive verbs. "Judges the prompt and only the
+            # prompt" is what `tools=""` means, so these ship together — no servers, no
+            # setting sources (hence no hooks, no plugins) and no skills.
+            args += ["--strict-mcp-config", *stack.enter_context(_empty_mcp_config()),
+                     "--setting-sources", "", "--disable-slash-commands"]
+        args += stack.enter_context(
+            _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
+        out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra)
     data: Any = None
     try:
         data = json.loads(out)
@@ -1592,7 +1647,9 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                  timeout: int = 300, tools: str | None = None,
                  attribute: bool = True, record: Any = None,
                  permission_mode: str | None = None,
-                 env_extra: dict[str, str] | None = None) -> str:
+                 env_extra: dict[str, str] | None = None,
+                 settings: Path | str | None = None,
+                 keep_default_context: bool = False) -> str:
     """`run_headless_result`, keeping only the text.
 
     Kept for callers that have nothing to account against — and for the `call=` seams,
@@ -1609,7 +1666,8 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                                cwd=cwd, timeout=timeout, tools=tools,
                                attribute=attribute, record=record,
                                permission_mode=permission_mode,
-                               env_extra=env_extra).text
+                               env_extra=env_extra, settings=settings,
+                               keep_default_context=keep_default_context).text
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:

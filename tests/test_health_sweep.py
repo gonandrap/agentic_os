@@ -92,13 +92,8 @@ def store(started):
 
 
 def _health_calls(fake_claude) -> list[dict]:
-    out = []
-    for call in fake_claude.calls:
-        argv = call.get("argv") or []
-        if "--append-system-prompt" in argv:
-            if CHECKLIST in argv[argv.index("--append-system-prompt") + 1]:
-                out.append(call)
-    return out
+    return [call for call in fake_claude.calls
+            if CHECKLIST in (call.get("system_prompt_seen") or "")]
 
 
 def _agent_calls(kind: str) -> list[dict]:
@@ -337,7 +332,7 @@ def test_one_tick_makes_one_call_and_leaves_one_finding_on_the_record(
     _sweep(started(), clock)
 
     (call,) = _health_calls(fake_claude)
-    system = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    system = call["system_prompt_seen"]
     armed = probes_mod.armed(CFG.probes, "work_order")
     assert len(armed) > 1, "one probe cannot discriminate one call per unit from one per probe"
     for probe in armed:
@@ -716,7 +711,7 @@ def test_a_sweep_is_indistinguishable_from_a_review_by_persona_alone(
     _sweep(started(), clock)
 
     (call,) = _health_calls(fake_claude)
-    system = call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    system = call["system_prompt_seen"]
     assert SUPERVISOR_PERSONA.splitlines()[0] in system
     assert CHECKLIST in system, "and the checklist is the only thing that separates them"
 
@@ -876,8 +871,7 @@ def test_the_sweep_asks_the_model_for_findings_not_for_a_decision(
     _sweep(started(), clock)
 
     (call,) = _health_calls(fake_claude)
-    argv = call["argv"]
-    prompt = argv[argv.index("--append-system-prompt") + 1]
+    prompt = call["system_prompt_seen"]
     assert '"findings"' in prompt
     assert prompt.index('"findings"') > prompt.index('"decision"')
 

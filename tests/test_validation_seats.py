@@ -208,7 +208,7 @@ def test_the_seats_run_at_jarvis_home_with_no_tools_and_still_see_the_diff(
         assert argv[argv.index("--tools") + 1] == "", "a seat judges the packet only"
         assert "--strict-mcp-config" in argv, "`--tools ''` leaves MCP servers reachable"
         assert Path(call["cwd"]) == paths.ensure_home()
-    systems = [c["argv"][c["argv"].index("--append-system-prompt") + 1] for c in calls]
+    systems = [c["system_prompt_seen"] for c in calls]
     assert all("THE_DIFF_MARKER" in s for s in systems), (
         "a seat that sees nothing passes the tools assertion and reviews nothing")
 

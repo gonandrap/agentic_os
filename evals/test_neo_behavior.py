@@ -42,7 +42,7 @@ def neo_calls(fake_claude):
 
 
 def system_of(call):
-    return call["argv"][call["argv"].index("--append-system-prompt") + 1]
+    return call["system_prompt_seen"]
 
 
 def question_of(call):
