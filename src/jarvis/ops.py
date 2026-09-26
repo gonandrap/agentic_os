@@ -1546,6 +1546,27 @@ def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
             "shown_limit": shown, "more": max(0, len(rows) - shown)}
 
 
+def ack_decision_blocker(blockers: list[str]) -> str | None:
+    """The blocker that makes acking unacceptable, or None — the one extraction of it."""
+    return next((b for b in blockers if "assumption" in b.lower()), None)
+
+
+def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
+    """Why `jarvis wo ack` would be refused on this order, or None if it would be taken.
+
+    ONE HOME FOR THE RULE: `_diagnose_commands` carried a hand-written copy of
+    `ack_attention`'s predicate, and a second copy of a predicate passes every
+    behavioural test and drifts anyway (kn-9748020c, kn-4ea33fe6). The sentence is the
+    one `ack_attention` raises, so the offer and the acceptance cannot disagree.
+    """
+    blocker = ack_decision_blocker(blockers)
+    if blocker is None:
+        return None
+    return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
+            f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
+            f"send it back.")
+
+
 def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
                        blocker: dict[str, Any], needs_you: list[str],
                        ) -> tuple[list[dict[str, str]], list[str]]:
@@ -1571,12 +1592,16 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     else:
         refusals.append(refusal)
 
-    # `ack_attention`'s own predicate, verbatim: a blocker naming an assumption is a
-    # decision the OS is waiting on, and acknowledging would bury it.
-    if wo["needs_attention"] and not [b for b in needs_you if "assumption" in b.lower()]:
-        out.append({"command": f"jarvis wo ack {wo_id}",
-                    "why": "put the attention flag down for good — nothing here is a "
-                           "decision that would be buried by it"})
+    # `ack_attention`'s own predicate, called rather than copied (`ack_refusal`). The
+    # flag is still required: with none there is nothing to ack and nothing to refuse.
+    if wo["needs_attention"]:
+        ack_no = ack_refusal(wo, needs_you)
+        if ack_no is None:
+            out.append({"command": f"jarvis wo ack {wo_id}",
+                        "why": "put the attention flag down for good — nothing here is a "
+                               "decision that would be buried by it"})
+        else:
+            refusals.append(ack_no)
 
     blockers = store.unfinished_dependencies(wo_id)
     if blockers:
@@ -1590,6 +1615,10 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
                        "why": "every edge it waits on is still LIVE, so only --all cuts "
                               "them — it then runs without the work it was to build on"}
 
+    # NUDGE_IS_WRONG half mirrors `resume_in_auto`'s own refusal, testing that mapping
+    # independently of `stalled`. Unreachable today — no `waiting_on` answer arrives both
+    # stalled and in the mapping (only `prompt` returns stalled=True) — kept because the
+    # mapping owns the rule, not this call site.
     if blocker["stalled"] and blocker["what"] not in NUDGE_IS_WRONG:
         out.append({"command": f"jarvis wo resume-auto {wo_id}",
                     "why": "nothing is coming for this by itself, and this is the one "
@@ -1641,10 +1670,12 @@ def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
             "status_label": invariants.status_label(store, wo, held_by_fleet),
             "blocker": blocker,
             "needs_you": needs_you,
+            # All three `or None`: these return "" for "no note", and an empty string
+            # renders as a blank note. Absent must be absent (issue #227).
             "notes": {
                 "parked": invariants.parked_reason(store, wo, now) or None,
-                "pause": invariants.pause_note(store, wo),
-                "fleet_hold": invariants.fleet_hold_note(wo, held_by_fleet),
+                "pause": invariants.pause_note(store, wo) or None,
+                "fleet_hold": invariants.fleet_hold_note(wo, held_by_fleet) or None,
             },
             "disagreements": _disagreements(blocker, needs_you),
             "clock": _diagnose_clock(store, str(wo["id"]), now),
@@ -5196,15 +5227,13 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
                 candidates = [w for w in store.list_work_orders() if w["needs_attention"]]
             for wo in candidates:
                 blockers = true_blockers(store, wo)
-                needs_decision = [b for b in blockers if "assumption" in b.lower()]
-                if needs_decision:
+                refusal = ack_refusal(wo, blockers)
+                if refusal is not None:
                     if wo_id:
-                        raise OpsError(
-                            f"{wo['id']} is waiting on a decision ({needs_decision[0]}) "
-                            f"— acknowledging would bury it. Use `jarvis wo review "
-                            f"{wo['id']}` to accept, or `--reject` to send it back."
-                        )
-                    skipped.append({"wo_id": wo["id"], "reason": needs_decision[0]})
+                        raise OpsError(refusal)
+                    # The BLOCKER, not the sentence: a sweep reports what it skipped over.
+                    skipped.append({"wo_id": wo["id"],
+                                    "reason": ack_decision_blocker(blockers) or ""})
                     continue
                 store.ack_attention(wo["id"], blockers)
                 acknowledged.append(wo["id"])

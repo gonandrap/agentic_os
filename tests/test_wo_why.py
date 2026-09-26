@@ -20,10 +20,13 @@ are about the AGGREGATION and about the four honesty rules the spec puts on it:
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from jarvis import agent_usage, cli, db, invariants, ops
+from jarvis import agent_usage, cli, db, invariants, ops, usage
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
@@ -379,3 +382,172 @@ def test_cli_human_rendering_names_the_blocker(started, capsys):
     # too — 200 lines of call table in a terminal is not a diagnosis.
     assert out.count("  answered  ") == ops.OS_CALLS_SHOWN
     assert "… and 2 older call(s)" in out
+
+
+# -- 10. every command offered is one the OS would accept -------------------------------
+
+
+def test_ack_is_offered_and_the_real_command_accepts_it(started, project):
+    """The offer and the acceptance agree — one predicate, `ops.ack_refusal`."""
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        store.flag_attention(wo["id"], "worker session disappeared")
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert f"jarvis wo ack {wo['id']}" in commands(d)
+    assert not any("acknowledging would bury it" in r for r in d["refusals"])
+    result = ops.ack_attention(wo["id"], project_name="proj_a")
+    assert wo["id"] in result["acknowledged"]
+
+
+def test_a_withheld_ack_is_explained(started, project):
+    """§6.5: a command not offered says why, like a withheld `validation force`."""
+    wo = an_order(started)
+    ops.assume(wo["id"], "exporting CSV by default")
+
+    d = ops.diagnose(wo["id"])
+
+    assert not any(c.startswith("jarvis wo ack") for c in commands(d))
+    assert any("acknowledging would bury it" in r for r in d["refusals"])
+    with pytest.raises(ops.OpsError, match="acknowledging would bury it"):
+        ops.ack_attention(wo["id"], project_name="proj_a")
+
+
+def test_no_attention_flag_means_no_ack_offer_and_no_refusal(started, project):
+    """Nothing to ack and nothing to refuse either."""
+    wo = ops.create_work_order("proj_a", "nobody flagged this")
+
+    d = ops.diagnose(wo["id"])
+
+    assert not any(c.startswith("jarvis wo ack") for c in commands(d))
+    assert not any("acknowledging would bury it" in r for r in d["refusals"])
+
+
+def test_resume_auto_is_offered_when_nothing_is_coming_by_itself(started, project):
+    wo = ops.create_work_order("proj_a", "stalled on a prompt")  # no tick: no turn
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "waiting_input")
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["blocker"]["what"] == "prompt" and d["blocker"]["stalled"] is True
+    assert f"jarvis wo resume-auto {wo['id']}" in commands(d)
+
+
+def test_resume_auto_is_withheld_from_an_idle_manager(started, project):
+    """`manager_idle` is in `NUDGE_IS_WRONG`: the nudge buys one turn of nothing."""
+    wo = ops.create_work_order("proj_a", "the feature's manager")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "idle")
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["blocker"]["what"] == "manager_idle"
+    assert not any(c.startswith("jarvis wo resume-auto") for c in commands(d))
+
+
+def test_resume_auto_is_withheld_when_a_nudge_is_actively_wrong(started, monkeypatch):
+    """The `NUDGE_IS_WRONG` arm itself, which store state cannot reach.
+
+    Both entries — `message_stuck` and `manager_idle` — report `stalled=False` from real
+    store rows, so the offer is already withheld by the `stalled` test above them in
+    `_diagnose_commands`. The arm exists for a `what` in that mapping arriving stalled,
+    which no store shape produces, so the blocker is stated directly here.
+    """
+    wo = an_order(started)
+    monkeypatch.setattr(ops, "waiting_on", lambda store, w: {
+        "what": "message_stuck", "stalled": True,
+        "detail": "a message is queued undelivered"})
+
+    d = ops.diagnose(wo["id"])
+
+    assert not any(c.startswith("jarvis wo resume-auto") for c in commands(d))
+
+
+def test_an_escalated_gate_offers_both_verdicts(started, project):
+    wo = an_order(started)
+    store = ProjectStore(project)
+    try:
+        # The command text is never read by the report (kn-1791a5e6: a gate's command is
+        # a privileged line a worker proposed), so the fixture states none.
+        approval = store.add_approval(wo["id"], "release", "<the proposed command>")
+        store.mark_approval_escalated(approval["id"], "Neo would not decide this one")
+        assert store.escalated_approvals(wo["id"])
+    finally:
+        store.close()
+
+    d = ops.diagnose(wo["id"])
+
+    assert f'jarvis gate approve {approval["id"]} --reason "…"' in commands(d)
+    assert f'jarvis gate deny {approval["id"]} --reason "…"' in commands(d)
+
+
+# -- 11. a found transcript gives the residual a number ---------------------------------
+
+
+def _stamp(at: float) -> str:
+    return datetime.fromtimestamp(at, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _transcript(session: str, rows: list[dict]) -> str:
+    """One session file where `usage.index_sessions` looks — `jarvis_home` points that
+    at an empty tree, so nothing else is on disk."""
+    directory = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV]) / "-proj"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{session}.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in rows))
+    return session
+
+
+def test_a_found_transcript_reports_a_residual_number(started, project):
+    wo = ops.create_work_order("proj_a", "transcribed")
+    session = _transcript("why-session", [
+        {"type": "user", "timestamp": _stamp(1000), "promptSource": "sdk",
+         "message": {"content": "go"}},
+        {"type": "assistant", "timestamp": _stamp(1060),
+         "message": {"id": "m1", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "text", "text": "ok"}]}},
+    ])
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], session_id=session)
+    finally:
+        store.close()
+
+    residual = ops.diagnose(wo["id"])["holds"]["unexplained"]
+
+    assert residual["residual"] is True
+    assert residual["seconds"] is not None and residual["seconds_human"]
+    assert "transcript" not in residual["note"]
+
+
+def test_a_live_turn_reports_the_clock_open(started):
+    wo = an_order(started)  # the dispatch turn is a real process, still running
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["clock"]["turn_open"] is True
+    assert d["clock"]["last_turn"]["state"] == "running"
+
+
+# -- 12. absent notes are absent, not blank --------------------------------------------
+
+
+def test_an_order_with_no_notes_reports_all_three_as_none(started):
+    wo = ops.create_work_order("proj_a", "nothing parked, nothing paused")
+
+    notes = ops.diagnose(wo["id"])["notes"]
+
+    assert notes == {"parked": None, "pause": None, "fleet_hold": None}
