@@ -390,6 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    # OFF BY DEFAULT: a tool input can be a whole file, so the default report must not
+    # grow with what the worker typed (spec §4c).
+    sp.add_argument("--params", action="store_true",
+                    help="also print each turn's tool calls with their parameters, "
+                         "and the caps those were truncated at")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
@@ -1697,6 +1702,15 @@ PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
 PART_SHORT = {"generating": "gen", "blocked": "blocked", "tools": "tools",
               "idle": "idle", "unaccounted": "unacc"}
 
+#: The glyph each bucket occupies in the per-turn bar (spec §4c). SAME KEYS, SAME ORDER,
+#: SAME PIN as the two tables above: the bar is built from the very `share` figures
+#: printed beside it, so the picture and the percentages cannot disagree.
+BAR_GLYPHS = {"generating": "█", "blocked": "▓", "tools": "▒", "idle": "░",
+              "unaccounted": "·"}
+
+#: Fixed, so every turn's bar is comparable at a glance and the columns after it line up.
+BAR_WIDTH = 20
+
 #: What a turn with no API call says, ahead of any duration breakdown. A fixed width so
 #: the split below it stays a column, and stated rather than left to be inferred from
 #: `0 calls`: the inference is what four layers got wrong (issue 227).
@@ -1734,7 +1748,69 @@ def _print_partition(unit: dict[str, Any]) -> None:
               f"of that idle, nothing on record was holding it")
 
 
-def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
+def _bar(share: dict[str, float]) -> str:
+    """The turn's partition as one fixed-width stacked bar, in `PARTS` order.
+
+    Cumulative edges rather than per-bucket rounding: five independently rounded
+    segments do not add up to the width, and a bar that is a character short reads as a
+    sixth bucket nobody named.
+    """
+    keys = list(BAR_GLYPHS)
+    out, done = [], 0
+    for index, name in enumerate(keys, start=1):
+        edge = min(BAR_WIDTH,
+                   round(sum(share.get(k, 0.0) for k in keys[:index]) * BAR_WIDTH))
+        out.append(BAR_GLYPHS[name] * max(0, edge - done))
+        done = max(done, edge)
+    return "".join(out).ljust(BAR_WIDTH, BAR_GLYPHS[keys[-1]])
+
+
+def _print_subagent(sub: dict[str, Any], indent: str) -> None:
+    """One subagent under the turn that named it. EVERY FIGURE COMES OUT OF THE PAYLOAD.
+
+    `writes_by_cause` is summed in `inspection` for the reason spec §4c gives: a number
+    the renderer computes is one the dashboard will eventually compute differently.
+    """
+    writes = ", ".join(f"{cause} {_tok(written)}"
+                       for cause, written in (sub["writes_by_cause"] or {}).items())
+    print(f"{indent}⤷ {sub['label'] or sub['task_id']}  {_mins(sub['wall']):>7}  "
+          f"{sub['api_calls']:>3} api calls  peak {_tok(sub['context_peak']):>5}  "
+          f"{'writes ' + writes if writes else 'no large writes'}")
+    if sub["deeper"]:
+        # Never imply completeness (spec §4b): one directory level is globbed, so a
+        # subagent's own subagents are counted and their transcripts are not read.
+        noun = "subagent" if sub["deeper"] == 1 else "subagents"
+        print(f"{indent}  {sub['deeper']} deeper {noun} NOT read — "
+              f"depth read {sub['depth_read']}")
+
+
+def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
+    """Every span of one turn with its reported parameters, behind `--params`.
+
+    The caps ride with the listing rather than sitting in a footnote: a report that
+    truncates without saying so is not reproducible (spec §4a), and this is the only
+    place a value is ever cut short.
+    """
+    if not turn["spans"]:
+        return
+    print(f"           parameters — capped at {caps['per_value']:,} chars per value, "
+          f"{caps['per_span']:,} per span, {caps['per_turn']:,} per turn")
+    for span in turn["spans"]:
+        print(f"           · {span['name']}  {_mins(span['seconds'])}")
+        for key, value in span["params"].items():
+            print(f"               {key} = {value}")
+        notes = []
+        if span["params_truncated"]:
+            notes.append("shortened: " + ", ".join(span["params_truncated"]))
+        if span["params_dropped"]:
+            notes.append("not printed, the cap was reached: "
+                         + ", ".join(span["params_dropped"]))
+        for note in notes:
+            print(f"               ({note})")
+
+
+def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
+                   params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
 
     The partition first because it is the headline, then the turns it is made of, then
@@ -1760,14 +1836,20 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
 
     print()
+    # The legend for the bars below, keyed off the same dict they are drawn from — a
+    # glyph in one and not the other is `PART_LABELS`' failure in pictures (spec §4c).
+    print("  " + "  ".join(f"{g} {PART_SHORT[k]}" for k, g in BAR_GLYPHS.items()))
     causes = unit.get("hold_causes") or {}
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
         split = "  ".join(f"{PART_SHORT[k]} {s[k] * 100:>3.0f}%" for k in PART_SHORT)
         flag = "" if turn["observed"] else NO_CALL_FLAG
+        # The bar is drawn FROM `share` and the percentages are printed from the same
+        # dict, so the picture cannot disagree with the numbers. Both, not either: the
+        # bar is read at a glance and the numbers are what get quoted.
         print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
-              f"{flag:<{len(NO_CALL_FLAG)}}  {split}  "
+              f"{flag:<{len(NO_CALL_FLAG)}}  {_bar(s)}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
         # The second clock only where the two differ, on its own line and naming the
@@ -1780,6 +1862,23 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
             print(f"           · {_mins(turn['active'])} active — held {named}")
         for trigger in turn["triggers"]:
             print(f"           ↳ {trigger['quote']}")
+        if turn["subagents"]:
+            # A PARTITION of the turn above, drawn out of it and never added to it
+            # (spec §4b, kn-7a2180ba) — said here because the seconds on these lines
+            # would otherwise read as extra time on top of the turn's own wall clock.
+            print("           subagents — a partition of this turn, not an addition:")
+            for sub in turn["subagents"]:
+                _print_subagent(sub, "           ")
+        if params:
+            _print_params(turn, unit["param_caps"])
+
+    if unit["unattached_subagents"]:
+        # No timestamp fallback upstream, so these are reported rather than given a
+        # parent the record does not name (issue 227).
+        print(f"\n  subagents no span named — depth read "
+              f"{unit['subagent_depth_read']}:")
+        for sub in unit["unattached_subagents"]:
+            _print_subagent(sub, "    ")
 
     if unit["joins"]:
         print("\n  blocked on:")
@@ -1818,7 +1917,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     for index, unit in enumerate(res["units"]):
         if index:
             print()
-        _print_anatomy(unit, res["write_floor"])
+        _print_anatomy(unit, res["write_floor"], params=args.params)
     return 0
 
 

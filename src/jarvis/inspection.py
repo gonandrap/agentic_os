@@ -82,6 +82,7 @@ is reported as absent rather than guessed at.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,6 +109,18 @@ TTL_1H = 3600.0
 #: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
 #: wait it defers is exactly what `TaskOutput` later collects.
 JOIN_TOOLS = ("TaskOutput",)
+
+#: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
+#: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
+#: is reported `unattached` rather than given the turn its timestamps fall in — inventing
+#: a parent the record does not name is the issue-227 mistake.
+SPAWN_TOOLS = ("Agent", "TaskOutput")
+
+#: How many directory levels of subagent this module actually reads. `_subagent_labels`
+#: and `_subagent_transcripts` glob ONE, so a subagent spawned by a subagent is counted
+#: (`SubagentAnatomy.deeper`) and not read. Stated in every payload, because a depth the
+#: reader cannot see is a completeness claim this code cannot make (spec §4b).
+SUBAGENT_DEPTH_READ = 1
 
 COLD_START, TTL_EXPIRY, PREFIX_MISS = "cold-start", "ttl-expiry", "prefix-miss"
 #: The fourth, and the only one the OS chose. A compaction leaves a summary that the
@@ -148,6 +161,160 @@ def _first_line(text: str, limit: int) -> str:
     return line[:limit] + "…" if len(line) > limit else line
 
 
+# -- tool parameters: what may be reported, and how much of it -------------------------
+
+#: THE SHAPES, COPIED FROM `autoreview` AND NOT IMPORTED. `autoreview.SECRET_EVIDENCE`
+#: and its placeholder set are the reference for how carefully this is taken here
+#: (kn-32fa2a7d: bound every field you did not write), but `inspection` is a leaf —
+#: `usage`, `catalog`, `holds` and nothing else — and importing the review pipeline to
+#: read a transcript would put a model-calling module under `jarvis cost`. The price of
+#: the copy is that a shape added there must be added here; the price of the import is a
+#: cycle. Each entry is (pattern, what the marker CALLS it): the marker names the shape
+#: and never quotes the match, because a report that echoes the credential has only
+#: moved it one file along (kn-deef42ea).
+PARAM_SECRET_SHAPES: tuple[tuple[str, str], ...] = (
+    # The whole block, not the BEGIN line: substituting the header alone would leave the
+    # base64 body sitting in the payload underneath the marker.
+    (r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?"
+     r"(?:-----END (?:[A-Z]+ )*PRIVATE KEY-----|\Z)", "a private key block"),
+    (r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+", "an ssh key line"),
+    (r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
+     "an Authorization header value"),
+)
+
+#: An assignment whose left side NAMES a credential. Same two-part test as
+#: `autoreview._line_marker`: the name must name one and the value must look like one.
+_PARAM_ASSIGNMENT_RE = re.compile(
+    r"(?P<head>^[ \t]*(?:(?:export|set|const|let|var|readonly)[ \t]+)?"
+    r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
+    r"[ \t]*(?:=>|:=|=|:)[ \t]*)"
+    r"(?P<value>[^\r\n]*?)(?P<tail>[ \t]*[,;]?[ \t]*)$")
+
+#: Words that make a name a credential's name, matched against the identifier's PARTS:
+#: `monkey` is not a `key` and `AWS_SECRET_ACCESS_KEY` is.
+_PARAM_SECRET_NAMES = frozenset({
+    "key", "keys", "apikey", "accesskey", "privatekey", "secretkey",
+    "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
+    "password", "passwd", "passphrase", "pwd", "credential", "credentials",
+})
+
+#: A VALUE THAT IS NOT A SECRET, however secret its name — the negative control. Most
+#: `key=` lines in any repo carry an empty default, a placeholder or an expression, and
+#: redacting those would make the parameter report useless for the one thing it is for:
+#: reading what the worker actually ran.
+_PARAM_PLACEHOLDER_RE = re.compile(
+    r"none|null|nil|nan|true|false|x+|\.+|-+|_+|"
+    r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample|"
+    r"example|examples|test|testing|secret|password|passwd|token|key|value|"
+    r"your[-_].*|my[-_].*|some[-_].*|the[-_].*", re.IGNORECASE)
+_PARAM_VALUE_CHARS = re.compile(r"[A-Za-z0-9+/=._~-]+")
+_PARAM_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+_PARAM_SHAPE_RE = [(re.compile(p, re.IGNORECASE | re.DOTALL), name)
+                   for p, name in PARAM_SECRET_SHAPES]
+
+CREDENTIAL_VALUE_MARKER = "<redacted: a credential value>"
+
+
+def _names_a_credential(identifier: str) -> bool:
+    parts = [p.lower() for p in _PARAM_WORD_SPLIT_RE.split(identifier) if p]
+    return any(p in _PARAM_SECRET_NAMES for p in parts)
+
+
+def _looks_like_a_credential(raw: str) -> bool:
+    """`autoreview._secret_value`'s test, same reasoning: an expression is not a value."""
+    value = raw.strip()
+    quoted = len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'"
+    if quoted:
+        value = value[1:-1].strip()
+    if len(value) < 6 or not _PARAM_VALUE_CHARS.fullmatch(value):
+        return False
+    if _PARAM_PLACEHOLDER_RE.fullmatch(value):
+        return False
+    has_digit = any(c.isdigit() for c in value)
+    has_alpha = any(c.isalpha() for c in value)
+    return (has_digit and has_alpha) or len(value) >= 20
+
+
+def redact_param(text: str) -> str:
+    """One tool-input value with its secret-shaped content NAMED, never quoted. Pure.
+
+    Applied before the value reaches any payload (spec §4a) — a tool input carries file
+    contents and anything a worker typed into a `Bash` command, and `jarvis inspect`
+    output is read, pasted and stored. Returns the text unchanged when nothing matches,
+    which is the overwhelmingly common case.
+    """
+    if not text:
+        return text
+    for pattern, name in _PARAM_SHAPE_RE:
+        text = pattern.sub(f"<redacted: {name}>", text)
+    lines = []
+    for line in text.split("\n"):
+        m = _PARAM_ASSIGNMENT_RE.match(line)
+        if m and _names_a_credential(m.group("name")) and \
+                _looks_like_a_credential(m.group("value")):
+            line = m.group("head") + CREDENTIAL_VALUE_MARKER + m.group("tail")
+        lines.append(line)
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ParamCaps:
+    """How much of a tool's input may be reported, per value, per span and per turn.
+
+    NOT `catalog.InspectConfig` settings, unlike the write and join floors. Those are a
+    per-project JUDGEMENT about what counts as expensive; these are a STRUCTURAL bound
+    on how big one report may get — a single `Write` input can be a whole file, and no
+    project wants a different answer to "may `jarvis inspect` print a megabyte". Stated
+    in every payload (`Anatomy.as_dict`) because a report that truncates without saying
+    so is not reproducible.
+    """
+
+    per_value: int = 500
+    per_span: int = 2_000
+    per_turn: int = 20_000
+
+    def as_dict(self) -> dict[str, int]:
+        return {"per_value": self.per_value, "per_span": self.per_span,
+                "per_turn": self.per_turn}
+
+
+PARAM_CAPS = ParamCaps()
+
+
+def _params_of(payload: Any, spent: int,
+               caps: ParamCaps = PARAM_CAPS,
+               ) -> tuple[dict[str, str], list[str], list[str], int]:
+    """One tool input, redacted and bounded: `(params, truncated, dropped, spent)`.
+
+    EVERY key of the input is accounted for — kept, listed as shortened, or listed as
+    dropped — so the reader can tell "the tool was not given that" from "the report
+    would not print it". `spent` is the turn's budget already used; the returned figure
+    is what it becomes.
+    """
+    if not isinstance(payload, dict):
+        return {}, [], [], spent
+    params: dict[str, str] = {}
+    truncated: list[str] = []
+    dropped: list[str] = []
+    span_spent = 0
+    for key, value in payload.items():
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        text = redact_param(text)
+        if len(text) > caps.per_value:
+            text = text[:caps.per_value] + "…"
+            truncated.append(str(key))
+        if (span_spent + len(text) > caps.per_span
+                or spent + len(text) > caps.per_turn):
+            dropped.append(str(key))
+            if str(key) in truncated:
+                truncated.remove(str(key))
+            continue
+        params[str(key)] = text
+        span_spent += len(text)
+        spent += len(text)
+    return params, truncated, dropped, spent
+
+
 @dataclass
 class ToolSpan:
     """One tool call, from the model asking for it to the result coming back.
@@ -163,6 +330,15 @@ class ToolSpan:
     started: float
     ended: float = 0.0
     detail: str = ""
+    #: The tool's whole `input`, redacted and capped (`_params_of`). ADDITIVE: `detail`
+    #: above is unchanged and stays the one-line answer every renderer already prints —
+    #: spec §4a, `docs/specs/2026-09-24-order-observability.md`.
+    params: dict[str, str] = field(default_factory=dict)
+    #: Keys shortened to `ParamCaps.per_value`, and keys left out because the span or
+    #: turn budget ran out. Separate lists: "cut short" and "not printed" are different
+    #: facts about the same key and a reader acts on them differently.
+    params_truncated: list[str] = field(default_factory=list)
+    params_dropped: list[str] = field(default_factory=list)
 
     @property
     def finished(self) -> bool:
@@ -180,7 +356,9 @@ class ToolSpan:
         return {"name": self.name, "tool_id": self.tool_id, "started": self.started,
                 "ended": self.ended, "seconds": round(self.seconds, 2),
                 "detail": self.detail, "join": self.is_join,
-                "finished": self.finished}
+                "finished": self.finished, "params": self.params,
+                "params_truncated": self.params_truncated,
+                "params_dropped": self.params_dropped}
 
 
 @dataclass
@@ -252,6 +430,10 @@ class Turn:
     #: without a store — a report that cannot see the record must say a turn was held
     #: for zero seconds, never guess.
     holds: list[Hold] = field(default_factory=list)
+    #: The subagents this turn's own spans NAME (`_attach_subagents`). A PARTITION of the
+    #: turn, drawn out of it and never added to it (kn-7a2180ba, spec §4b): nothing below
+    #: reads this field, so attaching one moves no figure of the parent's.
+    subagents: list[SubagentAnatomy] = field(default_factory=list)
 
     @property
     def wall(self) -> float:
@@ -387,7 +569,68 @@ class Turn:
             "api_calls": len(self.calls), "tool_calls": len(self.spans),
             "unfinished_tool_calls": self.unfinished,
             "triggers": [p.as_dict() for p in self.triggers],
+            # ADDITIVE, and carried because the renderer DERIVES NOTHING (spec §4c):
+            # `jarvis inspect --params` prints each span's parameters, and a CLI that
+            # re-read the transcript to get them is a second answer to the same
+            # question. The profile above stays the summary; this is the detail.
+            "spans": [s.as_dict() for s in self.spans],
             "usage": self.usage.as_dict(),
+            # ADDITIVE and empty on most turns: every key above is unchanged, and none
+            # of them reads this one (spec §4b's partition rule).
+            "subagents": [s.as_dict() for s in self.subagents],
+        }
+
+
+@dataclass
+class SubagentAnatomy:
+    """One subagent's OWN anatomy: its turns, its cache writes, its context peak.
+
+    The same arithmetic as the parent, on its own transcript — `classify_writes` over
+    `usage.calls_of`, `Turn.context_peak` off its turns — because a subagent transcript
+    is a transcript and that is what answers "when is the user paying a write-cache" for
+    the half of the spend the lead agent's file does not hold.
+
+    ITS WRITES ARE ITS OWN AND ARE NEVER FOLDED INTO THE PARENT'S (spec §4b): a parent
+    turn that merely waited on a join did not pay that write, and attributing it upward
+    names the wrong turn as the prefix break.
+    """
+
+    task_id: str
+    label: str = ""
+    turns: list[Turn] = field(default_factory=list)
+    writes: list[Write] = field(default_factory=list)
+    #: Subagents of THIS subagent, counted and not read — see `SUBAGENT_DEPTH_READ`.
+    deeper: int = 0
+
+    @property
+    def wall(self) -> float:
+        return sum(t.wall for t in self.turns)
+
+    @property
+    def api_calls(self) -> int:
+        return sum(len(t.calls) for t in self.turns)
+
+    @property
+    def context_peak(self) -> int:
+        return max((t.context_peak for t in self.turns), default=0)
+
+    def writes_by_cause(self) -> dict[str, int]:
+        """Tokens written, totalled per cause. Summed HERE and not in a renderer: the
+        CLI and the dashboard both read this dict verbatim (spec §4c)."""
+        totals: dict[str, int] = {}
+        for write in self.writes:
+            totals[write.cause] = totals.get(write.cause, 0) + write.written
+        return totals
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id, "label": self.label,
+            "turns": [t.as_dict() for t in self.turns],
+            "writes": [w.as_dict() for w in self.writes],
+            "writes_by_cause": self.writes_by_cause(),
+            "context_peak": self.context_peak,
+            "wall": round(self.wall, 2), "api_calls": self.api_calls,
+            "deeper": self.deeper, "depth_read": SUBAGENT_DEPTH_READ,
         }
 
 
@@ -412,6 +655,11 @@ class Anatomy:
     #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside
     #: the transcript. This is what turns "blocked 450s on a7b62083" into a sentence.
     subagents: dict[str, str] = field(default_factory=dict)
+    #: Subagent transcripts no `Agent`/`TaskOutput` span of this session names. Reported
+    #: HERE rather than attached to the turn their timestamps fall in: a timestamp
+    #: fallback invents a parent the record does not name (issue 227), so an unattached
+    #: subagent says it is unattached (spec §4b, decided on wo-5f4d8611 q687).
+    unattached_subagents: list[SubagentAnatomy] = field(default_factory=list)
     #: Every hold on the WHOLE work order (`holds.held`), including any falling outside
     #: the turns below. Kept whole rather than only as the per-turn slices, because a
     #: hold still running past the last turn is the live one, and it is the answer to
@@ -528,6 +776,9 @@ class Anatomy:
             "found": self.found,
             "write_floor": self.write_floor,
             "join_floor": self.join_floor,
+            # Stated beside the floors for the same reason they are: a truncation the
+            # reader cannot size is not reproducible (spec §4a).
+            "param_caps": PARAM_CAPS.as_dict(),
             "partition": {k: round(v, 2) for k, v in part.items()},
             "share": {k: round(part[k] / wall, 4) for k in PARTS},
             "held_by": {k: round(v, 2) for k, v in self.held_by().items()},
@@ -543,6 +794,11 @@ class Anatomy:
             "writes": [w.as_dict() for w in self.writes],
             "joins": [s.as_dict() for s in self.joins()],
             "tools": self.tool_profile(),
+            # ADDITIVE, and `subagent_depth_read` is stated for the reason the floors and
+            # the caps are: silence here would read as "there were none deeper".
+            "unattached_subagents": [s.as_dict()
+                                     for s in self.unattached_subagents],
+            "subagent_depth_read": SUBAGENT_DEPTH_READ,
         }
 
 
@@ -554,13 +810,18 @@ def _detail_of(payload: Any, limit: int) -> str:
 
     `description` first wherever it exists, because it is the agent's own words for what
     it was doing and every long-running tool in the fleet carries one.
+
+    REDACTED BEFORE IT IS CUT, and in that order (spec §4a, wo-5f4d8611 q687): `command`
+    is second in the list, so an undescribed `Bash` call put the raw command line here
+    while `params` beside it was redacted. Truncating first would leave the head of a
+    credential printed; redacting first can only cost the tail of a marker.
     """
     if not isinstance(payload, dict):
         return ""
     for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
-            return _first_line(value, limit)
+            return _first_line(redact_param(value), limit)
     return ""
 
 
@@ -636,6 +897,10 @@ def read_transcript(path: Path | str,
     pending: dict[str, ToolSpan] = {}
     open_turn: Turn | None = None
     saw_assistant = False
+    # The per-turn parameter budget is spent HERE, in the one ordered walk, because this
+    # is the only place that knows which turn a span landed in. Reset with the turn: the
+    # cap bounds one turn's report, not the session's (spec §4a).
+    param_spent = 0
 
     for row in usage_mod.rows(path):
         ts = usage_mod.parse_stamp(row.get("timestamp"))
@@ -658,6 +923,7 @@ def read_transcript(path: Path | str,
                 open_turn = Turn(seq=len(turns) + 1, started=ts, ended=ts)
                 turns.append(open_turn)
                 saw_assistant = False
+                param_spent = 0
             open_turn.triggers.append(prompt)
             continue
         if row.get("type") == "assistant":
@@ -666,10 +932,14 @@ def read_transcript(path: Path | str,
             tool_id = str(block.get("id") or "")
             if not tool_id:
                 continue
+            params, truncated, dropped, param_spent = _params_of(
+                block.get("input"), param_spent)
             span = ToolSpan(name=str(block.get("name") or ""), tool_id=tool_id,
                             started=ts,
                             detail=_detail_of(block.get("input"),
-                                              cfg.quote_chars))
+                                              cfg.quote_chars),
+                            params=params, params_truncated=truncated,
+                            params_dropped=dropped)
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -761,6 +1031,13 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagents)
+    # AFTER `_name_joins`, which rewrites a join's `detail` from the bare task id to
+    # "label (id)": matching on the id as a SUBSTRING works either side of it, so the
+    # order of these two is not a trap for the next reader (spec §4b).
+    anatomy.unattached_subagents = _attach_subagents(
+        turns,
+        [_read_subagent(sub, cfg, anatomy.subagents)
+         for path in sorted(paths) for sub in _subagent_transcripts(path)])
     # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
     # attached before it would be measured against a turn whose `ended` was still its
     # own last row rather than its successor's prompt.
@@ -827,6 +1104,59 @@ def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> Non
                 break
         if home is not None:
             home.calls.append(call)
+
+
+def _read_subagent(path: Path, cfg: InspectConfig,
+                   labels: dict[str, str]) -> SubagentAnatomy:
+    """One subagent transcript, taken apart the way `read_session` takes the parent apart.
+
+    The task id is the stem minus its `agent-` prefix — the same join `_subagent_labels`
+    uses, and the only thing tying "what the lead waited on" to "what that thing was".
+    An unlabelled subagent keeps an empty label: no meta file was written, and there is
+    nothing else in the record to name it.
+    """
+    stem = path.stem
+    task_id = stem[len("agent-"):] if stem.startswith("agent-") else stem
+    turns, _ = read_transcript(path, cfg)
+    calls = usage_mod.calls_of(path)
+    _attach_calls(turns, calls)
+    _close_turns(turns)
+    return SubagentAnatomy(
+        task_id=task_id, label=labels.get(task_id, ""), turns=turns,
+        writes=classify_writes(calls, cfg.report_write_floor,
+                               sorted(usage_mod.compaction_stamps(path))),
+        deeper=len(_subagent_transcripts(path)))
+
+
+def _names(span: ToolSpan, task_id: str) -> bool:
+    """Whether this span names that subagent — `detail` or any reported parameter.
+
+    Substring, not equality: `_name_joins` may already have rewritten `detail` to
+    "label (id)", and the id also arrives inside a `subagent_type`/`prompt` parameter
+    rather than alone.
+    """
+    return span.name in SPAWN_TOOLS and (
+        task_id in span.detail or any(task_id in v for v in span.params.values()))
+
+
+def _attach_subagents(turns: Sequence[Turn],
+                      subs: Sequence[SubagentAnatomy]) -> list[SubagentAnatomy]:
+    """Hang each subagent off the turn whose span NAMES it; return the rest.
+
+    No timestamp fallback, decided on this work order (q687, option 1): containment
+    would invent a parent the record does not name, which is issue 227's mistake. A
+    subagent nothing names is returned to `Anatomy.unattached_subagents` and reported as
+    unattached.
+    """
+    unattached: list[SubagentAnatomy] = []
+    for sub in subs:
+        home = next((t for t in turns
+                     if any(_names(s, sub.task_id) for s in t.spans)), None)
+        if home is None:
+            unattached.append(sub)
+        else:
+            home.subagents.append(sub)
+    return unattached
 
 
 def _name_joins(turns: Sequence[Turn], labels: dict[str, str]) -> None:
