@@ -455,7 +455,8 @@ underivable; and nothing anywhere reports window share, so §5 stands. The kille
 settles it — SIGKILL at t=25.02s exported metrics: none at all, last log flush t=19.54s,
 ~5.5s of events including the final `tool_result` lost — and a 3000ms interval narrows that
 window without closing it, because the exporter dies with the process. The env seam stays
-one line (`claude_cli.py:805`), so the door is open at zero cost. Reason 2's "new failure
+one line — the `env = {**os.environ, **cache_env()}` dict in `claude_cli.spawn_turn` — so
+the door is open at zero cost. Reason 2's "new failure
 mode" was CONTRADICTED: a dead endpoint costs a turn nothing (`rc=0`, `subtype: success`,
 `duration_ms: 7893`) — the concern that replaced it is `user.email` and the account
 identifiers riding on every record and every flush. Parked here as backlog notes, the two

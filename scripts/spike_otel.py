@@ -11,6 +11,7 @@ deliverable; a script that pre-empted it would be answering a question nobody as
 
     uv run python scripts/spike_otel.py --out /tmp/spike-otel-clean
     uv run python scripts/spike_otel.py --mode killed --out /tmp/spike-otel-killed
+    uv run python scripts/spike_otel.py --mode dead --out /tmp/spike-otel-dead
 
 TWO THINGS THIS CANNOT ANSWER, and no run of it ever will:
 
@@ -33,6 +34,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -213,7 +215,8 @@ def otel_env(port: int, protocol: str, interval_ms: int | None,
     return overlay
 
 
-def spawn_turn(overlay: dict[str, str], outfile: Path) -> subprocess.Popen[bytes]:
+def spawn_turn(overlay: dict[str, str], outfile: Path,
+               errfile: Path | None = None) -> subprocess.Popen[bytes]:
     args = [claude(), "-p", "--output-format", "json",
             "--session-id", str(uuid.uuid4()), "--permission-mode", "auto",
             "--", PROMPT]
@@ -222,13 +225,63 @@ def spawn_turn(overlay: dict[str, str], outfile: Path) -> subprocess.Popen[bytes
         env.pop(k, None)
     outfile.parent.mkdir(parents=True, exist_ok=True)
     with outfile.open("wb") as out:
-        return subprocess.Popen(args, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
-                                stdout=out, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+        # errfile only for --mode dead, which must report stderr VERBATIM and so cannot
+        # have it interleaved into the JSON envelope on stdout. Left None everywhere
+        # else, keeping the clean/killed spawn byte-identical to before.
+        if errfile is None:
+            return subprocess.Popen(args, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        with errfile.open("wb") as err:
+            return subprocess.Popen(args, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=err, start_new_session=True)
+
+
+#: Cap on the stderr text copied into summary.json for --mode dead. Stated in the
+#: payload beside the text, because this is output the SCRIPT did not write: a reader
+#: must be able to tell "that was all of it" from "that is where we stopped copying".
+STDERR_CAP = 20000
+
+
+def prove_port_closed() -> dict[str, object]:
+    """Pick a port and PROVE nothing listens on it, or abort.
+
+    Measuring against a port that turned out to be open would be a false negative:
+    some other server would answer the exporter's POSTs, the turn would see a working
+    endpoint, and the run would report "a dead endpoint is harmless" having never had
+    one. So: bind an ephemeral port to learn a free number, close it, then connect and
+    require a refusal. A successful connect means the number was reused between the
+    close and the probe - abort rather than measure the wrong thing.
+    """
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        holder.bind(("127.0.0.1", 0))
+        port = int(holder.getsockname()[1])
+    finally:
+        holder.close()
+    probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe_sock.settimeout(2.0)
+    try:
+        probe_sock.connect(("127.0.0.1", port))
+    except ConnectionRefusedError as exc:
+        proof = {"port": port, "method": "bind ephemeral, close, then connect",
+                 "connect_result": "refused", "connect_error": repr(exc)}
+    except OSError as exc:
+        proof = {"port": port, "method": "bind ephemeral, close, then connect",
+                 "connect_result": "failed (not refused)", "connect_error": repr(exc)}
+    else:
+        probe_sock.close()
+        raise SystemExit(
+            f"abort: connect to 127.0.0.1:{port} SUCCEEDED, so something is listening "
+            f"there. --mode dead measures a turn against a CLOSED port; running it "
+            f"against someone else's server would measure the opposite. Re-run.")
+    finally:
+        probe_sock.close()
+    return proof
 
 
 # --------------------------------------------------------------------------
-# Part 4: harvesting. Every walk is GENERIC - shape-matched, not path-coded - so a
+# Part 3: harvesting. Every walk is GENERIC - shape-matched, not path-coded - so a
 # renamed nesting level still yields its keys instead of silently yielding none.
 # --------------------------------------------------------------------------
 
@@ -348,8 +401,54 @@ def truncate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 # --------------------------------------------------------------------------
-# Part 3: modes. One mode per invocation.
+# Part 4: modes. One mode per invocation.
 # --------------------------------------------------------------------------
+
+def run_dead(a: argparse.Namespace, rec: Recorder, overlay: dict[str, str],
+             workdir: Path, proof: dict[str, object]) -> dict[str, object]:
+    """--mode dead: same turn, endpoint pointed at a port NOTHING listens on.
+
+    This mode exists because the finding it backs was otherwise unreproducible: the
+    closed-port measurement in the findings document (rc=0, subtype success,
+    is_error false, one ordinary stdin warning on stderr) was taken with an ad-hoc
+    shell script that was never committed, so nobody could re-check it from the
+    artifact - wo-b2f8a660 review round 1, defect 1. Measurement only: the numbers and
+    the stderr text go into summary.json and this function draws no conclusion from them.
+    """
+    outfile = workdir / "turn-dead.json"
+    errfile = workdir / "turn-dead.stderr.txt"
+    proc = spawn_turn(overlay, outfile, errfile=errfile)
+    info: dict[str, object] = {"pid": proc.pid, "mode": a.mode,
+                               "closed_port": proof.get("port"),
+                               "closed_port_proof": proof,
+                               "endpoint": overlay["OTEL_EXPORTER_OTLP_ENDPOINT"]}
+    rc = proc.wait()
+    info["turn_rc"] = rc
+    info["turn_done_at_t"] = round(time.monotonic() - rec.t0, 2)
+
+    stderr_text = errfile.read_text(errors="replace") if errfile.exists() else ""
+    info["stderr_bytes"] = errfile.stat().st_size if errfile.exists() else 0
+    info["stderr_cap_chars"] = STDERR_CAP
+    info["stderr_truncated"] = len(stderr_text) > STDERR_CAP
+    info["stderr_verbatim"] = stderr_text[:STDERR_CAP]
+    info["stderr_file"] = str(errfile)
+
+    envelope: object = None
+    try:
+        envelope = json.loads(outfile.read_text())
+    except (OSError, ValueError) as exc:
+        info["envelope_parse_error"] = repr(exc)
+    if isinstance(envelope, dict):
+        info["result_subtype"] = envelope.get("subtype")
+        info["result_is_error"] = envelope.get("is_error")
+        info["result_duration_ms"] = envelope.get("duration_ms")
+    info["stdout_file"] = str(outfile)
+    # No listener was started, so there is nothing to drain and --drain is not honoured
+    # here; said out loud so its absence does not read as a dropped wait.
+    info["drained"] = False
+    print(json.dumps({"event": "turn-settled", **info}, default=str), flush=True)
+    return info
+
 
 def run_mode(a: argparse.Namespace, rec: Recorder,
              overlay: dict[str, str], workdir: Path) -> dict[str, object]:
@@ -392,7 +491,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="Record what Claude Code's OTEL export emits (spec §9). "
                     "Measurements only; no verdict.")
-    ap.add_argument("--mode", choices=("clean", "killed"), default="clean")
+    ap.add_argument("--mode", choices=("clean", "killed", "dead"), default="clean",
+                    help="clean: listener up, turn runs to completion. killed: listener "
+                         "up, group SIGKILLed mid-turn. dead: NO listener, endpoint "
+                         "points at a port proven closed")
     ap.add_argument("--out", default="/tmp/spike-otel")
     ap.add_argument("--protocol", default="http/json",
                     help="OTEL_EXPORTER_OTLP_PROTOCOL (http/json, http/protobuf, grpc)")
@@ -409,7 +511,14 @@ def main() -> int:
 
     workdir = Path(a.out)
     workdir.mkdir(parents=True, exist_ok=True)
-    srv, rec, port = start_listener(workdir)
+    closed_proof: dict[str, object] | None = None
+    if a.mode == "dead":
+        srv = None
+        rec = Recorder(workdir)
+        closed_proof = prove_port_closed()
+        port = int(closed_proof["port"])  # type: ignore[arg-type]
+    else:
+        srv, rec, port = start_listener(workdir)
     overlay = otel_env(port, a.protocol, a.interval_ms, a.log_prompts)
 
     header = {
@@ -417,7 +526,9 @@ def main() -> int:
         "claude_bin": claude(),
         "mode": a.mode,
         "port": port,
-        "drain_s": a.drain,
+        "listener": a.mode != "dead",
+        "closed_port_proof": closed_proof,
+        "drain_s": a.drain if a.mode != "dead" else None,
         "kill_after_s": a.kill_after if a.mode == "killed" else None,
         "protocol": a.protocol,
         "interval_ms": a.interval_ms,
@@ -430,8 +541,12 @@ def main() -> int:
     }
     print(json.dumps(header, indent=2), flush=True)
 
-    info = run_mode(a, rec, overlay, workdir)
-    srv.shutdown()
+    if a.mode == "dead":
+        info = run_dead(a, rec, overlay, workdir, closed_proof or {})
+    else:
+        info = run_mode(a, rec, overlay, workdir)
+    if srv is not None:
+        srv.shutdown()
 
     rows = list(rec.requests)
     summary = {

@@ -10,9 +10,12 @@ needs (tool parameters, cache-write cause, context composition), and on the case
 worth debugging — a turn killed mid-flight — it exports **no metrics at all** and loses
 its last ~5.5 s of log events. The transcript is on disk throughout.
 
-No follow-on feature order is filed. Nothing is built. The env seam stays one line —
-`src/jarvis/claude_cli.py:805`, `env = {**os.environ, **cache_env()}` — so adopting OTEL
-later remains a dict, not an architecture.
+No follow-on feature order is filed. Nothing is built. The env seam stays one line — the
+`env = {**os.environ, **cache_env()}` dict inside `claude_cli.spawn_turn`
+(`src/jarvis/claude_cli.py`) — so adopting OTEL later remains a dict, not an
+architecture. Knowledge entry kn-a2504a39 records this same seam as line 805 as of
+2026-09-25; that ledger is append-only and cannot be corrected in place, so the symbol is
+the address to trust if the line has moved.
 
 **A decline is a full result.** The four reasons in §9 were reasoned, not measured; one
 of them turned out wrong and another understated what arrives. The measurement decided
@@ -37,10 +40,12 @@ ships.
 ## The fix — decline, and keep the door open at zero cost
 
 Adopt nothing. §8 of the parent spec gains a DECLINED entry pointing here and at
-`scripts/spike_otel.py`. The env seam is left exactly as it is: one dict literal at
-`claude_cli.py:805`, which is where an adoption would land if the answer ever changes.
-Nothing in this finding costs anything to keep open, and re-opening the question in a
-year needs **no new measurement** — the six answers below are complete for 2.1.282.
+`scripts/spike_otel.py`. The env seam is left exactly as it is: the
+`env = {**os.environ, **cache_env()}` dict literal in `claude_cli.spawn_turn`, which is
+where an adoption would land if the answer ever changes. Nothing in this finding costs
+anything to keep open. The six answers below are complete **for 2.1.282 only** — a later
+CLI can emit anything and has to be re-measured. `scripts/spike_otel.py` is committed so
+that re-measurement is a script run, not a fresh spike.
 
 Two things OTEL uniquely has are parked as backlog notes in §8 rather than built; see
 "What OTEL has that the transcript does not" below.
@@ -63,12 +68,15 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/json
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:<port>
 ```
 
-Three runs plus one shell-only run:
+Four script runs:
 
 1. `--mode clean` — default intervals, 120 s drain after exit.
 2. `--mode killed --kill-after 25` — SIGKILL the process group mid-tool-call, 120 s drain.
 3. `--mode clean --interval-ms 3000` — control: does the interval knob work at all.
-4. Shell only, endpoint pointed at a **closed** port.
+4. `--mode dead` — no listener, endpoint at a port the script **proves** closed: bind an
+   ephemeral port, close it, require the connect to be refused. The original closed-port
+   measurement was an uncommitted shell run; re-done through the script on 2026-09-25 so
+   the finding is reproducible from the artifact.
 
 The turn's prompt made three Bash calls each running `sleep 4; echo SPIKE-MARKER-<n>`,
 Read a file, and dispatched one built-in `Explore` subagent — so tool parameters, a file
@@ -196,11 +204,20 @@ per worker.
 The new process is the **collector**: one long-lived listener on one port that every
 concurrent headless worker POSTs to, against a core that is deliberately stdlib-only.
 
-Measured failure mode, endpoint pointed at a CLOSED port with telemetry on: the turn was
-completely unharmed — `rc=0`, result envelope `subtype: success`, `is_error: false`,
-`duration_ms: 7893`, and the only stderr line was the unrelated ordinary
-`Warning: no stdin data received in 3s`. So export failure is **silent**: it does not break
-a turn, and it does not report that data was dropped either.
+Measured failure mode, endpoint pointed at a CLOSED port with telemetry on. First
+measurement, ad-hoc shell: the turn was completely unharmed — `rc=0`, result envelope
+`subtype: success`, `is_error: false`, `duration_ms: 7893`, and the only stderr line was
+the unrelated ordinary `Warning: no stdin data received in 3s`. Re-run through
+`--mode dead` on 2026-09-25, CLI 2.1.282: closed port 43883, proof
+`ConnectionRefusedError(111, 'Connection refused')`; `turn_rc: 0`,
+`result_subtype: success`, `result_is_error: false`, `result_duration_ms: 35848`,
+`request_count: 0`, and stderr EMPTY — `stderr_bytes: 0`, cap 20000 chars, not truncated.
+
+So export failure is **silent** in both runs: it does not break a turn, and it does not
+report that data was dropped either. Knowledge entry kn-a2504a39's "no stderr line" holds
+for the script path. The shell run's stdin warning came from how that invocation handled
+stdin, not from telemetry — the script spawns with `stdin=subprocess.DEVNULL`. The two
+runs differ in stdin handling, not in what telemetry reported.
 
 Concurrency was NOT measured — one worker only.
 
@@ -221,8 +238,9 @@ Concurrency was NOT measured — one worker only.
 3. **Confirmed, and STRONGER than stated.** The reason said a dying turn "may never
    flush". Measured: it never flushes metrics at all, and loses its last ~5.5 s of log
    events. Survives.
-4. **Confirmed and unchanged.** The seam is one dict in `claude_cli.spawn_turn`
-   (`claude_cli.py:805`); nothing in this finding costs anything to keep open. Survives.
+4. **Confirmed and unchanged.** The seam is one dict in `claude_cli.spawn_turn` —
+   `env = {**os.environ, **cache_env()}`; nothing in this finding costs anything to keep
+   open. Survives.
 
 ## What OTEL has that the transcript does not — and why it is still a decline
 
