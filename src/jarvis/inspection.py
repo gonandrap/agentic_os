@@ -219,10 +219,21 @@ _PARAM_ASSIGNMENT_RE = re.compile(
 #: …`, `…; NAME=value …`, `env NAME=value …`. The whole-line form above cannot see any
 #: of those, and they are how a credential most often reaches `params["command"]`. The
 #: value runs to the next whitespace, `;`, `&` or `|`, which is where the shell ends it.
+#: The OPENING quote or bracket counts as a boundary too — `bash -c "export TOKEN=…"` and
+#: `ssh host 'API_KEY=… ./run'` are how a credential reaches a nested command line, and
+#: with only whitespace before the name neither was seen at all (review round 2).
 _PARAM_INLINE_ASSIGNMENT_RE = re.compile(
-    r"(?P<head>(?:^|[\s;&|(])(?:(?:export|env|set)[ \t]+)?"
+    r"(?P<head>(?:^|[\s;&|(\"'\[{])(?:(?:export|env|set)[ \t]+)?"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=)"
     r"(?P<value>[^\s;&|]+)")
+
+#: Characters that CLOSE the context around a value instead of belonging to it: the
+#: closing quote of `bash -c "export TOKEN=…"`, the `)]}` of a subshell or a subscript.
+#: Captured INTO the value they made the credential test fail OPEN — `"` is not in the
+#: credential charset, so the value was judged not-a-secret and printed (review round 2,
+#: spec §4a). Trimmed before the two-part test and put back after it, so the marker
+#: replaces the value only and the line still reads as the command that was run.
+_PARAM_VALUE_CLOSERS = "\"')]}"
 
 #: Words that make a name a credential's name, matched against the identifier's PARTS:
 #: `monkey` is not a `key` and `AWS_SECRET_ACCESS_KEY` is.
@@ -269,11 +280,24 @@ def _looks_like_a_credential(raw: str) -> bool:
     return (has_digit and has_alpha) or len(value) >= 20
 
 
+def _assigned_credential(raw: str) -> tuple[bool, str]:
+    """Is this assigned value a credential, and what CLOSERS trail it: `(yes, tail)`.
+
+    The value as matched is tested first: a value inside a BALANCED pair of quotes is a
+    value (`"token": "ghp_…"`), and trimming that pair would break the test instead of
+    fixing it. Only then is the unbalanced trailing quote or bracket trimmed off.
+    """
+    if _looks_like_a_credential(raw):
+        return True, ""
+    trimmed = raw.rstrip(_PARAM_VALUE_CLOSERS)
+    return _looks_like_a_credential(trimmed), raw[len(trimmed):]
+
+
 def _redact_assignment(m: "re.Match[str]") -> str:
     """One inline assignment, kept unless BOTH halves say credential."""
-    if _names_a_credential(m.group("name")) and \
-            _looks_like_a_credential(m.group("value")):
-        return m.group("head") + CREDENTIAL_VALUE_MARKER
+    is_credential, closers = _assigned_credential(m.group("value"))
+    if _names_a_credential(m.group("name")) and is_credential:
+        return m.group("head") + CREDENTIAL_VALUE_MARKER + closers
     return m.group(0)
 
 
@@ -294,9 +318,11 @@ def redact_param(text: str) -> str:
     for line in text.split("\n"):
         line = _PARAM_INLINE_ASSIGNMENT_RE.sub(_redact_assignment, line)
         m = _PARAM_ASSIGNMENT_RE.match(line)
-        if m and _names_a_credential(m.group("name")) and \
-                _looks_like_a_credential(m.group("value")):
-            line = m.group("head") + CREDENTIAL_VALUE_MARKER + m.group("tail")
+        if m and _names_a_credential(m.group("name")):
+            is_credential, closers = _assigned_credential(m.group("value"))
+            if is_credential:
+                line = (m.group("head") + CREDENTIAL_VALUE_MARKER + closers
+                        + m.group("tail"))
         lines.append(line)
     text = "\n".join(lines)
     for pattern, name in _PARAM_SHAPE_RE:
@@ -304,6 +330,34 @@ def redact_param(text: str) -> str:
             lambda m, n=name: (m.groupdict().get("keep") or "") + f"<redacted: {n}>",
             text)
     return text
+
+
+#: How deep the leaf walk goes. 12 is far past any real tool input (`MultiEdit` is two),
+#: and a bound is needed because the input is a worker's JSON, not a schema we control.
+#: At the bound the subtree is redacted as serialised TEXT — best effort, not the leaf
+#: guarantee above it.
+_PARAM_WALK_MAX_DEPTH = 12
+
+
+def _redact_leaves(value: Any, depth: int = 0) -> Any:
+    """Every STRING LEAF of a nested tool input redacted, structure untouched.
+
+    THE CLASS OF BUG THIS EXISTS FOR (spec §4a, reopened in review round 2): a value is
+    redacted at the LEAF, never after serialisation. `json.dumps` turns a credential into
+    one escaped line — `"DB_PASSWORD=hunter2000abc\\n"` — where no assignment regex can
+    see it, so `MultiEdit`'s `edits[].new_string` printed verbatim. Do not move redaction
+    back after the dump. Non-string scalars have no secret to carry and pass through.
+    """
+    if isinstance(value, str):
+        return redact_param(value)
+    if depth >= _PARAM_WALK_MAX_DEPTH:
+        return redact_param(json.dumps(value, default=str))
+    if isinstance(value, dict):
+        return {_redact_leaves(k, depth + 1): _redact_leaves(v, depth + 1)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_leaves(v, depth + 1) for v in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -347,7 +401,12 @@ def _params_of(payload: Any, spent: int,
     dropped: list[str] = []
     span_spent = 0
     for key, value in payload.items():
-        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(_redact_leaves(value), default=str)
+        # Belt and braces: the line pass also runs over the serialised form, which is the
+        # only place a secret spanning two leaves could show up.
         text = redact_param(text)
         if len(text) > caps.per_value:
             text = text[:caps.per_value] + "…"

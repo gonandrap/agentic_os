@@ -700,7 +700,10 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
                # report may get, not a per-project judgement about what is expensive —
                # no catalog wants its own answer to "may this print a megabyte". 6 and
                # 20 are `autoreview`'s credential-length tests, copied with the shapes.
-               6, 20, *inspection.PARAM_CAPS.as_dict().values()}
+               # Same reasoning for the leaf walk's depth bound: a guard against blowing
+               # the stack on a worker's JSON, not a project's choice (review round 2).
+               6, 20, inspection._PARAM_WALK_MAX_DEPTH,
+               *inspection.PARAM_CAPS.as_dict().values()}
     literals = {node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool)}
@@ -1846,3 +1849,129 @@ def test_an_unattached_subagent_gets_its_own_section(write_transcript, capsys):
     out = capsys.readouterr().out
 
     assert "no span named" in out and orphan in out
+
+
+# -- nested tool inputs, and values that end at a quote (spec §4a, review round 2) -----
+
+
+def test_a_secret_in_a_nested_edit_never_reaches_the_payload(write_transcript):
+    """A `MultiEdit` input is a list of dicts, so the credential is a LEAF — and before
+    round 2 it was redacted only after `json.dumps`, where neither assignment regex can
+    see it (escaped newlines, one line, quotes in the way)."""
+    session = write_transcript("nested-edit", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "MultiEdit",
+                   {"edits": [{"new_string": "DB_PASSWORD=hunter2000abc\n"}]}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert "hunter2000abc" not in json.dumps(anatomy.as_dict())
+    assert inspection.CREDENTIAL_VALUE_MARKER in anatomy.turns[0].spans[0].params["edits"]
+
+
+def test_a_secret_in_a_list_of_strings_never_reaches_the_payload(write_transcript):
+    session = write_transcript("nested-list", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"args": ["--quiet", "export TOKEN=abc123def456", 7, None, True]}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "abc123def456" not in json.dumps(span.as_dict())
+    assert "--quiet" in span.params["args"]
+    # Non-string scalars pass through the walk untouched.
+    assert "7" in span.params["args"] and "null" in span.params["args"]
+
+
+def test_a_secret_two_levels_down_in_a_dict_never_reaches_the_payload(write_transcript):
+    session = write_transcript("nested-dict", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "mcp__deploy__run",
+                   {"env": {"stage": {"API_KEY": "sk-live-9f2a8c7b1d4e"}}}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "sk-live-9f2a8c7b1d4e" not in json.dumps(span.as_dict())
+    assert "stage" in span.params["env"]
+
+
+def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
+        write_transcript):
+    """Belt and braces must not read as two findings: the leaf pass and the line pass
+    both see the same text, and the marker must appear ONCE."""
+    session = write_transcript("double-mark", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"parts": ["TOKEN=abc123def456"]}),
+    ])
+    value = inspection.read_session(session).turns[0].spans[0].params["parts"]
+
+    assert value.count(inspection.CREDENTIAL_VALUE_MARKER) == 1
+
+
+def test_a_pathologically_deep_input_is_bounded_and_still_redacted(write_transcript):
+    """The walk is bounded, so a nested input cannot blow the stack — and what sits
+    below the bound is still redacted, as text."""
+    nested: object = {"TOKEN": "abc123def456"}
+    for _ in range(inspection._PARAM_WALK_MAX_DEPTH + 40):
+        nested = {"next": nested}
+    session = write_transcript("deep", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"deep": nested}),
+    ])
+
+    assert "abc123def456" not in json.dumps(
+        inspection.read_session(session).as_dict())
+
+
+def test_a_nested_input_is_redacted_before_it_is_capped(write_transcript):
+    """Order, not an extra allowance: the walk runs first and `ParamCaps` still bites."""
+    session = write_transcript("nested-cap", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "MultiEdit",
+                   {"edits": [{"new_string": "TOKEN=abc123def456 " + "z" * 5_000}]}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "abc123def456" not in json.dumps(span.as_dict())
+    assert len(span.params["edits"]) == inspection.PARAM_CAPS.per_value + 1
+    assert span.params_truncated == ["edits"]
+
+
+@pytest.mark.parametrize("line, leak", [
+    ('bash -c "export TOKEN=abc123def"', "abc123def"),
+    ("ssh host 'API_KEY=abc123def456 ./run'", "abc123def456"),
+    ("sh -c (PASSWORD=hunter2000abc ./deploy)", "hunter2000abc"),
+    ('bash -c "printf %s ${VARS[API_KEY=abc123def456]}"', "abc123def456"),
+])
+def test_an_assignment_that_ends_at_a_quote_or_bracket_loses_its_value(line, leak):
+    """It used to fail OPEN: the closing quote was captured INTO the value, so the
+    credential test rejected it on a character the shell never gave it (round 2)."""
+    out = inspection.redact_param(line)
+
+    assert inspection.CREDENTIAL_VALUE_MARKER in out
+    assert leak not in out
+
+
+@pytest.mark.parametrize("line, redacted", [
+    ('bash -c "export TOKEN=abc123def"',
+     'bash -c "export TOKEN=<redacted: a credential value>"'),
+    ("ssh host 'API_KEY=abc123def456 ./run'",
+     "ssh host 'API_KEY=<redacted: a credential value> ./run'"),
+    ("sh -c (PASSWORD=hunter2000abc ./deploy)",
+     "sh -c (PASSWORD=<redacted: a credential value> ./deploy)"),
+])
+def test_the_quote_around_a_redacted_value_survives(line, redacted):
+    """The marker replaces the VALUE only: the redacted line must still read as the
+    command that was run."""
+    assert inspection.redact_param(line) == redacted
+
+
+@pytest.mark.parametrize("line, leak", [
+    ('bash -c "mysql --password s3cr3tpa55 -h db"', "s3cr3tpa55"),
+    ("sh -c 'gh auth login --token=ghXYZ012abc9'", "ghXYZ012abc9"),
+])
+def test_a_credential_flag_inside_quotes_loses_its_value(line, leak):
+    out = inspection.redact_param(line)
+
+    assert "<redacted: a credential passed as a flag>" in out
+    assert leak not in out
