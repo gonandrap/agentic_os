@@ -42,7 +42,7 @@ def _wo(fleet, **kwargs) -> dict:
 
 def test_start_mints_a_uuid_and_records_the_turn(fleet, settle_turns):
     wo = _wo(fleet)
-    turn = worker_session.start(fleet["store"], fleet["project"], wo, "go")
+    turn, _ = worker_session.start(fleet["store"], fleet["project"], wo, "go")
 
     fresh = fleet["store"].get_work_order(wo["id"])
     assert uuid.UUID(fresh["session_id"])       # a real uuid: --session-id demands one
@@ -127,7 +127,7 @@ def test_an_empty_reply_falls_back_to_what_the_stop_hook_saw(fleet):
 
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
-    turn = worker_session.start(store, project, wo, "go")
+    turn, _ = worker_session.start(store, project, wo, "go")
     sid = store.get_work_order(wo["id"])["session_id"]
 
     handle_hook({"hook_event_name": "Stop", "session_id": sid,
@@ -183,7 +183,7 @@ def test_cancel_kills_the_process_group(fleet, fake_claude):
     store, project = fleet["store"], fleet["project"]
     fake_claude.hold_turns()
     wo = _wo(fleet)
-    turn = worker_session.start(store, project, wo, "go")
+    turn, _ = worker_session.start(store, project, wo, "go")
     assert claude_cli.process_alive(turn["pid"])
 
     out = worker_session.cancel(store, wo["id"])
@@ -232,7 +232,7 @@ def test_a_finished_turn_is_not_reported_alive_as_a_zombie(fleet):
 
     store, project = fleet["store"], fleet["project"]
     wo = _wo(fleet)
-    turn = worker_session.start(store, project, wo, "go")
+    turn, _ = worker_session.start(store, project, wo, "go")
 
     # wait for the process to finish WITHOUT reaping it — that is what makes a zombie
     deadline = time.monotonic() + 15
@@ -258,7 +258,7 @@ def test_a_just_launched_turn_is_never_reported_dead(fleet, fake_claude, settle_
     gate = fake_claude.hold_turns()
     for _ in range(8):
         wo = _wo(fleet)
-        turn = worker_session.start(store, project, wo, "go")
+        turn, _ = worker_session.start(store, project, wo, "go")
         assert claude_cli.process_alive(turn["pid"]), "reaped a turn that just started"
         assert worker_session.poll(store) == []
     gate.unlink()
