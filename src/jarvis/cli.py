@@ -634,6 +634,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
 
+    wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
+                                   "what has held it, what the OS spent on it, and the "
+                                   "commands that would be accepted right now")
+    wy.add_argument("wo_id")
+    wy.add_argument("--project")
+
     # feature orders -------------------------------------------------------------------
     # Parallel to `wo` on purpose: a user who knows the work-order surface should not
     # have to learn a second grammar to use the one above it.
@@ -2438,7 +2444,88 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "why":
+        diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
+        if args.json:
+            _print(diagnosis, True)
+        else:
+            _print_diagnosis(diagnosis)
     return 0
+
+
+def _print_diagnosis(d: dict[str, Any]) -> None:
+    """`jarvis wo why` for a person — A RENDERER AND NOTHING ELSE.
+
+    It computes no number, no total and no duration: every figure and every sentence
+    below is already in the payload, `ops.diagnose` having put the formatted durations
+    there itself. That rule is the whole reason the two surfaces cannot drift — a
+    terminal reader and a `--json` consumer are looking at one reading of one record,
+    not two derivations of it.
+
+    Order is the order the question gets asked: what is it waiting for, whether the OS's
+    two answers agree, when anything last happened, what has held it, what the OS spent
+    on it, and finally what to type.
+    """
+    print(f"{d['wo_id']} — {d['title']}  ({d['project']})")
+    print(f"  {d['status_label']}")
+    print(f"\nwaiting on: {d['blocker']['what']} — {d['blocker']['detail']}")
+    for blocker in d["needs_you"]:
+        print(f"  needs you: {blocker}")
+    for note in (d["notes"]["parked"], d["notes"]["pause"], d["notes"]["fleet_hold"]):
+        if note:
+            print(f"  {note}")
+    for sentence in d["disagreements"]:
+        print(f"  ⚠ {sentence}")
+
+    clock = d["clock"]
+    print("\nthe OS's record:")
+    if clock["last_status"]:
+        print(f"  last status    {clock['last_status']['status']} · "
+              f"{clock['last_status']['ago']} ago")
+    if clock["last_turn"]:
+        turn = clock["last_turn"]
+        print(f"  last turn      {turn['label']} {turn['state']} · "
+              f"{turn['ago']} ago")
+    if clock["last_event"]:
+        print(f"  last event     {clock['last_event']['kind']} · "
+              f"{clock['last_event']['ago']} ago")
+    if clock["note"]:
+        print(f"  {clock['note']}")
+    print(f"  {clock['live_note']}")
+
+    held = d["holds"]
+    if held["episodes"]:
+        print("\nheld by the OS:")
+        for episode in held["episodes"]:
+            mark = " (still held)" if episode["open"] else ""
+            print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    residual = held["unexplained"]
+    if residual["seconds"] is None:
+        print(f"  unexplained: none measurable — {residual['note']}")
+    elif residual["seconds"]:
+        print(f"  unexplained: {residual['seconds_human']} — "
+              f"{residual['note']}")
+
+    calls = d["os_calls"]
+    if calls["calls"]:
+        print(f"\nthe OS's own calls for this order: {calls['calls']}, "
+              f"{calls['failed']} unreachable")
+        # Newest first, which is the order `_os_calls_detail` returns. The slice depth
+        # and the remainder are both the payload's (`shown_limit`, `more`) — a count
+        # worked out here would be a second arithmetic for `--json` to disagree with.
+        for row in calls["rows"][:calls["shown_limit"]]:
+            print(f"  {row['outcome']:>11}  {row['kind']} · {row['label']}")
+        if calls["more"]:
+            print(f"  … and {calls['more']} older call(s) — `jarvis wo why "
+                  f"{d['wo_id']} --json` has them all")
+        if calls["failed"] or calls["capped"]:
+            print(f"  {calls['note']}")
+
+    print(f"\n{d['way_through']['note']}")
+    for command in d["commands"]:
+        print(f"  {command['command']}\n      {command['why']}")
+    for refusal in d["refusals"]:
+        print(f"  not offered: {refusal}")
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
