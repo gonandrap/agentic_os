@@ -76,6 +76,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .stakes import Stakes
+
 log = logging.getLogger(__name__)
 
 #: The Neo question kind. `neo_store.Q_KINDS` carries the full list — adding one is SEVEN
@@ -183,42 +185,59 @@ PROVISIONAL_OBJECT = "object"
 #:
 #: Word boundaries on both sides: `\bkey\b` must not fire on "monkey", and a substring
 #: match would make the list unreadable as the rule it is meant to be.
+#: The data objects a destructive verb needs before it is an act rather than a word. ONE
+#: list, shared by the wide net's `drop` row and by every tightened destructive verb.
+_DATA_OBJECTS = (r"tables?|columns?|databases?|db|indexe?s?|rows?|records?|data|"
+                 r"collections?|buckets?|volumes?")
+#: Up to two words may sit between the verb and its object, but not a preposition or a
+#: conjunction: "dropped from the record" and "deleted when the row is stale" are not acts.
+_NOT_A_PREPOSITION = (r"(?:(?!from\b|in\b|into\b|out\b|off\b|on\b|to\b|by\b|for\b|at\b|"
+                      r"when\b|during\b|because\b|so\b)\w+\s+){0,2}")
+
+_HS_CREDENTIAL = r"credential|secret|password|\bapi[ -]?key\b|\btoken\b|\bauth\b"
+# `live` only as a live THING; `production`/`prod` name it on their own.
+_HS_PRODUCTION = (r"\bproduction\b|\bprod\b"
+                  r"|\blive\s+(?:credential|key|secret|token|data|database|db|"
+                  r"environment|env|traffic|system|server|fleet|user|account|customer|"
+                  r"instance|deployment|service)"
+                  r"|\bgo(?:es|ing|ne)?\s+live\b")
+# `drop` only with a data object AFTER it — "dropped from the record" is not one.
+_HS_DESTRUCTIVE = (r"\bdelet|\bdestroy|\btruncat|\birreversib|\bpurge"
+                   r"|\bdrop(?:s|ped|ping)?\s+(?:(?:the|a|an|all|this|these|its)\s+)?"
+                   + _NOT_A_PREPOSITION + rf"(?:{_DATA_OBJECTS})\b")
+# The noun `migration` IS the act. The verb needs its object, and `schema` needs a
+# verb: "migrate to the new helper" and "the schema of the reply" are neither.
+_HS_SCHEMA = (r"|\bmigrat(?:e|es|ed|ing)\s+(?:(?:the|a|an|all)\s+)?(?:\w+\s+){0,2}"
+              r"(?:database|db|schema|tables?|data|rows?|users?|production|prod)\b"
+              r"|\bschema\s+(?:change|migration|edit|rewrite)|\bchange\s+the\s+schema\b"
+              r"|\balter\s+(?:the\s+)?(?:table|column|schema)|\bALTER\s+TABLE\b"
+              r"|\b(?:add|adds|adding|drop|drops|dropping|rename|renames|renaming)\s+"
+              r"(?:a|the)\s+column\b")
+_HS_MIGRATION = r"\bmigrations?\b|\bbackfill" + _HS_SCHEMA
+_HS_MONEY = r"\bbill(ed|ing|s)?\b|\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b|\bspend"
+# Shipping something somewhere — not the noun "the next release".
+_HS_SHIPPING_TAIL = (r"|\brelease\w*\s+(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|"
+                     r"customers?|the\s+fleet|pypi|npm)\b"
+                     r"|\b(?:ship|ships|shipped|shipping|push|pushes|pushed|pushing)\s+"
+                     r"(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|customers?|"
+                     r"the\s+fleet|main|master|pypi|npm)\b")
+_HS_SHIPPING = (r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b|\bdeploy\w*\s+(?:\S+\s+){0,3}?to\b"
+                r"|\b(?:cut|cuts|cutting|ship|ships|shipped|shipping|make|makes|making)"
+                r"\s+(?:a|the|another)\s+release\b" + _HS_SHIPPING_TAIL)
+_HS_PII = r"\bpii\b|\bgdpr\b|personal data|\bpersonally identifiable"
+_HS_LEGAL = r"\blicen[cs]e|\blegal\b|\bcopyright\b"
+_HS_BREAKING = r"breaking change|backward(s)? incompatible"
+
 HIGH_STAKES = (
-    r"credential|secret|password|\bapi[ -]?key\b|\btoken\b|\bauth\b",
-    # `live` only as a live THING; `production`/`prod` name it on their own.
-    r"\bproduction\b|\bprod\b"
-    r"|\blive\s+(?:credential|key|secret|token|data|database|db|environment|env|"
-    r"traffic|system|server|fleet|user|account|customer|instance|deployment|service)"
-    r"|\bgo(?:es|ing|ne)?\s+live\b",
-    # `drop` only with a data object AFTER it — "dropped from the record" is not one.
-    r"\bdelet|\bdestroy|\btruncat|\birreversib|\bpurge"
-    r"|\bdrop(?:s|ped|ping)?\s+(?:(?:the|a|an|all|this|these|its)\s+)?"
-    r"(?:(?!from\b|in\b|into\b|out\b|off\b|on\b|to\b|by\b|for\b|at\b|when\b|"
-    r"during\b|because\b|so\b)\w+\s+){0,2}"
-    r"(?:tables?|columns?|databases?|db|indexe?s?|rows?|records?|data|"
-    r"collections?|buckets?|volumes?)\b",
-    # The noun `migration` IS the act. The verb needs its object, and `schema` needs a
-    # verb: "migrate to the new helper" and "the schema of the reply" are neither.
-    r"\bmigrations?\b|\bbackfill"
-    r"|\bmigrat(?:e|es|ed|ing)\s+(?:(?:the|a|an|all)\s+)?(?:\w+\s+){0,2}"
-    r"(?:database|db|schema|tables?|data|rows?|users?|production|prod)\b"
-    r"|\bschema\s+(?:change|migration|edit|rewrite)|\bchange\s+the\s+schema\b"
-    r"|\balter\s+(?:the\s+)?(?:table|column|schema)|\bALTER\s+TABLE\b"
-    r"|\b(?:add|adds|adding|drop|drops|dropping|rename|renames|renaming)\s+"
-    r"(?:a|the)\s+column\b",
-    r"\bbill(ed|ing|s)?\b|\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b|\bspend",
-    # Shipping something somewhere — not the noun "the next release".
-    r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b|\bdeploy\w*\s+(?:\S+\s+){0,3}?to\b"
-    r"|\b(?:cut|cuts|cutting|ship|ships|shipped|shipping|make|makes|making)\s+"
-    r"(?:a|the|another)\s+release\b"
-    r"|\brelease\w*\s+(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|customers?|"
-    r"the\s+fleet|pypi|npm)\b"
-    r"|\b(?:ship|ships|shipped|shipping|push|pushes|pushed|pushing)\s+"
-    r"(?:\S+\s+){0,3}?to\s+(?:prod|production|users?|customers?|the\s+fleet|"
-    r"main|master|pypi|npm)\b",
-    r"\bpii\b|\bgdpr\b|personal data|\bpersonally identifiable",
-    r"\blicen[cs]e|\blegal\b|\bcopyright\b",
-    r"breaking change|backward(s)? incompatible",
+    _HS_CREDENTIAL,
+    _HS_PRODUCTION,
+    _HS_DESTRUCTIVE,
+    _HS_MIGRATION,
+    _HS_MONEY,
+    _HS_SHIPPING,
+    _HS_PII,
+    _HS_LEGAL,
+    _HS_BREAKING,
 )
 
 #: THE ONE CARVE-OUT, and it is a sense of a word rather than a word (Neo, question 562).
@@ -235,25 +254,171 @@ HIGH_STAKES_SENSE_CARVE_OUTS = (
     r"\b\d+[km]?\s+tokens?\b",
 )
 
+# -- the tightened net (`validation.stakes_classifier: regex-tightened`) ---------------
+
+#: THE TIGHTENED NET, and every row of it was derived from a MEASURED false positive.
+#:
+#: The A/B of §3.9 ran on 485 hand-labelled production assumptions. No model arm cleared
+#: the bar (recall >= 0.667 at precision > 0.140) and haiku answered the same row two ways
+#: on 7.5% of a repeat run, so the recommendation became a tightened regex instead
+#: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md §6-§7).
+#:
+#: Each row below replaces a WIDE row and names the class of false positives it removes;
+#: `evals/tools/score_stakes_regex.py` re-scores both nets and is the only place the
+#: corpus is read. THE WIDE NET IS UNCHANGED and stays the default, so this is an opt-in
+#: mode rather than a narrowing of what ships.
+#:
+#: **`production`/`prod` IS DELIBERATELY NOT TIGHTENED — a knowing asymmetry.** It carries
+#: 7 of the false positives, and tightening it to acts would clear wo-1ee46481#1, which is
+#: the true positive the USER themselves named: its text mentions production rather than
+#: acting on it. A rule that loses the one case the user pointed at is not worth 7 rows of
+#: precision.
+_HST_DESTRUCTIVE_VERBS = (r"delet(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|"
+                          r"truncat(?:e|es|ed|ing)|drop(?:s|ped|ping)?|"
+                          r"wip(?:e|es|ed|ing)")
+#: 19 false positives, every one deleting CODE or a record about code — a test, an
+#: assertion, a line of markup, a method, dead code. `truncat` adds 5 more, all clipping
+#: text for display. So every destructive verb needs what `drop` already needed: a DATA
+#: object, or a live subject. `irreversib` and `purge` stay bare (no false positives).
+_HST_DESTRUCTIVE = (rf"\b(?:{_HST_DESTRUCTIVE_VERBS})\s+"
+                    r"(?:(?:the|a|an|all|this|these|its|four|every|six)\s+)?"
+                    + _NOT_A_PREPOSITION
+                    + rf"(?:{_DATA_OBJECTS}|(?:live|production|prod)\s+\w+)\b"
+                    r"|\birreversib|\bpurge")
+#: A currency amount, or money named as money. 14 false positives spent a ROUND, a SLOT, a
+#: WRITER, a CAP, a BUDGET, a concurrency slot — this repo's own units, not the user's.
+_HST_MONEY_OBJECT = (r"(?:\$\s?[\d,]+(?:\.\d+)?|\b\d+(?:\.\d+)?\s*(?:usd|dollars?|"
+                     r"cents?|eur|gbp)\b|\bdollars?\b|\busd\b|\bmoney\b|"
+                     r"\breal\s+api\s+calls?\b)")
+#: `bill` is DROPPED, not narrowed: 6 false positives and zero high rows. In this repo it
+#: is the name of the cost report and its module (`bill.PAYLOAD_VERSION`, "the window's
+#: bill", "still being billed"). `invoice`, `charge`, `price` stay.
+_HST_MONEY = (r"\bprice|\bpricing\b|\binvoice|\bcharge[ds]?\b"
+              rf"|\bspen(?:d|ds|t|ding)\b[^.;]{{0,40}}?{_HST_MONEY_OBJECT}")
+#: 4 false positives are the ADDED_COLUMNS mechanism or a gap left open on purpose ("no
+#: migration", "would buy a migration and five store verbs"). The bare NOUN is not the act
+#: here: it must be RUN or APPLIED. The verb forms of the wide row are unchanged.
+_HST_MIGRATION = (r"\b(?:run|runs|ran|running|appl(?:y|ies|ied|ying)|"
+                  r"execut(?:e|es|ed|ing))\s+(?:(?:the|a|an|another|its|one)\s+)?"
+                  r"(?:\w+\s+){0,2}(?:migrations?|backfill\w*)\b"
+                  r"|\b(?:migrations?|backfill\w*)(?:\s+\w+){0,3}?\s+(?:was|were|is|are|"
+                  r"be|been|gets?|got)\s+(?:\w+\s+){0,2}?(?:run|ran|applied|executed)\b"
+                  + _HS_SCHEMA)
+#: `make/makes/making a release` is 1 false positive ("what makes a release verifiable")
+#: and no high rows: `cut` and `ship` are the verbs that ship.
+_HST_SHIPPING = (r"\bpublish\w*\s+(?:\S+\s+){0,3}?to\b"
+                 r"|\bdeploy\w*\s+(?:\S+\s+){0,3}?to\b"
+                 r"|\b(?:cut|cuts|cutting|ship|ships|shipped|shipping)\s+"
+                 r"(?:a|the|another)\s+release\b" + _HS_SHIPPING_TAIL)
+#: ADDITION 1 of 3, for 4 of the 6 rows the wide net MISSES: settling which version ships.
+#: A BARE DOTTED VERSION MUST NOT MATCH — this repo quotes tool versions constantly ("gh
+#: 2.86", "CC 2.1.282") and a bare match would be a worse false-positive class than the
+#: ones being removed. So each alternative carries the act: a bump, the word `version`, or
+#: a tag or release branch naming the number.
+_HST_VERSION = (r"\b(?:patch|minor|major)[\s-]?bump\w*"
+                r"|\b(?:patch|minor|major)[\s-]?bumps?\s+the\b"
+                r"|\bbump(?:s|ed|ing)?\s+(?:\S+\s+){0,3}?v?\d+\.\d+(?:\.\d+)?\b"
+                r"|\b(?:release\s+)?version\s+v?\d+\.\d+\.\d+\b"
+                r"|\b(?:tag|tags|tagged|tagging)\s+[\w./-]*\d+\.\d+\.\d+"
+                r"|\brelease/[\w.-]*\d+\.\d+\.\d+")
+#: ADDITION 2: moving a remote ref (`wo-29d99c67#3`, a force-push with a lease).
+#: `non-fast-forward` was in the brief and is NOT here: measured, it named a push being
+#: REJECTED as one ("my push was rejected as non-fast-forward, and a rebase would have
+#: rewritten commits already on the public remote") — a failure being handled, the same
+#: shape as the auth carve-out, and it bought no true positive.
+_HST_REMOTE_REF = (r"\bforce[- ]?push\w*|--force-with-lease|\bforce[- ]updat\w+"
+                   r"|\b(?:updat|mov|repoint|push|reset)\w*\s+(?:only\s+)?"
+                   r"(?:(?:the|a|its)\s+)?remote\s+(?:branch|ref|tag|head)\b")
+#: ADDITION 3: arming or disarming a privileged-action control (`wo-551f5e8c#1`,
+#: four live gate exemptions retracted). `exemption` may NOT stand bare — "the manager
+#: exemption in count_active" is a code-level exemption and would be a new false positive.
+_HST_GATE_CONTROL = (r"\brule-retract\b"
+                     r"|\bretract\w*\s+(?:\S+\s+){0,3}?(?:rules?|exemptions?)\b"
+                     r"|\b(?:live|learned|gate)\s+exemptions?\b"
+                     r"|\bre-?arm(?:s|ed|ing)?\s+(?:(?:a|the)\s+)?gate")
+
+HIGH_STAKES_TIGHTENED = (
+    _HS_CREDENTIAL,
+    _HS_PRODUCTION,     # deliberately untightened — see above
+    _HST_DESTRUCTIVE,
+    _HST_MIGRATION,
+    _HST_MONEY,
+    _HST_SHIPPING,
+    _HS_PII,
+    _HS_LEGAL,
+    _HS_BREAKING,
+    _HST_VERSION,
+    _HST_REMOTE_REF,
+    _HST_GATE_CONTROL,
+)
+
+#: The tightened net's extra senses. SAME KIND AS `HIGH_STAKES_SENSE_CARVE_OUTS` and its
+#: docstring's rule still holds — not a general excuse register: the five `token` spans
+#: below are the measurement-and-parsing sense that list already carves (a single-token
+#: insertion, a zero-token row, a `FORCE_` marker, a token-efficiency request, a JSON
+#: token), and none of them is a credential. The other three are a word quoted as a
+#: keyword or used in its permission sense: `ON DELETE CASCADE` is SQL in prose, an auth
+#: FAILURE is one being handled or rendered rather than a credential touched, and "licence
+#: to ship a thin body" is permission, not licensing.
+HIGH_STAKES_TIGHTENED_CARVE_OUTS = HIGH_STAKES_SENSE_CARVE_OUTS + (
+    r"\b(?:single|zero|one|two|multi|per|no)[- ]token\b",
+    r"\btoken[- ]efficien\w*",
+    r"\bFORCE_\w*\s+tokens?\b",
+    r"\b(?:json|valid|closing|closer|bare|last)\s+tokens?\b",
+    r"\bon\s+delete\s+(?:cascade|set\s+null|restrict|no\s+action)\b",
+    r"\bauth[\s-](?:failure|failures|error|errors|blocker|blockers|paused)\b",
+    r"\bcould\s+not\s+authenticate\b",
+    r"\blicen[cs]e\s+to\s+\w+",
+)
+
 _HIGH_STAKES_RE = re.compile("|".join(HIGH_STAKES), re.IGNORECASE)
 _CARVE_OUT_RE = re.compile("|".join(HIGH_STAKES_SENSE_CARVE_OUTS), re.IGNORECASE)
+_HIGH_STAKES_TIGHTENED_RE = re.compile("|".join(HIGH_STAKES_TIGHTENED), re.IGNORECASE)
+_CARVE_OUT_TIGHTENED_RE = re.compile("|".join(HIGH_STAKES_TIGHTENED_CARVE_OUTS),
+                                     re.IGNORECASE)
 
 
-def high_stakes_marker(text: str) -> str:
+def high_stakes_marker(text: str, *, tightened: bool = False) -> str:
     """The high-stakes phrase this assumption contains, or `''`. Pure, no model.
 
     Returns the matched text rather than a boolean so the hold can SAY what it matched:
     "held — 'production' is a word the OS does not rule on" is actionable, and "high
     stakes" is not.
+
+    `tightened=False` is the SHIPPED net and every existing caller: one matcher, two
+    pattern sets, so the two nets can never drift apart in how a match is read or how a
+    carve-out is applied. `tightened=True` is `HIGH_STAKES_TIGHTENED`, reached only by
+    `validation.stakes_classifier: regex-tightened`.
     """
     text = text or ""
-    carved = [m.span() for m in _CARVE_OUT_RE.finditer(text)]
-    for m in _HIGH_STAKES_RE.finditer(text):
+    net = _HIGH_STAKES_TIGHTENED_RE if tightened else _HIGH_STAKES_RE
+    carve = _CARVE_OUT_TIGHTENED_RE if tightened else _CARVE_OUT_RE
+    carved = [m.span() for m in carve.finditer(text)]
+    for m in net.finditer(text):
         start, end = m.span()
         if any(a <= start and end <= b for a, b in carved):
             continue
         return m.group(0)
     return ""
+
+
+def tightened_verdict(text: str) -> Stakes:
+    """The tightened net's answer in the CLASSIFIER's verdict type. Pure, no model.
+
+    `decide`'s condition 7 takes either `stakes=None` (run the wide net here) or a
+    `Stakes`, so mode `regex-tightened` needs no third code path in the decision table:
+    the daemon hands the tightened net's answer over in the same shape a model's would
+    arrive in. `model` says which net ruled, so a hold is never read as a model's ruling —
+    `parsed` is True because something DID rule, unlike the two classifier failure paths.
+
+    `category` stays empty: a regex match is a phrase, not one of `stakes.STAKES_CATEGORIES`,
+    and inventing one would put a category on the record that nothing decided.
+    """
+    marker = high_stakes_marker(text, tightened=True)
+    if not marker:
+        return Stakes(high=False, category="none", reason="", model="regex-tightened")
+    return Stakes(high=True, category="",
+                  reason=f"its text says {marker!r}", model="regex-tightened")
 
 
 # -- the second net's second gate: a diff the OS will not copy into a question ---------
@@ -538,9 +703,27 @@ def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
                     **fields)
 
 
+def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
+    """The high-stakes hold as the CLASSIFIER states it.
+
+    `reason` REPLACES the matched phrase (2026-09-25 spec SS3.2). `high_stakes_marker`
+    returns matched text rather than a boolean so the hold can say why — "mentions
+    'production'" — and under the classifier there is no phrase to name: the line says
+    what the OS thinks the worker DID, and the category names which clause of
+    `neo.PERSONA` it falls under. On the two failure paths `reason` is
+    `stakes.HIGH_UNREACHABLE` or `stakes.HIGH_UNPARSEABLE` and `category` is empty, so a
+    hold nobody ruled on never reads like a ruling.
+    """
+    category = f" ({verdict.category})" if verdict.category else ""
+    return _held(HELD_HIGH_STAKES,
+                 f"assumption #{n} commits to an act{category}: "
+                 f"{verdict.reason or 'no reason given'} — the OS does not decide those "
+                 f"for you, whatever it thinks of them", **fields)
+
+
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            round_outcome: str = "", refusal_answered: bool = True,
-           asked_question_id: int = 0) -> Decision:
+           asked_question_id: int = 0, stakes: Stakes | None = None) -> Decision:
     """May the OS decide this assumption right now? PURE — no store, no clock, no model.
 
     Dicts in, armed-or-held-with-a-reason out, for `automerge.decide`'s reason: the whole
@@ -567,7 +750,12 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
        would land the very decision the user turned down;
     6. it is not already with Neo on some OTHER question — one question per assumption,
        ever (see `asked_question_id` below);
-    7. `high_stakes_marker` finds nothing in its text.
+    7. nothing in its text is high-stakes. WHICH NET ANSWERS THAT IS THE CALLER'S
+       CHOICE: with `stakes=None` — every existing caller, and the shipped `regex` mode
+       — this function runs `high_stakes_marker` itself, exactly as it always has. Given
+       a `stakes.Stakes`, the classifier's verdict decides instead and the hold carries
+       its reason and category (2026-09-25 spec SS3.7). THE FUNCTION STAYS PURE either
+       way: the model call is the caller's, in `Daemon._classify_stakes`.
 
     Condition 1's redundancy with `Daemon.auto_review`'s own guard is deliberate and is
     `two-gates-not-a-chain`'s shape: a project's permission is asserted at the site that
@@ -617,18 +805,25 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     if asked and asked != int(asked_question_id or 0):
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
-    marker = high_stakes_marker(str(assumption.get("content") or ""))
-    if marker:
-        return _held(HELD_HIGH_STAKES,
-                     f"assumption #{n} mentions {marker!r} — the OS does not decide "
-                     f"those for you, whatever it thinks of them", **fields)
+    if stakes is not None:
+        # The caller computed the verdict (`Daemon._classify_stakes`) and this function
+        # stays PURE. `stakes=None` is today's behaviour and the shipped `regex` mode.
+        if stakes.high:
+            return _stakes_hold(n, stakes, fields)
+    else:
+        marker = high_stakes_marker(str(assumption.get("content") or ""))
+        if marker:
+            return _held(HELD_HIGH_STAKES,
+                         f"assumption #{n} mentions {marker!r} — the OS does not decide "
+                         f"those for you, whatever it thinks of them", **fields)
     return Decision(armed=True, code="armed",
                     reason=f"assumption #{n} is routine enough to put to Neo", **fields)
 
 
 def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    round_outcome: str = "", refusal_answered: bool = True,
-                   objections_outstanding: bool = False) -> Decision:
+                   objections_outstanding: bool = False,
+                   stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
 
     docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
@@ -679,12 +874,16 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "been withdrawn yet — confirming is retried once it has", **fields)
     return decide(assumption, wo, cfg, round_outcome=round_outcome,
                   refusal_answered=refusal_answered,
-                  asked_question_id=int(assumption.get("neo_question_id") or 0))
+                  asked_question_id=int(assumption.get("neo_question_id") or 0),
+                  # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is
+                  # gated by the same verdict the ask pass was.
+                  stakes=stakes)
 
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  round_outcome: str = "", refusal_answered: bool = True,
-                 asked_question_id: int | None = None) -> Decision:
+                 asked_question_id: int | None = None,
+                 stakes: Stakes | None = None) -> Decision:
     """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? PURE.
 
     docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-runs.md
@@ -709,8 +908,9 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
        and it is what §7 confirms against;
     5. the PANEL HAS NOT GIVEN UP, 6. no refusal of the user's is outstanding and 7. it is
        not already with Neo, each for `decide`'s reason at the same number;
-    8. `high_stakes_marker` finds nothing in its text. **Both nets stay armed in this
-       pass** (§2): the regex before any call, `read_ruling`'s allowlist on the reply.
+    8. nothing in its text is high-stakes, by `decide`'s condition 7 and its `stakes`
+       argument. **Both nets stay armed in this pass** (§2): net 1 before any reviewer
+       call, `read_ruling`'s allowlist on the reply.
 
     `asked_question_id` is here for `decide`'s reason and is unused by any caller today —
     this pass has no settle site to re-check against, and a second call excluding its own
@@ -750,11 +950,17 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     if asked and asked != int(asked_question_id or 0):
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
-    marker = high_stakes_marker(str(assumption.get("content") or ""))
-    if marker:
-        return _held(HELD_HIGH_STAKES,
-                     f"assumption #{n} mentions {marker!r} — the OS does not decide "
-                     f"those for you, whatever it thinks of them", **fields)
+    if stakes is not None:
+        # The caller computed the verdict (`Daemon._classify_stakes`) and this function
+        # stays PURE. `stakes=None` is today's behaviour and the shipped `regex` mode.
+        if stakes.high:
+            return _stakes_hold(n, stakes, fields)
+    else:
+        marker = high_stakes_marker(str(assumption.get("content") or ""))
+        if marker:
+            return _held(HELD_HIGH_STAKES,
+                         f"assumption #{n} mentions {marker!r} — the OS does not decide "
+                         f"those for you, whatever it thinks of them", **fields)
     return Decision(armed=True, code="armed",
                     reason=f"assumption #{n} is routine enough to put to Neo while the "
                            f"worker can still act on it", **fields)

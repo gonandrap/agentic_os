@@ -4950,9 +4950,13 @@ class Daemon:
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):
-                decision = autoreview.decide_confirm(
-                    a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
-                    objections_outstanding=objecting)
+                def confirm(stakes_verdict=None, a=a):
+                    return autoreview.decide_confirm(
+                        a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
+                        objections_outstanding=objecting, stakes=stakes_verdict)
+
+                decision = self._stakes_reviewed(project, store, wo, cfg, a,
+                                                 confirm(), confirm)
                 if not decision.armed:
                     self._note_autoreview_held(store, wo["id"], decision,
                                                suppress=suppress)
@@ -4973,14 +4977,156 @@ class Daemon:
                                                 assumptions, stat=packet[0],
                                                 diff=packet[1])
                 continue
-            decision = rule(a, wo, cfg, round_outcome=outcome,
-                            refusal_answered=answered)
+            def judge(stakes_verdict=None, a=a):
+                return rule(a, wo, cfg, round_outcome=outcome,
+                            refusal_answered=answered, stakes=stakes_verdict)
+
+            decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision,
                                            suppress=suppress)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early)
+
+    def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                         cfg: Any, a: dict, decision: Any,
+                         rerun: Callable[[Any], Any]) -> Any:
+        """Apply this project's `validation.stakes_classifier` to ONE row's decision.
+
+        docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.5.
+
+        * `regex` — hands `decision` straight back. NO CALL, NO ROW, NO EVENT: the shipped
+          default must be indistinguishable from the behaviour before this existed.
+        * `shadow` — calls, records the disagreement, and hands the REGEX's decision back
+          unchanged. The measurement, and nothing else.
+        * `classifier` — re-runs the pure decision with the verdict in it.
+        * `regex-tightened` — the TIGHTENED net re-runs the decision. NO CALL AND NO ROW,
+          like `regex`: the verdict is `autoreview.tightened_verdict`, a pure match handed
+          over in the classifier's own shape (2026-09-25 spec §7, the A/B's recommendation).
+
+        **THE CHEAP CONDITIONS RUN FIRST, which is why the decision is computed before
+        this is called.** A row that holds on a cheaper condition — already settled,
+        already with Neo, a panel that gave up, the project's permission revoked — never
+        reaches a model, the same discipline `_confirmation_evidence` is collected under.
+        Only a row that ARMED, or that held on the high-stakes net itself, is worth
+        asking about: those are the two answers the classifier can change.
+        """
+        from . import autoreview
+
+        mode = str(getattr(cfg, "stakes_classifier", "regex") or "regex")
+        if mode == "regex":
+            return decision
+        if not (decision.armed or decision.code == autoreview.HELD_HIGH_STAKES):
+            return decision
+        if mode == "regex-tightened":
+            return rerun(autoreview.tightened_verdict(str(a.get("content") or "")))
+        verdict = self._classify_stakes(project, wo, a)
+        if mode == "shadow":
+            self._note_stakes_disagreement(store, wo["id"], a, verdict)
+            return decision
+        return rerun(verdict)
+
+    def _settle_stakes(self, project: ProjectSpec, wo: dict, a: dict) -> Any:
+        """The verdict the SETTLE site re-checks condition 7 against, or None.
+
+        A second call, not a cached one: the settle re-runs the whole table against state
+        read NOW, and a verdict from before the model call is exactly the stale fact that
+        re-run exists to refuse. Only `classifier` pays for it — under `regex` and
+        `shadow` the regex decided the ask, so the regex decides the settle.
+
+        `regex-tightened` also answers here, and for free: the settle would otherwise fall
+        back on the WIDE net and hold rows the ask had already armed on the tightened one.
+        """
+        mode = str(getattr(project.validation, "stakes_classifier", "regex") or "regex")
+        if mode == "regex-tightened":
+            from . import autoreview
+            return autoreview.tightened_verdict(str(a.get("content") or ""))
+        if mode != "classifier":
+            return None
+        return self._classify_stakes(project, wo, a)
+
+    def _classify_stakes(self, project: ProjectSpec, wo: dict, a: dict, *,
+                         call: Callable[..., Any] | None = None,
+                         record: Callable[..., Any] | None = None) -> Any:
+        """Ask the classifier about one assumption. Never raises; a failure is HELD.
+
+        SS3.3 and SS3.8. The transport is `neo.answer_question`'s, verbatim in its two
+        non-obvious arguments: the neutral cwd, so the project's `CLAUDE.md` is not pulled
+        into a prompt that is supposed to carry one sentence, and `attribute=False`
+        because this call records itself and leaving the transport's attribution on would
+        double-count it.
+
+        ONE `agent_calls` ROW PER CALL, and a FAILED call still writes one with `ok=False`
+        — `add_agent_call`'s own rule: a None-usage row says a call was made and cost
+        something unknown, which is a different fact from no call at all.
+
+        The model asked for is a floating alias; the model that ANSWERED is what is
+        recorded and what rides on the verdict.
+
+        `tools=""` — SS3.10, and the same string the A/B measured. A tooled callee "will
+        happily go read the real state and answer about *that*" (claude_cli.py:1522), and
+        `""` also sends `--strict-mcp-config`, so the user's MCP servers are out too. The
+        judgement is about one sentence and must come from the prompt alone.
+        """
+        from . import agent_usage, stakes
+
+        call = call or claude_cli.run_headless_result
+        record = record or agent_usage.record
+        try:
+            result = call(stakes.question(str(a.get("content") or "")),
+                          system_prompt=stakes.PERSONA, model=stakes.MODEL,
+                          timeout=stakes.TIMEOUT, cwd=ensure_home(), tools="",
+                          attribute=False)
+        except Exception:  # noqa: BLE001 — an unreachable classifier holds, never raises
+            log.exception("[%s] stakes classifier for %s failed", project.name,
+                          wo.get("id"))
+            record("stakes_classifier", usage=None, project=project.name,
+                   wo_id=str(wo.get("id") or ""), label="assumption",
+                   model=stakes.MODEL, ok=False)
+            return stakes.unreachable(stakes.MODEL)
+        model = getattr(result, "model", "") or stakes.MODEL
+        record("stakes_classifier", usage=result, project=project.name,
+               wo_id=str(wo.get("id") or ""), label="assumption", model=model,
+               ok=bool(getattr(result, "text", "")))
+        return stakes.read_verdict(getattr(result, "text", ""), model=model)
+
+    def _note_stakes_disagreement(self, store: ProjectStore, wo_id: str, a: dict,
+                                  verdict: Any) -> None:
+        """Record ONCE that the two nets disagreed about one assumption (SS3.5).
+
+        `_note_autoreview_held`'s discipline, with a wider key. **THE KEY IS
+        `(assumption_id, regex marker, classifier verdict)`, not the assumption alone**:
+        keyed on the row, a classifier that changes its mind between ticks is lost, which
+        is the single most interesting shadow result; keyed on nothing, the pass writes an
+        event every reconcile tick for as long as the order sits there and buries the ones
+        that mean something.
+
+        `regex` is `high_stakes_marker`'s return (`""` when it did not fire), so ONE kind
+        says which way the two disagreed.
+
+        **DELIBERATELY NOT RENDERED.** It is not in `ops.AUTOREVIEW_EVENTS` and has no
+        branch in `timeline.py` — shadow is a measurement the operator reads with `jarvis
+        search` or SQL, and a work order whose behaviour did not change must not grow a
+        timeline line saying a mechanism disagreed with itself. That is an exception to
+        `ops.py:2311`'s warning, taken knowingly, and recorded in the spec.
+        """
+        from . import autoreview, db
+
+        marker = autoreview.high_stakes_marker(str(a.get("content") or ""))
+        high = bool(getattr(verdict, "high", True))
+        if bool(marker) == high:
+            return
+        key = (int(a.get("id") or 0), marker, high)
+        for event in store.events_of_kind(wo_id, "autoreview_stakes_disagreed"):
+            payload = db.from_json(event["payload"], {})
+            if (int(payload.get("assumption_id") or 0), str(payload.get("regex") or ""),
+                    bool(payload.get("classifier_high"))) == key:
+                return
+        store.add_event(wo_id, "autoreview_stakes_disagreed", {
+            "assumption_id": a.get("id"), "n": a.get("n"), "regex": marker,
+            "classifier_high": high, "category": verdict.category,
+            "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
 
     def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
                                cfg: Any) -> tuple[str, str]:
@@ -5184,7 +5330,13 @@ class Daemon:
             # that is the id to exclude, or every confirmed assumption would be dropped
             # as "already with Neo" on its own first pass.
             asked_question_id=int((assumption.get("neo_question_id") or q["id"])
-                                  if confirming else q["id"]))
+                                  if confirming else q["id"]),
+            # CONDITION 7 IS RE-RUN THE WAY THE ASK RAN IT. Under `classifier` the row
+            # was armed by a verdict, and re-checking it with `stakes=None` would put the
+            # regex back in charge at the settle — dropping every ruling the OS just paid
+            # for on a row that merely MENTIONS a deletion. `regex` and `shadow` pass
+            # None, which is the regex, which is what decided the ask under both.
+            stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
             # Escalated rather than left `answered`: the assumption is the user's again,
             # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
