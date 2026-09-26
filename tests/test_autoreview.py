@@ -25,7 +25,7 @@ import json
 
 import pytest
 
-from jarvis import autoreview, neo, ops
+from jarvis import autoreview, neo, ops, stakes
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -191,6 +191,121 @@ def test_the_token_carve_out_is_a_sense_not_a_word(text, held):
     """`token` stays bare — a hard-coded one is a credential — but this repo MEASURES
     ITSELF IN TOKENS, so the economics sense is carved out (Neo, question 562)."""
     assert bool(autoreview.high_stakes_marker(text)) is held
+
+
+# -- the classifier's verdict, passed in ------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.7. `decide`
+# stays PURE: the caller computes the verdict and passes it, so the whole condition table
+# is still unit-testable without a socket.
+
+ACT = "cut the tag jarvis-0.6.2 and pushed it, skipping the dry-run preview"
+
+
+def routine_verdict(**over):
+    return stakes.Stakes(**{"high": False, "category": "none",
+                            "reason": "a conflict note, not a deletion",
+                            "model": "haiku", **over})
+
+
+def high_verdict(**over):
+    return stakes.Stakes(**{"high": True, "category": "publishing",
+                            "reason": "cuts and pushes a release tag", "model": "haiku",
+                            **over})
+
+
+@pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
+def test_a_verdict_of_none_leaves_every_existing_caller_byte_identical(rule):
+    """`stakes=None` is today's behaviour, and BYTE-IDENTICAL is the claim: the regex
+    mode ships as the default, so any drift in this line is a change to what every
+    project already running sees on its timeline."""
+    text = "deleted the orphaned rows instead of backfilling them"
+    wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
+    a = assumption(content=text)
+
+    before = rule(a, wo, cfg())
+    after = rule(a, wo, cfg(), stakes=None)
+
+    assert before.reason == after.reason
+    assert before.code == after.code == autoreview.HELD_HIGH_STAKES
+    assert autoreview.high_stakes_marker(text) in before.reason
+
+
+@pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
+def test_a_high_verdict_holds_and_the_hold_says_what_the_worker_did(rule):
+    """SS3.2: `reason` REPLACES the matched phrase. The regex line tells the user a word
+    was present; this one tells them what the OS thinks the worker did."""
+    wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
+
+    d = rule(assumption(content=ACT), wo, cfg(), stakes=high_verdict())
+
+    assert d.code == autoreview.HELD_HIGH_STAKES
+    assert "cuts and pushes a release tag" in d.reason
+    assert "publishing" in d.reason
+
+
+@pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
+def test_a_routine_verdict_arms_text_the_regex_would_have_held(rule):
+    """THE CASE THAT MATTERS MOST. `delet` is the regex's top marker at 21 of 91 hits and
+    almost none of them is a deletion; under a routine verdict the row arms."""
+    text = ("this branch's own ops.objection_undeliverable was deleted upstream, so the "
+            "conflict resolution keeps the other copy")
+    wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
+    assert autoreview.high_stakes_marker(text)
+
+    assert rule(assumption(content=text), wo, cfg(), stakes=routine_verdict()).armed
+    assert rule(assumption(content=text), wo, cfg()).code == autoreview.HELD_HIGH_STAKES
+
+
+@pytest.mark.parametrize("rule", [autoreview.decide, autoreview.decide_early])
+def test_a_high_verdict_holds_text_the_regex_misses(rule):
+    """SS1.1, the half no narrowing reaches: a release the regex never saw."""
+    wo = dict(WO, status="running" if rule is autoreview.decide_early else "needs_review")
+    assert autoreview.high_stakes_marker(ACT) == ""
+
+    assert rule(assumption(content=ACT), wo, cfg()).armed
+    assert rule(assumption(content=ACT), wo, cfg(),
+                stakes=high_verdict()).code == autoreview.HELD_HIGH_STAKES
+
+
+def test_an_unreachable_classifier_holds_and_the_hold_says_so():
+    """NEVER FABRICATE A DEFAULT FROM A FAILURE: the hold from a call that never
+    returned must say it never returned, not borrow a category."""
+    d = autoreview.decide(assumption(content=ACT), WO, cfg(),
+                          stakes=stakes.unreachable("haiku"))
+
+    assert d.code == autoreview.HELD_HIGH_STAKES
+    assert stakes.HIGH_UNREACHABLE in d.reason
+
+
+@pytest.mark.parametrize("verdict, armed", [(routine_verdict(), True),
+                                            (high_verdict(), False)])
+def test_the_confirmation_pass_is_gated_by_the_same_verdict(verdict, armed):
+    """`decide_confirm` forwards it unchanged, so a provisional accept is no ticket past
+    the net the ask pass was gated by."""
+    a = assumption(content=ACT, provisional_verdict="accept", neo_question_id=41)
+
+    assert autoreview.decide_confirm(a, WO, cfg(), stakes=verdict).armed is armed
+
+
+def test_the_cheap_conditions_still_win_over_the_verdict():
+    """Order matters: a row that holds on a cheaper condition must not be reported as a
+    stakes hold, whatever the classifier said about it."""
+    d = autoreview.decide(assumption(content=ACT, status="accepted"), WO, cfg(),
+                          stakes=routine_verdict())
+
+    assert d.code == autoreview.HELD_SETTLED
+
+
+def test_sibling_redaction_stays_on_the_regex_under_every_mode():
+    """SS3.6. `sibling_line` runs over a LIST — N model calls to render ONE prompt — and
+    being wrong there costs one sentence of context, not a decision in the user's name.
+    So the consequence is explicit: a row the classifier arms can still be withheld."""
+    text = "deleted the orphaned rows instead of backfilling them"
+    line = autoreview.sibling_line({"n": 2, "status": "pending", "content": text})
+
+    assert "withheld" in line
+    assert text not in line
 
 
 SECRET = "reused the production api key rather than minting a second one"
@@ -693,8 +808,85 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     assert questions()[0]["status"] == "escalated"
     assert q["id"] == questions()[0]["id"]
     # The one line the user reads on `jarvis wo show` says it is theirs again.
-    assert "left with you" in ops.autoreview_state(
-        store, store.get_work_order(wo["id"]))["line"]
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "left with you" in line
+    # Still pending: no resolution clause (the spec's §Tests 3).
+    assert "since " not in line
+
+
+# -- the banner against the assumption's CURRENT row -----------------------------------
+#
+# docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md.
+
+
+def _escalated(daemon):
+    """A work order parked on one assumption the OS left with the user."""
+    store, wo = park(daemon, auto_review=True)
+    ask(daemon, store)
+    drain(daemon)
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending"
+    return store, wo, row["id"]
+
+
+def _line(store, wo_id: str) -> str:
+    return ops.autoreview_state(store, store.get_work_order(wo_id))["line"]
+
+
+def test_an_accepted_assumption_is_no_longer_left_with_you(started):
+    """The escalation stays on the record — it happened — and the banner stops claiming
+    the user still owes the decision they already took."""
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "accepted", reason="fine")
+
+    line = _line(store, wo["id"])
+    assert "left with you" in line
+    assert "since accepted by you" in line
+
+
+def test_a_rejected_assumption_says_rejected_and_not_accepted(started):
+    """The status column is interpolated, not hard-coded."""
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "rejected", reason="no")
+
+    line = _line(store, wo["id"])
+    assert "since rejected by you" in line
+    assert "accepted" not in line
+
+
+def test_a_still_pending_escalation_reads_exactly_as_before(started):
+    """The common case: nothing read, nothing appended."""
+    store, wo, _aid = _escalated(started)
+
+    assert "since " not in _line(store, wo["id"])
+
+
+def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
+    """One attribution renderer, asserted as one: `ops.assumption_decider`."""
+    from jarvis.project_store import ASSUMPTION_DECIDER_OS
+
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
+                            reason="no new surface", model="claude-opus-5")
+
+    row = store.get_assumption(aid)
+    assert _line(store, wo["id"]).endswith(
+        f"; since accepted by {ops.assumption_decider(row)}")
+    assert ops.assumption_decider(row) == "the OS (neo, claude-opus-5)"
+
+
+def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started):
+    """Unresolvable, and a banner is not the place to guess."""
+    wo = ops.create_work_order("proj_a", "older event")
+    store = ProjectStore(started.catalog.project("proj_a").path)
+    store.add_event(wo["id"], "autoreview_escalated",
+                    {"n": 1, "reason": "this is a surface others call"})
+
+    assert _line(store, wo["id"]) == (
+        "assumption #1 left with you — this is a surface others call")
 
 
 def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_landed(

@@ -49,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import background, budget, claude_cli, systemd_units, usage
+from . import background, budget, claude_cli, context, systemd_units, usage
 from .catalog import ProjectSpec
 from .project_store import COMPACT_TURN, COST_FROM_TRANSCRIPT, ProjectStore
 
@@ -326,14 +326,23 @@ def delivery_hold(store: ProjectStore, wo: dict[str, Any],
 
 
 def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
-          prompt: str) -> dict[str, Any]:
-    """Open the conversation: turn 1, in a fresh worktree, under a minted session id."""
+          prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Open the conversation: turn 1, in a fresh worktree, under a minted session id.
+
+    Returns the turn row AND the briefing it was launched with, which is the one thing
+    this differs from `send`/`retry` in: `dispatch.dispatch_work_order` records the
+    context ledger for the seq-1 turn, and `briefing_for` REWRITES the worker settings
+    file — so dispatch must be handed the briefing rather than rebuilding it to measure
+    it (spec docs/specs/2026-09-24-order-observability.md §5).
+    """
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
     store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
-    return _launch(store, project, {**wo, "session_id": session_id, "worktree": wo_id},
+    briefing: dict[str, Any] = {}
+    turn = _launch(store, project, {**wo, "session_id": session_id, "worktree": wo_id},
                    prompt, kind="dispatch", resume=False, worktree=wo_id,
-                   cwd=project.path)
+                   cwd=project.path, briefing_out=briefing)
+    return turn, briefing
 
 
 def send(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], text: str,
@@ -525,7 +534,8 @@ def wo_model(store: ProjectStore, wo_id: str) -> str:
 
 def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], prompt: str,
             kind: str, resume: bool, worktree: str | None, cwd: Path,
-            msg_id: int | None = None) -> dict[str, Any]:
+            msg_id: int | None = None,
+            briefing_out: dict[str, Any] | None = None) -> dict[str, Any]:
     from .central_store import CentralStore
     from .dispatch import worker_name
 
@@ -579,7 +589,21 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     })
     log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
              wo_id, spawned.pid, f", unit {spawned.unit}" if spawned.unit else "")
-    return store.get_turn(turn["id"])  # type: ignore[return-value]
+    fresh = store.get_turn(turn["id"])
+    # `start` asks for the briefing back through this dict — see its docstring. An
+    # out-parameter rather than a second return value because `send`, `retry` and
+    # `compact` all return this row straight to callers that treat it as a DB row.
+    if briefing_out is not None:
+        briefing_out.update(briefing)
+    # THE CONTEXT LEDGER, for every turn EXCEPT the seq-1 dispatch turn — Neo's ruling on
+    # question 681. That one is recorded by `dispatch.dispatch_work_order`, which is the
+    # only caller holding the `KnowledgeBrief` the knowledge block is measured from. The
+    # partition is by (kind, seq) and not by kind: a RETRIED dispatch turn takes a fresh
+    # seq, so it lands here, and every turn is therefore recorded exactly once by exactly
+    # one writer (spec docs/specs/2026-09-24-order-observability.md §5).
+    if kind != "dispatch" or turn["seq"] > 1:
+        context.record(store, project, wo, fresh, briefing)
+    return fresh  # type: ignore[return-value]
 
 
 def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:

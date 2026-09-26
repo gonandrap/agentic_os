@@ -911,6 +911,15 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     -- NULL means "not recorded" — a turn reaped before this column existed (readers
     -- lazily backfill it from the outfile while that survives) — never zero spend.
     usage_json TEXT,
+    -- WHAT JARVIS PUT IN THIS TURN'S CONTEXT WINDOW, per ingredient: the appended system
+    -- prompt, the prompt, the knowledge index, the settings file, the memory files, the
+    -- persona, the --add-dir trees and the MCP server set, each with bytes and an
+    -- ESTIMATED token count (`context.payload`; spec docs/specs/
+    -- 2026-09-24-order-observability.md §5). One blob per turn, same lifetime and same
+    -- owner as the row, which is why it is a column and not a table.
+    -- NULL means "not recorded" — a turn that ran before this landed, or one whose
+    -- measurement failed — and NEVER "nothing was in the window".
+    context_json TEXT,
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
@@ -1177,6 +1186,12 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. NULL on every row written before the transcript
         # fallback existed, which reads correctly as "the CLI's own figure".
         "cost_source": "TEXT",
+        # See the CREATE TABLE comment. `wo_turns` already ships, so the context ledger
+        # reaches a live database only through here. NULL is "not recorded" — every turn
+        # that ran before this landed, and any turn whose measurement failed — and never
+        # "nothing was in the window"; `ops.context_report` renders that as a sentence
+        # rather than an empty table (spec §5, forward-only).
+        "context_json": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
@@ -2746,6 +2761,21 @@ class ProjectStore:
             (kind, *ids)).fetchall()
         return {str(row["wo_id"]) for row in rows}
 
+    def last_event_of_kind(self, wo_id: str, kind: str) -> dict[str, Any] | None:
+        """The NEWEST event of one kind on this work order, or None.
+
+        Neither read beside it answers this: `events_of_kind` is oldest-first and
+        uncapped, and `list_events` takes the oldest `limit` rows — so a caller asking
+        "what did the last pass say" would walk every row of a chatty order to reach it.
+        A hold that RESTATES itself (`Daemon._record_retry_held`, spec
+        docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md §1) is the first
+        reader that wants only the latest, and it asks on every sweep.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_events WHERE wo_id=? AND kind=? ORDER BY ts DESC LIMIT 1",
+            (wo_id, kind)).fetchone()
+        return dict(row) if row is not None else None
+
     def events_across(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
         """Every event of ONE kind in the project, NEWEST first, with its work order.
 
@@ -3743,6 +3773,18 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq LIMIT ?", (wo_id, limit)
         ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def all_turns(self, wo_id: str) -> list[dict[str, Any]]:
+        """EVERY turn of the conversation, in order and with no ceiling.
+
+        `list_turns`' default limit of 100 is right for a renderer showing a conversation
+        and wrong for a per-turn ledger: a long work order would silently lose its later
+        turns from a report whose entire subject is what changed between them
+        (`ops.context_report`).
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:

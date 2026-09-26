@@ -19,14 +19,25 @@ refactor and neither is visible from any single function:
 from __future__ import annotations
 
 import json
+import logging
+import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
-from jarvis import db, ops, plans
+from jarvis import db, ops, plans, specs
+from jarvis import neo as neo_mod
 from jarvis.catalog import load_catalog
+from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
+from jarvis.neo_store import NeoStore
 from jarvis.project_store import ProjectStore
-from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
+from jarvis.testing import (
+    FIXTURE_DESIGN_DOC,
+    FIXTURE_DESIGN_DOC_BODY,
+    fixture_spec_section,
+)
 
 
 @pytest.fixture()
@@ -835,3 +846,272 @@ def test_no_overtaken_note_when_no_child_has_merged(started, store):
     assert ops.overtaken_line(row) == ""
 
     assert ops.assumptions_with_rulings(store, plain["id"])[0]["overtaken"] is None
+
+
+# -- the spec the OS holds travels with the question (issue #746) ----------------------
+#
+# docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md. Two
+# halves: the spec rides in the question's context (A), and it stays equal to the
+# COMMITTED copy for as long as the review is open (B).
+
+
+REVISED = FIXTURE_DESIGN_DOC_BODY.replace("Rows are dicts", "Rows are frozen records")
+
+
+def git(repo, *args) -> None:
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    *args], check=True, capture_output=True)
+
+
+def commit_spec(repo, text: str, message: str = "spec: revise") -> None:
+    (repo / FIXTURE_DESIGN_DOC).write_text(text)
+    git(repo, "add", "--", FIXTURE_DESIGN_DOC)
+    git(repo, "commit", "-qm", message)
+
+
+def planner_worktree(project, store, fo_id: str, branch: str = "feat/plan"):
+    """The planner's worktree, as a dispatched planner would have created it."""
+    planner = planner_of(store, fo_id)
+    path = project / ".claude" / "worktrees" / (planner["worktree"] or planner["id"])
+    git(project, "worktree", "add", "-q", "-b", branch, str(path))
+    return path
+
+
+def question(qid: int) -> dict:
+    neo = NeoStore()
+    try:
+        return neo.get(qid)
+    finally:
+        neo.close()
+
+
+def plan_questions() -> list[dict]:
+    neo = NeoStore()
+    try:
+        return [dict(r) for r in neo.conn.execute(
+            "SELECT * FROM questions WHERE kind='plan' ORDER BY id")]
+    finally:
+        neo.close()
+
+
+def test_the_question_carries_the_spec_under_its_own_label(planning, store):
+    """1. The reviewer is handed the text, not the filename it used to go hunting for."""
+    _, fo = planning
+
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+
+    q = question(out["neo_question_id"])
+    assert "An empty result set writes the header" in q["context"]
+    assert "Do NOT open this path on disk" in q["context"]
+    assert "Spec under review:" in neo_mod.build_question_prompt(q)
+
+
+def test_a_spec_merged_after_submission_is_what_the_review_reads(planning, store,
+                                                                 project):
+    """2. Issue #746 by name: revised, committed, merged, and the review moves with it."""
+    daemon, fo = planning
+    worktree = planner_worktree(project, store, fo["id"])
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+    old_qid = out["neo_question_id"]
+
+    # The squash merge: the revision lands on the default branch and the planner's
+    # worktree is reclaimed. No merge predicate anywhere — the rung that is READABLE
+    # decides (§7).
+    commit_spec(project, REVISED)
+    git(project, "worktree", "remove", "--force", str(worktree))
+
+    daemon.tick()
+
+    refreshed = store.get_feature_order(fo["id"])
+    assert question(old_qid)["answer"] == f"SUPERSEDED by question {old_qid + 1}"
+    assert refreshed["plan_question_id"] == old_qid + 1
+    new = question(refreshed["plan_question_id"])
+    assert "Rows are frozen records" in new["context"]
+    assert re.search(r"as committed on main @ [0-9a-f]{7}", new["context"])
+    assert json.loads(refreshed["plan"])["design_doc_content"] == REVISED
+
+
+def test_an_unmerged_revision_is_read_from_the_branch_never_from_main(planning, store,
+                                                                     project):
+    """3. Question 658's exact shape: main's older copy must not win."""
+    daemon, fo = planning
+    worktree = planner_worktree(project, store, fo["id"])
+    ops.submit_plan(fo["id"], a_plan(child("reader")))
+
+    commit_spec(worktree, REVISED)      # on the planner's branch only
+
+    daemon.tick()
+
+    new = question(store.get_feature_order(fo["id"])["plan_question_id"])
+    assert "Rows are frozen records" in new["context"]
+    assert "Rows are dicts" not in new["context"]
+    assert "as committed on branch feat/plan @ " in new["context"]
+
+
+def test_an_uncommitted_edit_is_invisible(planning, store, project):
+    """4. The working tree is never read, so a dirty spec is no divergence at all."""
+    daemon, fo = planning
+    worktree = planner_worktree(project, store, fo["id"])
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+
+    (worktree / FIXTURE_DESIGN_DOC).write_text(REVISED)
+
+    daemon.tick()
+
+    assert store.get_feature_order(fo["id"])["plan_question_id"] == out["neo_question_id"]
+    assert len(plan_questions()) == 1
+
+
+def test_a_spec_with_no_committed_copy_is_refused_and_names_the_commit(planning, store,
+                                                                      project):
+    """5. §11: the refusal is the ruling applied at its source, with the fix named."""
+    _, fo = planning
+    doc = a_plan(child("reader"))
+    doc["design_doc"] = "docs/specs/uncommitted.md"
+    (project / doc["design_doc"]).write_text(FIXTURE_DESIGN_DOC_BODY)
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.submit_plan(fo["id"], doc)
+
+    assert "no COMMITTED copy" in str(e.value)
+    assert "git add docs/specs/uncommitted.md && git commit" in str(e.value)
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
+
+
+def test_an_untouched_spec_costs_no_neo_call_however_many_ticks(planning, store):
+    """6. The hash is what keeps this off the every-tick cadence's bill."""
+    daemon, fo = planning
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+
+    for _ in range(3):
+        daemon.tick()
+
+    assert len(plan_questions()) == 1
+    assert store.get_feature_order(fo["id"])["plan_question_id"] == out["neo_question_id"]
+
+
+def test_a_question_the_user_holds_is_told_about_the_revision_not_replaced(planning,
+                                                                          store,
+                                                                          project):
+    """7. Superseding an escalated question would close a row the user is looking at."""
+    daemon, fo = planning
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))  # no FORCE_: it escalates
+    daemon._neo_drain()
+    assert question(out["neo_question_id"])["status"] == "escalated"
+
+    commit_spec(project, REVISED)
+    daemon.tick()
+
+    after = store.get_feature_order(fo["id"])
+    assert after["plan_question_id"] == out["neo_question_id"]
+    assert json.loads(after["plan"])["design_doc_content"] == FIXTURE_DESIGN_DOC_BODY
+    assert "the spec has been revised" in after["attention_reason"]
+
+
+def test_a_verdict_in_flight_cannot_land_on_a_refreshed_plan(planning, store, project,
+                                                             monkeypatch):
+    """8. The pointer, not the question row, is what protects the decision."""
+    daemon, fo = planning
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+    old_qid = out["neo_question_id"]
+    neo = NeoStore()
+    try:
+        neo.mark(old_qid, "answering")
+    finally:
+        neo.close()
+
+    commit_spec(project, REVISED)
+    daemon.tick()
+    assert store.get_feature_order(fo["id"])["plan_question_id"] != old_qid
+
+    def boom(*a, **k):
+        raise AssertionError("a verdict judged against superseded text was applied")
+
+    monkeypatch.setattr(ops, "review_plan", boom)
+    neo = NeoStore()
+    try:
+        daemon._deliver_plan_verdict(CentralStore(), neo, store, question(old_qid),
+                                     {"escalate": False, "verdict": "approved",
+                                      "reason": "judged against the old text"})
+    finally:
+        neo.close()
+
+    assert store.get_feature_order(fo["id"])["status"] == "plan_review"
+
+
+def test_nothing_readable_leaves_the_review_exactly_as_it_was(planning, store, project,
+                                                              caplog):
+    """9. A stale spec the reviewer was told IS the spec beats no spec."""
+    daemon, fo = planning
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+    git(project, "rm", "-q", "--", FIXTURE_DESIGN_DOC)
+    git(project, "commit", "-qm", "spec: gone")
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.ops"):
+        daemon.tick()
+
+    after = store.get_feature_order(fo["id"])
+    assert after["plan_question_id"] == out["neo_question_id"]
+    assert after["status"] == "plan_review"
+    assert json.loads(after["plan"])["design_doc_content"] == FIXTURE_DESIGN_DOC_BODY
+    assert "no committed copy" in caplog.text
+
+
+def test_a_revision_the_plan_no_longer_fits_goes_back_to_the_planner(planning, store,
+                                                                     project):
+    """10. §9 step 5: never refresh under a plan the new text no longer satisfies."""
+    daemon, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("reader")))
+    section = fixture_spec_section("reader")
+    broken = "\n".join(line for line in FIXTURE_DESIGN_DOC_BODY.splitlines()
+                       if not line.startswith(f"## {section}."))
+
+    commit_spec(project, broken)
+    daemon.tick()
+
+    after = store.get_feature_order(fo["id"])
+    assert after["status"] == "planning"
+    assert json.loads(after["plan"])["design_doc_content"] == FIXTURE_DESIGN_DOC_BODY
+    reviewed = store.events_of_kind(fo["plan_wo_id"], "plan_reviewed")[-1]
+    assert f"'{section}' matches no heading" in db.from_json(reviewed["payload"],
+                                                             {})["reason"]
+
+
+def test_a_spec_over_the_bound_is_clipped_in_the_question_and_whole_in_the_plan(
+        planning, store, project):
+    """11. Clipping is a rendering of the QUESTION. The children keep the whole text."""
+    _, fo = planning
+    big = FIXTURE_DESIGN_DOC_BODY + "\n".join(
+        f"\n## Padding {n}\n\n" + "x" * 4000 for n in range(40))
+    commit_spec(project, big)
+
+    out = ops.submit_plan(fo["id"], a_plan(child("reader")))
+
+    q = question(out["neo_question_id"])
+    assert "TRUNCATED at " in q["context"]
+    assert "## Padding 39" in q["context"]     # the omitted headings, verbatim
+    assert len(q["context"]) < len(big)
+    assert json.loads(store.get_feature_order(fo["id"])["plan"])["design_doc_content"] \
+        == big
+
+
+def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, store,
+                                                                     project):
+    """12. `design_doc_content` has four other readers and all of them improve."""
+    daemon, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("reader", extra="FORCE_APPROVE")))
+    revised = REVISED.replace("You are a Python engineer working on the exporter.",
+                              "You are a Python engineer who writes frozen records.")
+    commit_spec(project, revised)
+
+    # `ops` directly, not `daemon.tick()`: a tick followed by a drain in the same test
+    # races on the project registry whatever runs in the planning band (a bare
+    # `time.sleep` in that seam reproduces it). The daemon seam is covered by test 2.
+    assert ops.refresh_plan_spec(fo["id"])["refreshed"]
+    daemon._neo_drain()    # and then the release
+
+    kid = store.feature_children(fo["id"])[0]
+    assert specs.spec_of(store, kid)["content"] == revised
+    out = ops.rebuild_feature_agent(fo["id"])
+    definition = Path(out["dir"]) / ".claude" / "agents" / f"{out['agent']}.md"
+    assert "frozen records" in definition.read_text()

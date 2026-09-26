@@ -59,6 +59,28 @@ The ranking above is the design input. Class 1 outnumbers everything, so the dia
 report (§6) is a first-class child and not a footnote on the debug page. Class 2 says the
 new surfaces must *show the underlying rows*, not a prettier total.
 
+**Each class, the section that exposes it, and whether it needs a new FIX TOOL.** The
+feature order asked for fix tooling as well as visibility; this is the accounting for it,
+and the answer is one new tool, one class partly served, three argued as needing none.
+
+- **Class 1 (parked, nothing says why — 8 issues). Exposed by §6. NEEDS A FIX TOOL, and
+  §11 is it.** Largest class, and the one where seeing the blocker and clearing it are two
+  different acts: §6's diagnosis names the thing that has to happen next and stops there,
+  so the user still has to carry it to a second command.
+- **Class 2 (bill wrong or useless — 6 issues). Exposed by §4 and §7. No fix tool.** The
+  arithmetic bugs are already fixed; what remained was a visibility gap, and §4 and §7
+  close it by showing the underlying rows.
+- **Class 3 (state inconsistency, no self-heal — 5 issues). Exposed by §6 and §7. Partly
+  served by §11**, where the inconsistency is a blocker a shipped remedy already covers.
+  The rest are OS defects and are fixed as issues, not by a user-facing tool: a tool that
+  patches inconsistent state hides the defect that produced it.
+- **Class 4 (the OS's own model calls failing silently — 2 issues). Exposed by §6**, which
+  surfaces a failed `agent_usage` row as UNREACHABLE. **No fix tool:** the remedy for a
+  failed OS call is to re-ask, and every one of those paths already has its own re-ask
+  command.
+- **Class 5 (gate recogniser false positives — 5 issues). Already served by `jarvis gate
+  explain`.** This feature adds nothing, and no fix tool.
+
 ## 2. What already exists, and the standing rules this feature must not break
 
 Read this before proposing anything. Most of what the feature order asks for is already
@@ -137,6 +159,12 @@ identically by CLI and UI; a renderer that computes anything is a renderer the o
 surface will disagree with. That is how a listing and a header once came to disagree about
 the same work order (PR 65), and it is why every section below specifies an `ops` function
 returning a dict, with both renderers consuming that dict verbatim.
+
+**Everything this feature adds is metered, and everything it writes is gated.** Every
+surface below is metered through §10, every WRITE any of them makes is gated by §10's
+configuration, and §10 lands LAST, retrofitting both the meter and the gate onto what the
+earlier sections built, so no section is blocked waiting for it. The detail is there; this
+spec says each thing once.
 
 ---
 
@@ -229,6 +257,16 @@ the nesting depth actually supported: `_subagent_labels` globs one directory lev
 subagent spawned *by* a subagent may not be reachable. Check it, and say in the payload
 which depth was read rather than implying completeness.
 
+A subagent's transcript is a transcript, so it also yields cache writes and context size on
+the same arithmetic as the parent's: `inspection.classify_writes` runs over it exactly as
+it runs over the parent, and its `Turn.context_peak` is available the same way. That is
+what answers the feature order's "when the user is paying a write-cache" for subagents.
+**A subagent's writes are reported as the SUBAGENT's own and are never folded into the
+parent's classification** — a parent turn that merely waited on a join did not pay that
+write, and attributing it upward names the wrong turn as the prefix break. The partition
+rule above governs here unchanged: attaching a subagent must not change the parent turn's
+own totals.
+
 **There is no real subagent transcript in this repository, and you must not create one.**
 `tests/data/transcripts/-wo-5a6b2d6d/…/subagents/` holds `.meta.json` files only; the
 transcripts themselves were dropped by `scripts/redact_transcript.py`. Eleven existing
@@ -273,6 +311,19 @@ blob per turn with the same lifetime and the same owner. Follow `ProjectStore._m
 `ADDED_COLUMNS`. `kn-c712a5d6` is the rule for testing it: a new column is untested until
 a test writes it *and* a test reads a row that predates it.
 
+**One writer function, two call sites.** The ledger is written through one helper,
+`context.record(store, project, wo, turn)`, and that helper is called at TWO sites:
+`dispatch.dispatch_work_order` and `worker_session.start`. "One write call in
+`dispatch.py`" in the child's brief means one WRITER FUNCTION, not one call site, and
+this paragraph supersedes both that reading and the "at dispatch" wording earlier in
+this section. `dispatch_work_order` normally runs once per work order and every later
+turn is opened by `worker_session.start`, so a dispatch-only write would ship a delta
+feature whose delta is always empty, and a prefix miss at turn 5 could never be
+explained. Every path that opens a turn must record. The prompt text
+`dispatch.build_worker_prompt` produces and the value of `hooks.prefix_fingerprint` stay
+byte-identical, so the existing test asserting that stays (Neo, question 681 on
+wo-3a7d9bda, 2026-09-25).
+
 **The delta, and the join that makes this worth having.** `ops.context_report(wo_id,
 project) -> {"turns": [{"seq", "ingredients": [...], "delta": {...}, "prefix_break":
 {...} | null}]}`. The delta is this turn's ingredients against the previous turn's. The
@@ -295,6 +346,15 @@ way to prove that in CI. Say exactly this in the pull request rather than a stro
 **Forward-only, and the surface must say so.** The ingredients of orders that already ran
 were never recorded and cannot be recovered. An order that predates this landing renders
 "not recorded for this order" — not an empty table, which a reader will report as a bug.
+
+**What this section does NOT cover, and it is a boundary rather than an oversight.**
+Per-subagent context COMPOSITION, and its delta, are out of reach. §5 measures at dispatch
+because Jarvis builds the worker's prompt; Jarvis does not build a subagent's prompt —
+Claude Code does, inside the session, and writes no record of what went into it (§2's third
+measured fact). So for subagents the ask is answered by §4's transcript arithmetic, which
+gives their tokens, tool calls, cache writes and context peak, and it is DECLINED for
+composition, for that reason. A reader asking "where is subagent context" gets §4 for the
+numbers and this paragraph for why there is no ingredient list behind them.
 
 **CLI surface:** `jarvis wo context <wo-id>` (`--json`, `--turn N`).
 
@@ -344,8 +404,9 @@ functions**; a diagnosis that disagrees with the status label is worse than no d
 reporting how it settled.
 
 **The boundary.** This report explains and offers; it never acts. It files nothing,
-unblocks nothing and sends nothing. The acting path is `remedies.py`, which is a closed
-registry behind a Neo approval and a grant, and is out of this feature entirely (§8).
+unblocks nothing and sends nothing. The acting path is `remedies.py`, a closed registry
+behind a Neo approval and a one-use grant; §11 is the user-facing entry point to it, a
+separate command and a separate child, and it adds nothing to that registry (§8).
 
 ## 7. The debugging view: the dashboard page and the JSON behind it
 
@@ -397,24 +458,23 @@ must not 500 the page — `uilog` turns a dashboard 500 into an inbox item and
 Filed to the backlog where a backlog item is the right home. Listed here so nobody
 re-proposes them mid-feature.
 
-**OTEL: rejected PROVISIONALLY, and §9 is the measurement that confirms or overturns it.**
-The feature order suggested integrating Claude Code's OpenTelemetry export first. Nothing
-in this tree mentions OTEL today. Four reasons to decline: (1) the export is metrics and log events — session, token and cost counters,
-tool-decision events, aggregated on a flush interval — and carries no tool parameters, no
-cache-write cause, no context composition and no per-call `modelUsage` breakdown; every one
-of those is already parsed with strictly more fidelity by `usage.py` and `inspection.py`,
-including the 1h-versus-5m cache-write split that a counter cannot express. (2) A collector
-is a new long-lived process, a new port and a new failure mode against a core that is
-deliberately stdlib-only, with many concurrent headless workers each exporting. (3) Metrics
-flush on an interval, so a turn that *dies* — the case most worth debugging — may never
-flush; the transcript is on disk throughout. (4) The cost of keeping the door open is one
-line: the env seam is `claude_cli.spawn_turn`'s `env = {**os.environ, **cache_env()}`.
-Adding OTEL later is a dict, not an architecture. **The honest caveat: every word of that
-is reasoned, not measured** — nobody ran `claude` with `CLAUDE_CODE_ENABLE_TELEMETRY=1` and
-enumerated what arrives. The feature order asked for OTEL to be *assessed* first, and a
-reasoned-only rejection does not answer that ask. So the measurement is §9, it runs
-alongside the other five and gates none of them, and **the four reasons above stand only
-for as long as §9 does not contradict them.**
+**OTEL is DECLINED, on a measurement and not on the prior.** A real headless turn on CLI
+2.1.282 exported to a recording listener (`scripts/spike_otel.py`, findings in
+`docs/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
+tree needs: `tool_result` gives `tool_input_size_bytes` and never the input, so §4 is
+unserved; cache tokens arrive as flat `cache_read_tokens` / `cache_creation_tokens` with no
+`ephemeral_5m` / `ephemeral_1h` and no `modelUsage`, so `classify_writes`'s cause is
+underivable; and nothing anywhere reports window share, so §5 stands. The killed turn
+settles it — SIGKILL at t=25.02s exported metrics: none at all, last log flush t=19.54s,
+~5.5s of events including the final `tool_result` lost — and a 3000ms interval narrows that
+window without closing it, because the exporter dies with the process. The env seam stays
+one line — the `env = {**os.environ, **cache_env()}` dict in `claude_cli.spawn_turn` — so
+the door is open at zero cost. Reason 2's "new failure
+mode" was CONTRADICTED: a dead endpoint costs a turn nothing (`rc=0`, `subtype: success`,
+`duration_ms: 7893`) — the concern that replaced it is `user.email` and the account
+identifiers riding on every record and every flush. Parked here as backlog notes, the two
+things OTEL uniquely has: per-hook `total_duration_ms` and per-request `ttft_ms`; neither
+serves a section of this feature and no feature order is filed.
 
 **Hook-recorded tool spans, and any live-state table. Rejected on the merits, not deferred
 for size.** `PostToolUse` is already matched in `assets/settings.base.json`, so a hook would
@@ -427,10 +487,15 @@ one thing Jarvis alone witnesses, which is §5.
 `probes.RESERVED_IDS` — a probe id may not shadow an alarm kind — so adding kinds drags the
 supervisor into this feature. The existing alarms keep firing unchanged.
 
-**Any acting or repair path.** This feature explains; `remedies.py` acts, behind a Neo
-approval and a one-use grant. The feature order asked for "tools to fix those identified
-issues"; the fix affordance delivered here is §6's literal, pre-validated commands, which
-is the largest honest step. Automating them is a separate feature.
+**Any NEW remedy, and any automation that acts without the grant.** `remedies.py`'s
+`REMEDIES` registry, its `catalog.RemedyConfig` allow-list default and its `self_heal`
+grant requirement all stay exactly as they are, and this feature adds no remedy to them.
+What §11 adds is a user-facing ENTRY POINT to the remedies that already ship — the same
+three, behind the same Neo approval and the same one-use grant, reached from the diagnosis
+instead of only from the supervisor acting on an alarm. A blocker no shipped remedy covers
+still gets §6's literal, pre-validated command and nothing more. Out of scope: adding a
+remedy to the registry, widening an allow-list, and any path that acts without an approved,
+unexpired, unspent grant.
 
 **Retroactive context composition.** Impossible: the ingredients of past orders were never
 recorded. §5 is forward-only and says so on the surface.
@@ -445,20 +510,41 @@ transcripts per refresh multiplies the read cost for a rare case.
 on the dashboard home. Genuinely useful, purely additive on top of §3, and droppable.
 Backlogged.
 
-**Changing the bill.** `bill.py` is correct after six fixed issues and is sealed on
-settlement (`kn-3629fa87`). This feature links to it and does not touch it.
+**Changing the bill's arithmetic.** `bill.py` is correct after six fixed issues and is
+sealed on settlement (`kn-3629fa87`). Its existing lines, its arithmetic and that seal are
+untouched. The one change this feature makes to the bill is the observability class §10
+adds, and it arrives the way every other kind already does — as `agent_usage` rows read by
+the reporting `bill.py` already has, not as new maths inside `bill.py`.
 
 ---
 
-## 9. OTEL: measure what it actually emits, then confirm or overturn §8
+## 9. OTEL: the decision, and the measurement that settles it
 
-**This section produces a finding, not a feature.** §8 rejects OTEL integration on four
-reasoned grounds and admits none of them was measured. The feature order asked for OTEL to
-be assessed *first*. This section is that assessment, run in parallel with §§3–7, gating
-none of them, and it ends by either confirming §8's rejection with evidence or overturning
-it with evidence. **Either outcome is a success.** A spike that confirms the prior is worth
-exactly as much as one that overturns it, and a worker who feels pressure to produce a
-recommendation has misunderstood the job.
+**This section produces a decision, not a feature.** The feature order asked for Claude
+Code's OpenTelemetry export to be assessed *first*, and nothing in this tree mentions OTEL
+today. The deliverable is a verdict — adopt, decline, or adopt in part — carried by
+evidence and reached here, not a confirmation of a decision taken anywhere else in this
+spec. It runs in parallel with §§3–7 and gates none of them. **A decline is as full a
+success as an adoption.** A measurement that lands where the planner expected is worth
+exactly as much as one that does not, and a worker who feels pressure to produce a
+recommendation in either direction has misunderstood the job.
+
+**The prior this measurement tests, and it is reasoned, not measured.** The planner
+expected a decline and wrote down why. What follows is the hypothesis the six questions
+below are pointed at — each reason is confirmed or contradicted by what actually arrives —
+and it is explicitly **not a verdict**. (1) The export is metrics and log events — session,
+token and cost counters, tool-decision events, aggregated on a flush interval — and carries
+no tool parameters, no cache-write cause, no context composition and no per-call
+`modelUsage` breakdown; every one of those is already parsed with strictly more fidelity by
+`usage.py` and `inspection.py`, including the 1h-versus-5m cache-write split that a counter
+cannot express. (2) A collector is a new long-lived process, a new port and a new failure
+mode against a core that is deliberately stdlib-only, with many concurrent headless workers
+each exporting. (3) Metrics flush on an interval, so a turn that *dies* — the case most
+worth debugging — may never flush; the transcript is on disk throughout. (4) The cost of
+keeping the door open is one line: the env seam is `claude_cli.spawn_turn`'s
+`env = {**os.environ, **cache_env()}`. Adding OTEL later is a dict, not an architecture.
+**Nobody ran `claude` with `CLAUDE_CODE_ENABLE_TELEMETRY=1` and enumerated what arrives**,
+which is exactly why those four reasons settle nothing on their own.
 
 **Timebox: one session.** If the measurement is not in hand by then, report what was
 measured and what was not. Do not extend into building an integration.
@@ -483,7 +569,7 @@ this repository — read it before you start.
 4. Does any carry **context composition** — the share of the window taken by the system
    prompt, skills or agents? (§5 exists only because the transcript does not.)
 5. What is the **flush interval**, and does anything arrive from a turn that is **killed
-   mid-flight**? This is §8's third reason and the one most likely to be wrong.
+   mid-flight**? This is the third reason above and the one most likely to be wrong.
 6. What does it cost to run: process count, port, failure modes with many concurrent
    headless workers.
 
@@ -493,10 +579,162 @@ containing both. **Write no production code.** If the finding is that OTEL adds 
 the transcript does not, the deliverable is still the finding — file the integration as a
 separate feature order and say so; do not start building it in this session.
 
-**Amend §8 in the same pull request**, either to cite this measurement in place of the
-"reasoned, not measured" caveat, or to strike the reasons the measurement contradicts.
-That edit to §8 is the only part of this spec any child may change, and it belongs to this
-one.
+**Write the decision into §8 in the same pull request.** On a decline, §8 gains a new
+entry — declined, and here is the measurement that declined it — carrying the evidence and
+striking whichever of the four reasons above the measurement contradicts. On an adopt, or
+an adopt in part, §8 gains one line saying OTEL has moved out of this feature into a named
+follow-on feature order, with that order's id. §8 is the only prose outside this section
+that any child of this feature may edit, and it belongs to this one.
+
+---
+
+## 10. What observability costs, and who turns it on
+
+**This section lands LAST of every child, after §§3–7.** The meter can only wrap report
+functions that exist: wrapping `ops.live_report`, `ops.inspect_report`, `ops.context_report`
+and `ops.diagnose` in ONE place, once they are all in the tree, beats four separate workers
+each remembering to instrument their own — one of them would forget, and a meter with a
+hole in it reports a number lower than the truth, which is worse than no number at all. The
+gate has exactly one consumer, §5's per-turn write, and switching that off is a single
+guard this section adds to code §5 already landed, not a contract §5 has to be built
+against. So nothing waits on §10: §§3, 4, 5, 6 and 9 have no dependency on each other or on
+this section, and §7 and §10 both follow the first four. Section order in this spec is
+still reading order and still not build order — it just now runs the other way from what a
+reader might have assumed.
+
+**Where this section came from.** Not planner scope drift: it answers two review comments
+the user left on this feature order, quoted verbatim as the source.
+
+> "the spec doesn't mention cost of live debugging, so the question is: how much of that is
+> mechanical vs model calls? Sounds like it is mostly mechanical, but I want to be
+> explicitely measured, so the bill view of the order should include how much cost was
+> incurred in collecting and generating debug data"
+
+> "Debug data should be collected based on configuration, the spec doesn't say so. Make
+> sure that there is a config (default by os, project can override, as well as order by
+> parameter, with that precedence) that gates debugging info"
+
+The first comment is the METER; the second is the GATE. **They are two separate things and
+this section keeps them apart, because conflating them is what makes the rest of the text
+read as a contradiction.** The gate governs exactly one write, §5's per-turn ingredient
+row. The meter observes all five paths, four of which are reads, and it is never switched
+off: a meter the user can disable cannot answer the question the meter exists to answer.
+
+**The gate.** A new `ObservabilityConfig` dataclass, added to the fleet-level config
+dataclass AND the project-level one, exactly the way `InspectConfig` already appears in
+both (`src/jarvis/catalog.py` lines 1009 and 1118). The project object is built on the
+fleet object as its base, so one caller reads one field and never consults two objects —
+copy that construction and do not invent a second lookup. One field to start: `level`, one
+of `off`, `normal`, `full`. A per-order override lives in a new `work_orders` column,
+following `budget_usd`'s precedent in `ProjectStore.ADDED_COLUMNS` — nullable, and NULL
+means "this order has no answer", which is **not** the same as `off`. Precedence is stated
+as a rule and tested as one: the order column, else the project config, else the fleet
+config. Default `normal`.
+
+**What the gate actually governs, and what it must not.** Only WRITING. §§3, 4, 6 and 7 are
+arithmetic over files Claude Code already wrote — they collect nothing, and gating a
+read-only computation would buy the user nothing while costing them the very view they
+opened. §5's per-turn ingredient row is the one real collection this feature adds, and it
+is the thing `off` switches off — this section retrofits that guard into the write path §5
+already landed, and §5 itself is written with no knowledge of the config. Say it plainly,
+on the surface and in the config's own docstring: `off` does not disable `jarvis watch`,
+`jarvis inspect`, `jarvis wo why` or the debug page.
+
+**Where the level guard goes.** Apply it to `context.record` ITSELF, or to both of its
+call sites — `dispatch.dispatch_work_order` and `worker_session.start` — and NOT only to
+the `dispatch.py` call: guarding only `dispatch.py` leaves the `worker_session.start`
+path writing at level `off` (Neo, question 681 on wo-3a7d9bda, 2026-09-25).
+
+**The three levels, concretely.** `off` means §5 writes no per-turn ingredient row, and
+changes NOTHING else. The consequence a user notices: an order run at `off` has no context
+ledger afterwards, so `jarvis wo context` reports it as not recorded — §5's forward-only
+wording, now for a second reason — and every other surface is unaffected. `normal` is the
+default and records that row. `full` records it and additionally records whatever the child
+determines is worth recording beyond the ingredient list; if that turns out to be nothing,
+`full` and `normal` collapse, and the child says so rather than inventing a difference to
+justify a third level. The meter below is not on this scale at all: it records at every
+level.
+
+**The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
+lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,
+`ops.context_report`, `ops.diagnose`, and §5's `context.record` write — is wrapped at its
+own definition, by this section, after all four exist, so that each invocation records one row
+through the EXISTING `agent_usage` seam (`agent_usage.record` / `agent_usage.recorder`,
+`src/jarvis/agent_usage.py`), under new kinds, against the work order it was run for. Wall
+clock is recorded; tokens are recorded as they are actually reported, which for a
+pure-arithmetic path is zero. **That is the point.** The claim
+"debugging is mechanical" becomes a measured zero in the bill rather than an assertion in
+this spec, and if any of these paths ever gains a model call, the row stops reading zero on
+its own and nobody has to remember to instrument it. Wrapping at the definition is also why
+§7 needs no edit: its dashboard page calls those same `ops` functions, so it is metered
+automatically, with no change to §7's routes.
+
+**The bill line.** `agent_usage` rows already reach `jarvis cost` and the /cost page
+through `bill.py`'s `_call_items` / `_agent_items`, and `WORKER_SUBPROCESS` is the existing
+precedent for reporting a kind as its OWN CLASS rather than folding it into Jarvis's
+overhead. Observability is a third class beside the worker's turns and Jarvis's overhead,
+for the same reason: money the user spent *looking at* the order is not money spent *doing*
+the order, and a bill that mixes them answers neither question. A class whose dollars are
+zero and whose count and wall clock are not is the honest rendering of a mechanical path.
+Call that out on the surface, because a reviewer will otherwise read a `0.00` line as a
+bug.
+
+**What it must not do.** Accounting is an observer — `agent_usage`'s own module docstring
+says so. A failed meter row never fails the report it was measuring, and never fails the
+work order. `bill.py`'s settlement seal and its existing arithmetic are unchanged: this is
+a new kind arriving through a path the bill already has, not new maths. The gate is never
+consulted to decide whether a READ may proceed, and the meter over those reads has no off
+switch — the two are separate, as above.
+
+**Absent is not zero, here too.** An order that ran before this landed has no observability
+rows. The class renders as *not recorded*, never as `0.00` spent — §2's standing rule
+governs this section's own numbers exactly as it governs every other section's.
+
+---
+
+## 11. Clearing the blocker the diagnosis just named
+
+**The question this answers:** "§6 told me what this order is waiting on — now clear it."
+The feature order says outright that "tools to fix those identified issues is also in
+scope". §6 explains; this acts, and it acts with no authority §6 did not already have.
+
+**What it is.** `jarvis wo fix <wo-id>`, and the same control on §7's debug page. It takes
+the blocker §6's diagnosis named, matches it against the SHIPPED remedies, and proposes the
+one that fits — the proposal, its subject, and what approving it will do. One `ops`
+function returning a dict, both surfaces rendering that dict verbatim, exactly like every
+other section here.
+
+**It adds no authority, and that is the whole design.** Read `src/jarvis/remedies.py`'s
+module docstring before touching this: the `REMEDIES` registry is CLOSED and
+`tuple(REMEDIES) == SHIPPED_REMEDIES` is asserted, so adding one is a reviewed diff;
+`catalog.RemedyConfig` ships off with an empty allow-list on every project; a remedy rides
+an approved, unexpired, unspent `self_heal` grant consumed through `gates.open_gate`; and
+an AST walk in `tests/test_remedies.py` pins every acting call inside a handler. **§11 adds
+NO remedy to that registry, widens no allow-list, and skips no grant.** The only new thing
+is the ENTRY POINT: today a remedy is reachable only from the supervisor acting on an
+alarm, and this lets the user reach the same three — `nudge`, `unblock`, `file_work_order`
+— from the diagnosis they are already looking at. A section that needed a new remedy would
+be a different and much larger section, carrying a registry diff and its own approval
+story. This is not that section.
+
+**What it refuses.** `remedies.py` excludes cancelling a turn, `set_status`, `wo done`,
+`fo resume` and killing a process, on purpose, and its docstring calls that a boundary
+rather than an oversight. **§11 inherits every one of those exclusions verbatim and must
+not route around them** — not with a new remedy, and not with an `ops` helper that does the
+same thing under another name. When the diagnosis names a blocker no shipped remedy covers,
+the honest output is §6's pre-validated command for the user to run themselves, labelled as
+exactly that: a command for them, not an act the OS is offering to take. Never a silent
+no-op, and never an invented remedy.
+
+**Where it comes from.** §1's class 1 — parked with nothing saying why — is the largest of
+the 47 at eight issues, and it is the class where naming the blocker and clearing it are
+separate acts. Class 3 is partly served here, in the cases where the inconsistency is a
+blocker a shipped remedy already covers.
+
+**Absent is not zero, here too.** An order with no blocker, and an order whose project has
+remedies switched off, each say so in those words and offer nothing. Neither renders an
+empty list: a reader reads an empty list as "nothing to do" when the truth is "nothing is
+armed here".
 
 ---
 

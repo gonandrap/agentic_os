@@ -473,3 +473,32 @@ def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
         page = client.get(url)
         assert page.status_code == 200
         assert "is a floor" in page.text, url
+
+
+# -- a feature order's own spend -------------------------------------------------------
+
+
+def test_the_feature_bill_shows_the_parents_own_calls_beside_its_orders(
+        client, project, improvement_order):
+    """The list under "the orders under it" sums to the headline only with this row:
+    calls Jarvis made against the parent itself belong to no child."""
+    from jarvis.bill import OWN_LABEL
+
+    io = improvement_order
+    add_os_calls(io["id"], neo_calls=2)
+
+    page = client.get(f"/cost/proj_a/{io['id']}")
+    assert page.status_code == 200
+    assert OWN_LABEL in page.text
+
+
+def test_the_feature_bill_grows_no_own_row_when_there_is_no_own_spend(
+        client, project, improvement_order):
+    from jarvis.bill import OWN_LABEL
+
+    io = improvement_order
+
+    page = client.get(f"/cost/proj_a/{io['id']}")
+    assert page.status_code == 200
+    assert "The orders under it" in page.text
+    assert OWN_LABEL not in page.text

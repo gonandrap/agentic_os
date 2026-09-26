@@ -300,6 +300,46 @@ def test_validation_settings_round_trip():
     assert v.feature_units is False
 
 
+# -- the stakes classifier: three values, not a boolean --------------------------------
+
+
+def test_the_stakes_classifier_ships_on_the_regex():
+    """SS3.4. `regex` is today's behaviour exactly — no call, no new row, no new event —
+    and it is the shipped default at both levels."""
+    assert parse_catalog({"projects": []}).os.validation.stakes_classifier == "regex"
+    assert validation_of({}).stakes_classifier == "regex"
+
+
+@pytest.mark.parametrize("mode", ["regex", "shadow", "classifier"])
+def test_every_legal_stakes_classifier_mode_parses(mode):
+    assert validation_of({"stakes_classifier": mode}).stakes_classifier == mode
+
+
+def test_a_fourth_stakes_classifier_value_is_refused_loudly():
+    """The `roster` precedent: a typo that silently changes which net guards the settle
+    path is refused at boot, naming the value and the three legal ones — not shrugged off
+    to the default, which would read as the feature being off."""
+    with pytest.raises(CatalogError) as err:
+        validation_of({"stakes_classifier": "haiku"})
+    message = str(err.value)
+    assert "haiku" in message
+    for legal in ("regex", "shadow", "classifier"):
+        assert legal in message
+
+
+def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
+    """The ordinary field-level fallback: a project naming one key keeps the rest."""
+    quiet, loud = projects_validation({"stakes_classifier": "shadow"},
+                                      {}, {"validation": {"auto_review": True}})
+    assert quiet.stakes_classifier == "shadow"
+    assert loud.stakes_classifier == "shadow"
+    assert loud.auto_review is True
+
+    [over] = projects_validation({"stakes_classifier": "shadow"},
+                                 {"validation": {"stakes_classifier": "classifier"}})
+    assert over.stakes_classifier == "classifier"
+
+
 @pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
