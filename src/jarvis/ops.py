@@ -2602,6 +2602,42 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
+def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the surfaces say about this order's pull request landing, or None.
+
+    `automerge_state`'s shape and its reasons: None — and therefore no line at all — for
+    an order with no pull request and no `pr_merged` event, so an order the mechanism
+    never touched gains nothing. ONE derivation for `jarvis wo show` (`cli.py`) and the
+    dashboard work-order page (`ui/app.py`), because a derivation duplicated across those
+    two files is how they drift (2026-09-25 spec §7).
+
+    **NEVER FROM `pr_state`** (kn-dbc4971d): that column is stale by construction, has one
+    permitted reader, and gains no writer in this change. MERGED comes from the
+    `pr_merged` event — written by `ops.complete_merged` when the merge ended the order and
+    by `Daemon.refresh_landings` when it was observed afterwards — and any other state from
+    the newest `landing_seen`, which is dated and audited.
+
+    An empty `state` means NOTHING HAS LOOKED YET, which `landing` is careful never to read
+    as "did not merge".
+    """
+    from . import db
+
+    pr_url = str(wo.get("pr_url") or "")
+    merged = store.events_of_kind(wo["id"], "pr_merged")
+    if not pr_url and not merged:
+        return None
+    if merged:
+        payload = db.from_json(merged[-1]["payload"], {})
+        return {"pr_url": str(payload.get("pr_url") or pr_url), "state": "MERGED",
+                "head_oid": str(payload.get("head_oid") or ""),
+                "merged_at": payload.get("merged_at"),
+                "source": str(payload.get("source") or "")}
+    seen = store.events_of_kind(wo["id"], "landing_seen")
+    payload = db.from_json(seen[-1]["payload"], {}) if seen else {}
+    return {"pr_url": pr_url, "state": str(payload.get("pr_state") or ""),
+            "head_oid": "", "merged_at": None, "source": ""}
+
+
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
 
@@ -2845,8 +2881,12 @@ def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
     already landed, else None.
 
     From the TIMELINE, never from `work_orders.pr_state` — kn-dbc4971d, that column is
-    stale by construction. `pr_merged` is written by `complete_merged`, the single
-    close-out for a hand-merge and an auto-merge alike, so one read covers both routes.
+    stale by construction. `pr_merged` has TWO writers since the 2026-09-25 spec §5:
+    `complete_merged`, the close-out for a hand-merge and an auto-merge alike, and
+    `Daemon.refresh_landings`, which records a merge it observed after the order had
+    already settled. Both mean the child's code is on the default branch, which is the
+    only thing counted here, so one read still covers every route — and the second writer
+    ADDS the children that reached `completed` without the merge ending them.
     """
     fo = store.feature_order_for_planner(wo_id)
     if fo is None or fo.get("plan_wo_id") != wo_id:
@@ -3267,7 +3307,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     off the same predicate: see `unlanded_work`.
     """
     wo_id = wo["id"]
-    pr_url = pr_url or wo.get("pr_url") or None
+    pr_url = pr_url or (str(wo.get("pr_url") or "")
+                        if routes_on_pull_request(store, wo) else "") or None
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
@@ -3282,6 +3323,55 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The pull request the SUBMITTER declared — the only one that routes the merge queue.
+
+    `work_orders.pr_url` has two sources since issue #742. `ops.finish` writes it from
+    `jarvis wo finish --pr` and records `finished {pr_url}`; `gates._record_pull_request`
+    writes it from an approved merge gate and records `pr_url_recorded {source: "gate"}`,
+    which is the only record a planner's pull request leaves. A gate-derived URL is
+    DELIBERATELY NOT A DECLARATION: it is recorded for every reader (INV-PR-RECORDED, the
+    landing sweep, the CLI and the dashboard) and inert for routing, so a planner whose
+    gate was decided before `ops.submit_plan` settles `completed` rather than parking in
+    `waiting_pr_merge` and opening a validation round over a pull request that has already
+    merged (2026-09-25 spec §3).
+
+    **THIS PREDICATE IS THE ONE LINE TO REVISIT** if another route is ever to reach the
+    merge queue. Nothing else branches on where the column came from, and every router
+    asks `routes_on_pull_request`, which is this read plus the gate-only test.
+
+    It says WHETHER a declaration exists, and the routers still route on the caller's own
+    `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
+    BLANKED once the poll has settled that pull request, and returning a URL out of the
+    timeline there would put a closed pull request back in the merge queue.
+    """
+    for event in reversed(store.events_of_kind(wo["id"], "finished")):
+        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
+        if declared:
+            return declared
+    return ""
+
+
+def routes_on_pull_request(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Whether `wo['pr_url']` may move this work order — the merge queue's one test.
+
+    ONE rule, read by `land_finished`, by the reconciler's park and by
+    `Daemon.poll_pull_requests`, because three copies of it is how a gate-recorded URL
+    stayed inert at one site and settled a planner at the others (2026-09-25 spec §4).
+
+    A NEGATIVE test, deliberately: the column routes unless it is GATE-ONLY — a
+    `pr_url_recorded` event with no declaration behind it (`declared_pull_request`). A row
+    carrying a `pr_url` and no event about it at all is a legacy row, and it keeps routing
+    exactly as it did. Requiring a declaration instead would take every record written
+    before issue #742 out of the merge queue.
+    """
+    if not wo.get("pr_url"):
+        return False
+    if not store.events_of_kind(wo["id"], "pr_url_recorded"):
+        return True
+    return bool(declared_pull_request(store, wo))
 
 
 def unlanded_work(store: ProjectStore, wo: dict[str, Any],

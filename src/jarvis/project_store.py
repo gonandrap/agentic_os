@@ -2741,6 +2741,26 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def work_orders_with_event(self, kind: str, wo_ids: Sequence[str]) -> set[str]:
+        """Which of `wo_ids` carry an event of `kind`. ONE statement, whatever the count.
+
+        `events_of_kind` per order is what this replaces on a path that runs over every
+        open pull request in the fleet every couple of minutes: the merge poll's read
+        budget is asserted per pull request (`tests/test_pr_checks.py`), so the gate-only
+        exclusion it needs (2026-09-25 spec §4) has to cost one statement per STEP.
+
+        An empty id list never touches the connection — the poll's skip-the-whole-step
+        rule, one level down.
+        """
+        ids = list(wo_ids)
+        if not ids:
+            return set()
+        holes = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT wo_id FROM wo_events WHERE kind=? AND wo_id IN ({holes})",
+            (kind, *ids)).fetchall()
+        return {str(row["wo_id"]) for row in rows}
+
     def last_event_of_kind(self, wo_id: str, kind: str) -> dict[str, Any] | None:
         """The NEWEST event of one kind on this work order, or None.
 

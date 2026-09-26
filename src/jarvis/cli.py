@@ -2434,6 +2434,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # is every work order on a project that has not opted in (§8).
                 **({"auto_merge": state}
                    if (state := ops.automerge_state(store, wo)) else {}),
+                # Whether that pull request landed, from the timeline and never from
+                # `pr_state` — the same helper the dashboard reads (spec §7).
+                **({"merge_state": merged}
+                   if (merged := ops.merge_state(store, wo)) else {}),
                 # And the same for the assumption review, on the same never-always rule:
                 # a work order whose assumptions the OS never looked at has no line here.
                 **({"auto_review": review}

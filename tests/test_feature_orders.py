@@ -218,6 +218,34 @@ def test_submitting_a_plan_parks_it_for_review_and_settles_the_planner(planning,
     assert [w for w in store.list_work_orders() if w["kind"] == "worker"] == []
 
 
+def test_a_planner_whose_merge_was_gated_settles_completed_and_not_into_the_queue(
+        planning, store):
+    """The gate records the pull request; ROUTING still needs a submitter's `--pr`.
+
+    Issue #742 and the 2026-09-25 spec §3: a gate-derived URL is not a declaration, so a
+    planner keeps settling `completed` and no validation round opens over a pull request
+    that already merged.
+    """
+    from jarvis import gates
+
+    _, fo = planning
+    planner = planner_of(store, fo["id"])
+    pr = "https://github.com/acme/proj/pull/735"
+    approval = store.add_approval(planner["id"], gates.PR_MERGE,
+                                  f"gh pr merge {pr} --squash")
+    gates.apply_decision(store, approval["id"], verdict="approved",
+                         reason="the plan's own docs PR", decided_by="neo")
+    assert store.get_work_order(planner["id"])["pr_url"] == pr
+
+    out = ops.submit_plan(fo["id"], a_plan(child("reader"), child("writer")))
+
+    assert out["status"] == "plan_review"
+    settled = store.get_work_order(planner["id"])
+    assert settled["status"] == "completed"
+    assert settled["pr_url"] == pr
+    assert ops.validation_rounds(store, wo_id=planner["id"]) == []
+
+
 def test_an_invalid_plan_creates_nothing_and_names_every_problem(planning, store):
     _, fo = planning
 

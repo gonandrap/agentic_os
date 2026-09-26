@@ -64,6 +64,13 @@
     <p class="kv">⑃ pull request:
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
+    {# Whether it landed, derived by `ops.merge_state` from the timeline and never from
+       `pr_state` — the same helper `jarvis wo show` renders. Absent while nothing has
+       looked yet: "nothing has looked" is not "did not merge". #}
+    {% if merge_state and merge_state.state %}
+      <p class="sub">⑃ state: {{ merge_state.state }}
+        {%- if merge_state.head_oid %} at {{ merge_state.head_oid[:10] }}{% endif %}</p>
+    {% endif %}
     {# What the OS did, or declined to do, about merging it. Absent entirely unless the
        mechanism has touched this order — which is every order on a project that has not
        opted in — and NEVER a warning tone: a held auto-merge means the user merges this

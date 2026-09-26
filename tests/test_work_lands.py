@@ -570,6 +570,202 @@ def test_complete_merged_writes_the_sha_that_merged_onto_the_event(started, proj
     assert json.loads(event["payload"])["head_oid"] == sha
 
 
+def test_the_sweep_records_the_merge_it_saw_and_never_settles_the_order(
+        started, project, fake_gh):
+    """The merge, on the record, without `pr_state` gaining a writer — 2026-09-25 spec §5.
+
+    The `pr_url` a gate recorded reaches this sweep and nothing else; `complete_merged` is
+    the wrong tool here, because every order in this population is `completed` already and
+    that function runs `close_out` over it.
+    """
+    sha = "9f1c2ab4d5e6f708192a3b4c5d6e7f8091a2b3c4"
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-20T10:00:00Z", head_oid=sha)
+
+    _refresh(started, project)
+
+    [event] = _events(project, wo["id"], "pr_merged")
+    payload = json.loads(event["payload"])
+    assert payload["pr_url"] == PR
+    assert payload["head_oid"] == sha
+    assert payload["merged_at"] == "2026-09-20T10:00:00Z"
+    # Distinguishable from the merge that ENDED an order (`complete_merged`).
+    assert payload["source"] == "landing_sweep"
+    store = ProjectStore(project)
+    try:
+        fresh = store.get_work_order(wo["id"])
+    finally:
+        store.close()
+    assert fresh["status"] == "completed"
+    assert fresh["pr_state"] is None    # kn-dbc4971d: no new writer
+    assert _events(project, wo["id"], "landing_seen")
+
+
+def test_the_sweep_records_the_merge_once_and_never_a_second_time(
+        started, project, fake_gh):
+    """`timeline.build_timeline` renders every `pr_merged` it finds: two events are two
+    merge lines on `jarvis wo show` for ever."""
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", head_oid="abc1234")
+    _refresh(started, project)
+
+    store = ProjectStore(project)
+    try:
+        store.conn.execute(
+            "UPDATE wo_events SET ts = ts - ? WHERE wo_id = ? AND kind = 'landing_seen'",
+            (landing.FRESH_FOR_SECONDS + 1, wo["id"]))
+        store.conn.commit()
+    finally:
+        store.close()
+    _refresh(started, project)
+
+    assert len(_pr_reads(fake_gh)) == 2      # it did ask again…
+    assert len(_events(project, wo["id"], "pr_merged")) == 1     # …and wrote once
+
+
+def _gate_records(project: Path, wo_id: str, pr_url: str) -> None:
+    """Put `pr_url` on the record the way a planner's gets there — an approved merge gate.
+
+    Through `gates.apply_decision`, not into the column, so the `pr_url_recorded` event
+    the routing predicate reads exists (2026-09-25 spec §4).
+    """
+    from jarvis import gates
+
+    store = ProjectStore(project)
+    try:
+        approval = store.add_approval(wo_id, gates.PR_MERGE,
+                                      f"gh pr merge {pr_url} --squash")
+        gates.apply_decision(store, approval["id"], verdict="approved",
+                             reason="checks green", decided_by="neo")
+        assert store.get_work_order(wo_id)["pr_url"] == pr_url
+    finally:
+        store.close()
+
+
+def test_the_sweep_reads_the_pull_request_a_gate_recorded(started, project, fake_gh):
+    """THE SEAM: the sweep keeps reading the RAW column, and must — it writes
+    `landing_seen` and `pr_merged` and routes nothing (2026-09-25 spec §5).
+
+    Excluding a gate-recorded URL here would make INV-WORK-LANDED structurally silent
+    about exactly the order issue #742 is about, which is what this change exists to end.
+    """
+    sha = "9f3c1ad20b4e5f6a7b8c9d0e1f2a3b4c5d6e7f80"
+    wo = _order(project, "plan the feature", code="plan")
+    _gate_records(project, wo["id"], PR)
+    _settle(project, wo["id"])
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-25T10:00:00Z", head_oid=sha)
+
+    _refresh(started, project)
+
+    [event] = _events(project, wo["id"], "pr_merged")
+    payload = json.loads(event["payload"])
+    assert payload["head_oid"] == sha
+    assert payload["source"] == "landing_sweep"
+    assert _row(project, wo["id"])["status"] == "completed"
+
+
+def test_the_merge_the_sweep_saw_answers_a_park_over_the_same_work(started, project,
+                                                                  fake_gh):
+    """§6's INTENDED consequence, and the one reader the second `pr_merged` writer changes.
+
+    `land_finished` parks only over an EMPTY column, so the sweep reaches a parked order
+    only once a gate has recorded one — the #742 shape. The park is then answered by the
+    merge that really happened, and `invariants.true_blockers` stops re-deriving
+    UNLANDED_BLOCKER over code that is on the default branch.
+    """
+    wo = _order(project, code="watchdogs")
+    ops.assume(wo["id"], "polled every 30s")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+    ops.review_work_order(wo["id"], accept=True)        # parks it: no pull request
+    store = ProjectStore(project)
+    try:
+        assert store.work_unlanded_open(wo["id"]) is True
+    finally:
+        store.close()
+
+    _gate_records(project, wo["id"], PR)
+    _settle(project, wo["id"])
+    fake_gh.set_pr(PR, "MERGED", head_oid="abc1234")
+    _refresh(started, project)
+
+    store = ProjectStore(project)
+    try:
+        assert store.work_unlanded_open(wo["id"]) is False
+        assert invariants.UNLANDED_BLOCKER not in invariants.true_blockers(
+            store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+
+def test_a_pull_request_that_has_not_merged_records_no_merge(started, project, fake_gh):
+    wo = _delivered(project, "launcher contract", OTHER_PR, code="launcher")
+    fake_gh.set_pr(OTHER_PR, "OPEN")
+
+    _refresh(started, project)
+
+    assert _events(project, wo["id"], "pr_merged") == []
+
+
+def test_both_surfaces_say_the_pull_request_merged_off_the_same_derivation(
+        started, project, fake_gh, capsys):
+    """The issue's Expected: `pr_url …/pull/735` with state MERGED, on `wo show`.
+
+    From the event, never from `pr_state` (kn-dbc4971d), and through the one helper the
+    dashboard also calls — a derivation duplicated across those two files is how they
+    drift. 2026-09-25 spec §7.
+    """
+    from jarvis import cli
+
+    wo = _delivered(project, "the cap", PR, code="cap")
+    fake_gh.set_pr(PR, "MERGED", head_oid="abc1234")
+    _refresh(started, project)
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["pr_url"] == PR
+    assert document["merge_state"]["state"] == "MERGED"
+    assert document["merge_state"]["head_oid"] == "abc1234"
+
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    assert "MERGED" in capsys.readouterr().out
+
+
+def test_an_order_whose_pull_request_nothing_has_looked_at_claims_no_state(
+        started, project, capsys):
+    """"Nothing has looked yet" is not "did not merge" — `landing.py`'s own rule."""
+    from jarvis import cli
+
+    wo = _order(project, "launcher contract", code="launcher")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["merge_state"] == {"pr_url": PR, "state": "", "head_oid": "",
+                                       "merged_at": None, "source": ""}
+
+    # ...and the human surface says the same thing: the link, and NO state beside it.
+    # `capsys` was drained by the read above, so asserting over it again proves nothing.
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    printed = capsys.readouterr().out
+    assert PR in printed
+    assert "MERGED" not in printed
+
+
+def test_an_order_with_no_pull_request_gains_no_merge_line_at_all(started, project,
+                                                                 capsys):
+    from jarvis import cli
+
+    wo = _order(project, "a planner", code="")
+    ops.finish(wo["id"], "wrote no code")
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    assert "merge_state" not in json.loads(capsys.readouterr().out)
+
+
 def test_the_check_is_silent_until_the_sweep_has_run_and_never_guesses(
         started, project, fake_gh):
     """The invariant is a pure timeline read, so an order nothing has looked at yet is

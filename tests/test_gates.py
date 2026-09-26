@@ -9,6 +9,7 @@ these tests pin both directions: what must be gated, and what must never be.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -124,6 +125,58 @@ def test_gated_action_hidden_in_a_pipeline_is_still_caught():
         "if [ -f x ]; then gh pr merge 31; fi",
     ):
         assert gates.classify(command, ALL_GATES) is not None, command
+
+
+# -- the pull request inside a merge command -------------------------------------------
+
+
+@pytest.fixture()
+def origin(project):
+    """The fixture project with an `origin` — what a bare PR number is composed against."""
+    subprocess.run(["git", "-C", str(project), "remote", "add", "origin",
+                    "https://github.com/acme/proj.git"], check=True)
+    return project
+
+
+@pytest.mark.parametrize("command,expected", [
+    # Resolvable offline, the three shapes of the spec's §1 table.
+    ("gh pr merge https://github.com/acme/proj/pull/735 --squash",
+     "https://github.com/acme/proj/pull/735"),
+    ("gh pr merge 735 --squash", "https://github.com/acme/proj/pull/735"),
+    ("gh pr merge --squash --delete-branch 735", "https://github.com/acme/proj/pull/735"),
+    ("gh api --method PUT repos/acme/proj/pulls/735/merge",
+     "https://github.com/acme/proj/pull/735"),
+    ("gh pr merge https://github.com/acme/proj/pull/735 --squash "
+     "--match-head-commit abc123", "https://github.com/acme/proj/pull/735"),
+    # Not resolvable without a round trip: a branch ref, and the current branch.
+    ("gh pr merge feature/thing --squash", ""),
+    ("gh pr merge --auto", ""),
+])
+def test_the_pull_request_in_a_merge_command(origin, command, expected):
+    assert gates.pull_request_in(command, origin) == expected
+
+
+@pytest.mark.parametrize("command", [
+    # A well-formed URL on somebody else's repository: `origin` is what refuses it.
+    "gh pr merge https://github.com/someone/else/pull/1 --squash",
+    # The same, through the API form, whose owner and repo the worker chose.
+    "gh api --method PUT repos/someone/else/pulls/1/merge",
+    # A bare number beside `--repo`: read, so the number is never composed against
+    # `origin` and recorded as this project's pull request.
+    "gh pr merge --repo=someone/else 735",
+    # ...and the short spelling of the same flag.
+    "gh pr merge -R someone/else 735",
+    # Not on `https://`: no shape matches a plaintext URL, so nothing is recorded.
+    "gh pr merge http://github.com/acme/proj/pull/735 --squash",
+])
+def test_a_pull_request_on_another_repository_is_never_recorded(origin, command):
+    """Worker-written text, checked against `origin` — kn-c748e0fe. The shape check
+    itself is pinned by test_evidence_pull_request.py, not re-proved here."""
+    assert gates.pull_request_in(command, origin) == ""
+
+
+def test_a_bare_number_with_no_readable_origin_resolves_to_nothing(project):
+    assert gates.pull_request_in("gh pr merge 735 --squash", project) == ""
 
 
 def test_classification_is_off_when_no_gate_is_enabled():
@@ -529,6 +582,81 @@ def test_apply_decision_tells_the_worker_what_to_do_next(gated):
     assert "gh pr merge 31" in body
     kinds = [e["kind"] for e in gated.store.list_events(gated.wo["id"])]
     assert "gate_decided" in kinds
+
+
+PR_735 = "https://github.com/acme/proj/pull/735"
+
+
+def _recorded(store, wo_id) -> list[dict]:
+    return [db.from_json(e["payload"], {}) for e in store.list_events(wo_id)
+            if e["kind"] == "pr_url_recorded"]
+
+
+def test_an_approved_merge_records_the_pull_request_it_authorised(gated):
+    """The gate is the only record a planner's pull request leaves — issue #742."""
+    gated.attempt(f"gh pr merge {PR_735} --squash")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    gates.apply_decision(gated.store, approval["id"], verdict="approved",
+                         reason="checks green", decided_by="neo")
+
+    assert gated.store.get_work_order(gated.wo["id"])["pr_url"] == PR_735
+    events = _recorded(gated.store, gated.wo["id"])
+    assert len(events) == 1
+    assert events[0]["pr_url"] == PR_735
+    assert events[0]["approval_id"] == approval["id"]
+    # Never confusable with `finished {pr_url}`, which is a SUBMITTER declaration (§3).
+    assert events[0]["source"] == "gate"
+
+
+@pytest.mark.parametrize("verdict", ["denied", "dismissed"])
+def test_only_an_approval_is_evidence_of_a_merge(gated, verdict):
+    """A denial never ran the command, and a dismissal says it was not one."""
+    gated.attempt(f"gh pr merge {PR_735} --squash")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    gates.apply_decision(gated.store, approval["id"], verdict=verdict,
+                         reason="no", decided_by="neo")
+
+    assert not gated.store.get_work_order(gated.wo["id"])["pr_url"]
+    assert _recorded(gated.store, gated.wo["id"]) == []
+
+
+def test_a_pull_request_the_record_already_carries_is_left_alone(gated):
+    gated.store.update_work_order(gated.wo["id"], pr_url="https://x/a/b/pull/1")
+    gated.attempt(f"gh pr merge {PR_735} --squash")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    gates.apply_decision(gated.store, approval["id"], verdict="approved",
+                         reason="checks green", decided_by="neo")
+
+    assert gated.store.get_work_order(gated.wo["id"])["pr_url"] == "https://x/a/b/pull/1"
+    assert _recorded(gated.store, gated.wo["id"]) == []
+
+
+def test_a_release_gate_records_no_pull_request(gated):
+    gated.attempt("./scripts/shipit.sh")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    gates.apply_decision(gated.store, approval["id"], verdict="approved",
+                         reason="ship it", decided_by="neo")
+
+    assert not gated.store.get_work_order(gated.wo["id"])["pr_url"]
+
+
+def test_a_verdict_stands_even_when_the_pull_request_cannot_be_recorded(gated,
+                                                                       monkeypatch):
+    """A verdict that fails to record a URL must still be a verdict (§3)."""
+    monkeypatch.setattr(gates, "pull_request_in",
+                        lambda command, cwd: (_ for _ in ()).throw(RuntimeError("boom")))
+    gated.attempt(f"gh pr merge {PR_735} --squash")
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+
+    row = gates.apply_decision(gated.store, approval["id"], verdict="approved",
+                               reason="checks green", decided_by="neo")
+
+    assert row["status"] == "approved"
+    assert not gated.store.get_work_order(gated.wo["id"])["pr_url"]
 
 
 def test_denial_message_tells_the_worker_not_to_retry(gated):
