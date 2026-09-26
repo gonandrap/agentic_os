@@ -5,6 +5,7 @@ Grouped commands:
   jarvis cost [project|wo-id|fo-id]       what the work has cost in tokens
   jarvis inspect <wo-id|fo-id>            where its TIME went, and which cache writes
                                           were a defect rather than the cache expiring
+  jarvis watch <wo-id>                    what its turn is doing RIGHT NOW, repainted
   jarvis alarms [project] [--wo|--fo|--source]   findings, newest first: a turn raised
                                           WHILE it burned, or a probe's symptom
   jarvis alarms show|review <al-id>       one alarm, and your verdict on the
@@ -390,6 +391,19 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
+        "watch",
+        help="what a work order's turn is doing RIGHT NOW: the tool in flight and how "
+             "long it has been running — or, when nothing has been written, since when",
+    )
+    sp.add_argument("target", help="a work-order id")
+    sp.add_argument("--project")
+    sp.add_argument("--interval", type=float, default=2.0,
+                    help="seconds between repaints (default: 2.0)")
+    sp.add_argument("--once", action="store_true",
+                    help="print one frame and exit, instead of repainting")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
@@ -1820,6 +1834,87 @@ def cmd_inspect(args: argparse.Namespace) -> int:
             print()
         _print_anatomy(unit, res["write_floor"])
     return 0
+
+
+def _print_live(payload: dict[str, Any]) -> None:
+    """One frame, in the order §3 asks the eye to read it.
+
+    THIS RENDERER DERIVES NOTHING. Every number and every sentence is a value from
+    `ops.live_report`; the only thing done here is where it goes on the screen and how
+    wide it is. A renderer that computed one of them is one the dashboard would disagree
+    with (PR 65), and the `--json` test is what pins that.
+    """
+    print(f"{payload['wo_id']} · {payload['project']} · {payload['state']}")
+    print("=" * RULE_WIDTH)
+    if not payload["found"]:
+        # No counters at all, not zeroed ones: absent is never zero (issue #227).
+        print(f"  {payload['note']}")
+        return
+
+    # THE LARGEST THING ON THE SCREEN is what it is doing and for how long — that is the
+    # question the command was opened to answer. In every other state the payload's own
+    # sentence takes that place, because there is nothing current to put there.
+    live_now = payload["now"]
+    if live_now:
+        print(f"\n  {live_now['tool'].upper()}   {live_now['elapsed']:.0f}s")
+        if live_now["detail"]:
+            print(f"  {live_now['detail']}")
+    else:
+        print(f"\n  {payload['note']}")
+
+    turn = payload["turn"]
+    if turn:
+        why = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
+        print(f"\n  turn {turn['seq']} · {_mins(turn['elapsed'])} · {why}")
+    tok = payload["tokens"]
+    print(f"  in {_tok(tok['input'])} · out {_tok(tok['output'])} · "
+          f"cache write {_tok(tok['cache_write'])} · read {_tok(tok['cache_read'])} · "
+          f"context {_tok(tok['context'])}")
+    write = payload["last_write"]
+    if write:
+        print(f"  last cache write {_tok(write['written'])} — {write['cause']}: "
+              f"{write['note']}")
+
+    if payload["recent"]:
+        print("\n  just finished:")
+        for span in payload["recent"]:
+            print(f"    {span['tool']:<12}{span['elapsed']:>7.1f}s  "
+                  f"{span['detail']}")
+    if payload["holds"]:
+        print("\n  held:")
+        for hold in payload["holds"]:
+            print(f"    {_mins(hold['seconds']):>8}  {hold['phrase']}")
+    print(f"\n  parameters shown to {payload['params_cap']} characters")
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    from . import live, ops
+
+    # ONE reader for the whole loop (Neo q678 (1)): it carries the resolved transcript
+    # path and the rows already parsed, which is the only reason a 2s refresh is cheap.
+    reader = live.Reader()
+    try:
+        while True:
+            payload = ops.live_report(args.target, args.project, reader=reader)
+            if args.json:
+                _print(payload, True)
+            else:
+                # Repaint rather than scroll, and only where there is a terminal to
+                # repaint: piped or redirected output keeps every frame.
+                if not args.once and sys.stdout.isatty():
+                    print("\033[H\033[2J", end="")
+                _print_live(payload)
+            # Redirected stdout is block-buffered, and a repaint loop is normally ended
+            # by a signal rather than a clean exit — so without this a frame sits in the
+            # buffer and is lost. `--once` needs no flush of its own: its exit is clean.
+            sys.stdout.flush()
+            if args.once:
+                return 0
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        # The normal way this command ends. Not a failure, so not an error code.
+        print()
+        return 0
 
 
 #: The `alarms` subcommands. Anything else after `alarms` is the project positional the
@@ -3682,6 +3777,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cost(args)
         if args.cmd == "inspect":
             return cmd_inspect(args)
+        if args.cmd == "watch":
+            return cmd_watch(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
         if args.cmd == "search":

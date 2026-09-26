@@ -8759,6 +8759,45 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+def live_report(target: str, project: str | None = None, *,
+                reader: Any = None, now: float | None = None) -> dict[str, Any]:
+    """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point.
+
+    THE SINGLE SHIPPED ENTRY POINT, and both renderers consume the payload without
+    reshaping it: a renderer that derives a number is one the other surface will disagree
+    with (PR 65). Returns `live.Live.as_dict()` verbatim.
+
+    A WORK ORDER ONLY. A feature order is not a live turn — it has no session and no
+    clock of its own — so `find_work_order`'s OpsError is the right answer for one, and
+    `inspect_report`'s feature-order-first resolution deliberately is not copied.
+
+    `reader` is the caller's `live.Reader`, reused across frames (Neo q678 (1)): it holds
+    the resolved transcript path and the rows already parsed, which is what makes a
+    two-second refresh cheap. None builds one for this call. Nothing is cached at module
+    level and nothing is persisted.
+    """
+    from . import holds, live
+    from . import worker_session as ws
+
+    name, path, wo = find_work_order(target, project)
+    reader = live.Reader() if reader is None else reader
+    reader.bind(wo.get("session_id") or "")
+    store = ProjectStore(path)
+    try:
+        # The two facts only the record knows, plus the holds — `live` opens no database,
+        # so they are read here and passed in (`inspection.read_session`'s `spans` rule).
+        return reader.snapshot(
+            wo_id=wo["id"], project=name,
+            turn_in_flight=ws.busy(store, wo["id"]) is not None,
+            settled=wo["status"] not in OPEN_STATUSES,
+            now=time.time() if now is None else now,
+            holds=holds.held(store, wo["id"]),
+            write_floor=inspect_config(name).report_write_floor,
+        ).as_dict()
+    finally:
+        store.close()
+
+
 def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
     """The twenty keys `list_cost_alarms` publishes, from one `alarms_across` row.
 
