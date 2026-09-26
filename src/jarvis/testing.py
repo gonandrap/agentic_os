@@ -2192,7 +2192,8 @@ FIXTURE_DESIGN_DOC_BODY = "\n".join([
 ])
 
 
-def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> Path:
+def make_git_project(root: Path, name: str, readme: str | None = "# proj\n",
+                     commit_spec: bool = True) -> Path:
     path = root / name
     path.mkdir(parents=True)
     # `-b main`, not the machine's `init.defaultBranch`: `evidence.base_ref`'s last rung
@@ -2204,7 +2205,19 @@ def make_git_project(root: Path, name: str, readme: str | None = "# proj\n") -> 
     doc = path / FIXTURE_DESIGN_DOC
     doc.parent.mkdir(parents=True, exist_ok=True)
     doc.write_text(FIXTURE_DESIGN_DOC_BODY)
+    if commit_spec:
+        # The SPEC ONLY, so the repository is otherwise as empty as every other suite
+        # expects. A plan is refused unless its design document has a committed copy
+        # (§11 of the plan-review spec), so without this commit no fixture plan submits.
+        commit(path, "fixture: the design document", FIXTURE_DESIGN_DOC)
     return path
+
+
+def commit(repo: Path, message: str, *paths: str) -> None:
+    """Commit named paths in a fixture repository, identity and all."""
+    subprocess.run(["git", "-C", str(repo), "add", "--", *paths], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", message], check=True)
 
 
 @pytest.fixture(autouse=True)
