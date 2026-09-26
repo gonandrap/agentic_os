@@ -445,8 +445,22 @@ must not 500 the page — `uilog` turns a dashboard 500 into an inbox item and
 Filed to the backlog where a backlog item is the right home. Listed here so nobody
 re-proposes them mid-feature.
 
-**OTEL is not out of scope here, and it is not rejected.** Whether Claude Code's
-OpenTelemetry export earns a place in this tree is UNDECIDED, and §9 owns that decision.
+**OTEL is DECLINED, on a measurement and not on the prior.** A real headless turn on CLI
+2.1.282 exported to a recording listener (`scripts/spike_otel.py`, findings in
+`docs/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
+tree needs: `tool_result` gives `tool_input_size_bytes` and never the input, so §4 is
+unserved; cache tokens arrive as flat `cache_read_tokens` / `cache_creation_tokens` with no
+`ephemeral_5m` / `ephemeral_1h` and no `modelUsage`, so `classify_writes`'s cause is
+underivable; and nothing anywhere reports window share, so §5 stands. The killed turn
+settles it — SIGKILL at t=25.02s exported metrics: none at all, last log flush t=19.54s,
+~5.5s of events including the final `tool_result` lost — and a 3000ms interval narrows that
+window without closing it, because the exporter dies with the process. The env seam stays
+one line (`claude_cli.py:805`), so the door is open at zero cost. Reason 2's "new failure
+mode" was CONTRADICTED: a dead endpoint costs a turn nothing (`rc=0`, `subtype: success`,
+`duration_ms: 7893`) — the concern that replaced it is `user.email` and the account
+identifiers riding on every record and every flush. Parked here as backlog notes, the two
+things OTEL uniquely has: per-hook `total_duration_ms` and per-request `ttft_ms`; neither
+serves a section of this feature and no feature order is filed.
 
 **Hook-recorded tool spans, and any live-state table. Rejected on the merits, not deferred
 for size.** `PostToolUse` is already matched in `assets/settings.base.json`, so a hook would
