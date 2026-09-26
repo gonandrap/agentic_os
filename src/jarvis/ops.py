@@ -1366,6 +1366,328 @@ def _project_permission_mode(project_name: str) -> str | None:
     return None
 
 
+#: The `waiting_on` answers that mean THE USER IS NEEDED — the set `true_blockers` is
+#: cross-checked against in `diagnose`. Written out rather than derived, because the two
+#: functions are deliberately different questions ("what is this waiting for" against
+#: "does this need the USER") and the only honest way to compare two answers to two
+#: questions is to state the mapping between them once, in the open, where it can be
+#: read and argued with. Spec §6.1: where the two disagree the report says so and picks
+#: NEITHER — a silent pick is how GitHub issues #197 and #711 reached the user as a
+#: confident wrong sentence.
+USER_IS_NEEDED_WAITS = frozenset({
+    "assumptions", "gate_escalated", "neo_escalated", "plan_assumptions",
+    "message_stuck", "signin", "needs_review",
+})
+
+#: As much timeline as any conversation the fleet has run, and the same number
+#: `holds._EVENT_LIMIT` uses for the same reason: `list_events` takes the OLDEST `limit`
+#: rows, so a cap that bit would hide the RECENT events — which for this report are the
+#: only ones it asks about.
+DIAGNOSE_EVENT_LIMIT = 10_000
+
+
+def ago_phrase(seconds: float) -> str:
+    """"3.1h" — an age at the magnitude a reader can hold in their head.
+
+    HERE RATHER THAN IN THE RENDERER, and that is the §6 rule rather than a preference:
+    `jarvis wo why`'s human output renders only, computing no number and no duration that
+    is not already in the payload, so that the `--json` consumer and the person reading
+    the terminal cannot be shown two different clocks. Same ladder as `cli._age`.
+    """
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 5400:
+        return f"{int(seconds / 60)}m"
+    if seconds < 129_600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def _ago(ts: Any, now: float) -> dict[str, Any]:
+    """`{ago_seconds, ago}` for one moment, for the clock block below."""
+    seconds = max(0.0, now - float(ts))
+    return {"ago_seconds": round(seconds, 1), "ago": ago_phrase(seconds)}
+
+
+#: Said on every clock block, whatever it contains. This report reads the OS's RECORD;
+#: the live process is §3's question and a different command answers it. Spec §6.2 calls
+#: the seam deliberate: coupling them would make this section unbuildable for one number.
+LIVE_NOTE = ("this is the OS's own record of the order, not the process — `jarvis watch "
+             "{wo_id}` is what reads the turn in flight")
+
+#: `None` and a sentence, never `0` — issue #227. An order that has never taken a turn,
+#: never changed status or has no timeline at all has an ABSENT clock, and a zeroed
+#: sub-block would read as "it happened, just now", which is the opposite fact.
+NO_TURN_NOTE = ("no worker turn has ever run for this order, so there is no last turn to "
+                "date — absent, not zero")
+NO_STATUS_NOTE = ("no status transition is on the timeline for this order, so there is "
+                  "none to date — absent, not zero")
+NO_EVENT_NOTE = ("this order has no timeline events at all, so there is nothing to date "
+                 "— absent, not zero")
+
+#: The residual is NOT a cause and is labelled as one thing only: idle the record does
+#: not account for. Spec §6.3, and `inspection.Anatomy.unexplained` is where the number
+#: comes from — Neo ruled on question 680 that the transcript supplies the residual and
+#: NOTHING else here, every duration and the status still coming from the store.
+UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a residual; a "
+                    "large one is a different defect from anything this report can name")
+NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
+                      "by Claude Code), so the residual is unmeasurable rather than zero")
+
+#: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
+#: retried and gave up is today visible only as a cost row, and the whole point of
+#: surfacing it here is that the reader can see it was NEVER REACHED. The wording avoids
+#: every verb of judgement on purpose: an unreachable call produced no judgement and the
+#: OS must never synthesise one for it.
+OS_CALLS_NOTE = ("`unreachable` means the OS could not reach the model on that call: it "
+                 "produced no judgement at all, and nothing may be read into it. Only an "
+                 "`answered` row carries anything a model actually said.")
+
+#: Said whenever the read hit its cap, because a list cut off silently is read as the
+#: whole of it — the same false claim `NO_TURN_NOTE` above exists to stop. The counts go
+#: with the sentence: they are counts of the rows this block HOLDS, not of the order's
+#: history, so at the cap they are a floor.
+OS_CALLS_CAPPED_NOTE = ("This list is capped at the newest {limit} calls, so the counts "
+                        "beside it are a floor rather than the order's whole history.")
+
+#: How many call rows the newest-first list is worth printing to a terminal, and the cap
+#: on the read behind it. Two numbers rather than one: 200 is the depth a `--json`
+#: consumer can page through, 10 is the depth a person reading a diagnosis can take in —
+#: and a report that scrolls a screen of table is one whose first line is never read.
+OS_CALLS_LIMIT = 200
+OS_CALLS_SHOWN = 10
+
+#: The clearing command lives INSIDE `waiting_on`'s sentence, which is written by the one
+#: function that knows the case. Carried verbatim rather than re-derived or re-parsed:
+#: a second extraction of a command out of a sentence is a second thing to keep correct.
+WAY_THROUGH_NOTE = ("the blocker's own sentence above names the way through, in the "
+                    "words of the function that diagnosed it")
+
+
+def _diagnose_clock(store: ProjectStore, wo_id: str, now: float) -> dict[str, Any]:
+    """The last state transition, the last turn, the last event — from the store alone."""
+    statuses = store.events_of_kind(wo_id, "status")
+    last_status = ({"status": (db.from_json(statuses[-1].get("payload"), {}) or {}
+                               ).get("status") or "",
+                    "ts": statuses[-1]["ts"], **_ago(statuses[-1]["ts"], now)}
+                   if statuses else None)
+    turn = store.latest_turn(wo_id)
+    last_turn = ({"seq": turn["seq"], "label": turn_label(turn["seq"]),
+                  "state": turn["state"],
+                  "started_at": turn["started_at"], "ended_at": turn["ended_at"],
+                  **_ago(turn["ended_at"] or turn["started_at"], now)}
+                 if turn else None)
+    events = store.list_events(wo_id, limit=DIAGNOSE_EVENT_LIMIT)
+    last_event = ({"kind": events[-1]["kind"], "ts": events[-1]["ts"],
+                   **_ago(events[-1]["ts"], now)} if events else None)
+    notes = [note for note, absent in ((NO_STATUS_NOTE, last_status is None),
+                                       (NO_TURN_NOTE, last_turn is None),
+                                       (NO_EVENT_NOTE, last_event is None)) if absent]
+    return {"last_status": last_status, "last_turn": last_turn,
+            "last_event": last_event,
+            "turn_open": bool(turn is not None and turn["state"] == "running"),
+            "note": " ".join(notes), "live_note": LIVE_NOTE.format(wo_id=wo_id)}
+
+
+def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
+                    project: str, now: float) -> dict[str, Any]:
+    """Every episode the record says held this order, plus the honest residual."""
+    from . import holds as holds_mod
+    from . import inspection
+
+    episodes = holds_mod.held(store, wo["id"], now=now)
+    by_cause = {cause: round(seconds, 2) for cause, seconds
+                in holds_mod.by_cause(episodes, float("-inf"), now, now=now).items()}
+    session = str(wo.get("session_id") or "")
+    # Exactly `inspect_report`'s inner `unit()` shape, and it takes the SAME two
+    # arguments for the same reason: `read_session` has never opened the OS's database,
+    # so the spans are passed in. The walk itself is not touched here — this report reads
+    # one number off it (Neo, question 680).
+    anatomy = (inspection.read_session(session, inspect_config(project),
+                                       spans=list(episodes))
+               if session else None)
+    if anatomy is not None and anatomy.found:
+        unexplained = {"seconds": round(anatomy.unexplained, 2),
+                       "seconds_human": ago_phrase(anatomy.unexplained),
+                       "residual": True, "note": UNEXPLAINED_NOTE}
+    else:
+        unexplained = {"seconds": None, "seconds_human": None, "residual": True,
+                       "note": NO_TRANSCRIPT_NOTE}
+    # `as_dict` verbatim plus the FORMATTED duration, because the human surface renders
+    # only and may compute nothing of its own (see `ago_phrase`). Nothing is taken out.
+    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"])}
+            for h in episodes]
+    return {"episodes": rows, "by_cause": by_cause,
+            "open": next((r for r in reversed(rows) if r["open"]), None),
+            "unexplained": unexplained}
+
+
+def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
+                       shown: int = OS_CALLS_SHOWN) -> dict[str, Any]:
+    """The OS's own `claude -p` calls for this order, each with its outcome.
+
+    The limit is passed EXPLICITLY and then published, rather than left to
+    `_os_calls_detail`'s default: the read truncates, and a truncated list presented as
+    complete is the same false claim as a zero standing in for an absent number (issue
+    #227). `calls` and `failed` count the rows this report actually holds, so at the cap
+    both are a floor and `note` says so in those words.
+
+    `shown` and `more` are the HUMAN listing's arithmetic, done here because the renderer
+    renders only (see `ago_phrase`) — 200 lines of call table is not a diagnosis.
+    """
+    rows = [{**row, "outcome": "answered" if row["ok"] else "unreachable"}
+            for row in _os_calls_detail(wo_id, limit=limit)]
+    note = OS_CALLS_NOTE
+    capped = len(rows) >= limit
+    if capped:
+        note = f"{note} {OS_CALLS_CAPPED_NOTE.format(limit=limit)}"
+    return {"calls": len(rows), "failed": sum(1 for r in rows if not r["ok"]),
+            "rows": rows, "note": note, "limit": limit, "capped": capped,
+            "shown_limit": shown, "more": max(0, len(rows) - shown)}
+
+
+def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
+                       blocker: dict[str, Any], needs_you: list[str],
+                       ) -> tuple[list[dict[str, str]], list[str]]:
+    """Only what the OS would accept RIGHT NOW, plus why the rest is missing.
+
+    Every predicate here MIRRORS the refusal of the command it offers rather than
+    restating it: `force_validation_refusal` is already the one home of its rule,
+    `ack_attention` refuses on an assumption blocker in those words, `unblock_work_order`
+    refuses on live edges. Offering a command that will be refused teaches the user to
+    distrust the surface (spec §6.5), and a second copy of a predicate passes every
+    behavioural test and drifts anyway (kn-4ea33fe6).
+    """
+    wo_id = str(wo["id"])
+    out: list[dict[str, str]] = []
+    refusals: list[str] = []
+
+    refusal = force_validation_refusal(store, wo, project=project,
+                                       cfg=validation_config(project))
+    if refusal is None:
+        out.append({"command": f'jarvis validation force {wo_id} --reason "…"',
+                    "why": "judge the current pull request again, now — no worker runs "
+                           "and no round is open"})
+    else:
+        refusals.append(refusal)
+
+    # `ack_attention`'s own predicate, verbatim: a blocker naming an assumption is a
+    # decision the OS is waiting on, and acknowledging would bury it.
+    if wo["needs_attention"] and not [b for b in needs_you if "assumption" in b.lower()]:
+        out.append({"command": f"jarvis wo ack {wo_id}",
+                    "why": "put the attention flag down for good — nothing here is a "
+                           "decision that would be buried by it"})
+
+    blockers = store.unfinished_dependencies(wo_id)
+    if blockers:
+        out.append({"command": f"jarvis wo unblock {wo_id}",
+                    "why": f"cut the dependency edges holding it back "
+                           f"({', '.join(d['id'] for d in blockers)})"})
+        if not invariants.dead_dependencies(store, wo):
+            # `--all` is the only form `unblock_work_order` would accept here: with no
+            # dead edge the default cuts nothing and refuses, saying the work is live.
+            out[-1] = {"command": f"jarvis wo unblock {wo_id} --all",
+                       "why": "every edge it waits on is still LIVE, so only --all cuts "
+                              "them — it then runs without the work it was to build on"}
+
+    if blocker["stalled"] and blocker["what"] not in NUDGE_IS_WRONG:
+        out.append({"command": f"jarvis wo resume-auto {wo_id}",
+                    "why": "nothing is coming for this by itself, and this is the one "
+                           "blocker a nudge can move"})
+
+    for approval in store.escalated_approvals(wo_id):
+        out.append({"command": f'jarvis gate approve {approval["id"]} --reason "…"',
+                    "why": "a privileged action Neo sent up to you — nobody else can "
+                           "open this gate"})
+        out.append({"command": f'jarvis gate deny {approval["id"]} --reason "…"',
+                    "why": "refuse it; the reason reaches the worker"})
+    return out, refusals
+
+
+def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Why is this order not moving, and what do I type — `jarvis wo why`.
+
+    PURE COMPOSITION, AND THAT IS THE POINT (spec §6 of
+    docs/specs/2026-09-24-order-observability.md). Every part of the answer already
+    existed and was scattered over three surfaces that each showed a slice; this puts
+    them in one payload and rewrites none of them. A diagnosis that disagrees with the
+    status label is worse than no diagnosis, so where `waiting_on` and `true_blockers`
+    disagree the report says so and picks neither.
+
+    IT ACTS ON NOTHING. It files nothing, unblocks nothing, sends nothing and writes not
+    one row — the acting path is `remedies.py`, a closed registry behind a Neo approval.
+    Works on a settled order too, reporting how it settled.
+
+    NOTHING IN THE PAYLOAD IS TEXT THE OS DID NOT WRITE. Every field is an OS-authored
+    sentence, a status, a number or an id: no gate command, no prompt, no transcript
+    line, no error tail. That is the boundary `holds.Hold`'s docstring sets out and it is
+    a security one rather than minimalism — a gate's command is a privileged shell line a
+    worker proposed, routinely carrying a tokenised remote (kn-1791a5e6).
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    now = time.time()
+    store = ProjectStore(path)
+    try:
+        # One read for one row, the way `os_status` takes one for a whole listing: the
+        # account's state can change the status label of an order a usage window holds,
+        # and `fleet_if_held` answers None when nothing here is holdable or the catalog
+        # cannot be resolved (issue #714).
+        held_by_fleet = fleet_if_held([wo])
+        blocker = waiting_on(store, wo)
+        needs_you = invariants.true_blockers(store, wo, now)
+        payload = {
+            "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
+            "status": wo["status"],
+            "status_label": invariants.status_label(store, wo, held_by_fleet),
+            "blocker": blocker,
+            "needs_you": needs_you,
+            "notes": {
+                "parked": invariants.parked_reason(store, wo, now) or None,
+                "pause": invariants.pause_note(store, wo),
+                "fleet_hold": invariants.fleet_hold_note(wo, held_by_fleet),
+            },
+            "disagreements": _disagreements(blocker, needs_you),
+            "clock": _diagnose_clock(store, str(wo["id"]), now),
+            "holds": _diagnose_holds(store, wo, name, now),
+            "way_through": {"detail": blocker["detail"], "note": WAY_THROUGH_NOTE},
+        }
+        commands, refusals = _diagnose_commands(store, wo, project=name,
+                                                blocker=blocker, needs_you=needs_you)
+    finally:
+        store.close()
+    # After the store is closed on purpose: this one reads the CENTRAL database and opens
+    # its own handle, and holding two while asking is how a reader of one report ends up
+    # blocking a reconcile tick.
+    payload["os_calls"] = _diagnose_os_calls(str(wo["id"]))
+    payload["commands"] = commands
+    payload["refusals"] = refusals
+    return payload
+
+
+def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
+    """Both answers, both sources, no winner — spec §6.1.
+
+    Raised in BOTH directions because both have been wrong in production, and each names
+    the two functions and what each of them said, so the user can go and read either one
+    rather than being handed a verdict this report is in no position to reach.
+    """
+    what = blocker["what"]
+    out: list[str] = []
+    if needs_you and what not in USER_IS_NEEDED_WAITS:
+        out.append(
+            f"these two disagree and neither is overruled here: `invariants."
+            f"true_blockers` says this needs YOU ({needs_you[0]}), while `ops.waiting_on`"
+            f" says it is waiting on {what!r} — {blocker['detail']}"
+        )
+    if not needs_you and what in USER_IS_NEEDED_WAITS:
+        out.append(
+            f"these two disagree and neither is overruled here: `ops.waiting_on` says "
+            f"it is waiting on you ({what!r} — {blocker['detail']}), while `invariants."
+            f"true_blockers` says nothing here needs you"
+        )
+    return out
+
+
 def assume(wo_id: str, content: str) -> dict[str, Any]:
     """Record an assumption: DB row + ASSUMPTIONS.md append + review flag.
 
