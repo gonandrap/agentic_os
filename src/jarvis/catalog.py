@@ -408,6 +408,22 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
+#: Which net answers "is this assumption high-stakes?" before any model call
+#: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
+#:
+#: * `regex` — today's behaviour exactly: `autoreview.high_stakes_marker` decides, no
+#:   model call is made and nothing new is written. THE SHIPPED DEFAULT.
+#: * `shadow` — both run and THE REGEX STILL DECIDES. The disagreement is recorded as an
+#:   `autoreview_stakes_disagreed` event and nothing else about the order changes.
+#: * `classifier` — the model's verdict decides.
+#: * `regex-tightened` — `autoreview.HIGH_STAKES_TIGHTENED` decides. NO MODEL CALL either,
+#:   so it costs what `regex` costs. THE RECOMMENDATION of the 2026-09-25 spec §7 after
+#:   the A/B: no model arm cleared the bar on 485 hand-labelled production assumptions and
+#:   haiku answered 7.5% of a repeat run differently, which for a safety net is
+#:   disqualifying on its own. Not the default — `regex` is, so the shipped behaviour is
+#:   unchanged until a project opts in.
+STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
+
 
 @dataclass
 class ValidationConfig:
@@ -488,6 +504,18 @@ class ValidationConfig:
     follow_ups: bool = True
     # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
+    # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call
+    # (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
+    # `regex`, `shadow`, `classifier` or `regex-tightened` — see STAKES_CLASSIFIER_MODES.
+    # `regex-tightened` is the A/B's RECOMMENDATION (spec SS7) and calls nothing either.
+    #
+    # NOT A BOOLEAN because `shadow` is the entire point: a boolean
+    # offers "measure it in production" and "swap it" with nothing in between, and this
+    # net guards the one authority the user hands over one project at a time. Ships
+    # `regex`, which is today's behaviour exactly — no call, no row, no event.
+    #
+    # Same field-level fallback as every flag in this block.
+    stakes_classifier: str = "regex"
 
 
 # -- the house style: how terse the OS holds its workers ---------------------------------
@@ -1331,6 +1359,14 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    stakes_classifier = str(
+        raw.get("stakes_classifier", base.stakes_classifier) or "regex")
+    if stakes_classifier not in STAKES_CLASSIFIER_MODES:
+        # The `roster` precedent: refused loudly rather than shrugged to the default,
+        # because a typo here silently decides which net guards the settle path — and
+        # falling back would read as the feature being off.
+        raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
+                   f"one of {list(STAKES_CLASSIFIER_MODES)}")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
@@ -1354,6 +1390,8 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_merge=bool(raw.get("auto_merge", base.auto_merge)),
         # Same fallback, same reason — see `ValidationConfig.auto_review`.
         auto_review=bool(raw.get("auto_review", base.auto_review)),
+        # Same fallback again — see `ValidationConfig.stakes_classifier`.
+        stakes_classifier=stakes_classifier,
     )
 
 
