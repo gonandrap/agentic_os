@@ -427,6 +427,99 @@ def test_a_tokenised_remote_is_scrubbed_before_anything_is_cut(write_transcript)
     assert payload["now"]["detail"].startswith("git push https://<redacted>@")
 
 
+def test_an_env_prefixed_token_is_redacted_mid_command(write_transcript):
+    """THE SHAPE THE ROUND-1 REVIEW FAILED ON. `GH_TOKEN=ghp_…` is how a worker passes a
+    credential to one command, and it is neither a secret-NAMED key nor a URL's userinfo:
+    both of round 1's rules miss it. Asserted over the WHOLE payload (kn-637a7236), and
+    the command has to stay READABLE — a report that redacts the verb is useless."""
+    session = write_transcript.write("envtok", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash",
+                     {"command": "GH_TOKEN=ghp_abc123 git push origin HEAD"}),
+    ])
+
+    _, payload = snap(session, turn_in_flight=True, now=1020.0)
+
+    blob = json.dumps(payload)
+    assert "ghp_abc123" not in blob
+    assert "git push origin HEAD" in payload["now"]["params"]["command"]
+    assert "git push" in payload["now"]["detail"]
+
+
+def test_an_inline_assignment_is_caught_where_an_anchored_pattern_would_miss(
+        write_transcript):
+    """A value with no recognisable prefix, mid-command: only the NAME=value rule can
+    see it, and only if it is not anchored to the start of a line."""
+    session = write_transcript.write("inline", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash",
+                     {"command": "run && APP_PASSWORD=h7Kq2moPz4 ./deploy.sh"}),
+    ])
+
+    _, payload = snap(session, turn_in_flight=True, now=1020.0)
+
+    assert "h7Kq2moPz4" not in json.dumps(payload)
+    assert "./deploy.sh" in payload["now"]["params"]["command"]
+
+
+def test_a_flag_form_credential_is_redacted(write_transcript):
+    """THE SAME LEAK ONE SYNTAX ALONG: on a command line a credential arrives as an env
+    prefix OR as a flag, and `--password=` escapes a name test anchored to a bare
+    identifier exactly as `GH_TOKEN=` escaped an anchored line pattern."""
+    session = write_transcript.write("flag", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash",
+                     {"command": "deploy --password=h7Kq2moPz4 host"}),
+    ])
+
+    _, payload = snap(session, turn_in_flight=True, now=1020.0)
+
+    assert "h7Kq2moPz4" not in json.dumps(payload)
+    command = payload["now"]["params"]["command"]
+    assert command.startswith("deploy ") and command.endswith(" host")
+
+
+def test_a_bearer_header_inside_a_command_is_redacted(write_transcript):
+    """`curl -H 'Authorization: Bearer …'` — the header shape AND the `sk-` value shape,
+    either of which must fire before the string reaches params or detail."""
+    session = write_transcript.write("bearer", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash", {
+            "command": "curl -H 'Authorization: Bearer sk-live-xyz' "
+                       "https://api.example.com"}),
+    ])
+
+    _, payload = snap(session, turn_in_flight=True, now=1020.0)
+
+    assert "sk-live-xyz" not in json.dumps(payload)
+    assert "curl" in payload["now"]["params"]["command"]
+
+
+def test_a_placeholder_value_is_not_redacted_however_secret_its_name():
+    """THE NEGATIVE CONTROL, and the reason the name test alone is not enough: every
+    repo is full of `token=your-token-here` and `--key=none`, and redacting those makes
+    the frame useless for reading what the worker actually ran."""
+    out = live.redact_params(
+        {"command": "pytest --key=none && TOKEN=your-token-here ./run.sh"})
+
+    assert out["command"] == "pytest --key=none && TOKEN=your-token-here ./run.sh"
+
+
+def test_a_private_key_block_does_not_survive_under_its_marker():
+    """DOTALL or the base64 body sits in the payload underneath the marker
+    (kn-097c40ef's first trap)."""
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ"
+    out = live.redact_params({"content": "-----BEGIN RSA PRIVATE KEY-----\n"
+                                         + body + "\n-----END RSA PRIVATE KEY-----\n"})
+
+    assert body not in out["content"]
+    assert "private key block" in out["content"]
+
+
 def test_a_nested_structure_is_bounded_like_everything_else():
     """A dict of a thousand keys is as expensive to paint as a string of a million
     characters, and a tool input can be either."""
@@ -515,3 +608,34 @@ def test_jarvis_watch_once_json_prints_the_payload_unchanged(registered,
     assert set(printed) == set(expected)
     for key in PAYLOAD_KEYS - {"stale_seconds", "turn", "now"}:
         assert printed[key] == expected[key], key
+
+
+def test_the_human_frame_shows_the_payload_s_own_values(registered, write_transcript,
+                                                        capsys):
+    """The non-json frame, which had no test at all. Every assertion is FORMATTED FROM
+    THE PAYLOAD rather than written out: the point is that the renderer derives nothing,
+    so a literal here would pass against a renderer that computed its own number."""
+    store = ProjectStore(registered)
+    try:
+        wo = store.create_work_order("watch me", "")
+        store.conn.execute("UPDATE work_orders SET session_id=?, status='running' "
+                           "WHERE id=?", ("live-sess", wo["id"]))
+        store.conn.commit()
+        store.create_turn(wo["id"], "dispatch", "go")
+    finally:
+        store.close()
+    write_transcript.write("live-sess", [
+        prompt_row(time.time() - 40, DISPATCH),
+        assistant_row(time.time() - 30, "m1"),
+        tool_use_row(time.time() - 20, "t1", "Bash", {"command": "uv run pytest -q"}),
+    ])
+    payload = ops.live_report(wo["id"])
+
+    cli._print_live(payload)
+
+    out = capsys.readouterr().out
+    assert f"{payload['now']['tool'].upper()}" in out
+    assert f"{payload['now']['elapsed']:.0f}s" in out
+    assert payload["now"]["detail"] in out
+    assert f"turn {payload['turn']['seq']}" in out
+    assert f"parameters shown to {payload['params_cap']} characters" in out

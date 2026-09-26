@@ -53,7 +53,6 @@ from typing import Any, Sequence
 
 from . import inspection
 from . import usage as usage_mod
-from .autoreview import SECRET_NAME_PARTS
 from .catalog import DEFAULT_INSPECT_QUOTE_CHARS, DEFAULT_INSPECT_REPORT_WRITE_FLOOR
 from .holds import Hold
 
@@ -95,6 +94,75 @@ _WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
 _URL_USERINFO_RE = re.compile(r"://[^/\s@]+@")
 _URL_USERINFO_SAFE = "://<redacted>@"
 
+#: Words that make a NAME a credential's name, matched against the identifier's parts:
+#: `monkey` is not a `key` and `AWS_SECRET_ACCESS_KEY` is. COPIED from
+#: `autoreview.SECRET_NAME_PARTS` rather than imported, which is kn-097c40ef's rule for a
+#: redacting leaf: `autoreview` calls models, and importing it to read a transcript would
+#: put a model-calling module on `jarvis watch`'s import path. Price of the copy is that a
+#: word added there must be added here; price of the import is a live frame that pays for
+#: the review pipeline.
+SECRET_NAME_PARTS = frozenset({
+    "key", "keys", "apikey", "accesskey", "privatekey", "secretkey", "seckey",
+    "token", "tokens", "authtoken", "secret", "secrets", "clientsecret",
+    "password", "passwd", "passphrase", "pwd", "credential", "credentials",
+})
+
+#: SHAPES, because a NAME test only catches the credential somebody already thought of
+#: and round 1 of this order shipped with only names plus URL userinfo: `GH_TOKEN=ghp_…
+#: git push` has an innocent key, no userinfo, and was published verbatim in BOTH
+#: `now.params` and `now.detail`. Copied from `inspection.PARAM_SECRET_SHAPES` for
+#: SECRET_NAME_PARTS' reason and one more: that symbol lives on an unmerged sibling
+#: branch, so there is nothing to import yet. Each entry is (pattern, what the marker
+#: CALLS it) — the marker NAMES the shape and never quotes the match, because a frame
+#: that echoes the credential has only moved it one file along (kn-deef42ea).
+SECRET_SHAPES: tuple[tuple[str, str], ...] = (
+    # The whole BLOCK and not the BEGIN line, under DOTALL: substituting the header alone
+    # leaves the base64 body sitting in the payload underneath the marker.
+    (r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?"
+     r"(?:-----END (?:[A-Z]+ )*PRIVATE KEY-----|\Z)", "a private key block"),
+    (r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+", "an ssh key line"),
+    (r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
+     "an Authorization header value"),
+    # THE TWO `inspection`'S SET DOES NOT HAVE, and the reason the round-1 review failed:
+    # an issued credential names itself in its first characters, so it is recognisable
+    # with no name and no assignment around it — `gh auth login --with-token ghp_…` is
+    # neither. Kept as an explicit prefix list rather than an entropy test: a bare
+    # high-entropy string is every sha in every `git` command a worker runs.
+    (r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{6,}", "a GitHub token"),
+    (r"\bsk-[A-Za-z0-9_-]{6,}", "an API key"),
+)
+
+#: `NAME=value` ANYWHERE IN THE STRING, and that is a DELIBERATE DIVERGENCE from
+#: `inspection._PARAM_ASSIGNMENT_RE`, which is anchored `^…$` per line. `inspection` reads
+#: file contents, where an assignment owns its line; this reads a Bash `command`, which is
+#: ONE line with the assignment as an env prefix — `GH_TOKEN=ghp_abc123 git push origin
+#: HEAD` slips past the anchored pattern entirely. So: a word boundary after the start of
+#: the string, whitespace, or a shell separator, and the value runs to the next
+#: whitespace. THE FLAG FORM IS THE SAME LEAK: on a command line a credential arrives as
+#: an env prefix (`GH_TOKEN=…`) or as a flag (`deploy --password=…`, `-p=…`, `--api-key=…`)
+#: and nothing distinguishes them, so an optional leading `-`/`--` is part of the head. The
+#: name still has to follow a shell separator — that is what makes the left side a name
+#: rather than the tail of some other token — and the two-part test still decides, so
+#: `--key=none` comes through untouched.
+_ASSIGNMENT_RE = re.compile(
+    r"(?P<head>(?:\A|(?<=[\s;&|(]))(?:(?:export|env|set)\s+)?-{0,2}"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)=)(?P<value>[^\s]+)")
+
+#: A VALUE THAT IS NOT A SECRET, however secret its name — the negative control, and the
+#: second half of `autoreview`'s two-part test (kn-097c40ef: bring it or every placeholder
+#: is redacted). Most `key=` in any command carries an empty default or a placeholder, and
+#: redacting those makes the frame useless for the one thing it is for: reading what the
+#: worker actually ran.
+_PLACEHOLDER_RE = re.compile(
+    r"none|null|nil|nan|true|false|x+|\.+|-+|_+|"
+    r"todo|tbd|fixme|changeme|change[-_]me|placeholder|redacted|dummy|fake|sample|"
+    r"example|examples|test|testing|secret|password|passwd|token|key|value|"
+    r"your[-_].*|my[-_].*|some[-_].*|the[-_].*", re.IGNORECASE)
+_VALUE_CHARS = re.compile(r"[A-Za-z0-9+/=._~-]+")
+_SHAPE_RE = [(re.compile(pattern, re.IGNORECASE | re.DOTALL), name)
+             for pattern, name in SECRET_SHAPES]
+CREDENTIAL_VALUE = "<redacted: a credential value>"
+
 
 def clock(ts: float) -> str:
     """A wall-clock time a person can compare against their own — local, to the second.
@@ -114,9 +182,11 @@ def redact_params(payload: Any, cap: int = PARAMS_CAP) -> dict[str, str]:
     Three jobs, and none is cosmetic.
 
     A value whose KEY names a secret is REPLACED rather than shortened. The key survives,
-    so a reader still sees what the tool was called with. `SECRET_NAME_PARTS` is
-    `autoreview`'s, reused rather than restated: a second word list is one that drifts,
-    and that module is stdlib-only at import time.
+    so a reader still sees what the tool was called with.
+
+    A value's SHAPE is redacted wherever it sits, which is the half the key test and the
+    userinfo test both miss: `GH_TOKEN=ghp_… git push` and `curl -H 'Authorization:
+    Bearer sk-…'` have innocent keys and no URL to strip.
 
     A URL's USERINFO is stripped from every string at every depth, and this is the half a
     key test cannot do: `{"command": "git push https://x-access-token:ghp_…@github.com/
@@ -155,8 +225,48 @@ def _scrub(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_scrub(v) for v in value]
     if isinstance(value, str):
-        return _URL_USERINFO_RE.sub(_URL_USERINFO_SAFE, value)
+        return _scrub_text(value)
     return value
+
+
+def _scrub_text(text: str) -> str:
+    """One string, with every secret-shaped part of it NAMED rather than quoted. Pure.
+
+    THE ONE FUNCTION `redact_params` AND `detail_of` SHARE (kn-637a7236: one tool input
+    reaches the payload several times, and scrubbing only `params` leaves the leak in
+    `detail`). Order matters once: the URL's userinfo goes first, so a tokenised remote
+    reads as `https://<redacted>@github.com/…` — a recognisable URL — instead of having
+    its token named by the GitHub shape inside otherwise intact userinfo.
+    """
+    if not text:
+        return text
+    text = _URL_USERINFO_RE.sub(_URL_USERINFO_SAFE, text)
+    for pattern, name in _SHAPE_RE:
+        text = pattern.sub(f"<redacted: {name}>", text)
+    return _ASSIGNMENT_RE.sub(_assignment_marker, text)
+
+
+def _assignment_marker(m: re.Match[str]) -> str:
+    """The two-part test, `autoreview._line_marker`'s: the name must NAME a credential AND
+    the value must LOOK like one. Either half alone is useless — the name alone redacts
+    `key=none`, the value alone redacts every sha."""
+    if _names_secret(m.group("name")) and _looks_like_a_credential(m.group("value")):
+        return m.group("head") + CREDENTIAL_VALUE
+    return m.group(0)
+
+
+def _looks_like_a_credential(raw: str) -> bool:
+    """`autoreview._secret_value`'s test, same reasoning: an expression is not a value."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    if len(value) < 6 or not _VALUE_CHARS.fullmatch(value):
+        return False
+    if _PLACEHOLDER_RE.fullmatch(value):
+        return False
+    has_digit = any(c.isdigit() for c in value)
+    has_alpha = any(c.isalpha() for c in value)
+    return (has_digit and has_alpha) or len(value) >= 20
 
 
 def _render(value: Any, cap: int) -> str:
@@ -167,9 +277,10 @@ def _render(value: Any, cap: int) -> str:
     same rule rather than walked to some second depth limit.
     """
     text = value if isinstance(value, str) else json.dumps(value, default=str)
-    # Again, on the RENDERED text and still before the cut: `default=str` can print an
-    # object whose repr holds a URL, and no leaf test saw that string.
-    text = _URL_USERINFO_RE.sub(_URL_USERINFO_SAFE, text)
+    # Again, on the RENDERED text and still before the cut (kn-1791a5e6: scrub before you
+    # slice): `default=str` can print an object whose repr holds a credential, and no leaf
+    # test saw that string.
+    text = _scrub_text(text)
     if len(text) <= cap:
         return text
     return text[:max(0, cap - len(TRUNCATED))] + TRUNCATED
@@ -561,10 +672,10 @@ def _secs(seconds: float | None) -> str:
 def detail_of(payload: Any, limit: int = QUOTE_CHARS) -> str:
     """A one-line answer to "doing what" for a tool call.
 
-    `description` first wherever it exists — it is the agent's own words, and every
-    long-running tool in the fleet carries one. Same key order as `inspection`'s reader
-    and a deliberate copy of it: §4 is rewriting that walk, so reaching into the sibling
-    for a private helper is reaching for a name that can move or change shape mid-feature.
+    MIRRORS `inspection._detail_of` — same key order, copied and not imported. §4 of the
+    feature is rewriting the walk inside `inspection.read_transcript`, and `_detail_of` is
+    PRIVATE there: importing it would bind a live frame to a name that can move or change
+    shape mid-feature. Reconcile the two when §4 lands.
     """
     if not isinstance(payload, dict):
         return ""
@@ -585,7 +696,8 @@ def subagent_labels(path: Path) -> dict[str, str]:
 
     The task id IS the subagent transcript's stem minus its `agent-` prefix, which is the
     only join between "what the lead agent is waiting on" and "what that thing is". The
-    same join `inspection` makes, copied here for `detail_of`'s reason — and no subagent
+    MIRRORS `inspection._subagent_labels`, copied here for `detail_of`'s reason: it is
+    private on a file §4 is rewriting, so reconcile the two when §4 lands — and no subagent
     TRANSCRIPT is opened: §8 owns those, and one read per frame is the cost this module
     exists to avoid.
     """
@@ -624,7 +736,8 @@ def _prompt_of(row: dict[str, Any], ts: float) -> inspection.Prompt | None:
 
     THE VOCABULARY IS SHARED AND THE WALK IS NOT: `inspection.TRIGGERS` names the kinds
     so a trigger cannot be called one thing on a live frame and another in a report, but
-    the walk itself is local because §4 rewrites the one in `inspection`.
+    the walk MIRRORS `inspection._prompt_of` rather than calling it, because §4 rewrites
+    that one and it is private. Reconcile the two when §4 lands.
 
     Two `user` rows are not prompts and both would cut a turn in half at the worst
     moment: a tool result is the agent's own loop, and an `isMeta` row is Claude Code
