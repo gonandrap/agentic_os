@@ -58,7 +58,8 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from . import db
-from .project_store import VALIDATION_HELD_CAUSE, ProjectStore
+from .project_store import (VALIDATION_AUTH_CAUSE, VALIDATION_HELD_CAUSE,
+                            ProjectStore)
 from .worker_session import PAUSE_AUTH, PAUSE_TRANSIENT, PAUSE_USAGE_LIMIT
 
 #: The three transport pauses, named by `worker_session` and carried verbatim in
@@ -253,11 +254,17 @@ def _episodes(events: Sequence[dict[str, Any]]) -> list[Hold]:
         if kind == "validation_failed" and payload.get("cause") == VALIDATION_HELD_CAUSE:
             open_holds[(PAUSE_USAGE_LIMIT, None)] = Hold(PAUSE_USAGE_LIMIT, ts)
             continue
+        # The same synthesis for a round whose seats could not authenticate — spec
+        # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7.
+        if kind == "validation_failed" and payload.get("cause") == VALIDATION_AUTH_CAUSE:
+            open_holds[(PAUSE_AUTH, None)] = Hold(PAUSE_AUTH, ts)
+            continue
         if kind in ("validation_submitted", "validation_forced"):
-            reopened = open_holds.pop((PAUSE_USAGE_LIMIT, None), None)
-            if reopened is not None:
-                done.append(Hold(reopened.cause, reopened.started,
-                                 max(ts, reopened.started)))
+            for synthesised in (PAUSE_USAGE_LIMIT, PAUSE_AUTH):
+                reopened = open_holds.pop((synthesised, None), None)
+                if reopened is not None:
+                    done.append(Hold(reopened.cause, reopened.started,
+                                     max(ts, reopened.started)))
         opener = _OPEN.get(kind)
         if opener is None:
             continue

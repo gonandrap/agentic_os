@@ -1430,6 +1430,51 @@ def test_a_held_feature_round_carries_the_cause_on_the_ROUND(fleet):
         store.close()
 
 
+def test_a_feature_round_whose_seats_could_not_authenticate_is_held(fleet):
+    """GitHub issue #778 on the feature side, and the twin of the usage-window pair above:
+    an auth failure holds the round instead of escalating it, and the events live on the
+    MANAGER's timeline because `wo_events.wo_id` is a foreign key into `work_orders`."""
+    from jarvis.claude_cli import AuthFailure, AuthFailureError
+    from jarvis.project_store import (VALIDATION_AUTH_CAUSE, validation_hold,
+                                      validation_standing)
+
+    auth = AuthFailure(
+        message="Failed to authenticate: OAuth session expired and could not be refreshed")
+    validator = Validator(AuthFailureError(auth))
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.drain(ticks=4)
+
+        assert len(validator.calls) == 1, "the panel went again inside the backoff"
+        row = store.latest_validation_round(fo_id=fo_id)
+        assert row["outcome"] == "failed"
+        assert row["hold_cause"] == VALIDATION_AUTH_CAUSE
+        assert validation_standing(row) == ("held for authentication", "active", "◑")
+        assert store.counted_validation_rounds(fo_id=fo_id) == 0
+        assert store.get_feature_order(fo_id)["status"] == "validating"
+
+        events = ops.feature_events_of_kind(store, fo_id, "validation_failed")
+        until, cause = validation_hold(events, 1)
+        assert cause == VALIDATION_AUTH_CAUSE
+        assert until > time.time()
+
+        # The STREAK is counted from those events, so a daemon restart does not hand the
+        # round a fresh schedule.
+        Daemon._feature_auth_held(fleet.daemon, store, store.get_feature_order(fo_id),
+                                  int(row["id"]), 1, auth)
+        attempts = [json.loads(e["payload"])["attempt"]
+                    for e in ops.feature_events_of_kind(store, fo_id,
+                                                        "validation_failed")]
+        assert attempts == [1, 2]
+    finally:
+        store.close()
+
+
 def test_a_feature_with_no_manager_escalates_without_calling_the_panel(fleet):
     """A feature whose plan was released while validation was off has no manager, so a
     rejection would have no addressee and the round's own events would have no timeline

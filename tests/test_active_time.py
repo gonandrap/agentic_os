@@ -601,6 +601,28 @@ def test_a_validation_round_held_by_the_usage_window_holds_the_work_order(record
     ]
 
 
+def test_a_validation_round_held_for_authentication_holds_the_work_order(record):
+    """`VALIDATION_AUTH_CAUSE`: the seats could not authenticate (GitHub issue #778).
+
+    The twin above, keyed `PAUSE_AUTH` — an hour of auth hold billed as active time is
+    the same mis-accounting the usage-limit opener beside it exists to prevent.
+    """
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_submitted", T0 + 120, {"round": 1})
+    rec.event("validation_failed", T0 + 180,
+              {"round": 1, "cause": "auth", "reopens_at": T0 + 3_780, "attempt": 1})
+    rec.event("validation_submitted", T0 + 3_780, {"round": 1})
+
+    spans = holds.held(store, wo, now=T0 + 3_800)
+
+    assert [(h.cause, h.started, h.ended) for h in spans] == [
+        (holds.VALIDATION, T0 + 120, T0 + 180),
+        (holds.PAUSE_AUTH, T0 + 180, T0 + 3_780),   # the sign-in, synthesised
+        (holds.VALIDATION, T0 + 3_780, None),       # round 1 again, still in flight
+    ]
+
+
 def test_a_validation_round_that_merely_failed_synthesises_no_usage_hold(record):
     """The near neighbour, because the branch turns on one payload key. A round that
     failed for any other reason — an outage, a validator crash — is the round ending and

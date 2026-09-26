@@ -73,6 +73,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_AUTH_CAUSE,
     VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
     ProjectStore,
@@ -297,6 +298,13 @@ CI_HOLD_RECHECK_SECONDS = 60.0
 #: watching, which is the silent stall `VALIDATION_OUTAGE_LIMIT` exists to prevent one
 #: authority along. Forty-five minutes is CI's ~20-minute suite with room for a queue.
 CI_HOLD_DEADLINE_SECONDS = 45.0 * 60.0
+
+#: How long a round whose seats could not authenticate waits before going again: 1m, 5m,
+#: 15m, then 60m FOR EVER — the last entry is a cap and not a final attempt. What clears
+#: an auth failure is a human running `/login`, which may be thirty seconds or next week
+#: away, so nothing here gives up on a count (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §4).
+AUTH_HOLD_BACKOFF = (60.0, 300.0, 900.0, 3600.0)
 
 #: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
 #: nothing judged this work, so there is nothing for its author to fix, and the reason
@@ -1985,6 +1993,13 @@ class Daemon:
                 log.info("[%s] %s: round %d held until the usage window reopens",
                          project.name, wo_id, n)
                 return
+            if isinstance(failure, claude_cli.AuthFailureError):
+                # BEFORE the generic outage below, and Neo's hard condition on question
+                # 723: an auth failure must never consume one of its three attempts.
+                self._validation_auth_held(store, wo, round_id, n, failure.auth)
+                log.info("[%s] %s: round %d held until Claude Code can authenticate",
+                         project.name, wo_id, n)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -2286,6 +2301,46 @@ class Daemon:
                         {"round": n, "cause": VALIDATION_CI_CAUSE,
                          "reopens_at": reopens, "pending": list(pending)})
 
+    @staticmethod
+    def _validation_auth_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                              auth: claude_cli.AuthFailure) -> None:
+        """Claude Code could not authenticate. WAIT — this costs no outage attempt.
+
+        `_validation_ci_held`'s twin in every mechanical respect, and read that one first:
+        the round is closed `failed` because `failed` is `RUNNABLE` and
+        `counted_validation_rounds` ignores it, so the submitter spends no round number and
+        the next tick owns the same round again. GitHub issue #778: four work orders on
+        2026-09-25/26 were closed `escalated` on the FIRST auth failure of an OAuth refresh
+        race that fixed itself, each spending a round number and a user's attention.
+
+        IT NEVER ESCALATES ON A COUNT. `attempt` is recorded so a reader can see the streak
+        and so the backoff is derivable, and it is compared against nothing —
+        `worker_session.TurnPause.exhausted`'s reasoning one authority along: what clears
+        an auth failure is a human, and a count that gives up turns something a sign-in
+        fixes into a spent round. The 60m cap is what bounds the cost of waiting for ever:
+        one round, four seats, ~1.5s and zero tokens each, once an hour.
+
+        Counted FROM THE EVENTS, like `_validation_outage`, so a daemon restart does not
+        hand the round a fresh schedule. No `not recorded` backstop, for
+        `_validation_ci_held`'s reason: this holds on a moment, so an unwritten event costs
+        one unnecessary retry on the next tick rather than a silent stall.
+        """
+        from .invariants import AUTH_HOLD_NOTE
+
+        wo_id = wo["id"]
+        attempt = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                         "reopens_at": reopens, "attempt": attempt,
+                         "error": auth.message[:500]})
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -2537,6 +2592,13 @@ class Daemon:
                 log.info("[%s] feature %s: round %d held until the window reopens",
                          project.name, fo_id, n)
                 return
+            except claude_cli.AuthFailureError as e:
+                # BEFORE the generic clause — a `ClaudeCliError` subclass, so Python would
+                # never reach it after — and held rather than spent, GitHub issue #778.
+                self._feature_auth_held(store, fo, round_id, n, e.auth)
+                log.info("[%s] feature %s: round %d held until Claude Code can "
+                         "authenticate", project.name, fo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -2708,6 +2770,32 @@ class Daemon:
                           {"round": n, "cause": VALIDATION_HELD_CAUSE,
                            "reopens_at": reopens, "error": limit.message[:500],
                            "feature_order": fo_id})
+
+    def _feature_auth_held(self, store: ProjectStore, fo: dict, round_id: int, n: int,
+                           auth: claude_cli.AuthFailure) -> None:
+        """`_validation_auth_held` for a feature round — read that one; this is its twin.
+
+        The only difference is the carrier, the same one `_feature_held` has: these events
+        live on the MANAGER's timeline (`ops.feature_event`), because `wo_events.wo_id` is
+        a foreign key into `work_orders`, and the streak is counted back through
+        `ops.feature_events_of_kind`.
+        """
+        from . import ops
+        from .invariants import AUTH_HOLD_NOTE
+
+        fo_id = fo["id"]
+        attempt = 1 + sum(
+            1 for e in ops.feature_events_of_kind(store, fo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        ops.feature_event(store, fo_id, "validation_failed",
+                          {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                           "reopens_at": reopens, "attempt": attempt,
+                           "error": auth.message[:500], "feature_order": fo_id})
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
