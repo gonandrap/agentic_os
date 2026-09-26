@@ -654,6 +654,28 @@ def test_the_auto_review_line_shows_before_there_is_a_pull_request(client, proje
     assert "does not decide those for you" in page
 
 
+def test_the_banner_stops_claiming_a_decision_is_pending(client, project):
+    """docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md:
+    the escalation stays on the record, and the claim that the user still owes a decision
+    does not survive them taking it."""
+    wo = ops.create_work_order("proj_a", "task with a judgement call")
+    store = ProjectStore(project)
+    aid = store.add_assumption(wo["id"], "changed the CLI's default output")
+    store.add_event(wo["id"], "autoreview_escalated", {
+        "assumption_id": aid, "n": 1, "reason": "this is a surface others call"})
+    store.set_status(wo["id"], "needs_review")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "left with you" in page
+    assert "since accepted" not in page
+
+    store.review_assumption(aid, "accepted", reason="fine")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    assert "left with you" in page
+    assert "since accepted by you" in page
+
+
 def test_wo_show_carries_every_assumption_with_its_number(jarvis_home, fake_claude,
                                                           catalog_file, capsys):
     """`jarvis wo show` speaks the same record as the page, for the same reason."""

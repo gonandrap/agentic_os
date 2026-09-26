@@ -693,8 +693,85 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     assert questions()[0]["status"] == "escalated"
     assert q["id"] == questions()[0]["id"]
     # The one line the user reads on `jarvis wo show` says it is theirs again.
-    assert "left with you" in ops.autoreview_state(
-        store, store.get_work_order(wo["id"]))["line"]
+    line = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "left with you" in line
+    # Still pending: no resolution clause (the spec's §Tests 3).
+    assert "since " not in line
+
+
+# -- the banner against the assumption's CURRENT row -----------------------------------
+#
+# docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md.
+
+
+def _escalated(daemon):
+    """A work order parked on one assumption the OS left with the user."""
+    store, wo = park(daemon, auto_review=True)
+    ask(daemon, store)
+    drain(daemon)
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["status"] == "pending"
+    return store, wo, row["id"]
+
+
+def _line(store, wo_id: str) -> str:
+    return ops.autoreview_state(store, store.get_work_order(wo_id))["line"]
+
+
+def test_an_accepted_assumption_is_no_longer_left_with_you(started):
+    """The escalation stays on the record — it happened — and the banner stops claiming
+    the user still owes the decision they already took."""
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "accepted", reason="fine")
+
+    line = _line(store, wo["id"])
+    assert "left with you" in line
+    assert "since accepted by you" in line
+
+
+def test_a_rejected_assumption_says_rejected_and_not_accepted(started):
+    """The status column is interpolated, not hard-coded."""
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "rejected", reason="no")
+
+    line = _line(store, wo["id"])
+    assert "since rejected by you" in line
+    assert "accepted" not in line
+
+
+def test_a_still_pending_escalation_reads_exactly_as_before(started):
+    """The common case: nothing read, nothing appended."""
+    store, wo, _aid = _escalated(started)
+
+    assert "since " not in _line(store, wo["id"])
+
+
+def test_a_decision_the_os_took_is_not_credited_to_the_user(started):
+    """One attribution renderer, asserted as one: `ops.assumption_decider`."""
+    from jarvis.project_store import ASSUMPTION_DECIDER_OS
+
+    store, wo, aid = _escalated(started)
+
+    store.review_assumption(aid, "accepted", decided_by=ASSUMPTION_DECIDER_OS,
+                            reason="no new surface", model="claude-opus-5")
+
+    row = store.get_assumption(aid)
+    assert _line(store, wo["id"]).endswith(
+        f"; since accepted by {ops.assumption_decider(row)}")
+    assert ops.assumption_decider(row) == "the OS (neo, claude-opus-5)"
+
+
+def test_an_event_written_before_the_payload_carried_the_id_is_unchanged(started):
+    """Unresolvable, and a banner is not the place to guess."""
+    wo = ops.create_work_order("proj_a", "older event")
+    store = ProjectStore(started.catalog.project("proj_a").path)
+    store.add_event(wo["id"], "autoreview_escalated",
+                    {"n": 1, "reason": "this is a surface others call"})
+
+    assert _line(store, wo["id"]) == (
+        "assumption #1 left with you — this is a surface others call")
 
 
 def test_a_work_order_cancelled_while_neo_is_thinking_is_not_settled_and_re_landed(
