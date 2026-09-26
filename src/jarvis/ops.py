@@ -2332,6 +2332,11 @@ AUTOREVIEW_EVENTS = ("autoreview_accepted", "autoreview_escalated", "autoreview_
                      "autoreview_objection_withdrawn", "autoreview_confirmed",
                      "autoreview_unconfirmed")
 
+#: The kinds whose prose asserts the USER OWES A DECISION, and the only ones resolved
+#: against the assumption's current row
+#: (docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md).
+_AUTOREVIEW_OWED_BY_USER = ("autoreview_escalated", "autoreview_unconfirmed")
+
 
 def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic review, or None.
@@ -2366,6 +2371,15 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # "left with you" is a claim about the PRESENT: resolve it against the row, once
+    # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §1).
+    if newest["kind"] in _AUTOREVIEW_OWED_BY_USER:
+        aid = int(newest.get("assumption_id") or 0)
+        row = store.get_assumption(aid) if aid else None
+        status = str((row or {}).get("status") or "")
+        if status and status != "pending":
+            newest = {**newest, "resolved_status": status,
+                      "resolved_decider": assumption_decider(row or {})}
     return {**newest, "line": _autoreview_line(newest)}
 
 
@@ -2710,13 +2724,17 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     """One line. The verb says WHO acted, which is the whole point of the record."""
     kind = state["kind"]
     n = state.get("n")
+    # One shared suffix: both "left with you" branches make the same claim
+    # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §2).
+    since = (f"; since {state['resolved_status']} by {state['resolved_decider']}"
+             if state.get("resolved_status") else "")
     if kind == "autoreview_accepted":
         return (f"assumption #{n} accepted by the OS (Neo, "
                 f"{state.get('model') or 'model not recorded'}) — "
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_escalated":
         return (f"assumption #{n} left with you — "
-                f"{state.get('reason') or 'no reason recorded'}")
+                f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_asked":
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
     # The early pass's five. Each gets a branch rather than falling through, because the
@@ -2737,7 +2755,7 @@ def _autoreview_line(state: dict[str, Any]) -> str:
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_unconfirmed":
         return (f"assumption #{n} left with you — the OS did not confirm its early "
-                f"reading: {state.get('reason') or 'no reason recorded'}")
+                f"reading: {state.get('reason') or 'no reason recorded'}{since}")
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
