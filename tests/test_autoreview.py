@@ -628,6 +628,36 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
     assert "held" in ops.autoreview_state(store, wo)["line"]
 
 
+def settled_round(store, wo_id: str, outcome: str) -> None:
+    """A fresh settled round on the judged commit, `park`'s way."""
+    row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
+    store.set_validation_head(row["id"], JUDGED)
+    store.close_validation_round(row["id"], outcome, "")
+
+
+def test_a_hold_returning_to_an_earlier_reason_is_recorded_again(started):
+    """ISSUE #782, the real trace: held on stakes, then a transient panel give-up, then a
+    forced round that PASSED — and the third pass held on the stakes again and wrote
+    nothing, because the dedupe looked at EVERY past hold. `assumptions_with_rulings`
+    renders the newest, so every surface went on saying the panel gave up on an order
+    whose panel had passed."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=("reused the production api key",))
+
+    ask(started, store)
+    settled_round(store, wo["id"], "escalated")
+    ask(started, store)
+    settled_round(store, wo["id"], "passed")
+    ask(started, store)
+
+    assert [h["code"] for h in events(store, wo["id"], "autoreview_held")] == [
+        autoreview.HELD_HIGH_STAKES, autoreview.HELD_PANEL_GAVE_UP,
+        autoreview.HELD_HIGH_STAKES]
+    (line,) = rulings(store, wo["id"])
+    assert line.startswith("Held by the OS — mentions 'production'")
+    assert "gave up" not in line
+
+
 # -- the daemon: ruling ----------------------------------------------------------------
 
 

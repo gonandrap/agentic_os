@@ -395,6 +395,38 @@ def _holds_not_recorded(early: bool) -> tuple[str, ...]:
     return shared + (autoreview.HELD_STATUS, autoreview.HELD_CONFIRMING)
 
 
+def _hold_is_news(store: ProjectStore, wo_id: str, kind: str,
+                  key: tuple[Any, ...],
+                  key_of: Callable[[dict[str, Any]], tuple[Any, ...]]) -> bool:
+    """Is this hold different from the NEWEST hold of `kind` about the same subject?
+
+    Shared by `Daemon._note_autoreview_held` and `_note_automerge_held`, which dedupe the
+    same way over different payloads: only the key COMPARISON is here. `key[0]` is the
+    subject the holds are grouped by — the assumption for one, the commit for the other —
+    and the rest is what a reader would notice changing. `key_of` reads the same tuple
+    back out of a stored payload.
+
+    **AGAINST THE NEWEST HOLD ONLY, and issue #782 is why.** Both renderers
+    (`ops.assumptions_with_rulings`, `ops.automerge_state`) show the newest event, so a
+    hold compared against EVERY past one leaves A -> B -> A unwritten and B on the screen
+    of an order it stopped describing (kn-a2ebbbdb: a present-tense claim derived from an
+    immutable timeline event goes stale). The one-event-per-tick bound the dedupe exists
+    for is unaffected: both `decide` functions are deterministic given state, so the key
+    only changes when the state does.
+
+    `events_of_kind` is OLDEST FIRST, so the newest match is the LAST in list order —
+    never re-sorted by timestamp, which would reorder rows that share one.
+    """
+    from . import db
+
+    newest: tuple[Any, ...] | None = None
+    for event in store.events_of_kind(wo_id, kind):
+        candidate = key_of(db.from_json(event["payload"], {}))
+        if candidate[0] == key[0]:
+            newest = candidate
+    return newest != key
+
+
 def escalation_body(reason: str) -> str:
     """The reason as a notification body — see `VALIDATION_REASON_CHARS`."""
     if len(reason) <= VALIDATION_REASON_CHARS:
@@ -5311,6 +5343,9 @@ class Daemon:
         as the assumption, because the hold that matters most — "this mentions
         production" — can follow one that does not.
 
+        Against the NEWEST hold for the assumption and not every past one, because
+        `ops.assumptions_with_rulings` renders the newest: see `_hold_is_news`.
+
         **DELIBERATELY NOT AN ATTENTION ITEM.** A held assumption is one the user decides
         themselves, which is what they did for every assumption before this existed, and
         the work order is already on their list carrying `assumptions pending review`.
@@ -5344,16 +5379,13 @@ class Daemon:
         them would leave the OS's decision not to act as the one thing it never wrote
         down.
         """
-        from . import db
-
         if not settling and decision.code in (suppress or ()):
             return
-        key = (decision.assumption_id, decision.code)
-        for event in store.events_of_kind(wo_id, "autoreview_held"):
-            payload = db.from_json(event["payload"], {})
-            if (int(payload.get("assumption_id") or 0),
-                    str(payload.get("code") or "")) == key:
-                return
+        key = (int(decision.assumption_id or 0), str(decision.code or ""))
+        if not _hold_is_news(store, wo_id, "autoreview_held", key,
+                             lambda p: (int(p.get("assumption_id") or 0),
+                                        str(p.get("code") or ""))):
+            return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,
             "assumption_id": decision.assumption_id, "n": decision.n})
@@ -5671,7 +5703,9 @@ class Daemon:
         THE REASON'S TEXT IS IN THE KEY, not just its code, and issue #263 is why: a code
         is coarser than the sentence it names. `ops.automerge_state` renders the NEWEST
         hold, so a changed reason this function drops is a user reading a hold that has
-        stopped being true — sent to look at CI for a merge conflict. `automerge`'s codes
+        stopped being true — sent to look at CI for a merge conflict. That is also why the
+        key is compared against the newest hold alone and not every past one, issue #782:
+        see `_hold_is_news`. `automerge`'s codes
         are one per condition for the same reason; the text catches what a code cannot,
         which is a condition whose wording carries the value (`BEHIND` against `DIRTY`,
         round 2 rejected against round 3). A reason is built from a bounded vocabulary
@@ -5698,17 +5732,18 @@ class Daemon:
           fire on every `needs_review` order with a green pull request and tell the user
           the automatic merge declined something it was never asked about.
         """
-        from . import automerge, db
+        from . import automerge
 
         if decision.code in (automerge.HELD_DISABLED,   # both unreachable via the poll:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
-        key = (decision.head_sha, decision.code, decision.reason)
-        for event in store.events_of_kind(wo_id, "automerge_held"):
-            payload = db.from_json(event["payload"], {})
-            if (str(payload.get("head_sha") or ""), str(payload.get("code") or ""),
-                    str(payload.get("reason") or "")) == key:
-                return
+        key = (str(decision.head_sha or ""), str(decision.code or ""),
+               str(decision.reason or ""))
+        if not _hold_is_news(store, wo_id, "automerge_held", key,
+                             lambda p: (str(p.get("head_sha") or ""),
+                                        str(p.get("code") or ""),
+                                        str(p.get("reason") or ""))):
+            return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,
             "judged_sha": decision.judged_sha, "head_sha": decision.head_sha,
