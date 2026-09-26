@@ -81,7 +81,8 @@ def test_a_refused_seat_abstains_but_carries_the_window(monkeypatch, tmp_path):
     four answered — that call belongs to `validation.decide`."""
     monkeypatch.setattr(claude_cli, "run_headless_result",
                         lambda *a, **k: (_ for _ in ()).throw(refused(3600)))
-    op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path)
+    op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path,
+                         kind="validation_seat")
 
     assert (op.status, op.replied) == ("abstained", False)
     assert op.refused is not None and op.refused.reset_at is not None

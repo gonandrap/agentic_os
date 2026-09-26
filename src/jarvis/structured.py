@@ -35,17 +35,15 @@ from __future__ import annotations
 
 import json
 import re
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
 from . import claude_cli
 
-#: The default transport. `attribute=False` because every caller of `request` that pays
-#: for its calls binds them itself through `on_usage`, and the transport's own
-#: attribution would then write a second row for the same tokens. A caller that wants
-#: the transport to account for it should pass `call=claude_cli.run_headless_result`.
-DEFAULT_CALL = partial(claude_cli.run_headless_result, attribute=False)
+#: The default transport. A caller of `request` that records its calls itself through
+#: `on_usage` declares that with `records_itself=`; one that does not is attributed by the
+#: transport, which is what an eval or a script wants.
+DEFAULT_CALL = claude_cli.run_headless_result
 
 #: One JSON object out of possibly-fenced, possibly-chatty output. GREEDY on purpose:
 #: it spans from the first `{` to the LAST `}`, so a nested object survives and a
@@ -188,7 +186,8 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
             attempts: int = 1, on_invalid: Callable[[str], Any] | None = None,
             timeout: int = 300, cwd: Path | None = None,
             call: Callable[..., Any] = DEFAULT_CALL,
-            on_usage: Callable[[Any], None] | None = None) -> Any:
+            on_usage: Callable[[Any], None] | None = None,
+            records_itself: str = "") -> Any:
     """Ask a model for strict JSON and return the validated value.
 
     Makes at most `attempts` calls. Each failed attempt appends the validator's complaint
@@ -204,6 +203,11 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
     `claude_cli.ClaudeCliError` — propagate untouched: a call that never happened is not
     invalid output, and callers already tell those two apart (see `neo.drain_queue`).
 
+    `records_itself` is the `agent_calls.kind` the caller's own `on_usage` writes, passed
+    to `call` ONLY when non-empty so no test fake's captured kwargs change (spec §5).
+    Declaring it WITHOUT an `on_usage` is refused: this function forwards a declaration
+    rather than making one, and a declaration nobody records is the #749 hole.
+
     `on_usage(envelope)` is called ONCE PER ATTEMPT, before the reply is validated. A
     retry is a second call the OS paid for, and an accounting that only recorded the
     attempt that happened to parse would quietly under-report exactly the calls that went
@@ -211,11 +215,20 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
     """
     if attempts < 1:
         raise ValueError(f"attempts must be at least 1, got {attempts}")
+    if records_itself and on_usage is None:
+        # Before the first attempt, so a refused call spends nothing (spec §2).
+        raise claude_cli.AttributionRefused(
+            f"records_itself={records_itself!r} says this caller records the call itself "
+            "and no on_usage was given: nothing would record it. Pass an "
+            "`agent_usage.recorder`, or drop the declaration and let the transport "
+            "attribute the call.")
     complaint = ""
     for attempt in range(1, attempts + 1):
         ask = f"{prompt}\n\n{RETRY_NOTE}{complaint}" if complaint else prompt
+        declared = {"records_itself": records_itself} if records_itself else {}
         raw, usage = claude_cli.unpack_headless(
-            call(ask, system_prompt=system_prompt, model=model, timeout=timeout, cwd=cwd))
+            call(ask, system_prompt=system_prompt, model=model, timeout=timeout, cwd=cwd,
+                 **declared))
         if on_usage is not None and usage is not None:
             on_usage(usage)
         if attempt == attempts:

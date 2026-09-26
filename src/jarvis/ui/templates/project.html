@@ -58,6 +58,27 @@
     <a href="{{ purl(p_show, p_fo, hidden=true) }}">show</a>
   {% endif %}
 </p>
+{# Improvement orders, their own short block beside the features: same "counts, not
+   trees" rule (§6.1 of the improvement-orders spec) — the findings are what the order's
+   own page is for, and the label is kind-aware because `plan_review` here means a
+   decision is owed, not a plan awaiting release. #}
+{% if improvements %}
+<h3>Improvement orders</h3>
+<div class="panel">
+  {% for io in improvements %}
+    {% set im = fo_status_meta.get(io.status, {'word': io.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ im.tone }}"><span class="i">{{ im.icon }}</span>{{ io.status_label }}</span>
+      <div class="grow">
+        <a href="/io/{{ project_name }}/{{ io.id }}" class="mono">{{ io.id }}</a> {{ io.title }}
+        {% if io.needs_attention %}<div class="sub tone-warn">◭ {{ io.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="sub mono">{{ fmt_age(io.created_at) }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 {# Feature orders sit ABOVE the work orders and do not expand into their children here:
    the children are already in the listing below as ordinary work orders, and printing
    the same tree twice on one page is how a page stops being read. The tree is on the

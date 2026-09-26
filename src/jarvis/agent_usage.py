@@ -39,6 +39,12 @@ Every call site takes a `record=` parameter defaulting to `record` here, the sam
 (which runs on a pool thread, where a sqlite connection from another thread would be a
 bug) and lets a test assert on what would have been written without a database at all.
 
+A site that records a call here tells the transport so with
+`claude_cli.run_headless_result(..., records_itself="<kind>")`, so the same call is not
+also billed as a `WORKER_SUBPROCESS` row. That declaration is not a kill switch and is
+refused unless an OS code path is making the call — see
+docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
+
 ## It never raises
 
 Accounting is an observer. A work order must not fail, and Neo must not stop answering,
@@ -96,6 +102,12 @@ KIND_LABELS = {
     # JUDGING; folded together, `jarvis cost` cannot answer "what does watching
     # cost" — the first question anyone asks before turning this on.
     "health": "supervisor health review",
+    # A KIND OF ITS OWN AND NOT A LABEL ON `neo_answer`, for `panel.py:218`'s ONE ROW PER
+    # SEAT reason exactly: whether the stakes classifier earns its price is the question
+    # of what it costs against the escalations it saves, and a row folded into
+    # `neo_answer` cannot answer it (docs/superpowers/specs/
+    # 2026-09-25-a-model-decides-what-is-high-stakes.md SS3.8).
+    "stakes_classifier": "classifying an assumption's stakes",
     COMPACTION: "compacting a cold conversation",
     WORKER_SUBPROCESS: "worker subprocess",
 }

@@ -66,7 +66,8 @@ class Env:
 
 @pytest.fixture()
 def env(tmp_path) -> Env:
-    project = make_git_project(tmp_path, "proj")
+    # No fixture commit: this suite builds `main` itself, one rung at a time.
+    project = make_git_project(tmp_path, "proj", commit_spec=False)
     _git(project, "symbolic-ref", "HEAD", "refs/heads/trunk")
     (project / "app.py").write_text(_body("app", 30))
     (project / "lib.py").write_text(_body("lib", 30))

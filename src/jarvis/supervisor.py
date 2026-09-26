@@ -732,6 +732,8 @@ def review(pstore: Any, neo_store: Any, project: str, wo: dict[str, Any],
             # Neutral cwd, Neo's reason: a project directory would pull its CLAUDE.md in
             # and break prefix stability.
             cwd=ensure_home(),
+            # This call is recorded by `on_usage`, below, under the same kind.
+            records_itself="supervisor",
             on_usage=agent_usage.recorder(
                 "supervisor", project=project, wo_id=wo["id"],
                 label=str(alarm.get("kind") or ""), model=cfg.model, record=record),
@@ -886,6 +888,8 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
             # Neutral cwd, `review`'s reason: a project directory pulls its CLAUDE.md in
             # and breaks prefix stability.
             cwd=ensure_home(),
+            # This call is recorded by `on_usage`, below, under the same kind.
+            records_itself="health",
             on_usage=agent_usage.recorder(
                 "health", project=project, wo_id=carrier["id"], label=trigger,
                 model=cfg.model, record=record),

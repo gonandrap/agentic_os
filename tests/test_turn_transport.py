@@ -49,8 +49,9 @@ def _start(fleet, hold: bool = False) -> dict:
     if hold:
         fleet["hold_gate"] = fleet["claude"].hold_turns()
     wo = ops.create_work_order("proj_a", "task")
-    return worker_session.start(fleet["store"], fleet["project"],
-                                fleet["store"].get_work_order(wo["id"]), "go")
+    turn, _ = worker_session.start(fleet["store"], fleet["project"],
+                                   fleet["store"].get_work_order(wo["id"]), "go")
+    return turn
 
 
 # -- choosing the transport ------------------------------------------------------------

@@ -90,6 +90,24 @@ def test_a_panel_that_gave_up_is_not_ruled_on_for_the_user():
     assert decide_early(round_outcome="escalated").code == autoreview.HELD_PANEL_GAVE_UP
 
 
+def test_the_early_hold_names_the_round_and_what_it_said():
+    d = decide_early(round_outcome="escalated", round_n=4,
+                     round_reason="the seats could not agree")
+    assert d.code == autoreview.HELD_PANEL_GAVE_UP and d.round == 4
+    assert "gave up on round 4" in d.reason
+    assert "the seats could not agree" in d.reason
+    # ...and the tail this pass owns is unchanged: nothing is ruled on while it waits.
+    assert "does not rule on its assumptions while it waits for you" in d.reason
+
+
+def test_a_hold_with_no_round_named_is_still_a_sentence():
+    """Every caller that names no round — and every table test here — must still read as
+    prose rather than as "round 0"."""
+    d = decide_early(round_outcome="escalated")
+    assert d.round == 0 and "round" not in d.reason
+    assert d.reason.startswith("the validation panel gave up and put this work order")
+
+
 @pytest.mark.parametrize("outcome", ["", "passed", "failed", "pending"])
 def test_every_other_round_outcome_leaves_the_assumption_reviewable(outcome):
     assert decide_early(round_outcome=outcome).armed

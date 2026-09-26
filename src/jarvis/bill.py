@@ -120,6 +120,10 @@ NO_TURN_NOTE = ("spend that belongs to this order but to none of its turns — a
                 "made before the first turn started, or a conversation with no turns "
                 "on record at all")
 
+#: How `payload["own"]` is labelled, on the page and in the terminal both — wording that
+#: differs between the two renderers is wording the reader stops trusting.
+OWN_LABEL = "what Jarvis spent on this order itself, not on any order below it"
+
 
 @dataclass
 class Item:
@@ -1149,6 +1153,7 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
     did this cost" is asked and the answer is never one session's.
     """
     from . import ops
+    from .central_store import CentralStore
     from .project_store import ProjectStore
 
     store = ProjectStore(path)
@@ -1168,7 +1173,18 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
     # eight children would otherwise walk it eight times to answer one page.
     index = index if index is not None else usage_mod.index_sessions()
     orders = [for_work_order(project, path, child, index=index) for child in children]
-    items: list[Item] = []
+    # Calls Jarvis made against the PARENT row itself — a plan question whose planner is
+    # gone carries the feature's own id (`ProjectStore.work_order_for_question`), and an
+    # improvement order's family is the order plus its analyst, §2.6 of
+    # docs/superpowers/specs/2026-09-23-improvement-orders.md. Nothing below this row
+    # owns them, so without this they are on no bill at all.
+    central = CentralStore()
+    try:
+        own_calls = central.agent_calls(wo_id=fo["id"], limit=CALL_LIMIT)
+    finally:
+        central.close()
+    own_items = _call_items(own_calls, lambda ts: None)
+    items: list[Item] = [*own_items]
     agent_items: list[Item] = []
     for order, child in zip(orders, children):
         for line in order["actors"]:
@@ -1193,6 +1209,9 @@ def for_feature_order(project: str, path: Path, fo: dict[str, Any],
         "agents": _fold(agent_items, key=lambda i: i.path,
                         label=lambda p: str(p[-1])),
         "orders": orders,
+        # Its own calls as one line beside the orders, so `reconcile`'s third view still
+        # adds up to the headline: the feature's total is its orders PLUS this.
+        "own": _total_line(own_items, fo["id"]) if own_items else None,
         "notes": [],
         "checks": {},
     }
@@ -1310,6 +1329,9 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
     # different stories on one page.
     if payload.get("orders"):
         views["orders"] = [order["total"] for order in payload["orders"]]
+        # Plus what Jarvis spent on the parent row itself, which belongs to no child.
+        if payload.get("own"):
+            views["orders"].append(payload["own"])
     for view, lines in views.items():
         if not lines:
             continue

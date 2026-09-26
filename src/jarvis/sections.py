@@ -76,3 +76,26 @@ def extract_section(markdown: str, which: str) -> str | None:
             end = pos
             break
     return markdown[start:end].rstrip()
+
+
+def clip_at_heading(markdown: str, max_chars: int) -> tuple[str, list[str]]:
+    """The prefix ending at the last heading that fits, and the heading LINES dropped.
+
+    A spec too long to ride in a question is cut at a heading boundary, never
+    mid-sentence, and the caller names what it dropped: a reviewer that believes a
+    silently clipped spec is complete is how question 658 concluded the spec "stops at
+    §9". §10 of
+    docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md.
+    """
+    if len(markdown) <= max_chars:
+        return markdown, []
+    heads = [(m.start(), m.group(0).strip()) for m in HEADING_RE.finditer(markdown)]
+    kept_end = 0
+    for pos, _line in heads:
+        if 0 < pos <= max_chars:
+            kept_end = pos
+    # No heading boundary inside the budget: a hard cut beats returning nothing.
+    if kept_end == 0:
+        kept_end = max_chars
+    return (markdown[:kept_end].rstrip(),
+            [line for pos, line in heads if pos >= kept_end])

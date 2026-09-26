@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from .. import bill, fleet, invariants, ops, specs, uilog, wiring
+from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
 from ..inspection import ALARM_KINDS
@@ -28,6 +29,7 @@ from ..project_store import (
     TERMINAL_STATUSES,
     WO_STATUSES,
     ProjectStore,
+    feature_status_label,
     validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
@@ -851,6 +853,14 @@ def create_app() -> FastAPI:
             # the feature's own page.
             features = [{**row, "progress": ops.feature_progress(store, row)}
                         for row in store.list_feature_orders(statuses=fo_statuses)]
+            # Beside the features and never merged into them: `list_feature_orders`
+            # defaults to kind='feature', so the read above already excludes these, and
+            # the two lifecycles spell the same statuses differently (§6.1).
+            improvements = [
+                {**row,
+                 "status_label": feature_status_label("improvement", row["status"])}
+                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind="improvement")]
             fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
@@ -893,6 +903,7 @@ def create_app() -> FastAPI:
                       pauses=pauses,
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features, fo_settled=fo_settled,
+                      improvements=improvements,
                       issue_board=issue_board,
                       fo_revealed=fo_revealed)
 
@@ -923,6 +934,39 @@ def create_app() -> FastAPI:
                       # the template reads the same name on both pages.
                       issues=detail["issues"],
                       validation=validation, error=error)
+
+    @app.get("/io/{name}/{io_id}", response_class=HTMLResponse)
+    def improvement_order(request: Request, name: str, io_id: str, error: str = ""):
+        """An improvement order's page — §6.1 of the improvement-orders spec.
+
+        Counts first, then the evidence, then one card per finding: a report is only
+        judgeable next to what it was quoted from, and the decision is taken on the page
+        it is read on. Everything the page renders, including each filed order's current
+        status, comes off `show_improvement_order` — a second resolution here would make
+        the page and `jarvis io show` two answers to one question.
+        """
+        try:
+            detail = ops.show_improvement_order(io_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "improvement_order.html", io=detail,
+                      project=detail["project"], error=error)
+
+    @app.post("/io/{name}/{io_id}/review")
+    def review_findings(name: str, io_id: str, key: str = Form(...),
+                        decision: str = Form(...), reason: str = Form("")):
+        """One finding, decided. Holds no logic of its own, exactly as `review_plan`
+        does not: `ops.review_findings` owns what a decision means."""
+        try:
+            ops.review_findings(
+                io_id, accept=(key,) if decision == "accept" else (),
+                reject={} if decision == "accept" else {key: reason},
+                decided_by="user", project_name=name)
+        except ops.OpsError as e:
+            # A rejection with no reason is the refusal that actually happens here — the
+            # knowledge entry and the analyst read only that reason.
+            return RedirectResponse(f"/io/{name}/{io_id}?error={e}", status_code=303)
+        return RedirectResponse(f"/io/{name}/{io_id}", status_code=303)
 
     @app.get("/project/{name}/sessions", response_class=HTMLResponse)
     def project_sessions(request: Request, name: str):
@@ -1087,7 +1131,7 @@ def create_app() -> FastAPI:
         scale = max([t.get("context_window") or 0 for t in turn_rows]
                     + [t.get("context_peak") or 0 for t in turn_rows] + [1])
         return render(request, "bill.html", active="cost", bill=bill, project=name,
-                      turn_rows=turn_rows, bar_scale=scale)
+                      turn_rows=turn_rows, bar_scale=scale, own_label=OWN_LABEL)
 
     @app.get("/inbox", response_class=HTMLResponse)
     def inbox(request: Request):

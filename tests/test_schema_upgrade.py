@@ -479,3 +479,54 @@ def test_assumptions_that_predate_the_new_columns_still_read_as_the_users(tmp_pa
     assert row["decided_config_version"] is None and row["neo_question_id"] is None
     assert ops.assumption_decider(row) == "you"
     assert "by you" in ops.assumption_line(row)
+
+
+def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
+                                                                      monkeypatch):
+    """kn-c712a5d6: a column is untested until a test WRITES it and a test reads a row
+    that PREDATES it. `tests/test_context.py` covers the write; this is the other half.
+
+    The frozen 0.1.11 asset has no `wo_turns` at all, so the table is built here in its
+    pre-ledger shape — which is the live database this migration actually meets: one whose
+    `wo_turns` arrived in a later release and whose rows have no `context_json`. NULL must
+    read as "not recorded", never as an empty table or a zero-sized window.
+    """
+    from jarvis import ops
+    from jarvis.project_store import ProjectStore as PS
+
+    proj = tmp_path / "legacy-turns"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, created_at, "
+                "updated_at) VALUES ('wo-old', 'ran before the ledger', 'd', "
+                "'completed', 1.0, 1.0)")
+    old.execute("CREATE TABLE wo_turns (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "wo_id TEXT NOT NULL REFERENCES work_orders(id), seq INTEGER NOT NULL, "
+                "kind TEXT NOT NULL, msg_id INTEGER, prompt TEXT NOT NULL, "
+                "state TEXT NOT NULL DEFAULT 'running', pid INTEGER, "
+                "started_at REAL NOT NULL, ended_at REAL, exit_code INTEGER, "
+                "result TEXT, error TEXT, cost_usd REAL, num_turns INTEGER, "
+                "outfile TEXT NOT NULL DEFAULT '', errfile TEXT NOT NULL DEFAULT '')")
+    old.execute("INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at, "
+                "ended_at) VALUES ('wo-old', 1, 'dispatch', 'go', 'done', 1.0, 2.0)")
+    old.commit()
+    old.close()
+
+    store = PS(proj)                                  # the upgrade
+    try:
+        assert "context_json" in schema_of(store.conn)["wo_turns"]
+        (row,) = store.list_turns("wo-old")
+        assert row["context_json"] is None             # not recorded, and not "{}"
+    finally:
+        store.close()
+
+    # and the read path says so in words rather than rendering an empty table
+    monkeypatch.setattr(ops, "registered_project_paths", lambda: {"legacy": proj})
+    out = ops.context_report("wo-old")
+
+    assert out["recorded"] is False
+    assert "not recorded for this order" in out["note"]
+    assert [t["seq"] for t in out["turns"]] == [1]
+    assert out["turns"][0]["recorded"] is False and out["turns"][0]["ingredients"] == []
+    assert "not recorded" in out["turns"][0]["note"]

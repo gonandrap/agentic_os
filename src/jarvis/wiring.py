@@ -250,6 +250,18 @@ def cached(*, refresh: bool = False) -> Inventory | None:
         return None if refresh else inv
 
 
+def peek() -> Inventory | None:
+    """The cached inventory WITHOUT triggering a read. None means nothing read yet.
+
+    `cached()` starts a discovery thread when the cache is cold, and discovery shells out
+    to `claude mcp list`. `context.py` measures inside the dispatch path, where a
+    measurement must not spawn a subprocess — so it reads the cache or says it is cold
+    (§5 of docs/specs/2026-09-24-order-observability.md).
+    """
+    with _LOCK:
+        return _STATE["inventory"]
+
+
 def discover(*, refresh: bool = False, timeout: int = 90) -> Inventory:
     """Everything the user has configured, with no project applied. BLOCKS.
 

@@ -11,6 +11,7 @@ Three post-conditions outrank everything else here:
    the work order's attention is not cleared.
 3. **A stopped order's undelivered objection is withdrawn, never delivered late** —
    the pair: stopped ends `withdrawn` with no turn sent, running stays outstanding.
+4. **§6.6 and §7 agree on one order**: the withdrawal is what unblocks the confirmation.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import sqlite3
 
 import pytest
 
-from jarvis import bus, ops
+from jarvis import autoreview, bus, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ADDED_COLUMNS, ProjectStore
@@ -357,3 +358,152 @@ def test_delivery_refuses_an_objection_to_an_order_that_stopped(started):
     assert store.get_assumption(a["id"])["objection_withdrawn_ts"] is not None
     assert events(store, wo["id"], "autoreview_objection_withdrawn")
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+
+# -- the joint: §6.6's withdrawal and §7's gate ----------------------------------------
+
+#: Routine text, and the FORCE_ACCEPT marker sits PAST character 200 on purpose, so it
+#: never leaks into the prompt for the assumption beside this one. The test asserts that
+#: cut itself (`autoreview.sibling_line`) rather than trusting this comment.
+ACCEPTED_TEXT = (
+    "named the helper `_render_row`, matching the two beside it, and kept its arguments "
+    "in the order the three callers already pass them, so a reader of any one call site "
+    "sees the same shape as the other two and nothing has to be re-checked when a fourth "
+    "caller arrives — FORCE_ACCEPT")
+OBJECTED_TEXT = "FORCE_DENY — put the helper at the bottom of the module"
+
+
+def tick(daemon, project, store, *, poll=True, reconcile=True, drain=True):
+    """One daemon tick, in `Daemon.run`'s own order (daemon.py ~715 and ~782).
+
+    The halves are separable because the race §7's gate exists for happens BETWEEN them.
+    """
+    if poll:
+        daemon.deliver_envelopes(project, store)
+        daemon.deliver_messages(project, store)
+    if reconcile:
+        daemon.auto_review(project, store)
+        daemon.withdraw_stale_objections(project, store)
+    if drain:
+        daemon._neo_drain()
+
+
+def test_the_withdrawal_is_what_lets_the_confirmation_pass_run(started):
+    """§6.6 and §7 were written in separate sessions and only work if they agree.
+
+    Every other test in the feature proves ONE section. This is the joint: an objection in
+    flight HOLDS the confirmation (§7), and §6.6's withdrawal is the only thing that ever
+    releases it on an order that stopped first. Real passes only — the verdicts come from
+    the fake through the markers in the assumption text.
+    """
+    from jarvis import invariants
+    from jarvis.neo_store import NeoStore
+
+    def asked(kind="assumption"):
+        neo = NeoStore()
+        try:
+            return [q for q in neo.list_questions() if q["kind"] == kind]
+        finally:
+            neo.close()
+
+    project = spec(started)
+    wo_row = ops.create_work_order("proj_a", "an order with two readings",
+                                   description="d")
+    store = ProjectStore(project.path)
+    store.set_status(wo_row["id"], "running", session_id="s-joint")
+    # The worker is MID-TURN: that is when it records an assumption, and it is why the
+    # bus cannot hand it anything (`worker_session.delivery_hold` -> HOLD_TURN_IN_FLIGHT).
+    turn = store.create_turn(wo_row["id"], "dispatch", "the dispatch prompt")
+    wo_id = wo_row["id"]
+    ops.assume(wo_id, OBJECTED_TEXT)
+    ops.assume(wo_id, ACCEPTED_TEXT)
+
+    def rows():
+        by = {("object" if "FORCE_DENY" in a["content"] else "accept"): a
+              for a in store.all_assumptions(wo_id)}
+        return by["object"], by["accept"]
+
+    # ACCEPTED_TEXT only works while `sibling_line`'s 200-char cut hides its marker: if
+    # the cut moves, the fake accepts BOTH rows, so fail here and say why.
+    assert "FORCE_ACCEPT" not in autoreview.sibling_line(rows()[1])
+
+    # tick 1: the early pass asks, the drain rules, and NOTHING settles (§5).
+    tick(started, project, store)
+    objected, accepted = rows()
+    assert objected["provisional_verdict"] == "object" and objected["provisional_reason"]
+    assert accepted["provisional_verdict"] == "accept"
+    for row in (objected, accepted):
+        assert row["status"] == "pending" and row["decided_by"] == ""
+    assert len(store.pending_assumptions(wo_id)) == 2
+    assert len(asked()) == 2
+
+    # tick 2: §6.1 files the objection, off the recorded verdict and nothing else.
+    tick(started, project, store)
+    objected, accepted = rows()
+    [ev] = events(store, wo_id, "autoreview_objected")
+    assert ev["n"] == objected["n"]
+    [env] = store.envelopes(subject_wo_id=wo_id)
+    assert objected["objection_envelope_id"] == env["id"]
+    assert objected["objection_transport"] == "queue"
+    assert accepted["objection_envelope_id"] is None
+    assert [a["id"] for a in store.outstanding_objections(wo_id)] == [objected["id"]]
+    assert objected["status"] == "pending" and accepted["status"] == "pending"
+
+    # tick 3, delivery half only: the envelope becomes a message and the hold keeps it.
+    tick(started, project, store, reconcile=False, drain=False)
+    env = store.get_envelope(int(env["id"]))       # `delivered_msg_id` is set by routing
+    [msg] = [m for m in store.list_messages(wo_id) if m["id"] == env["delivered_msg_id"]]
+    assert msg["status"] == "queued"
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]
+
+    # The worker finishes MID-TICK — its own process writing, between the delivery half
+    # of a tick and the reconcile half. That race is what §7's gate exists for.
+    assert ops.finish(wo_id, "two readings recorded")["status"] == "needs_review"
+    store.finish_turn(turn["id"], "done")           # ...and its process exits
+
+    # tick 3, reconcile half: the gate holds, THEN §6.6 withdraws.
+    tick(started, project, store, poll=False, drain=False)
+    objected, accepted = rows()
+    assert len(asked()) == 2                       # no confirmation question yet
+    assert objected["confirm_question_id"] is None
+    assert accepted["confirm_question_id"] is None
+    assert autoreview.HELD_OBJECTION_IN_FLIGHT in [
+        h["code"] for h in events(store, wo_id, "autoreview_held")]
+    assert objected["objection_withdrawn_ts"] is not None
+    assert objected["objection_delivered_ts"] is None
+    [withdrawn] = events(store, wo_id, "autoreview_objection_withdrawn")
+    assert withdrawn["n"] == objected["n"]
+    assert withdrawn["reason"] == "the order stopped before it could be delivered"
+    assert store.get_message(int(env["delivered_msg_id"]))["status"] == "withdrawn"
+    assert store.queued_messages(wo_id) == []
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]   # no second turn, ever
+    assert [t for t in store.list_turns(wo_id) if t["msg_id"]] == []
+
+    # The hold was belt and the withdrawal is braces: the turn has ENDED, so no hold is
+    # left at all, and the withdrawn message is STILL not deliverable.
+    tick(started, project, store, reconcile=False, drain=False)
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]
+    assert store.deliverable_messages(wo_id) == []
+
+    # tick 4: the gate is open, so the accepted row alone is confirmed and settled.
+    tick(started, project, store, drain=False)
+    objected, accepted = rows()
+    confirming = [q for q in asked() if q["id"] == accepted["confirm_question_id"]]
+    assert len(asked()) == 3 and len(confirming) == 1
+    assert objected["confirm_question_id"] is None
+
+    started._neo_drain()
+    objected, accepted = rows()
+    assert accepted["status"] == "accepted" and accepted["decided_by"] == "neo"
+    [confirmed] = events(store, wo_id, "autoreview_confirmed")
+    assert confirmed["neo_question_id"] == confirming[0]["id"]
+    assert objected["status"] == "pending" and objected["decided_by"] == ""
+    assert [t["seq"] for t in store.list_turns(wo_id)] == [1]   # still no second turn
+
+    # kn-640e7f6c: a WITHDRAWN objection is not an undeliverable one — nothing failed.
+    blockers = invariants.true_blockers(store, store.get_work_order(wo_id))
+    assert invariants.OBJECTION_UNDELIVERABLE_BLOCKER not in blockers
+    # THE POSITIVE CONTROL, or an empty list would pass the line above. A provisional
+    # OBJECT is nobody's confirmation in flight (`invariants._os_is_confirming`) — §7
+    # asks nothing on one, so the objected row is the user's and says so.
+    assert blockers == ["1 assumption pending your review"]
