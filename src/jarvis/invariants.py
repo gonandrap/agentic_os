@@ -57,6 +57,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     SLOT_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_AUTH_CAUSE,
     VALIDATION_HELD_CAUSE,
     validation_hold,
 )
@@ -1051,6 +1052,14 @@ def usage_hold_note(until: float) -> str:
 #: this is the label's half of the same sentence.
 CI_HOLD_NOTE = "waiting for GitHub to finish running the checks"
 
+#: The THIRD hold, and it names no moment either — `reopens_at` on an auth hold is the
+#: recheck interval (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7).
+#: The wording is `worker_session.PAUSE_NOUN[PAUSE_AUTH]`'s: one expired sign-in stops a
+#: worker turn and a validation seat alike, and a user reading a quiet fleet must not have
+#: to learn that those are two different things.
+AUTH_HOLD_NOTE = "waiting for Claude Code authentication"
+
 
 def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
     """Why this round is not being judged, or "" for a round that is not held.
@@ -1063,7 +1072,11 @@ def validation_hold_note(store: ProjectStore, wo_id: str, round_no: int) -> str:
                                    round_no)
     if until <= time.time():
         return ""
-    return usage_hold_note(until) if cause == VALIDATION_HELD_CAUSE else CI_HOLD_NOTE
+    if cause == VALIDATION_HELD_CAUSE:
+        return usage_hold_note(until)
+    if cause == VALIDATION_AUTH_CAUSE:
+        return AUTH_HOLD_NOTE
+    return CI_HOLD_NOTE
 
 
 def parallel_round_note(store: ProjectStore, wo_id: str) -> str:

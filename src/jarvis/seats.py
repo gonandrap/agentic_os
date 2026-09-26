@@ -162,6 +162,11 @@ class Opinion:
     #: down a panel the other four answered: it is the CALLER that decides whether the
     #: round can be judged without it (`validation.decide`, GitHub issue #235).
     refused: claude_cli.UsageLimit | None = None
+    #: CLAUDE CODE COULD NOT AUTHENTICATE and this seat was never asked. `refused`'s twin
+    #: in every respect, including the reason it is carried rather than raised: one seat
+    #: that could not authenticate must not take down a panel the other three answered,
+    #: and that call belongs to `validation.decide` (GitHub issue #778).
+    auth: claude_cli.AuthFailure | None = None
     #: NO DEFINITION FOR THIS SEAT SHIPS IN THIS BUILD — the `SeatError` construction
     #: sites in `panel._round` and `validation._run_seats`, and nowhere else.
     #:
@@ -214,7 +219,8 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
         log.warning("seat %s abstained: %s", seat, e)
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
                        latency_ms=elapsed(), replied=False,
-                       refused=getattr(e, "limit", None))
+                       refused=getattr(e, "limit", None),
+                       auth=getattr(e, "auth", None))
     raw, usage = result.text, result.usage
     data = structured.parse_json_object(raw)
     if not isinstance(data, dict):

@@ -147,6 +147,11 @@ def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCl
     limit = usage_limit(detail)
     if limit is not None:
         return UsageLimitError(limit)
+    # AFTER the window and against the UNPREFIXED text: spec
+    # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §2.
+    auth = auth_failure(detail)
+    if auth is not None:
+        return AuthFailureError(auth)
     return ClaudeCliError(
         f"claude {' '.join(args[:4])}... failed (rc={rc}): {detail[:500]}")
 
@@ -982,6 +987,21 @@ class UsageLimitError(ClaudeCliError):
     def __init__(self, limit: UsageLimit) -> None:
         super().__init__(limit.message)
         self.limit = limit
+
+
+class AuthFailureError(ClaudeCliError):
+    """`claude` could not authenticate: the OAuth session expired, the login lapsed.
+
+    `UsageLimitError`'s shape, and a `ClaudeCliError` subclass for its reason: every
+    existing `except claude_cli.ClaudeCliError` keeps working unchanged and what this adds
+    is `auth`. The difference from the window is that NO deadline exists — what clears it
+    is a human — so the caller holds on a schedule rather than on a stated moment
+    (`Daemon._validation_auth_held`, GitHub issue #778).
+    """
+
+    def __init__(self, auth: AuthFailure) -> None:
+        super().__init__(auth.message)
+        self.auth = auth
 
 
 #: The legacy shape, and the only one that states the moment unambiguously:

@@ -2264,6 +2264,27 @@ def test_a_round_waiting_for_ci_is_not_painted_as_a_failure(client, project):
     assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
 
 
+def test_a_round_held_for_authentication_is_not_painted_as_a_failure(client, project):
+    """GitHub issue #778. No template edit ships with that fix — the badge is keyed on
+    `project_store.validation_standing` — so the thing that can regress is the table row,
+    and this is what pins it rendered."""
+    from jarvis.project_store import VALIDATION_AUTH_CAUSE
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("add the export")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="ffff6666")
+    store.close_validation_round(rnd["id"], "failed",
+                                 "waiting for Claude Code authentication",
+                                 hold_cause=VALIDATION_AUTH_CAUSE)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert ('class="st tone-active"><span class="i">◑</span>held for authentication'
+            '</span>') in page
+    assert ">failed</span>" not in page
+    assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
+
+
 def test_a_round_that_really_failed_keeps_the_red_badge(client, project):
     """The other half, and the one a rendering fix breaks by accident: an outage and an
     unconfigured panel have no `hold_cause`, nothing is coming back on its own, and they
