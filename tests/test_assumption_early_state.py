@@ -233,6 +233,26 @@ EARLY_KINDS = ("autoreview_provisional", "autoreview_objected",
                "autoreview_unconfirmed")
 
 
+def test_confirming_under_a_panel_that_gave_up_names_the_round():
+    """§7's tail call forwards the round the way it already forwards the outcome and the
+    stakes: a confirmation held by a give-up must say which round, or the one pass that
+    settles anything is the one whose hold says least."""
+    from jarvis import autoreview
+    from jarvis.catalog import ValidationConfig
+
+    d = autoreview.decide_confirm(
+        {"id": 3, "n": 1, "status": "pending", "content": "kept the default timeout",
+         "provisional_verdict": "accept"},
+        {"id": "wo-1", "status": "needs_review"},
+        ValidationConfig(enabled=True, auto_review=True),
+        round_outcome="escalated", round_n=2,
+        round_reason="two seats read the lock as advisory")
+
+    assert d.code == autoreview.HELD_PANEL_GAVE_UP and d.round == 2
+    assert "gave up on round 2" in d.reason
+    assert "two seats read the lock as advisory" in d.reason
+
+
 def test_the_five_event_kinds_are_enumerated_once():
     assert set(EARLY_KINDS) <= set(ops.AUTOREVIEW_EVENTS)
 

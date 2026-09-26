@@ -628,11 +628,11 @@ def test_a_hold_is_recorded_once_per_reason_and_is_not_an_attention_item(started
     assert "held" in ops.autoreview_state(store, wo)["line"]
 
 
-def settled_round(store, wo_id: str, outcome: str) -> None:
+def settled_round(store, wo_id: str, outcome: str, reason: str = "") -> None:
     """A fresh settled round on the judged commit, `park`'s way."""
     row = store.open_validation_round(wo_id=wo_id, fingerprint="fp1")
     store.set_validation_head(row["id"], JUDGED)
-    store.close_validation_round(row["id"], outcome, "")
+    store.close_validation_round(row["id"], outcome, reason)
 
 
 def test_a_hold_returning_to_an_earlier_reason_is_recorded_again(started):
@@ -656,6 +656,94 @@ def test_a_hold_returning_to_an_earlier_reason_is_recorded_again(started):
     (line,) = rulings(store, wo["id"])
     assert line.startswith("Held by the OS — mentions 'production'")
     assert "gave up" not in line
+
+
+# -- the panel's give-up: which round, what it said, and when it stops being true -------
+#
+# docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-when-
+# it-passes.md. The hold is an append-only event read as a statement about NOW, so this
+# one — whose subject is a queryable row — is resolved against that row at the read side.
+
+PANEL_REASON = ("the seats could not agree about whether the retry loop is safe under a\n"
+                "partial write, and the chair would not break the tie:   two read the lock\n"
+                "as sufficient and one read it as advisory only, which is a question about "
+                "the storage engine and not about this diff at all — the chair asked for a "
+                "second opinion and none of the three would move, so the submission comes "
+                "to you with all three readings attached")
+
+
+def test_a_panel_hold_names_the_round_and_quotes_what_the_panel_said(started):
+    """A reader cannot tell a real disagreement from #778's OAuth outage from the static
+    sentence, and the round reason — the one text that distinguishes them — was read at
+    both daemon call sites and thrown away."""
+    store, wo = park(started, auto_review=True, outcome="")
+    row = store.latest_validation_round(wo_id=wo["id"])
+    store.close_validation_round(row["id"], "escalated", PANEL_REASON)
+
+    ask(started, store)
+
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
+    assert held["round"] == 1
+    assert "gave up on round 1" in held["reason"]
+    # Whitespace-collapsed and clamped, `ops.objection_response_line`'s rule: one line
+    # inside a list of assumptions, with the full text one pointer away.
+    assert len(PANEL_REASON) > 300
+    assert " ".join(PANEL_REASON.split())[:117] + "…" in held["reason"]
+    assert "\n" not in held["reason"] and "  " not in held["reason"]
+
+
+def test_a_panel_hold_stops_being_rendered_once_a_later_round_passes(started):
+    """#782's sibling, and the one only the freshness check can satisfy: ONE routine
+    assumption, so no second hold reason masks the stale line the way
+    `test_a_hold_returning_to_an_earlier_reason_is_recorded_again`'s stakes hold does.
+
+    Measured on wo-15f5d969: round 3 was forced and PASSED at the same commit, and both
+    the pending assumptions and the `auto_review:` line still said the panel gave up."""
+    store, wo = park(started, auto_review=True, outcome="escalated")
+    ask(started, store)
+    assert "gave up" in rulings(store, wo["id"])[0]
+
+    settled_round(store, wo["id"], "passed")
+
+    # Not-looked-at is an understatement; the stale sentence is a lie.
+    assert rulings(store, wo["id"]) == [""]
+    assert ops.autoreview_state(store, store.get_work_order(wo["id"])) is None
+    # The history is KEPT — the hold did happen, and the timeline is append-only.
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
+
+
+def test_a_second_escalated_round_refreshes_the_hold_rather_than_voiding_it(started):
+    """The dedupe key carries the round, or round 2's give-up writes nothing, the payload
+    still says round 1, and the freshness check drops a hold that is TRUE."""
+    store, wo = park(started, auto_review=True, outcome="escalated")
+    ask(started, store)
+    settled_round(store, wo["id"], "escalated")
+    ask(started, store)
+
+    holds = events(store, wo["id"], "autoreview_held")
+    assert [h["round"] for h in holds] == [1, 2]
+    assert "gave up on round 2" in holds[-1]["reason"]
+    assert "gave up" in rulings(store, wo["id"])[0]
+
+
+def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
+    """A payload from before this shipped carries no round: KEPT while the newest round is
+    still escalated (the panel did give up), dropped once a later one passed."""
+    store, wo = park(started, auto_review=True, outcome="escalated")
+    (row,) = store.all_assumptions(wo["id"])
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_PANEL_GAVE_UP,
+                     "reason": "the validation panel gave up and put this work order in "
+                               "front of you",
+                     "assumption_id": row["id"], "n": 1})
+
+    assert "gave up" in rulings(store, wo["id"])[0]
+
+    settled_round(store, wo["id"], "passed")
+
+    assert rulings(store, wo["id"]) == [""]
 
 
 # -- the daemon: ruling ----------------------------------------------------------------
@@ -832,7 +920,11 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     # ...and the OS said why, in both places: the work order's record and Neo's own list.
     (held,) = events(store, wo["id"], "autoreview_held")
     assert held["code"] == autoreview.HELD_PANEL_GAVE_UP
-    assert "gave up" in held["reason"]
+    # WHICH round and WHAT IT SAID, not merely that one gave up: this round closed with a
+    # real reason, and the hold is where the user meets it beside the assumption.
+    assert held["round"] == 1
+    assert "gave up on round 1" in held["reason"]
+    assert "the seats could not agree" in held["reason"]
     (escalated,) = events(store, wo["id"], "autoreview_escalated")
     assert escalated["dropped"] == autoreview.HELD_PANEL_GAVE_UP
     assert questions()[0]["status"] == "escalated"
@@ -1340,3 +1432,40 @@ def test_wo_show_carries_every_ruling_and_not_just_the_last_one(started, capsys)
     rows = json.loads(capsys.readouterr().out)["assumptions"]
     # `--json` keeps the payload, not the prose: whoever reads it reads the event.
     assert rows[0]["os_ruling"]["code"] == autoreview.HELD_HIGH_STAKES
+
+
+def test_the_cli_points_at_the_round_and_only_for_a_panel_hold(started, capsys):
+    """WHERE TO READ THE FULL PANEL REASON, on the surface that cannot carry a URL. The
+    pointer is per-surface by construction: `ops.assumption_ruling_line` is pure and
+    shared, so a `jarvis …` command in the reason would be printed inside an HTML page.
+
+    TWO ORDERS, because one cannot render both holds as its newest: `decide` checks the
+    panel before the stakes net, so under an escalated round every row holds on the panel.
+    """
+    from jarvis import cli
+
+    store, gave_up = park(started, auto_review=True, outcome="escalated")
+    _, stakes_hold = park(started, auto_review=True,
+                          assumptions=("reused the production api key",))
+
+    ask(started, store)
+
+    pointer = f"jarvis validation show {gave_up['id']}"
+    capsys.readouterr()
+    cli.main(["wo", "show", gave_up["id"]])
+    out = capsys.readouterr().out
+    (assumption_line,) = [l for l in out.splitlines() if "_render_row" in l]
+    assert assumption_line.rstrip().endswith(pointer)
+    (summary,) = [l for l in out.splitlines() if "auto_review" in l]
+    assert summary.rstrip().endswith(pointer)
+
+    # ...and NOT on a hold whose subject is not a round.
+    capsys.readouterr()
+    cli.main(["wo", "show", stakes_hold["id"]])
+    other = capsys.readouterr().out
+    assert "mentions 'production'" in other and "jarvis validation show" not in other
+
+    # `--json` keeps the rows untouched, which is what that function promises.
+    capsys.readouterr()
+    cli.main(["wo", "show", gave_up["id"], "--json"])
+    assert "jarvis validation show" not in capsys.readouterr().out
