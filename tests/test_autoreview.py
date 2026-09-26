@@ -1621,3 +1621,34 @@ def test_an_outage_that_ends_lets_the_assumption_be_asked_about_again(started):
     assert len(asks) == 2, "the outage held the assumption for the life of the order"
     (row,) = store.all_assumptions(wo["id"])
     assert row["neo_question_id"] == max(asks) != dead["id"]
+
+
+def test_a_second_outage_on_the_re_asked_question_re_arms_it_again(started):
+    """THE LOOP #788 asked to be made safe: re-arming is not a one-shot. A dead question
+    is replaced by one that ALSO dies, and the assumption is asked about a third time
+    rather than being stuck behind the replacement for the life of the order — while the
+    ask still costs at most one question per tick, so an outage cannot become spam.
+
+    docs/superpowers/specs/2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
+    flight.md §4.
+    """
+    store, wo, first = _unreachable_ask(started)
+
+    ask(started, store)
+    second = max(q["id"] for q in questions())
+    _kill(second)
+    ask(started, store)
+
+    ids = sorted(q["id"] for q in questions())
+    assert len(ids) == 3, "the second outage stuck the assumption behind a dead question"
+    third = ids[-1]
+    assert third not in (first["id"], second)
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["neo_question_id"] == third, "the link still points at a dead question"
+
+    # THE SAFETY: the live question holds the next pass, so the ask does not multiply.
+    ask(started, store)
+    assert sorted(q["id"] for q in questions()) == ids
+    assert len(events(store, wo["id"], "autoreview_asked")) == 3
+    # `HELD_ASKED` is suppressed (`_holds_not_recorded`): the question IS filed.
+    assert events(store, wo["id"], "autoreview_held") == []
