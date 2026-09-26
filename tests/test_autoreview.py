@@ -1469,3 +1469,155 @@ def test_the_cli_points_at_the_round_and_only_for_a_panel_hold(started, capsys):
     capsys.readouterr()
     cli.main(["wo", "show", gave_up["id"], "--json"])
     assert "jarvis validation show" not in capsys.readouterr().out
+
+
+# -- a question Neo never answered is not a question in flight -------------------------
+#
+# docs/superpowers/specs/2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
+# flight.md. GitHub issue #788.
+
+
+LAST_ERROR = "connection reset by peer"
+
+
+def _kill(question_id: int) -> None:
+    """Spend the ladder on one question: `failed`, stamped `UNREACHABLE_PREFIX`."""
+    neo_store = NeoStore()
+    try:
+        assert neo_store.release_claim(question_id, LAST_ERROR,
+                                       max_attempts=0) == "unreachable"
+    finally:
+        neo_store.close()
+
+
+def _unreachable_ask(daemon):
+    """A parked order whose assumption is linked to a question nobody will ever answer."""
+    store, wo = park(daemon, auto_review=True)
+    ask(daemon, store)
+    (q,) = questions()
+    _kill(q["id"])
+    return store, wo, q
+
+
+def _unreachable_confirmation(daemon):
+    """The same on the `confirm: True` link, written by its real writer."""
+    store, wo = park(daemon, auto_review=True)
+    rows = store.all_assumptions(wo["id"])
+    neo_store = NeoStore()
+    try:
+        q = autoreview.propose_confirmation(store, neo_store, "proj_a", wo, rows[0], rows)
+    finally:
+        neo_store.close()
+    _kill(q["id"])
+    return store, wo, q
+
+
+def test_an_unreachable_ask_reads_as_the_users_and_not_as_awaiting_ruling(started):
+    """THE SYMPTOM: `autoreview_asked` is append-only, so the row claimed a ruling was on
+    its way for the life of the work order. The question is dead and the line says so."""
+    store, wo, q = _unreachable_ask(started)
+
+    (line,) = rulings(store, wo["id"])
+
+    assert "awaiting ruling" not in line
+    assert line.startswith(f"Neo could not be reached (question {q['id']}) — nobody "
+                           f"judged this; you decide it: ")
+    assert f"jarvis neo answer {q['id']}" in line
+    assert f"jarvis wo review {wo['id']}" in line
+    assert line.endswith(f"— last error: {LAST_ERROR} (after 0 retries — nobody has "
+                         f"judged this)")
+    # A crash is not a decision: neither word may appear.
+    assert "escalated" not in line and "Neo decided" not in line
+
+
+def test_an_unreachable_confirmation_says_what_was_never_confirmed(started):
+    """Both links, one branch — `propose_confirmation` writes `autoreview_asked` too."""
+    store, wo, q = _unreachable_confirmation(started)
+
+    (line,) = rulings(store, wo["id"])
+
+    assert "awaiting ruling" not in line
+    assert (f"Neo could not be reached (question {q['id']}) — nobody judged this to "
+            f"confirm its early reading; you decide it: ") in line
+
+
+def test_the_summary_line_puts_an_unreachable_ask_back_with_the_user(started):
+    """The same derivation on `jarvis wo show`'s one line, in `left with you`'s words so
+    it sorts with the other two claims of that shape."""
+    store, wo, q = _unreachable_ask(started)
+
+    line = _line(store, wo["id"])
+
+    assert line == (f"assumption #1 left with you — Neo could not be reached "
+                    f"(question {q['id']}); nobody judged it")
+    assert "is with Neo" not in line
+    # The row is still pending, so there is nothing to resolve it against.
+    assert "since " not in line
+
+
+def test_a_dead_question_re_arms_the_assumption_it_was_asked_on():
+    """Condition 6's mandate is unchanged — one question per assumption — because a
+    `failed` question is not a question any more."""
+    a = assumption(neo_question_id=41)
+
+    assert decide(assumption=a, unreachable_question_ids=(41,)).armed
+    assert decide(assumption=a).code == autoreview.HELD_ASKED
+    assert decide(assumption=a,
+                  unreachable_question_ids=(9,)).code == autoreview.HELD_ASKED
+
+
+def test_the_early_pass_re_arms_on_a_dead_link_too():
+    """`decide_early` reaches one on an order that is still `running`."""
+    a = assumption(neo_question_id=41)
+    wo = {**WO, "status": "running"}
+
+    assert autoreview.decide_early(a, wo, cfg(),
+                                   unreachable_question_ids=(41,)).armed
+    assert autoreview.decide_early(a, wo, cfg()).code == autoreview.HELD_ASKED
+
+
+@pytest.mark.parametrize("status", ["queued", "answering", "answered", "escalated"])
+def test_a_question_that_is_genuinely_in_flight_is_never_in_the_set(started, status):
+    """Only `failed` means nobody judged it: `escalated` is Neo handing the question back
+    WITH a decision, and the other three are out or already delivered."""
+    store, wo = park(started, auto_review=True)
+    ask(started, store)
+    (q,) = questions()
+    neo_store = NeoStore()
+    try:
+        neo_store.conn.execute("UPDATE questions SET status=? WHERE id=?",
+                               (status, q["id"]))
+        ids = started._unreachable_question_ids(   # noqa: SLF001
+            neo_store, store.all_assumptions(wo["id"]))
+    finally:
+        neo_store.close()
+
+    assert ids == set()
+
+
+def test_the_set_names_a_dead_link_of_either_kind(started):
+    """What the daemon supplies, read off both columns."""
+    store, wo, q = _unreachable_ask(started)
+    (row,) = store.all_assumptions(wo["id"])
+    store.link_assumption_confirmation(row["id"], q["id"])
+    neo_store = NeoStore()
+    try:
+        ids = started._unreachable_question_ids(   # noqa: SLF001
+            neo_store, store.all_assumptions(wo["id"]))
+    finally:
+        neo_store.close()
+
+    assert ids == {q["id"]}
+
+
+def test_an_outage_that_ends_lets_the_assumption_be_asked_about_again(started):
+    """The whole point: the daemon asks again once the question is dead, on the pass that
+    would otherwise hold it for the life of the order."""
+    store, wo, dead = _unreachable_ask(started)
+
+    ask(started, store)
+
+    asks = [q["id"] for q in questions()]
+    assert len(asks) == 2, "the outage held the assumption for the life of the order"
+    (row,) = store.all_assumptions(wo["id"])
+    assert row["neo_question_id"] == max(asks) != dead["id"]
