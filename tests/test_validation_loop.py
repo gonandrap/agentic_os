@@ -1235,6 +1235,10 @@ def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet
     store = fleet.store()
     try:
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
+        # The feedback went out as a turn, so the landing may have been deferred behind
+        # it (spec §3.1); either way it is taken, and by the same rule.
+        assert _settle(store, wo["id"])
+        fleet.tick()
         assert store.get_work_order(wo["id"])["status"] == "needs_review"
         assert store.pending_assumptions(wo["id"]) == []
     finally:
@@ -1678,3 +1682,40 @@ def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
     assert len(rows) == 1
     assert rows[0]["body"] == "no test covers the change"
     assert VALIDATION_REASON_CUT not in rows[0]["body"]
+
+
+def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
+                                                                     fake_claude):
+    """Measured on wo-83e4183c: a round opened before turn 13 came back `passed` while
+    turn 13 ran, and the landing put a planner halfway through a revision into
+    `needs_review`. The verdict is about a commit the worker has already moved past;
+    what it must not do is write a status under a live conversation."""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.daemon.validator = Validator(passed())
+    gate = fake_claude.hold_turns()
+
+    store = fleet.store()
+    try:
+        store.queue_message(wo["id"], "one more thing")
+        fleet.drain()  # the message goes out, then the round is judged behind it
+
+        round_row = store.latest_validation_round(wo_id=wo["id"])
+        assert round_row["outcome"] == "passed"
+        kinds = [e["kind"] for e in store.list_events(wo["id"])]
+        assert "validation_passed" in kinds
+        assert "validation_landing_deferred" in kinds
+        assert store.get_work_order(wo["id"])["status"] == "running", (
+            "the verdict landed a work order whose worker was mid-turn")
+
+        # The turn ends; the landing the round deferred is the settler's to finish.
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+        assert [e["kind"] for e in store.list_events(wo["id"])].count(
+            "validation_landed") == 1
+    finally:
+        store.close()

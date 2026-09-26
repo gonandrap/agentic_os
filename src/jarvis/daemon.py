@@ -61,7 +61,7 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
-from .invariants import PR_REPAIR_STATUSES
+from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
@@ -306,6 +306,14 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: The pair that records a landing the round machine could not take because a worker
+#: turn was in flight, and the one `settle_work_order` takes for it afterwards. TWO
+#: EVENTS AND NO COLUMN, by project_store.py's rule: a state that can be derived gets no
+#: column, and the pair keeps the WHY on the record where a boolean would not. Spec §3.2
+#: of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
+VALIDATION_LANDED = "validation_landed"
+
 #: The give-up notification, for both round machines (issue #199). ONE shape for both,
 #: because a unit that gives up says the same thing to the user whichever machine gave
 #: up on it. The body is the round's reason, CUT to `VALIDATION_REASON_CHARS`.
@@ -392,6 +400,24 @@ def escalation_body(reason: str) -> str:
     if len(reason) <= VALIDATION_REASON_CHARS:
         return reason
     return reason[:VALIDATION_REASON_CHARS] + VALIDATION_REASON_CUT
+
+
+def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
+    """The round whose landing is still owed — the newest deferral no landing answered.
+
+    Derived from the event pair rather than a column (`VALIDATION_LANDING_DEFERRED`), so
+    a landing taken is a landing recorded and the settler cannot take it twice.
+    """
+    last = store.last_event_of_kind(wo_id, VALIDATION_LANDING_DEFERRED)
+    if last is None:
+        return None
+    owed = (db.from_json(last.get("payload"), {}) or {}).get("round_id")
+    if owed is None:
+        return None
+    landed = store.last_event_of_kind(wo_id, VALIDATION_LANDED)
+    done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") if landed \
+        else None
+    return None if done == owed else int(owed)
 
 
 class Daemon:
@@ -706,6 +732,12 @@ class Daemon:
                 # reopened must re-send the turn it was refused BEFORE any newer
                 # message goes out, or the user's earlier message — already marked
                 # delivered, and living only on that turn row — would be skipped.
+                #
+                # And before dispatch, far below: when a slot frees it goes to a paused
+                # turn being resumed before it goes to a pending work order being
+                # dispatched. A resume continues a conversation whose prefix is paid for
+                # and whose work is half done; a dispatch starts one that re-sends its
+                # whole context at the cache-WRITE rate for the rest of its life.
                 if retry_paused:
                     self.retry_paused_turns(project, store, state)
                 # Before delivery, not after: an envelope BECOMES a queued message,
@@ -1390,12 +1422,26 @@ class Daemon:
         every order this pass relaunches. It bites narrowly and on purpose — a usage or
         transient pause leaves its work order `running`, which already holds a slot, so
         the only thing held here is the AUTH pause, the one parked out of `running` by
-        `_park_on_signin`. Held means the pause stays parked with nothing written.
+        `_park_on_signin`.
+
+        A HOLD IS WRITTEN DOWN (`retry_held`, issue #752). Held used to mean the pause
+        stayed parked with nothing recorded anywhere, which no surface could read: the
+        note went on promising a retry whose moment had passed, and INV-PAUSE-OVERDUE
+        reported the OS as not healing an order the OS was correctly waiting to heal. The
+        cap skip is re-read per order rather than hoisted, because `Fleet.launched`
+        mutates `in_flight` inside this very loop — the pass can fill the cap itself.
+
+        AND THE SLOT IT WAITS FOR IS ITS OWN: when one frees it goes to a paused turn
+        being resumed before it goes to a pending work order being dispatched, which is
+        what `tick`'s ordering guarantees. A resume continues a conversation whose prompt
+        prefix is already paid for and which is holding somebody's half-finished work;
+        a dispatch starts a session that re-sends its whole context at the cache-WRITE
+        rate for every turn of its life. Starving the resume is the one direction of
+        unfairness that costs money AND time.
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            if state is not None and state.blocked():
-                return
+            held = state.blocked() if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1405,8 +1451,26 @@ class Daemon:
                 continue
             if pause is None or not pause.resumable or not pause.due():
                 continue
+            # BELOW the filter above, so only an order that was going to be relaunched
+            # on this pass is ever recorded — nothing else is being held.
+            if held:
+                shut = state is not None and state.shut()
+                figures = {"in_flight": state.in_flight, "cap": state.cap}
+                if shut:
+                    # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
+                    # for an outage (issue #714), and the event exists for the invariant
+                    # suppression, which an outage hold needs exactly as a cap hold does.
+                    figures["reopens_at"] = state.outage.reopens_at
+                self._record_retry_held(
+                    store, wo, pause,
+                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
+                self._record_retry_held(
+                    store, wo, pause, cause="project_cap",
+                    figures={"active": store.count_active(),
+                             "max_concurrent": project.max_concurrent})
                 continue
             try:
                 turn = worker_session.retry(store, project, wo, pause)
@@ -1467,6 +1531,29 @@ class Daemon:
                 # `waiting_input`, and nothing re-derives it once this row is `running`.
                 if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
                     store.clear_attention(wo["id"])
+
+    @staticmethod
+    def _record_retry_held(store: ProjectStore, wo: dict, pause: Any, *,
+                           cause: str, figures: dict[str, Any]) -> None:
+        """Write down that this due pause was deferred — at most once every restate.
+
+        ONE PAYLOAD SHAPE for all three causes, so a reader has one branch, and `seq` is
+        on it because the hold is about ONE pause: a later turn makes the event
+        meaningless and a reader that could not tell would suppress an invariant about a
+        different failure. Restated rather than written per sweep because the sweep runs
+        every ten seconds and a usage window lasts five hours — ~60 events instead of
+        ~1,800, with `RETRY_HELD_FRESH_FOR` of slack for a tick that slipped. Spec §1 of
+        docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        """
+        last = store.last_event_of_kind(wo["id"], invariants_mod.RETRY_HELD_EVENT)
+        if last is not None:
+            payload = db.from_json(last.get("payload"), {}) or {}
+            if (payload.get("seq") == pause.turn["seq"]
+                    and db.now() - float(last.get("ts") or 0) < RETRY_HELD_RESTATE):
+                return
+        store.add_event(wo["id"], invariants_mod.RETRY_HELD_EVENT,
+                        {"cause": cause, "seq": pause.turn["seq"],
+                         "reason": pause.reason, "retry_at": pause.retry_at, **figures})
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -1873,7 +1960,20 @@ class Daemon:
                                       unit=wo_id, wo_id=wo_id)
                 store.add_event(wo_id, "validation_passed",
                                 {"round": n, "round_id": round_id})
-                status = ops.land_when_cleared(store, wo)
+                # NOT UNDER A LIVE TURN. `wo` is the row read before the seats ran —
+                # minutes stale by construction — and landing it writes a status under a
+                # worker that is typing: on wo-83e4183c a planner halfway through a
+                # revision read as awaiting the user. `busy` is the OS's one definition
+                # of that, the same predicate delivery uses. `settle_work_order` picks
+                # the landing up when the turn ends. Spec §3.1 of
+                # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+                if worker_session.busy(store, wo_id) is None:
+                    status = ops.land_when_cleared(store, wo)
+                else:
+                    status = "deferred — a worker turn is in flight"
+                    store.add_event(wo_id, VALIDATION_LANDING_DEFERRED,
+                                    {"round": n, "round_id": round_id,
+                                     "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
             elif outcome == "rejected" and n < max_rounds:
@@ -3952,7 +4052,10 @@ class Daemon:
         # Free for the fleet as it stands: `ceiling` returns None the moment the row has
         # neither a budget nor a reservation, which is every work order until someone
         # sets one.
-        round_open = (store.latest_validation_round(wo_id=wo["id"]) or {}).get("outcome")
+        # The whole row, not just its outcome: the deferred-landing check below needs to
+        # know the latest round PASSED, and this read is already paid for.
+        latest_round = store.latest_validation_round(wo_id=wo["id"]) or {}
+        round_open = latest_round.get("outcome")
         if round_open not in RUNNABLE_VALIDATION_OUTCOMES:
             spent = budget_mod.exhaustion(store, self.central, wo)
             if spent is not None:
@@ -4056,6 +4159,19 @@ class Daemon:
         if store.queued_messages(wo["id"]):
             return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        # THE LANDING THE ROUND MACHINE DEFERRED, taken explicitly rather than left to
+        # the coincidence that the branches below usually reach the same status: they
+        # re-derive the join from the TURN, skipping the two rules only
+        # `land_when_cleared` knows (`refusal_answered`, the `OPEN_VALIDATION_OUTCOMES`
+        # re-park). On `fresh`, so the landing sees a `pr_url` this turn wrote. Spec §3.2
+        # of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
+        if deferred is not None:
+            from . import ops as ops_mod
+
+            ops_mod.land_when_cleared(store, fresh)
+            store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
+            return
         if fresh.get("result_summary"):
             if store.pending_assumptions(wo["id"]):
                 if fresh["status"] != "needs_review":
@@ -4081,7 +4197,17 @@ class Daemon:
                 # way the OS takes a work order out of its status (issue #259): a
                 # relaunched turn must not end by filing the review somebody still owes
                 # as a merge-queue entry. It answers for `needs_review` alone — see it.
-                back = (ops_mod.pr_repair_origin(store, wo["id"])
+                # AND A GIVE-UP IS NOT UNDONE BY THE TURN THAT FOLLOWS IT. The panel
+                # escalating writes `needs_review` under a possibly-live turn — it must,
+                # or `true_blockers` could not derive its flag — and that status used to
+                # be parked away here the moment the turn ended with a pull request,
+                # taking a refusal off the user's list. `validation_escalated` is the
+                # predicate `true_blockers` reads, so the status and the flag come from
+                # one fact. Spec §3.3 of
+                # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+                back = ("needs_review"
+                        if invariants_mod.validation_escalated(store, fresh)
+                        else ops_mod.pr_repair_origin(store, wo["id"])
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
                 if fresh["status"] != back:

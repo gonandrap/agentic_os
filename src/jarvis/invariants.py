@@ -1260,6 +1260,26 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
 #: evening to it. See `check_paused_turns_resume`.
 PAUSE_OVERDUE_GRACE = 15 * 60
 
+#: What `Daemon.retry_paused_turns` writes when it looks at a due pause and defers the
+#: relaunch — the fleet cap, the project cap, or the account-wide outage. A hold that
+#: produced no record is the whole of GitHub issue #752: the note went on promising a
+#: retry whose moment had passed, and the check below called the OS broken for obeying
+#: its own cap. Spec docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md §1.
+RETRY_HELD_EVENT = "retry_held"
+
+#: At most one `retry_held` per order per five minutes, which is what makes a five-hour
+#: window cost ~60 events instead of ~1,800 at the sweep's ten-second cadence.
+RETRY_HELD_RESTATE = 5 * 60
+
+#: How long a reader treats the newest hold as LIVE. Deliberately here, beside the other
+#: two, because the inequality between the three is the whole design and is invisible if
+#: they live apart: restate < fresh < grace. Restated every 5 minutes an ongoing hold
+#: always has an event newer than 10 — a full restate interval of slack for a tick that
+#: slipped — and a hold that ENDED goes stale inside 10, so the check below comes back
+#: within ten minutes of the last word the sweep said. Setting the restate at the grace
+#: itself would let a live hold go 15 minutes unstated, exactly while the check decides.
+RETRY_HELD_FRESH_FOR = 2 * RETRY_HELD_RESTATE
+
 
 def clock(ts: float) -> str:
     """A moment as the reader's own clock reads it, WITH THE DATE unless it is today.
@@ -1295,6 +1315,63 @@ def _span(seconds: float) -> str:
     return f"{max(seconds, 60) / 60:.0f}m"
 
 
+def retry_hold(store: ProjectStore, wo: dict[str, Any], pause: Any,
+               now: float | None = None) -> dict[str, Any] | None:
+    """The `retry_held` payload explaining why this due pause has not relaunched, if it
+    is still live: same turn `seq`, written inside `RETRY_HELD_FRESH_FOR`.
+
+    ONE READER FOR BOTH SURFACES — the note below and INV-PAUSE-OVERDUE — because they
+    are answering the same question from opposite ends ("why is nothing happening" and
+    "is this silence a defect"), and derived separately they would drift into a label
+    naming a hold the check was firing about.
+
+    The `seq` match is load-bearing, not tidiness: the event is about ONE pause, so a
+    later turn makes it meaningless, and a reader that could not tell would suppress a
+    violation about a different failure. Same rule as `ops.resumed_from`.
+    """
+    from . import db
+
+    if pause is None:
+        return None
+    row = store.last_event_of_kind(wo["id"], RETRY_HELD_EVENT)
+    if row is None:
+        return None
+    payload = db.from_json(row.get("payload"), {}) or {}
+    if payload.get("seq") != pause.turn["seq"]:
+        return None
+    at = time.time() if now is None else now
+    if at - float(row.get("ts") or 0) > RETRY_HELD_FRESH_FOR:
+        return None
+    return payload
+
+
+def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
+    """That hold in words — or None for a cause this OS does not write.
+
+    From the PAYLOAD rather than a live `Fleet`: the sweep's decision depended on the
+    figures at the instant it ran, and by the time a surface asks, the fleet may be idle
+    while the order is still parked. The fleet-cap parenthesis is `Fleet.blocked()`'s own
+    clause verbatim, so `jarvis status`'s header and a work order's line say the same
+    thing in the same words.
+    """
+    cause = hold.get("cause")
+    if cause == "fleet_cap":
+        return (f"waiting for a free in-flight slot ({hold.get('in_flight')} of "
+                f"{hold.get('cap')} worker turns already in flight)")
+    if cause == "project_cap":
+        return (f"waiting for a free slot in this project ({hold.get('active')} of "
+                f"{hold.get('max_concurrent')} running)")
+    if cause == "fleet_outage":
+        # `fleet_hold_note` owns these words wherever it is gated to speak them; a second
+        # source for one sentence is the drift this spec pays for elsewhere. Said here
+        # only for the statuses it is NOT gated on, which would otherwise lose it.
+        if wo["status"] in FLEET_HELD_STATUSES:
+            return ""
+        return ("the Claude usage window is spent, reopening at "
+                f"{clock(float(hold.get('reopens_at') or 0))}")
+    return None
+
+
 def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     """Why this work order is not moving and when it will move again — or "" normally.
 
@@ -1324,6 +1401,17 @@ def pause_note(store: ProjectStore, wo: dict[str, Any]) -> str:
     pause = worker_session.turn_pause(store, wo["id"])
     if pause is None or pause.exhausted:
         return ""
+    # ABOVE all three branches below, including the auth one: they say what the pause is
+    # waiting for, this says the wait is over and something else is now in the way — the
+    # strictly more current fact about the same pause. A user who has just signed in
+    # would otherwise still read "resuming once you sign in again" while their relaunch
+    # queued behind the cap. Spec §2a of
+    # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+    hold = retry_hold(store, wo, pause)
+    if hold is not None:
+        note = _retry_hold_note(wo, hold)
+        if note is not None:
+            return note
     if pause.reason == worker_session.PAUSE_AUTH:
         # The one pause with no moment to name — it resumes on an ACTION. `clock` would
         # be asked to render `NEVER`, and any time it could print would be a guess.
@@ -2285,6 +2373,13 @@ def check_paused_turns_resume(store: ProjectStore) -> Iterator[Violation]:
                             detail=f"could not diagnose the pause: {e!r}")
             continue
         if pause is None or not pause.resumable:
+            continue
+        # The sweep looked at this one and deferred it; nothing is broken. Suppressed
+        # only by a positive, recent, turn-matched statement from the pass that owes the
+        # relaunch — absence of evidence is still a violation, and a hold that ends
+        # without one ages out inside `RETRY_HELD_FRESH_FOR`. Spec §2b of
+        # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        if retry_hold(store, wo, pause) is not None:
             continue
         overdue = time.time() - pause.retry_at
         if overdue <= PAUSE_OVERDUE_GRACE:
