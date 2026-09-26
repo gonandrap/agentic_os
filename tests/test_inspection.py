@@ -1308,11 +1308,153 @@ def test_a_credential_assignment_loses_its_value(line, leak):
     'password: ""',
     "monkey=banana12345",
     'api_key = os.environ["API_KEY"]',
+    "mysql --password changeme -h db",
+    'gh auth login --token ""',
+    "gh pr list --token $GH_TOKEN",
+    "gh pr list --token ${GH_TOKEN}",
+    "export GH_TOKEN=$OTHER_TOKEN && gh pr list",
+    "curl https://api.example.com/v1/models",
 ])
 def test_a_line_that_carries_no_credential_is_left_exactly_as_it_is(line):
     """The negative control. Redacting a placeholder or a mention would make the report
     useless for the case it exists for: reading what the worker actually ran."""
     assert inspection.redact_param(line) == line
+
+
+# -- shapes that carry a credential with no credential-named key beside it -------------
+
+
+@pytest.mark.parametrize("line, leak", [
+    ("ANTHROPIC_API_KEY=sk-ant-api03-abc123def456 claude -p \"go\"",
+     "sk-ant-api03-abc123def456"),
+    ("export GH_TOKEN=ghp_A1b2C3d4E5 && gh pr list", "ghp_A1b2C3d4E5"),
+    ("cd x; TOKEN=abc123def ./deploy.sh", "abc123def"),
+    ("env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI2K7MDENG aws s3 ls",
+     "wJalrXUtnFEMI2K7MDENG"),
+])
+def test_an_inline_credential_assignment_loses_its_value(line, leak):
+    """The commonest way a credential reaches `params["command"]`: an assignment that is
+    not the whole line, in front of the command it is for."""
+    out = inspection.redact_param(line)
+
+    assert inspection.CREDENTIAL_VALUE_MARKER in out
+    assert leak not in out
+
+
+def test_an_inline_assignment_keeps_the_command_around_it():
+    out = inspection.redact_param("cd x; TOKEN=abc123def ./deploy.sh")
+
+    assert out == f"cd x; TOKEN={inspection.CREDENTIAL_VALUE_MARKER} ./deploy.sh"
+
+
+def test_an_anthropic_key_is_named_and_never_quoted():
+    out = inspection.redact_param("claude --api-key-helper 'echo sk-ant-api03-Zq9x8W7v'")
+
+    assert "<redacted: an Anthropic API key>" in out
+    assert "sk-ant-api03-Zq9x8W7v" not in out
+
+
+@pytest.mark.parametrize("secret", [
+    "sk-proj-9f2a8c7b1d4e6a5b", "sk-9f2a8c7b1d4e6a5b3c7d9e1f",
+])
+def test_a_bare_sk_key_is_named(secret):
+    out = inspection.redact_param(f"curl -H 'x-key: {secret}' https://x")
+
+    assert "<redacted: an sk- API key>" in out
+    assert secret not in out
+
+
+@pytest.mark.parametrize("secret", [
+    "ghp_A1b2C3d4E5f6G7h8I9j0", "gho_A1b2C3d4E5f6G7h8I9j0",
+    "ghs_A1b2C3d4E5f6G7h8I9j0", "ghu_A1b2C3d4E5f6G7h8I9j0",
+    "ghr_A1b2C3d4E5f6G7h8I9j0", "github_pat_11ABCDE0y0aBcDeFgH",
+])
+def test_a_github_token_is_named(secret):
+    out = inspection.redact_param(f"echo {secret} | gh auth login --with-token")
+
+    assert "<redacted: a GitHub token>" in out
+    assert secret not in out
+
+
+def test_an_aws_access_key_id_is_named():
+    out = inspection.redact_param("aws configure set AKIAIOSFODNN7EXAMPLE")
+
+    assert "<redacted: an AWS access key id>" in out
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+
+def test_a_slack_token_is_named():
+    out = inspection.redact_param("echo xoxb-2468013579-AbCdEfGh | slack-cli auth")
+
+    assert "<redacted: a Slack token>" in out
+    assert "xoxb-2468013579-AbCdEfGh" not in out
+
+
+def test_a_password_in_a_url_is_named_and_the_host_survives():
+    out = inspection.redact_param(
+        "psql postgres://deploy:s3cr3t-pa55@db.internal:5432/app")
+
+    assert "<redacted: a password in a URL>" in out
+    assert "s3cr3t-pa55" not in out
+    assert "postgres://deploy:" in out
+    assert "@db.internal:5432/app" in out
+
+
+def test_a_curl_u_credential_is_named():
+    out = inspection.redact_param("curl -u deploy:s3cr3t-pa55 https://api.example.com")
+
+    assert "<redacted: a curl -u credential>" in out
+    assert "s3cr3t-pa55" not in out
+    assert "https://api.example.com" in out
+
+
+@pytest.mark.parametrize("line, leak", [
+    ("mysql --password s3cr3tpa55 -h db", "s3cr3tpa55"),
+    ("mysql --password=s3cr3tpa55 -h db", "s3cr3tpa55"),
+    ("gh auth login --token ghXYZ012abc9", "ghXYZ012abc9"),
+    ("call --api-key 9f2a8c7b1d4e6a5b", "9f2a8c7b1d4e6a5b"),
+    ("call --api-key=9f2a8c7b1d4e6a5b", "9f2a8c7b1d4e6a5b"),
+])
+def test_a_credential_flag_value_is_named(line, leak):
+    out = inspection.redact_param(line)
+
+    assert "<redacted: a credential passed as a flag>" in out
+    assert leak not in out
+
+
+def test_a_credential_flag_keeps_the_flag_it_was_passed_to():
+    out = inspection.redact_param("mysql --password s3cr3tpa55 -h db")
+
+    assert out.startswith("mysql --password <redacted:")
+    assert out.endswith(" -h db")
+
+
+def test_a_bare_token_in_a_bash_command_never_reaches_the_payload(write_transcript):
+    """The transcript-level proof for the shapes that need no assignment: a token with
+    nothing around it naming it, straight into `params["command"]`."""
+    secret = "ghp_A1b2C3d4E5f6G7h8I9j0"
+    session = write_transcript("bare-token", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f"echo {secret} | gh auth login --with-token",
+                    "description": "log in"}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert secret not in json.dumps(anatomy.as_dict())
+    assert "<redacted: a GitHub token>" in anatomy.turns[0].spans[0].params["command"]
+
+
+def test_an_inline_assignment_never_reaches_the_payload(write_transcript):
+    secret = "sk-ant-api03-abc123def456"
+    session = write_transcript("inline-assign", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f'ANTHROPIC_API_KEY={secret} claude -p "go"'}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert secret not in json.dumps(anatomy.as_dict())
 
 
 def test_a_secret_in_a_bash_command_never_reaches_the_payload(write_transcript):
@@ -1527,14 +1669,32 @@ def test_a_subagent_of_a_subagent_is_counted_and_the_depth_read_is_stated(
     deeper = (tmp_path / "projects" / "-proj" / session / "subagents"
               / f"agent-{TASK}" / "subagents")
     deeper.mkdir(parents=True)
-    (deeper / "agent-child.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
+    # TWO, so the count is not trivially satisfied by any non-zero answer.
+    for stem in ("agent-child-one", "agent-child-two"):
+        (deeper / f"{stem}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
     anatomy = inspection.read_session(session)
 
     sub = anatomy.turns[0].subagents[0]
-    assert sub.deeper >= 1
-    assert sub.as_dict()["deeper"] == sub.deeper
+    assert sub.deeper == 2
+    assert sub.as_dict()["deeper"] == 2
     assert anatomy.as_dict()["subagent_depth_read"] == 1
+
+
+def test_only_the_taskoutput_span_carries_the_task_id_in_a_real_transcript(real_session):
+    """What `_names` can actually join on. An `Agent` span's params are a `description`
+    and nothing else, so the id it spawned is NOT there; the `TaskOutput` span's
+    `task_id` parameter is the only join in the committed transcript."""
+    spawns = [s for s in real_session.spans if s.name in inspection.SPAWN_TOOLS]
+    ids = set(real_session.subagent_labels)
+
+    assert ids
+    agents = [s for s in spawns if s.name == "Agent"]
+    assert agents
+    assert not any(i in v for s in agents for v in s.params.values() for i in ids)
+    outputs = [s for s in spawns if s.name == "TaskOutput"]
+    assert [s for s in outputs
+            if any(i in v for v in s.params.values() for i in ids)] == outputs
 
 
 def test_a_meta_only_directory_adds_nothing_to_the_real_session(real_session):
@@ -1542,7 +1702,7 @@ def test_a_meta_only_directory_adds_nothing_to_the_real_session(real_session):
     keys must EXIST and be empty. Absent is not zero."""
     payload = real_session.as_dict()
 
-    assert real_session.subagents  # the meta files are there
+    assert real_session.subagent_labels  # the meta files are there
     assert payload["unattached_subagents"] == []
     assert payload["subagent_depth_read"] == 1
     assert all(t["subagents"] == [] for t in payload["turns"])

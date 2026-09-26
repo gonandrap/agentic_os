@@ -180,6 +180,31 @@ PARAM_SECRET_SHAPES: tuple[tuple[str, str], ...] = (
     (r"\bssh-(?:rsa|dss|ed25519)\s+AAAA[0-9A-Za-z+/=]+", "an ssh key line"),
     (r"\bAuthorization[\"\']?\s*:\s*[\"\']?(?:Bearer|Basic|Token)\s+\S+",
      "an Authorization header value"),
+    # FROM HERE DOWN, NOT IN `autoreview`. Its `SECRET_EVIDENCE` has exactly three
+    # shapes and all three are above; these were invented here and have no upstream to
+    # go looking for. The reason they are not shared: `autoreview` scans a DIFF, where a
+    # credential arrives as an added assignment line, and this scans a COMMAND LINE,
+    # where the common case is a bare token with nothing naming it — a `ghp_…` piped
+    # into `gh auth login`, a password inside a connection URL.
+    (r"\bsk-ant-[A-Za-z0-9_-]{8,}", "an Anthropic API key"),
+    (r"\bsk-(?:[A-Za-z0-9]+-)?[A-Za-z0-9_-]{16,}", "an sk- API key"),
+    (r"\bgithub_pat_[A-Za-z0-9_]{8,}|\bgh[poshur]_[A-Za-z0-9]{8,}", "a GitHub token"),
+    (r"\bAKIA[0-9A-Z]{16}\b", "an AWS access key id"),
+    (r"\bxox[abpr]-[A-Za-z0-9-]{8,}", "a Slack token"),
+    # `keep` survives the substitution: the scheme, the user and the flag name are what
+    # make the redacted line still readable as the command that was run.
+    (r"(?P<keep>\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s:/@]+:)[^\s:/@]{3,}(?=@)",
+     "a password in a URL"),
+    (r"(?P<keep>\bcurl\b[^\n]*?\s-u[ =]+[^\s:@]+:)[^\s\"\']+",
+     "a curl -u credential"),
+    # The VALUE shape is spelled into the pattern rather than tested afterwards, and it
+    # is `_looks_like_a_credential`'s test in regex: at least six characters from the
+    # credential charset, carrying both a digit and a letter. That is what keeps
+    # `--password changeme`, `--token ""` and `--token $GH_TOKEN` out (spec §4a).
+    (r"(?P<keep>--(?:password|token|api[-_]?key)[ =]+)"
+     r"(?=[A-Za-z0-9+/=._~-]*[A-Za-z])(?=[A-Za-z0-9+/=._~-]*[0-9])"
+     r"[A-Za-z0-9+/=._~-]{6,}",
+     "a credential passed as a flag"),
 )
 
 #: An assignment whose left side NAMES a credential. Same two-part test as
@@ -189,6 +214,15 @@ _PARAM_ASSIGNMENT_RE = re.compile(
     r"(?P<quote>[\"\']?)(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)(?P=quote)"
     r"[ \t]*(?:=>|:=|=|:)[ \t]*)"
     r"(?P<value>[^\r\n]*?)(?P<tail>[ \t]*[,;]?[ \t]*)$")
+
+#: THE SAME ASSIGNMENT, ANYWHERE IN THE LINE — `NAME=value cmd`, `export NAME=value &&
+#: …`, `…; NAME=value …`, `env NAME=value …`. The whole-line form above cannot see any
+#: of those, and they are how a credential most often reaches `params["command"]`. The
+#: value runs to the next whitespace, `;`, `&` or `|`, which is where the shell ends it.
+_PARAM_INLINE_ASSIGNMENT_RE = re.compile(
+    r"(?P<head>(?:^|[\s;&|(])(?:(?:export|env|set)[ \t]+)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)=)"
+    r"(?P<value>[^\s;&|]+)")
 
 #: Words that make a name a credential's name, matched against the identifier's PARTS:
 #: `monkey` is not a `key` and `AWS_SECRET_ACCESS_KEY` is.
@@ -235,6 +269,14 @@ def _looks_like_a_credential(raw: str) -> bool:
     return (has_digit and has_alpha) or len(value) >= 20
 
 
+def _redact_assignment(m: "re.Match[str]") -> str:
+    """One inline assignment, kept unless BOTH halves say credential."""
+    if _names_a_credential(m.group("name")) and \
+            _looks_like_a_credential(m.group("value")):
+        return m.group("head") + CREDENTIAL_VALUE_MARKER
+    return m.group(0)
+
+
 def redact_param(text: str) -> str:
     """One tool-input value with its secret-shaped content NAMED, never quoted. Pure.
 
@@ -245,16 +287,23 @@ def redact_param(text: str) -> str:
     """
     if not text:
         return text
-    for pattern, name in _PARAM_SHAPE_RE:
-        text = pattern.sub(f"<redacted: {name}>", text)
+    # ASSIGNMENTS BEFORE SHAPES, and the order is load-bearing: `API_KEY=sk-live-…`
+    # is one finding, not two, and the assignment marker is the more informative of the
+    # pair. Running the shapes first would name the value and leave the key beside it.
     lines = []
     for line in text.split("\n"):
+        line = _PARAM_INLINE_ASSIGNMENT_RE.sub(_redact_assignment, line)
         m = _PARAM_ASSIGNMENT_RE.match(line)
         if m and _names_a_credential(m.group("name")) and \
                 _looks_like_a_credential(m.group("value")):
             line = m.group("head") + CREDENTIAL_VALUE_MARKER + m.group("tail")
         lines.append(line)
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    for pattern, name in _PARAM_SHAPE_RE:
+        text = pattern.sub(
+            lambda m, n=name: (m.groupdict().get("keep") or "") + f"<redacted: {n}>",
+            text)
+    return text
 
 
 @dataclass(frozen=True)
@@ -654,7 +703,8 @@ class Anatomy:
     join_floor: int = DEFAULT_INSPECT_REPORT_JOIN_FLOOR
     #: Task id -> what it was, from the subagent `.meta.json` Claude Code writes beside
     #: the transcript. This is what turns "blocked 450s on a7b62083" into a sentence.
-    subagents: dict[str, str] = field(default_factory=dict)
+    #: NOT `Turn.subagents`, which is the list of `SubagentAnatomy` — hence the name.
+    subagent_labels: dict[str, str] = field(default_factory=dict)
     #: Subagent transcripts no `Agent`/`TaskOutput` span of this session names. Reported
     #: HERE rather than attached to the turn their timestamps fall in: a timestamp
     #: fallback invents a parent the record does not name (issue 227), so an unattached
@@ -1017,7 +1067,7 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     for path in sorted(paths):
         found, labels = read_transcript(path, cfg)
         turns.extend(found)
-        anatomy.subagents.update(labels)
+        anatomy.subagent_labels.update(labels)
     turns.sort(key=lambda t: t.started)
     for seq, turn in enumerate(turns, start=1):
         turn.seq = seq
@@ -1030,13 +1080,13 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                                      sorted(compactions))
     _attach_calls(turns, calls)
     _close_turns(turns)
-    _name_joins(turns, anatomy.subagents)
+    _name_joins(turns, anatomy.subagent_labels)
     # AFTER `_name_joins`, which rewrites a join's `detail` from the bare task id to
     # "label (id)": matching on the id as a SUBSTRING works either side of it, so the
     # order of these two is not a trap for the next reader (spec §4b).
     anatomy.unattached_subagents = _attach_subagents(
         turns,
-        [_read_subagent(sub, cfg, anatomy.subagents)
+        [_read_subagent(sub, cfg, anatomy.subagent_labels)
          for path in sorted(paths) for sub in _subagent_transcripts(path)])
     # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
     # attached before it would be measured against a turn whose `ended` was still its
@@ -1131,9 +1181,12 @@ def _read_subagent(path: Path, cfg: InspectConfig,
 def _names(span: ToolSpan, task_id: str) -> bool:
     """Whether this span names that subagent — `detail` or any reported parameter.
 
-    Substring, not equality: `_name_joins` may already have rewritten `detail` to
-    "label (id)", and the id also arrives inside a `subagent_type`/`prompt` parameter
-    rather than alone.
+    Substring, not equality, and that is what `_name_joins` needs: it rewrites a join's
+    `detail` from the bare id to "label (id)", so equality would hold before it ran and
+    not after. The params are read too, because the `TaskOutput` span is the join in
+    practice — an `Agent` span's parameters are a `description` and carry no task id at
+    all (tests/data/transcripts/-wo-5a6b2d6d), so `task_id` on `TaskOutput` is the only
+    place the id appears as a parameter.
     """
     return span.name in SPAWN_TOOLS and (
         task_id in span.detail or any(task_id in v for v in span.params.values()))
