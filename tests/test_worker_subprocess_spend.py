@@ -31,7 +31,7 @@ import textwrap
 
 import pytest
 
-from jarvis import agent_usage, claude_cli, cli, dispatch, ops, testing
+from jarvis import agent_usage, claude_cli, cli, dispatch, ops, seats, structured, testing
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
@@ -155,6 +155,107 @@ def test_the_refusal_happens_before_any_subprocess_is_spawned(jarvis_home, monke
         claude_cli.run_headless_result("summarise this", records_itself="neo_answer")
 
 
+# -- the forwarders, which are not the OS frame that authorises ------------------------
+
+
+def test_an_eval_cannot_declare_through_structured_request(jarvis_home, fake_claude,
+                                                           monkeypatch):
+    """`structured.request` FORWARDS a declaration, so before §3's forwarder set its own
+    frame authorised every caller's: an eval named a kind and spent with no row."""
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
+    go = _compiled_in("evals.llm.test_stakes_classifier_ab",
+                      "def go(structured, on_usage):\n"
+                      "    return structured.request('q', validate=lambda d: d,\n"
+                      "                              records_itself='digest',\n"
+                      "                              on_usage=on_usage)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused, match="outside the jarvis package"):
+        go(structured, lambda usage: None)
+
+    assert calls(wo_id="wo-abc123") == []
+
+
+def test_an_eval_cannot_declare_through_run_blind(jarvis_home, monkeypatch, tmp_path):
+    """The seats path, same hole: `jarvis.seats` forwarded `kind` into the transport, so
+    an outside caller naming `panel_seat` bought silence for a whole round."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("evals.llm.test_neo_panel_judgment",
+                      "def go(seats, cwd):\n"
+                      "    return seats.run_blind({'tester': ('s', 'u')}, models={},\n"
+                      "                           timeout=5, cwd=cwd,\n"
+                      "                           kind='panel_seat')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        go(seats, tmp_path)
+
+
+def test_an_eval_cannot_declare_through_prime_cache(jarvis_home, monkeypatch, tmp_path):
+    """`prime_cache` never raises on a transport failure, so a refusal it swallowed would
+    be a free pass — it is refused at the front door instead, before the pool."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("evals.llm.test_validation_judgment",
+                      "def go(seats, cwd):\n"
+                      "    return seats.prime_cache('s', 'u', 'haiku', timeout=5,\n"
+                      "                             cwd=cwd, kind='validation_seat')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        go(seats, tmp_path)
+
+
+def test_a_declaration_with_no_recorder_records_nothing_so_it_is_refused(monkeypatch):
+    """Even from an OS frame. `records_itself` says the caller writes the row; no
+    `on_usage` means nobody does, and the transport has already stood down."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("jarvis.digest",
+                      "def go(structured):\n"
+                      "    return structured.request('q', validate=lambda d: d,\n"
+                      "                              records_itself='digest')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused, match="on_usage"):
+        go(structured)
+
+
+def test_an_outside_caller_cannot_mint_an_authorisation(tmp_path):
+    """The token IS the check (§3): minting it runs the frame walk, and the class has no
+    other constructor, so an eval cannot build one to hand the transport."""
+    mint = _compiled_in("evals.llm.test_neo_panel_judgment",
+                        "def go(fn, kind):\n    return fn(kind)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        mint(claude_cli.authorise, "panel_seat")
+    with pytest.raises(claude_cli.AttributionRefused):
+        mint(claude_cli.Authorisation, "panel_seat")
+
+
+def test_an_os_frame_mints_a_token_the_transport_takes_as_checked():
+    """The other half: panel and validation mint on their own thread, and the token
+    carries the kind it was checked for."""
+    mint = _compiled_in("jarvis.panel", "def go(fn, kind):\n    return fn(kind)\n")
+
+    token = mint(claude_cli.authorise, "panel_seat")
+
+    assert token.kind == "panel_seat"
+
+
+def test_a_jarvis_frame_beyond_the_frame_cap_does_not_authorise():
+    """`_CALLER_FRAME_CAP` refuses rather than accepts past the horizon: a stack this deep
+    is not one of the OS's own, and accepting would make the cap a hole."""
+    deep = _compiled_in("evals.llm.deep_chain",
+                        "def go(check, kind, depth):\n"
+                        "    if depth:\n"
+                        "        return go(check, kind, depth - 1)\n"
+                        "    return check(kind)\n")
+    os_frame = _compiled_in("jarvis.neo",
+                            "def go(deep, check, kind):\n"
+                            "    return deep(check, kind, 25)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        os_frame(deep, claude_cli._check_records_itself, "neo_answer")
+
+
 #: Every declaration the OS makes of the `agent_calls.kind` it writes for its own call:
 #: the function whose source carries the literal, the call it is passed to, the keyword it
 #: is passed under, and the kind it must name. `jarvis.panel` primes no cache, so it has
@@ -199,14 +300,26 @@ def _called_name(node: ast.Call) -> str:
     return getattr(func, "id", "")
 
 
+def _kind_literal(value: ast.expr):
+    """The kind a declaration names, through the conditional `digest.summarise` uses.
+
+    `records_itself="digest" if on_usage is not None else ""` declares `digest` and
+    nothing else — the other branch is the fall-back to the transport's own attribution.
+    """
+    if isinstance(value, ast.IfExp):
+        return _kind_literal(value.body)
+    return value.value if isinstance(value, ast.Constant) else None
+
+
 def _declared_kinds(fn, call: str, keyword: str) -> list[str]:
     """Every literal `fn`'s own source passes as `keyword` to `call`."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
-    return [kw.value.value
+    return [kind
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and _called_name(node) == call
             for kw in node.keywords
-            if kw.arg == keyword and isinstance(kw.value, ast.Constant)]
+            if kw.arg == keyword
+            for kind in [_kind_literal(kw.value)] if kind is not None]
 
 
 @pytest.mark.parametrize("site,module,call,keyword,kind", OS_DECLARATIONS)
@@ -232,15 +345,19 @@ def test_the_transport_accepts_every_kind_the_os_declares(site, module, call, ke
     go(claude_cli._check_records_itself, kind)     # raises AttributionRefused if it drifts
 
 
-def test_no_os_source_file_still_opts_out_of_attribution():
+def test_no_source_file_in_the_repo_still_opts_out_of_attribution():
     """Catches a half-done migration: a site left on the deleted boolean would raise a
     `TypeError` only when that path next ran, which for the chair paths is in production."""
     from pathlib import Path
 
     import jarvis
 
-    root = Path(jarvis.__file__).parent
-    assert [f.name for f in root.rglob("*.py") if "attribute=False" in f.read_text()] == []
+    repo = Path(jarvis.__file__).parent.parent.parent
+    roots = [repo / "src" / "jarvis", repo / "evals", repo / "scripts"]
+    # `evals/` and `scripts/` too: the keyword #749 was spent through was typed in an
+    # eval, not in `src/jarvis`.
+    assert [str(f) for root in roots if root.is_dir()
+            for f in root.rglob("*.py") if "attribute=False" in f.read_text()] == []
 
 
 @pytest.mark.parametrize("kind", ["neo_answers", "  ", "Neo_answer", "anything",

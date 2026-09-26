@@ -81,8 +81,8 @@ class ClaudeCliError(RuntimeError):
 class AttributionRefused(RuntimeError):
     """A caller's `records_itself` declaration was not one it could make.
 
-    DELIBERATELY NOT a `ClaudeCliError`: `seats.py:213`, `panel.py:611` and
-    `validation.py:1165` turn those into an abstention, so a refusal caught there would be
+    DELIBERATELY NOT a `ClaudeCliError`: the seat paths in `seats`, `panel` and
+    `validation` each turn those into an abstention, so a refusal caught there would be
     silent — the bug being fixed wearing the fix's clothes. See §4 of
     docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
     """
@@ -1516,15 +1516,41 @@ def model_of(result: HeadlessResult) -> str:
 #: the OS is not evidence of one. Spec's Open section.
 _CALLER_FRAME_CAP = 20
 
+#: Modules that FORWARD a caller's declaration instead of making one. Skipped by the walk
+#: and never counted as the OS frame that authorises: `structured.request` and
+#: `seats.run_blind` take `records_itself`/`kind` from whoever called them, so counting
+#: their frames means an eval calling either one authorises itself. The real declarers —
+#: `supervisor`, `digest`, `neo`, `panel`, `validation` — sit BEHIND them on the stack and
+#: still authorise. Spec §3.
+_FORWARDERS = frozenset({"jarvis.claude_cli", "jarvis.structured", "jarvis.seats"})
 
-def _check_records_itself(kind: str) -> None:
-    """Raise `AttributionRefused` unless `kind` is a declaration this caller can make.
 
-    Spec §2 and §3: the kind must be one the OS accounts under and not the one this
-    transport writes, and an OS code path must be on the stack — a frame's module is a
-    fact about where code lives, and an argument would be forgeable by the caller with the
-    motive to forge it.
+@dataclass(frozen=True)
+class Authorisation:
+    """A checked declaration, minted where the frames prove it and carried where they do not.
+
+    `seats._run_seat` runs on a `ThreadPoolExecutor` thread whose only jarvis frame is
+    `seats` itself — a forwarder — and a context flag would not travel either, because
+    `ThreadPoolExecutor` does not propagate contextvars. So the check runs on the CALLING
+    thread, where `panel`/`validation` are live, and this token is its result.
+
+    MINTING IS THE CHECK: the only constructor path runs `_check_records_itself`, so
+    `Authorisation("digest")` from an eval is refused exactly as the keyword is. Spec §3.
     """
+
+    kind: str
+
+    def __post_init__(self) -> None:
+        _check_records_itself(self.kind)
+
+
+def authorise(kind: str) -> Authorisation:
+    """Mint an `Authorisation` for `kind` on THIS thread, or raise `AttributionRefused`."""
+    return Authorisation(kind)
+
+
+def _check_kind(kind: str) -> None:
+    """Spec §2 conditions 1 and 2: the kind itself, with nothing said about the caller."""
     from . import agent_usage
 
     if kind not in agent_usage.KIND_LABELS:
@@ -1536,14 +1562,24 @@ def _check_records_itself(kind: str) -> None:
         raise AttributionRefused(
             f"records_itself={kind!r} is the kind this transport writes itself; "
             "a caller cannot claim it.")
+
+
+def _check_records_itself(kind: str) -> None:
+    """Raise `AttributionRefused` unless `kind` is a declaration this caller can make.
+
+    Spec §2 and §3: the kind must be one the OS accounts under and not the one this
+    transport writes, and an OS code path must be on the stack — a frame's module is a
+    fact about where code lives, and an argument would be forgeable by the caller with the
+    motive to forge it.
+    """
+    _check_kind(kind)
     nearest = ""
     frame: Any = sys._getframe(1)
     seen = 0
     while frame is not None and seen < _CALLER_FRAME_CAP:
         module = frame.f_globals.get("__name__", "")
-        # `run_headless` forwards to `run_headless_result`, so without this skip the
-        # nearest caller of every `run_headless` call is the transport itself.
-        if module != __name__:
+        # A forwarder's frame is not evidence of an OS declaration — see `_FORWARDERS`.
+        if module not in _FORWARDERS:
             nearest = nearest or module
             if module == "jarvis" or module.startswith("jarvis."):
                 return
@@ -1558,7 +1594,7 @@ def _check_records_itself(kind: str) -> None:
 def run_headless_result(prompt: str, system_prompt: str | None = None,
                         model: str | None = None, cwd: Path | None = None,
                         timeout: int = 300, tools: str | None = None, *,
-                        records_itself: str = "", record: Any = None,
+                        records_itself: str | Authorisation = "", record: Any = None,
                         permission_mode: str | None = None,
                         env_extra: dict[str, str] | None = None) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
@@ -1596,6 +1632,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     is a real OS kind and an OS code path is on the stack — see
     docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
 
+    An `Authorisation` is accepted in its place: the frame check already ran where the
+    token was minted, which is how the seats reach here off a pool thread (spec §3).
+
     `permission_mode` and `env_extra` exist for the other direction: running a
     subject that is *supposed* to touch the machine, in a controlled one. A
     headless callee cannot answer a permission prompt any more than a `--bg`
@@ -1606,7 +1645,11 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     """
     # FIRST, before any argument is built or any subprocess runs: a refused call spends
     # nothing (spec §2).
-    if records_itself:
+    if isinstance(records_itself, Authorisation):
+        # Already checked where the frames proved it (spec §3). The kind is re-read off the
+        # token, so a token is never a way to declare a kind it was not minted for.
+        _check_kind(records_itself.kind)
+    elif records_itself:
         _check_records_itself(records_itself)
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if model:
@@ -1650,7 +1693,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
                  timeout: int = 300, tools: str | None = None, *,
-                 records_itself: str = "", record: Any = None,
+                 records_itself: str | Authorisation = "", record: Any = None,
                  permission_mode: str | None = None,
                  env_extra: dict[str, str] | None = None) -> str:
     """`run_headless_result`, keeping only the text.

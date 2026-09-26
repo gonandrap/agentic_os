@@ -190,8 +190,9 @@ def summarise(question: str, *, model: str, timeout: int = 120,
         # directory would pull that repo's CLAUDE.md into the prompt.
         cwd=ensure_home(),
         call=call,
-        # `daemon._digest_batch` writes this row through `on_usage`, under this kind.
-        records_itself="digest",
+        # Declared only when a recorder exists: `on_usage` is optional here, and a
+        # declaration with nobody recording is refused (spec §5).
+        records_itself="digest" if on_usage is not None else "",
         # A digest is an extra call per question that the user never asked for, so what
         # it costs belongs on the work order's bill beside the answer it shortens.
         on_usage=on_usage,

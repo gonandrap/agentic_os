@@ -205,6 +205,8 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
 
     `records_itself` is the `agent_calls.kind` the caller's own `on_usage` writes, passed
     to `call` ONLY when non-empty so no test fake's captured kwargs change (spec §5).
+    Declaring it WITHOUT an `on_usage` is refused: this function forwards a declaration
+    rather than making one, and a declaration nobody records is the #749 hole.
 
     `on_usage(envelope)` is called ONCE PER ATTEMPT, before the reply is validated. A
     retry is a second call the OS paid for, and an accounting that only recorded the
@@ -213,6 +215,13 @@ def request(prompt: str, *, validate: Callable[[dict[str, Any]], Any],
     """
     if attempts < 1:
         raise ValueError(f"attempts must be at least 1, got {attempts}")
+    if records_itself and on_usage is None:
+        # Before the first attempt, so a refused call spends nothing (spec §2).
+        raise claude_cli.AttributionRefused(
+            f"records_itself={records_itself!r} says this caller records the call itself "
+            "and no on_usage was given: nothing would record it. Pass an "
+            "`agent_usage.recorder`, or drop the declaration and let the transport "
+            "attribute the call.")
     complaint = ""
     for attempt in range(1, attempts + 1):
         ask = f"{prompt}\n\n{RETRY_NOTE}{complaint}" if complaint else prompt

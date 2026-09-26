@@ -194,7 +194,8 @@ class Opinion:
 
 
 def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
-              cwd: Path, tools: str | None = None, *, kind: str) -> Opinion:
+              cwd: Path, tools: str | None = None, *,
+              kind: str | claude_cli.Authorisation) -> Opinion:
     """Call one seat. Never raises: a seat that fails abstains and the panel proceeds.
 
     Runs on a pool thread, so it touches NO database — sqlite connections belong to the
@@ -202,7 +203,9 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
 
     `kind` is the `agent_calls.kind` that caller writes — `panel_seat` or
     `validation_seat`. Required and from the caller because a literal here would be false
-    for one of the two (spec §5).
+    for one of the two (spec §5). `run_blind` and `prime_cache` hand down a
+    `claude_cli.Authorisation` instead: this thread carries no OS frame of its own to
+    prove the declaration with (spec §3).
     """
     started = time.monotonic()
 
@@ -240,18 +243,23 @@ def prime_cache(system: str, user: str, model: str, *, timeout: int, cwd: Path,
     which is what makes the round blind and also means that on a cold cache none of them
     sees another's write: all N pay in full, and the sharing measures as nothing at all.
 
-    Never raises. A primer that fails costs the round nothing but its own latency — the
+    Never raises for a call that failed — `claude_cli.AttributionRefused` from the
+    authorisation below is a misuse, not a failure, and must not be swallowed (spec §4).
+    A primer that fails costs the round nothing but its own latency — the
     seats behind it then run exactly as they did before this function existed — so its
     failure is a price, not an outage, and must not take a round down.
 
     The usage comes back rather than being recorded here for the reason nothing in this
     module touches a store: the caller owns the thread that may.
     """
+    # On the CALLING thread and before the call: this module only forwards `kind`, so it
+    # cannot authorise it (spec §3).
+    authorised = claude_cli.authorise(kind)
     try:
         result = claude_cli.run_headless_result(user, system_prompt=system, model=model,
                                                 timeout=timeout, cwd=cwd, tools=tools,
                                                 # The caller records this call, `kind`.
-                                                records_itself=kind)
+                                                records_itself=authorised)
     except claude_cli.ClaudeCliError as e:
         log.warning("prompt-cache priming failed, seats will each write: %s", e)
         return None
@@ -283,11 +291,15 @@ def run_blind(prompts: dict[str, tuple[str, str]], *, models: dict[str, str],
     """
     if not prompts:
         return []
+    # BEFORE THE FAN-OUT, on this thread: a pool thread's only jarvis frame is this
+    # module, which forwards `kind` rather than declaring it, and contextvars do not
+    # travel to a `ThreadPoolExecutor` thread either. Spec §3.
+    authorised = claude_cli.authorise(kind)
     with ThreadPoolExecutor(max_workers=len(prompts),
                             thread_name_prefix="seat") as pool:
         futures = {
             seat: pool.submit(_run_seat, seat, user, system, models.get(seat, ""),
-                              timeout, cwd, tools, kind=kind)
+                              timeout, cwd, tools, kind=authorised)
             for seat, (system, user) in prompts.items()
         }
         return [futures[seat].result() for seat in prompts]

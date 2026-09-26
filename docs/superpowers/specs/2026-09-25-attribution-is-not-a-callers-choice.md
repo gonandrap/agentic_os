@@ -122,6 +122,25 @@ The walk, precisely:
 3. Otherwise keep walking. Accept if ANY frame further out is inside `jarvis`; refuse if
    none is, naming the nearest caller's module in the message.
 
+**FORWARDERS DO NOT AUTHORISE (review round 1).** `jarvis.claude_cli`, `jarvis.structured`
+and `jarvis.seats` are a module-level `_FORWARDERS` frozenset: skipped by the walk, walked
+past, never counted as the OS frame and not counted toward the cap. All three take the
+declaration from their own caller, so counting their frames let
+`structured.request(records_itself="digest")` and `seats.run_blind(kind="panel_seat")` —
+both public — authorise any caller, which is #749 with two more steps. `supervisor`,
+`digest`, `neo`, `panel` and `validation` still authorise: their frames sit behind the
+forwarders.
+
+**THE SEATS CARRY A TOKEN, because their thread has no frame to prove anything with.**
+`seats._run_seat` runs on a `ThreadPoolExecutor` thread whose only jarvis frame is
+`seats` — a forwarder — and contextvars do not propagate to a pool thread either. So
+`claude_cli.authorise(kind) -> Authorisation` runs the frame check on the CALLING thread,
+where `panel`/`validation` are live, and `run_blind`/`prime_cache` call it before the
+fan-out and before any subprocess. `records_itself` accepts `str | Authorisation`; a token
+is taken as already frame-checked and its kind re-read off itself. MINTING IS THE CHECK —
+`Authorisation.__post_init__` runs it, so there is no constructor that skips it and an eval
+cannot build one.
+
 **The two `functools.partial` sites need no special case.** `functools.partial` is C-level
 and pushes no Python frame, so the frame the walk finds is whoever *invoked* the partial —
 for both `digest.CALL` and `structured.DEFAULT_CALL` that is `structured.request` at
@@ -206,14 +225,18 @@ which kind the caller writes:
   literal it already writes the row with — a hardcoded `"panel_seat"` inside `seats`
   would be false for every validation round.
 * **`structured.request`** takes `records_itself: str = ""` and forwards it to `call(...)`
-  **only when non-empty**. Non-empty-only keeps the kwarg out of every test fake's
+  **only when non-empty**, and RAISES `AttributionRefused` when it is non-empty with
+  `on_usage is None` — before the first attempt, so it spends nothing. A caller that says
+  it records the call itself and passes no recorder records nothing at all. Non-empty-only keeps the kwarg out of every test fake's
   captured kwargs — `tests/test_structured.py:327-330` asserts on an exact kwargs dict —
   and leaves the `call=` fakes (all `**kw`) untouched. Its paying callers declare:
   `supervisor.py:718` passes `records_itself="supervisor"`, `supervisor.py:872` passes
   `records_itself="health"`, matching the `agent_usage.recorder` kinds they already bind
   at `:735` and `:889`.
-* **`digest.summarise`** passes `records_itself="digest"` in its `structured.request` call
-  (`digest.py:182`), matching the kind `daemon.py:2908` binds. `daemon` is unchanged.
+* **`digest.summarise`** passes `records_itself="digest" if on_usage is not None else ""`
+  in its `structured.request` call, matching the kind `daemon.py:2908` binds. Its
+  `on_usage` is optional, and the fall-back is the transport's own attribution rather than
+  no row at all. `daemon` is unchanged; it always passes a recorder.
 
 `agent_usage.COMPACTION` is not a site here: `worker_session` compacts through the
 resume/send transport, not `run_headless`, and records itself at `worker_session.py:498`.
@@ -290,6 +313,6 @@ resume/send transport, not `run_headless`, and records itself at `worker_session
 * Whether `records_itself` should be keyword-only. It is at every site listed, and
   positional use of a 7th parameter is not a real risk; making it keyword-only is one
   `*` and slightly louder. Implementer's call.
-* Frame-walk depth is unbounded as written. Every stack here is shallow (transport, an OS
-  function, the daemon or a fixture); if profiling ever objects, cap it at ~20 frames and
-  refuse past that rather than accept.
+* Frame-walk depth is capped at `_CALLER_FRAME_CAP = 20` non-forwarder frames, refusing
+  past it rather than accepting: every real stack here is shallow, and a jarvis frame
+  beyond the horizon is not evidence of one.
