@@ -9515,6 +9515,40 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     }]
 
 
+def _plan_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """The plan this work order submitted, if it submitted one. Spec
+    docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md §5-§6.
+
+    A plan authors nothing in the planner's worktree: the design doc is snapshotted into
+    the stored plan and the children are created later, so the packet was empty and every
+    planner escalated (fo-ff8570fa).
+
+    The pointer IS the proof, unlike `_release_effects`' marker: `submit_plan` is the only
+    writer of `plan`, it writes only after the plan validated, and `plan_wo_id` is set when
+    the planner is created rather than by a worker.
+
+    Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
+    """
+    fo = store.feature_order_for_planner(wo_id) if wo_id else None
+    plan = db.from_json(fo.get("plan"), {}) if fo else {}
+    if not plan:
+        return []
+    children = len(plan.get("children") or [])
+    return [{
+        "kind": "plan_submitted", "id": fo["id"],
+        "summary": f"submitted the plan for {fo['id']}: it decomposes into "
+                   f"{children} work orders",
+        "detail": (
+            f"design doc {plan.get('design_doc') or '?'}, {children} children, "
+            f"queued for review as Neo question "
+            f"{fo.get('plan_question_id') or '?'}.\n\n"
+            "What no diff can show: the plan lives in the feature order's `plan` column "
+            "and dispatch materialises each child's brief from it."),
+        # Strict by §6: only the feature order that points at THIS planner attests it.
+        "verified": fo.get("plan_wo_id") == wo_id,
+    }]
+
+
 @dataclass(frozen=True)
 class SideEffectCollector:
     """One kind of durable change no diff can show, and whether a reviewer can judge it.
@@ -9542,6 +9576,7 @@ class SideEffectCollector:
 SIDE_EFFECT_COLLECTORS = (
     SideEffectCollector("knowledge", _knowledge_effects),
     SideEffectCollector("release", _release_effects, attested=True),
+    SideEffectCollector("plan", _plan_effects, attested=True),
 )
 
 
