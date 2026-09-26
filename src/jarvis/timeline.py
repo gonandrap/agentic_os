@@ -37,6 +37,7 @@ DEBUG_KINDS = frozenset({
     "turn_ended",               # that turn's process finished and its reply was captured
     "session_released",         # a legacy background agent handed its session over
     "hook_ignored",             # a hook from a session that is not this work order's
+    "tool_managed_paths",       # which tool-owned files the worktree's index now hides
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
     # Same moment as the message carrying the answer, so the message is the entry — §5.
@@ -49,6 +50,12 @@ DEBUG_KINDS = frozenset({
     # ledger of looking out of the surfaces for exactly this reason; the same argument
     # applies to the default timeline.
     "health_reviewed",
+    # The retry sweep DEFERRING a relaunch, restated every five minutes for as long as
+    # the cap holds. `invariants.pause_note` is the user-facing half of one hold — one
+    # sentence — and twelve rows an hour of "still queued" would bury the work in
+    # `jarvis wo show`. Same argument as `health_reviewed` above; spec §1 of
+    # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+    "retry_held",
 })
 
 #: `background.EVENT`, spelled out here for the reason `SUPERVISOR_SOURCE` is: this

@@ -136,6 +136,25 @@ def test_planner_prompt_is_untouched_by_the_split():
     assert "gated, NOT forbidden" in planner
 
 
+def test_planner_brief_requires_the_spec_to_be_committed():
+    """ops.submit_plan reads the spec with `git show`, never from the working tree
+    (docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md
+    sections 6 and 11). A planner told only that the file "must already exist" writes
+    it, leaves it uncommitted and hits that refusal with no warning."""
+    import json
+    from jarvis.dispatch import build_worker_prompt
+    planner = build_worker_prompt(
+        {"id": "wo-pl2", "title": "t", "description": "d", "kind": "planner",
+         "parent_id": "fo-1"}, GATED, [])
+    assert "must already be COMMITTED" in planner
+    assert 'must already exist"' not in planner
+    assert "not on disk" not in planner
+    assert "It must exist before you submit" not in planner
+    assert "not committed" in planner
+    block = re.search(r"```json\n(.*?)```", planner, re.S).group(1)
+    json.loads(block)
+
+
 # -- nothing was lost, only moved -------------------------------------------------------
 
 def test_contract_section_contains_everything_the_old_contract_had():

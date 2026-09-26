@@ -1471,23 +1471,34 @@ def _outbox(store: ProjectStore, unit_id: str) -> list[dict]:
     the second one returns — and a test reading only the unrouted rows would see the
     silence it was written to rule out.
 
-    SCOPED BY UNIT, because the fixture validates work orders too: the feature's own
-    MANAGER is a work order that finishes with an empty worktree and gives up on its
-    round 1, so an unfiltered read is never empty and the rejection pairing below would
-    pass for the wrong reason.
+    SCOPED BY UNIT, because the fixture validates work orders too: `Fleet.release`
+    submits the plan, which finishes the PLANNER, and that work order gets a round of its
+    own — so an unfiltered read can carry a row this feature never wrote, and the
+    rejection pairing below would pass for the wrong reason.
 
-    THE SCOPE IS A MATCH ON THE TITLE, which makes the title's wording load-bearing as
-    an identifier — there is no `fo_id` column to filter on instead. So the exclusion is
-    ASSERTED rather than assumed: a reworded title would otherwise make this filter
-    match nothing, and "a rejection wrote no row" would start passing because the read
-    found nothing rather than because nothing was written.
+    THE PLANNER NO LONGER WRITES A GIVE-UP ROW: a submitted plan is an attested side
+    effect, so its round VOIDS rather than escalating on the empty worktree — spec
+    docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md.
+
+    THE SCOPE IS A MATCH ON THE TITLE, which makes the title's wording load-bearing as an
+    identifier — there is no `fo_id` column to filter on instead. So both halves are
+    ASSERTED rather than assumed: every row's title must start with a unit id, so a
+    reworded title fails here instead of silently making the filter match nothing; and
+    work-order validation is asserted to have RUN at all, over the planner's own round,
+    so "a rejection wrote no row" can never start passing because this fixture stopped
+    judging work orders.
     """
     rows = [dict(r) for r in store.conn.execute(
         "SELECT * FROM notifications WHERE source='validation' ORDER BY id").fetchall()]
-    assert any(r["title"].startswith("wo-") for r in rows), (
-        "the manager's own give-up row is missing: either the title no longer starts "
-        "with the unit id, or work-order validation stopped running in this fixture — "
-        "and this helper is now silently excluding nothing")
+    assert all(r["title"].startswith(("wo-", "fo-")) for r in rows), (
+        "a validation notification is no longer titled by its unit id "
+        f"({[r['title'] for r in rows]}), so this helper's filter now excludes "
+        "everything")
+    planner = str(store.get_feature_order(unit_id)["plan_wo_id"] or "")
+    judged = [dict(r)["outcome"] for r in store.validation_rounds(wo_id=planner)]
+    assert judged == ["void"], (
+        "work-order validation stopped running in this fixture: the planner's rounds are "
+        f"{judged}, not one voided round")
     return [r for r in rows if r["title"].startswith(unit_id)]
 
 

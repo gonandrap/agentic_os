@@ -347,6 +347,19 @@ TRANSPORT_HEADLESS = "headless"
 REQUIRE_CREW_ENV = "JARVIS_REQUIRE_CREW"
 WO_KIND_ENV = "JARVIS_WO_KIND"
 
+#: JSON list of repo-relative paths an installed TOOL owns and rewrites, marked
+#: `skip-worktree` in the worker worktree's index by `mark_tool_managed_paths`. Defined in
+#: the READER, like `concision.STANDING_PROMPT_ENV`, and written by
+#: `dispatch._write_worker_settings` from `project.worktree.tool_managed_paths` — the hook
+#: must not import `jarvis.catalog` to learn a value fixed at spawn (~60ms against a 155ms
+#: hook process). Absent or unparseable: the mechanism is off for that worker, silently,
+#: which is what a work order dispatched before this landed carries.
+TOOL_MANAGED_PATHS_ENV = "JARVIS_TOOL_MANAGED_PATHS"
+
+#: Cap on how many of them one `SessionStart` will consider, so the hook's cost cannot
+#: grow without limit as the list does.
+MAX_TOOL_MANAGED_PATHS = 32
+
 #: Everything the shell backgrounds a job with, other than a bare `&`. In COMMAND
 #: position only, so `grep -r nohup src/` is not a detached job.
 _BACKGROUNDING_WORD = re.compile(
@@ -1469,6 +1482,107 @@ def _subagent_start(payload: dict[str, Any],
             }}
 
 
+def _git_index(tree: Path, *args: str) -> tuple[int, str] | None:
+    """One git command against a worktree's index: `(exit status, stdout)`, or `None`
+    when git could not be run at all.
+
+    `landing._git` is deliberately not reused: that helper's contract is "one READ-ONLY
+    git command" and this writes the index. `import subprocess` is lazy because
+    `hooks.py` does not import it at module level and this module's import cost is
+    measured (see `TOOL_MANAGED_PATHS_ENV`).
+
+    The exit status is returned rather than folded into `None` so the recorded event can
+    name it: a failure must land on the record, and "git failed" without the code is not
+    a fact anyone can act on.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "-C", str(tree), *args],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out.returncode, out.stdout
+
+
+def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore,
+                            wo: dict[str, Any], cwd: Path) -> None:
+    """Tell THIS work order's worktree that the tool-managed files are not its to report.
+
+    `git update-index --skip-worktree` means "the worktree copy of this path is not
+    mine": the tool keeps rewriting it, the worker keeps reading it, and `git status`,
+    `git add -A` and `git commit -a` all stop seeing it — so the churn can no longer be
+    staged into a pull request about something else. Spec docs/superpowers/specs/
+    2026-09-25-serena-config-churn-and-tool-managed-files.md.
+
+    Nothing happens on the shared checkout, by design: a schema upgrade there is the
+    user's to see and commit, and hiding it from `git status` would hide it from the only
+    person who can land it. Nothing happens for another work order's worktree either.
+
+    Idempotent — every turn's `SessionStart` re-runs the same steps, and a path already
+    carrying the flag is neither re-marked nor recorded.
+    """
+    raw = env.get(TOOL_MANAGED_PATHS_ENV)
+    if not raw:
+        return
+    try:
+        configured = json.loads(raw)
+    except ValueError:
+        return
+    if not isinstance(configured, list):
+        return
+
+    # Both conditions, in this order: the cheap text test first (hooks.py:441), then the
+    # identity of the worktree. Both sides resolved — a worker's cwd is a symlinked path
+    # on some checkouts and a plain one on others, which is why `find_project_root`
+    # resolves too.
+    worktree = wo.get("worktree")
+    if not worktree or "/.claude/worktrees/" not in str(cwd):
+        return
+    expected = root / ".claude" / "worktrees" / str(worktree)
+    try:
+        if cwd.resolve() != expected.resolve():
+            return
+    except OSError:
+        return
+
+    marked: list[str] = []
+    skipped: dict[str, str] = {}
+    failed: dict[str, str] = {}
+    for path in [str(p) for p in configured[:MAX_TOOL_MANAGED_PATHS]]:
+        # `-v` for the same call that answers "does git track it": the flag letter is what
+        # makes "already marked" a state this can pass over without recording it again.
+        listed = _git_index(cwd, "ls-files", "-v", "--", path)
+        if listed is None or listed[0] != 0:
+            failed[path] = "ls-files: git unavailable" if listed is None \
+                else f"ls-files: exit {listed[0]}"
+            continue
+        line = listed[1].strip()
+        if not line:
+            skipped[path] = "untracked"   # update-index would exit non-zero anyway
+            continue
+        if line.split(" ", 1)[0] == "S":
+            continue                      # already marked: the first event said so
+        if not (cwd / path).exists():
+            # `skip-worktree` on an absent path makes git present the index version as
+            # the truth — a confusing state to create for a file the tool has not written.
+            skipped[path] = "absent"
+            continue
+        result = _git_index(cwd, "update-index", "--skip-worktree", "--", path)
+        if result is None or result[0] != 0:
+            failed[path] = "update-index: git unavailable" if result is None \
+                else f"update-index: exit {result[0]}"
+            continue
+        marked.append(path)
+
+    # Every DISTINCT reason lands once. The one case that records nothing is "every
+    # configured path is already marked", which is not a new reason — `SessionStart` fires
+    # once per TURN, and a row per turn would make the record a hook log (timeline.py:19).
+    if marked or skipped or failed:
+        store.add_event(wo["id"], "tool_managed_paths",
+                        {"marked": marked, "skipped": skipped, "failed": failed})
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -1535,6 +1649,15 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             # elsewhere, so a broken read costs a data point and nothing else.
             try:
                 note_prefix(payload, env, root, store, wo)
+            except Exception:  # noqa: BLE001
+                pass
+            # ...and the tool-managed files, marked `skip-worktree` in this worktree's
+            # index. AFTER the two above: the git calls cost tens of milliseconds and
+            # nothing already in this branch may be delayed by them. Never fatal, for
+            # `note_prefix`' reason and more sharply — a worker's session must not end
+            # because git is unhappy about a file it was not going to commit anyway.
+            try:
+                mark_tool_managed_paths(env, root, store, wo, cwd)
             except Exception:  # noqa: BLE001
                 pass
             # ...and the house style, which is the whole point of this event for

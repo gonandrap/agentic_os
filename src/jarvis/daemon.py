@@ -61,7 +61,7 @@ from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
-from .invariants import PR_REPAIR_STATUSES
+from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     FO_OPEN_STATUSES,
@@ -306,6 +306,14 @@ NO_VALIDATOR_REASON = (
     "settled exactly where it settles with validation switched off"
 )
 
+#: The pair that records a landing the round machine could not take because a worker
+#: turn was in flight, and the one `settle_work_order` takes for it afterwards. TWO
+#: EVENTS AND NO COLUMN, by project_store.py's rule: a state that can be derived gets no
+#: column, and the pair keeps the WHY on the record where a boolean would not. Spec §3.2
+#: of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+VALIDATION_LANDING_DEFERRED = "validation_landing_deferred"
+VALIDATION_LANDED = "validation_landed"
+
 #: The give-up notification, for both round machines (issue #199). ONE shape for both,
 #: because a unit that gives up says the same thing to the user whichever machine gave
 #: up on it. The body is the round's reason, CUT to `VALIDATION_REASON_CHARS`.
@@ -392,6 +400,24 @@ def escalation_body(reason: str) -> str:
     if len(reason) <= VALIDATION_REASON_CHARS:
         return reason
     return reason[:VALIDATION_REASON_CHARS] + VALIDATION_REASON_CUT
+
+
+def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
+    """The round whose landing is still owed — the newest deferral no landing answered.
+
+    Derived from the event pair rather than a column (`VALIDATION_LANDING_DEFERRED`), so
+    a landing taken is a landing recorded and the settler cannot take it twice.
+    """
+    last = store.last_event_of_kind(wo_id, VALIDATION_LANDING_DEFERRED)
+    if last is None:
+        return None
+    owed = (db.from_json(last.get("payload"), {}) or {}).get("round_id")
+    if owed is None:
+        return None
+    landed = store.last_event_of_kind(wo_id, VALIDATION_LANDED)
+    done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") if landed \
+        else None
+    return None if done == owed else int(owed)
 
 
 class Daemon:
@@ -706,6 +732,12 @@ class Daemon:
                 # reopened must re-send the turn it was refused BEFORE any newer
                 # message goes out, or the user's earlier message — already marked
                 # delivered, and living only on that turn row — would be skipped.
+                #
+                # And before dispatch, far below: when a slot frees it goes to a paused
+                # turn being resumed before it goes to a pending work order being
+                # dispatched. A resume continues a conversation whose prefix is paid for
+                # and whose work is half done; a dispatch starts one that re-sends its
+                # whole context at the cache-WRITE rate for the rest of its life.
                 if retry_paused:
                     self.retry_paused_turns(project, store, state)
                 # Before delivery, not after: an envelope BECOMES a queued message,
@@ -727,6 +759,10 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
+                # Immediately after: this is the tick's feature-order planning band, and
+                # a question asked here is picked up by the same Neo drain on the same
+                # tick rather than one interval late. §9.
+                self.refresh_plan_specs(project, store)
                 # Before dispatch for the planner's reason one step removed: an order the
                 # scheduler files this tick is an ordinary pending work order, so the
                 # same pass claims it instead of leaving it a whole poll interval late.
@@ -992,6 +1028,22 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+    def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Re-ask any plan review whose spec has been committed over. Thin, like its
+        siblings: the logic is `ops.refresh_plan_spec` (§9).
+
+        Cost when nothing is in `plan_review` — the normal case — is one indexed query
+        returning zero rows and no git subprocess at all.
+        """
+        from . import ops
+
+        for fo in store.list_feature_orders(statuses=("plan_review",)):
+            try:
+                ops.refresh_plan_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not refresh the spec under review for %s",
+                              project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close out feature orders whose children have all landed, or one of which has
@@ -1390,12 +1442,26 @@ class Daemon:
         every order this pass relaunches. It bites narrowly and on purpose — a usage or
         transient pause leaves its work order `running`, which already holds a slot, so
         the only thing held here is the AUTH pause, the one parked out of `running` by
-        `_park_on_signin`. Held means the pause stays parked with nothing written.
+        `_park_on_signin`.
+
+        A HOLD IS WRITTEN DOWN (`retry_held`, issue #752). Held used to mean the pause
+        stayed parked with nothing recorded anywhere, which no surface could read: the
+        note went on promising a retry whose moment had passed, and INV-PAUSE-OVERDUE
+        reported the OS as not healing an order the OS was correctly waiting to heal. The
+        cap skip is re-read per order rather than hoisted, because `Fleet.launched`
+        mutates `in_flight` inside this very loop — the pass can fill the cap itself.
+
+        AND THE SLOT IT WAITS FOR IS ITS OWN: when one frees it goes to a paused turn
+        being resumed before it goes to a pending work order being dispatched, which is
+        what `tick`'s ordering guarantees. A resume continues a conversation whose prompt
+        prefix is already paid for and which is holding somebody's half-finished work;
+        a dispatch starts a session that re-sends its whole context at the cache-WRITE
+        rate for every turn of its life. Starving the resume is the one direction of
+        unfairness that costs money AND time.
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            if state is not None and state.blocked():
-                return
+            held = state.blocked() if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1405,8 +1471,26 @@ class Daemon:
                 continue
             if pause is None or not pause.resumable or not pause.due():
                 continue
+            # BELOW the filter above, so only an order that was going to be relaunched
+            # on this pass is ever recorded — nothing else is being held.
+            if held:
+                shut = state is not None and state.shut()
+                figures = {"in_flight": state.in_flight, "cap": state.cap}
+                if shut:
+                    # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
+                    # for an outage (issue #714), and the event exists for the invariant
+                    # suppression, which an outage hold needs exactly as a cap hold does.
+                    figures["reopens_at"] = state.outage.reopens_at
+                self._record_retry_held(
+                    store, wo, pause,
+                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
+                self._record_retry_held(
+                    store, wo, pause, cause="project_cap",
+                    figures={"active": store.count_active(),
+                             "max_concurrent": project.max_concurrent})
                 continue
             try:
                 turn = worker_session.retry(store, project, wo, pause)
@@ -1467,6 +1551,29 @@ class Daemon:
                 # `waiting_input`, and nothing re-derives it once this row is `running`.
                 if wo["attention_reason"] == invariants_mod.AUTH_BLOCKER:
                     store.clear_attention(wo["id"])
+
+    @staticmethod
+    def _record_retry_held(store: ProjectStore, wo: dict, pause: Any, *,
+                           cause: str, figures: dict[str, Any]) -> None:
+        """Write down that this due pause was deferred — at most once every restate.
+
+        ONE PAYLOAD SHAPE for all three causes, so a reader has one branch, and `seq` is
+        on it because the hold is about ONE pause: a later turn makes the event
+        meaningless and a reader that could not tell would suppress an invariant about a
+        different failure. Restated rather than written per sweep because the sweep runs
+        every ten seconds and a usage window lasts five hours — ~60 events instead of
+        ~1,800, with `RETRY_HELD_FRESH_FOR` of slack for a tick that slipped. Spec §1 of
+        docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        """
+        last = store.last_event_of_kind(wo["id"], invariants_mod.RETRY_HELD_EVENT)
+        if last is not None:
+            payload = db.from_json(last.get("payload"), {}) or {}
+            if (payload.get("seq") == pause.turn["seq"]
+                    and db.now() - float(last.get("ts") or 0) < RETRY_HELD_RESTATE):
+                return
+        store.add_event(wo["id"], invariants_mod.RETRY_HELD_EVENT,
+                        {"cause": cause, "seq": pause.turn["seq"],
+                         "reason": pause.reason, "retry_at": pause.retry_at, **figures})
 
     # -- 3. message delivery ----------------------------------------------------------
 
@@ -1873,7 +1980,20 @@ class Daemon:
                                       unit=wo_id, wo_id=wo_id)
                 store.add_event(wo_id, "validation_passed",
                                 {"round": n, "round_id": round_id})
-                status = ops.land_when_cleared(store, wo)
+                # NOT UNDER A LIVE TURN. `wo` is the row read before the seats ran —
+                # minutes stale by construction — and landing it writes a status under a
+                # worker that is typing: on wo-83e4183c a planner halfway through a
+                # revision read as awaiting the user. `busy` is the OS's one definition
+                # of that, the same predicate delivery uses. `settle_work_order` picks
+                # the landing up when the turn ends. Spec §3.1 of
+                # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+                if worker_session.busy(store, wo_id) is None:
+                    status = ops.land_when_cleared(store, wo)
+                else:
+                    status = "deferred — a worker turn is in flight"
+                    store.add_event(wo_id, VALIDATION_LANDING_DEFERRED,
+                                    {"round": n, "round_id": round_id,
+                                     "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
             elif outcome == "rejected" and n < max_rounds:
@@ -3952,7 +4072,10 @@ class Daemon:
         # Free for the fleet as it stands: `ceiling` returns None the moment the row has
         # neither a budget nor a reservation, which is every work order until someone
         # sets one.
-        round_open = (store.latest_validation_round(wo_id=wo["id"]) or {}).get("outcome")
+        # The whole row, not just its outcome: the deferred-landing check below needs to
+        # know the latest round PASSED, and this read is already paid for.
+        latest_round = store.latest_validation_round(wo_id=wo["id"]) or {}
+        round_open = latest_round.get("outcome")
         if round_open not in RUNNABLE_VALIDATION_OUTCOMES:
             spent = budget_mod.exhaustion(store, self.central, wo)
             if spent is not None:
@@ -4056,6 +4179,19 @@ class Daemon:
         if store.queued_messages(wo["id"]):
             return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        # THE LANDING THE ROUND MACHINE DEFERRED, taken explicitly rather than left to
+        # the coincidence that the branches below usually reach the same status: they
+        # re-derive the join from the TURN, skipping the two rules only
+        # `land_when_cleared` knows (`refusal_answered`, the `OPEN_VALIDATION_OUTCOMES`
+        # re-park). On `fresh`, so the landing sees a `pr_url` this turn wrote. Spec §3.2
+        # of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
+        if deferred is not None:
+            from . import ops as ops_mod
+
+            ops_mod.land_when_cleared(store, fresh)
+            store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
+            return
         if fresh.get("result_summary"):
             if store.pending_assumptions(wo["id"]):
                 if fresh["status"] != "needs_review":
@@ -4081,7 +4217,17 @@ class Daemon:
                 # way the OS takes a work order out of its status (issue #259): a
                 # relaunched turn must not end by filing the review somebody still owes
                 # as a merge-queue entry. It answers for `needs_review` alone — see it.
-                back = (ops_mod.pr_repair_origin(store, wo["id"])
+                # AND A GIVE-UP IS NOT UNDONE BY THE TURN THAT FOLLOWS IT. The panel
+                # escalating writes `needs_review` under a possibly-live turn — it must,
+                # or `true_blockers` could not derive its flag — and that status used to
+                # be parked away here the moment the turn ended with a pull request,
+                # taking a refusal off the user's list. `validation_escalated` is the
+                # predicate `true_blockers` reads, so the status and the flag come from
+                # one fact. Spec §3.3 of
+                # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+                back = ("needs_review"
+                        if invariants_mod.validation_escalated(store, fresh)
+                        else ops_mod.pr_repair_origin(store, wo["id"])
                         or ops_mod.resumed_from(store, wo["id"], turn["seq"])
                         or "waiting_pr_merge")
                 if fresh["status"] != back:
@@ -4950,9 +5096,13 @@ class Daemon:
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):
-                decision = autoreview.decide_confirm(
-                    a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
-                    objections_outstanding=objecting)
+                def confirm(stakes_verdict=None, a=a):
+                    return autoreview.decide_confirm(
+                        a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
+                        objections_outstanding=objecting, stakes=stakes_verdict)
+
+                decision = self._stakes_reviewed(project, store, wo, cfg, a,
+                                                 confirm(), confirm)
                 if not decision.armed:
                     self._note_autoreview_held(store, wo["id"], decision,
                                                suppress=suppress)
@@ -4973,14 +5123,156 @@ class Daemon:
                                                 assumptions, stat=packet[0],
                                                 diff=packet[1])
                 continue
-            decision = rule(a, wo, cfg, round_outcome=outcome,
-                            refusal_answered=answered)
+            def judge(stakes_verdict=None, a=a):
+                return rule(a, wo, cfg, round_outcome=outcome,
+                            refusal_answered=answered, stakes=stakes_verdict)
+
+            decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
                 self._note_autoreview_held(store, wo["id"], decision,
                                            suppress=suppress)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
                                early=early)
+
+    def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                         cfg: Any, a: dict, decision: Any,
+                         rerun: Callable[[Any], Any]) -> Any:
+        """Apply this project's `validation.stakes_classifier` to ONE row's decision.
+
+        docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.5.
+
+        * `regex` — hands `decision` straight back. NO CALL, NO ROW, NO EVENT: the shipped
+          default must be indistinguishable from the behaviour before this existed.
+        * `shadow` — calls, records the disagreement, and hands the REGEX's decision back
+          unchanged. The measurement, and nothing else.
+        * `classifier` — re-runs the pure decision with the verdict in it.
+        * `regex-tightened` — the TIGHTENED net re-runs the decision. NO CALL AND NO ROW,
+          like `regex`: the verdict is `autoreview.tightened_verdict`, a pure match handed
+          over in the classifier's own shape (2026-09-25 spec §7, the A/B's recommendation).
+
+        **THE CHEAP CONDITIONS RUN FIRST, which is why the decision is computed before
+        this is called.** A row that holds on a cheaper condition — already settled,
+        already with Neo, a panel that gave up, the project's permission revoked — never
+        reaches a model, the same discipline `_confirmation_evidence` is collected under.
+        Only a row that ARMED, or that held on the high-stakes net itself, is worth
+        asking about: those are the two answers the classifier can change.
+        """
+        from . import autoreview
+
+        mode = str(getattr(cfg, "stakes_classifier", "regex") or "regex")
+        if mode == "regex":
+            return decision
+        if not (decision.armed or decision.code == autoreview.HELD_HIGH_STAKES):
+            return decision
+        if mode == "regex-tightened":
+            return rerun(autoreview.tightened_verdict(str(a.get("content") or "")))
+        verdict = self._classify_stakes(project, wo, a)
+        if mode == "shadow":
+            self._note_stakes_disagreement(store, wo["id"], a, verdict)
+            return decision
+        return rerun(verdict)
+
+    def _settle_stakes(self, project: ProjectSpec, wo: dict, a: dict) -> Any:
+        """The verdict the SETTLE site re-checks condition 7 against, or None.
+
+        A second call, not a cached one: the settle re-runs the whole table against state
+        read NOW, and a verdict from before the model call is exactly the stale fact that
+        re-run exists to refuse. Only `classifier` pays for it — under `regex` and
+        `shadow` the regex decided the ask, so the regex decides the settle.
+
+        `regex-tightened` also answers here, and for free: the settle would otherwise fall
+        back on the WIDE net and hold rows the ask had already armed on the tightened one.
+        """
+        mode = str(getattr(project.validation, "stakes_classifier", "regex") or "regex")
+        if mode == "regex-tightened":
+            from . import autoreview
+            return autoreview.tightened_verdict(str(a.get("content") or ""))
+        if mode != "classifier":
+            return None
+        return self._classify_stakes(project, wo, a)
+
+    def _classify_stakes(self, project: ProjectSpec, wo: dict, a: dict, *,
+                         call: Callable[..., Any] | None = None,
+                         record: Callable[..., Any] | None = None) -> Any:
+        """Ask the classifier about one assumption. Never raises; a failure is HELD.
+
+        SS3.3 and SS3.8. The transport is `neo.answer_question`'s, verbatim in its two
+        non-obvious arguments: the neutral cwd, so the project's `CLAUDE.md` is not pulled
+        into a prompt that is supposed to carry one sentence, and `attribute=False`
+        because this call records itself and leaving the transport's attribution on would
+        double-count it.
+
+        ONE `agent_calls` ROW PER CALL, and a FAILED call still writes one with `ok=False`
+        — `add_agent_call`'s own rule: a None-usage row says a call was made and cost
+        something unknown, which is a different fact from no call at all.
+
+        The model asked for is a floating alias; the model that ANSWERED is what is
+        recorded and what rides on the verdict.
+
+        `tools=""` — SS3.10, and the same string the A/B measured. A tooled callee "will
+        happily go read the real state and answer about *that*" (claude_cli.py:1522), and
+        `""` also sends `--strict-mcp-config`, so the user's MCP servers are out too. The
+        judgement is about one sentence and must come from the prompt alone.
+        """
+        from . import agent_usage, stakes
+
+        call = call or claude_cli.run_headless_result
+        record = record or agent_usage.record
+        try:
+            result = call(stakes.question(str(a.get("content") or "")),
+                          system_prompt=stakes.PERSONA, model=stakes.MODEL,
+                          timeout=stakes.TIMEOUT, cwd=ensure_home(), tools="",
+                          attribute=False)
+        except Exception:  # noqa: BLE001 — an unreachable classifier holds, never raises
+            log.exception("[%s] stakes classifier for %s failed", project.name,
+                          wo.get("id"))
+            record("stakes_classifier", usage=None, project=project.name,
+                   wo_id=str(wo.get("id") or ""), label="assumption",
+                   model=stakes.MODEL, ok=False)
+            return stakes.unreachable(stakes.MODEL)
+        model = getattr(result, "model", "") or stakes.MODEL
+        record("stakes_classifier", usage=result, project=project.name,
+               wo_id=str(wo.get("id") or ""), label="assumption", model=model,
+               ok=bool(getattr(result, "text", "")))
+        return stakes.read_verdict(getattr(result, "text", ""), model=model)
+
+    def _note_stakes_disagreement(self, store: ProjectStore, wo_id: str, a: dict,
+                                  verdict: Any) -> None:
+        """Record ONCE that the two nets disagreed about one assumption (SS3.5).
+
+        `_note_autoreview_held`'s discipline, with a wider key. **THE KEY IS
+        `(assumption_id, regex marker, classifier verdict)`, not the assumption alone**:
+        keyed on the row, a classifier that changes its mind between ticks is lost, which
+        is the single most interesting shadow result; keyed on nothing, the pass writes an
+        event every reconcile tick for as long as the order sits there and buries the ones
+        that mean something.
+
+        `regex` is `high_stakes_marker`'s return (`""` when it did not fire), so ONE kind
+        says which way the two disagreed.
+
+        **DELIBERATELY NOT RENDERED.** It is not in `ops.AUTOREVIEW_EVENTS` and has no
+        branch in `timeline.py` — shadow is a measurement the operator reads with `jarvis
+        search` or SQL, and a work order whose behaviour did not change must not grow a
+        timeline line saying a mechanism disagreed with itself. That is an exception to
+        `ops.py:2311`'s warning, taken knowingly, and recorded in the spec.
+        """
+        from . import autoreview, db
+
+        marker = autoreview.high_stakes_marker(str(a.get("content") or ""))
+        high = bool(getattr(verdict, "high", True))
+        if bool(marker) == high:
+            return
+        key = (int(a.get("id") or 0), marker, high)
+        for event in store.events_of_kind(wo_id, "autoreview_stakes_disagreed"):
+            payload = db.from_json(event["payload"], {})
+            if (int(payload.get("assumption_id") or 0), str(payload.get("regex") or ""),
+                    bool(payload.get("classifier_high"))) == key:
+                return
+        store.add_event(wo_id, "autoreview_stakes_disagreed", {
+            "assumption_id": a.get("id"), "n": a.get("n"), "regex": marker,
+            "classifier_high": high, "category": verdict.category,
+            "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
 
     def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
                                cfg: Any) -> tuple[str, str]:
@@ -5184,7 +5476,13 @@ class Daemon:
             # that is the id to exclude, or every confirmed assumption would be dropped
             # as "already with Neo" on its own first pass.
             asked_question_id=int((assumption.get("neo_question_id") or q["id"])
-                                  if confirming else q["id"]))
+                                  if confirming else q["id"]),
+            # CONDITION 7 IS RE-RUN THE WAY THE ASK RAN IT. Under `classifier` the row
+            # was armed by a verdict, and re-checking it with `stakes=None` would put the
+            # regex back in charge at the settle — dropping every ruling the OS just paid
+            # for on a row that merely MENTIONS a deletion. `regex` and `shadow` pass
+            # None, which is the regex, which is what decided the ask under both.
+            stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
             # Escalated rather than left `answered`: the assumption is the user's again,
             # and `/neo` and `jarvis neo list` have to say so — the same re-mark the

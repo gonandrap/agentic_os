@@ -565,6 +565,13 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                             + ", ".join(_child_note(k, parked_by_id) for k in kids)
                         )
                     progress = feature_progress(store, fo)
+                    # §6.2 of docs/superpowers/specs/2026-09-23-improvement-orders.md: an
+                    # improvement order's reason is `findings.review_headline` word for
+                    # word — it already leads with counts and already names the command,
+                    # and "0/1 done" about a one-child family displaces those counts with
+                    # noise. Feature orders keep the prefix and `jarvis fo show`.
+                    improvement = (fo.get("kind") or "feature") == "improvement"
+                    body = "; ".join(reasons)
                     attention.append({
                         "project": p["name"], "wo_id": None, "fo_id": fo_id,
                         "title": fo["title"],
@@ -573,9 +580,11 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         # feature order's label is unchanged by construction.
                         "status": (f"{fo.get('kind') or 'feature'}:"
                                    f"{feature_status_label(fo.get('kind'), fo['status'])}"),
-                        "reason": f"{progress['label']} — " + "; ".join(reasons),
+                        "reason": body if improvement
+                                  else f"{progress['label']} — {body}",
                         "rolled_up": [k["id"] for k in kids],
-                        "decide": f"jarvis fo show {fo_id}",
+                        "decide": (f"jarvis io review {fo_id}" if improvement
+                                   else f"jarvis fo show {fo_id}"),
                     })
                 drift = settings_drift(path / ".claude" / "settings.json")
                 projects.append({
@@ -1364,6 +1373,359 @@ def _project_permission_mode(project_name: str) -> str | None:
         if spec.name == project_name:
             return spec.worker.permission_mode
     return None
+
+
+#: The `waiting_on` answers that mean THE USER IS NEEDED — the set `true_blockers` is
+#: cross-checked against in `diagnose`. Written out rather than derived, because the two
+#: functions are deliberately different questions ("what is this waiting for" against
+#: "does this need the USER") and the only honest way to compare two answers to two
+#: questions is to state the mapping between them once, in the open, where it can be
+#: read and argued with. Spec §6.1: where the two disagree the report says so and picks
+#: NEITHER — a silent pick is how GitHub issues #197 and #711 reached the user as a
+#: confident wrong sentence.
+USER_IS_NEEDED_WAITS = frozenset({
+    "assumptions", "gate_escalated", "neo_escalated", "plan_assumptions",
+    "message_stuck", "signin", "needs_review",
+})
+
+#: As much timeline as any conversation the fleet has run, and the same number
+#: `holds._EVENT_LIMIT` uses for the same reason: `list_events` takes the OLDEST `limit`
+#: rows, so a cap that bit would hide the RECENT events — which for this report are the
+#: only ones it asks about.
+DIAGNOSE_EVENT_LIMIT = 10_000
+
+
+def ago_phrase(seconds: float) -> str:
+    """"3.1h" — an age at the magnitude a reader can hold in their head.
+
+    HERE RATHER THAN IN THE RENDERER, and that is the §6 rule rather than a preference:
+    `jarvis wo why`'s human output renders only, computing no number and no duration that
+    is not already in the payload, so that the `--json` consumer and the person reading
+    the terminal cannot be shown two different clocks. Same ladder as `cli._age`.
+    """
+    if seconds < 90:
+        return f"{int(seconds)}s"
+    if seconds < 5400:
+        return f"{int(seconds / 60)}m"
+    if seconds < 129_600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+def _ago(ts: Any, now: float) -> dict[str, Any]:
+    """`{ago_seconds, ago}` for one moment, for the clock block below."""
+    seconds = max(0.0, now - float(ts))
+    return {"ago_seconds": round(seconds, 1), "ago": ago_phrase(seconds)}
+
+
+#: Said on every clock block, whatever it contains. This report reads the OS's RECORD;
+#: the live process is §3's question and a different command answers it. Spec §6.2 calls
+#: the seam deliberate: coupling them would make this section unbuildable for one number.
+LIVE_NOTE = ("this is the OS's own record of the order, not the process — `jarvis watch "
+             "{wo_id}` is what reads the turn in flight")
+
+#: `None` and a sentence, never `0` — issue #227. An order that has never taken a turn,
+#: never changed status or has no timeline at all has an ABSENT clock, and a zeroed
+#: sub-block would read as "it happened, just now", which is the opposite fact.
+NO_TURN_NOTE = ("no worker turn has ever run for this order, so there is no last turn to "
+                "date — absent, not zero")
+NO_STATUS_NOTE = ("no status transition is on the timeline for this order, so there is "
+                  "none to date — absent, not zero")
+NO_EVENT_NOTE = ("this order has no timeline events at all, so there is nothing to date "
+                 "— absent, not zero")
+
+#: The residual is NOT a cause and is labelled as one thing only: idle the record does
+#: not account for. Spec §6.3, and `inspection.Anatomy.unexplained` is where the number
+#: comes from — Neo ruled on question 680 that the transcript supplies the residual and
+#: NOTHING else here, every duration and the status still coming from the store.
+UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a residual; a "
+                    "large one is a different defect from anything this report can name")
+NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
+                      "by Claude Code), so the residual is unmeasurable rather than zero")
+
+#: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
+#: retried and gave up is today visible only as a cost row, and the whole point of
+#: surfacing it here is that the reader can see it was NEVER REACHED. The wording avoids
+#: every verb of judgement on purpose: an unreachable call produced no judgement and the
+#: OS must never synthesise one for it.
+OS_CALLS_NOTE = ("`unreachable` means the OS could not reach the model on that call: it "
+                 "produced no judgement at all, and nothing may be read into it. Only an "
+                 "`answered` row carries anything a model actually said.")
+
+#: Said whenever the read hit its cap, because a list cut off silently is read as the
+#: whole of it — the same false claim `NO_TURN_NOTE` above exists to stop. The counts go
+#: with the sentence: they are counts of the rows this block HOLDS, not of the order's
+#: history, so at the cap they are a floor.
+OS_CALLS_CAPPED_NOTE = ("This list is capped at the newest {limit} calls, so the counts "
+                        "beside it are a floor rather than the order's whole history.")
+
+#: How many call rows the newest-first list is worth printing to a terminal, and the cap
+#: on the read behind it. Two numbers rather than one: 200 is the depth a `--json`
+#: consumer can page through, 10 is the depth a person reading a diagnosis can take in —
+#: and a report that scrolls a screen of table is one whose first line is never read.
+OS_CALLS_LIMIT = 200
+OS_CALLS_SHOWN = 10
+
+#: The clearing command lives INSIDE `waiting_on`'s sentence, which is written by the one
+#: function that knows the case. Carried verbatim rather than re-derived or re-parsed:
+#: a second extraction of a command out of a sentence is a second thing to keep correct.
+WAY_THROUGH_NOTE = ("the blocker's own sentence above names the way through, in the "
+                    "words of the function that diagnosed it")
+
+
+def _diagnose_clock(store: ProjectStore, wo_id: str, now: float) -> dict[str, Any]:
+    """The last state transition, the last turn, the last event — from the store alone."""
+    statuses = store.events_of_kind(wo_id, "status")
+    last_status = ({"status": (db.from_json(statuses[-1].get("payload"), {}) or {}
+                               ).get("status") or "",
+                    "ts": statuses[-1]["ts"], **_ago(statuses[-1]["ts"], now)}
+                   if statuses else None)
+    turn = store.latest_turn(wo_id)
+    last_turn = ({"seq": turn["seq"], "label": turn_label(turn["seq"]),
+                  "state": turn["state"],
+                  "started_at": turn["started_at"], "ended_at": turn["ended_at"],
+                  **_ago(turn["ended_at"] or turn["started_at"], now)}
+                 if turn else None)
+    events = store.list_events(wo_id, limit=DIAGNOSE_EVENT_LIMIT)
+    last_event = ({"kind": events[-1]["kind"], "ts": events[-1]["ts"],
+                   **_ago(events[-1]["ts"], now)} if events else None)
+    notes = [note for note, absent in ((NO_STATUS_NOTE, last_status is None),
+                                       (NO_TURN_NOTE, last_turn is None),
+                                       (NO_EVENT_NOTE, last_event is None)) if absent]
+    return {"last_status": last_status, "last_turn": last_turn,
+            "last_event": last_event,
+            "turn_open": bool(turn is not None and turn["state"] == "running"),
+            "note": " ".join(notes), "live_note": LIVE_NOTE.format(wo_id=wo_id)}
+
+
+def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
+                    project: str, now: float) -> dict[str, Any]:
+    """Every episode the record says held this order, plus the honest residual."""
+    from . import holds as holds_mod
+    from . import inspection
+
+    episodes = holds_mod.held(store, wo["id"], now=now)
+    by_cause = {cause: round(seconds, 2) for cause, seconds
+                in holds_mod.by_cause(episodes, float("-inf"), now, now=now).items()}
+    session = str(wo.get("session_id") or "")
+    # Exactly `inspect_report`'s inner `unit()` shape, and it takes the SAME two
+    # arguments for the same reason: `read_session` has never opened the OS's database,
+    # so the spans are passed in. The walk itself is not touched here — this report reads
+    # one number off it (Neo, question 680).
+    anatomy = (inspection.read_session(session, inspect_config(project),
+                                       spans=list(episodes))
+               if session else None)
+    if anatomy is not None and anatomy.found:
+        unexplained = {"seconds": round(anatomy.unexplained, 2),
+                       "seconds_human": ago_phrase(anatomy.unexplained),
+                       "residual": True, "note": UNEXPLAINED_NOTE}
+    else:
+        unexplained = {"seconds": None, "seconds_human": None, "residual": True,
+                       "note": NO_TRANSCRIPT_NOTE}
+    # `as_dict` verbatim plus the FORMATTED duration, because the human surface renders
+    # only and may compute nothing of its own (see `ago_phrase`). Nothing is taken out.
+    rows = [{**h.as_dict(now), "seconds_human": ago_phrase(h.as_dict(now)["seconds"])}
+            for h in episodes]
+    return {"episodes": rows, "by_cause": by_cause,
+            "open": next((r for r in reversed(rows) if r["open"]), None),
+            "unexplained": unexplained}
+
+
+def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
+                       shown: int = OS_CALLS_SHOWN) -> dict[str, Any]:
+    """The OS's own `claude -p` calls for this order, each with its outcome.
+
+    The limit is passed EXPLICITLY and then published, rather than left to
+    `_os_calls_detail`'s default: the read truncates, and a truncated list presented as
+    complete is the same false claim as a zero standing in for an absent number (issue
+    #227). `calls` and `failed` count the rows this report actually holds, so at the cap
+    both are a floor and `note` says so in those words.
+
+    `shown` and `more` are the HUMAN listing's arithmetic, done here because the renderer
+    renders only (see `ago_phrase`) — 200 lines of call table is not a diagnosis.
+    """
+    rows = [{**row, "outcome": "answered" if row["ok"] else "unreachable"}
+            for row in _os_calls_detail(wo_id, limit=limit)]
+    note = OS_CALLS_NOTE
+    capped = len(rows) >= limit
+    if capped:
+        note = f"{note} {OS_CALLS_CAPPED_NOTE.format(limit=limit)}"
+    return {"calls": len(rows), "failed": sum(1 for r in rows if not r["ok"]),
+            "rows": rows, "note": note, "limit": limit, "capped": capped,
+            "shown_limit": shown, "more": max(0, len(rows) - shown)}
+
+
+def ack_decision_blocker(blockers: list[str]) -> str | None:
+    """The blocker that makes acking unacceptable, or None — the one extraction of it."""
+    return next((b for b in blockers if "assumption" in b.lower()), None)
+
+
+def ack_refusal(wo: dict[str, Any], blockers: list[str]) -> str | None:
+    """Why `jarvis wo ack` would be refused on this order, or None if it would be taken.
+
+    ONE HOME FOR THE RULE: `_diagnose_commands` carried a hand-written copy of
+    `ack_attention`'s predicate, and a second copy of a predicate passes every
+    behavioural test and drifts anyway (kn-9748020c, kn-4ea33fe6). The sentence is the
+    one `ack_attention` raises, so the offer and the acceptance cannot disagree.
+    """
+    blocker = ack_decision_blocker(blockers)
+    if blocker is None:
+        return None
+    return (f"{wo['id']} is waiting on a decision ({blocker}) — acknowledging would "
+            f"bury it. Use `jarvis wo review {wo['id']}` to accept, or `--reject` to "
+            f"send it back.")
+
+
+def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
+                       blocker: dict[str, Any], needs_you: list[str],
+                       ) -> tuple[list[dict[str, str]], list[str]]:
+    """Only what the OS would accept RIGHT NOW, plus why the rest is missing.
+
+    Every predicate here MIRRORS the refusal of the command it offers rather than
+    restating it: `force_validation_refusal` is already the one home of its rule,
+    `ack_attention` refuses on an assumption blocker in those words, `unblock_work_order`
+    refuses on live edges. Offering a command that will be refused teaches the user to
+    distrust the surface (spec §6.5), and a second copy of a predicate passes every
+    behavioural test and drifts anyway (kn-4ea33fe6).
+    """
+    wo_id = str(wo["id"])
+    out: list[dict[str, str]] = []
+    refusals: list[str] = []
+
+    refusal = force_validation_refusal(store, wo, project=project,
+                                       cfg=validation_config(project))
+    if refusal is None:
+        out.append({"command": f'jarvis validation force {wo_id} --reason "…"',
+                    "why": "judge the current pull request again, now — no worker runs "
+                           "and no round is open"})
+    else:
+        refusals.append(refusal)
+
+    # `ack_attention`'s own predicate, called rather than copied (`ack_refusal`). The
+    # flag is still required: with none there is nothing to ack and nothing to refuse.
+    if wo["needs_attention"]:
+        ack_no = ack_refusal(wo, needs_you)
+        if ack_no is None:
+            out.append({"command": f"jarvis wo ack {wo_id}",
+                        "why": "put the attention flag down for good — nothing here is a "
+                               "decision that would be buried by it"})
+        else:
+            refusals.append(ack_no)
+
+    blockers = store.unfinished_dependencies(wo_id)
+    if blockers:
+        out.append({"command": f"jarvis wo unblock {wo_id}",
+                    "why": f"cut the dependency edges holding it back "
+                           f"({', '.join(d['id'] for d in blockers)})"})
+        if not invariants.dead_dependencies(store, wo):
+            # `--all` is the only form `unblock_work_order` would accept here: with no
+            # dead edge the default cuts nothing and refuses, saying the work is live.
+            out[-1] = {"command": f"jarvis wo unblock {wo_id} --all",
+                       "why": "every edge it waits on is still LIVE, so only --all cuts "
+                              "them — it then runs without the work it was to build on"}
+
+    # NUDGE_IS_WRONG half mirrors `resume_in_auto`'s own refusal, testing that mapping
+    # independently of `stalled`. Unreachable today — no `waiting_on` answer arrives both
+    # stalled and in the mapping (only `prompt` returns stalled=True) — kept because the
+    # mapping owns the rule, not this call site.
+    if blocker["stalled"] and blocker["what"] not in NUDGE_IS_WRONG:
+        out.append({"command": f"jarvis wo resume-auto {wo_id}",
+                    "why": "nothing is coming for this by itself, and this is the one "
+                           "blocker a nudge can move"})
+
+    for approval in store.escalated_approvals(wo_id):
+        out.append({"command": f'jarvis gate approve {approval["id"]} --reason "…"',
+                    "why": "a privileged action Neo sent up to you — nobody else can "
+                           "open this gate"})
+        out.append({"command": f'jarvis gate deny {approval["id"]} --reason "…"',
+                    "why": "refuse it; the reason reaches the worker"})
+    return out, refusals
+
+
+def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
+    """Why is this order not moving, and what do I type — `jarvis wo why`.
+
+    PURE COMPOSITION, AND THAT IS THE POINT (spec §6 of
+    docs/specs/2026-09-24-order-observability.md). Every part of the answer already
+    existed and was scattered over three surfaces that each showed a slice; this puts
+    them in one payload and rewrites none of them. A diagnosis that disagrees with the
+    status label is worse than no diagnosis, so where `waiting_on` and `true_blockers`
+    disagree the report says so and picks neither.
+
+    IT ACTS ON NOTHING. It files nothing, unblocks nothing, sends nothing and writes not
+    one row — the acting path is `remedies.py`, a closed registry behind a Neo approval.
+    Works on a settled order too, reporting how it settled.
+
+    NOTHING IN THE PAYLOAD IS TEXT THE OS DID NOT WRITE. Every field is an OS-authored
+    sentence, a status, a number or an id: no gate command, no prompt, no transcript
+    line, no error tail. That is the boundary `holds.Hold`'s docstring sets out and it is
+    a security one rather than minimalism — a gate's command is a privileged shell line a
+    worker proposed, routinely carrying a tokenised remote (kn-1791a5e6).
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    now = time.time()
+    store = ProjectStore(path)
+    try:
+        # One read for one row, the way `os_status` takes one for a whole listing: the
+        # account's state can change the status label of an order a usage window holds,
+        # and `fleet_if_held` answers None when nothing here is holdable or the catalog
+        # cannot be resolved (issue #714).
+        held_by_fleet = fleet_if_held([wo])
+        blocker = waiting_on(store, wo)
+        needs_you = invariants.true_blockers(store, wo, now)
+        payload = {
+            "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
+            "status": wo["status"],
+            "status_label": invariants.status_label(store, wo, held_by_fleet),
+            "blocker": blocker,
+            "needs_you": needs_you,
+            # All three `or None`: these return "" for "no note", and an empty string
+            # renders as a blank note. Absent must be absent (issue #227).
+            "notes": {
+                "parked": invariants.parked_reason(store, wo, now) or None,
+                "pause": invariants.pause_note(store, wo) or None,
+                "fleet_hold": invariants.fleet_hold_note(wo, held_by_fleet) or None,
+            },
+            "disagreements": _disagreements(blocker, needs_you),
+            "clock": _diagnose_clock(store, str(wo["id"]), now),
+            "holds": _diagnose_holds(store, wo, name, now),
+            "way_through": {"detail": blocker["detail"], "note": WAY_THROUGH_NOTE},
+        }
+        commands, refusals = _diagnose_commands(store, wo, project=name,
+                                                blocker=blocker, needs_you=needs_you)
+    finally:
+        store.close()
+    # After the store is closed on purpose: this one reads the CENTRAL database and opens
+    # its own handle, and holding two while asking is how a reader of one report ends up
+    # blocking a reconcile tick.
+    payload["os_calls"] = _diagnose_os_calls(str(wo["id"]))
+    payload["commands"] = commands
+    payload["refusals"] = refusals
+    return payload
+
+
+def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
+    """Both answers, both sources, no winner — spec §6.1.
+
+    Raised in BOTH directions because both have been wrong in production, and each names
+    the two functions and what each of them said, so the user can go and read either one
+    rather than being handed a verdict this report is in no position to reach.
+    """
+    what = blocker["what"]
+    out: list[str] = []
+    if needs_you and what not in USER_IS_NEEDED_WAITS:
+        out.append(
+            f"these two disagree and neither is overruled here: `invariants."
+            f"true_blockers` says this needs YOU ({needs_you[0]}), while `ops.waiting_on`"
+            f" says it is waiting on {what!r} — {blocker['detail']}"
+        )
+    if not needs_you and what in USER_IS_NEEDED_WAITS:
+        out.append(
+            f"these two disagree and neither is overruled here: `ops.waiting_on` says "
+            f"it is waiting on you ({what!r} — {blocker['detail']}), while `invariants."
+            f"true_blockers` says nothing here needs you"
+        )
+    return out
 
 
 def assume(wo_id: str, content: str) -> dict[str, Any]:
@@ -2323,6 +2685,11 @@ AUTOREVIEW_EVENTS = ("autoreview_accepted", "autoreview_escalated", "autoreview_
                      "autoreview_objection_withdrawn", "autoreview_confirmed",
                      "autoreview_unconfirmed")
 
+#: The kinds whose prose asserts the USER OWES A DECISION, and the only ones resolved
+#: against the assumption's current row
+#: (docs/superpowers/specs/2026-09-25-a-decided-assumption-is-not-left-with-you.md).
+_AUTOREVIEW_OWED_BY_USER = ("autoreview_escalated", "autoreview_unconfirmed")
+
 
 def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic review, or None.
@@ -2357,6 +2724,15 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # "left with you" is a claim about the PRESENT: resolve it against the row, once
+    # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §1).
+    if newest["kind"] in _AUTOREVIEW_OWED_BY_USER:
+        aid = int(newest.get("assumption_id") or 0)
+        row = store.get_assumption(aid) if aid else None
+        status = str((row or {}).get("status") or "")
+        if status and status != "pending":
+            newest = {**newest, "resolved_status": status,
+                      "resolved_decider": assumption_decider(row or {})}
     return {**newest, "line": _autoreview_line(newest)}
 
 
@@ -2701,13 +3077,17 @@ def _autoreview_line(state: dict[str, Any]) -> str:
     """One line. The verb says WHO acted, which is the whole point of the record."""
     kind = state["kind"]
     n = state.get("n")
+    # One shared suffix: both "left with you" branches make the same claim
+    # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §2).
+    since = (f"; since {state['resolved_status']} by {state['resolved_decider']}"
+             if state.get("resolved_status") else "")
     if kind == "autoreview_accepted":
         return (f"assumption #{n} accepted by the OS (Neo, "
                 f"{state.get('model') or 'model not recorded'}) — "
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_escalated":
         return (f"assumption #{n} left with you — "
-                f"{state.get('reason') or 'no reason recorded'}")
+                f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_asked":
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
     # The early pass's five. Each gets a branch rather than falling through, because the
@@ -2728,7 +3108,7 @@ def _autoreview_line(state: dict[str, Any]) -> str:
                 f"{state.get('reason') or 'no reason recorded'}")
     if kind == "autoreview_unconfirmed":
         return (f"assumption #{n} left with you — the OS did not confirm its early "
-                f"reading: {state.get('reason') or 'no reason recorded'}")
+                f"reading: {state.get('reason') or 'no reason recorded'}{since}")
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
@@ -4874,15 +5254,13 @@ def ack_attention(wo_id: str | None = None, all_projects: bool = False,
                 candidates = [w for w in store.list_work_orders() if w["needs_attention"]]
             for wo in candidates:
                 blockers = true_blockers(store, wo)
-                needs_decision = [b for b in blockers if "assumption" in b.lower()]
-                if needs_decision:
+                refusal = ack_refusal(wo, blockers)
+                if refusal is not None:
                     if wo_id:
-                        raise OpsError(
-                            f"{wo['id']} is waiting on a decision ({needs_decision[0]}) "
-                            f"— acknowledging would bury it. Use `jarvis wo review "
-                            f"{wo['id']}` to accept, or `--reject` to send it back."
-                        )
-                    skipped.append({"wo_id": wo["id"], "reason": needs_decision[0]})
+                        raise OpsError(refusal)
+                    # The BLOCKER, not the sentence: a sweep reports what it skipped over.
+                    skipped.append({"wo_id": wo["id"],
+                                    "reason": ack_decision_blocker(blockers) or ""})
                     continue
                 store.ack_attention(wo["id"], blockers)
                 acknowledged.append(wo["id"])
@@ -5940,6 +6318,56 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
         store.close()
 
 
+def _planner_work_order(path: Path, fo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature's planner row, for `landing.committed_text`'s first rung."""
+    if not fo.get("plan_wo_id"):
+        return None
+    store = ProjectStore(path)
+    try:
+        return store.get_work_order(fo["plan_wo_id"])
+    finally:
+        store.close()
+
+
+def _spec_branch(path: Path, planner_wo: dict[str, Any] | None) -> str:
+    """Which branch the refusal below tells the planner to commit on."""
+    from . import evidence, landing
+
+    worktree = landing.worktree_of(path, planner_wo) if planner_wo else None
+    branch = landing.authored(worktree).branch if worktree else ""
+    return branch or evidence.base_ref(path) or "the default branch"
+
+
+def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
+                     planner_id: str, source: str, why: str) -> dict[str, Any]:
+    """Ask for a review of this plan, closing whichever review it replaces.
+
+    ONE sequence for both callers (§9): a submission and a spec refresh perform the same
+    supersede-then-ask, and two copies would be two chances to disagree about what a
+    re-ask means. A resubmission moves `plan_question_id` off the previous review, and
+    `review_plan` only ever closes the one it currently points at — so an escalated plan
+    question survived every revision that followed it (production questions 67 and 130).
+    Closing it here is the only moment that knows both ids.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        q = neo.ask(name, planner_id, plans.build_plan_question(fo, plan),
+                    context=plans.build_plan_context(plan, source), kind="plan")
+        if fo.get("plan_question_id"):
+            neo.supersede(
+                fo["plan_question_id"],
+                f"SUPERSEDED by question {q['id']}",
+                f"{why}; question {q['id']} reviews the version that replaced the one "
+                f"this asks about",
+            )
+    finally:
+        neo.close()
+    return q
+
+
 def submit_plan(fo_id: str, doc: Any,
                 project_name: str | None = None) -> dict[str, Any]:
     """(Planners) hand back the decomposition. The planner's terminal action.
@@ -5951,8 +6379,7 @@ def submit_plan(fo_id: str, doc: Any,
     briefing tells it not to call the latter. A rejection later re-opens the same session
     through the ordinary message path, so settling now costs the revision nothing.
     """
-    from . import plans
-    from .neo_store import NeoStore
+    from . import landing, plans
 
     name, path, fo = find_feature_order(fo_id, project_name)
     _require_kind(fo, "feature", "jarvis io report")
@@ -5979,19 +6406,20 @@ def submit_plan(fo_id: str, doc: Any,
     # section or find the agent profile without it, and this is the one place that holds
     # both. Reported together with a second `PlanError` shape so a planner fixes
     # everything in one revision, which is `PlanError`'s whole argument.
-    candidates = []
-    if fo.get("plan_wo_id"):
-        candidates.append(path / ".claude" / "worktrees" / fo["plan_wo_id"]
-                          / plan["design_doc"])
-    candidates.append(path / plan["design_doc"])
-    existing = next((c for c in candidates if c.is_file()), None)
-    if existing is None:
+    #
+    # The COMMITTED copy, never the working tree (§6, ruling 667): a snapshot taken from
+    # a mutable worktree is text that exists in no commit, and it is what the children
+    # and the reviewer are then built from.
+    planner_wo = _planner_work_order(path, fo)
+    found = landing.committed_text(path, planner_wo, plan["design_doc"])
+    if found is None:
         raise OpsError(
-            f"the plan names design_doc {plan['design_doc']!r} but no such file "
-            f"exists — write it before submitting (looked in: "
-            + ", ".join(str(c) for c in candidates) + ")"
+            f"the plan names design_doc {plan['design_doc']!r} but no COMMITTED copy "
+            f"exists on {_spec_branch(path, planner_wo)} — the reviewer is sent the "
+            f"committed text, never your working tree. Commit it and resubmit:\n"
+            f"  git add {plan['design_doc']} && git commit -m \"spec: …\""
         )
-    plan["design_doc_content"] = existing.read_text()
+    plan["design_doc_content"], source = found
     spec_problems = plans.spec_problems(plan, plan["design_doc_content"])
     if spec_problems:
         raise OpsError(
@@ -6004,25 +6432,8 @@ def submit_plan(fo_id: str, doc: Any,
     # order whose planner was deleted still submits — the question just names the feature
     # order instead of a row that no longer exists.
     planner_id = fo.get("plan_wo_id") or fo_id
-    question = plans.build_plan_question(fo, plan)
-    neo = NeoStore()
-    try:
-        q = neo.ask(name, planner_id, question, kind="plan")
-        # A resubmission moves `plan_question_id` off the previous review, and
-        # `review_plan` only ever closes the one it currently points at — so an
-        # escalated plan question survived every revision that followed it (production
-        # questions 67 and 130, the second still asking for the user three days after
-        # its successor was approved). Close it here, naming what replaced it, because
-        # this is the only moment that knows both ids.
-        if fo.get("plan_question_id"):
-            neo.supersede(
-                fo["plan_question_id"],
-                f"SUPERSEDED by question {q['id']}",
-                f"the plan was revised and resubmitted; question {q['id']} reviews the "
-                f"version that replaced the one this asks about",
-            )
-    finally:
-        neo.close()
+    q = _ask_plan_review(name, fo, plan, planner_id, source,
+                         why="the plan was revised and resubmitted")
 
     store = ProjectStore(path)
     try:
@@ -6050,6 +6461,99 @@ def submit_plan(fo_id: str, doc: Any,
             f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
         )
     return out
+
+
+def refresh_plan_spec(fo_id: str,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Keep the spec under review equal to the spec as committed. (B) of issue #746.
+
+    §9 of docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md.
+    A plan sits in `plan_review` for minutes while its planner may still be committing
+    revisions of the very document the review judges; question 658 was answered 22
+    seconds after the revision it should have read merged. Here per tick, beside
+    `submit_plan` because it performs the same three writes and must not perform them
+    differently.
+
+    THE ORDERING INVARIANT: the text the reviewer judges and the text the children are
+    built from are the same text. That is why a refresh never happens without a re-ask,
+    and why a revision the plan no longer satisfies is REJECTED to the planner instead
+    of refreshed under it.
+    """
+    from . import landing, plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    out: dict[str, Any] = {"project": name, "fo_id": fo_id, "refreshed": False}
+    if fo["status"] != "plan_review":
+        return {**out, "reason": f"{fo_id} is {fo['status']}"}
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    qid = fo.get("plan_question_id")
+    if not (plan.get("design_doc") and plan.get("design_doc_content") and qid):
+        return {**out, "reason": "no spec under review"}
+    neo = NeoStore()
+    try:
+        q = neo.get(qid)
+    finally:
+        neo.close()
+    # `answered` means the decision is taken; the verdict is on its way through the drain.
+    if q is None or q["status"] == "answered":
+        return {**out, "reason": "the review is decided"}
+
+    found = landing.committed_text(path, _planner_work_order(path, fo),
+                                   plan["design_doc"])
+    if found is None:
+        # §7 rung 3. A stale spec the reviewer was told IS the spec beats no spec, so the
+        # snapshot and the question are left exactly as they are.
+        log.warning("[%s] %s: no committed copy of %s on any rung — the plan under "
+                    "review keeps the spec it was submitted with", name, fo_id,
+                    plan["design_doc"])
+        return {**out, "reason": "nothing readable"}
+    text, source = found
+    if (hashlib.sha256(text.encode()).hexdigest()
+            == hashlib.sha256(str(plan["design_doc_content"]).encode()).hexdigest()):
+        return {**out, "reason": "unchanged"}
+
+    if q["status"] in ("escalated", "failed"):
+        # The user holds this question. Pulling it out of their queue would leave
+        # `flag_feature_attention` pointing at a closed row, so they are told instead.
+        store = ProjectStore(path)
+        try:
+            store.flag_feature_attention(
+                fo_id, "the spec has been revised since this plan was reviewed — reject "
+                       "it and let the planner resubmit")
+        finally:
+            store.close()
+        return {**out, "reason": "the user holds the question"}
+
+    problems = plans.spec_problems(plan, text)
+    if problems:
+        # The committed revision broke the plan. Back to the planner through the one path
+        # that already exists, which also closes the question.
+        feedback = ("the spec was revised on " + source + " and the plan no longer fits "
+                    "it:\n  - " + "\n  - ".join(problems))
+        review_plan(fo_id, accept=False, feedback=feedback, decided_by="os",
+                    project_name=name)
+        return {**out, "reason": "rejected", "problems": problems}
+
+    plan["design_doc_content"] = text
+    planner_id = fo.get("plan_wo_id") or fo_id
+    q2 = _ask_plan_review(name, fo, plan, planner_id, source,
+                          why=f"the spec was revised on {source}")
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(fo_id, plan=db.to_json(plan),
+                                   plan_question_id=q2["id"])
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_spec_refreshed", {
+                "feature_order": fo_id, "source": source,
+                "was_question": qid, "neo_question_id": q2["id"],
+            })
+    finally:
+        store.close()
+    log.info("[%s] %s: the spec moved to %s — re-asked as question %s", name, fo_id,
+             source, q2["id"])
+    return {**out, "refreshed": True, "source": source, "neo_question_id": q2["id"],
+            "superseded": qid}
 
 
 def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
@@ -8798,6 +9302,164 @@ def live_report(target: str, project: str | None = None, *,
         store.close()
 
 
+#: The precedence, carried in the PAYLOAD and not only in this file's prose, because the
+#: CLI and the dashboard must both be able to print it: a `prefix-miss` classification is
+#: an observation of what the API was charged for, and a context delta is an explanation
+#: offered for it. kn-fafe92b7 is explicit that `invariants.check_prefix_stable` is the
+#: authoritative measurement of prefix stability, and kn-2c41d4cc that a proxy earns its
+#: place beside an authority by NAMING A CAUSE rather than raising a second alarm — which
+#: is why this report raises none.
+PREFIX_AUTHORITY = (
+    "the write classification is the authority and the delta is the hypothesis; "
+    "`invariants.check_prefix_stable` is the authoritative measurement of prefix "
+    "stability"
+)
+
+#: What a work order whose turns all predate the ledger reads as. Forward-only: the
+#: ingredients of orders that already ran were never recorded and cannot be recovered, and
+#: an empty table is what a reader reports as a bug (spec §5).
+NOT_RECORDED = ("not recorded for this order — its turns ran before the context ledger "
+                "landed")
+TURN_NOT_RECORDED = ("not recorded for this turn — it ran before the context ledger "
+                     "landed, or its measurement failed")
+
+
+def context_report(wo_id: str, project: str | None = None, *,
+                   turn: int | None = None) -> dict[str, Any]:
+    """What Jarvis put in each of a work order's context windows, and the delta.
+
+    §5 of docs/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
+    the renderers compute nothing: the residual subtraction, the per-turn delta and the
+    sentence naming a prefix break are keys of this payload.
+
+    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`,
+    never by transcript turn numbering — `inspection` renumbers the turns it finds in the
+    transcript files, and that sequence is not `wo_turns.seq` (a coalesced delivery, an
+    adopted session or a second segment file makes them disagree). The window is the OS's
+    own record of when the process ran, which is the thing both sides share.
+    """
+    from . import context as context_mod
+    from . import inspection
+    from . import usage as usage_mod
+
+    name, path, wo = find_work_order(wo_id, project)
+    store = ProjectStore(path)
+    try:
+        # `all_turns` and not `list_turns`: that one stops at 100 by default, which on a
+        # long order would drop the later turns out of a per-turn ledger silently.
+        rows = store.all_turns(wo_id)
+        session = wo.get("session_id") or ""
+        cfg = inspect_config(name)
+        anatomy = (inspection.read_session(session, cfg,
+                                          index=usage_mod.index_sessions())
+                   if session else None)
+        if turn is not None and not any(r["seq"] == turn for r in rows):
+            raise OpsError(f"{wo_id} has no turn {turn} "
+                           f"(it has {len(rows)}: "
+                           f"{', '.join(str(r['seq']) for r in rows) or 'none'})")
+        out: list[dict[str, Any]] = []
+        previous: tuple[int, list[dict[str, Any]]] | None = None
+        for row in rows:
+            payload = db.from_json(row["context_json"]) if row["context_json"] else None
+            entry: dict[str, Any] = {
+                "seq": row["seq"], "kind": row["kind"],
+                "started_at": row["started_at"], "ended_at": row["ended_at"],
+                "recorded": payload is not None,
+                # Two different absences, two different keys: `note` is "this turn was
+                # never measured", `residual_note` is "it was, but Claude Code's own
+                # share cannot be inferred". One field carrying both would make the
+                # renderer print the wrong sentence for one of them.
+                "note": "" if payload else TURN_NOT_RECORDED,
+                "residual_note": "",
+                "ingredients": (payload or {}).get("ingredients") or [],
+                "caps": (payload or {}).get("caps") or {},
+                "token_bytes": (payload or {}).get("token_bytes"),
+                "residual": None, "delta": None, "prefix_break": None,
+            }
+            if payload:
+                entry["residual"] = _turn_residual(entry, anatomy, context_mod,
+                                                   inspection)
+                if previous is not None:
+                    entry["delta"] = context_mod.delta(
+                        entry["ingredients"], previous[1], against_seq=previous[0])
+                entry["prefix_break"] = _turn_prefix_break(entry, anatomy, inspection)
+                previous = (row["seq"], entry["ingredients"])
+            out.append(entry)
+    finally:
+        store.close()
+
+    recorded = [t for t in out if t["recorded"]]
+    return {
+        "wo_id": wo["id"], "project": name, "title": wo["title"],
+        "recorded": bool(recorded),
+        "note": "" if recorded else NOT_RECORDED,
+        "turns": [t for t in out if turn is None or t["seq"] == turn],
+    }
+
+
+def _in_window(ts: float, turn: dict[str, Any]) -> bool:
+    """Is this cache write inside the turn's process window? See `context_report` for why
+    the join is on the clock and not on a turn number. An unfinished turn has no
+    `ended_at`, and everything after its start belongs to it — it is the live one."""
+    if ts < (turn["started_at"] or 0.0):
+        return False
+    end = turn["ended_at"]
+    return True if end is None else ts <= end
+
+
+def _turn_residual(entry: dict[str, Any], anatomy: Any, context_mod: Any,
+                   inspection: Any) -> dict[str, Any] | None:
+    """The inferred row for one turn, or None with a sentence when it cannot be read.
+
+    None rather than a zeroed row when there is no session or the transcript has expired:
+    an unmeasurable prefix and a prefix of nothing are different answers, which is the
+    same rule `jarvis inspect` reports `found: false` under.
+    """
+    if anatomy is None or not anatomy.found:
+        entry["residual_note"] = (
+            "Claude Code's own share cannot be inferred: no transcript for this session "
+            "— it has expired, or the session never wrote one")
+        return None
+    cold = next((w for w in anatomy.writes
+                 if w.cause == inspection.COLD_START and _in_window(w.ts, entry)), None)
+    return context_mod.residual(context_mod.measured_tokens(entry["ingredients"]), cold)
+
+
+def _turn_prefix_break(entry: dict[str, Any], anatomy: Any,
+                       inspection: Any) -> dict[str, Any] | None:
+    """The `prefix-miss` writes that land in this turn, joined to its delta.
+
+    The join is the point of the whole section: one sentence that says the prefix broke
+    here and names what grew. `PREFIX_AUTHORITY` travels with it so no renderer can print
+    the hypothesis without the precedence.
+    """
+    if anatomy is None or not anatomy.found:
+        return None
+    writes = [w for w in anatomy.writes
+              if w.cause == inspection.PREFIX_MISS and _in_window(w.ts, entry)]
+    if not writes:
+        return None
+    delta = entry["delta"]
+    grew = (delta or {}).get("biggest_growth")
+    if delta is None:
+        cause = (f"the prefix broke at turn {entry['seq']} and there is no earlier "
+                 f"recorded turn to compare its ingredients against")
+    elif grew:
+        row = next(r for r in delta["rows"] if r["name"] == grew)
+        cause = (f"the prefix broke at turn {entry['seq']} and {grew} grew "
+                 f"{row['bytes_delta']:,} bytes since turn {delta['against_seq']}")
+    else:
+        moved = ", ".join([f"{n} appeared" for n in delta["appeared"]]
+                          + [f"{n} disappeared" for n in delta["disappeared"]])
+        cause = (f"the prefix broke at turn {entry['seq']} and no measured ingredient "
+                 f"grew since turn {delta['against_seq']}"
+                 + (f" ({moved})" if moved else ""))
+    return {"writes": [w.as_dict() for w in writes],
+            "tokens_rewritten": sum(w.written for w in writes),
+            "delta": delta, "cause": cause, "authority": PREFIX_AUTHORITY,
+            "note": "this report names a cause and raises no alarm of its own"}
+
+
 def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
     """The twenty keys `list_cost_alarms` publishes, from one `alarms_across` row.
 
@@ -9554,6 +10216,40 @@ def _release_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     }]
 
 
+def _plan_effects(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
+    """The plan this work order submitted, if it submitted one. Spec
+    docs/superpowers/specs/2026-09-25-a-plan-submission-is-not-an-empty-packet.md §5-§6.
+
+    A plan authors nothing in the planner's worktree: the design doc is snapshotted into
+    the stored plan and the children are created later, so the packet was empty and every
+    planner escalated (fo-ff8570fa).
+
+    The pointer IS the proof, unlike `_release_effects`' marker: `submit_plan` is the only
+    writer of `plan`, it writes only after the plan validated, and `plan_wo_id` is set when
+    the planner is created rather than by a worker.
+
+    Raises nothing on absence, which is the registry's rule: see `side_effects_of`.
+    """
+    fo = store.feature_order_for_planner(wo_id) if wo_id else None
+    plan = db.from_json(fo.get("plan"), {}) if fo else {}
+    if not plan:
+        return []
+    children = len(plan.get("children") or [])
+    return [{
+        "kind": "plan_submitted", "id": fo["id"],
+        "summary": f"submitted the plan for {fo['id']}: it decomposes into "
+                   f"{children} work orders",
+        "detail": (
+            f"design doc {plan.get('design_doc') or '?'}, {children} children, "
+            f"queued for review as Neo question "
+            f"{fo.get('plan_question_id') or '?'}.\n\n"
+            "What no diff can show: the plan lives in the feature order's `plan` column "
+            "and dispatch materialises each child's brief from it."),
+        # Strict by §6: only the feature order that points at THIS planner attests it.
+        "verified": fo.get("plan_wo_id") == wo_id,
+    }]
+
+
 @dataclass(frozen=True)
 class SideEffectCollector:
     """One kind of durable change no diff can show, and whether a reviewer can judge it.
@@ -9581,6 +10277,7 @@ class SideEffectCollector:
 SIDE_EFFECT_COLLECTORS = (
     SideEffectCollector("knowledge", _knowledge_effects),
     SideEffectCollector("release", _release_effects, attested=True),
+    SideEffectCollector("plan", _plan_effects, attested=True),
 )
 
 

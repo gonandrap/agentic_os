@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from . import concision
@@ -408,6 +408,22 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
+#: Which net answers "is this assumption high-stakes?" before any model call
+#: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
+#:
+#: * `regex` — today's behaviour exactly: `autoreview.high_stakes_marker` decides, no
+#:   model call is made and nothing new is written. THE SHIPPED DEFAULT.
+#: * `shadow` — both run and THE REGEX STILL DECIDES. The disagreement is recorded as an
+#:   `autoreview_stakes_disagreed` event and nothing else about the order changes.
+#: * `classifier` — the model's verdict decides.
+#: * `regex-tightened` — `autoreview.HIGH_STAKES_TIGHTENED` decides. NO MODEL CALL either,
+#:   so it costs what `regex` costs. THE RECOMMENDATION of the 2026-09-25 spec §7 after
+#:   the A/B: no model arm cleared the bar on 485 hand-labelled production assumptions and
+#:   haiku answered 7.5% of a repeat run differently, which for a safety net is
+#:   disqualifying on its own. Not the default — `regex` is, so the shipped behaviour is
+#:   unchanged until a project opts in.
+STAKES_CLASSIFIER_MODES = ("regex", "shadow", "classifier", "regex-tightened")
+
 
 @dataclass
 class ValidationConfig:
@@ -488,6 +504,18 @@ class ValidationConfig:
     follow_ups: bool = True
     # The cap above, per project. See DEFAULT_VALIDATION_FOLLOW_UP_CAP.
     max_follow_ups: int = DEFAULT_VALIDATION_FOLLOW_UP_CAP
+    # WHICH NET DECIDES THAT AN ASSUMPTION IS HIGH-STAKES before any model call
+    # (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
+    # `regex`, `shadow`, `classifier` or `regex-tightened` — see STAKES_CLASSIFIER_MODES.
+    # `regex-tightened` is the A/B's RECOMMENDATION (spec SS7) and calls nothing either.
+    #
+    # NOT A BOOLEAN because `shadow` is the entire point: a boolean
+    # offers "measure it in production" and "swap it" with nothing in between, and this
+    # net guards the one authority the user hands over one project at a time. Ships
+    # `regex`, which is today's behaviour exactly — no call, no row, no event.
+    #
+    # Same field-level fallback as every flag in this block.
+    stakes_classifier: str = "regex"
 
 
 # -- the house style: how terse the OS holds its workers ---------------------------------
@@ -839,6 +867,34 @@ class WiringConfig:
     disabled_skills: tuple[str, ...] = ()
 
 
+#: Tracked files an installed TOOL owns and rewrites. `.serena/project.yml` is the case
+#: that named the class: Serena regenerates it from its own template on activation — in
+#: the worker's worktree, seconds into turn 1 — so `git add -A` stages ~120 lines of
+#: vendor comments into a pull request about something else. Adding the next one is a
+#: `jarvis config set`, not a release. Spec docs/superpowers/specs/
+#: 2026-09-25-serena-config-churn-and-tool-managed-files.md.
+DEFAULT_TOOL_MANAGED_PATHS = (".serena/project.yml",)
+
+
+@dataclass
+class WorktreeConfig:
+    """What is true of a WORKER'S worktree specifically, and not of the shared checkout.
+
+    The one lever so far marks each `tool_managed_paths` entry `skip-worktree` in the
+    worktree's index (`hooks.mark_tool_managed_paths`): the tool keeps rewriting the file,
+    the worker keeps reading it, and git stops reporting it as modified. The shared
+    checkout is deliberately untouched — a schema upgrade there is the user's to see and
+    commit.
+
+    The list REPLACES rather than merges when a project overrides it — `WiringConfig`'s
+    rule (kn-6ca2bcd9), for its reason: inheritance is field-level.
+    """
+
+    #: Repo-relative paths. Absolute paths and `..` are refused by `_parse_worktree`:
+    #: the value is handed to `git -C <worktree>`.
+    tool_managed_paths: tuple[str, ...] = DEFAULT_TOOL_MANAGED_PATHS
+
+
 @dataclass
 class ScheduleConfig:
     """Recurring work orders: whether, how often, and which.
@@ -1013,6 +1069,7 @@ class ProjectSpec:
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
+    worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1122,6 +1179,7 @@ class OsConfig:
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
+    worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
 
 
 @dataclass
@@ -1331,6 +1389,14 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    stakes_classifier = str(
+        raw.get("stakes_classifier", base.stakes_classifier) or "regex")
+    if stakes_classifier not in STAKES_CLASSIFIER_MODES:
+        # The `roster` precedent: refused loudly rather than shrugged to the default,
+        # because a typo here silently decides which net guards the settle path — and
+        # falling back would read as the feature being off.
+        raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
+                   f"one of {list(STAKES_CLASSIFIER_MODES)}")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
@@ -1354,6 +1420,8 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         auto_merge=bool(raw.get("auto_merge", base.auto_merge)),
         # Same fallback, same reason — see `ValidationConfig.auto_review`.
         auto_review=bool(raw.get("auto_review", base.auto_review)),
+        # Same fallback again — see `ValidationConfig.stakes_classifier`.
+        stakes_classifier=stakes_classifier,
     )
 
 
@@ -1522,6 +1590,30 @@ def _parse_wiring(raw: Any, base: WiringConfig | None = None,
         disabled_plugins=_names("disabled_plugins", base.disabled_plugins),
         disabled_skills=_names("disabled_skills", base.disabled_skills),
     )
+
+
+def _parse_worktree(raw: Any, base: WorktreeConfig | None = None,
+                    where: str = "os.worktree") -> WorktreeConfig:
+    """`os.worktree`, or a project's override of it — field-level, like `_parse_wiring`.
+
+    An absolute path and any entry containing `..` fail the whole catalog: the value is
+    handed to `git -C <worktree> update-index`, and a path escaping the worktree would
+    mark a file in the shared checkout — which is the one place Part B must not touch.
+    """
+    base = base or WorktreeConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+
+    value = raw.get("tool_managed_paths", base.tool_managed_paths)
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise _err(f"{where}.tool_managed_paths must be a list of paths")
+    paths = tuple(str(v) for v in value)
+    for path in paths:
+        if PurePosixPath(path).is_absolute() or Path(path).is_absolute():
+            raise _err(f"{where}.tool_managed_paths entry {path!r} must be repo-relative")
+        if ".." in PurePosixPath(path).parts:
+            raise _err(f"{where}.tool_managed_paths entry {path!r} must not contain '..'")
+    return WorktreeConfig(tool_managed_paths=paths)
 
 
 def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
@@ -1758,6 +1850,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
+        worktree=_parse_worktree(os_raw.get("worktree", {})),
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
@@ -1844,6 +1937,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         wiring_cfg = _parse_wiring(
             p.get("wiring", {}), base=os_cfg.wiring,
             where=f"projects[{i}] ({name}).wiring")
+        worktree_cfg = _parse_worktree(
+            p.get("worktree", {}), base=os_cfg.worktree,
+            where=f"projects[{i}] ({name}).worktree")
         projects.append(
             ProjectSpec(
                 name=name,
@@ -1862,6 +1958,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 bugs=bugs_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
+                worktree=worktree_cfg,
                 raw=p,
             )
         )

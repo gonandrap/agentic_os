@@ -639,6 +639,16 @@ def build_parser() -> argparse.ArgumentParser:
                                       "one the session's directory is inside)")
     ij.add_argument("--title", help="work order title (default: the session's name)")
 
+    cx = wo.add_parser("context",
+                       help="what Jarvis put in this work order's context window, turn "
+                            "by turn: the ingredient sizes (estimated), the inferred "
+                            "residual, and what changed since the previous turn")
+    cx.add_argument("wo_id")
+    cx.add_argument("--project")
+    cx.add_argument("--turn", type=int, metavar="N",
+                    help="one turn only, by its sequence number")
+    cx.add_argument("--json", action="store_true")
+
     ra = wo.add_parser("resume-auto",
                        help="say what a work order is really waiting on, and unstick it "
                             "if it is a permission prompt (nothing else can be)")
@@ -647,6 +657,12 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--force", action="store_true",
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
+
+    wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
+                                   "what has held it, what the OS spent on it, and the "
+                                   "commands that would be accepted right now")
+    wy.add_argument("wo_id")
+    wy.add_argument("--project")
 
     # feature orders -------------------------------------------------------------------
     # Parallel to `wo` on purpose: a user who knows the work-order surface should not
@@ -1593,13 +1609,18 @@ def _print_bill(bill: dict) -> None:
                           ("agents", "agent by agent — the lead, then what it spawned"),
                           ("orders", "the orders under it")):
         lines = bill.get(view) or []
-        if not lines:
+        own = bill.get("own") if view == "orders" else None
+        if not lines and not own:
             continue
         print(f"\n{caption}:")
         print(f"{'$':>9} {'tokens':>8}")
         if view == "orders":
             for order in lines:
                 _print_bill_line(order["total"])
+            if own:
+                # Relabelled: its label is the parent's id, which beside the child ids
+                # would read as one more order rather than as the parent's own spend.
+                _print_bill_line({**own, "label": bill_mod.OWN_LABEL})
             continue
         for line in lines:
             _print_bill_line(line)
@@ -2321,6 +2342,55 @@ def _budget_arg(args: argparse.Namespace) -> float | None:
     return _parse_budget_amount(raw) if raw else None
 
 
+def _print_context(res: dict[str, Any]) -> None:
+    """`jarvis wo context` for a human. DERIVES NOTHING: every number and every sentence
+    here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
+    (spec docs/specs/2026-09-24-order-observability.md §5)."""
+    print(f"{res['wo_id']}  {res['project']}  {res['title']}")
+    if not res["recorded"]:
+        print(f"\n  {res['note']}")
+        return
+    for turn in res["turns"]:
+        print(f"\nturn {turn['seq']} ({turn['kind']})")
+        if not turn["recorded"]:
+            print(f"  {turn['note']}")
+            continue
+        print("  ingredient            bytes      tokens (all token figures are "
+              "estimates)")
+        for row in turn["ingredients"]:
+            size = f"{row['bytes']:,}" if row["bytes"] is not None else "—"
+            tokens = f"{row['tokens']:,}" if row["tokens"] is not None else "—"
+            mark = "  (estimate)" if row["estimated"] and not row["absent"] else ""
+            print(f"  {row['name']:<20}{size:>10}{tokens:>12}{mark}")
+            if row["note"]:
+                print(f"      {row['note']}")
+        residual = turn["residual"]
+        if residual is None:
+            print(f"  residual: {turn['residual_note']}")
+        else:
+            tokens = (f"{residual['tokens']:,}" if residual["tokens"] is not None
+                      else "—")
+            print(f"  {residual['name']:<20}{'—':>10}{tokens:>12}  (INFERRED, not "
+                  f"measured)")
+            print(f"      {residual['note']}")
+        delta = turn["delta"]
+        if delta:
+            print(f"  since turn {delta['against_seq']}:")
+            for row in delta["rows"]:
+                if row["kind"] == "absent" or (row["kind"] == "change"
+                                               and not row["bytes_delta"]):
+                    continue
+                change = (f"{row['bytes_delta']:+,} bytes" if row["bytes_delta"]
+                          is not None else row["kind"])
+                print(f"    {row['name']:<20}{change}"
+                      + (f"   {row['note']}" if row["note"] else ""))
+        break_ = turn["prefix_break"]
+        if break_:
+            print(f"  {break_['cause']}")
+            print(f"      {break_['authority']}")
+            print(f"      {break_['note']}")
+
+
 def cmd_wo(args: argparse.Namespace) -> int:
     from . import invariants, ops
     from .project_store import OPEN_STATUSES, ProjectStore
@@ -2525,10 +2595,97 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "inject":
         _print(ops.inject_session(args.session_id, project_name=args.project,
                                   title=args.title), args.json)
+    elif args.wo_cmd == "context":
+        res = ops.context_report(args.wo_id, args.project, turn=args.turn)
+        if args.json:
+            _print(res, True)
+        else:
+            _print_context(res)
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "why":
+        diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
+        if args.json:
+            _print(diagnosis, True)
+        else:
+            _print_diagnosis(diagnosis)
     return 0
+
+
+def _print_diagnosis(d: dict[str, Any]) -> None:
+    """`jarvis wo why` for a person — A RENDERER AND NOTHING ELSE.
+
+    It computes no number, no total and no duration: every figure and every sentence
+    below is already in the payload, `ops.diagnose` having put the formatted durations
+    there itself. That rule is the whole reason the two surfaces cannot drift — a
+    terminal reader and a `--json` consumer are looking at one reading of one record,
+    not two derivations of it.
+
+    Order is the order the question gets asked: what is it waiting for, whether the OS's
+    two answers agree, when anything last happened, what has held it, what the OS spent
+    on it, and finally what to type.
+    """
+    print(f"{d['wo_id']} — {d['title']}  ({d['project']})")
+    print(f"  {d['status_label']}")
+    print(f"\nwaiting on: {d['blocker']['what']} — {d['blocker']['detail']}")
+    for blocker in d["needs_you"]:
+        print(f"  needs you: {blocker}")
+    for note in (d["notes"]["parked"], d["notes"]["pause"], d["notes"]["fleet_hold"]):
+        if note:
+            print(f"  {note}")
+    for sentence in d["disagreements"]:
+        print(f"  ⚠ {sentence}")
+
+    clock = d["clock"]
+    print("\nthe OS's record:")
+    if clock["last_status"]:
+        print(f"  last status    {clock['last_status']['status']} · "
+              f"{clock['last_status']['ago']} ago")
+    if clock["last_turn"]:
+        turn = clock["last_turn"]
+        print(f"  last turn      {turn['label']} {turn['state']} · "
+              f"{turn['ago']} ago")
+    if clock["last_event"]:
+        print(f"  last event     {clock['last_event']['kind']} · "
+              f"{clock['last_event']['ago']} ago")
+    if clock["note"]:
+        print(f"  {clock['note']}")
+    print(f"  {clock['live_note']}")
+
+    held = d["holds"]
+    if held["episodes"]:
+        print("\nheld by the OS:")
+        for episode in held["episodes"]:
+            mark = " (still held)" if episode["open"] else ""
+            print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    residual = held["unexplained"]
+    if residual["seconds"] is None:
+        print(f"  unexplained: none measurable — {residual['note']}")
+    elif residual["seconds"]:
+        print(f"  unexplained: {residual['seconds_human']} — "
+              f"{residual['note']}")
+
+    calls = d["os_calls"]
+    if calls["calls"]:
+        print(f"\nthe OS's own calls for this order: {calls['calls']}, "
+              f"{calls['failed']} unreachable")
+        # Newest first, which is the order `_os_calls_detail` returns. The slice depth
+        # and the remainder are both the payload's (`shown_limit`, `more`) — a count
+        # worked out here would be a second arithmetic for `--json` to disagree with.
+        for row in calls["rows"][:calls["shown_limit"]]:
+            print(f"  {row['outcome']:>11}  {row['kind']} · {row['label']}")
+        if calls["more"]:
+            print(f"  … and {calls['more']} older call(s) — `jarvis wo why "
+                  f"{d['wo_id']} --json` has them all")
+        if calls["failed"] or calls["capped"]:
+            print(f"  {calls['note']}")
+
+    print(f"\n{d['way_through']['note']}")
+    for command in d["commands"]:
+        print(f"  {command['command']}\n      {command['why']}")
+    for refusal in d["refusals"]:
+        print(f"  not offered: {refusal}")
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",

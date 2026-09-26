@@ -66,7 +66,7 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     """
     import json as _json
 
-    from . import agent_usage, concision, wiring
+    from . import agent_usage, concision, hooks, wiring
     from .bootstrap import build_settings, deep_merge
     from .paths import jarvis_home
 
@@ -176,6 +176,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # The crew is the ordinary worker's; a planner has its own team prose. Carried as
         # env rather than read at hook time for the same reason as the key above.
         "JARVIS_WO_KIND": str(wo.get("kind") or "worker"),
+        # The tracked files an installed TOOL rewrites, which the worktree's index is told
+        # not to report (`hooks.mark_tool_managed_paths`). Env for `JARVIS_GATES`' reason,
+        # and the sharper one the constant states: the `SessionStart` hook must not import
+        # `jarvis.catalog` to read a value fixed at spawn. The project spec is already
+        # resolved against the OS config, so this list is the answer for this project and
+        # the hook consults nothing else.
+        hooks.TOOL_MANAGED_PATHS_ENV: _json.dumps(
+            list(project.worktree.tool_managed_paths)),
     })
     settings["env"] = env
     out = project.path / ".jarvis" / "worker-settings" / f"{wo['id']}.json"
@@ -492,7 +500,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "{",
         '  "summary": "one line: what this feature is, once it is all done",',
         '  "design_doc": "docs/specs/<feature>.md — the spec you wrote, relative to the '
-        'repo root. REQUIRED, and it must already exist",',
+        'repo root. REQUIRED, and it must already be COMMITTED on your branch — the '
+        'reviewer is sent the committed text, never your working tree",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
@@ -516,11 +525,12 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "## THE SPEC IS THE DELIVERABLE. The plan is an index into it.",
         "Write the feature's spec FIRST — a markdown file in your worktree (convention: "
-        "`docs/`), with numbered sections — and name it in `design_doc`. It must exist "
-        "before you submit; a plan that names no spec, or names one that is not on disk, "
-        "is refused. Everything you know because you read the whole feature — the "
-        "architecture, the data model, the interfaces, the traps — goes THERE, once, and "
-        "is never repeated into a brief.",
+        "`docs/`), with numbered sections — and name it in `design_doc`. Commit it "
+        "before you submit; a plan that names no spec, or names one that is not "
+        "committed on your branch, is refused — writing the file is not enough, the "
+        "reviewer only ever sees the committed text. Everything you know because you "
+        "read the whole feature — the architecture, the data model, the interfaces, the "
+        "traps — goes THERE, once, and is never repeated into a brief.",
         "",
         "**Cut the spec's sections along the feature's FUNCTIONAL boundaries, because "
         "the sections are the split.** One section, one work order: every child names "
@@ -568,7 +578,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"edge of \"the margin, not the brief\", and it is not negotiable by writing "
         f"more carefully: if the piece needs more than that to explain, the explanation "
         f"belongs in its section of the spec",
-        "- a plan naming no `design_doc`, or one naming a file that is not on disk",
+        "- a plan naming no `design_doc`, or one naming a file not committed on your "
+        "branch",
         "- a child with no `spec_section`, a `spec_section` matching no heading in the "
         "spec, two children claiming the same section, or a child claiming the `Agent "
         "profile` appendix",
@@ -1025,7 +1036,7 @@ def dispatch_work_order(
     resolved model/effort/permission mode — and hands the running of it to
     `worker_session`, which owns the transport.
     """
-    from . import budget, worker_session
+    from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
     knowledge = central.knowledge_brief(
@@ -1057,7 +1068,7 @@ def dispatch_work_order(
     wo = store.get_work_order(wo["id"])
 
     try:
-        turn = worker_session.start(store, project, wo, prompt)
+        turn, briefing = worker_session.start(store, project, wo, prompt)
     except budget.BudgetExhausted as e:
         # Spent before it ever ran a turn — its feature had nothing left to lend it, or
         # the panel and Neo spent the order's own budget on an earlier round. Not a
@@ -1090,6 +1101,15 @@ def dispatch_work_order(
             )
         raise
 
+    # THE CONTEXT LEDGER for the seq-1 dispatch turn, and only that one: Neo's ruling on
+    # question 681 partitions the writers so no row is written twice, and this is the only
+    # site holding the `KnowledgeBrief` the knowledge block is measured from
+    # (`worker_session._launch` records every other turn). The briefing comes back from
+    # `start` rather than being rebuilt — `briefing_for` REWRITES the worker settings
+    # file, and a measurement must not have side effects. Spec docs/specs/
+    # 2026-09-24-order-observability.md §5.
+    if turn["seq"] == 1:
+        context.record(store, project, wo, turn, briefing, knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {

@@ -311,6 +311,19 @@ blob per turn with the same lifetime and the same owner. Follow `ProjectStore._m
 `ADDED_COLUMNS`. `kn-c712a5d6` is the rule for testing it: a new column is untested until
 a test writes it *and* a test reads a row that predates it.
 
+**One writer function, two call sites.** The ledger is written through one helper,
+`context.record(store, project, wo, turn)`, and that helper is called at TWO sites:
+`dispatch.dispatch_work_order` and `worker_session.start`. "One write call in
+`dispatch.py`" in the child's brief means one WRITER FUNCTION, not one call site, and
+this paragraph supersedes both that reading and the "at dispatch" wording earlier in
+this section. `dispatch_work_order` normally runs once per work order and every later
+turn is opened by `worker_session.start`, so a dispatch-only write would ship a delta
+feature whose delta is always empty, and a prefix miss at turn 5 could never be
+explained. Every path that opens a turn must record. The prompt text
+`dispatch.build_worker_prompt` produces and the value of `hooks.prefix_fingerprint` stay
+byte-identical, so the existing test asserting that stays (Neo, question 681 on
+wo-3a7d9bda, 2026-09-25).
+
 **The delta, and the join that makes this worth having.** `ops.context_report(wo_id,
 project) -> {"turns": [{"seq", "ingredients": [...], "delta": {...}, "prefix_break":
 {...} | null}]}`. The delta is this turn's ingredients against the previous turn's. The
@@ -445,8 +458,23 @@ must not 500 the page — `uilog` turns a dashboard 500 into an inbox item and
 Filed to the backlog where a backlog item is the right home. Listed here so nobody
 re-proposes them mid-feature.
 
-**OTEL is not out of scope here, and it is not rejected.** Whether Claude Code's
-OpenTelemetry export earns a place in this tree is UNDECIDED, and §9 owns that decision.
+**OTEL is DECLINED, on a measurement and not on the prior.** A real headless turn on CLI
+2.1.282 exported to a recording listener (`scripts/spike_otel.py`, findings in
+`docs/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
+tree needs: `tool_result` gives `tool_input_size_bytes` and never the input, so §4 is
+unserved; cache tokens arrive as flat `cache_read_tokens` / `cache_creation_tokens` with no
+`ephemeral_5m` / `ephemeral_1h` and no `modelUsage`, so `classify_writes`'s cause is
+underivable; and nothing anywhere reports window share, so §5 stands. The killed turn
+settles it — SIGKILL at t=25.02s exported metrics: none at all, last log flush t=19.54s,
+~5.5s of events including the final `tool_result` lost — and a 3000ms interval narrows that
+window without closing it, because the exporter dies with the process. The env seam stays
+one line — the `env = {**os.environ, **cache_env()}` dict in `claude_cli.spawn_turn` — so
+the door is open at zero cost. Reason 2's "new failure
+mode" was CONTRADICTED: a dead endpoint costs a turn nothing (`rc=0`, `subtype: success`,
+`duration_ms: 7893`) — the concern that replaced it is `user.email` and the account
+identifiers riding on every record and every flush. Parked here as backlog notes, the two
+things OTEL uniquely has: per-hook `total_duration_ms` and per-request `ttft_ms`; neither
+serves a section of this feature and no feature order is filed.
 
 **Hook-recorded tool spans, and any live-state table. Rejected on the merits, not deferred
 for size.** `PostToolUse` is already matched in `assets/settings.base.json`, so a hook would
@@ -612,6 +640,11 @@ already landed, and §5 itself is written with no knowledge of the config. Say i
 on the surface and in the config's own docstring: `off` does not disable `jarvis watch`,
 `jarvis inspect`, `jarvis wo why` or the debug page.
 
+**Where the level guard goes.** Apply it to `context.record` ITSELF, or to both of its
+call sites — `dispatch.dispatch_work_order` and `worker_session.start` — and NOT only to
+the `dispatch.py` call: guarding only `dispatch.py` leaves the `worker_session.start`
+path writing at level `off` (Neo, question 681 on wo-3a7d9bda, 2026-09-25).
+
 **The three levels, concretely.** `off` means §5 writes no per-turn ingredient row, and
 changes NOTHING else. The consequence a user notices: an order run at `off` has no context
 ledger afterwards, so `jarvis wo context` reports it as not recorded — §5's forward-only
@@ -624,8 +657,8 @@ level.
 
 **The meter.** `src/jarvis/observability.py`, which is also where the precedence resolver
 lives. Every observability payload — `ops.live_report`, `ops.inspect_report`,
-`ops.context_report`, `ops.diagnose`, and §5's dispatch-time write — is wrapped at its own
-definition, by this section, after all four exist, so that each invocation records one row
+`ops.context_report`, `ops.diagnose`, and §5's `context.record` write — is wrapped at its
+own definition, by this section, after all four exist, so that each invocation records one row
 through the EXISTING `agent_usage` seam (`agent_usage.record` / `agent_usage.recorder`,
 `src/jarvis/agent_usage.py`), under new kinds, against the work order it was run for. Wall
 clock is recorded; tokens are recorded as they are actually reported, which for a
