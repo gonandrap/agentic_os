@@ -289,6 +289,55 @@ def test_an_act_before_the_delivery_is_not_a_response(project):
         row_of(store, wo["id"], row["id"]))
 
 
+# -- the pointer each surface adds for a panel hold --------------------------------------
+
+
+def panel_held_order(store, *, outcome: str, round_in_payload: int | None = 1):
+    """An order whose one pending assumption is held because the panel gave up."""
+    from jarvis import autoreview
+
+    wo = store.create_work_order(title="an order the panel gave up on", description="d")
+    aid = store.add_assumption(wo["id"], "the exporter handles the empty case")
+    store.set_status(wo["id"], "needs_review")
+    r = store.open_validation_round(wo_id=wo["id"], fingerprint="fp1")
+    store.close_validation_round(r["id"], outcome, "the seats could not agree")
+    payload = {"code": autoreview.HELD_PANEL_GAVE_UP,
+               "reason": "the validation panel gave up on round 1 and put this work order "
+                         "in front of you — the seats could not agree",
+               "assumption_id": aid, "n": 1}
+    if round_in_payload is not None:
+        payload["round"] = round_in_payload
+    store.add_event(wo["id"], "autoreview_held", payload)
+    return wo
+
+
+def test_a_panel_hold_links_to_the_round_it_names(client, project):
+    """AN ANCHOR THAT DOES NOT RESOLVE is the one failure a link test exists to catch: the
+    `href` the assumption block emits must match the `id` the validation section emits."""
+    store = ProjectStore(project)
+    wo = panel_held_order(store, outcome="escalated")
+    store.close()
+
+    raw = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert 'href="#round-1"' in raw
+    assert 'id="round-1"' in raw
+    assert "round 1 →" in html.unescape(raw)
+
+
+def test_a_panel_hold_with_no_round_recorded_gets_no_link(client, project):
+    """A payload written before the round was recorded: the sentence renders, the anchored
+    link does not, because there is no round number to point at."""
+    store = ProjectStore(project)
+    wo = panel_held_order(store, outcome="escalated", round_in_payload=None)
+    store.close()
+
+    raw = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert "gave up on round 1" in html.unescape(raw)
+    assert "#round-" not in raw.split('id="validation"')[0]
+
+
 # -- one renderer, both surfaces --------------------------------------------------------
 
 

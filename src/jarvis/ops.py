@@ -2712,8 +2712,17 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     from . import db
 
     newest: dict[str, Any] | None = None
+    stale = _stale_panel_hold(store, wo["id"])
     for kind in AUTOREVIEW_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
+        # A `panel_gave_up` hold about an overtaken round cannot be this kind's candidate,
+        # so the kind is walked newest-backwards to the first surviving row — and
+        # contributes NOTHING when every one of them is stale. The line is then the newest
+        # surviving event of any kind, and None (no `auto_review:` line at all) when the
+        # order has nothing else. Both surfaces already treat a falsy state as no line.
+        if kind == "autoreview_held":
+            rows = [r for r in rows
+                    if not stale(kind, db.from_json(r["payload"], {}))]
         if not rows:
             continue
         # Payload first, so `kind` and `ts` are this function's answers and not whatever
@@ -2783,6 +2792,58 @@ _RULING_RANK = {"autoreview_confirmed": 9, "autoreview_unconfirmed": 8,
                 "autoreview_asked": 1}
 
 
+def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
+                         payload: dict[str, Any]) -> bool:
+    """Has the round this `panel_gave_up` hold is about been overtaken?
+
+    docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
+    when-it-passes.md (c). A hold has no storage but a timeline event, so an immutable
+    fact is making a present-tense claim (kn-a2ebbbdb) — and `HELD_STATUS` is suppressed
+    at the ask site for a reason that still holds, so nothing newer is ever written once a
+    forced round moves the order out of `needs_review`. Measured on wo-15f5d969: round 3
+    passed and every surface still said the panel gave up.
+
+    DERIVED HERE AND ONCE, for `assumptions_with_rulings`' reason: two readers deriving
+    freshness apart is GitHub issue #712 verbatim. `autoreview_state`'s own
+    `_AUTOREVIEW_OWED_BY_USER` resolution is the same shape of claim against a different
+    row, resolved in the same place.
+
+    A PAYLOAD WITH NO ROUND — written before this shipped — is dropped only by clause (i).
+    An order whose newest round is still escalated HAS had its panel give up, so
+    suppressing the sentence there would replace a stale truth with a fresh silence.
+    """
+    from . import autoreview
+
+    if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
+        return False
+    if not latest_round or str(latest_round.get("outcome") or "").lower() != "escalated":
+        return True
+    held_round = int(payload.get("round") or 0)
+    return bool(held_round) and held_round != int(latest_round.get("round") or 0)
+
+
+def _stale_panel_hold(store: ProjectStore, wo_id: str):
+    """`_panel_hold_is_stale` bound to this work order, reading the round LAZILY and ONCE.
+
+    An order with no panel hold pays nothing for the check — the discipline
+    `assumptions_with_rulings` already applies to `_overtaken` and `objection_response`.
+    """
+    from . import autoreview
+
+    cache: dict[str, dict[str, Any] | None] = {}
+
+    def stale(kind: str, payload: dict[str, Any]) -> bool:
+        if kind != "autoreview_held":
+            return False
+        if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
+            return False
+        if "round" not in cache:
+            cache["round"] = store.latest_validation_round(wo_id=wo_id)
+        return _panel_hold_is_stale(cache["round"], payload)
+
+    return stale
+
+
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling`.
 
@@ -2805,11 +2866,19 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
     from . import db
 
     newest: dict[int, dict[str, Any]] = {}
+    stale = _stale_panel_hold(store, wo_id)
     for kind in AUTOREVIEW_EVENTS:
         for event in store.events_of_kind(wo_id, kind):
             payload = db.from_json(event["payload"], {})
             aid = int(payload.get("assumption_id") or 0)
             if not aid:
+                continue
+            # A hold about a round a later one overtook is not a ruling about now: it is
+            # `continue`d, so the row falls back to the next-best event and to `os_ruling
+            # = None` when this was the only one — which `assumption_ruling_line` renders
+            # as nothing-has-looked-at-it. Not-looked-at understates; the stale sentence
+            # lies. The event itself stays on the timeline.
+            if stale(kind, payload):
                 continue
             # Payload first, so `kind` and `ts` are this function's own answers —
             # `autoreview_state`'s note.

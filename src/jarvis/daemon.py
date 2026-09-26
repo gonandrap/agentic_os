@@ -5119,6 +5119,10 @@ class Daemon:
         # outstanding objections are the same kind of fact and are read the same way.
         latest = store.latest_validation_round(wo_id=wo["id"])
         outcome = str((latest or {}).get("outcome") or "")
+        # WHICH round and WHAT IT SAID travel with the outcome: the hold is the only place
+        # the user meets the panel's reason beside the assumption it stopped.
+        round_n = int((latest or {}).get("round") or 0)
+        round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
         objecting = bool(store.outstanding_objections(wo["id"]))
         packet = None
@@ -5130,7 +5134,8 @@ class Daemon:
             if not early and str(a.get("provisional_verdict") or ""):
                 def confirm(stakes_verdict=None, a=a):
                     return autoreview.decide_confirm(
-                        a, wo, cfg, round_outcome=outcome, refusal_answered=answered,
+                        a, wo, cfg, round_outcome=outcome, round_n=round_n,
+                        round_reason=round_reason, refusal_answered=answered,
                         objections_outstanding=objecting, stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
@@ -5156,7 +5161,8 @@ class Daemon:
                                                 diff=packet[1])
                 continue
             def judge(stakes_verdict=None, a=a):
-                return rule(a, wo, cfg, round_outcome=outcome,
+                return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
+                            round_reason=round_reason,
                             refusal_answered=answered, stakes=stakes_verdict)
 
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
@@ -5381,14 +5387,23 @@ class Daemon:
         """
         if not settling and decision.code in (suppress or ()):
             return
-        key = (int(decision.assumption_id or 0), str(decision.code or ""))
+        # THE ROUND IS PART OF THE KEY, and the hold that needs it is `panel_gave_up`: two
+        # consecutive escalated rounds share `(assumption, code)`, so round 3's give-up
+        # would write nothing, the stored payload would still say round 2, and
+        # `ops._panel_hold_is_stale` would then drop a hold that is TRUE. Every other code
+        # carries 0 on both sides, so their dedupe is what it was.
+        key = (int(decision.assumption_id or 0), str(decision.code or ""),
+               int(decision.round or 0))
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
-                                        str(p.get("code") or ""))):
+                                        str(p.get("code") or ""),
+                                        int(p.get("round") or 0))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,
-            "assumption_id": decision.assumption_id, "n": decision.n})
+            "assumption_id": decision.assumption_id, "n": decision.n,
+            # What the freshness check at the read side compares against the current round.
+            "round": decision.round})
 
     def _deliver_assumption_verdict(self, central: CentralStore, neo_store: Any,
                                     pstore: ProjectStore | None, q: dict,
@@ -5502,6 +5517,10 @@ class Daemon:
         still = autoreview.decide(
             numbered, wo, project.validation,
             round_outcome=str((latest or {}).get("outcome") or ""),
+            # The round travels with its outcome here too: this is the site that writes
+            # the hold on the give-up that arrived while Neo was thinking.
+            round_n=int((latest or {}).get("round") or 0),
+            round_reason=str((latest or {}).get("reason") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
             # On a CONFIRMATION the question being delivered is not the one condition 6
             # would trip on: `neo_question_id` still points at the early question, so

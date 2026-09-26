@@ -633,6 +633,11 @@ class Decision:
     #: The assumption's position in its work order's list, as `all_assumptions` numbers
     #: it. What a person calls it; the id is what the database calls it.
     n: int = 0
+    #: The escalated round this hold is about, 0 when no round was named. Carried onto the
+    #: `autoreview_held` payload, where it is both the dedupe key and what
+    #: `ops._panel_hold_is_stale` compares the CURRENT round against — a hold is a claim
+    #: about now, and this is the fact that says whether it still holds.
+    round: int = 0
 
 
 @dataclass(frozen=True)
@@ -651,6 +656,43 @@ class Ruling:
 
 def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
+
+
+#: The panel reason, clamped to one line beside an assumption. `ops.objection_response_
+#: line`'s rule, spelled again rather than imported: this module is PURE and pulling `ops`
+#: in for a three-line clamp would invert the layering for nothing.
+_HINT_CHARS = 120
+
+
+def _round_hint(round_reason: str) -> str:
+    text = " ".join(str(round_reason or "").split())
+    return text[:_HINT_CHARS - 3] + "…" if len(text) > _HINT_CHARS else text
+
+
+def _panel_gave_up(round_n: int, round_reason: str, tail: str,
+                   fields: dict[str, Any]) -> Decision:
+    """The `panel_gave_up` hold, built once for all three decision functions.
+
+    WHICH ROUND and WHAT IT SAID, because the static sentence cannot tell a real
+    disagreement from a reviewer outage whose round reads "nobody could be reached to
+    review this submission" (GitHub issue #778).
+
+    THE EXISTING SENTENCE SURVIVES rather than becoming "round N: hint": the prefix
+    `ops.assumption_ruling_line` adds is the generic `Held by the OS — `, so a reason
+    opening with the round would render a hold that never says WHO held it or why. Both
+    additions are omitted when there is nothing to say — `round_n == 0` is every caller
+    that names no round, and "round 0" is not a sentence.
+
+    NO COMMAND AND NO URL: this reason is rendered by a pure one-liner on both surfaces,
+    so each of them adds its own pointer to the round (`cli._readable_autoreview`, the
+    work-order page).
+    """
+    on_round = f" on round {round_n}" if round_n else ""
+    hint = _round_hint(round_reason)
+    return _held(HELD_PANEL_GAVE_UP,
+                 f"the validation panel gave up{on_round} and put this work order in "
+                 f"front of you{f' — {hint}' if hint else ''} — {tail}",
+                 round=round_n, **fields)
 
 
 def decide_evidence(assumption: dict[str, Any], stat: str, diff: str,
@@ -722,7 +764,8 @@ def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
 
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
-           round_outcome: str = "", refusal_answered: bool = True,
+           round_outcome: str = "", round_n: int = 0, round_reason: str = "",
+           refusal_answered: bool = True,
            asked_question_id: int = 0, stakes: Stakes | None = None) -> Decision:
     """May the OS decide this assumption right now? PURE — no store, no clock, no model.
 
@@ -793,10 +836,9 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
         return _held(HELD_SETTLED,
                      f"assumption #{n} is already {assumption.get('status')}", **fields)
     if str(round_outcome or "").lower() == "escalated":
-        return _held(HELD_PANEL_GAVE_UP,
-                     "the validation panel gave up and put this work order in front of "
-                     "you — settling its assumptions would answer that for you too",
-                     **fields)
+        return _panel_gave_up(round_n, round_reason,
+                              "settling its assumptions would answer that for you too",
+                              fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
                      "you refused an assumption on this work order and the worker has "
@@ -821,7 +863,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 
 def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
-                   round_outcome: str = "", refusal_answered: bool = True,
+                   round_outcome: str = "", round_n: int = 0, round_reason: str = "",
+                   refusal_answered: bool = True,
                    objections_outstanding: bool = False,
                    stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
@@ -873,6 +916,9 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "an objection on this work order has not reached the worker or "
                      "been withdrawn yet — confirming is retried once it has", **fields)
     return decide(assumption, wo, cfg, round_outcome=round_outcome,
+                  # The round travels with its outcome: the hold it produces names which
+                  # round gave up and quotes what it said.
+                  round_n=round_n, round_reason=round_reason,
                   refusal_answered=refusal_answered,
                   asked_question_id=int(assumption.get("neo_question_id") or 0),
                   # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is
@@ -881,7 +927,8 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
-                 round_outcome: str = "", refusal_answered: bool = True,
+                 round_outcome: str = "", round_n: int = 0, round_reason: str = "",
+                 refusal_answered: bool = True,
                  asked_question_id: int | None = None,
                  stakes: Stakes | None = None) -> Decision:
     """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? PURE.
@@ -938,10 +985,9 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      f"assumption #{n} already carries an early verdict "
                      f"({assumption.get('provisional_verdict')})", **fields)
     if str(round_outcome or "").lower() == "escalated":
-        return _held(HELD_PANEL_GAVE_UP,
-                     "the validation panel gave up and put this work order in front of "
-                     "you — the OS does not rule on its assumptions while it waits for "
-                     "you", **fields)
+        return _panel_gave_up(round_n, round_reason,
+                              "the OS does not rule on its assumptions while it waits "
+                              "for you", fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
                      "you refused an assumption on this work order and the worker has "

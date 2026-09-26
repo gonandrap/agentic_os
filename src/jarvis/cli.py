@@ -184,16 +184,34 @@ def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     which is where `decided_by`, `decided_model` and `decided_config_version` are read
     from by anything else, while a person gets "#2 accepted by the OS (neo, opus) — the
     branch name is a convention, not a decision" — WHO DECIDED IT, first, every time.
+
+    THE POINTER TO THE ROUND IS THIS SURFACE'S, not `ops`': `assumption_ruling_line` is
+    pure and both surfaces render it, so a `jarvis …` command in the reason would be
+    printed inside an HTML page and a URL would be printed in a terminal. The dashboard
+    links to the round's anchor instead.
     """
-    from . import ops
+    from . import autoreview, ops
 
     row = dict(detail)
     state = row.pop("auto_review", None)
+    pointer = f" · jarvis validation show {row.get('id')}"
+
+    def gave_up(ruling: dict[str, Any] | None) -> bool:
+        return str((ruling or {}).get("code") or "") == autoreview.HELD_PANEL_GAVE_UP
+
+    def held_pending(a: dict[str, Any]) -> bool:
+        # A SETTLED row renders its own decision reason, never the hold, so a pointer
+        # there would point at a round that no longer explains the line above it.
+        return str(a.get("status") or "") == "pending" and gave_up(a.get("os_ruling"))
+
     if state:
-        row["auto_review"] = state["line"]
+        row["auto_review"] = state["line"] + (
+            pointer if state.get("kind") == "autoreview_held" and gave_up(state) else "")
     rows = row.get("assumptions") or []
     if rows:
-        row["assumptions"] = [ops.assumption_line(a) for a in rows]
+        row["assumptions"] = [
+            ops.assumption_line(a) + (pointer if held_pending(a) else "")
+            for a in rows]
     return row
 
 
