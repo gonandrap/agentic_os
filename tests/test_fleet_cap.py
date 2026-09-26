@@ -50,10 +50,12 @@ def _epoch(stamp: str) -> float:
 
 
 def _catalog(tmp_path, projects: dict[str, object], max_in_flight: int | None = None,
-             name: str = "catalog-fleet.json"):
+             name: str = "catalog-fleet.json", max_concurrent: int | None = None):
     defaults: dict[str, object] = {"model": "sonnet"}
     if max_in_flight is not None:
         defaults["max_in_flight"] = max_in_flight
+    if max_concurrent is not None:
+        defaults["max_concurrent"] = max_concurrent
     path = tmp_path / name
     path.write_text(json.dumps({
         "os": {"defaults": defaults, "notifications": {"sinks": ["log"]}},
@@ -484,6 +486,92 @@ def test_a_cap_held_order_does_not_promise_a_retry(jarvis_home, fake_claude, tmp
     assert "waiting for a free in-flight slot" in label
     assert "2 of 2 worker turns already in flight" in label
     assert "retrying by itself" not in label
+    store.close()
+
+
+def _refused_at(store: ProjectStore, wo_id: str, *, ended: float, reset: float):
+    """A usage-limit refusal that names `reset`, on a turn that ended at `ended`.
+
+    The reset is written as the epoch the parser takes verbatim, so one order can be
+    staged not-due (it is what `fleet.read` builds the outage from) and another due (it
+    is the one the sweep reaches) against the same clock.
+    """
+    store.create_work_order(wo_id, origin="manual", wo_id=wo_id)
+    store.set_status(wo_id, "running")
+    _refuse(store, wo_id, ended, 0,
+            error=f"Claude AI usage limit reached|{reset:.0f}")
+    return store.get_work_order(wo_id)
+
+
+def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tmp_path,
+                                                                 project):
+    """The outage half of the same hold, and the one that dereferences `state.outage`
+    inside the per-order loop: an exception there stalls every resume in the project.
+    The cause recorded is `fleet_outage` and NOT `fleet_cap` — the words for an outage
+    belong to `fleet_hold_note` (issue #714), and the event exists for the invariant
+    suppression, which an outage hold needs exactly as a cap hold does."""
+    now = time.time()
+    catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=3)
+    ops.start_os(str(catalog_path), foreground=True)
+    catalog = load_catalog(catalog_path)
+    daemon = Daemon(catalog)
+    store = ProjectStore(project)
+
+    shut = _refused_at(store, "wo-shut", ended=now - 7200, reset=now + 3600)
+    due = _refused_at(store, "wo-due", ended=now - 7200, reset=now - 3600)
+    state = fleet.read(3, {"proj_a": store}, now=now)
+    assert state.shut(), "the not-due refusal is what holds the account"
+
+    daemon.retry_paused_turns(catalog.project("proj_a"), store, state)
+
+    events = store.events_of_kind(due["id"], invariants.RETRY_HELD_EVENT)
+    assert len(events) == 1
+    payload = json.loads(events[-1]["payload"])
+    assert payload["cause"] == "fleet_outage"
+    assert payload["reopens_at"] == state.outage.reopens_at
+    assert store.events_of_kind(shut["id"], invariants.RETRY_HELD_EVENT) == [], (
+        "it was not due — the record is only for an order that was going to relaunch")
+
+    # `fleet_hold_note` owns these words for the statuses it is gated on; the note says
+    # them only where that gate is shut and the sentence would otherwise be lost.
+    assert due["status"] in invariants.FLEET_HELD_STATUSES
+    assert invariants.pause_note(store, store.get_work_order(due["id"])) == ""
+    store.set_status(due["id"], "needs_review")
+    note = invariants.pause_note(store, store.get_work_order(due["id"]))
+    assert note == ("the Claude usage window is spent, reopening at "
+                    f"{invariants.clock(state.outage.reopens_at)}")
+    store.close()
+
+
+def test_a_project_cap_hold_names_the_slot_it_waits_for(jarvis_home, tmp_path, project):
+    """The second door, with the fleet wide open: a resume out of `needs_review` takes a
+    `max_concurrent` slot it is not already holding, and being held for one is as silent
+    as the fleet cap was."""
+    now = time.time()
+    catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=50,
+                            max_concurrent=1, name="catalog-project-cap.json")
+    ops.start_os(str(catalog_path), foreground=True)
+    catalog = load_catalog(catalog_path)
+    daemon = Daemon(catalog)
+    store = ProjectStore(project)
+
+    store.create_work_order("holding the slot", origin="manual", wo_id="wo-busy")
+    store.set_status("wo-busy", "running")
+    parked = _refused_at(store, "wo-parked", ended=now - 7200, reset=now - 3600)
+    store.set_status(parked["id"], "needs_review")
+    assert store.count_active() == 1, "the project is full"
+
+    open_fleet = fleet.Fleet(50, 0)
+    assert not open_fleet.blocked(), "the fleet must not be what holds this"
+    daemon.retry_paused_turns(catalog.project("proj_a"), store, open_fleet)
+
+    events = store.events_of_kind(parked["id"], invariants.RETRY_HELD_EVENT)
+    assert len(events) == 1
+    payload = json.loads(events[-1]["payload"])
+    assert payload["cause"] == "project_cap"
+    assert payload["active"] == 1 and payload["max_concurrent"] == 1
+    assert invariants.pause_note(store, store.get_work_order(parked["id"])) == (
+        "waiting for a free slot in this project (1 of 1 running)")
     store.close()
 
 

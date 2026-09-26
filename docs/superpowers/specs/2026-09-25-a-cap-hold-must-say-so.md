@@ -352,11 +352,16 @@ if round_open == "passed" and _landing_deferred(store, wo["id"]):
   precisely because it must reach the user immediately.
 
   What is needed there instead is the opposite guarantee: the escalation must not be
-  silently UNDONE when the live turn settles. Today it is — `settle_work_order`'s
-  `pr_url` branch computes `back` from `pr_repair_origin` and `resumed_from` only
-  (daemon.py:4083-4085), so an escalated order whose turn ends with a `pr_url` is parked
-  in `waiting_pr_merge` and leaves the user's list. Fix, one line in that same
-  derivation, in the same shape as its two existing terms:
+  silently UNDONE by the NEXT turn. Not by the live one — `settle_turns` sweeps only
+  `running`/`idle`/`waiting_input`/`dispatching` (daemon.py:4025-4026) and the escalation
+  writes `needs_review` before that turn ends, so the turn that was live when the round
+  gave up is out of the sweep and `settle_work_order` is never called on it at all. The
+  exposure is the turn that STARTS after: a queued message un-parks the order to
+  `running`, and when that turn ends the `pr_url` an earlier `finish` recorded is still on
+  the row, so the `back` derivation — `pr_repair_origin` and `resumed_from` only
+  (daemon.py:4083-4085) — parks the give-up in `waiting_pr_merge` and it leaves the user's
+  list. Fix, one line in that same derivation, in the same shape as its two existing
+  terms:
 
   ```python
   back = ("needs_review" if invariants_mod.validation_escalated(store, fresh)
@@ -402,9 +407,12 @@ before the change, that is said.
 | # | file | test | fails before |
 |---|---|---|---|
 | 1 | `tests/test_fleet_cap.py` | `test_a_cap_held_resume_says_so_on_the_record` | yes |
+| 1b | `tests/test_fleet_cap.py` | `test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep` | yes |
+| 1c | `tests/test_fleet_cap.py` | `test_a_project_cap_hold_names_the_slot_it_waits_for` | yes |
 | 2a | `tests/test_fleet_cap.py` | `test_a_cap_held_order_does_not_promise_a_retry` | yes |
 | 2b | `tests/test_parked_retry.py` | `test_the_overdue_invariant_is_quiet_under_a_cap_hold_and_returns_after` | yes |
 | 3 | `tests/test_validation_loop.py` | `test_a_passed_round_does_not_land_an_order_whose_worker_is_typing` | yes |
+| 3b | `tests/test_validation_loop.py` | `test_a_give_up_survives_the_turn_that_follows_it` | yes |
 | 4 | `tests/test_fleet_cap.py` | `test_a_due_resume_takes_the_slot_before_a_pending_dispatch` | **no** — pin |
 
 1. Build on `test_the_retry_pass_is_staggered_by_the_cap`
@@ -413,6 +421,22 @@ before the change, that is said.
    `retry_held` event with `cause == "fleet_cap"`, `in_flight == 2`, `cap == 2` and the
    held pause's `seq`; then tick again inside `RETRY_HELD_RESTATE` and assert no second
    event. Today: zero events, so the first assertion fails.
+1b. The OTHER cause behind the same skip at daemon.py:1397, and the one that dereferences
+   `state.outage` inside the per-order loop — an exception there stalls every resume in
+   the project, not only this order's. Two refusals in one project: one whose reset is in
+   the future (it is what `fleet.read` builds the outage from, so `state.shut()` holds)
+   and one that is due. Sweep the project; assert the due order carries one `retry_held`
+   with `cause == "fleet_outage"` and `reopens_at == state.outage.reopens_at`, and the
+   not-due one carries none — it was never going to relaunch. Then both halves of §2a's
+   `fleet_outage` split: `pause_note` is `""` while the status is in
+   `FLEET_HELD_STATUSES`, and is `the Claude usage window is spent, reopening at …` once
+   it is `needs_review`. Today: zero events.
+1c. The project cap, with the fleet deliberately wide open (`max_in_flight=50` and an
+   unblocked `Fleet`) so nothing else can be the hold: `max_concurrent=1` filled by a
+   `running` order, plus a due pause on a `needs_review` order, which
+   `resume_spends_slot` says takes a slot. Assert one `retry_held` with
+   `cause == "project_cap"`, `active == 1`, `max_concurrent == 1`, and `pause_note` ==
+   `waiting for a free slot in this project (1 of 1 running)`. Today: zero events.
 2a. Same fixture. `invariants.status_label(store, held_wo)` contains
    `waiting for a free in-flight slot` and does NOT contain `retrying by itself`. Today it
    is the second string.
@@ -427,6 +451,14 @@ before the change, that is said.
    `running`, and a `validation_landing_deferred` event was written; then settle the turn,
    run a tick, and assert it lands (`waiting_pr_merge` with a `pr_url`, `needs_review`
    with a pending assumption). Today the status is `needs_review` while the turn runs.
+3b. The mirror of 3, for §3.3's `back` line. `max_rounds=1` and a rejecting validator, so
+   the first round escalates, on an order that has already finished with a `pr_url`.
+   Assert `needs_review` + `VALIDATION_STUCK_BLOCKER` at the give-up; then run the turn
+   that starts AFTER it — a queued message un-parks the order, asserted `running` — hold
+   it open, settle it and tick. Assert the status is still `needs_review` and the blocker
+   still derives. Today the settler's `pr_url` branch parks it in `waiting_pr_merge` and
+   the flag goes with the status, taking a refusal off the user's list with nobody having
+   decided anything.
 4. A pin, and it passes before the change: one free fleet slot, one due paused order and
    one `pending` order in the same project; one tick; assert the paused order has a new
    running turn and the pending one is still `pending`. It fails only if someone reorders
