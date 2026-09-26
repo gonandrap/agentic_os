@@ -151,6 +151,46 @@ def test_a_plan_on_a_DIFFERENT_work_order_does_not_attest_this_one(fleet):
     assert _round(fleet, other["id"])["outcome"] == "escalated"
 
 
+def test_a_plan_no_pointer_claims_is_unattested_and_its_round_is_still_judged(fleet,
+                                                                             monkeypatch):
+    """The OTHER direction of §6: `_plan_effects` collects the plan but sets
+    `verified=False` whenever the feature order was reached by its OWN id rather than by
+    `plan_wo_id` — the shape `ops.submit_plan` files a plan question with once the planner
+    is gone. Unattested is row 3 of `nothing_to_judge`, so such a round is JUDGED by a
+    seat and never voided."""
+    seen = Validator(passed())
+    fleet.daemon.validator = seen
+    fo = submitted(fleet)
+    other = fleet.dispatch("delivered nothing")
+
+    store = fleet.store()
+    try:
+        effects = ops.side_effects_of(store, fo["id"])
+        assert [e["kind"] for e in effects] == ["plan_submitted"]
+        assert effects[0]["attested"] is False, "an unclaimed plan attested a packet"
+    finally:
+        store.close()
+
+    # The same unattested effect on a real round: the registered collector is asked about
+    # the feature order's id, so `_plan_effects` itself decides `verified` exactly as it
+    # did above — nothing about the attestation is faked here.
+    monkeypatch.setattr(ops, "SIDE_EFFECT_COLLECTORS", tuple(
+        ops.SideEffectCollector(
+            c.name,
+            (lambda s, _wo, _fo=fo["id"]: ops._plan_effects(s, _fo))
+            if c.name == "plan" else c.collect,
+            attested=c.attested)
+        for c in ops.SIDE_EFFECT_COLLECTORS))
+
+    finish(fleet, other["id"], summary="nothing", pr=None)
+    fleet.drain()
+
+    rnd = _round(fleet, other["id"])
+    assert rnd["outcome"] != "void", rnd["reason"]
+    assert len(seen.calls) == 1, "an unattested effect never reached a seat"
+    assert seen.calls[0]["packet"].side_effects[0]["attested"] is False
+
+
 # -- §11.4: a planner that also wrote code is judged ------------------------------------
 
 

@@ -13,18 +13,18 @@ A planner work order can never settle. It lands `needs_review` with
 
 ### 1. The chain, with the code
 
-1. `ops.submit_plan` (`src/jarvis/ops.py:5942`) is the planner's terminal action. Its last
-   act, `src/jarvis/ops.py:6046`, calls `finish(fo["plan_wo_id"], ...)` — `jarvis fo plan`
+1. `ops.submit_plan` is the planner's terminal action. Its last
+   act calls `finish(fo["plan_wo_id"], ...)` — `jarvis fo plan`
    IS the planner's `jarvis wo finish`, which is why the planner briefing forbids the
    latter.
 2. A plan changes no files in the planner's worktree. The design doc it wrote is
-   snapshotted INTO the stored plan (`plan["design_doc_content"]`,
-   `src/jarvis/ops.py:5997`) and the children are created later by a different call, so
+   snapshotted INTO the stored plan (`plan["design_doc_content"]`, in
+   `ops.submit_plan`) and the children are created later by a different call, so
    the evidence packet carries no `files`, no `pr_url`, and — before this change — no side
    effects.
-3. `evidence.nothing_to_judge` (`src/jarvis/evidence.py:390`) hits row 2 of its table
+3. `evidence.nothing_to_judge` (`src/jarvis/evidence.py`) hits row 2 of its table
    (no files, no side effects) and returns `"escalate"`.
-4. `Daemon._validate_work_order` (`src/jarvis/daemon.py:1795-1801`) escalates with, verbatim:
+4. `Daemon._validate_work_order` (`src/jarvis/daemon.py`) escalates with, verbatim:
    `this submission changes no files and records no other durable effect, so there is
    nothing to review. Nobody has judged the work.`
 5. `_escalate` delegates to `ops.escalate_validation_round`, which closes the round
@@ -34,9 +34,9 @@ A planner work order can never settle. It lands `needs_review` with
 
 ### 2. Why nothing repairs it afterwards
 
-`ops.review_plan(accept=True)` (`src/jarvis/ops.py:6054`) creates the children, records
+`ops.review_plan(accept=True)` (`src/jarvis/ops.py`) creates the children, records
 the feature's `base_sha`, moves the feature to `executing`, installs the feature agent,
-and adds a `plan_reviewed` event to the planner (`src/jarvis/ops.py:6116`). It never
+and adds a `plan_reviewed` event to the planner (`src/jarvis/ops.py`). It never
 touches the planner's status. No other machine re-derives it either: a `needs_review` work
 order is settled as far as the reconciler is concerned.
 
@@ -52,7 +52,7 @@ the same plan.
 
 ### 4. Root cause, named
 
-The registry `ops.SIDE_EFFECT_COLLECTORS` (`src/jarvis/ops.py:9542`) has no collector for
+The registry `ops.SIDE_EFFECT_COLLECTORS` (`src/jarvis/ops.py`) has no collector for
 a plan, so a plan submission is indistinguishable from a work order that delivered
 nothing. Everything in §1 follows correctly from that one gap. This is the root cause and
 it is what §5 fixes; the escalation and the stuck status are symptoms and are not touched.
@@ -64,7 +64,7 @@ One registry entry. Not a widening of `daemon.py`'s guard, and not a status writ
 
 ### 5. The collector
 
-Add to `ops.SIDE_EFFECT_COLLECTORS` (`src/jarvis/ops.py:9542`):
+Add to `ops.SIDE_EFFECT_COLLECTORS` (`src/jarvis/ops.py`):
 
 ```python
 SideEffectCollector("plan", _plan_effects, attested=True),
@@ -74,7 +74,7 @@ SideEffectCollector("plan", _plan_effects, attested=True),
 non-file effect:
 
 - `kind`: `"plan_submitted"` — the same name `submit_plan` already writes on the timeline
-  (`src/jarvis/ops.py:6035`).
+  (`src/jarvis/ops.py`).
 - `id`: the feature order id.
 - `summary`: which feature order, and how many children the plan decomposes it into.
 - `detail`: the design doc path, the child count, and the Neo plan question id
@@ -84,7 +84,7 @@ non-file effect:
 - `verified`: per §6.
 
 It returns `[]` when no feature order points at this work order, and raises nothing. That
-is `side_effects_of`'s contract (`src/jarvis/ops.py:9547`): a raising collector leaves the
+is `side_effects_of`'s contract (`src/jarvis/ops.py`): a raising collector leaves the
 round unjudged and retried for ever, and a swallowed exception could drop a judgeable
 effect from a packet that then reads as all-attested and voids. `attested` is not set on
 the record — `side_effects_of` computes it as the registry's AND of the collector's opt-in
@@ -98,13 +98,13 @@ has a feature order in `plan_review`": that would attest any work order in a pro
 some plan happened to be pending.
 
 Why that pointer is proof where `_release_effects`' marker is only a claim
-(`src/jarvis/ops.py:9437`, whose docstring makes the distinction):
+(`src/jarvis/ops.py`, whose docstring makes the distinction):
 
 - `ops.submit_plan` is the ONLY writer of `plan` and of `plan_question_id`
-  (`src/jarvis/ops.py:6031`), and `plan_wo_id` is set when the planner is created — never
+  (`src/jarvis/ops.py`), and `plan_wo_id` is set when the planner is created — never
   by a worker.
-- It writes them only after `plans.parse_plan` (`src/jarvis/ops.py:5966`) and
-  `plans.spec_problems` (`src/jarvis/ops.py:5998`) have both passed, and after the named
+- It writes them only after `plans.parse_plan` (`src/jarvis/ops.py`) and
+  `plans.spec_problems` (`src/jarvis/ops.py`) have both passed, and after the named
   `design_doc` was found on disk.
 - So the row is the OS's own validation record of a plan it accepted. A worker cannot
   author it from its worktree, which is exactly what a release marker under
@@ -119,13 +119,13 @@ With the collector in place a planner's packet has no files, one side effect, th
 attested, and no PR. `evidence.nothing_to_judge` falls through to row 4 and returns
 `"void"`. Then, unchanged code:
 
-1. `Daemon._validate_work_order` (`src/jarvis/daemon.py:1802`) calls `_void`.
-2. `_void` (`src/jarvis/daemon.py:2029`) closes the round `void`, adds `validation_void`,
+1. `Daemon._validate_work_order` (`src/jarvis/daemon.py`) calls `_void`.
+2. `_void` (`src/jarvis/daemon.py`) closes the round `void`, adds `validation_void`,
    and calls `ops.land_when_cleared(store, wo, panel_cleared=True)`.
 3. `void` is in none of the OPEN/RUNNABLE/COUNTED outcome sets and
    `invariants.validation_escalated` keys on `escalated`, so no flag comes back on the
    next tick.
-4. `ops.land_when_cleared` (`src/jarvis/ops.py:3026`) settles the planner the way
+4. `ops.land_when_cleared` (`src/jarvis/ops.py`) settles the planner the way
    `submit_plan`'s docstring already says it intends: `completed` when nothing else holds
    it; `needs_review` when the planner left pending assumptions.
 
@@ -143,7 +143,7 @@ unmerged, and never parks an unread pull request on the merge queue.
 ### 9. The rejection path keeps working
 
 `ops.review_plan(accept=False)` reaches a planner that is now `completed` rather than
-`needs_review`. That is already permitted: `ops.send_message` (`src/jarvis/ops.py:1077`)
+`needs_review`. That is already permitted: `ops.send_message` (`src/jarvis/ops.py`)
 accepts a `completed`/`failed`/`cancelled` work order and notes `the session will be
 revived`. The feedback is queued as a message and the planner revises from its existing
 session, exactly as `submit_plan`'s docstring promises. Neo required a test, §11.2.
@@ -153,7 +153,7 @@ session, exactly as `submit_plan`'s docstring promises. Neo required a test, §1
 1. **Widen `daemon.py`'s empty-packet guard for planner work orders.** The guard has been
    widened twice already for the same lesson (issue #200, wo-ec96a1e9), which is why the
    registry exists; and `nothing_to_judge` has two callers (work-order loop
-   `daemon.py:1795`, feature loop `daemon.py:2354`), so a guard-side special case is a
+   `daemon.py`, feature loop `daemon.py`), so a guard-side special case is a
    second copy of the rule waiting to drift.
 2. **Have `review_plan` set the planner's status.** Repairs the symptom at the far end:
    the planner would sit flagged with `VALIDATION_STUCK_BLOCKER` for however long the
@@ -205,7 +205,7 @@ New file `tests/test_plan_side_effect.py`.
 - The work-order page hiding the Accept-all form when there are no pending assumptions
   (§2). It is why the stuck state had no exit, but it is a separate UI question and this
   fix removes the state that made it visible.
-- Feature-order rounds (`daemon.py:2354`). They share `nothing_to_judge` and inherit the
+- Feature-order rounds (`daemon.py`). They share `nothing_to_judge` and inherit the
   new row for free; nothing here is specific to them.
 - Backfilling planners already stuck in production, fo-ff8570fa included. `jarvis
   validation force` cannot open a round on a `needs_review` planner with no pull request;
