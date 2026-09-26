@@ -136,7 +136,7 @@ def test_neo_answers_and_delivers_to_worker(asked, project, fake_claude):
     calls = _neo_calls(fake_claude)
     assert len(calls) == 1
     argv = calls[0]["argv"]
-    system = argv[argv.index("--append-system-prompt") + 1]
+    system = calls[0]["system_prompt_seen"]
     assert "You are Neo" in system
     assert argv[argv.index("--model") + 1] == "opus"  # catalog default
 
@@ -155,7 +155,7 @@ def test_fifo_order_and_backtoback_drain(started, fake_claude):
     assert [p.splitlines()[-1] for p in prompts] == [
         "first question", "second question", "third question"]
     # cache economics: identical system prompt bytes across the whole drain
-    systems = {c["argv"][c["argv"].index("--append-system-prompt") + 1] for c in calls}
+    systems = {c["system_prompt_seen"] for c in calls}
     assert len(systems) == 1
 
 
@@ -276,13 +276,13 @@ def test_learnings_shape_future_answers(asked, fake_claude):
     daemon, wo, _ = asked
     drain(daemon)
     calls = _neo_calls(fake_claude)
-    system_before = calls[-1]["argv"][calls[-1]["argv"].index("--append-system-prompt") + 1]
+    system_before = calls[-1]["system_prompt_seen"]
 
     ops.neo_review(1, approved=False, feedback="Prefer CSV, always")
     ops.ask_question(wo["id"], "And what delimiter?")
     drain(daemon)
     calls = _neo_calls(fake_claude)
-    system_after = calls[-1]["argv"][calls[-1]["argv"].index("--append-system-prompt") + 1]
+    system_after = calls[-1]["system_prompt_seen"]
     assert "Prefer CSV, always" in system_after
     # append-only: the old prefix (minus the placeholder line) survives verbatim
     head = system_before.replace("(none yet — escalate when unsure)\n", "").rstrip()
@@ -345,8 +345,7 @@ def test_with_the_panel_disabled_neo_answers_exactly_as_before(started, project,
     assert len(calls) == 3, "one call per question — no seat, no chair"
     neo = NeoStore()
     try:
-        systems = {c["argv"][c["argv"].index("--append-system-prompt") + 1]
-                   for c in calls}
+        systems = {c["system_prompt_seen"] for c in calls}
         assert systems == {neo_mod.build_system_prompt(neo, "proj_a")}
         assert {c["argv"][c["argv"].index("--model") + 1] for c in calls} == {"opus"}
         for qid in (1, 2, 3):

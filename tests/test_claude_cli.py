@@ -11,6 +11,8 @@ call site.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 from jarvis import claude_cli
@@ -68,10 +70,80 @@ def test_named_tools_are_passed_through(fake_claude, tmp_path) -> None:
 
 
 def test_a_small_system_prompt_rides_in_argv(fake_claude, tmp_path) -> None:
+    """REPLACING, not appending: the caller's persona instead of the CLI's default
+    context. Spec: docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+    """
     claude_cli.run_headless("hi", cwd=tmp_path, system_prompt="be brief")
     argv = _argv(fake_claude)
-    assert argv[argv.index("--append-system-prompt") + 1] == "be brief"
+    assert argv[argv.index("--system-prompt") + 1] == "be brief"
+    assert "--append-system-prompt" not in argv
     assert "--append-system-prompt-file" not in argv
+
+
+def test_sessions_are_never_persisted(fake_claude, tmp_path) -> None:
+    """Nothing in `src/` reads `HeadlessResult.session_id`, tooled or not."""
+    claude_cli.run_headless("hi", cwd=tmp_path, tools="")
+    assert "--no-session-persistence" in _argv(fake_claude)
+    claude_cli.run_headless("hi", cwd=tmp_path)
+    assert "--no-session-persistence" in _argv(fake_claude)
+
+
+def test_a_prompt_only_call_loses_settings_mcp_and_skills(fake_claude, tmp_path) -> None:
+    """`tools=""` means judge the prompt and only the prompt, so the user's settings
+    sources (hence hooks and plugins), MCP servers and skills all go."""
+    claude_cli.run_headless("hi", cwd=tmp_path, tools="")
+    argv = _argv(fake_claude)
+    assert "--strict-mcp-config" in argv
+    assert not Path(argv[argv.index("--mcp-config") + 1]).exists(), "temp file cleaned up"
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--disable-slash-commands" in argv
+
+
+def test_the_mcp_config_the_prompt_only_call_names_has_no_servers() -> None:
+    with claude_cli._empty_mcp_config() as flags:
+        assert json.loads(Path(flags[1]).read_text()) == {"mcpServers": {}}
+
+
+def test_a_tooled_call_keeps_settings_mcp_and_skills(fake_claude, tmp_path) -> None:
+    """A tooled callee runs under the permissions the setting sources supply: stripping
+    them changes what it is ALLOWED to do, not what it reads (Neo's carve-out, q670)."""
+    for tools in (None, "Read,Bash"):
+        claude_cli.run_headless("hi", cwd=tmp_path, tools=tools)
+        argv = _argv(fake_claude)
+        assert "--mcp-config" not in argv
+        assert "--setting-sources" not in argv
+        assert "--disable-slash-commands" not in argv
+
+
+def test_an_oversize_system_prompt_is_split_and_arrives_whole(fake_claude, tmp_path) -> None:
+    """CLI 2.1.282 has no `--system-prompt-file`, so the caller's OWN bytes split across
+    `--system-prompt` and `--append-system-prompt-file`. No stub: measured, a stub that
+    talks about the prompt reads to the model as an injection attempt."""
+    big = "é" * claude_cli.SYSTEM_PROMPT_ARGV_LIMIT + "\nTHE_PREFIX_MARKER"
+
+    claude_cli.run_headless("hi", cwd=tmp_path, system_prompt=big)
+
+    argv = _argv(fake_claude)
+    assert "--append-system-prompt" not in argv
+    head = argv[argv.index("--system-prompt") + 1]
+    assert 0 < len(head.encode()) <= claude_cli.SYSTEM_PROMPT_ARGV_LIMIT
+    written = Path(argv[argv.index("--append-system-prompt-file") + 1])
+    assert not written.exists(), "the temporary file is cleaned up after the call"
+    assert fake_claude.calls[-1]["system_prompt_seen"] == big
+
+
+def test_the_environment_escape_hatch_appends_and_takes_a_settings_file(
+        fake_claude, tmp_path) -> None:
+    """Only `evals/llm/test_navigation_judgment.py`, whose SUBJECT is the default
+    environment, may keep it."""
+    settings = tmp_path / "eval-settings.json"
+    settings.write_text("{}")
+    claude_cli.run_headless("hi", cwd=tmp_path, system_prompt="be brief",
+                            settings=settings, keep_default_context=True)
+    argv = _argv(fake_claude)
+    assert argv[argv.index("--append-system-prompt") + 1] == "be brief"
+    assert "--system-prompt" not in argv
+    assert argv[argv.index("--settings") + 1] == str(settings)
 
 
 def test_a_system_prompt_past_the_argv_ceiling_goes_by_file(fake_claude, tmp_path) -> None:
@@ -98,3 +170,16 @@ def test_call_runs_in_the_requested_directory(fake_claude, tmp_path) -> None:
     neutral.mkdir()
     claude_cli.run_headless("hi", cwd=neutral)
     assert fake_claude.calls[-1]["cwd"] == str(neutral.resolve())
+
+
+def test_the_fake_records_a_split_system_prompt_whole(fake_claude, tmp_path) -> None:
+    """Both flag families arrive together on the oversize path, so the recorder has to
+    CONCATENATE in CLI order; assigning per family read every split prompt back as one
+    half. Spec: docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+    """
+    tail = tmp_path / "tail.md"
+    tail.write_text("TAIL")
+    subprocess.run([claude_cli.claude_bin(), "-p", "hi", "--output-format", "json",
+                    "--system-prompt", "HEAD", "--append-system-prompt-file", str(tail)],
+                   cwd=tmp_path, check=True, capture_output=True)
+    assert fake_claude.calls[-1]["system_prompt_seen"] == "HEADTAIL"

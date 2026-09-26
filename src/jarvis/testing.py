@@ -222,6 +222,29 @@ os.makedirs(calls_dir, exist_ok=True)
 _started = time.time()
 _record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
 
+def _system_prompt():
+    """THE SYSTEM PROMPT, RESOLVED THROUGH ALL FOUR DOORS, concatenated in CLI order.
+
+    It arrives by argv or by file depending on its size
+    (`claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`), and the file is a temporary one that is gone
+    by the time a test reads the call record — so an argv-only resolution would read
+    every large call as having NO system prompt, silently, in the direction that makes a
+    validation seat look like a Neo question. An oversize prompt is SPLIT across the
+    replacing and appending doors, so ASSIGNING per door dropped whichever half came
+    first; both halves are needed and their order is the model's.
+    """
+    parts = []
+    for flag in ("--system-prompt", "--append-system-prompt"):
+        if flag + "-file" in argv:
+            try:
+                with open(argv[argv.index(flag + "-file") + 1]) as f:
+                    parts.append(f.read())
+            except OSError:
+                pass
+        elif flag in argv:
+            parts.append(argv[argv.index(flag) + 1])
+    return "".join(parts)
+
 def _write_call_record(finished=None):
     # WRITTEN TWICE, AND BOTH TIMES MATTER. At entry, because tests observe a call while
     # it is deliberately still running (`hold_turns`) and a record that appeared only at
@@ -234,20 +257,7 @@ def _write_call_record(finished=None):
     # so a call record of argv alone cannot test the rate Jarvis pays. Only those two
     # keys: the whole environment would spill every secret the daemon holds into a
     # fixture on disk.
-    # THE SYSTEM PROMPT, RESOLVED. It arrives by argv or by file depending on its size
-    # (`claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`), and the file is a temporary one that is
-    # gone by the time a test reads this record — so an argv-only record would make
-    # every large prompt look like no prompt at all.
-    seen = ""
-    for flag in ("--append-system-prompt", "--system-prompt"):
-        if flag + "-file" in argv:
-            try:
-                with open(argv[argv.index(flag + "-file") + 1]) as f:
-                    seen = f.read()
-            except OSError:
-                seen = ""
-        elif flag in argv:
-            seen = argv[argv.index(flag) + 1]
+    seen = _system_prompt()  # all four doors — see `_system_prompt`
     tmp = _record_path + f".part{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump({"argv": argv, "cwd": os.getcwd(), "system_prompt_seen": seen,
@@ -538,12 +548,9 @@ elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
     prompt = argv[argv.index("-p") + 1]
-    # THE SYSTEM PROMPT ARRIVES BY ONE OF TWO DOORS and a fake that knew only the argv
-    # one would read every large call as having no system prompt at all — silently, and
-    # in the direction that makes a seat look like a Neo question. See
-    # `claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`.
-    spfile = opt("--append-system-prompt-file")
-    system = open(spfile).read() if spfile else opt("--append-system-prompt", "")
+    # Every door, concatenated — the reply chooser below branches on this text, so a
+    # half-read prompt answers a validation seat with a Neo verdict. See `_system_prompt`.
+    system = _system_prompt()
     # A VALIDATION SEAT, AND THIS BRANCH IS FIRST OF ALL. `chair` IS A LEGAL SEAT NAME IN
     # BOTH ROSTERS: a validator chair answered by the Neo seat branch below comes back a
     # perfectly well-formed Neo verdict carrying no pass and no reject at all, and a

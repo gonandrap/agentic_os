@@ -110,7 +110,7 @@ def arg(call: dict, flag: str) -> str:
 
 
 def seat_of(call: dict) -> str | None:
-    system = arg(call, "--append-system-prompt")
+    system = call["system_prompt_seen"]
     return next((s for s in SEATS if f"# Neo panel seat: {s}" in system), None)
 
 
@@ -380,7 +380,7 @@ def test_the_seats_run_blind_and_only_the_chair_sees_them(store, fake_claude):
         seat = seat_of(call)
         if seat in (None, "chair"):
             continue
-        seen = arg(call, "-p") + arg(call, "--append-system-prompt")
+        seen = arg(call, "-p") + call["system_prompt_seen"]
         others = [s for s in replies if s != seat]
         assert not [s for s in others if replies[s] and replies[s] in seen], seat
 
@@ -402,7 +402,7 @@ def test_a_seats_system_prompt_is_its_own_mandate_and_its_own_learnings(store,
 
     panel.decide(store, q, cfg())
 
-    systems = {seat_of(c): arg(c, "--append-system-prompt") for c in headless(fake_claude)}
+    systems = {seat_of(c): c["system_prompt_seen"] for c in headless(fake_claude)}
     assert "Always default to CSV" in systems["premise"]
     assert "A grep naming shipit ships nothing" in systems["premise"]
     # The seat-scoped learning is the premise seat's alone...
@@ -497,7 +497,7 @@ def test_a_premise_reply_with_no_route_runs_the_panel(store, fake_claude):
     """Fail toward the expensive-but-safe side.
 
     This is also the assertion that catches a fake-`claude` collision: seat identity
-    travels in `--append-system-prompt`, so a premise call on a gate question would
+    travels in the system prompt, so a premise call on a gate question would
     otherwise hit the fake's "PRIVILEGED ACTION REQUEST" branch and come back as a
     well-formed gate verdict with no `route` key at all — after which a lenient `decide`
     defaults the route and the whole fast-path suite passes having exercised nothing.
@@ -548,7 +548,7 @@ def test_a_failed_premise_seat_falls_back_to_the_single_agent(store, fake_claude
 
     calls = headless(fake_claude)
     expected = neo_mod.build_system_prompt(store, "proj_a", kind="question")
-    single = [c for c in calls if arg(c, "--append-system-prompt") == expected]
+    single = [c for c in calls if c["system_prompt_seen"] == expected]
     assert len(single) == 1, "exactly one single-agent call"
     assert len(calls) == 2, "the failed premise attempt, then the fallback"
     assert not any(seat_of(c) == "chair" for c in calls)
@@ -729,7 +729,7 @@ def test_the_later_seats_are_blind_to_the_premise_seat_that_ran_before_them(stor
         seat = seat_of(call)
         if seat in (None, "chair"):
             continue
-        seen = arg(call, "-p") + arg(call, "--append-system-prompt")
+        seen = arg(call, "-p") + call["system_prompt_seen"]
         assert not [s for s in replies if s != seat and replies[s] and replies[s] in seen], seat
 
     chair_call = next(c for c in headless(fake_claude) if seat_of(c) == "chair")
