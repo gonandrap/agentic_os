@@ -8759,6 +8759,164 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+#: The precedence, carried in the PAYLOAD and not only in this file's prose, because the
+#: CLI and the dashboard must both be able to print it: a `prefix-miss` classification is
+#: an observation of what the API was charged for, and a context delta is an explanation
+#: offered for it. kn-fafe92b7 is explicit that `invariants.check_prefix_stable` is the
+#: authoritative measurement of prefix stability, and kn-2c41d4cc that a proxy earns its
+#: place beside an authority by NAMING A CAUSE rather than raising a second alarm — which
+#: is why this report raises none.
+PREFIX_AUTHORITY = (
+    "the write classification is the authority and the delta is the hypothesis; "
+    "`invariants.check_prefix_stable` is the authoritative measurement of prefix "
+    "stability"
+)
+
+#: What a work order whose turns all predate the ledger reads as. Forward-only: the
+#: ingredients of orders that already ran were never recorded and cannot be recovered, and
+#: an empty table is what a reader reports as a bug (spec §5).
+NOT_RECORDED = ("not recorded for this order — its turns ran before the context ledger "
+                "landed")
+TURN_NOT_RECORDED = ("not recorded for this turn — it ran before the context ledger "
+                     "landed, or its measurement failed")
+
+
+def context_report(wo_id: str, project: str | None = None, *,
+                   turn: int | None = None) -> dict[str, Any]:
+    """What Jarvis put in each of a work order's context windows, and the delta.
+
+    §5 of docs/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
+    the renderers compute nothing: the residual subtraction, the per-turn delta and the
+    sentence naming a prefix break are keys of this payload.
+
+    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`,
+    never by transcript turn numbering — `inspection` renumbers the turns it finds in the
+    transcript files, and that sequence is not `wo_turns.seq` (a coalesced delivery, an
+    adopted session or a second segment file makes them disagree). The window is the OS's
+    own record of when the process ran, which is the thing both sides share.
+    """
+    from . import context as context_mod
+    from . import inspection
+    from . import usage as usage_mod
+
+    name, path, wo = find_work_order(wo_id, project)
+    store = ProjectStore(path)
+    try:
+        # `all_turns` and not `list_turns`: that one stops at 100 by default, which on a
+        # long order would drop the later turns out of a per-turn ledger silently.
+        rows = store.all_turns(wo_id)
+        session = wo.get("session_id") or ""
+        cfg = inspect_config(name)
+        anatomy = (inspection.read_session(session, cfg,
+                                          index=usage_mod.index_sessions())
+                   if session else None)
+        if turn is not None and not any(r["seq"] == turn for r in rows):
+            raise OpsError(f"{wo_id} has no turn {turn} "
+                           f"(it has {len(rows)}: "
+                           f"{', '.join(str(r['seq']) for r in rows) or 'none'})")
+        out: list[dict[str, Any]] = []
+        previous: tuple[int, list[dict[str, Any]]] | None = None
+        for row in rows:
+            payload = db.from_json(row["context_json"]) if row["context_json"] else None
+            entry: dict[str, Any] = {
+                "seq": row["seq"], "kind": row["kind"],
+                "started_at": row["started_at"], "ended_at": row["ended_at"],
+                "recorded": payload is not None,
+                # Two different absences, two different keys: `note` is "this turn was
+                # never measured", `residual_note` is "it was, but Claude Code's own
+                # share cannot be inferred". One field carrying both would make the
+                # renderer print the wrong sentence for one of them.
+                "note": "" if payload else TURN_NOT_RECORDED,
+                "residual_note": "",
+                "ingredients": (payload or {}).get("ingredients") or [],
+                "caps": (payload or {}).get("caps") or {},
+                "token_bytes": (payload or {}).get("token_bytes"),
+                "residual": None, "delta": None, "prefix_break": None,
+            }
+            if payload:
+                entry["residual"] = _turn_residual(entry, anatomy, context_mod,
+                                                   inspection)
+                if previous is not None:
+                    entry["delta"] = context_mod.delta(
+                        entry["ingredients"], previous[1], against_seq=previous[0])
+                entry["prefix_break"] = _turn_prefix_break(entry, anatomy, inspection)
+                previous = (row["seq"], entry["ingredients"])
+            out.append(entry)
+    finally:
+        store.close()
+
+    recorded = [t for t in out if t["recorded"]]
+    return {
+        "wo_id": wo["id"], "project": name, "title": wo["title"],
+        "recorded": bool(recorded),
+        "note": "" if recorded else NOT_RECORDED,
+        "turns": [t for t in out if turn is None or t["seq"] == turn],
+    }
+
+
+def _in_window(ts: float, turn: dict[str, Any]) -> bool:
+    """Is this cache write inside the turn's process window? See `context_report` for why
+    the join is on the clock and not on a turn number. An unfinished turn has no
+    `ended_at`, and everything after its start belongs to it — it is the live one."""
+    if ts < (turn["started_at"] or 0.0):
+        return False
+    end = turn["ended_at"]
+    return True if end is None else ts <= end
+
+
+def _turn_residual(entry: dict[str, Any], anatomy: Any, context_mod: Any,
+                   inspection: Any) -> dict[str, Any] | None:
+    """The inferred row for one turn, or None with a sentence when it cannot be read.
+
+    None rather than a zeroed row when there is no session or the transcript has expired:
+    an unmeasurable prefix and a prefix of nothing are different answers, which is the
+    same rule `jarvis inspect` reports `found: false` under.
+    """
+    if anatomy is None or not anatomy.found:
+        entry["residual_note"] = (
+            "Claude Code's own share cannot be inferred: no transcript for this session "
+            "— it has expired, or the session never wrote one")
+        return None
+    cold = next((w for w in anatomy.writes
+                 if w.cause == inspection.COLD_START and _in_window(w.ts, entry)), None)
+    return context_mod.residual(context_mod.measured_tokens(entry["ingredients"]), cold)
+
+
+def _turn_prefix_break(entry: dict[str, Any], anatomy: Any,
+                       inspection: Any) -> dict[str, Any] | None:
+    """The `prefix-miss` writes that land in this turn, joined to its delta.
+
+    The join is the point of the whole section: one sentence that says the prefix broke
+    here and names what grew. `PREFIX_AUTHORITY` travels with it so no renderer can print
+    the hypothesis without the precedence.
+    """
+    if anatomy is None or not anatomy.found:
+        return None
+    writes = [w for w in anatomy.writes
+              if w.cause == inspection.PREFIX_MISS and _in_window(w.ts, entry)]
+    if not writes:
+        return None
+    delta = entry["delta"]
+    grew = (delta or {}).get("biggest_growth")
+    if delta is None:
+        cause = (f"the prefix broke at turn {entry['seq']} and there is no earlier "
+                 f"recorded turn to compare its ingredients against")
+    elif grew:
+        row = next(r for r in delta["rows"] if r["name"] == grew)
+        cause = (f"the prefix broke at turn {entry['seq']} and {grew} grew "
+                 f"{row['bytes_delta']:,} bytes since turn {delta['against_seq']}")
+    else:
+        moved = ", ".join([f"{n} appeared" for n in delta["appeared"]]
+                          + [f"{n} disappeared" for n in delta["disappeared"]])
+        cause = (f"the prefix broke at turn {entry['seq']} and no measured ingredient "
+                 f"grew since turn {delta['against_seq']}"
+                 + (f" ({moved})" if moved else ""))
+    return {"writes": [w.as_dict() for w in writes],
+            "tokens_rewritten": sum(w.written for w in writes),
+            "delta": delta, "cause": cause, "authority": PREFIX_AUTHORITY,
+            "note": "this report names a cause and raises no alarm of its own"}
+
+
 def _alarm_dict(name: str, row: dict[str, Any]) -> dict[str, Any]:
     """The twenty keys `list_cost_alarms` publishes, from one `alarms_across` row.
 

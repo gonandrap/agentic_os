@@ -1025,7 +1025,7 @@ def dispatch_work_order(
     resolved model/effort/permission mode — and hands the running of it to
     `worker_session`, which owns the transport.
     """
-    from . import budget, worker_session
+    from . import budget, context, worker_session
 
     cfg = os_config or OsConfig()
     knowledge = central.knowledge_brief(
@@ -1057,7 +1057,7 @@ def dispatch_work_order(
     wo = store.get_work_order(wo["id"])
 
     try:
-        turn = worker_session.start(store, project, wo, prompt)
+        turn, briefing = worker_session.start(store, project, wo, prompt)
     except budget.BudgetExhausted as e:
         # Spent before it ever ran a turn — its feature had nothing left to lend it, or
         # the panel and Neo spent the order's own budget on an earlier round. Not a
@@ -1090,6 +1090,15 @@ def dispatch_work_order(
             )
         raise
 
+    # THE CONTEXT LEDGER for the seq-1 dispatch turn, and only that one: Neo's ruling on
+    # question 681 partitions the writers so no row is written twice, and this is the only
+    # site holding the `KnowledgeBrief` the knowledge block is measured from
+    # (`worker_session._launch` records every other turn). The briefing comes back from
+    # `start` rather than being rebuilt — `briefing_for` REWRITES the worker settings
+    # file, and a measurement must not have side effects. Spec docs/specs/
+    # 2026-09-24-order-observability.md §5.
+    if turn["seq"] == 1:
+        context.record(store, project, wo, turn, briefing, knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
