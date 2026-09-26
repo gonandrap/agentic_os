@@ -47,6 +47,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import sections
+
 #: How many children a plan may contain before the planner owes an explanation.
 #: Eight, from the design. Not a per-project knob: a cap the user can raise is a cap
 #: that gets raised the first time it fires, which is precisely when it was working.
@@ -426,7 +428,9 @@ APPROVE when all of these hold:
 - **The split follows the spec's boundaries.** Every child names the section of the
   design document it implements, and no two name the same one. Judge whether those
   sections are the feature's real functional seams or a decomposition the planner
-  reached for first and then carved the spec to fit.
+  reached for first and then carved the spec to fit. The spec is SUPPLIED WITH THIS
+  QUESTION, so do not read the repository for it; if it is marked TRUNCATED, do not
+  conclude the spec ends where the text ends.
 - **Each child is nameable from its line.** You see one line per child — title,
   edges, section, acceptance — and NOT the full briefs: those were validated mechanically
   (they stand alone, or this never reached you) and are withheld on purpose, because
@@ -459,6 +463,43 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "verdict": "reject",  "reason": "<what the planner must fix>"}
   {"escalate": true,  "verdict": "reject",  "reason": "<one line: why the user must \
 decide>"}"""
+
+
+#: How much spec may ride in one plan question. 120,000 chars, not §10's 40,000: every
+#: spec in this repo must fit unclipped or clipping becomes the common path — the largest
+#: is 99,602 bytes and the spec of this very incident is 42,776, so 40,000 would clip the
+#: document the bug was about.
+SPEC_CONTEXT_MAX_CHARS = 120_000
+
+
+def build_plan_context(plan: dict[str, Any], source: str,
+                       max_chars: int = SPEC_CONTEXT_MAX_CHARS) -> str:
+    """The spec the plan decomposes, as the reviewer must read it — text, not a path.
+
+    §5 of docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md:
+    a question that names its one load-bearing artifact instead of carrying it sends the
+    reviewer to whatever checkout it can reach, which is how question 658 judged a
+    revision nobody had pulled. The wording is asserted by test, not paraphrased.
+    """
+    text = str(plan.get("design_doc_content") or "")
+    kept, omitted = sections.clip_at_heading(text, max_chars)
+    lines = [
+        f"SPEC UNDER REVIEW — {plan.get('design_doc')}, as committed on {source}.",
+        "This text IS the spec this plan decomposes. Judge against THIS text and nothing "
+        "else.",
+        "Do NOT open this path on disk: the checkout you can reach is not the one this "
+        "plan was",
+        "written against, and reading it is how question 658 was answered wrongly.",
+    ]
+    if omitted:
+        lines += [
+            "",
+            f"TRUNCATED at {len(kept)} of {len(text)} characters. The sections below "
+            f"were NOT included and you have not",
+            "seen them — do not conclude the spec stops where this text stops:",
+            *(f"  {line}" for line in omitted),
+        ]
+    return "\n".join([*lines, "", kept])
 
 
 def build_plan_question(fo: dict[str, Any], plan: dict[str, Any]) -> str:

@@ -5940,6 +5940,56 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
         store.close()
 
 
+def _planner_work_order(path: Path, fo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature's planner row, for `landing.committed_text`'s first rung."""
+    if not fo.get("plan_wo_id"):
+        return None
+    store = ProjectStore(path)
+    try:
+        return store.get_work_order(fo["plan_wo_id"])
+    finally:
+        store.close()
+
+
+def _spec_branch(path: Path, planner_wo: dict[str, Any] | None) -> str:
+    """Which branch the refusal below tells the planner to commit on."""
+    from . import evidence, landing
+
+    worktree = landing.worktree_of(path, planner_wo) if planner_wo else None
+    branch = landing.authored(worktree).branch if worktree else ""
+    return branch or evidence.base_ref(path) or "the default branch"
+
+
+def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
+                     planner_id: str, source: str, why: str) -> dict[str, Any]:
+    """Ask for a review of this plan, closing whichever review it replaces.
+
+    ONE sequence for both callers (§9): a submission and a spec refresh perform the same
+    supersede-then-ask, and two copies would be two chances to disagree about what a
+    re-ask means. A resubmission moves `plan_question_id` off the previous review, and
+    `review_plan` only ever closes the one it currently points at — so an escalated plan
+    question survived every revision that followed it (production questions 67 and 130).
+    Closing it here is the only moment that knows both ids.
+    """
+    from . import plans
+    from .neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        q = neo.ask(name, planner_id, plans.build_plan_question(fo, plan),
+                    context=plans.build_plan_context(plan, source), kind="plan")
+        if fo.get("plan_question_id"):
+            neo.supersede(
+                fo["plan_question_id"],
+                f"SUPERSEDED by question {q['id']}",
+                f"{why}; question {q['id']} reviews the version that replaced the one "
+                f"this asks about",
+            )
+    finally:
+        neo.close()
+    return q
+
+
 def submit_plan(fo_id: str, doc: Any,
                 project_name: str | None = None) -> dict[str, Any]:
     """(Planners) hand back the decomposition. The planner's terminal action.
@@ -5951,8 +6001,7 @@ def submit_plan(fo_id: str, doc: Any,
     briefing tells it not to call the latter. A rejection later re-opens the same session
     through the ordinary message path, so settling now costs the revision nothing.
     """
-    from . import plans
-    from .neo_store import NeoStore
+    from . import landing, plans
 
     name, path, fo = find_feature_order(fo_id, project_name)
     _require_kind(fo, "feature", "jarvis io report")
@@ -5979,19 +6028,20 @@ def submit_plan(fo_id: str, doc: Any,
     # section or find the agent profile without it, and this is the one place that holds
     # both. Reported together with a second `PlanError` shape so a planner fixes
     # everything in one revision, which is `PlanError`'s whole argument.
-    candidates = []
-    if fo.get("plan_wo_id"):
-        candidates.append(path / ".claude" / "worktrees" / fo["plan_wo_id"]
-                          / plan["design_doc"])
-    candidates.append(path / plan["design_doc"])
-    existing = next((c for c in candidates if c.is_file()), None)
-    if existing is None:
+    #
+    # The COMMITTED copy, never the working tree (§6, ruling 667): a snapshot taken from
+    # a mutable worktree is text that exists in no commit, and it is what the children
+    # and the reviewer are then built from.
+    planner_wo = _planner_work_order(path, fo)
+    found = landing.committed_text(path, planner_wo, plan["design_doc"])
+    if found is None:
         raise OpsError(
-            f"the plan names design_doc {plan['design_doc']!r} but no such file "
-            f"exists — write it before submitting (looked in: "
-            + ", ".join(str(c) for c in candidates) + ")"
+            f"the plan names design_doc {plan['design_doc']!r} but no COMMITTED copy "
+            f"exists on {_spec_branch(path, planner_wo)} — the reviewer is sent the "
+            f"committed text, never your working tree. Commit it and resubmit:\n"
+            f"  git add {plan['design_doc']} && git commit -m \"spec: …\""
         )
-    plan["design_doc_content"] = existing.read_text()
+    plan["design_doc_content"], source = found
     spec_problems = plans.spec_problems(plan, plan["design_doc_content"])
     if spec_problems:
         raise OpsError(
@@ -6004,25 +6054,8 @@ def submit_plan(fo_id: str, doc: Any,
     # order whose planner was deleted still submits — the question just names the feature
     # order instead of a row that no longer exists.
     planner_id = fo.get("plan_wo_id") or fo_id
-    question = plans.build_plan_question(fo, plan)
-    neo = NeoStore()
-    try:
-        q = neo.ask(name, planner_id, question, kind="plan")
-        # A resubmission moves `plan_question_id` off the previous review, and
-        # `review_plan` only ever closes the one it currently points at — so an
-        # escalated plan question survived every revision that followed it (production
-        # questions 67 and 130, the second still asking for the user three days after
-        # its successor was approved). Close it here, naming what replaced it, because
-        # this is the only moment that knows both ids.
-        if fo.get("plan_question_id"):
-            neo.supersede(
-                fo["plan_question_id"],
-                f"SUPERSEDED by question {q['id']}",
-                f"the plan was revised and resubmitted; question {q['id']} reviews the "
-                f"version that replaced the one this asks about",
-            )
-    finally:
-        neo.close()
+    q = _ask_plan_review(name, fo, plan, planner_id, source,
+                         why="the plan was revised and resubmitted")
 
     store = ProjectStore(path)
     try:
@@ -6050,6 +6083,99 @@ def submit_plan(fo_id: str, doc: Any,
             f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
         )
     return out
+
+
+def refresh_plan_spec(fo_id: str,
+                      project_name: str | None = None) -> dict[str, Any]:
+    """Keep the spec under review equal to the spec as committed. (B) of issue #746.
+
+    §9 of docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md.
+    A plan sits in `plan_review` for minutes while its planner may still be committing
+    revisions of the very document the review judges; question 658 was answered 22
+    seconds after the revision it should have read merged. Here per tick, beside
+    `submit_plan` because it performs the same three writes and must not perform them
+    differently.
+
+    THE ORDERING INVARIANT: the text the reviewer judges and the text the children are
+    built from are the same text. That is why a refresh never happens without a re-ask,
+    and why a revision the plan no longer satisfies is REJECTED to the planner instead
+    of refreshed under it.
+    """
+    from . import landing, plans
+    from .neo_store import NeoStore
+
+    name, path, fo = find_feature_order(fo_id, project_name)
+    out: dict[str, Any] = {"project": name, "fo_id": fo_id, "refreshed": False}
+    if fo["status"] != "plan_review":
+        return {**out, "reason": f"{fo_id} is {fo['status']}"}
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    qid = fo.get("plan_question_id")
+    if not (plan.get("design_doc") and plan.get("design_doc_content") and qid):
+        return {**out, "reason": "no spec under review"}
+    neo = NeoStore()
+    try:
+        q = neo.get(qid)
+    finally:
+        neo.close()
+    # `answered` means the decision is taken; the verdict is on its way through the drain.
+    if q is None or q["status"] == "answered":
+        return {**out, "reason": "the review is decided"}
+
+    found = landing.committed_text(path, _planner_work_order(path, fo),
+                                   plan["design_doc"])
+    if found is None:
+        # §7 rung 3. A stale spec the reviewer was told IS the spec beats no spec, so the
+        # snapshot and the question are left exactly as they are.
+        log.warning("[%s] %s: no committed copy of %s on any rung — the plan under "
+                    "review keeps the spec it was submitted with", name, fo_id,
+                    plan["design_doc"])
+        return {**out, "reason": "nothing readable"}
+    text, source = found
+    if (hashlib.sha256(text.encode()).hexdigest()
+            == hashlib.sha256(str(plan["design_doc_content"]).encode()).hexdigest()):
+        return {**out, "reason": "unchanged"}
+
+    if q["status"] in ("escalated", "failed"):
+        # The user holds this question. Pulling it out of their queue would leave
+        # `flag_feature_attention` pointing at a closed row, so they are told instead.
+        store = ProjectStore(path)
+        try:
+            store.flag_feature_attention(
+                fo_id, "the spec has been revised since this plan was reviewed — reject "
+                       "it and let the planner resubmit")
+        finally:
+            store.close()
+        return {**out, "reason": "the user holds the question"}
+
+    problems = plans.spec_problems(plan, text)
+    if problems:
+        # The committed revision broke the plan. Back to the planner through the one path
+        # that already exists, which also closes the question.
+        feedback = ("the spec was revised on " + source + " and the plan no longer fits "
+                    "it:\n  - " + "\n  - ".join(problems))
+        review_plan(fo_id, accept=False, feedback=feedback, decided_by="os",
+                    project_name=name)
+        return {**out, "reason": "rejected", "problems": problems}
+
+    plan["design_doc_content"] = text
+    planner_id = fo.get("plan_wo_id") or fo_id
+    q2 = _ask_plan_review(name, fo, plan, planner_id, source,
+                          why=f"the spec was revised on {source}")
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(fo_id, plan=db.to_json(plan),
+                                   plan_question_id=q2["id"])
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "plan_spec_refreshed", {
+                "feature_order": fo_id, "source": source,
+                "was_question": qid, "neo_question_id": q2["id"],
+            })
+    finally:
+        store.close()
+    log.info("[%s] %s: the spec moved to %s — re-asked as question %s", name, fo_id,
+             source, q2["id"])
+    return {**out, "refreshed": True, "source": source, "neo_question_id": q2["id"],
+            "superseded": qid}
 
 
 def review_plan(fo_id: str, accept: bool = True, feedback: str = "",

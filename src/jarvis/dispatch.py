@@ -492,7 +492,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "{",
         '  "summary": "one line: what this feature is, once it is all done",',
         '  "design_doc": "docs/specs/<feature>.md — the spec you wrote, relative to the '
-        'repo root. REQUIRED, and it must already exist",',
+        'repo root. REQUIRED, and it must already be COMMITTED on your branch — the '
+        'reviewer is sent the committed text, never your working tree",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
@@ -516,11 +517,12 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         "## THE SPEC IS THE DELIVERABLE. The plan is an index into it.",
         "Write the feature's spec FIRST — a markdown file in your worktree (convention: "
-        "`docs/`), with numbered sections — and name it in `design_doc`. It must exist "
-        "before you submit; a plan that names no spec, or names one that is not on disk, "
-        "is refused. Everything you know because you read the whole feature — the "
-        "architecture, the data model, the interfaces, the traps — goes THERE, once, and "
-        "is never repeated into a brief.",
+        "`docs/`), with numbered sections — and name it in `design_doc`. Commit it "
+        "before you submit; a plan that names no spec, or names one that is not "
+        "committed on your branch, is refused — writing the file is not enough, the "
+        "reviewer only ever sees the committed text. Everything you know because you "
+        "read the whole feature — the architecture, the data model, the interfaces, the "
+        "traps — goes THERE, once, and is never repeated into a brief.",
         "",
         "**Cut the spec's sections along the feature's FUNCTIONAL boundaries, because "
         "the sections are the split.** One section, one work order: every child names "
@@ -568,7 +570,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"edge of \"the margin, not the brief\", and it is not negotiable by writing "
         f"more carefully: if the piece needs more than that to explain, the explanation "
         f"belongs in its section of the spec",
-        "- a plan naming no `design_doc`, or one naming a file that is not on disk",
+        "- a plan naming no `design_doc`, or one naming a file not committed on your "
+        "branch",
         "- a child with no `spec_section`, a `spec_section` matching no heading in the "
         "spec, two children claiming the same section, or a child claiming the `Agent "
         "profile` appendix",

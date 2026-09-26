@@ -727,6 +727,10 @@ class Daemon:
                 # pending work order, so it is claimed by the same pass rather than
                 # waiting a whole poll interval to start.
                 self.plan_features(project, store)
+                # Immediately after: this is the tick's feature-order planning band, and
+                # a question asked here is picked up by the same Neo drain on the same
+                # tick rather than one interval late. §9.
+                self.refresh_plan_specs(project, store)
                 # Before dispatch for the planner's reason one step removed: an order the
                 # scheduler files this tick is an ordinary pending work order, so the
                 # same pass claims it instead of leaving it a whole poll interval late.
@@ -992,6 +996,22 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+    def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Re-ask any plan review whose spec has been committed over. Thin, like its
+        siblings: the logic is `ops.refresh_plan_spec` (§9).
+
+        Cost when nothing is in `plan_review` — the normal case — is one indexed query
+        returning zero rows and no git subprocess at all.
+        """
+        from . import ops
+
+        for fo in store.list_feature_orders(statuses=("plan_review",)):
+            try:
+                ops.refresh_plan_spec(fo["id"], project_name=project.name)
+            except Exception:  # noqa: BLE001 — one feature must not stop the rest
+                log.exception("[%s] could not refresh the spec under review for %s",
+                              project.name, fo["id"])
 
     def settle_features(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Close out feature orders whose children have all landed, or one of which has

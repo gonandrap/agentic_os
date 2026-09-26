@@ -190,7 +190,10 @@ def build_question_prompt(q: dict[str, Any]) -> str:
         f"Work order: {q['wo_id']}",
     ]
     if q.get("context"):
-        parts.append(f"Work order context:\n{q['context']}")
+        # A plan question's context IS the subject — the spec being judged (§5). Under a
+        # label reading "work order context" the reviewer treats it as background.
+        label = "Spec under review" if q.get("kind") == "plan" else "Work order context"
+        parts.append(f"{label}:\n{q['context']}")
     parts += ["", f"Worker question:\n{q['question']}"]
     return "\n".join(parts)
 
