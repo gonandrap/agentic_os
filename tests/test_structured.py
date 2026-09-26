@@ -368,3 +368,8 @@ def test_neo_parse_verdict_is_the_attempts_one_fallback_configuration():
     assert neo.parse_verdict(good) == structured.coerce(
         good, neo._validate_verdict, on_invalid=neo._unparseable_verdict)
     assert neo.parse_verdict("garbage")["escalate"] is True
+
+
+def test_default_call_is_the_transport_function_itself():
+    """No wrapper: `DEFAULT_CALL` binds nothing, so it must BE `run_headless_result`."""
+    assert structured.DEFAULT_CALL is claude_cli.run_headless_result

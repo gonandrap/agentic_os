@@ -101,10 +101,9 @@ Output STRICT JSON, nothing else, with exactly these keys:
 #: the reader a description of the code instead of a shortening of the question — a
 #: failure mode that looks like a good answer, which is the worst kind.
 #:
-#: `attribute=False` for the same reason as Neo's and the panel's calls: the daemon binds
-#: this call's work order itself, through `structured.request`'s `on_usage` seam, and the
-#: transport's own attribution would be a second row for the same tokens.
-CALL = partial(claude_cli.run_headless_result, tools="", attribute=False)
+#: The declaration that the daemon records this call itself — through
+#: `structured.request`'s `on_usage` seam — travels with the call, in `summarise`.
+CALL = partial(claude_cli.run_headless_result, tools="")
 
 
 class DigestError(RuntimeError):
@@ -191,6 +190,9 @@ def summarise(question: str, *, model: str, timeout: int = 120,
         # directory would pull that repo's CLAUDE.md into the prompt.
         cwd=ensure_home(),
         call=call,
+        # Declared only when a recorder exists: `on_usage` is optional here, and a
+        # declaration with nobody recording is refused (spec §5).
+        records_itself="digest" if on_usage is not None else "",
         # A digest is an extra call per question that the user never asked for, so what
         # it costs belongs on the work order's bill beside the answer it shortens.
         on_usage=on_usage,

@@ -24,11 +24,14 @@ anywhere. So it is recorded when it returns or it is lost, and what is worth a t
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import textwrap
 
 import pytest
 
-from jarvis import agent_usage, claude_cli, cli, dispatch, ops, testing
+from jarvis import agent_usage, claude_cli, cli, dispatch, ops, seats, structured, testing
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
@@ -102,38 +105,290 @@ def test_an_unparseable_reply_is_recorded_as_a_call_that_failed(jarvis_home, mon
     assert not row["ok"] and row["output"] == 0
 
 
-def test_attribution_can_be_switched_off(jarvis_home, fake_claude, monkeypatch):
-    """The escape hatch the OS's own call sites use. Without it, a Neo answer made from a
-    process that happens to carry a work order would be billed twice for one call."""
+def _compiled_in(module: str, source: str):
+    """A function whose FRAME reports `module`, for driving the caller check.
+
+    The check reads each frame's `f_globals["__name__"]` (spec §3), so a fake caller is a
+    function compiled with those globals — not a mock, and not something a caller could
+    pass in.
+    """
+    glb: dict = {"__name__": module}
+    exec(source, glb)
+    return glb["go"]
+
+
+def test_an_outside_caller_cannot_switch_attribution_off(jarvis_home, fake_claude,
+                                                         monkeypatch):
+    """The hole #749 was spent through. This test module is outside the `jarvis` package,
+    so the call below IS the outside caller: naming a real kind does not buy silence."""
     monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
 
-    claude_cli.run_headless("summarise this", attribute=False)
+    with pytest.raises(claude_cli.AttributionRefused, match="outside the jarvis package"):
+        claude_cli.run_headless("summarise this", records_itself="neo_answer")
+
+    assert calls(wo_id="wo-abc123") == []       # nothing ran, so there is nothing to bill
+
+
+def test_an_eval_shaped_caller_naming_a_real_kind_is_still_refused(jarvis_home,
+                                                                   fake_claude,
+                                                                   monkeypatch):
+    """The #749 shape exactly: 713 calls from `evals.llm.test_stakes_classifier_ab`, none
+    recorded. The kind is genuine and the module is not."""
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
+    go = _compiled_in("evals.llm.test_stakes_classifier_ab",
+                      "def go(cli):\n"
+                      "    return cli.run_headless('q', records_itself='neo_answer')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused) as e:
+        go(claude_cli)
+
+    assert "evals.llm.test_stakes_classifier_ab" in str(e.value)
+    assert calls(wo_id="wo-abc123") == []
+
+
+def test_the_refusal_happens_before_any_subprocess_is_spawned(jarvis_home, monkeypatch):
+    """The whole value of checking at the call: a misuse costs zero dollars."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        claude_cli.run_headless_result("summarise this", records_itself="neo_answer")
+
+
+# -- the forwarders, which are not the OS frame that authorises ------------------------
+
+
+def test_an_eval_cannot_declare_through_structured_request(jarvis_home, fake_claude,
+                                                           monkeypatch):
+    """`structured.request` FORWARDS a declaration, so before §3's forwarder set its own
+    frame authorised every caller's: an eval named a kind and spent with no row."""
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
+    go = _compiled_in("evals.llm.test_stakes_classifier_ab",
+                      "def go(structured, on_usage):\n"
+                      "    return structured.request('q', validate=lambda d: d,\n"
+                      "                              records_itself='digest',\n"
+                      "                              on_usage=on_usage)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused, match="outside the jarvis package"):
+        go(structured, lambda usage: None)
 
     assert calls(wo_id="wo-abc123") == []
 
 
-@pytest.mark.parametrize("site", ["neo", "panel_seat", "panel_chair", "digest"])
-def test_every_os_call_site_opts_out_of_the_transports_attribution(site):
-    """Each of these records itself, with the work order AND the question it was made
-    for — detail this seam cannot know. Leaving both on would write two rows for one call
-    the moment the OS's own process carried a `JARVIS_WO_ID`, which is precisely what
-    happens when the LLM evals drive Neo in-process inside a worker.
+def test_an_eval_cannot_declare_through_run_blind(jarvis_home, monkeypatch, tmp_path):
+    """The seats path, same hole: `jarvis.seats` forwarded `kind` into the transport, so
+    an outside caller naming `panel_seat` bought silence for a whole round."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("evals.llm.test_neo_panel_judgment",
+                      "def go(seats, cwd):\n"
+                      "    return seats.run_blind({'tester': ('s', 'u')}, models={},\n"
+                      "                           timeout=5, cwd=cwd,\n"
+                      "                           kind='panel_seat')\n")
 
-    Asserted against the source rather than by driving each path, because what must hold
-    is that NO site forgets — a behavioural test per site proves only the sites someone
-    remembered to write one for.
+    with pytest.raises(claude_cli.AttributionRefused):
+        go(seats, tmp_path)
+
+
+def test_an_eval_cannot_declare_through_prime_cache(jarvis_home, monkeypatch, tmp_path):
+    """`prime_cache` never raises on a transport failure, so a refusal it swallowed would
+    be a free pass — it is refused at the front door instead, before the pool."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("evals.llm.test_validation_judgment",
+                      "def go(seats, cwd):\n"
+                      "    return seats.prime_cache('s', 'u', 'haiku', timeout=5,\n"
+                      "                             cwd=cwd, kind='validation_seat')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        go(seats, tmp_path)
+
+
+def test_a_declaration_with_no_recorder_records_nothing_so_it_is_refused(monkeypatch):
+    """Even from an OS frame. `records_itself` says the caller writes the row; no
+    `on_usage` means nobody does, and the transport has already stood down."""
+    monkeypatch.setattr(claude_cli, "_run",
+                        lambda *a, **kw: pytest.fail("the subprocess ran"))
+    go = _compiled_in("jarvis.digest",
+                      "def go(structured):\n"
+                      "    return structured.request('q', validate=lambda d: d,\n"
+                      "                              records_itself='digest')\n")
+
+    with pytest.raises(claude_cli.AttributionRefused, match="on_usage"):
+        go(structured)
+
+
+def test_an_outside_caller_cannot_mint_an_authorisation(tmp_path):
+    """The token IS the check (§3): minting it runs the frame walk, and the class has no
+    other constructor, so an eval cannot build one to hand the transport."""
+    mint = _compiled_in("evals.llm.test_neo_panel_judgment",
+                        "def go(fn, kind):\n    return fn(kind)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        mint(claude_cli.authorise, "panel_seat")
+    with pytest.raises(claude_cli.AttributionRefused):
+        mint(claude_cli.Authorisation, "panel_seat")
+
+
+def test_an_os_frame_mints_a_token_the_transport_takes_as_checked():
+    """The other half: panel and validation mint on their own thread, and the token
+    carries the kind it was checked for."""
+    mint = _compiled_in("jarvis.panel", "def go(fn, kind):\n    return fn(kind)\n")
+
+    token = mint(claude_cli.authorise, "panel_seat")
+
+    assert token.kind == "panel_seat"
+
+
+def test_a_jarvis_frame_beyond_the_frame_cap_does_not_authorise():
+    """`_CALLER_FRAME_CAP` refuses rather than accepts past the horizon: a stack this deep
+    is not one of the OS's own, and accepting would make the cap a hole."""
+    deep = _compiled_in("evals.llm.deep_chain",
+                        "def go(check, kind, depth):\n"
+                        "    if depth:\n"
+                        "        return go(check, kind, depth - 1)\n"
+                        "    return check(kind)\n")
+    os_frame = _compiled_in("jarvis.neo",
+                            "def go(deep, check, kind):\n"
+                            "    return deep(check, kind, 25)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        os_frame(deep, claude_cli._check_records_itself, "neo_answer")
+
+
+#: Every declaration the OS makes of the `agent_calls.kind` it writes for its own call:
+#: the function whose source carries the literal, the call it is passed to, the keyword it
+#: is passed under, and the kind it must name. `jarvis.panel` primes no cache, so it has
+#: no `prime_cache` entry; `jarvis.validation.decide` carries two, one per seat helper.
+OS_DECLARATIONS = [
+    ("neo.answer_question", "jarvis.neo",
+     "claude_cli.run_headless_result", "records_itself", "neo_answer"),
+    ("panel._round", "jarvis.panel", "seats.run_blind", "kind", "panel_seat"),
+    ("panel._run_chair", "jarvis.panel",
+     "claude_cli.run_headless_result", "records_itself", "panel_seat"),
+    ("validation.decide/prime_cache", "jarvis.validation",
+     "seats.prime_cache", "kind", "validation_seat"),
+    ("validation.decide/run_blind", "jarvis.validation",
+     "seats.run_blind", "kind", "validation_seat"),
+    ("validation._run_chair", "jarvis.validation",
+     "claude_cli.run_headless_result", "records_itself", "validation_seat"),
+    ("digest.summarise", "jarvis.digest",
+     "structured.request", "records_itself", "digest"),
+    ("supervisor.review", "jarvis.supervisor",
+     "structured.request", "records_itself", "supervisor"),
+    ("supervisor.review_health", "jarvis.supervisor",
+     "structured.request", "records_itself", "health"),
+]
+
+
+def _site_function(site: str):
+    """The function a site id names — `decide` for `validation.decide/run_blind`."""
+    from jarvis import digest, neo, panel, supervisor, validation
+
+    module, _, rest = site.partition(".")
+    return getattr({"neo": neo, "panel": panel, "validation": validation,
+                    "digest": digest, "supervisor": supervisor}[module],
+                   rest.split("/")[0])
+
+
+def _called_name(node: ast.Call) -> str:
+    """`seats.run_blind` for an attribute call, `request` for a bare one."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        prefix = func.value.id + "." if isinstance(func.value, ast.Name) else ""
+        return prefix + func.attr
+    return getattr(func, "id", "")
+
+
+def _kind_literal(value: ast.expr):
+    """The kind a declaration names, through the conditional `digest.summarise` uses.
+
+    `records_itself="digest" if on_usage is not None else ""` declares `digest` and
+    nothing else — the other branch is the fall-back to the transport's own attribution.
     """
-    import inspect
+    if isinstance(value, ast.IfExp):
+        return _kind_literal(value.body)
+    return value.value if isinstance(value, ast.Constant) else None
 
-    from jarvis import digest, neo, panel
 
-    if site == "digest":
-        assert digest.CALL.keywords.get("attribute") is False
-        return
-    source = {"neo": inspect.getsource(neo.answer_question),
-              "panel_seat": inspect.getsource(panel._run_seat),
-              "panel_chair": inspect.getsource(panel._run_chair)}[site]
-    assert "attribute=False" in source
+def _declared_kinds(fn, call: str, keyword: str) -> list[str]:
+    """Every literal `fn`'s own source passes as `keyword` to `call`."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    return [kind
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _called_name(node) == call
+            for kw in node.keywords
+            if kw.arg == keyword
+            for kind in [_kind_literal(kw.value)] if kind is not None]
+
+
+@pytest.mark.parametrize("site,module,call,keyword,kind", OS_DECLARATIONS)
+def test_every_os_site_declares_the_kind_its_own_row_uses(site, module, call, keyword,
+                                                          kind):
+    """Read out of each site's REAL source: the literal it passes is the kind its own row
+    is written under. A site whose literal drifts — to a kind another site writes, or to
+    one nobody writes — is billed twice or not at all, and this is what sees it.
+
+    By source rather than by driving each path, because what must hold is that NO site
+    drifts; a behavioural test per site proves only the sites someone wrote one for.
+    """
+    assert _declared_kinds(_site_function(site), call, keyword) == [kind]
+
+
+@pytest.mark.parametrize("site,module,call,keyword,kind", OS_DECLARATIONS)
+def test_the_transport_accepts_every_kind_the_os_declares(site, module, call, keyword,
+                                                          kind):
+    """The other half: the transport takes each of those kinds from the declaring module's
+    own frame. The frame is faked at the module that owns the literal (spec §3)."""
+    go = _compiled_in(module, "def go(check, kind):\n    check(kind)\n")
+
+    go(claude_cli._check_records_itself, kind)     # raises AttributionRefused if it drifts
+
+
+def test_no_source_file_in_the_repo_still_opts_out_of_attribution():
+    """Catches a half-done migration: a site left on the deleted boolean would raise a
+    `TypeError` only when that path next ran, which for the chair paths is in production."""
+    from pathlib import Path
+
+    import jarvis
+
+    repo = Path(jarvis.__file__).parent.parent.parent
+    roots = [repo / "src" / "jarvis", repo / "evals", repo / "scripts"]
+    # `evals/` and `scripts/` too: the keyword #749 was spent through was typed in an
+    # eval, not in `src/jarvis`.
+    assert [str(f) for root in roots if root.is_dir()
+            for f in root.rglob("*.py") if "attribute=False" in f.read_text()] == []
+
+
+@pytest.mark.parametrize("kind", ["neo_answers", "  ", "Neo_answer", "anything",
+                                  agent_usage.WORKER_SUBPROCESS])
+def test_a_declaration_of_an_unknown_or_subprocess_kind_is_refused(kind):
+    """`KIND_LABELS` stays open for RECORDING and is closed for DECLARING: a made-up kind
+    is the one place it would buy silence. `worker_subprocess` is the row this transport
+    writes, so a caller claiming it claims a row nobody wrote."""
+    go = _compiled_in("jarvis.neo", "def go(check, kind):\n    check(kind)\n")
+
+    with pytest.raises(claude_cli.AttributionRefused):
+        go(claude_cli._check_records_itself, kind)
+
+
+def test_a_test_double_between_the_os_and_the_transport_still_records_itself(
+        jarvis_home, fake_claude, monkeypatch):
+    """Spec §3 step 3, pinned so a later tightening to the nearest frame cannot happen
+    silently: it would kill every seat of both LLM eval suites
+    (`evals/llm/test_validation_judgment.py:1193`, `test_neo_panel_judgment.py:214`), whose
+    `Meter` forwards the OS's own declaration unchanged while `jarvis.validation` is below
+    it on the stack."""
+    monkeypatch.setenv("JARVIS_WO_ID", "wo-abc123")
+    meter = _compiled_in("evals.llm.test_validation_judgment",
+                         "def go(real, **kwargs):\n    return real('p', **kwargs)\n")
+    os_path = _compiled_in(
+        "jarvis.validation",
+        "def go(meter, real):\n"
+        "    return meter(real, records_itself='validation_seat')\n")
+
+    assert os_path(meter, claude_cli.run_headless_result).usage    # accepted, and it ran
+    assert calls(wo_id="wo-abc123") == []       # the declaring caller writes its own row
 
 
 def test_recording_a_subprocess_call_never_breaks_the_call(jarvis_home, fake_claude,
