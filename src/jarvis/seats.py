@@ -194,11 +194,15 @@ class Opinion:
 
 
 def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
-              cwd: Path, tools: str | None = None) -> Opinion:
+              cwd: Path, tools: str | None = None, *, kind: str) -> Opinion:
     """Call one seat. Never raises: a seat that fails abstains and the panel proceeds.
 
     Runs on a pool thread, so it touches NO database — sqlite connections belong to the
     thread that opened them. Opinions are recorded by the caller.
+
+    `kind` is the `agent_calls.kind` that caller writes — `panel_seat` or
+    `validation_seat`. Required and from the caller because a literal here would be false
+    for one of the two (spec §5).
     """
     started = time.monotonic()
 
@@ -206,10 +210,10 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
         return int((time.monotonic() - started) * 1000)
 
     try:
-        # `attribute=False`: the caller records this seat itself, by name. See `neo`.
+        # The caller records this seat itself, by name, under `kind`. See `neo`.
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
                                                 timeout=timeout, cwd=cwd, tools=tools,
-                                                attribute=False)
+                                                records_itself=kind)
     except claude_cli.ClaudeCliError as e:
         log.warning("seat %s abstained: %s", seat, e)
         return Opinion(seat=seat, raw=str(e), status="abstained", model=model,
@@ -226,7 +230,7 @@ def _run_seat(seat: str, prompt: str, system: str, model: str, timeout: int,
 
 
 def prime_cache(system: str, user: str, model: str, *, timeout: int, cwd: Path,
-                tools: str | None = None) -> dict[str, Any] | None:
+                tools: str | None = None, kind: str) -> dict[str, Any] | None:
     """Write a shared system prefix into the prompt cache, and WAIT for it. Returns what
     the call cost, or None if it never happened.
 
@@ -246,7 +250,8 @@ def prime_cache(system: str, user: str, model: str, *, timeout: int, cwd: Path,
     try:
         result = claude_cli.run_headless_result(user, system_prompt=system, model=model,
                                                 timeout=timeout, cwd=cwd, tools=tools,
-                                                attribute=False)
+                                                # The caller records this call, `kind`.
+                                                records_itself=kind)
     except claude_cli.ClaudeCliError as e:
         log.warning("prompt-cache priming failed, seats will each write: %s", e)
         return None
@@ -254,7 +259,8 @@ def prime_cache(system: str, user: str, model: str, *, timeout: int, cwd: Path,
 
 
 def run_blind(prompts: dict[str, tuple[str, str]], *, models: dict[str, str],
-              timeout: int, cwd: Path, tools: str | None = None) -> list[Opinion]:
+              timeout: int, cwd: Path, tools: str | None = None,
+              kind: str) -> list[Opinion]:
     """Run every seat concurrently and blind, and return one Opinion per seat, in the
     order the prompts were given.
 
@@ -281,7 +287,7 @@ def run_blind(prompts: dict[str, tuple[str, str]], *, models: dict[str, str],
                             thread_name_prefix="seat") as pool:
         futures = {
             seat: pool.submit(_run_seat, seat, user, system, models.get(seat, ""),
-                              timeout, cwd, tools)
+                              timeout, cwd, tools, kind=kind)
             for seat, (system, user) in prompts.items()
         }
         return [futures[seat].result() for seat in prompts]

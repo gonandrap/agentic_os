@@ -178,11 +178,10 @@ def test_the_call_strips_the_callees_tools():
     reads `src/jarvis/panel.py`, and the page then shows a description of the code
     instead of a shortening of the question — a failure that looks like a good answer.
 
-    `attribute=False` rides along for a different reason: the daemon binds this call's
-    work order itself through `on_usage`, and leaving the transport's own attribution on
-    would write a second `agent_calls` row for the same tokens.
+    The declaration that the daemon records this call itself travels in `summarise`, not
+    here: `records_itself="digest"`, matching the kind `daemon._digest_batch` binds.
     """
-    assert digest.CALL.keywords == {"tools": "", "attribute": False}
+    assert digest.CALL.keywords == {"tools": ""}
 
 
 def test_the_threshold_is_what_stops_a_one_line_question_costing_a_call():

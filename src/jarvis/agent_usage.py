@@ -39,6 +39,12 @@ Every call site takes a `record=` parameter defaulting to `record` here, the sam
 (which runs on a pool thread, where a sqlite connection from another thread would be a
 bug) and lets a test assert on what would have been written without a database at all.
 
+A site that records a call here tells the transport so with
+`claude_cli.run_headless_result(..., records_itself="<kind>")`, so the same call is not
+also billed as a `WORKER_SUBPROCESS` row. That declaration is not a kill switch and is
+refused unless an OS code path is making the call — see
+docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
+
 ## It never raises
 
 Accounting is an observer. A work order must not fail, and Neo must not stop answering,

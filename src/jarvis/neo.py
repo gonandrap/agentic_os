@@ -352,7 +352,7 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
         # This call records itself, three lines down, with the question it answered.
         # Leaving the transport's own attribution on would double-count it whenever the
         # daemon's environment happens to carry a work order — see `claude_cli`.
-        attribute=False,
+        records_itself="neo_answer",
     )
     record("neo_answer", usage=result, project=q.get("project") or "",
            wo_id=q.get("wo_id") or "", label=q.get("kind") or "question",

@@ -78,6 +78,16 @@ class ClaudeCliError(RuntimeError):
     pass
 
 
+class AttributionRefused(RuntimeError):
+    """A caller's `records_itself` declaration was not one it could make.
+
+    DELIBERATELY NOT a `ClaudeCliError`: `seats.py:213`, `panel.py:611` and
+    `validation.py:1165` turn those into an abstention, so a refusal caught there would be
+    silent — the bug being fixed wearing the fix's clothes. See §4 of
+    docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
+    """
+
+
 @contextlib.contextmanager
 def _system_prompt_arg(system_prompt: str | None) -> Iterator[list[str]]:
     """The flags that carry a system prompt, and the temporary file when it needs one."""
@@ -1501,10 +1511,54 @@ def model_of(result: HeadlessResult) -> str:
     return result.model or "unknown"
 
 
+#: How far out the caller walk looks before refusing. Every real stack here is shallow
+#: (transport, an OS function, the daemon or a fixture); past this a frame claiming to be
+#: the OS is not evidence of one. Spec's Open section.
+_CALLER_FRAME_CAP = 20
+
+
+def _check_records_itself(kind: str) -> None:
+    """Raise `AttributionRefused` unless `kind` is a declaration this caller can make.
+
+    Spec §2 and §3: the kind must be one the OS accounts under and not the one this
+    transport writes, and an OS code path must be on the stack — a frame's module is a
+    fact about where code lives, and an argument would be forgeable by the caller with the
+    motive to forge it.
+    """
+    from . import agent_usage
+
+    if kind not in agent_usage.KIND_LABELS:
+        raise AttributionRefused(
+            f"records_itself={kind!r} is not an OS accounting kind "
+            "(agent_usage.KIND_LABELS): a caller that records a call itself must name "
+            "the kind it writes.")
+    if kind in agent_usage.SUBPROCESS_KINDS:
+        raise AttributionRefused(
+            f"records_itself={kind!r} is the kind this transport writes itself; "
+            "a caller cannot claim it.")
+    nearest = ""
+    frame: Any = sys._getframe(1)
+    seen = 0
+    while frame is not None and seen < _CALLER_FRAME_CAP:
+        module = frame.f_globals.get("__name__", "")
+        # `run_headless` forwards to `run_headless_result`, so without this skip the
+        # nearest caller of every `run_headless` call is the transport itself.
+        if module != __name__:
+            nearest = nearest or module
+            if module == "jarvis" or module.startswith("jarvis."):
+                return
+            seen += 1
+        frame = frame.f_back
+    raise AttributionRefused(
+        f"records_itself={kind!r} is the OS's own opt-out from subprocess attribution "
+        f"and {nearest} may not make it: a call from outside the jarvis package is "
+        "billed to JARVIS_WO_ID and cannot be switched off. Delete the argument.")
+
+
 def run_headless_result(prompt: str, system_prompt: str | None = None,
                         model: str | None = None, cwd: Path | None = None,
-                        timeout: int = 300, tools: str | None = None,
-                        attribute: bool = True, record: Any = None,
+                        timeout: int = 300, tools: str | None = None, *,
+                        records_itself: str = "", record: Any = None,
                         permission_mode: str | None = None,
                         env_extra: dict[str, str] | None = None) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
@@ -1534,11 +1588,13 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     "judge the prompt and only the prompt" travel together, and neither is a caller's to
     remember.
 
-    `attribute` is the accounting for calls made from INSIDE a work order — see
-    `_attribute_subprocess`. It defaults ON because the callers that need it are eval
-    suites and scripts that do not know they are inside one; the OS's OWN call sites
-    (Neo, the panel's seats, the digest) switch it OFF because they record themselves,
-    with the work order and the question they were made for, which this seam cannot know.
+    `records_itself` names the `agent_calls.kind` the caller writes for this call ITSELF
+    (the OS's own sites — Neo, the panel's seats, the digest — record the work order and
+    the question, which this seam cannot know). Empty, the default, means the transport
+    attributes the call (`_attribute_subprocess`). It is not a kill switch: a declaration
+    is checked before anything runs and refused with `AttributionRefused` unless the kind
+    is a real OS kind and an OS code path is on the stack — see
+    docs/superpowers/specs/2026-09-25-attribution-is-not-a-callers-choice.md.
 
     `permission_mode` and `env_extra` exist for the other direction: running a
     subject that is *supposed* to touch the machine, in a controlled one. A
@@ -1548,6 +1604,10 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     suppress attribution: a measured subject still spends the work order's tokens,
     and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
     """
+    # FIRST, before any argument is built or any subprocess runs: a refused call spends
+    # nothing (spec §2).
+    if records_itself:
+        _check_records_itself(records_itself)
     args: list[str] = ["-p", prompt, "--output-format", "json"]
     if model:
         args += ["--model", model]
@@ -1582,15 +1642,15 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
             # several models and no single name is honest, so the requested one stands.
             model=(served[0] if len(served) == 1 else "") or model or "",
         )
-    if attribute:
+    if not records_itself:
         _attribute_subprocess(result, record)
     return result
 
 
 def run_headless(prompt: str, system_prompt: str | None = None,
                  model: str | None = None, cwd: Path | None = None,
-                 timeout: int = 300, tools: str | None = None,
-                 attribute: bool = True, record: Any = None,
+                 timeout: int = 300, tools: str | None = None, *,
+                 records_itself: str = "", record: Any = None,
                  permission_mode: str | None = None,
                  env_extra: dict[str, str] | None = None) -> str:
     """`run_headless_result`, keeping only the text.
@@ -1599,7 +1659,7 @@ def run_headless(prompt: str, system_prompt: str | None = None,
     whose fakes return a plain string. Anything the OS pays for should call
     `run_headless_result` and record what comes back.
 
-    It still ATTRIBUTES, though, and that is the point of passing the flags through: the
+    It still ATTRIBUTES, and that is the point of passing `records_itself` through: the
     LLM-graded evals reach the model through this wrapper, and they are the spend issue
     #103 was filed about. `permission_mode`/`env_extra` ride through for the same
     callers — the retrieval eval's tooled subject is both the thing being measured and,
@@ -1607,7 +1667,7 @@ def run_headless(prompt: str, system_prompt: str | None = None,
     """
     return run_headless_result(prompt, system_prompt=system_prompt, model=model,
                                cwd=cwd, timeout=timeout, tools=tools,
-                               attribute=attribute, record=record,
+                               records_itself=records_itself, record=record,
                                permission_mode=permission_mode,
                                env_extra=env_extra).text
 

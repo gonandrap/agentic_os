@@ -130,7 +130,8 @@ def test_run_blind_takes_no_store_and_runs_off_the_main_thread(monkeypatch, tmp_
     def worker():
         out["opinions"] = seats.run_blind(
             {"tester": ("system", "user"), "security": ("system", "user")},
-            models={"tester": "haiku", "security": ""}, timeout=5, cwd=tmp_path)
+            models={"tester": "haiku", "security": ""}, timeout=5, cwd=tmp_path,
+            kind="panel_seat")
 
     t = threading.Thread(target=worker)
     t.start()
@@ -154,7 +155,7 @@ def test_run_blind_fans_out_concurrently(monkeypatch, tmp_path):
 
     opinions = seats.run_blind(
         {s: ("system", "user") for s in ("tester", "security", "architect")},
-        models={}, timeout=5, cwd=tmp_path)
+        models={}, timeout=5, cwd=tmp_path, kind="panel_seat")
 
     assert len(opinions) == 3
     assert all(o.status == "ok" for o in opinions)
@@ -167,17 +168,18 @@ def test_the_prompts_and_model_each_seat_was_given_reach_the_call(monkeypatch, t
              **kw):
         seen.append({"prompt": prompt, "system": system_prompt, "model": model,
                      "timeout": timeout, "cwd": cwd, "tools": tools,
-                     "attribute": kw.get("attribute")})
+                     "records_itself": kw.get("records_itself")})
         return reply()
 
     monkeypatch.setattr(claude_cli, "run_headless_result", call)
 
     seats.run_blind({"tester": ("the tester mandate", "the packet")},
-                    models={"tester": "haiku"}, timeout=17, cwd=tmp_path, tools="")
+                    models={"tester": "haiku"}, timeout=17, cwd=tmp_path, tools="",
+                    kind="validation_seat")
 
     assert seen == [{"prompt": "the packet", "system": "the tester mandate",
                      "model": "haiku", "timeout": 17, "cwd": tmp_path, "tools": "",
-                     "attribute": False}]
+                     "records_itself": "validation_seat"}]
 
 
 def test_no_prompts_makes_no_calls(monkeypatch, tmp_path):
@@ -186,7 +188,8 @@ def test_no_prompts_makes_no_calls(monkeypatch, tmp_path):
 
     monkeypatch.setattr(claude_cli, "run_headless_result", explode)
 
-    assert seats.run_blind({}, models={}, timeout=5, cwd=tmp_path) == []
+    assert seats.run_blind({}, models={}, timeout=5, cwd=tmp_path,
+                           kind="panel_seat") == []
 
 
 # -- silence is not the same as unusable output --------------------------------------------
@@ -212,7 +215,7 @@ def test_a_seat_that_never_replied_is_distinguished_from_one_that_replied_unusab
 
     silent, unusable = seats.run_blind(
         {"tester": ("silent", "p"), "security": ("talkative", "p")},
-        models={}, timeout=5, cwd=tmp_path)
+        models={}, timeout=5, cwd=tmp_path, kind="panel_seat")
 
     assert (silent.status, silent.replied) == ("abstained", False)
     assert (unusable.status, unusable.replied) == ("failed", True)
@@ -229,7 +232,7 @@ def test_a_seat_that_fails_does_not_take_the_round_down(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_cli, "run_headless_result", call)
 
     opinions = seats.run_blind({"tester": ("boom", "p"), "security": ("fine", "p")},
-                               models={}, timeout=5, cwd=tmp_path)
+                               models={}, timeout=5, cwd=tmp_path, kind="panel_seat")
 
     assert [o.status for o in opinions] == ["abstained", "ok"]
 
@@ -241,7 +244,7 @@ def test_the_opinion_carries_the_latency_and_the_usage_it_cost(monkeypatch, tmp_
                         lambda *a, **kw: (time.sleep(0.01), reply(usage={"in": 1}))[1])
 
     op, = seats.run_blind({"tester": ("s", "p")}, models={"tester": "haiku"},
-                          timeout=5, cwd=tmp_path)
+                          timeout=5, cwd=tmp_path, kind="panel_seat")
 
     assert op.usage == {"in": 1}
     assert op.latency_ms >= 1
