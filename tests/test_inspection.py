@@ -695,7 +695,15 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     tree = ast.parse(stdlib_inspect.getsource(inspection))
     allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
                1e6,                             # tokens per million: the price unit
-               inspection.NAMED_SESSIONS}       # a display bound, see the docstring
+               inspection.NAMED_SESSIONS,       # a display bound, see the docstring
+               # The parameter caps (spec §4a) are a STRUCTURAL bound on how big one
+               # report may get, not a per-project judgement about what is expensive —
+               # no catalog wants its own answer to "may this print a megabyte". 6 and
+               # 20 are `autoreview`'s credential-length tests, copied with the shapes.
+               # Same reasoning for the leaf walk's depth bound: a guard against blowing
+               # the stack on a worker's JSON, not a project's choice (review round 2).
+               6, 20, inspection._PARAM_WALK_MAX_DEPTH,
+               *inspection.PARAM_CAPS.as_dict().values()}
     literals = {node.value for node in ast.walk(tree)
                 if isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool)}
@@ -1245,3 +1253,725 @@ def test_the_biggest_offender_is_first(write_transcript):
 
     assert [e.session_id for e in inspection.one_hour_writes(ALL_OF_IT)] == \
         ["big", "small"]
+
+
+# -- tool parameters: redaction, bounds, additivity (spec §4a) -------------------------
+
+
+def test_a_private_key_block_is_named_and_never_quoted():
+    """The marker names the SHAPE. Quoting the match would move the credential out of
+    the transcript and into the report — `kn-deef42ea`, one table along."""
+    body = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAA\n"
+            "-----END OPENSSH PRIVATE KEY-----")
+
+    out = inspection.redact_param(f"cat <<EOF\n{body}\nEOF")
+
+    assert "<redacted: a private key block>" in out
+    assert "b3BlbnNzaC1rZXktdjEA" not in out
+    assert "BEGIN OPENSSH PRIVATE KEY" not in out
+
+
+def test_an_ssh_key_line_is_redacted():
+    out = inspection.redact_param(
+        "echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHxK9qQ' >> authorized_keys")
+
+    assert "<redacted: an ssh key line>" in out
+    assert "AAAAC3NzaC1lZDI1NTE5" not in out
+
+
+def test_an_authorization_header_value_is_redacted():
+    out = inspection.redact_param(
+        'curl -H "Authorization: Bearer sk-live-9f2a8c7b1d" https://api.example.com')
+
+    assert "<redacted: an Authorization header value>" in out
+    assert "sk-live-9f2a8c7b1d" not in out
+    assert "https://api.example.com" in out
+
+
+@pytest.mark.parametrize("line, leak", [
+    ("export API_KEY=sk-live-9f2a8c7b1d4e", "sk-live-9f2a8c7b1d4e"),
+    ('  "token": "ghp_A1b2C3d4E5f6G7h8I9",', "ghp_A1b2C3d4E5f6G7h8I9"),
+    ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI2K7MDENGbPxRfiCY", "wJalrXUtnFEMI"),
+    ("password=hunter2000000", "hunter2000000"),
+    ("access_key: AKIAIOSFODNN7EXAMPLE9", "AKIAIOSFODNN7EXAMPLE9"),
+    ('passwd = "p4ssw0rd-aa12"', "p4ssw0rd-aa12"),
+])
+def test_a_credential_assignment_loses_its_value(line, leak):
+    out = inspection.redact_param(line)
+
+    assert "<redacted: a credential value>" in out
+    assert leak not in out
+
+
+@pytest.mark.parametrize("line", [
+    "the api_key is read from the environment at boot, never committed",
+    "API_KEY=changeme",
+    "API_KEY=",
+    'password: ""',
+    "monkey=banana12345",
+    'api_key = os.environ["API_KEY"]',
+    "mysql --password changeme -h db",
+    'gh auth login --token ""',
+    "gh pr list --token $GH_TOKEN",
+    "gh pr list --token ${GH_TOKEN}",
+    "export GH_TOKEN=$OTHER_TOKEN && gh pr list",
+    "curl https://api.example.com/v1/models",
+])
+def test_a_line_that_carries_no_credential_is_left_exactly_as_it_is(line):
+    """The negative control. Redacting a placeholder or a mention would make the report
+    useless for the case it exists for: reading what the worker actually ran."""
+    assert inspection.redact_param(line) == line
+
+
+# -- shapes that carry a credential with no credential-named key beside it -------------
+
+
+@pytest.mark.parametrize("line, leak", [
+    ("ANTHROPIC_API_KEY=sk-ant-api03-abc123def456 claude -p \"go\"",
+     "sk-ant-api03-abc123def456"),
+    ("export GH_TOKEN=ghp_A1b2C3d4E5 && gh pr list", "ghp_A1b2C3d4E5"),
+    ("cd x; TOKEN=abc123def ./deploy.sh", "abc123def"),
+    ("env AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI2K7MDENG aws s3 ls",
+     "wJalrXUtnFEMI2K7MDENG"),
+])
+def test_an_inline_credential_assignment_loses_its_value(line, leak):
+    """The commonest way a credential reaches `params["command"]`: an assignment that is
+    not the whole line, in front of the command it is for."""
+    out = inspection.redact_param(line)
+
+    assert inspection.CREDENTIAL_VALUE_MARKER in out
+    assert leak not in out
+
+
+def test_an_inline_assignment_keeps_the_command_around_it():
+    out = inspection.redact_param("cd x; TOKEN=abc123def ./deploy.sh")
+
+    assert out == f"cd x; TOKEN={inspection.CREDENTIAL_VALUE_MARKER} ./deploy.sh"
+
+
+def test_an_anthropic_key_is_named_and_never_quoted():
+    out = inspection.redact_param("claude --api-key-helper 'echo sk-ant-api03-Zq9x8W7v'")
+
+    assert "<redacted: an Anthropic API key>" in out
+    assert "sk-ant-api03-Zq9x8W7v" not in out
+
+
+@pytest.mark.parametrize("secret", [
+    "sk-proj-9f2a8c7b1d4e6a5b", "sk-9f2a8c7b1d4e6a5b3c7d9e1f",
+])
+def test_a_bare_sk_key_is_named(secret):
+    out = inspection.redact_param(f"curl -H 'x-key: {secret}' https://x")
+
+    assert "<redacted: an sk- API key>" in out
+    assert secret not in out
+
+
+@pytest.mark.parametrize("secret", [
+    "ghp_A1b2C3d4E5f6G7h8I9j0", "gho_A1b2C3d4E5f6G7h8I9j0",
+    "ghs_A1b2C3d4E5f6G7h8I9j0", "ghu_A1b2C3d4E5f6G7h8I9j0",
+    "ghr_A1b2C3d4E5f6G7h8I9j0", "github_pat_11ABCDE0y0aBcDeFgH",
+])
+def test_a_github_token_is_named(secret):
+    out = inspection.redact_param(f"echo {secret} | gh auth login --with-token")
+
+    assert "<redacted: a GitHub token>" in out
+    assert secret not in out
+
+
+def test_an_aws_access_key_id_is_named():
+    out = inspection.redact_param("aws configure set AKIAIOSFODNN7EXAMPLE")
+
+    assert "<redacted: an AWS access key id>" in out
+    assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+
+def test_a_slack_token_is_named():
+    out = inspection.redact_param("echo xoxb-2468013579-AbCdEfGh | slack-cli auth")
+
+    assert "<redacted: a Slack token>" in out
+    assert "xoxb-2468013579-AbCdEfGh" not in out
+
+
+def test_a_password_in_a_url_is_named_and_the_host_survives():
+    out = inspection.redact_param(
+        "psql postgres://deploy:s3cr3t-pa55@db.internal:5432/app")
+
+    assert "<redacted: a password in a URL>" in out
+    assert "s3cr3t-pa55" not in out
+    assert "postgres://deploy:" in out
+    assert "@db.internal:5432/app" in out
+
+
+def test_a_curl_u_credential_is_named():
+    out = inspection.redact_param("curl -u deploy:s3cr3t-pa55 https://api.example.com")
+
+    assert "<redacted: a curl -u credential>" in out
+    assert "s3cr3t-pa55" not in out
+    assert "https://api.example.com" in out
+
+
+@pytest.mark.parametrize("line, leak", [
+    ("mysql --password s3cr3tpa55 -h db", "s3cr3tpa55"),
+    ("mysql --password=s3cr3tpa55 -h db", "s3cr3tpa55"),
+    ("gh auth login --token ghXYZ012abc9", "ghXYZ012abc9"),
+    ("call --api-key 9f2a8c7b1d4e6a5b", "9f2a8c7b1d4e6a5b"),
+    ("call --api-key=9f2a8c7b1d4e6a5b", "9f2a8c7b1d4e6a5b"),
+])
+def test_a_credential_flag_value_is_named(line, leak):
+    out = inspection.redact_param(line)
+
+    assert "<redacted: a credential passed as a flag>" in out
+    assert leak not in out
+
+
+def test_a_credential_flag_keeps_the_flag_it_was_passed_to():
+    out = inspection.redact_param("mysql --password s3cr3tpa55 -h db")
+
+    assert out.startswith("mysql --password <redacted:")
+    assert out.endswith(" -h db")
+
+
+def test_a_bare_token_in_a_bash_command_never_reaches_the_payload(write_transcript):
+    """The transcript-level proof for the shapes that need no assignment: a token with
+    nothing around it naming it, straight into `params["command"]`."""
+    secret = "ghp_A1b2C3d4E5f6G7h8I9j0"
+    session = write_transcript("bare-token", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f"echo {secret} | gh auth login --with-token",
+                    "description": "log in"}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert secret not in json.dumps(anatomy.as_dict())
+    assert "<redacted: a GitHub token>" in anatomy.turns[0].spans[0].params["command"]
+
+
+def test_an_inline_assignment_never_reaches_the_payload(write_transcript):
+    secret = "sk-ant-api03-abc123def456"
+    session = write_transcript("inline-assign", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f'ANTHROPIC_API_KEY={secret} claude -p "go"'}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert secret not in json.dumps(anatomy.as_dict())
+
+
+def test_a_secret_in_a_bash_command_never_reaches_the_payload(write_transcript):
+    """Redaction runs BEFORE the value is stored, not at render time — spec §4a."""
+    secret = "sk-live-0ff1ce9a7b3c2d"
+    session = write_transcript("leaky", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f'curl -H "Authorization: Bearer {secret}" https://x',
+                    "description": "call the API"}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert secret not in json.dumps(anatomy.as_dict())
+    params = anatomy.turns[0].spans[0].params
+    assert params["description"] == "call the API"
+    assert "<redacted: an Authorization header value>" in params["command"]
+
+
+def test_a_long_value_is_cut_short_and_its_key_is_listed(write_transcript):
+    session = write_transcript("long", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Write",
+                   {"file_path": "/tmp/x.py", "content": "a" * 5_000}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert len(span.params["content"]) == inspection.PARAM_CAPS.per_value + 1
+    assert span.params["content"].endswith("…")
+    assert span.params_truncated == ["content"]
+    assert span.params_dropped == []
+    assert span.params["file_path"] == "/tmp/x.py"
+
+
+def test_the_span_cap_drops_the_keys_that_do_not_fit(write_transcript):
+    payload = {f"k{i}": "b" * inspection.PARAM_CAPS.per_value for i in range(8)}
+    session = write_transcript("wide", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", payload),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    kept = inspection.PARAM_CAPS.per_span // inspection.PARAM_CAPS.per_value
+    assert list(span.params) == [f"k{i}" for i in range(kept)]
+    assert span.params_dropped == [f"k{i}" for i in range(kept, 8)]
+
+
+def test_the_turn_budget_empties_a_later_span_s_params(write_transcript):
+    """Once a turn has spent its budget every later span reports `{}` AND says which
+    keys it dropped — a report that truncates silently is not reproducible."""
+    spans = inspection.PARAM_CAPS.per_turn // inspection.PARAM_CAPS.per_span
+    rows = [prompt_row(0, "You are the worker agent for wo-1")]
+    for i in range(spans + 1):
+        rows += tool_rows(1 + i, 2 + i, f"t{i}", "Bash",
+                          {f"k{j}": "c" * (inspection.PARAM_CAPS.per_span // 4)
+                           for j in range(4)})
+    turn = inspection.read_session(write_transcript("burn", rows)).turns[0]
+
+    assert turn.spans[0].params
+    last = turn.spans[-1]
+    assert last.params == {}
+    assert last.params_dropped == ["k0", "k1", "k2", "k3"]
+
+
+def test_the_caps_are_stated_in_the_payload(real_session):
+    assert real_session.as_dict()["param_caps"] == {
+        "per_value": inspection.PARAM_CAPS.per_value,
+        "per_span": inspection.PARAM_CAPS.per_span,
+        "per_turn": inspection.PARAM_CAPS.per_turn,
+    }
+
+
+def test_the_real_session_grows_keys_and_changes_none(real_session):
+    """Additivity against the committed session: `detail` is what it always was."""
+    span = real_session.turns[0].spans[0].as_dict()
+
+    assert span["detail"] == "List repo structure"
+    assert span["params"] == {"description": "List repo structure"}
+    assert span["params_truncated"] == [] and span["params_dropped"] == []
+    assert {"name", "tool_id", "started", "ended", "seconds", "detail", "join",
+            "finished"} <= set(span)
+
+
+# -- subagent anatomy (spec §4b) -------------------------------------------------------
+
+
+TASK = "a7b62083-1111-2222-3333-444455556666"
+
+
+def sub_rows(base: float, *, write: int = 0, read: int = 0) -> list[dict]:
+    """A subagent transcript: one prompt, two calls, one tool span."""
+    return [
+        prompt_row(base, "do the thing", sdk=False),
+        assistant_row(base + 1, "s-m1", write=write, read=read),
+        *tool_rows(base + 2, base + 4, "s-t1", "Grep", {"pattern": "needle"}),
+        assistant_row(base + 5, "s-m2", write=write, read=read),
+    ]
+
+
+def parent_rows(task_id: str = TASK, *, tool: str = "TaskOutput") -> list[dict]:
+    """A parent session whose turn 1 joins on `task_id` and whose turn 2 does not."""
+    return [
+        prompt_row(1000, "You are the worker agent for wo-1"),
+        assistant_row(1001, "m1", write=30_000),
+        *tool_rows(1002, 1400, "p-t1", tool, {"task_id": task_id}),
+        prompt_row(1500, "carry on"),
+        assistant_row(1501, "m2", read=30_000),
+        *tool_rows(1502, 1510, "p-t2", "Bash", {"command": "ls"}),
+    ]
+
+
+def write_meta(tmp_path, session_id: str, task_id: str, label: str) -> None:
+    directory = tmp_path / "projects" / "-proj" / session_id / "subagents"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"agent-{task_id}.meta.json").write_text(
+        json.dumps({"agentType": label, "description": "dig"}))
+
+
+def test_a_subagent_s_turns_writes_and_peak_hang_off_the_turn_that_joined_it(
+        write_transcript, tmp_path):
+    """Spec §4b: the subagent's own anatomy, attached to the parent turn that names it."""
+    session = write_transcript(
+        "nested", parent_rows(),
+        subagents={f"agent-{TASK}": sub_rows(1100, write=25_000, read=5_000)})
+    write_meta(tmp_path, session, TASK, "explorer")
+    anatomy = inspection.read_session(session)
+
+    sub = anatomy.turns[0].subagents[0]
+    assert sub.task_id == TASK and sub.label == "explorer · dig"
+    assert len(sub.turns) == 1 and sub.turns[0].tools == pytest.approx(2.0)
+    assert [w.cause for w in sub.writes] == [inspection.COLD_START,
+                                             inspection.PREFIX_MISS]
+    assert sub.context_peak == 30_000
+    assert anatomy.turns[1].subagents == []
+    assert anatomy.unattached_subagents == []
+
+
+def test_attaching_a_subagent_changes_no_parent_number(write_transcript, tmp_path):
+    """THE PARTITION RULE (kn-7a2180ba): a subagent is drawn OUT of its parent turn,
+    never added to it. The same session read with and without the transcript present
+    must be identical in every parent figure."""
+    without = inspection.read_session(
+        write_transcript("partition-a", parent_rows())).as_dict()
+    with_sub = inspection.read_session(write_transcript(
+        "partition-b", parent_rows(),
+        subagents={f"agent-{TASK}": sub_rows(1100, write=900_000, read=5_000)}))
+    grown = with_sub.as_dict()
+
+    for key in ("partition", "share", "context_peak", "rewrite_excess", "cache_ttl",
+                "tools", "writes", "joins"):
+        assert grown[key] == without[key], key
+    for a, b in zip(grown["turns"], without["turns"]):
+        for key in ("wall", "generating", "blocked", "tools", "share", "usage",
+                    "context_peak", "api_calls"):
+            assert a[key] == b[key], key
+    assert with_sub.turns[0].subagents[0].context_peak == 905_000
+
+
+def test_a_subagent_s_prefix_miss_is_never_folded_into_the_parent_s_writes(
+        write_transcript):
+    """A parent turn that merely waited on a join did not pay that write — attributing
+    it upward names the wrong turn as the prefix break (spec §4b)."""
+    anatomy = inspection.read_session(write_transcript(
+        "own-writes", parent_rows(),
+        subagents={f"agent-{TASK}": sub_rows(1100, write=400_000, read=5_000)}))
+
+    assert [w.written for w in anatomy.writes] == [30_000]
+    assert inspection.PREFIX_MISS in [w.cause
+                                      for w in anatomy.turns[0].subagents[0].writes]
+    assert inspection.PREFIX_MISS not in [w.cause for w in anatomy.writes]
+
+
+def test_a_subagent_no_span_names_is_unattached_and_on_no_turn(write_transcript):
+    """Issue 227's mistake was inventing a parent the record does not name: no timestamp
+    fallback, so an unnamed subagent is REPORTED as unattached."""
+    orphan = "deadbeef-0000-0000-0000-000000000000"
+    anatomy = inspection.read_session(write_transcript(
+        "orphan", parent_rows(), subagents={f"agent-{orphan}": sub_rows(1100)}))
+
+    assert [s.task_id for s in anatomy.unattached_subagents] == [orphan]
+    assert all(t.subagents == [] for t in anatomy.turns)
+    assert anatomy.as_dict()["unattached_subagents"][0]["task_id"] == orphan
+
+
+def test_a_join_whose_detail_name_joins_already_rewrote_still_attaches(
+        write_transcript, tmp_path):
+    """`_name_joins` turns the bare id into "label (id)"; matching the bare string only
+    would drop every labelled subagent — the common case."""
+    session = write_transcript(
+        "renamed", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)})
+    write_meta(tmp_path, session, TASK, "explorer")
+    anatomy = inspection.read_session(session)
+
+    assert anatomy.turns[0].spans[0].detail == f"explorer · dig ({TASK})"
+    assert [s.task_id for s in anatomy.turns[0].subagents] == [TASK]
+
+
+def test_an_agent_span_attaches_as_well_as_a_taskoutput_one(write_transcript):
+    anatomy = inspection.read_session(write_transcript(
+        "agent-span", parent_rows(tool="Agent"),
+        subagents={f"agent-{TASK}": sub_rows(1100)}))
+
+    assert [s.task_id for s in anatomy.turns[0].subagents] == [TASK]
+
+
+def test_a_subagent_of_a_subagent_is_counted_and_the_depth_read_is_stated(
+        write_transcript, tmp_path):
+    """`_subagent_transcripts` globs ONE level, so say which depth was read rather than
+    implying completeness (spec §4b)."""
+    session = write_transcript(
+        "deep", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)})
+    deeper = (tmp_path / "projects" / "-proj" / session / "subagents"
+              / f"agent-{TASK}" / "subagents")
+    deeper.mkdir(parents=True)
+    # TWO, so the count is not trivially satisfied by any non-zero answer.
+    for stem in ("agent-child-one", "agent-child-two"):
+        (deeper / f"{stem}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
+    anatomy = inspection.read_session(session)
+
+    sub = anatomy.turns[0].subagents[0]
+    assert sub.deeper == 2
+    assert sub.as_dict()["deeper"] == 2
+    assert anatomy.as_dict()["subagent_depth_read"] == 1
+
+
+def test_only_the_taskoutput_span_carries_the_task_id_in_a_real_transcript(real_session):
+    """What `_names` can actually join on. An `Agent` span's params are a `description`
+    and nothing else, so the id it spawned is NOT there; the `TaskOutput` span's
+    `task_id` parameter is the only join in the committed transcript."""
+    spawns = [s for s in real_session.spans if s.name in inspection.SPAWN_TOOLS]
+    ids = set(real_session.subagent_labels)
+
+    assert ids
+    agents = [s for s in spawns if s.name == "Agent"]
+    assert agents
+    assert not any(i in v for s in agents for v in s.params.values() for i in ids)
+    outputs = [s for s in spawns if s.name == "TaskOutput"]
+    assert [s for s in outputs
+            if any(i in v for v in s.params.values() for i in ids)] == outputs
+
+
+def test_a_meta_only_directory_adds_nothing_to_the_real_session(real_session):
+    """The committed session has `.meta.json` files and NO subagent transcripts: the new
+    keys must EXIST and be empty. Absent is not zero."""
+    payload = real_session.as_dict()
+
+    assert real_session.subagent_labels  # the meta files are there
+    assert payload["unattached_subagents"] == []
+    assert payload["subagent_depth_read"] == 1
+    assert all(t["subagents"] == [] for t in payload["turns"])
+
+
+# -- `detail` is redacted too (spec §4a, decided on wo-5f4d8611 q687) ------------------
+
+
+def test_a_secret_in_a_bash_command_never_reaches_the_detail(write_transcript):
+    """`_detail_of` prefers `command`, so an undescribed `Bash` call put the raw command
+    line in the payload while `params` beside it was redacted."""
+    secret = "sk-live-0ff1ce9a7b3c2d"
+    anatomy = inspection.read_session(write_transcript("leaky-detail", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": f'curl -H "Authorization: Bearer {secret}" https://x'}),
+    ]))
+
+    detail = anatomy.turns[0].spans[0].detail
+    assert "<redacted: an Authorization header value>" in detail
+    assert secret not in json.dumps(anatomy.as_dict())
+
+
+def test_detail_is_redacted_before_it_is_truncated(write_transcript):
+    """Order matters: truncating first would cut the header short and print the head of
+    the credential. A cut marker is a cosmetic loss; half a secret is not."""
+    secret = "sk-live-0ff1ce9a7b3c2dAAAABBBBCCCCDDDDEEEEFFFF"
+    command = 'curl -H "Authorization: Bearer ' + secret + '" https://x'
+    cfg = InspectConfig(quote_chars=len(command) - 20)
+    anatomy = inspection.read_session(write_transcript("cut-detail", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"command": command}),
+    ]), cfg)
+
+    assert secret[:12] not in anatomy.turns[0].spans[0].detail
+
+
+def test_redacting_detail_changes_nothing_in_the_committed_session(real_session):
+    """The no-op proof: the real session carries no secrets, so every pinned `detail`
+    reads exactly as it always did."""
+    details = [s.detail for t in real_session.turns for s in t.spans]
+
+    assert details and all(d == inspection.redact_param(d) for d in details)
+    assert real_session.turns[0].spans[0].detail == "List repo structure"
+
+
+# -- the visual pass on `jarvis inspect` (spec §4c) ------------------------------------
+
+
+def rendered(anatomy: inspection.Anatomy, **kwargs) -> None:
+    from jarvis import cli
+
+    unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
+    cli._print_anatomy(unit, InspectConfig().report_write_floor, **kwargs)
+
+
+def test_the_turn_line_carries_a_bar_whose_segments_follow_parts_order(
+        write_transcript, capsys):
+    from jarvis import cli
+
+    anatomy = inspection.read_session(write_transcript("bars", parent_rows()))
+    rendered(anatomy)
+    line = next(l for l in capsys.readouterr().out.splitlines() if "turn  1" in l)
+
+    bar = next(c for c in line.split() if set(c) <= set(cli.BAR_GLYPHS.values()))
+    assert len(bar) == cli.BAR_WIDTH
+    order = [g for g in cli.BAR_GLYPHS.values() if g in bar]
+    assert list(dict.fromkeys(bar)) == order
+
+
+def test_every_bar_glyph_is_keyed_by_parts():
+    from jarvis import cli
+
+    assert tuple(cli.BAR_GLYPHS) == inspection.PARTS
+
+
+def test_parameters_are_printed_only_when_asked_for(write_transcript, capsys):
+    anatomy = inspection.read_session(write_transcript("params", parent_rows()))
+
+    rendered(anatomy)
+    default = capsys.readouterr().out
+    rendered(anatomy, params=True)
+    asked = capsys.readouterr().out
+
+    assert "command" not in default and "task_id" not in default
+    assert "command = ls" in asked
+    assert str(inspection.PARAM_CAPS.per_value) in asked
+    assert f"{inspection.PARAM_CAPS.per_turn:,}" in asked
+
+
+def test_the_parameter_report_says_when_a_value_was_cut(write_transcript, capsys):
+    anatomy = inspection.read_session(write_transcript("cut", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Write", {"file_path": "/tmp/x.py",
+                                         "content": "a" * 5_000}),
+    ]))
+
+    rendered(anatomy, params=True)
+
+    assert "shortened: content" in capsys.readouterr().out
+
+
+def test_a_subagent_renders_under_its_turn_with_its_writes_by_cause(
+        write_transcript, tmp_path, capsys):
+    session = write_transcript(
+        "sub-render", parent_rows(),
+        subagents={f"agent-{TASK}": sub_rows(1100, write=25_000, read=5_000)})
+    write_meta(tmp_path, session, TASK, "explorer")
+
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if "explorer" in l)
+
+    assert inspection.COLD_START in out and inspection.PREFIX_MISS in out
+    assert "api calls" in line and "peak" in line
+    assert "partition" in out  # drawn OUT of the parent turn, never added to it
+
+
+def test_a_deeper_subagent_says_its_levels_were_not_read(
+        write_transcript, tmp_path, capsys):
+    session = write_transcript(
+        "deep-render", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)})
+    deeper = (tmp_path / "projects" / "-proj" / session / "subagents"
+              / f"agent-{TASK}" / "subagents")
+    deeper.mkdir(parents=True)
+    (deeper / "agent-child.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
+
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+
+    assert "NOT read" in out and "depth read 1" in out
+
+
+def test_an_unattached_subagent_gets_its_own_section(write_transcript, capsys):
+    orphan = "deadbeef-0000-0000-0000-000000000000"
+    anatomy = inspection.read_session(write_transcript(
+        "orphan-render", parent_rows(), subagents={f"agent-{orphan}": sub_rows(1100)}))
+
+    rendered(anatomy)
+    out = capsys.readouterr().out
+
+    assert "no span named" in out and orphan in out
+
+
+# -- nested tool inputs, and values that end at a quote (spec §4a, review round 2) -----
+
+
+def test_a_secret_in_a_nested_edit_never_reaches_the_payload(write_transcript):
+    """A `MultiEdit` input is a list of dicts, so the credential is a LEAF — and before
+    round 2 it was redacted only after `json.dumps`, where neither assignment regex can
+    see it (escaped newlines, one line, quotes in the way)."""
+    session = write_transcript("nested-edit", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "MultiEdit",
+                   {"edits": [{"new_string": "DB_PASSWORD=hunter2000abc\n"}]}),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert "hunter2000abc" not in json.dumps(anatomy.as_dict())
+    assert inspection.CREDENTIAL_VALUE_MARKER in anatomy.turns[0].spans[0].params["edits"]
+
+
+def test_a_secret_in_a_list_of_strings_never_reaches_the_payload(write_transcript):
+    session = write_transcript("nested-list", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"args": ["--quiet", "export TOKEN=abc123def456", 7, None, True]}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "abc123def456" not in json.dumps(span.as_dict())
+    assert "--quiet" in span.params["args"]
+    # Non-string scalars pass through the walk untouched.
+    assert "7" in span.params["args"] and "null" in span.params["args"]
+
+
+def test_a_secret_two_levels_down_in_a_dict_never_reaches_the_payload(write_transcript):
+    session = write_transcript("nested-dict", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "mcp__deploy__run",
+                   {"env": {"stage": {"API_KEY": "sk-live-9f2a8c7b1d4e"}}}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "sk-live-9f2a8c7b1d4e" not in json.dumps(span.as_dict())
+    assert "stage" in span.params["env"]
+
+
+def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
+        write_transcript):
+    """Belt and braces must not read as two findings: the leaf pass and the line pass
+    both see the same text, and the marker must appear ONCE."""
+    session = write_transcript("double-mark", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"parts": ["TOKEN=abc123def456"]}),
+    ])
+    value = inspection.read_session(session).turns[0].spans[0].params["parts"]
+
+    assert value.count(inspection.CREDENTIAL_VALUE_MARKER) == 1
+
+
+def test_a_pathologically_deep_input_is_bounded_and_still_redacted(write_transcript):
+    """The walk is bounded, so a nested input cannot blow the stack — and what sits
+    below the bound is still redacted, as text."""
+    nested: object = {"TOKEN": "abc123def456"}
+    for _ in range(inspection._PARAM_WALK_MAX_DEPTH + 40):
+        nested = {"next": nested}
+    session = write_transcript("deep", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"deep": nested}),
+    ])
+
+    assert "abc123def456" not in json.dumps(
+        inspection.read_session(session).as_dict())
+
+
+def test_a_nested_input_is_redacted_before_it_is_capped(write_transcript):
+    """Order, not an extra allowance: the walk runs first and `ParamCaps` still bites."""
+    session = write_transcript("nested-cap", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "MultiEdit",
+                   {"edits": [{"new_string": "TOKEN=abc123def456 " + "z" * 5_000}]}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert "abc123def456" not in json.dumps(span.as_dict())
+    assert len(span.params["edits"]) == inspection.PARAM_CAPS.per_value + 1
+    assert span.params_truncated == ["edits"]
+
+
+@pytest.mark.parametrize("line, leak", [
+    ('bash -c "export TOKEN=abc123def"', "abc123def"),
+    ("ssh host 'API_KEY=abc123def456 ./run'", "abc123def456"),
+    ("sh -c (PASSWORD=hunter2000abc ./deploy)", "hunter2000abc"),
+    ('bash -c "printf %s ${VARS[API_KEY=abc123def456]}"', "abc123def456"),
+])
+def test_an_assignment_that_ends_at_a_quote_or_bracket_loses_its_value(line, leak):
+    """It used to fail OPEN: the closing quote was captured INTO the value, so the
+    credential test rejected it on a character the shell never gave it (round 2)."""
+    out = inspection.redact_param(line)
+
+    assert inspection.CREDENTIAL_VALUE_MARKER in out
+    assert leak not in out
+
+
+@pytest.mark.parametrize("line, redacted", [
+    ('bash -c "export TOKEN=abc123def"',
+     'bash -c "export TOKEN=<redacted: a credential value>"'),
+    ("ssh host 'API_KEY=abc123def456 ./run'",
+     "ssh host 'API_KEY=<redacted: a credential value> ./run'"),
+    ("sh -c (PASSWORD=hunter2000abc ./deploy)",
+     "sh -c (PASSWORD=<redacted: a credential value> ./deploy)"),
+])
+def test_the_quote_around_a_redacted_value_survives(line, redacted):
+    """The marker replaces the VALUE only: the redacted line must still read as the
+    command that was run."""
+    assert inspection.redact_param(line) == redacted
+
+
+@pytest.mark.parametrize("line, leak", [
+    ('bash -c "mysql --password s3cr3tpa55 -h db"', "s3cr3tpa55"),
+    ("sh -c 'gh auth login --token=ghXYZ012abc9'", "ghXYZ012abc9"),
+])
+def test_a_credential_flag_inside_quotes_loses_its_value(line, leak):
+    out = inspection.redact_param(line)
+
+    assert "<redacted: a credential passed as a flag>" in out
+    assert leak not in out
