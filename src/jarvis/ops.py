@@ -2923,7 +2923,7 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     """
     wo_id = wo["id"]
     pr_url = pr_url or (str(wo.get("pr_url") or "")
-                        if declared_pull_request(store, wo) else "") or None
+                        if routes_on_pull_request(store, wo) else "") or None
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
@@ -2954,10 +2954,11 @@ def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
     merged (2026-09-25 spec §3).
 
     **THIS PREDICATE IS THE ONE LINE TO REVISIT** if another route is ever to reach the
-    merge queue. Nothing else branches on where the column came from.
+    merge queue. Nothing else branches on where the column came from, and every router
+    asks `routes_on_pull_request`, which is this read plus the gate-only test.
 
-    It says WHETHER a declaration exists, and `land_finished` still routes on the caller's
-    own `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
+    It says WHETHER a declaration exists, and the routers still route on the caller's own
+    `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
     BLANKED once the poll has settled that pull request, and returning a URL out of the
     timeline there would put a closed pull request back in the merge queue.
     """
@@ -2966,6 +2967,26 @@ def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
         if declared:
             return declared
     return ""
+
+
+def routes_on_pull_request(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Whether `wo['pr_url']` may move this work order — the merge queue's one test.
+
+    ONE rule, read by `land_finished`, by the reconciler's park and by
+    `Daemon.poll_pull_requests`, because three copies of it is how a gate-recorded URL
+    stayed inert at one site and settled a planner at the others (2026-09-25 spec §4).
+
+    A NEGATIVE test, deliberately: the column routes unless it is GATE-ONLY — a
+    `pr_url_recorded` event with no declaration behind it (`declared_pull_request`). A row
+    carrying a `pr_url` and no event about it at all is a legacy row, and it keeps routing
+    exactly as it did. Requiring a declaration instead would take every record written
+    before issue #742 out of the merge queue.
+    """
+    if not wo.get("pr_url"):
+        return False
+    if not store.events_of_kind(wo["id"], "pr_url_recorded"):
+        return True
+    return bool(declared_pull_request(store, wo))
 
 
 def unlanded_work(store: ProjectStore, wo: dict[str, Any],

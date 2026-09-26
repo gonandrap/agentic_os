@@ -157,11 +157,16 @@ def test_the_pull_request_in_a_merge_command(origin, command, expected):
 
 
 @pytest.mark.parametrize("command", [
+    # A well-formed URL on somebody else's repository: `origin` is what refuses it.
     "gh pr merge https://github.com/someone/else/pull/1 --squash",
+    # The same, through the API form, whose owner and repo the worker chose.
     "gh api --method PUT repos/someone/else/pulls/1/merge",
-    "gh pr merge -R someone/else --repo=someone/else",
-    # A string `gh` could read as a flag, and one not on `https://`, both refused.
+    # A bare number beside `--repo`: read, so the number is never composed against
+    # `origin` and recorded as this project's pull request.
     "gh pr merge --repo=someone/else 735",
+    # ...and the short spelling of the same flag.
+    "gh pr merge -R someone/else 735",
+    # Not on `https://`: no shape matches a plaintext URL, so nothing is recorded.
     "gh pr merge http://github.com/acme/proj/pull/735 --squash",
 ])
 def test_a_pull_request_on_another_repository_is_never_recorded(origin, command):

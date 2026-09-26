@@ -4056,12 +4056,14 @@ class Daemon:
         if store.queued_messages(wo["id"]):
             return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        from . import ops as ops_mod
+
         if fresh.get("result_summary"):
             if store.pending_assumptions(wo["id"]):
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
-            elif fresh.get("pr_url"):
+            elif ops_mod.routes_on_pull_request(store, fresh):
                 # Finished behind a pull request: it is the user's merge that ends this
                 # work order, not the worker's last turn. Settling it to `completed`
                 # here would take it off the open list before anyone had merged it.
@@ -4075,7 +4077,9 @@ class Daemon:
                 # question 275). The flag comes back on its own once the status does —
                 # INV-ATTENTION-MISSING re-derives it — so nothing has to be remembered
                 # beyond the status itself.
-                from . import ops as ops_mod
+                #
+                # A GATE-RECORDED URL IS NOT ONE OF THESE, and that exclusion is the
+                # predicate's, not this branch's: 2026-09-25 spec §4.
 
                 # `resumed_from` is the same rule as `pr_repair_origin` for the other
                 # way the OS takes a work order out of its status (issue #259): a
@@ -4095,8 +4099,7 @@ class Daemon:
                 # and no `pr_url` — used to be the one route to `completed` that walked
                 # past it. It also unparks: `park_unlanded` leaves `needs_review` behind,
                 # and this ran a tick later and completed the order it had just held.
-                from . import ops as ops_mod
-
+                # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
         elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
@@ -4301,14 +4304,28 @@ class Daemon:
         attention list; it does not mean the record may go on saying something untrue.
 
         The step is skipped whole when nothing is parked — one indexed query — so a
-        fleet with no open pull requests never spawns a subprocess for this.
+        fleet with no open pull requests never spawns a subprocess for this. One further
+        statement per STEP excludes the gate-only columns (2026-09-25 spec §4), and it is
+        per step and not per pull request on purpose: see below.
         """
-        parked = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
-                                                      include_hidden=True)
-                  if wo.get("pr_url")]
-        if not parked:
+        candidates = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
+                                                          include_hidden=True)
+                      if wo.get("pr_url")]
+        if not candidates:
             return
         from . import github, ops
+
+        # GATE-ONLY COLUMNS OUT, AND FOR ONE STATEMENT PER STEP. A URL a merge gate
+        # recorded routes nothing (2026-09-25 spec §4): polling one would see MERGED and
+        # `complete_merged` would close out a planner that never submitted its plan. The
+        # bulk read is what keeps the budget above per-pull-request — `pr_url_recorded` is
+        # rare, so `routes_on_pull_request` is asked only about the ids it names.
+        recorded = store.work_orders_with_event("pr_url_recorded",
+                                                [wo["id"] for wo in candidates])
+        parked = [wo for wo in candidates
+                  if wo["id"] not in recorded or ops.routes_on_pull_request(store, wo)]
+        if not parked:
+            return
 
         # THE BASE'S CI, READ ONCE PER PROJECT PER TICK AND LAZILY — `heal_inherited_
         # failure` fills this only when some pull request is actually failing, so a
@@ -5797,8 +5814,15 @@ class Daemon:
             # merged pull request or an order that produced nothing to land, so this
             # inherits issue #232's distinction rather than restating it — a fix sitting
             # on an unmerged branch never gets here. `pr_url` separates those two routes:
-            # an order with no code to land has nothing to put in a release.
-            if (applied == issues.CLOSED and wo.get("pr_url")
+            # an order with no code to land has nothing to put in a release — and it is
+            # read through the routing predicate, because cutting a RELEASE is the largest
+            # move the column makes and a gate-recorded one makes none (2026-09-25 spec
+            # §4). The closing COMMENT still names the raw column, which is the whole
+            # point of recording it.
+            from . import ops as ops_mod
+
+            if (applied == issues.CLOSED
+                    and ops_mod.routes_on_pull_request(store, wo)
                     and issues.dispatches(wo.get("issue_priority") or "")):
                 self.ensure_release(project, store, wo)
 

@@ -138,31 +138,71 @@ Rejected sites, each with the reason it loses:
   per settled order, already filed as `bl-2aabaee8` and explicitly out of scope of
   INV-PR-RECORDED (`invariants.py:2788-2795`).
 
-### 4. Routing stays declaration-only
+### 4. Routing stays declaration-only — through ONE predicate
 
-A URL recorded by a gate is **deliberately not a declaration.** `ops.land_finished`
-(`ops.py:2885-2890`) keeps routing the merge queue on a submitter-declared pull request,
-via a predicate rather than the raw column:
+A URL recorded by a gate is **deliberately not a declaration**, and review round 1 found
+that shipped at one site only: `ops.land_finished` asked
+`declared_pull_request`, while `Daemon.poll_pull_requests` and the reconciler's park read
+the raw column and settled a planner anyway. So the rule is one function, and every router
+calls it:
 
 ```
-pr_url = declared_pull_request(store, wo) or None
+def routes_on_pull_request(store, wo) -> bool:     # ops.py, beside declared_pull_request
 ```
 
-`declared_pull_request` returns the URL only when a `finished` event carries one. So a
-planner whose gate was decided before `submit_plan` still lands `completed`, and no
-validation round opens over its merged pull request — `ops.submit_for_validation` passes
-`pr_url=wo.get("pr_url")` onto the round (`ops.py:3272`) and `evidence.collect_work_order`
-(`evidence.py:495-502`) would fetch it as the artifact, which nothing excludes a
-`kind=planner` order from.
+True when `wo["pr_url"]` is non-empty AND the column is not GATE-ONLY. Gate-only means a
+`pr_url_recorded` event with `declared_pull_request(store, wo)` empty.
+
+**It is a NEGATIVE test, not "require a declaration".** A row with a `pr_url` and no event
+about it — every record written before this change, and the fixtures that set the column
+directly — routes exactly as it did. Requiring a declaration would empty the merge queue
+of the whole existing fleet.
+
+`declared_pull_request` is unchanged and still the thing that decides: it returns the URL
+only when a `finished` event carries one. So a planner whose gate was decided before
+`submit_plan` still lands `completed`, and no validation round opens over its merged pull
+request — `ops.submit_for_validation` passes `pr_url=wo.get("pr_url")` onto the round
+(`ops.py:3272`) and `evidence.collect_work_order` (`evidence.py:495-502`) would fetch it as
+the artifact, which nothing excludes a `kind=planner` order from.
+
+The three routers, and nothing else:
+
+1. `ops.land_finished` — on the CALLER'S OWN `wo` copy, never a re-read:
+   `review_work_order` hands its landing a copy with `pr_url` deliberately blanked.
+2. `Daemon.settle_work_order`'s park (`daemon.py:4066`). Its `else` branch goes through
+   `land_finished`, so a gate-only order lands `completed` there.
+3. `Daemon.poll_pull_requests`. **And it stays cheap.** The shipped read budget is per
+   pull request (`tests/test_pr_checks.py`), so the exclusion is ONE bulk statement per
+   STEP — a new `ProjectStore.work_orders_with_event(kind, wo_ids)`, one
+   `SELECT DISTINCT wo_id FROM wo_events WHERE kind=? AND wo_id IN (…)`, empty set for an
+   empty list without touching the connection. Only the ids that query names pay
+   `routes_on_pull_request`. Arithmetic asserted on a step with TWO parked orders:
+   `4 * pull requests + 1` `wo_events` statements.
 
 **That predicate is the one line to revisit if another settlement route ever wants the
 merge queue.** It is `finished`-event-only today because that is the one event every route
 through `ops.finish` writes and no other writer can forge.
 
-Unchanged by this, and deliberately: `ops._awaiting_merge` (`ops.py:4755`) still reads the
-raw column, so `ops.resettle_after_repair` (`ops.py:4517`) and `ops._land_after_acceptance`
-(`ops.py:5053`) can see a gate-recorded URL. Both are guarded by a status the planner case
-never reaches (`needs_review` with a `result_summary`; an accepted assumption review).
+#### Every other reader of the column, audited
+
+* `Daemon.refresh_landings` (`daemon.py:4501`) **must keep reading the raw column.** It
+  writes `landing_seen` and `pr_merged` and routes nothing, and INV-WORK-LANDED being
+  structurally silent about a gate-recorded pull request is the #742 defect itself. Pinned
+  by `test_the_sweep_reads_the_pull_request_a_gate_recorded`.
+* `ops._awaiting_merge` (`ops.py:4845`) still reads the raw column, and both callers are
+  covered by the routers above rather than by a second exclusion.
+  `ops._land_after_acceptance` (`ops.py:5122`) uses it only to decide whether to BLANK the
+  copy it hands to `land_finished`, which is a router and refuses.
+  `ops.resettle_after_repair` (`ops.py:4589`) additionally requires
+  `repaired_since_finish` — a repair episode, written only by `Daemon.heal_pull_request`
+  inside the poll — so with the poll excluding gate-only orders it is unreachable for one,
+  and so is INV-REPAIR-RESETTLED, which is its only other caller.
+* `Daemon.sync_issues` (`daemon.py:5818`) CAN reach `ensure_release` with a gate-only
+  column: an order that merged through a gate and finished without `--pr` reaches
+  `completed`, `issues.desired_state` answers CLOSED, and a `critical`/`blocker`
+  `issue_priority` then cuts a release. Cutting a release is the largest move the column
+  makes, so it is excluded with the same predicate. `issues.closing_comment` is NOT: the
+  `Landed in <url>.` line reading the gate's URL is one of the things recording it was for.
 
 ### 5. `pr_state` gains no writer; the sweep records the merge as an event
 
@@ -202,7 +242,7 @@ settled*. Every existing reader:
 |---|---|
 | `ops._overtaken` (`ops.py:2473`) — counts a planner's children carrying `pr_merged`, to tell a planner its plan has been overtaken | **Yes, and correctly.** A child that merged but reached `completed` by another route was invisible; it now counts. The docstring at `ops.py:2466` claims `complete_merged` is the single writer and MUST be corrected in the same change, or it becomes false. |
 | `ops.unmerged_pull_request` (`ops.py:2976`) — `""` when a `pr_merged` exists, so `jarvis wo done` writes no `work_unlanded` | **Yes, and no new outcome.** It already treats a settled `landing_seen` as the same signal (`ops.py:2978-2982`), so the new event only makes the first branch fire where the second already did. |
-| `ProjectStore.work_unlanded_open` (`project_store.py:3264-3270`) — a park episode is answered by `finished`, `abandoned` or `pr_merged` | **Yes, and this is an INTENDED consequence rather than a side effect.** `land_finished` parks only when `pr_url` is empty, so the sweep can reach a parked order only once §3 has recorded a URL for it — i.e. exactly the #742 order. Its park is then answered by the merge that really happened, and `invariants.true_blockers` stops re-deriving `UNLANDED_BLOCKER` for it. |
+| `ProjectStore.work_unlanded_open` (`project_store.py:3264-3270`) — a park episode is answered by `finished`, `abandoned` or `pr_merged` | **Yes, and this is an INTENDED consequence rather than a side effect.** `land_finished` parks only when `pr_url` is empty, so the sweep can reach a parked order only once §3 has recorded a URL for it — i.e. exactly the #742 order. Its park is then answered by the merge that really happened, and `invariants.true_blockers` stops re-deriving `UNLANDED_BLOCKER` for it — asserted by `test_the_merge_the_sweep_saw_answers_a_park_over_the_same_work`. |
 | `Daemon.poll_pull_requests` once-per-closure derivation (`daemon.py:4352-4360`) | **No.** It reads `pr_closed`, not `pr_merged`, and never runs over `completed`. |
 | `invariants.check_work_lands` / INV-LANDING-AUDIT-FRESH (`invariants.py:2712`) | **No.** Both read `landing_seen` only, which this path writes exactly as before. |
 | `timeline.build_timeline` | Renders through the generic path either way. §5's idempotence guard is what keeps it to one line. |
@@ -258,7 +298,14 @@ duplicated in those two files is how they drift.
    `test_the_invariant_reports_a_settled_order_that_wrote_code_with_no_pull_request`, and
    `test_the_invariant_costs_no_subprocess`, which pins "no subprocess" — keep
    `origin_repo` out of the invariant path).
-5. `tests/test_wo_pr_merge.py` and
+5. §4's ROUTING, one test per router, because round 1 shipped the rule at one site only:
+   `test_pr_checks.py::test_a_gate_recorded_pull_request_is_never_polled_and_never_settles_the_order`
+   (with its pairing, a declaration that arrives after the gate and must still poll),
+   `test_pr_recorded.py::test_the_reconciler_never_parks_a_gate_recorded_pull_request_in_the_merge_queue`
+   and `test_issue_lifecycle.py::test_a_gate_recorded_pull_request_closes_the_issue_and_ships_nothing`.
+   The read budget is re-asserted in the same file, plus one case over TWO parked orders so
+   "per step" is arithmetic rather than a claim.
+6. `tests/test_wo_pr_merge.py` and
    `tests/test_pr_checks.py::test_a_work_order_with_no_pr_url_is_never_polled` — the merge
    queue. Both stay green UNCHANGED, which is itself §4's assertion. §5 and §6 need new
    cases beside the landing-sweep tests: the sweep writes `pr_merged` once and never

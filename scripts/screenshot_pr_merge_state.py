@@ -51,7 +51,7 @@ def order(store, title: str, *, merged: bool) -> str:
         # The event `Daemon.refresh_landings` writes when GitHub says it landed — the
         # only source of MERGED, never the `pr_state` column (kn-dbc4971d).
         store.add_event(wo["id"], "pr_merged", {
-            "pr_url": PR, "head_oid": HEAD, "source": "refresh_landings",
+            "pr_url": PR, "head_oid": HEAD, "source": "landing_sweep",
             "merged_at": "2026-09-25T21:14:07Z"})
         store.set_status(wo["id"], "completed")
     return wo["id"]
