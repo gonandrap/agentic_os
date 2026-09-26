@@ -50,10 +50,12 @@ def _epoch(stamp: str) -> float:
 
 
 def _catalog(tmp_path, projects: dict[str, object], max_in_flight: int | None = None,
-             name: str = "catalog-fleet.json"):
+             name: str = "catalog-fleet.json", max_concurrent: int | None = None):
     defaults: dict[str, object] = {"model": "sonnet"}
     if max_in_flight is not None:
         defaults["max_in_flight"] = max_in_flight
+    if max_concurrent is not None:
+        defaults["max_concurrent"] = max_concurrent
     path = tmp_path / name
     path.write_text(json.dumps({
         "os": {"defaults": defaults, "notifications": {"sinks": ["log"]}},
@@ -409,3 +411,200 @@ def test_jarvis_status_names_the_cap_and_does_not_raise_attention(
     assert not [item for item in a_status["attention"]
                 if item.get("wo_id") == held["id"]], (
         "waiting for a slot must not reach the attention strip")
+
+
+# -- a hold that says so ---------------------------------------------------------------
+
+
+def _held_by_the_cap(fake_claude, tmp_path, project, settle_turns, monkeypatch):
+    """Four siblings refused by one window, then swept under `max_in_flight=2`.
+
+    The staging of `test_the_retry_pass_is_staggered_by_the_cap` above, reused: what the
+    two held orders SAY about themselves is a different question from whether they were
+    held, and it needs the same incident to ask it of.
+    """
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    ops.start_os(str(_catalog(tmp_path, {"proj_a": project}, max_in_flight=4)),
+                 foreground=True)
+    open_wide = Daemon(load_catalog(
+        _catalog(tmp_path, {"proj_a": project}, max_in_flight=4)))
+    store = ProjectStore(project)
+
+    fake_claude.turns_rate_limited(reset="11:59pm (UTC)")
+    wos = [ops.create_work_order("proj_a", f"sibling {n}") for n in range(4)]
+    _tick(open_wide)
+    assert settle_turns(store)
+    _tick(open_wide)
+
+    fake_claude.turns_recover()
+    fake_claude.hold_turns()
+    store.conn.execute("UPDATE wo_turns SET error=? WHERE state='failed'",
+                       ("Claude AI usage limit reached|1000000000",))
+    capped = Daemon(load_catalog(
+        _catalog(tmp_path, {"proj_a": project}, max_in_flight=2, name="capped.json")))
+    _tick(capped)
+
+    held = [store.get_work_order(wo["id"]) for wo in wos
+            if worker_session.turn_pause(store, wo["id"]) is not None]
+    assert len(held) == 2, "the cap did not hold two of the four back"
+    return store, capped, held
+
+
+def test_a_cap_held_resume_says_so_on_the_record(jarvis_home, fake_claude, tmp_path,
+                                                 project, settle_turns, monkeypatch):
+    """A hold that writes nothing is a hold nothing can read: the note went on promising
+    a retry whose moment had passed, and INV-PAUSE-OVERDUE called the OS broken for
+    obeying its own cap."""
+    store, capped, held = _held_by_the_cap(fake_claude, tmp_path, project,
+                                           settle_turns, monkeypatch)
+    for wo in held:
+        pause = worker_session.turn_pause(store, wo["id"])
+        events = store.events_of_kind(wo["id"], invariants.RETRY_HELD_EVENT)
+        assert len(events) == 1, "the sweep held this order and wrote nothing"
+        payload = json.loads(events[-1]["payload"])
+        assert payload["cause"] == "fleet_cap"
+        assert payload["in_flight"] == 2 and payload["cap"] == 2
+        assert payload["seq"] == pause.turn["seq"]
+        assert payload["reason"] == pause.reason
+
+    # The same hold, restated inside the dedupe window: one event, not one per sweep.
+    _tick(capped)
+    for wo in held:
+        assert len(store.events_of_kind(wo["id"], invariants.RETRY_HELD_EVENT)) == 1, (
+            "a five-hour hold would cost ~1,800 events at the sweep cadence")
+    store.close()
+
+
+def test_a_cap_held_order_does_not_promise_a_retry(jarvis_home, fake_claude, tmp_path,
+                                                   project, settle_turns, monkeypatch):
+    """The one string every surface prints. While the slot is what it is waiting for,
+    "retrying by itself at 15:50" is a promise about a moment already gone."""
+    store, _capped, held = _held_by_the_cap(fake_claude, tmp_path, project,
+                                            settle_turns, monkeypatch)
+    label = invariants.status_label(store, held[0])
+
+    assert "waiting for a free in-flight slot" in label
+    assert "2 of 2 worker turns already in flight" in label
+    assert "retrying by itself" not in label
+    store.close()
+
+
+def _refused_at(store: ProjectStore, wo_id: str, *, ended: float, reset: float):
+    """A usage-limit refusal that names `reset`, on a turn that ended at `ended`.
+
+    The reset is written as the epoch the parser takes verbatim, so one order can be
+    staged not-due (it is what `fleet.read` builds the outage from) and another due (it
+    is the one the sweep reaches) against the same clock.
+    """
+    store.create_work_order(wo_id, origin="manual", wo_id=wo_id)
+    store.set_status(wo_id, "running")
+    _refuse(store, wo_id, ended, 0,
+            error=f"Claude AI usage limit reached|{reset:.0f}")
+    return store.get_work_order(wo_id)
+
+
+def test_an_outage_hold_is_recorded_and_does_not_stall_the_sweep(jarvis_home, tmp_path,
+                                                                 project):
+    """The outage half of the same hold, and the one that dereferences `state.outage`
+    inside the per-order loop: an exception there stalls every resume in the project.
+    The cause recorded is `fleet_outage` and NOT `fleet_cap` — the words for an outage
+    belong to `fleet_hold_note` (issue #714), and the event exists for the invariant
+    suppression, which an outage hold needs exactly as a cap hold does."""
+    now = time.time()
+    catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=3)
+    ops.start_os(str(catalog_path), foreground=True)
+    catalog = load_catalog(catalog_path)
+    daemon = Daemon(catalog)
+    store = ProjectStore(project)
+
+    shut = _refused_at(store, "wo-shut", ended=now - 7200, reset=now + 3600)
+    due = _refused_at(store, "wo-due", ended=now - 7200, reset=now - 3600)
+    state = fleet.read(3, {"proj_a": store}, now=now)
+    assert state.shut(), "the not-due refusal is what holds the account"
+
+    daemon.retry_paused_turns(catalog.project("proj_a"), store, state)
+
+    events = store.events_of_kind(due["id"], invariants.RETRY_HELD_EVENT)
+    assert len(events) == 1
+    payload = json.loads(events[-1]["payload"])
+    assert payload["cause"] == "fleet_outage"
+    assert payload["reopens_at"] == state.outage.reopens_at
+    assert store.events_of_kind(shut["id"], invariants.RETRY_HELD_EVENT) == [], (
+        "it was not due — the record is only for an order that was going to relaunch")
+
+    # `fleet_hold_note` owns these words for the statuses it is gated on; the note says
+    # them only where that gate is shut and the sentence would otherwise be lost.
+    assert due["status"] in invariants.FLEET_HELD_STATUSES
+    assert invariants.pause_note(store, store.get_work_order(due["id"])) == ""
+    store.set_status(due["id"], "needs_review")
+    note = invariants.pause_note(store, store.get_work_order(due["id"]))
+    assert note == ("the Claude usage window is spent, reopening at "
+                    f"{invariants.clock(state.outage.reopens_at)}")
+    store.close()
+
+
+def test_a_project_cap_hold_names_the_slot_it_waits_for(jarvis_home, tmp_path, project):
+    """The second door, with the fleet wide open: a resume out of `needs_review` takes a
+    `max_concurrent` slot it is not already holding, and being held for one is as silent
+    as the fleet cap was."""
+    now = time.time()
+    catalog_path = _catalog(tmp_path, {"proj_a": project}, max_in_flight=50,
+                            max_concurrent=1, name="catalog-project-cap.json")
+    ops.start_os(str(catalog_path), foreground=True)
+    catalog = load_catalog(catalog_path)
+    daemon = Daemon(catalog)
+    store = ProjectStore(project)
+
+    store.create_work_order("holding the slot", origin="manual", wo_id="wo-busy")
+    store.set_status("wo-busy", "running")
+    parked = _refused_at(store, "wo-parked", ended=now - 7200, reset=now - 3600)
+    store.set_status(parked["id"], "needs_review")
+    assert store.count_active() == 1, "the project is full"
+
+    open_fleet = fleet.Fleet(50, 0)
+    assert not open_fleet.blocked(), "the fleet must not be what holds this"
+    daemon.retry_paused_turns(catalog.project("proj_a"), store, open_fleet)
+
+    events = store.events_of_kind(parked["id"], invariants.RETRY_HELD_EVENT)
+    assert len(events) == 1
+    payload = json.loads(events[-1]["payload"])
+    assert payload["cause"] == "project_cap"
+    assert payload["active"] == 1 and payload["max_concurrent"] == 1
+    assert invariants.pause_note(store, store.get_work_order(parked["id"])) == (
+        "waiting for a free slot in this project (1 of 1 running)")
+    store.close()
+
+
+def test_a_due_resume_takes_the_slot_before_a_pending_dispatch(
+        jarvis_home, fake_claude, tmp_path, project, settle_turns, monkeypatch):
+    """THE ORDERING `tick` ALREADY HAS, pinned. A resume continues a conversation whose
+    prefix is paid for and whose work is half done; a dispatch starts one that re-sends
+    its whole context for the rest of its life. Reordering two lines in `tick` breaks
+    this and nothing else."""
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    ops.start_os(str(_catalog(tmp_path, {"proj_a": project}, max_in_flight=4)),
+                 foreground=True)
+    open_wide = Daemon(load_catalog(
+        _catalog(tmp_path, {"proj_a": project}, max_in_flight=4)))
+    store = ProjectStore(project)
+
+    fake_claude.turns_rate_limited(reset="11:59pm (UTC)")
+    parked = ops.create_work_order("proj_a", "half done")
+    _tick(open_wide)
+    assert settle_turns(store)
+    _tick(open_wide)
+    assert worker_session.turn_pause(store, parked["id"]) is not None
+
+    fake_claude.turns_recover()
+    fake_claude.hold_turns()
+    store.conn.execute("UPDATE wo_turns SET error=? WHERE state='failed'",
+                       ("Claude AI usage limit reached|1000000000",))
+    fresh = ops.create_work_order("proj_a", "brand new")
+    one_slot = Daemon(load_catalog(
+        _catalog(tmp_path, {"proj_a": project}, max_in_flight=1, name="one.json")))
+    _tick(one_slot)
+
+    assert store.latest_turn(parked["id"])["state"] == "running", (
+        "the free slot went to new work over a conversation already in progress")
+    assert store.get_work_order(fresh["id"])["status"] == "pending"
+    store.close()

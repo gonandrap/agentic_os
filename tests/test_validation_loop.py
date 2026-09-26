@@ -1235,6 +1235,13 @@ def test_a_refused_assumption_blocks_the_landing_a_pass_would_otherwise_do(fleet
     store = fleet.store()
     try:
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"
+        # The feedback went out as a turn in this same tick, and `worker_session.busy`
+        # reads the stored turn — only `poll` ends one — so the landing is deferred
+        # behind it every time, never landed live (spec §3.1).
+        assert "validation_landing_deferred" in \
+            [e["kind"] for e in store.list_events(wo["id"])]
+        assert _settle(store, wo["id"])
+        fleet.tick()
         assert store.get_work_order(wo["id"])["status"] == "needs_review"
         assert store.pending_assumptions(wo["id"]) == []
     finally:
@@ -1678,3 +1685,86 @@ def test_a_reason_that_fits_is_not_marked_as_cut(fleet):
     assert len(rows) == 1
     assert rows[0]["body"] == "no test covers the change"
     assert VALIDATION_REASON_CUT not in rows[0]["body"]
+
+
+def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
+                                                                     fake_claude):
+    """Measured on wo-83e4183c: a round opened before turn 13 came back `passed` while
+    turn 13 ran, and the landing put a planner halfway through a revision into
+    `needs_review`. The verdict is about a commit the worker has already moved past;
+    what it must not do is write a status under a live conversation."""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+    fleet.daemon.validator = Validator(passed())
+    gate = fake_claude.hold_turns()
+
+    store = fleet.store()
+    try:
+        store.queue_message(wo["id"], "one more thing")
+        fleet.drain()  # the message goes out, then the round is judged behind it
+
+        round_row = store.latest_validation_round(wo_id=wo["id"])
+        assert round_row["outcome"] == "passed"
+        kinds = [e["kind"] for e in store.list_events(wo["id"])]
+        assert "validation_passed" in kinds
+        assert "validation_landing_deferred" in kinds
+        assert store.get_work_order(wo["id"])["status"] == "running", (
+            "the verdict landed a work order whose worker was mid-turn")
+
+        # The turn ends; the landing the round deferred is the settler's to finish.
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+        assert [e["kind"] for e in store.list_events(wo["id"])].count(
+            "validation_landed") == 1
+    finally:
+        store.close()
+
+
+def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
+    """The mirror of the test above, and the case where the landing must NOT be
+    deferred: a give-up writes `needs_review` under a possibly-live turn because
+    `true_blockers` can derive VALIDATION_STUCK_BLOCKER from no other status. The
+    exposure is therefore at the other end. A turn runs after the refusal — a message
+    is all it takes — and when it ends, the pull request `finish` recorded is still on
+    the row, so the settler's `pr_url` branch parked the order in `waiting_pr_merge`
+    and took a refusal off the user's list with nobody having decided anything. The
+    flag goes with it: `true_blockers` derives the blocker from `needs_review` alone.
+    Spec §3.3.
+    """
+    fleet.reconfigure(max_rounds=1)  # one rejection exhausts the budget
+    fleet.daemon.validator = Validator(rejected("no test covers the change"))
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])  # the `pr_url` the settler reacts to, written here
+
+    fleet.drain()
+
+    store = fleet.store()
+    try:
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "escalated"
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] == "needs_review"
+        assert true_blockers(store, fresh) == [VALIDATION_STUCK_BLOCKER]
+
+        # The turn that follows the refusal, held open across the give-up it must not
+        # undo. Delivery un-parks the order, so it settles out of `running`.
+        gate = fake_claude.hold_turns()
+        store.queue_message(wo["id"], "one more thing")
+        fleet.tick()
+        assert store.get_work_order(wo["id"])["status"] == "running"
+
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        fresh = store.get_work_order(wo["id"])
+        assert fresh["status"] != "waiting_pr_merge", (
+            "the turn ending parked a give-up on the merge queue")
+        assert fresh["status"] == "needs_review"
+        assert VALIDATION_STUCK_BLOCKER in true_blockers(store, fresh)
+    finally:
+        store.close()
