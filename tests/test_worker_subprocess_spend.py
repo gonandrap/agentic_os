@@ -278,17 +278,25 @@ OS_DECLARATIONS = [
      "structured.request", "records_itself", "supervisor"),
     ("supervisor.review_health", "jarvis.supervisor",
      "structured.request", "records_itself", "health"),
+    ("daemon._classify_stakes", "jarvis.daemon",
+     "claude_cli.run_headless_result", "records_itself", "stakes_classifier"),
 ]
 
 
 def _site_function(site: str):
-    """The function a site id names — `decide` for `validation.decide/run_blind`."""
-    from jarvis import digest, neo, panel, supervisor, validation
+    """The function a site id names — `decide` for `validation.decide/run_blind`.
+
+    Falls back to `daemon.Daemon`: `_classify_stakes` is a method, not module-level.
+    """
+    from jarvis import daemon, digest, neo, panel, supervisor, validation
 
     module, _, rest = site.partition(".")
-    return getattr({"neo": neo, "panel": panel, "validation": validation,
-                    "digest": digest, "supervisor": supervisor}[module],
-                   rest.split("/")[0])
+    owner = {"neo": neo, "panel": panel, "validation": validation, "digest": digest,
+             "supervisor": supervisor, "daemon": daemon}[module]
+    name = rest.split("/")[0]
+    if not hasattr(owner, name) and module == "daemon":
+        owner = daemon.Daemon
+    return getattr(owner, name)
 
 
 def _called_name(node: ast.Call) -> str:
@@ -311,12 +319,25 @@ def _kind_literal(value: ast.expr):
     return value.value if isinstance(value, ast.Constant) else None
 
 
+def _call_aliases(tree: ast.AST, call: str) -> set[str]:
+    """Local names bound to `call` for injection — `call = call or
+    claude_cli.run_headless_result` in `daemon._classify_stakes`."""
+    return {node.targets[0].id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.BoolOp) and isinstance(node.value.op, ast.Or)
+            and any(isinstance(v, ast.Attribute) and _called_name(ast.Call(
+                func=v, args=[], keywords=[])) == call for v in node.value.values)}
+
+
 def _declared_kinds(fn, call: str, keyword: str) -> list[str]:
-    """Every literal `fn`'s own source passes as `keyword` to `call`."""
+    """Every literal `fn`'s own source passes as `keyword` to `call`, or to a local alias
+    of it."""
     tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    names = {call} | _call_aliases(tree, call)
     return [kind
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _called_name(node) == call
+            if isinstance(node, ast.Call) and _called_name(node) in names
             for kw in node.keywords
             if kw.arg == keyword
             for kind in [_kind_literal(kw.value)] if kind is not None]

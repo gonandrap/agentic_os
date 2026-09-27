@@ -357,12 +357,15 @@ def _classify(row: dict[str, Any], model: str, cwd: Path) -> Call:
 
     The exception path returns `reached=False`. It still carries `high=True`, which is the
     daemon's shipped HOLD rule, but nothing downstream may read that as a verdict.
+
+    Attributed by the transport: outside the `jarvis` package, so it bills to
+    `JARVIS_WO_ID` and declares no kind of its own.
     """
     started = time.monotonic()
     try:
         result = claude_cli.run_headless_result(
             stakes.question(row["text"]), system_prompt=stakes.PERSONA, model=model,
-            cwd=cwd, timeout=stakes.TIMEOUT, tools="", attribute=False)
+            cwd=cwd, timeout=stakes.TIMEOUT, tools="")
     except Exception:  # noqa: BLE001 — the transport failed: no judgement was made
         return Call(row["id"], True, (time.monotonic() - started) * 1000, 0.0, False,
                     reached=False)

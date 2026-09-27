@@ -5412,9 +5412,9 @@ class Daemon:
 
         SS3.3 and SS3.8. The transport is `neo.answer_question`'s, verbatim in its two
         non-obvious arguments: the neutral cwd, so the project's `CLAUDE.md` is not pulled
-        into a prompt that is supposed to carry one sentence, and `attribute=False`
-        because this call records itself and leaving the transport's attribution on would
-        double-count it.
+        into a prompt that is supposed to carry one sentence, and
+        `records_itself="stakes_classifier"` because this call records itself and the
+        transport's attribution would double-count it.
 
         ONE `agent_calls` ROW PER CALL, and a FAILED call still writes one with `ok=False`
         — `add_agent_call`'s own rule: a None-usage row says a call was made and cost
@@ -5436,7 +5436,7 @@ class Daemon:
             result = call(stakes.question(str(a.get("content") or "")),
                           system_prompt=stakes.PERSONA, model=stakes.MODEL,
                           timeout=stakes.TIMEOUT, cwd=ensure_home(), tools="",
-                          attribute=False)
+                          records_itself="stakes_classifier")
         except Exception:  # noqa: BLE001 — an unreachable classifier holds, never raises
             log.exception("[%s] stakes classifier for %s failed", project.name,
                           wo.get("id"))
