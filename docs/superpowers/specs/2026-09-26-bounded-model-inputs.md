@@ -94,6 +94,13 @@ persisted and sent. Scanning bytes that are then dropped is a different and over
 rule, and a reviewer will otherwise read this change as weakening the net: say so in the
 pull request.
 
+**The test trap in this section.** `fake_claude` branches on substrings found ANYWHERE in
+the prompt — `"ASSUMPTION REVIEW"`, then `FORCE_ACCEPT_HIGH` / `FORCE_ACCEPT` / `FORCE_DENY`
+(testing.py:945-965), defaulting to escalate. A `FORCE_*` token placed inside a large test
+diff is deleted by truncation, the verdict silently becomes the default, and the test passes
+while proving nothing. Put the token in the assumption content or the result summary, which
+this change never cuts.
+
 **Already true, do not "fix" it twice.** The packet is collected lazily and exactly once
 per work order per pass (the `if packet is None` guard, daemon.py:5327-5330). N assumptions
 cost one `git diff`, not N. What they do cost is N model calls each carrying that diff —
@@ -134,6 +141,17 @@ catalog-settable ceiling on the combined prompt of an OS-originated call. Two ru
   an inbox row naming the kind, the size and the work order. Never a silent trim, and never
   a fabricated verdict: a call that was never made has decided nothing.
 
+**How the refusal is shaped, so it cannot become a verdict.** `run_headless_result` has no
+`kind` or `label` parameter — the only identity it holds is `records_itself` (a kind string
+or an `Authorisation` carrying one), and the work order comes from the caller or from
+`JARVIS_WO_ID`. So refuse by RAISING a subclass of `claude_cli.ClaudeCliError`
+(claude_cli.py:76), which every consumer already treats as a transport failure that decides
+nothing, and let the call site that already records failures write the inbox row
+(`CentralStore.add_inbox`) and the attention flag (`ProjectStore.flag_attention`). A Neo
+question stays claimable, a panel seat writes no opinion and shrinks no quorum, an
+assumption stays pending with no `confirm_question_id`, and no `agent_calls` row claims
+success for a call that never ran.
+
 **A hard ceiling at `neo_store.ask` too** (neo_store.py:240), because a question is
 persisted before it is ever sent and the store is the last place that can refuse one. Same
 shape: refuse or trim-and-label, loudly, with the reason on the record.
@@ -153,9 +171,17 @@ truncated input digests to an honest headline: clip the input.
 
 ## 4 — The worker side: pass a reference, and be refused when you paste a payload
 
-Two halves, and they are halves of one hole. A worker's `jarvis wo ask` / `neo ask` text
-goes whole into Neo's prompt (`ops.py` bounds only the `context=` to 800 characters), and
-a `jarvis wo send` body goes whole into the target worker's next turn.
+**What already exists, so nobody builds it twice.** `jarvis wo ask` / `neo ask` is ALREADY
+capped: `sections.QUESTION_MAX_CHARS = 4000` with a warning at `QUESTION_WARN_CHARS = 1500`,
+enforced in `ops.ask_question` (ops.py:7112), and `worker_brief.py:350` already tells every
+worker that a question over 4000 characters is refused. Do not introduce a second, different
+number for the same thing.
+
+**What is still open.** Two things. First, that cap fires AFTER the command has run — by
+which point a `$(git diff)` substitution has already been expanded into the worker's own
+argv and its context, which is the half a `PreToolUse` check can prevent and `ops` cannot.
+Second, `jarvis wo send` and `jarvis wo assume` have no cap at all: a `wo send` body goes
+whole into the target worker's next turn.
 
 **The instruction.** Worker-facing guidance — `worker_brief.py` and the project OPERATION
 guidance — gains one rule: never paste large content (a diff, a log, a file, a JSON dump)
@@ -165,12 +191,14 @@ request URL, a commit SHA, a path with a line range, or the command that reprodu
 fit by cutting something, not by raising the budget.
 
 **The enforcement.** A new `PreToolUse` check in the existing chain, wired in
-`pre_tool_use_decision` **after** `finish_summary_decision` and **before** the
-`is_jarvis_command_chain` auto-allow (hooks.py:863-871) — that ordering is load-bearing and
-the comments there say why: the auto-allow waves every `jarvis …` command through and makes
-any later check unreachable. It refuses an oversized payload on `jarvis neo ask`,
-`jarvis wo ask`, `jarvis wo send` and `jarvis wo assume`, and the refusal message tells the
-agent what to pass instead. The parser and the cap constant live in `concision.py`, which
+`hooks.preflight_decision` (hooks.py:825) **after** `finish_summary_decision` (called at
+hooks.py:863) and **before** the `is_jarvis_command_chain` auto-allow (hooks.py:871) — that
+ordering is load-bearing and the comment at 860-862 says why: the auto-allow waves every
+`jarvis …` command through and makes any later check unreachable. It refuses an oversized
+payload argument on `jarvis wo send` and `jarvis wo assume`, refuses a `jarvis neo ask` /
+`wo ask` over `sections.QUESTION_MAX_CHARS` before the command runs rather than after, and
+the refusal message tells the agent what to pass instead. The hook's cap and the 4000 in
+`sections.py` are the same rule at two layers: say so in a comment. The parser and the cap constant live in `concision.py`, which
 imports **only the standard library** — the hook runs on every Bash call in every worker and
 a `catalog` parse there is a ~39% tax on a ~155ms process; the cap is passed by env at
 spawn, exactly as `JARVIS_SUMMARY_MAX_WORDS` is (`dispatch._write_worker_settings`).
