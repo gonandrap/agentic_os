@@ -783,7 +783,14 @@ class ObservabilityConfig:
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
     `off` is that the order has no context ledger and `jarvis wo context` says it was
-    not recorded. `full` currently records exactly what `normal` does.
+    not recorded.
+
+    THE LEVEL CONTROLS ONLY THAT ROW. The full autopsy of an order — every turn, its
+    tools, its token classes, its context total, delta, peak and composition — is
+    shown for every order at every level, because §§3, 4, 6 and 7 derive it at read
+    time from the transcript and not from anything Jarvis collected. So `full` records
+    exactly what `normal` does and the two collapse; the level exists for the config
+    surface to grow into (Neo 814).
     """
 
     level: str = DEFAULT_OBSERVABILITY_LEVEL

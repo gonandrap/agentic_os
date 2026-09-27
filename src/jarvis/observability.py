@@ -17,7 +17,10 @@ What a user notices at `off` is that the order has no context ledger afterwards,
 `FULL` RECORDS EXACTLY WHAT `NORMAL` DOES. §10 leaves that to this child, and there is
 nothing worth recording beyond the ingredient list, so the two collapse rather than
 inventing a difference to justify a third level; it exists for the config surface to grow
-into.
+into. The autopsy is unconditional for the same reason (Neo 814): every turn, its tools,
+its token classes and its context total, delta, peak and composition are read-time
+arithmetic over the transcript (§§3, 4, 6, 7), so there is nothing there for `full` to
+turn on.
 
 A LEAF: it imports `agent_usage` (a leaf itself, and the meter's only seam) and nothing
 from `ops`, `bill` or `dispatch` — every one of which the metered functions live in or

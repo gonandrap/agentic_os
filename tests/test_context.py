@@ -608,3 +608,41 @@ def test_jarvis_wo_create_stamps_the_level_on_the_order(jarvis_home, fake_claude
         assert store.get_work_order(created)["observability"] == "full"
     finally:
         store.close()
+
+
+def test_both_surfaces_say_the_autopsy_is_not_gated():
+    """Neo 814: the level governs one row, and BOTH surfaces must say so in one phrase.
+
+    §§3, 4, 6 and 7 derive the autopsy at read time, so it is unconditional. A user who
+    reads `--help` and a developer who reads the config class have to learn the same fact
+    from the same words — hence one pinned phrase, not two spellings of it.
+
+    Whitespace is collapsed on both sides: the phrase is the fact, where a docstring or a
+    help string happens to wrap is not, and a reflow must not fail this test.
+    """
+    from jarvis.catalog import ObservabilityConfig
+    from jarvis.cli import build_parser
+
+    phrase = "shown for every order at every level"
+
+    def flat(text):
+        return " ".join(text.split())
+
+    assert phrase in flat(_observability_help(build_parser()))
+    assert phrase in flat(ObservabilityConfig.__doc__ or "")
+
+
+def _observability_help(parser):
+    """The `--observability` help string on `jarvis wo create`, as `--help` prints it."""
+    wo = _subparsers(parser).choices["wo"]
+    create = _subparsers(wo).choices["create"]
+    (action,) = [a for a in create._actions if "--observability" in a.option_strings]
+    return action.help or ""
+
+
+def _subparsers(parser):
+    import argparse
+
+    (action,) = [a for a in parser._actions
+                 if isinstance(a, argparse._SubParsersAction)]
+    return action
