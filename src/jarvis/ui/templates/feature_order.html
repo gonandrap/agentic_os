@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
+{% import "_states.html" as states_ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
 {% block content %}
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
@@ -134,6 +135,10 @@
 {% endif %}
 
 {{ validation_ui.section(validation, 'h3') }}
+
+{# How long this feature has been where it is — the same fragment as the work-order page,
+   after the rounds (spec §7). #}
+{{ states_ui.view(states, 'h3') }}
 
 {{ issues_ui.unit(issues, 'h3') }}
 

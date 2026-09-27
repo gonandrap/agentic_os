@@ -10,9 +10,11 @@ Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md.
 
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
-from jarvis import landing, ops, timeline
+from jarvis import cli, landing, ops, timeline
 from jarvis.project_store import (
     FO_STATUSES,
     WO_STATUSES,
@@ -252,3 +254,82 @@ def test_one_subject_only(store):
         ops.state_durations(store, now=NOW)
     with pytest.raises(ops.OpsError):
         ops.state_durations(store, wo_id=wo["id"], fo_id="fo-1", now=NOW)
+
+
+# the CLI surfaces (spec §6) -----------------------------------------------
+
+
+def _out(capsys, argv: list[str]) -> str:
+    assert cli.main(argv) == 0, argv
+    return capsys.readouterr().out
+
+
+#: Every key `as_dict` promises. Spelled out because the `--json` shape is a contract
+#: other tooling reads (spec §4).
+PAYLOAD_KEYS = (
+    "order_id", "order_kind", "now", "approximate", "lifetime_seconds",
+    "lifetime_human", "spans", "totals", "current_status", "current_status_since",
+    "current_status_age", "current_status_age_human", "last_activity_ts",
+    "last_activity_kind", "last_activity_age", "last_activity_age_human", "notes",
+)
+
+
+def test_wo_show_json_carries_time_in_state(jarvis_home, catalog_file, project, capsys):
+    ops.start_os(str(catalog_file), foreground=True)
+    s = ProjectStore(project)
+    try:
+        wo = s.create_work_order("ship the exporter")
+        s.set_status(wo["id"], "needs_review")
+    finally:
+        s.close()
+
+    doc = _json.loads(_out(capsys, ["--json", "wo", "show", wo["id"]]))["time_in_state"]
+
+    for key in PAYLOAD_KEYS:
+        assert key in doc, key
+    assert doc["current_status"] == "needs_review"
+    assert [t["status"] for t in doc["totals"]] == ["pending", "needs_review"]
+
+
+def test_wo_show_human_prints_the_status_a_duration_and_an_entry_count(
+        jarvis_home, catalog_file, project, capsys):
+    ops.start_os(str(catalog_file), foreground=True)
+    s = ProjectStore(project)
+    try:
+        wo = s.create_work_order("ship the exporter")
+        s.set_status(wo["id"], "needs_review")
+    finally:
+        s.close()
+
+    out = _out(capsys, ["wo", "show", wo["id"]])
+
+    assert "time in state" in out
+    assert "needs_review" in out
+    assert "1 entry" in out
+    assert "← now" in out
+
+
+def test_fo_show_carries_the_key_and_labels_a_coarse_span(
+        jarvis_home, catalog_file, project, capsys):
+    """The point of the flag: an unlabelled coarse span is the defect Neo's ruling names.
+
+    A feature whose spans were never observed is every feature that predates the table,
+    reproduced here by dropping the rows and letting the next open backfill them.
+    """
+    ops.start_os(str(catalog_file), foreground=True)
+    s = ProjectStore(project)
+    try:
+        fo = s.create_feature_order("CSV export", description="the whole ask")
+        s.conn.execute("DELETE FROM wo_state_spans WHERE order_id=?", (fo["id"],))
+        s.conn.commit()
+    finally:
+        s.close()
+
+    doc = _json.loads(_out(capsys, ["--json", "fo", "show", fo["id"]]))["time_in_state"]
+    for key in PAYLOAD_KEYS:
+        assert key in doc, key
+    assert doc["approximate"] is True
+
+    out = _out(capsys, ["fo", "show", fo["id"]])
+    assert "time in state" in out
+    assert "a feature order keeps no event trail" in out

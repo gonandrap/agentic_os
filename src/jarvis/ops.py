@@ -6814,6 +6814,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
             # carrier: a child's own alarm belongs on the child.
             "alarms": store.alarms_for_feature(fo_id),
+            # How long it has been where it is, on the same always-present rule — the
+            # identical document `jarvis wo show` carries for a work order (spec §6).
+            "time_in_state": state_durations(store, fo_id=fo_id).as_dict(),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
