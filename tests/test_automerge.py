@@ -1709,3 +1709,47 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
     assert list(invariants.check_attention_reason_is_true(store)) == []
     assert store.get_work_order(wo["id"])["attention_reason"] == \
         invariants.AUTOMERGE_DENIED_BLOCKER
+
+
+# -- a carried head relaxes the sha condition and nothing else -------------------------
+# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4 condition
+# (i), and Neo question 791 made it a requirement rather than a remark.
+
+CARRIED = "c0ffee11223300000000000000000000000ccccc"
+
+
+@pytest.mark.parametrize("over, armed, code", [
+    ({}, True, "armed"),
+    ({"checks": (check("unit (3.13)", "FAILURE"),)}, False,
+     automerge.HELD_CHECKS_NOT_GREEN),
+    ({"merge_state": "BEHIND"}, False, automerge.HELD_MERGE_STATE_UNCLEAN),
+    ({"mergeable": "CONFLICTING"}, False, automerge.HELD_NOT_MERGEABLE),
+    ({"state": "CLOSED"}, False, automerge.HELD_PR_CLOSED),
+])
+def test_a_carried_head_arms_only_when_every_other_condition_holds(over, armed, code):
+    """The carry moves ONE condition — the commit the verdict is bound to — and the other
+    five are asked of the carried commit exactly as before."""
+    decision = decide(rnd(carried_head_sha=CARRIED), pull=pr(head_oid=CARRIED, **over))
+
+    assert decision.armed is armed and decision.code == code
+    assert decision.judged_sha == CARRIED
+
+
+def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judged(
+        started, project, fake_gh):
+    """§3.5: the carry hangs off `HELD_SHA_MOVED` and nothing else. On the ordinary tick —
+    the head is the judged commit, an approval is already filed for it — it costs no
+    `git`, no extra API read, and writes nothing. A carry there would rebind a verdict
+    for no reason and orphan a grant Neo has already given on that sha."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
+                and "/commits/" in c["argv"][3]]
+    assert len(store.list_approvals(wo["id"])) == 1

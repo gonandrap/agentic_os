@@ -4950,19 +4950,50 @@ class Daemon:
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions)
         if not decision.armed:
-            self._note_automerge_held(store, wo_id, decision)
+            # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec
+            # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md
+            # §3.5). BEFORE the hold, so a carry that succeeds leaves no `automerge_held`
+            # event describing a stall that lasted microseconds, and before the re-judge,
+            # so the round machine never sees a head that moved for a reason no seat needs
+            # to read. A refused carry falls through to both, untouched.
             if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and automerge.only_the_head_moved(
-                        round_row, wo, pr, cfg, pending_assumptions=pending,
-                        plan_assumptions=plan_assumptions)):
-                self._rejudge_moved_head(project, store, wo, decision)
-            return
+                    and self._carry_catch_up(project, store, wo, pr, decision)):
+                round_row = store.latest_validation_round(wo_id=wo_id)
+                decision = automerge.decide(
+                    round_row, wo, pr, cfg,
+                    validated_head=store.validated_head(round_row),
+                    pending_assumptions=pending, plan_assumptions=plan_assumptions)
+            if not decision.armed:
+                self._note_automerge_held(store, wo_id, decision)
+                if (not record_only
+                        and decision.code == automerge.HELD_MERGE_STATE_UNCLEAN
+                        and str(getattr(pr, "merge_state", "") or "").upper() == "BEHIND"):
+                    # GitHub said BEHIND outright — the rarer half of §5.1, and the only
+                    # one `decide` can see. The commoner one reports CLEAN and is caught
+                    # on the armed path below, by ancestry.
+                    self._catch_up_with_base(project, store, wo, pr)
+                    return
+                if (not record_only and decision.code == automerge.HELD_SHA_MOVED
+                        and automerge.only_the_head_moved(
+                            round_row, wo, pr, cfg, pending_assumptions=pending,
+                            plan_assumptions=plan_assumptions)):
+                    self._rejudge_moved_head(project, store, wo, decision)
+                return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
 
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
+        if approval is None:
+            # BEFORE A GRANT EXISTS AND NEVER AFTER ONE (spec 2026-09-27 §5.2). The gate
+            # command string carries the judged sha, so catching the branch up behind a
+            # live grant would orphan a permission Neo already gave and silently ask for
+            # another. A head the OS moved is not decided on this tick: the next one
+            # re-reads it, waits out its CI and carries the verdict across (§3).
+            caught_up = self._catch_up_with_base(project, store, wo, pr)
+            if caught_up.head_oid != pr.head_oid:
+                return
         if approval is not None and approval["status"] != "approved":
             # Filed and not granted: pending with Neo, escalated to the user, denied,
             # expired. Every one of those is somebody's business and none of them is
@@ -5836,6 +5867,188 @@ class Daemon:
                  assumption.get("n"), wo["id"],
                  "accept" if ruling.accept else "object", ruling.reason)
 
+    def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                        pr: Any, decision: Any) -> bool:
+        """Prove this head added no unjudged commit, and carry the verdict onto it.
+
+        docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
+        True when the verdict now covers the live head, so the caller may re-decide on the
+        same tick. False is the ordinary answer and writes nothing but the refusal.
+
+        `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
+        rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
+        own job — `proof` is the difference between "someone resolved a conflict" and "the
+        daemon could not reach GitHub", and no reader can recover it from a bare None.
+
+        **The fetch comes first because both proofs need it**, and a failed one refuses:
+        proof (a)'s ancestry test reads `origin/{base}` out of this checkout. §3.4 on why
+        every failure here deserves the round that follows — a differing diff means the
+        bytes this pull request contributes are not the bytes the panel read, and on the
+        commonest cause (a worker resolving a conflict) that difference is authored content
+        nobody has judged.
+
+        **Deliberately NOT guarded by `automerge.only_the_head_moved`**, which the re-judge
+        below does require: CI on a freshly caught-up head is usually still running, and
+        waiting for it would defer the carry into exactly the window where a round gets
+        spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
+        """
+        from . import branchproof, ci, github, ops
+
+        judged = str(getattr(decision, "judged_sha", "") or "")
+        head = str(getattr(decision, "head_sha", "") or "")
+        base = str(getattr(pr, "base_ref", "") or "")
+        pr_url = str(wo.get("pr_url") or "")
+        if not judged or not head or head == judged or not base or not pr_url:
+            return False
+
+        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+            if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
+                                        proof=proof, detail=detail, chain=chain):
+                log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
+                         wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
+            return False
+
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            return refuse(ops.PROOF_FETCH,
+                          f"`git fetch origin {base} {pull_ref}` failed, so the pull "
+                          f"request's own diff cannot be compared locally")
+        before = branchproof.patch_id(project.path, base, judged)
+        after = branchproof.patch_id(project.path, base, head)
+        if not before or not after:
+            return refuse(ops.PROOF_FETCH,
+                          "the diff this branch adds on top of its merge base could not "
+                          "be computed locally")
+        if before != after:
+            return refuse(ops.PROOF_PATCH_ID,
+                          f"the diff on {head[:10]} is not the diff round "
+                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                          f"content nobody judged")
+        try:
+            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                        cwd=project.path)
+        except github.GitHubError as exc:
+            return refuse(ops.PROOF_READ,
+                          f"GitHub would not say what {head[:10]} merged ({exc})")
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return False
+        if not chain:
+            return refuse(ops.PROOF_CHAIN,
+                          f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
+                          f"of commits {judged[:10]} already contained")
+        # The NEWEST BASE commit walked, and `""` when none was: past Neo question 806 a
+        # walked merge may have brought in the branch's own lineage (§3.2 item 6).
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        carried = ops.carry_merge_chain(
+            store, wo, judged=judged, head=head, chain=chain, base=base,
+            base_sha=bases[-1] if bases else "", patch_ids=(before, after))
+        if carried is None:
+            return refuse(ops.PROOF_CHAIN,
+                          "the round this would have been carried from is no longer the "
+                          "verdict on the judged commit")
+        log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
+                 "%s, no round spent", project.name, wo["id"], carried["round"],
+                 judged[:10], head[:10], len(chain), len(bases), base)
+        return True
+
+    def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                            pr: Any) -> Any:
+        """Merge the base into this branch, when it is behind. Returns the head to decide on.
+
+        docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5. The
+        OS's own gate reviewer refuses a merge whose CI ran against a base behind `main`,
+        and `ops.PR_BEHIND_NOTE` has been telling workers to merge `origin/{base}` in for
+        exactly that reason — so the move is compulsory and the OS may as well make it,
+        now that §3's carry means it costs no round.
+
+        **RETURNS THE RE-READ `PullRequest`**, `heal_inherited_failure`'s contract and for
+        its reason: the caller must decide against the head the update produced, not the
+        one it replaced. The pull request it was given comes back unchanged whenever
+        nothing happened, which is the ordinary answer.
+
+        **THE SEVEN GUARDS ARE §5.3 AND EVERY ONE OF THEM DEFERS RATHER THAN DROPS.** In
+        order, cheapest first: a turn in flight or an undelivered message (never move the
+        head under a worker), an open round (never move it beneath the seats — Neo question
+        283), one update per base commit (`ops.base_heal_spent`, the red-base heal's key,
+        shared because the bound is about rebuilding one merge ref and not about why),
+        `ops.CATCH_UP_MAX` (the per-base-sha key cannot bound a fast-moving base: every
+        commit on it is a fresh key), and a re-read of the head immediately before the
+        update — `gh pr update-branch` has no `--match-head-commit`, so the window is
+        narrowed here and closed by §3's proof (a).
+
+        A refused update spends the attempt and leaves the pull request exactly where it
+        was. Nothing here is gated: `ci.update_branch` is `ci.WRITE_VERBS`' one entry and
+        ungated for the reasons in its own docstring, and the MERGE this leads to still
+        files its `automerge.GATE_KIND` request.
+        """
+        from . import branchproof, ci, github, ops
+
+        wo_id = wo["id"]
+        base = str(getattr(pr, "base_ref", "") or "")
+        pr_url = str(wo.get("pr_url") or "")
+        base_oid = str(getattr(pr, "base_oid", "") or "")
+        if not base or not pr_url:
+            return pr
+        if (worker_session.busy(store, wo_id) or store.queued_messages(wo_id)
+                or store.validation_round_open(wo_id)):
+            log.debug("[%s] %s is in flight — catching up with %s deferred",
+                      project.name, wo_id, base)
+            return pr
+        if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
+            return pr
+        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
+            log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
+                      project.name, wo_id, base, ops.CATCH_UP_MAX)
+            return pr
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            return pr           # logged there, with the refs it asked for
+        if not ops.catch_up_needed(pr, repo=project.path):
+            return pr
+
+        # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
+        # at the top of the poll, and a worker turn can end and push in the meantime. The
+        # update may only run on the commit a round judged, so that the carry afterwards
+        # has something true to rest on.
+        try:
+            fresh = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] could not re-read %s before catching it up: %s",
+                      project.name, pr_url, e)
+            return pr
+        judged = ProjectStore.validated_head(
+            store.latest_validation_round(wo_id=wo_id)) or ""
+        head_before = fresh.head_oid
+        if not head_before or head_before != judged:
+            return fresh
+        base_oid = fresh.base_oid or base_oid
+        try:
+            ci.update_branch(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] could not catch %s up with %s: %s", project.name, pr_url,
+                     base, e)
+            ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
+                                          reason=e.reason,
+                                          cause=ops.BASE_UPDATE_BEHIND)
+            return fresh
+        try:
+            fresh = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            # The update LANDED; only the read back failed. Recorded with the head
+            # unmoved, and the next tick reads the real one — `heal_inherited_failure`'s
+            # direction, for its reason.
+            log.info("[%s] caught %s up but could not re-read it: %s", project.name,
+                     pr_url, e)
+        ops.record_base_update(store, wo, base=base, base_sha=base_oid,
+                               head_before=head_before, head_after=fresh.head_oid,
+                               checks=fresh.failing, cause=ops.BASE_UPDATE_BEHIND)
+        log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
+                 project.name, pr_url, base, base_oid[:10], head_before[:10],
+                 fresh.head_oid[:10])
+        return fresh
+
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
                             wo: dict, decision: Any) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
@@ -6124,7 +6337,8 @@ class Daemon:
             log.info("[%s] could not rebuild %s against %s: %s", project.name,
                      wo["pr_url"], base_ref, e)
             ops.record_base_update_failed(store, wo, base=base_ref, base_sha=base_sha,
-                                          reason=e.reason)
+                                          reason=e.reason,
+                                          cause=ops.BASE_UPDATE_BASE_RED)
             return False, pr
         try:
             pr = github.pr_view(wo["pr_url"], cwd=project.path)
@@ -6137,7 +6351,7 @@ class Daemon:
                      wo["pr_url"], e)
         ops.record_base_update(store, wo, base=base_ref, base_sha=base_sha,
                                head_before=head_before, head_after=pr.head_oid,
-                               checks=pr.failing)
+                               checks=pr.failing, cause=ops.BASE_UPDATE_BASE_RED)
         log.info("[%s] %s was red only because %s was — rebuilt it against %s",
                  project.name, wo["pr_url"], base_ref, base_sha[:10])
         if judged and judged == head_before and pr.head_oid != head_before:

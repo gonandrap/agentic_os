@@ -1730,7 +1730,8 @@ def fake_gh(tmp_path, monkeypatch):
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
-                   merge_state: str | None = None, head_oid: str = "") -> None:
+                   merge_state: str | None = None, head_oid: str = "",
+                   base_oid: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1750,7 +1751,13 @@ def fake_gh(tmp_path, monkeypatch):
             — is how a test says "somebody pushed", which is the case the whole SHA
             binding exists for.
 
-            It is OMITTED rather than sent empty when unset, because GitHub never answers
+            `base_oid` is `baseRefOid`, the base branch's head as GitHub sees it, and it
+            is what says a branch is BEHIND on a repository whose strict status-check
+            policy is off — `mergeStateStatus` answers CLEAN there, so a fixture that
+            could not state this could only drive a catch-up that never fires in
+            production (spec 2026-09-27 §5.1).
+
+            Both are OMITTED rather than sent empty when unset, because GitHub never answers
             an empty sha: a test that wants the field absent must get it absent
             (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
             it present says so."""
@@ -1765,6 +1772,8 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            if base_oid:
+                row["baseRefOid"] = base_oid
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed:
