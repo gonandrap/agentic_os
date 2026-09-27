@@ -569,7 +569,7 @@ def investigator_write_decision(payload: dict[str, Any],
 
     §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md, and the hole
     `crew_edit_decision` above records rather than fixes: a `permissions.deny` cannot
-    express "no writes except one file" (src/jarvis/dispatch.py:687-691), so this is a
+    express "no writes except one file" (src/jarvis/dispatch.py:696-699), so this is a
     hook.
 
     ONE exempt path, and only for `Write`: the worktree's `verdict.json`. `Edit` on it is
@@ -611,10 +611,10 @@ def investigator_bash_decision(payload: dict[str, Any],
     log`, `gh pr view` and `jarvis … show` — so a speed bump is not enough: without this,
     `sed -i` on product code and `git commit` both go straight through.
 
-    Allowed only when the command satisfies one of three tests, in cost order:
-    `gate_rules.reads_only` (structural, all-or-nothing across the pipeline, already
-    refusing command substitution, shell invokers, unterminated heredocs and `sed -i`),
-    an `INVESTIGATOR_READS` pair, or a `jarvis` chain whose every verb is permitted.
+    Allowed only for a `jarvis` chain whose every verb is permitted, or a chain whose
+    EVERY segment is an `INVESTIGATOR_READS` pair or passes `gate_rules.reads_only`
+    (structural, already refusing command substitution, shell invokers, unterminated
+    heredocs and `sed -i`).
     """
     if env.get(WO_KIND_ENV) != "investigator" or payload.get("tool_name") != "Bash":
         return None
@@ -640,8 +640,29 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
+def _investigator_git_read(segment: str) -> bool:
+    """Whether one SEGMENT is an allowlisted `git`/`gh` read and nothing more.
+
+    §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    """
+    words = segment.split()
+    program = Path(words[0]).name if words else ""
+    sub = words[1] if len(words) > 1 else ""
+    if (program, sub) not in INVESTIGATOR_READS:
+        return False
+    # `git diff --output=src/a.py` writes a file with no chaining at all, and this path
+    # never reaches `reads_only`. A global option before the subcommand needs no test:
+    # the pair check reads `-C` as the subcommand and fails already — leave it that way.
+    if program == "git" and any(w.startswith("--output") for w in words[2:]):
+        return False
+    allowed = INVESTIGATOR_GH_ACTIONS.get(sub) if program == "gh" else None
+    if allowed is not None:
+        return (words[2] if len(words) > 2 else "") in allowed
+    return True
+
+
 def _investigator_may_run(command: str) -> bool:
-    """The three tests, each all-or-nothing across the whole command."""
+    """The jarvis-chain test, else every segment a read. All-or-nothing either way."""
     from . import gate_rules
 
     verbs = jarvis_verbs(command)
@@ -657,18 +678,22 @@ def _investigator_may_run(command: str) -> bool:
     # A REDIRECTION IS A WRITE, and `gate_rules.reads_only` does not ask: `cat > file
     # <<EOF` is every segment a reader and still writes the file. This is the hole
     # `crew_edit_decision`'s docstring names, and the one command this kind must not have.
-    if ">" in _mask_shell_text(command):
+    masked = _mask_shell_text(command)
+    if ">" in masked or "<" in masked:
         return False
-    words = command.split()
-    program = Path(words[0]).name if words else ""
-    sub = words[1] if len(words) > 1 else ""
-    if (program, sub) in INVESTIGATOR_READS:
-        allowed = INVESTIGATOR_GH_ACTIONS.get(sub) if program == "gh" else None
-        if allowed is not None:
-            action = words[2] if len(words) > 2 else ""
-            return action in allowed
-        return True
-    return gate_rules.reads_only(command)
+    # The git/gh path below bypasses `reads_only`, so its substitution test must exist
+    # here too (§2.6).
+    if "$(" in masked or "`" in masked:
+        return False
+    # SEGMENT-WISE, on the inert form: a pair exemption clears the segment it is in and
+    # never the rest of the chain (§2.6).
+    for start, end, _name in gate_rules.segments(command):
+        segment = command[start:end].strip()
+        if not segment:
+            return False
+        if not (_investigator_git_read(segment) or gate_rules.reads_only(segment)):
+            return False
+    return True
 
 
 #: A spec's two load-bearing sections, matched on the HEADING alone.

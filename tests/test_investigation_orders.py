@@ -190,6 +190,39 @@ def test_jarvis_verbs_reads_each_segment_and_leaves_the_chain_predicate_alone():
     assert hooks.is_jarvis_command_chain("cd /tmp && jarvis bug report x")
 
 
+#: A read the git/gh pair test clears on its FIRST TWO WORDS while the rest of the command
+#: writes. §2.6: the pair exemption is segment-wise, so a later segment cannot ride in.
+SMUGGLED = (
+    "git log && sed -i 's/a/b/' src/jarvis/ops.py",
+    "git status; git commit -am x && git push",
+    "gh pr view 1; gh pr merge 1 --admin",
+    "gh pr view 1 | sh",
+    # No chaining at all: a git argument that writes a file.
+    "git diff --output=src/a.py",
+)
+
+#: The pipelines an investigator actually needs, which the segment loop must keep.
+PIPED_READS = (
+    "git log --oneline -5 | head -20",
+    "git diff HEAD~1 | grep def",
+)
+
+
+def test_a_read_may_not_smuggle_a_write_into_a_later_segment():
+    for command in SMUGGLED:
+        assert _decision(hooks.preflight_decision(_bash(command), _env())) == "deny", (
+            command)
+        # Directly too, so the refusal is this kind's own and not a gate firing first.
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "deny", command
+
+
+def test_a_piped_read_still_runs():
+    for command in PIPED_READS:
+        assert _decision(
+            hooks.preflight_decision(_bash(command), _env())) == "allow", command
+
+
 # -- §2.7: filing one -----------------------------------------------------------------
 
 

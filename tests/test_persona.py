@@ -120,11 +120,45 @@ def test_improvement_order_block_is_shorter_than_the_feature_order_block(persona
     """Crib-sheet bloat pushes the directives down the page and regresses the LLM evals."""
     fo_at = persona.index("jarvis fo create")
     io_at = persona.index("jarvis io create")
-    backlog_at = persona.index("jarvis backlog promote")
+    # The io block ENDS where the investigate block starts, not at the backlog line:
+    # anything between them is a block of its own and must not be counted here.
+    investigate_at = persona.index("jarvis investigate")
     fo_block = persona[fo_at:io_at]
-    io_block = persona[io_at:backlog_at]
+    io_block = persona[io_at:investigate_at]
     assert len(io_block) < len(fo_block), (
         f"io block ({len(io_block)} chars) must stay shorter than the fo block "
         f"({len(fo_block)} chars): evals/llm/test_jarvis_judgment.py loads CLAUDE.md as a "
         "bare system prompt and a longer crib sheet buries the prime directives"
+    )
+
+
+# investigation orders: docs/superpowers/specs/2026-09-27-investigation-orders.md
+def test_investigation_order_block_is_shorter_than_the_improvement_order_block(
+        persona: str) -> None:
+    io_at = persona.index("jarvis io create")
+    investigate_at = persona.index("jarvis investigate")
+    backlog_at = persona.index("jarvis backlog promote")
+    io_block = persona[io_at:investigate_at]
+    investigate_block = persona[investigate_at:backlog_at]
+    assert len(investigate_block) < len(io_block), (
+        f"investigate block ({len(investigate_block)} chars) must stay shorter than the "
+        f"io block ({len(io_block)} chars): evals/llm/test_jarvis_judgment.py loads "
+        "CLAUDE.md as a bare system prompt and a longer crib sheet buries the prime "
+        "directives"
+    )
+
+
+def test_investigation_orders_sit_with_the_other_order_types(persona: str) -> None:
+    assert persona.index("jarvis investigate") > persona.index("jarvis io create"), (
+        "the investigate block must follow the io block, not precede it"
+    )
+    assert persona.index("jarvis investigate") < persona.index(DEV_MODE_HEADING), (
+        "the investigate block is operator content and must stay above the dev-mode "
+        "override"
+    )
+
+
+def test_prime_directives_still_precede_the_investigation_order_block(persona: str) -> None:
+    assert persona.index("Route, don't do") < persona.index("jarvis investigate"), (
+        "the prime directives must still dominate the crib sheet"
     )
