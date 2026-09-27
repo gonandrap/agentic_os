@@ -1735,6 +1735,41 @@ def test_a_carried_head_arms_only_when_every_other_condition_holds(over, armed, 
     assert decision.judged_sha == CARRIED
 
 
+def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
+        started, project, fake_gh, monkeypatch):
+    """§7 TEST 13's OTHER HALF, and §5.2's rule: the catch-up runs BEFORE a grant exists
+    and never after one. The gate command string carries the judged sha, so moving the head
+    behind a live grant orphans a permission Neo already gave and silently asks for another.
+
+    The base moves out from under an approved-and-filed pull request here — the ordinary
+    case on a busy `main` — and the OS leaves it alone."""
+    from jarvis import branchproof
+
+    base1, base2 = "1" * 40, "2" * 40
+    contained = {base1}
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+    monkeypatch.setattr(branchproof, "patch_id", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: ancestor in contained)
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base1)
+    fake_gh.updated_head(CARRIED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1 and fake_gh.updates == []
+
+    # `main` moved: the pull request is now behind, and a grant for the judged sha stands.
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base2)
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    assert store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert len(store.list_approvals(wo["id"])) == 1
+
+
 def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judged(
         started, project, fake_gh):
     """§3.5: the carry hangs off `HELD_SHA_MOVED` and nothing else. On the ordinary tick —

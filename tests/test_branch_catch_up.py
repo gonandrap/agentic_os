@@ -168,6 +168,36 @@ def test_a_head_that_already_carries_the_base_commit_is_left_alone(
     assert [a["kind"] for a in store.list_approvals(wo["id"])] == ["auto_merge"]
 
 
+def test_a_pull_request_github_calls_behind_is_caught_up_from_the_held_path(
+        started, project, fake_gh, local_proof):
+    """THE OTHER ARM, §5.2's first bullet — the rarer half, and the only one `decide` can
+    see. GitHub says BEHIND outright, so the hold is `merge_state_unclean` and the catch-up
+    fires from the held path rather than from in front of the approval lookup.
+
+    The head already CARRIES the base commit here, so ancestry says up to date and `.behind`
+    is the only thing left saying otherwise: an implementation that dropped the cheap
+    positive short-circuit leaves this pull request held for ever.
+    """
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["contains"] = {BASE_OID}
+    behind_pr(fake_gh)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="BEHIND", head_oid=JUDGED,
+                   base_oid=BASE_OID)
+
+    poll(started, store)
+
+    assert fake_gh.updates == [PR]
+    [row] = updates(store, wo)
+    assert row["cause"] == "behind" and row["head_after"] == UPDATED
+    # The hold is on the record too — the held path writes it before catching up, so a
+    # reader sees why the branch was moved (§3.5's first ordering note keeps that order).
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "automerge_held")]
+    assert [h["code"] for h in held] == ["merge_state_unclean"]
+    assert store.list_approvals(wo["id"]) == []
+
+
 # -- 15. once per base commit ----------------------------------------------------------
 
 

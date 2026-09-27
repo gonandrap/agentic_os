@@ -707,7 +707,10 @@ def local_proof(monkeypatch):
     """
     from jarvis import branchproof
 
-    state = {"id": "b7f0deadbeef", "ids": {}, "ancestors": None, "contained": set()}
+    # THE REAL ONES, kept reachable: the two whitespace tests below drive the daemon with
+    # ids a real repository produced, so they need the git behind the fake (review round 1).
+    state = {"id": "b7f0deadbeef", "ids": {}, "ancestors": None, "contained": set(),
+             "git_fetch": branchproof.fetch, "git_patch_id": branchproof.patch_id}
 
     def fetch(repo, *refs):
         return True
@@ -966,6 +969,99 @@ def test_identical_patch_ids_carry_and_an_edited_branch_file_does_not(tmp_path):
     clean = branchproof.patch_id(repo, "main", caught_up)
     assert clean and clean == branchproof.patch_id(repo, "main", judged)
     assert branchproof.patch_id(repo, "main", evil) != clean
+
+
+def _a_python_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
+    """A real clone where `main` moved INSIDE the file the branch also changed.
+
+    Returns (repo, judged, caught_up, dedented). `caught_up` merges the moved `main`
+    cleanly — the branch's own hunk is untouched and only its LINE NUMBERS shift, the
+    tolerance §3.3 has to keep. `dedented` merges the same commit and pulls a `return` out
+    of its `if` while resolving: whitespace only, a different program, and `git patch-id
+    --stable` cannot see it (review round 1 of wo-659be188).
+    """
+    up = make_git_project(tmp_path, "upstream")
+    (up / "mod.py").write_text("def f(x):\n    if x:\n        return 1\n    return 0\n")
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "the module")
+    repo = tmp_path / "pywork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    with open(repo / "mod.py", "a") as fh:
+        fh.write("\n\ndef g(y):\n    if y:\n        return 2\n    return 0\n")
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "the branch's contribution")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "mod.py").write_text("HEADER = 1\nHEADER2 = 2\n\n"
+                               + (up / "mod.py").read_text())
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "main moves, above the branch's own lines")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-edit", "origin/main")
+    caught_up = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", judged)
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "mod.py").write_text(
+        (repo / "mod.py").read_text().replace("        return 2", "    return 2"))
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "a resolution that only re-indented")
+    return repo, judged, caught_up, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_resolution_that_only_re_indents_python_is_not_the_diff_that_was_judged(
+        started, project, fake_gh, local_proof, tmp_path):
+    """REVIEW ROUND 1's BLOCKER. `git patch-id --stable` strips whitespace before hashing,
+    so a resolution that dedents a `return` out of its `if` — a different program, on the
+    branch's own line — produced the SAME id and the verdict was carried onto it, with the
+    record saying the diff was byte-identical.
+
+    Both halves in one test: the ids from a real repository must differ, and the daemon
+    driven with those ids must refuse the carry as `patch_id`."""
+    git_patch_id = local_proof["git_patch_id"]
+    repo, judged, _caught_up, dedented = _a_python_branch_that_merged_main(tmp_path)
+    assert local_proof["git_fetch"](repo, "main")
+    before = git_patch_id(repo, "main", judged)
+    after = git_patch_id(repo, "main", dedented)
+    assert before and after and before != after
+
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ids"] = {JUDGED: before, CAUGHT_UP: after}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["patch_id"]
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_base_merge_that_only_shifts_the_branchs_line_numbers_still_carries(
+        started, project, fake_gh, local_proof, tmp_path):
+    """THE TOLERANCE, and the reason the `@@` ranges are normalised rather than hashed.
+
+    `main` added lines ABOVE the branch's own hunk in the same file, so the branch's
+    contribution is unchanged and only the hunk header's numbers moved. A whitespace-exact
+    hash that kept them would refuse this — the commonest catch-up on the fleet — so the
+    ids must still be equal and the verdict must still carry with no round spent."""
+    git_patch_id = local_proof["git_patch_id"]
+    repo, judged, caught_up, _dedented = _a_python_branch_that_merged_main(tmp_path)
+    assert local_proof["git_fetch"](repo, "main")
+    before = git_patch_id(repo, "main", judged)
+    assert before and before == git_patch_id(repo, "main", caught_up)
+
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ids"] = {JUDGED: before, CAUGHT_UP: before}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert refusals(store, wo) == []
+    assert len(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)) == 1
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
 
 
 def test_the_ancestry_question_is_asked_of_the_local_origin_ref(tmp_path):

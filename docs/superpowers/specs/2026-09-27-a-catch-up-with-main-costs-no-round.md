@@ -55,7 +55,7 @@ OS did not choose and cannot bound.
 
 * **Re-judge, but do not count the round** (`counted_validation_rounds` exemption).
   Cheaper to write, and it still spends a full panel — five seats, real money, minutes of
-  latency — to re-read a diff that is byte-identical. It also makes the round ledger lie:
+  latency — to re-read a diff that has not changed. It also makes the round ledger lie:
   a round that happened and is not counted is the shape of every "why is this at round 4
   of 3" bug.
 * **Widen `automerge.decide` to accept "head is a descendant of the judged commit".**
@@ -69,7 +69,7 @@ OS did not choose and cannot bound.
   behaviour, and it fails on the case that actually occurs: base merges arrive in chains
   (a worker merges main, CI is slow, main moves, the OS merges main again).
 * **Ask the panel for a cheap one-seat opinion instead.** A seat asked "did this merge
-  change anything" is a model answering a question `git patch-id` answers exactly.
+  change anything" is a model answering a question a hash of the diff answers exactly.
 
 ## 3. The fix
 
@@ -82,8 +82,8 @@ gets the chance.
 | Piece | Home | Why there |
 |---|---|---|
 | Walk `judged..head`, read each commit's parents | `ci.base_merge_chain`, new, beside `ci.commit_parents` (src/jarvis/ci.py:234) | `commit_parents` is already the existing reader and already in `ci.VERBS` as `("api", "--method")`; a walk is N of it. |
-| Local git: fetch, `patch-id`, ancestry | **new module `src/jarvis/branchproof.py`** | `ci.py` is AST-tested against its `gh` allowlist and is *the* GitHub write surface (ci.py:51-66); `github.py` is AST-tested read-only. Neither is a home for local `git`. The shape to copy is `landing._git`/`landing._fetch_ref` (src/jarvis/landing.py:359) — subprocess, timeout, failure logs and returns None. No store, no catalog, no `gh`. |
-| The policy and the single write | `ops.carry_merge_chain`, new, beside `ops.carry_validated_head` (ops.py:5274) | Same signature discipline: the facts arrive as arguments (chain, patch-ids), the function decides and writes. Keeps it unit-testable with no network, exactly as `carry_validated_head` is. |
+| Local git: fetch, the diff hash, ancestry | **new module `src/jarvis/branchproof.py`** | `ci.py` is AST-tested against its `gh` allowlist and is *the* GitHub write surface (ci.py:51-66); `github.py` is AST-tested read-only. Neither is a home for local `git`. The shape to copy is `landing._git`/`landing._fetch_ref` (src/jarvis/landing.py:359) — subprocess, timeout, failure logs and returns None. No store, no catalog, no `gh`. |
+| The policy and the single write | `ops.carry_merge_chain`, new, beside `ops.carry_validated_head` (ops.py:5274) | Same signature discipline: the facts arrive as arguments (chain, diff hashes), the function decides and writes. Keeps it unit-testable with no network, exactly as `carry_validated_head` is. |
 | The IO and the logging | `Daemon._carry_catch_up`, new, beside `Daemon._rejudge_moved_head` (daemon.py:5839) | `_rejudge_moved_head`'s division of labour: daemon does `gh`/`git` and logging, `ops` holds the rule. |
 | The write itself | `ProjectStore.carry_round_head` (project_store.py:4375), unchanged | It is already dumb on purpose. |
 
@@ -131,26 +131,41 @@ propagates to the daemon, which logs and leaves the pull request exactly where i
 
 ```
 git -C <repo> fetch --quiet origin <base_ref> <pull/N/head>     # once per attempt
-git -C <repo> diff <merge-base(base_ref, sha)>..<sha> | git patch-id --stable
+git -C <repo> diff --full-index <merge-base(base_ref, sha)>..<sha>
+    -> drop the `@@ -a,b +c,d @@` ranges and the `index <old>..<new>` blob ids
+    -> sha256 of what is left
 ```
 
-computed for `judged` and for `head`. **The carry needs the two patch-ids to be
-identical.**
+computed for `judged` and for `head`. **The carry needs the two ids to be identical.**
+
+**THE HASH IS TAKEN HERE AND NOT BY `git patch-id`, and whitespace is in it.** Review round
+1 of wo-659be188: `patch-id --stable` strips all whitespace from every line before hashing,
+so a resolution that only re-indented Python — dedenting a `return` out of its `if`, a
+different program on the branch's own line — produced the id of the judged commit and the
+verdict was carried onto it, with the record saying the diff was byte-identical. Measured:
+`--stable` returned `fde3c3b7…` for the judged commit, for a clean catch-up and for the
+dedented resolution alike. So every space, every tab, the `---`/`+++` paths, the mode lines
+and the `@@`'s section heading are part of the id.
+
+**The `@@` ranges and the `index` blob ids are the only things dropped**, and for one
+reason: they are bookkeeping about the BASE rather than about the branch's contribution.
+`main` adding lines above the branch's own hunk shifts the ranges and changes both blob ids
+while the branch adds exactly what it added before — the commonest catch-up on the fleet,
+and the case this feature exists for.
 
 This is the proof (a) cannot give. GitHub reports an **evil merge** — a merge whose
 conflict resolution edited the pull request's own files — with exactly the parentage of a
 clean one. Proof (a) would carry it, binding the panel's verdict to code no seat read.
 Comparing what the branch adds *on top of its merge base* catches it: a resolution that
-changed the branch's contribution changes that diff, and therefore the patch-id.
+changed the branch's contribution changes that diff, and therefore the id.
 
 **Conservative by design, and the inverse error is accepted.** A perfectly clean merge can
-still change the patch-id when `main` touched lines adjacent to the branch's own, because
-the merge base moved and the diff's context moved with it. That is a *false refusal*: the
+still change the id when `main` touched lines adjacent to the branch's own, because
+the merge base moved and the diff's CONTEXT LINES moved with it. That is a *false
+refusal*: the
 pull request falls through to `ops.rejudge_moved_head` and behaves exactly as it does
 today. The asymmetry is deliberate — a missed carry costs a round, a wrong carry merges
 unread code.
-
-`git patch-id --stable`, not `--unstable`: the id must not depend on hunk ordering.
 
 ### 3.4 The fall-through, and why a failed proof (b) deserves a real round
 
@@ -159,7 +174,7 @@ refusal event (§4) and **do nothing else** — control returns to the existing
 `Daemon._rejudge_moved_head` call at daemon.py:4954-4958, unchanged, which spends a round
 or declines exactly as now.
 
-Spending a round there is right, not a consolation prize. A differing patch-id means the
+Spending a round there is right, not a consolation prize. A differing id means the
 bytes this pull request contributes are not the bytes the panel read. On the commonest
 cause — a worker resolving `CONFLICTING` — **the resolution is authored content**: someone
 chose which side won, line by line, in code that will land on `main`. No seat has read it.
@@ -223,12 +238,14 @@ chain: [sha, …]              # oldest-first, the commits walked
 merged_base_shas: [sha, …]    # second parents that are ancestors of origin/<base>
 merged_branch_shas: [sha, …]  # second parents the JUDGED commit already held (Neo 806)
 base, base_sha                # base_ref and origin/<base_ref> at proof time
-patch_id                      # the value both commits produced
+patch_id                      # the diff hash both commits produced
 reason                        # the sentence below
 ```
 
-`reason`: `` `main` was merged into this branch N time(s) and the pull request's own diff
-is byte-identical (patch-id <id[:12]>) — no authored content changed ``, with a second clause
+`reason`: `` `main` was merged into this branch N time(s), and the pull request's own diff
+is unchanged down to its whitespace (diff hash <id[:12]>, line numbers aside) — no authored
+content changed ``. It says HASH and not "byte-identical": the two diffs' bytes do differ, in
+exactly the base bookkeeping §3.3 drops. With a second clause
 `` and M merge(s) brought in only commits <judged[:10]> already contained `` whenever the
 chain holds a pull merge. **`merged_base_shas` must not lie**, so `base_sha` is the newest
 BASE commit walked and `""` when the chain held none.
@@ -393,13 +410,16 @@ fixture (`fake_gh.set_parents`, src/jarvis/testing.py:1793) and the `ci.VERBS` A
    commit is refused — `proof == "chain"`, no carry, and the round machine gets its turn
    (Neo question 806, condition 3);
 3a. a pull merge of two lineages of the branch itself, second parent already contained in
-   the judged commit and patch-ids equal, IS carried with no round spent (wo-00bd1096 /
+   the judged commit and the diff hashes equal, IS carried with no round spent (wo-00bd1096 /
    PR #779);
 4. a chain longer than `ci.CHAIN_LIMIT` is refused and makes at most `CHAIN_LIMIT` `gh api`
    calls (assert on `fake_gh.calls`);
-5. identical patch-ids carry; a merge that edits a branch file gives a different patch-id
-   and is refused with `proof == "patch_id"` (needs a real git repo — build it with the
-   existing `git init` helper at testing.py:2243);
+5. identical ids carry; a merge that edits a branch file gives a different id and is
+   refused with `proof == "patch_id"` (needs a real repo — build it with the existing
+   helper at testing.py:2243). Review round 1 added the two whitespace cases to the same
+   fixture: a resolution that ONLY re-indents a branch line must differ and be refused, and
+   a base merge that only shifts the branch hunk's line numbers must still compare equal
+   and carry;
 6. a fetch that fails refuses with `proof == "fetch"` and merges nothing;
 7. the AST test extended: `branchproof.py` runs `git` and never `gh`; `ci.WRITE_VERBS` is
    still one entry.
@@ -456,17 +476,21 @@ anything but base merges; making `ci.update_branch` gated; any change to `max_ro
 semantics or to `rejudge_moved_head` itself; base branches other than the pull request's own
 `baseRefName`.
 
-**Open questions for implementation.**
+**What the implementation settled.**
 
-* Does `mergeStateStatus` ever read `BEHIND` on this repository? `ops.PR_BEHIND_NOTE`
-  (ops.py:4944) says the ruleset forbids merging behind; `automerge.decide` (automerge.py:224)
-  says the strict policy is off. §5.1 does not depend on the answer — the `base_oid`
-  ancestry test is authoritative and `.behind` is a cheap positive short-circuit — but the
-  contradiction between the two docstrings should be settled and one of them corrected.
-* Whether `refs/pull/N/head` is fetchable in every project's checkout. If some project's
-  `origin` refuses it, proof (b) cannot be computed and the order falls through to a
-  re-judge — correct, but it makes the feature silently inert there, so
-  `branchproof.fetch` failing must be logged with the ref it asked for.
-* The issue body was read as relayed in the work order brief, not with `gh issue view 806`:
-  this seat has no shell. If #806 asks for anything beyond parts 1-3 above, that part is
-  unspecified.
+* **`BEHIND` is relied on in neither direction, and both arms exist.** `mergeStateStatus ==
+  "BEHIND"` is a cheap positive short-circuit inside `ops.catch_up_needed`, answered from
+  the held path (`HELD_MERGE_STATE_UNCLEAN`); the authoritative test is `base_oid` ancestry,
+  answered from the armed path before the approval lookup. Both arms are driven by tests, so
+  the feature cannot be a no-op whichever the repository reports. The contradiction between
+  `ops.PR_BEHIND_NOTE` and `automerge.decide` is a wording defect in those two docstrings
+  and nothing here rests on it.
+* **A `refs/pull/N/head` an `origin` refuses makes the carry inert in that project, by
+  design.** `branchproof.fetch` returns False and logs the refs it asked for, the refusal is
+  on the record as `proof == "fetch"`, and the order falls through to the re-judge exactly
+  as it did before this feature existed.
+* **Two carry writers, one rule.** `ops.carry_validated_head` and `ops.carry_merge_chain`
+  keep their own signatures and their own proofs, and share `ops._carry_round_onto`: the
+  guard (a latest round, its verdict on the judged commit, a head that moved) and the single
+  write (`carry_round_head` plus one `HEAD_CARRIED_EVENT`). `validated_head`'s one-home
+  invariant has one place to drift out of instead of two.

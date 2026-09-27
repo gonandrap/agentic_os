@@ -10,7 +10,7 @@ imports no module that can reach GitHub.
 **THE QUESTION THIS ANSWERS IS "DID THE BRANCH'S OWN CONTRIBUTION CHANGE", and no API can
 answer it.** GitHub reports an evil merge — one whose conflict resolution edited the pull
 request's own files — with exactly the parentage of a clean one, so the verdict carry needs
-a content proof beside the parentage proof (§3.3). `git patch-id --stable` over
+a content proof beside the parentage proof (§3.3). A WHITESPACE-EXACT hash of the diff over
 `merge-base(base, sha)..sha` is that proof: it is what the branch ADDS on top of its base,
 and a resolution that rewrote any of it moves the id.
 
@@ -22,6 +22,7 @@ behaves exactly as it did before this module existed.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -89,17 +90,42 @@ def fetch(repo: Path, *refs: str) -> bool:
     return True
 
 
+#: The two pieces of a diff that a BASE MERGE legitimately moves without the branch's
+#: contribution changing, and the only two dropped before the hash (§3.3, review round 1):
+#: the hunk header's line ranges — `main` adding lines above the branch's own hunk shifts
+#: them and nothing else — and the `index` line's blob ids, which name whole-file contents
+#: of the merge base and of the merged head, both of which move for the same reason. The
+#: `@@`'s trailing section heading and the mode on the `index` line stay in.
+_HUNK_RANGE_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M)
+_INDEX_IDS_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+", re.M)
+
+
 def patch_id(repo: Path, base_ref: str, sha: str) -> str | None:
     """What `sha`'s branch ADDS on top of its merge base with `origin/<base_ref>`, as an id.
 
     PROOF (b) of the carry, §3.3: computed for the judged commit and for the live head, and
-    the carry needs the two to be identical. `--stable`, never `--unstable`, so the id
-    cannot depend on hunk ordering.
+    the carry needs the two to be identical.
+
+    **WHITESPACE IS IN THE HASH, and that is why this is not `git patch-id`** (review round
+    1 of wo-659be188). `patch-id` strips all whitespace from every line before hashing, so
+    it cannot see a conflict resolution that only re-indented Python — dedenting a `return`
+    out of its `if` is a different program on the branch's own line, and `--stable` gave it
+    the id of the judged commit. The verdict was then carried onto code no seat read, with
+    the record saying the diff was byte-identical. So the diff is hashed HERE, verbatim:
+    every space, every tab, the `---`/`+++` paths, the mode lines and the `@@`'s section
+    heading are all part of the id. `--full-index`, so nothing depends on how short git
+    chose to abbreviate.
+
+    **The `@@` line ranges and the `index` blob ids are the ONLY things dropped**, because
+    they are bookkeeping about the base rather than about the branch's contribution: `main`
+    adding lines above the branch's own hunk shifts the ranges and changes both blob ids
+    while the branch adds exactly what it added before. Keeping them would refuse the
+    commonest catch-up on the fleet, which is the case this whole feature exists for.
 
     **CONSERVATIVE, and the inverse error is accepted.** A perfectly clean merge can still
     move the id when the base touched lines next to the branch's own, because the merge
-    base moved and the diff's context moved with it. That is a false refusal and it costs
-    a round — today's behaviour. The other direction would merge code no seat read.
+    base moved and the diff's CONTEXT lines moved with it. That is a false refusal and it
+    costs a round — today's behaviour. The other direction would merge code no seat read.
 
     None when git could not answer, which the caller reads as "no proof", never as "no
     change". An empty diff is None too: the carry's whole licence is "this differs from
@@ -113,13 +139,11 @@ def patch_id(repo: Path, base_ref: str, sha: str) -> str | None:
     merge_base = _git(repo, "merge-base", f"origin/{branch}", sha)
     if not merge_base or not merge_base.strip():
         return None
-    diff = _git(repo, "diff", f"{merge_base.strip()}..{sha}")
+    diff = _git(repo, "diff", "--full-index", f"{merge_base.strip()}..{sha}")
     if not diff:
         return None
-    out = _git(repo, "patch-id", "--stable", stdin=diff)
-    if not out or not out.split():
-        return None
-    return out.split()[0]
+    normalised = _INDEX_IDS_RE.sub("index", _HUNK_RANGE_RE.sub("@@ @@", diff))
+    return hashlib.sha256(normalised.encode("utf-8", "replace")).hexdigest()
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:

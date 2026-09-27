@@ -5202,9 +5202,6 @@ CARRY_REFUSED_EVENT = "validation_carry_refused"
 CARRY_BASE_HEAL = "base_heal"
 CARRY_BASE_MERGE_CHAIN = "base_merge_chain"
 
-#: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
-#: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
-#: not reach GitHub" (spec §4).
 #: `cause` on `PR_BASE_UPDATED_EVENT` / `PR_BASE_UPDATE_FAILED_EVENT`: which of the two
 #: reasons asked the OS to rebuild this merge ref. THE KEY IS SHARED (`base_heal_spent`)
 #: and the reason is not — the bound is about how often one merge ref may be rebuilt, and
@@ -5217,6 +5214,9 @@ BASE_UPDATE_BASE_RED = "base_red"
 #: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
 CATCH_UP_MAX = 3
 
+#: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
+#: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
+#: not reach GitHub" (spec §4).
 PROOF_CHAIN = "chain"
 PROOF_PATCH_ID = "patch_id"
 PROOF_FETCH = "fetch"
@@ -5352,6 +5352,37 @@ def catch_up_needed(pr: Any, *, repo: Path) -> bool:
     return not branchproof.is_ancestor(repo, base_oid, head)
 
 
+def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      facts: Callable[[dict], tuple[str, dict] | None]) -> dict | None:
+    """The guard both carries owe and the one write both make. Spec 2026-09-27 §3.1.
+
+    TWO ENTRY POINTS, ONE RULE (review round 1): `carry_validated_head` and
+    `carry_merge_chain` differ only in what they prove, and a second copy of the write is a
+    second place for `validated_head`'s one-home invariant to drift out of. What is shared
+    is exactly this — there must be a latest round, its verdict must be the one on `judged`,
+    the head must have actually moved, and the binding is `carry_round_head` plus ONE
+    `HEAD_CARRIED_EVENT` carrying the round it moved.
+
+    `facts` is the caller's own proof, given the round row so it can name the round in its
+    refusal log; it returns `(reason, payload extras)` or None to refuse. Nothing is written
+    until it holds, so a refusal at either level leaves the record exactly as it was.
+    """
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or not judged or not head or head == judged:
+        return None
+    if ProjectStore.validated_head(row) != judged:
+        return None
+    built = facts(row)
+    if built is None:
+        return None
+    reason, extra = built
+    store.carry_round_head(int(row["id"]), head, reason)
+    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
+               "judged_sha": judged, "carried_head_sha": head, "reason": reason, **extra}
+    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    return carried
+
+
 def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
                          head_after: str, base: str, base_sha: str,
                          parents: tuple[str, ...]) -> dict | None:
@@ -5403,30 +5434,22 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
     merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
     never whether one happens.
     """
-    row = store.latest_validation_round(wo_id=wo["id"])
-    if row is None or not judged or not head_after or head_after == judged:
-        return None
-    if ProjectStore.validated_head(row) != judged:
-        return None
-    if len(parents) != 2 or parents[0] != judged:
-        log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
-                 "of %s with the base", wo["id"], row["round"], head_after[:10],
-                 [p[:10] for p in parents] or "unreadable", judged[:10])
-        return None
-    reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
-              f"failure inherited from a red base — no authored content changed")
-    store.carry_round_head(int(row["id"]), head_after, reason)
-    carried = {"cause": CARRY_BASE_HEAL,
-               "round": int(row["round"]), "round_id": int(row["id"]),
-               "judged_sha": judged, "carried_head_sha": head_after,
-               "base": base, "base_sha": base_sha, "reason": reason,
-               # THE PROOF, not a restatement of the claim: the commit's own parents as
-               # GitHub answered them. `merged_base_sha` is the base commit that
-               # actually went in, which is not necessarily `base_sha` — the base can
-               # move between the CI read and the update.
-               "parents": list(parents), "merged_base_sha": parents[1]}
-    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
-    return carried
+    def facts(row: dict) -> tuple[str, dict] | None:
+        if len(parents) != 2 or parents[0] != judged:
+            log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
+                     "of %s with the base", wo["id"], row["round"], head_after[:10],
+                     [p[:10] for p in parents] or "unreadable", judged[:10])
+            return None
+        return ((f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
+                 f"failure inherited from a red base — no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commit's own parents as
+                # GitHub answered them. `merged_base_sha` is the base commit that
+                # actually went in, which is not necessarily `base_sha` — the base can
+                # move between the CI read and the update.
+                {"cause": CARRY_BASE_HEAL, "base": base, "base_sha": base_sha,
+                 "parents": list(parents), "merged_base_sha": parents[1]})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head_after, facts=facts)
 
 
 def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
@@ -5460,41 +5483,41 @@ def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
 
     Returns the payload written, or None when the facts do not hold.
     """
-    row = store.latest_validation_round(wo_id=wo["id"])
-    if row is None or not judged or not head or head == judged or not chain:
-        return None
-    if ProjectStore.validated_head(row) != judged:
-        return None
-    if chain[-1][0] != head:
-        return None             # oldest-first: the newest commit walked IS the head
     before, after = patch_ids
-    if not before or not after or before != after:
-        # Belt to the daemon's braces: a differing diff is authored content, and the one
-        # thing this function may never do is carry a verdict onto it.
-        return None
-    bases = [merged for _sha, merged, is_base in chain if is_base]
-    branch = [merged for _sha, merged, is_base in chain if not is_base]
-    # Two sentences and not one, because `merged_base_shas` must not lie: past Neo question
-    # 806 a walked merge may have brought in the branch's own lineage instead.
-    said = [f"`{base}` was merged into this branch {len(bases)} time(s)"] if bases else []
-    if branch:
-        said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
-                    f"already contained")
-    reason = (" and ".join(said) + f", and the pull request's own diff is byte-identical "
-              f"(patch-id {after[:12]}) — no authored content changed")
-    store.carry_round_head(int(row["id"]), head, reason)
-    carried = {"cause": CARRY_BASE_MERGE_CHAIN,
-               "round": int(row["round"]), "round_id": int(row["id"]),
-               "judged_sha": judged, "carried_head_sha": head,
-               # THE PROOF, not a restatement of the claim: the commits walked and what
-               # each of them merged in, as GitHub answered, plus the id both diffs
-               # produced. A reader six weeks later can re-run either proof from this.
-               "chain": [sha for sha, _merged, _base in chain],
-               "merged_base_shas": bases, "merged_branch_shas": branch,
-               "base": base, "base_sha": base_sha, "patch_id": after,
-               "reason": reason}
-    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
-    return carried
+
+    def facts(_row: dict) -> tuple[str, dict] | None:
+        if not chain or chain[-1][0] != head:
+            return None         # oldest-first: the newest commit walked IS the head
+        if not before or not after or before != after:
+            # Belt to the daemon's braces: a differing diff is authored content, and the
+            # one thing this function may never do is carry a verdict onto it.
+            return None
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        branch = [merged for _sha, merged, is_base in chain if not is_base]
+        # Two sentences and not one, because `merged_base_shas` must not lie: past Neo
+        # question 806 a walked merge may have brought in the branch's own lineage.
+        said = ([f"`{base}` was merged into this branch {len(bases)} time(s)"]
+                if bases else [])
+        if branch:
+            said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
+                        f"already contained")
+        # SAY WHAT IS TRUE, and it is a HASH comparison and not a comparison of the diff
+        # text (review round 1): `branchproof.patch_id` hashes the diff whitespace and all,
+        # dropping only the line numbers and blob ids a base merge moves. So "unchanged
+        # down to its whitespace", never "byte-identical" — the bytes of the two diffs do
+        # differ, in exactly the bookkeeping this is licensed to ignore.
+        return ((" and ".join(said) + f", and the pull request's own diff is unchanged "
+                 f"down to its whitespace (diff hash {after[:12]}, line numbers aside) "
+                 f"— no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commits walked and what
+                # each of them merged in, as GitHub answered, plus the id both diffs
+                # produced. A reader six weeks later can re-run either proof from this.
+                {"cause": CARRY_BASE_MERGE_CHAIN,
+                 "chain": [sha for sha, _merged, _base in chain],
+                 "merged_base_shas": bases, "merged_branch_shas": branch,
+                 "base": base, "base_sha": base_sha, "patch_id": after})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head, facts=facts)
 
 
 def carry_refusal_told(store: ProjectStore, wo_id: str, head_sha: str,
