@@ -193,8 +193,10 @@ def test_the_self_check_no_longer_flags_a_work_order_parked_on_neo(project):
 
 def test_the_self_check_still_surfaces_an_escalation(project):
     """The mirror. A question Neo sent up must be flagged even if nothing else flagged
-    it — `reclaim_stale` marks a question `failed` with no delivery callback at all, so
-    this invariant is the only thing that would ever raise it."""
+    it — `reclaim_stale` marks a question `failed` with a bare UPDATE, and `neo_tick` now
+    posts the flag itself (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-
+    flight.md §5, asserted in tests/test_transport_resilience.py), so this invariant is
+    the net UNDER that notification rather than the only thing that raises it."""
     store = ProjectStore(project)
     wo, q = park_on_a_question(store, status="failed")
 

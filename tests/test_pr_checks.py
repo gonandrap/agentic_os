@@ -30,6 +30,8 @@ from jarvis.invariants import (
 from jarvis.project_store import ProjectStore
 
 PR = "https://github.com/acme/proj/pull/7"
+#: A second parked pull request, for the per-step half of the read budget.
+OTHER_PR = "https://github.com/acme/proj/pull/8"
 
 
 @pytest.fixture()
@@ -269,11 +271,16 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     `poll_pull_requests` states this cost in its docstring, and the sentence had already
     drifted: it claimed one indexed read while the rewritten body performed several. A
     prose budget nobody executes is a comment, not a guarantee, so the statements are
-    read off the connection here. The four per pull request are one question each — was
+    read off the connection here. The four PER PULL REQUEST are one question each — was
     this closure already reported, is a conflict episode open, is a checks episode open,
     and is a "waiting for the base" note still up — and a fifth appearing means somebody
     put a query on the path every open pull request in the fleet pays for every two
     minutes.
+
+    The fifth statement here is the gate-only exclusion (2026-09-25 spec §4), and it is
+    PER STEP rather than per pull request: one bulk `pr_url_recorded` read over every
+    candidate id at once. `test_two_parked_pull_requests_pay_the_per_request_price_twice`
+    is what makes that an assertion instead of a claim.
 
     The fourth arrived with the inherited-failure heal and was bought deliberately: a
     pull request that goes green while its base is still broken would otherwise keep a
@@ -293,7 +300,7 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "wo_events" in s]) == 4
+    assert len([s for s in sql if "wo_events" in s]) == 5
     # ...and the work-order query is the step's one, for the whole project, not one per
     # pull request: the row is re-read only when a clear has just taken a flag down.
     assert len([s for s in sql if "wo_events" not in s]) == 1
@@ -302,13 +309,39 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     assert store.get_work_order(reviewing["id"])["status"] == "needs_review"
 
 
+def test_two_parked_pull_requests_pay_the_per_request_price_twice(
+        started, project, fake_gh, reviewing):
+    """What "per pull request" and "per step" mean, counted on a step that has two.
+
+    The exclusion above is one bulk read over every candidate id, so the arithmetic is
+    `4 * pull requests + 1`. A per-order `events_of_kind` for the same answer would read
+    `5 * pull requests` and look identical on a fleet with one open pull request — which
+    is every test but this one.
+    """
+    second = ops.create_work_order("proj_a", "add feature Y")
+    ops.finish(second["id"], "opened a second PR", pr_url=OTHER_PR)
+    red(fake_gh, GREEN)
+    fake_gh.set_pr(OTHER_PR, "OPEN", mergeable="MERGEABLE", base_ref="main",
+                   checks=GREEN)
+    store = ProjectStore(project)
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+
+    poll(started, store)
+
+    store.conn.set_trace_callback(None)
+    assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 2
+    assert len([s for s in sql if "wo_events" in s]) == 4 * 2 + 1
+    assert len([s for s in sql if "wo_events" not in s]) == 1
+
+
 def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
         started, project, fake_gh, parked):
     """The budget above is the SHIPPED one, and it must stay shipped.
 
     `validation.auto_merge` is false on every project until someone names it true, so the
-    common case has to be provably free — not "one cheap read", but the same four
-    `wo_events` reads and the same one work-order query as before the feature existed.
+    common case has to be provably free — not "one cheap read", but the same base budget
+    of the test above and the same one work-order query as before the feature existed.
     That is what `Daemon.auto_merge` returning on the config check buys, and asserting it
     here is what stops a later refactor moving the check below the query.
 
@@ -323,7 +356,7 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 4
+    assert len([s for s in sql if "wo_events" in s]) == 5
     assert len([s for s in sql if "wo_events" not in s]) == 1
     assert not [s for s in sql if "validation_rounds" in s]
 
@@ -364,7 +397,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
     assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
-    assert len([s for s in sql if "wo_events" in s]) == 5
+    assert len([s for s in sql if "wo_events" in s]) == 6
     assert not [s for s in sql if "approvals" in s]
 
 
@@ -389,7 +422,7 @@ def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 4
+    assert len([s for s in sql if "wo_events" in s]) == 5
     assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 
@@ -403,6 +436,63 @@ def test_a_work_order_with_no_pr_url_is_never_polled(started, project, fake_gh):
     poll(started, store)
 
     assert fake_gh.calls == []
+
+
+def test_a_gate_recorded_pull_request_is_never_polled_and_never_settles_the_order(
+        started, project, fake_gh):
+    """A merge a GATE recorded routes nothing — 2026-09-25 spec §4.
+
+    Without the exclusion the poll reads the raw column, GitHub says MERGED and
+    `ops.complete_merged` closes out a planner that never submitted its plan. Both
+    statuses a planner parks in are asserted, and both are in `PR_POLL_STATUSES`:
+    `waiting_input` is where a gate request leaves it, `failed` is where a dead turn does.
+    """
+    from jarvis import gates
+
+    wo = ops.create_work_order("proj_a", "plan the feature")
+    store = ProjectStore(project)
+    approval = store.add_approval(wo["id"], gates.PR_MERGE, f"gh pr merge {PR} --squash")
+    gates.apply_decision(store, approval["id"], verdict="approved",
+                         reason="the plan's own docs PR", decided_by="neo")
+    assert store.get_work_order(wo["id"])["pr_url"] == PR
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-25T10:00:00Z", head_oid="abc1234")
+
+    for status in ("waiting_input", "failed"):
+        store.set_status(wo["id"], status)
+
+        poll(started, store)
+
+        assert [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]] == []
+        row = store.get_work_order(wo["id"])
+        assert row["status"] == status
+        assert row["pr_state"] is None
+        assert store.events_of_kind(wo["id"], "pr_merged") == []
+
+
+def test_a_declaration_after_a_gate_recorded_the_same_url_is_still_polled(
+        started, project, fake_gh):
+    """The pairing: the exclusion is keyed on a gate-ONLY column, not on the EVENT.
+
+    A worker whose merge gate was decided mid-turn and who then ran `jarvis wo finish
+    --pr` carries both records, and a submitter's declaration is what routes — so this
+    order stays in the merge queue. Keying on `pr_url_recorded` alone would strand it
+    there for ever.
+    """
+    from jarvis import gates
+
+    wo = ops.create_work_order("proj_a", "merge it then declare it")
+    store = ProjectStore(project)
+    approval = store.add_approval(wo["id"], gates.PR_MERGE, f"gh pr merge {PR} --squash")
+    gates.apply_decision(store, approval["id"], verdict="approved", reason="green",
+                         decided_by="neo")
+    assert store.events_of_kind(wo["id"], "pr_url_recorded")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    fake_gh.set_pr(PR, "MERGED", merged_at="2026-09-25T10:00:00Z", head_oid="abc1234")
+
+    poll(started, store)
+
+    assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
+    assert store.get_work_order(wo["id"])["status"] == "completed"
 
 
 # -- giving up ----------------------------------------------------------------------
