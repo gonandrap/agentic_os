@@ -620,6 +620,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
             return ("Validation held — the Claude usage window is spent",
                     (f"resuming by itself at {when}" if when else "")
                     + (f" · {p.get('error')}" if p.get("error") else ""))
+        if p.get("cause") == "auth":  # project_store.VALIDATION_AUTH_CAUSE
+            # A FIFTH cause, and the one whose old reading cost four work orders a round
+            # and a user each (GitHub issue #778): the seats were reached and refused for
+            # want of a sign-in, which is neither a verdict nor a reviewer being down. NO
+            # `_clock(reopens_at)`, unlike the usage window above — that moment is a
+            # recheck interval, not a deadline anything stated (spec §7).
+            attempt = p.get("attempt")
+            return ("Validation held — Claude Code could not authenticate",
+                    f"attempt {attempt}: {p.get('error') or ''}")
         attempt = p.get("attempt")
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt
