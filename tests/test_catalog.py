@@ -486,3 +486,42 @@ def test_worker_require_crew_parsed():
     with pytest.raises(CatalogError, match="require_crew"):
         parse_catalog({"projects": [
             {"name": "a", "path": "/tmp/a", "worker": {"require_crew": "no"}}]})
+
+
+# -- observability: what debug data is COLLECTED ----------------------------------------
+#
+# §10 of docs/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
+# §5's per-turn ingredient row, and no read.
+
+
+def test_observability_ships_at_normal_fleet_wide_and_per_project():
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.observability.level == "normal"
+    assert cat.projects[0].observability.level == "normal"
+
+
+def test_a_project_inherits_the_fleet_observability_level_and_may_override_it():
+    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER, so
+    no caller consults two objects."""
+    cat = parse_catalog({
+        "os": {"observability": {"level": "off"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "observability": {"level": "full"}},
+        ],
+    })
+    assert cat.os.observability.level == "off"
+    assert cat.projects[0].observability.level == "off"
+    assert cat.projects[1].observability.level == "full"
+
+
+def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
+    """`GateConfig.parse`'s rule: a typo in `jarvis config set` must not silently leave
+    debugging off."""
+    with pytest.raises(CatalogError, match="off.*normal.*full"):
+        parse_catalog({"os": {"observability": {"level": "verbose"}}, "projects": []})
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).observability"):
+        parse_catalog({"projects": [
+            {"name": "a", "path": "/tmp/a", "observability": {"level": "loud"}}]})
+    with pytest.raises(CatalogError, match="must be an object"):
+        parse_catalog({"os": {"observability": "full"}, "projects": []})

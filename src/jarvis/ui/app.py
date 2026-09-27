@@ -747,6 +747,10 @@ def create_app() -> FastAPI:
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
+        # "What is not on this bill", worded ONCE in `bill.ABSENT_NOTES` and read by this
+        # page and `jarvis cost` both — it was spelled out in each until §10 needed a
+        # fourth sentence, and a caveat worded two ways is one the reader stops trusting.
+        absent_notes=bill.absent_notes,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,
