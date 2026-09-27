@@ -22,8 +22,11 @@
   {% if not turn.recorded %}
   {{ ui.note(turn.note) }}
   {% else %}
-  <table>
-    <tr><th>ingredient</th><th>bytes</th><th>tokens</th><th>what it is</th></tr>
+  {# Fixed columns: `table-layout: auto` sized turn 1's table off its empty note column and
+     turn 2's off a full one, so two readings of the same ledger did not line up. #}
+  <table style="table-layout: fixed;">
+    <tr><th style="width: 200px;">ingredient</th><th style="width: 120px;">bytes</th>
+        <th style="width: 120px;">tokens</th><th>what it is</th></tr>
     {% for row in turn.ingredients %}
     <tr>
       <td class="mono">{{ row.name }}</td>
