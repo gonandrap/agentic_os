@@ -74,6 +74,22 @@ line naming the size and where the rest is:
 
 The marker is not decoration. A silently truncated diff read as complete is how a reviewer
 confirms a change it never saw; a reviewer told what is missing can escalate instead.
+
+**THE REFERENCE RIDES ALWAYS, TRUNCATED OR NOT** (Neo, question 753, answering for the
+user). The confirmation question carries the pull request URL and the head SHA as plain
+text, in their own line, whether or not anything was cut. That is the reference the user
+asked for in place of an immense payload, and it is what makes the truncation marker
+actionable rather than an apology. Neo stays UNTOOLED — it cannot fetch that diff, and that
+is deliberate (section 6); the reference is there so the human reading the question, or a
+later reader of the record, can.
+
+**Do not print a branch name labelled as a SHA.** `EvidencePacket.base`/`head` mean
+different things per `source`: git objects on the worktree path (a resolved merge-base ref
+and a HEAD sha), and GitHub's `baseRefName`/`headRefName` — BRANCH NAMES — on the
+pull-request path. evidence.py says so at the field and excludes both from the fingerprint
+for that reason. So check `source` before you render: print a sha as a sha, a branch as a
+branch, and `"(unknown)"` where neither resolved. A confirmation question that names a
+branch as if it were a commit is a false reference, which is worse than none.
 Copy the wording discipline from `supervisor.build_evidence` (supervisor.py:528-614),
 which already ends its omission notice with "Escalate rather than judge on what you cannot
 see", and the per-field limit discipline from `gates.build_request_question`
@@ -244,6 +260,11 @@ knows where the CLI places a cache breakpoint inside a user message. Measure it;
 build on it, and do not reorder that prompt on the strength of a guess.
 
 ## 6 — Refused and deferred, with reasons, so nobody re-litigates them
+
+All three refusals below were put to Neo as question 753, on wo-7c7347e1, and sanctioned —
+with one condition, now in section 2: the trimmed evidence must carry the pull request link
+and the head SHA as plain text, because that is the reference the user asked for, and Neo
+stays untooled so the secret net still covers everything it reads.
 
 **By-reference evidence for Neo — refused.** Giving Neo a read-only checkout and `gh` so it
 fetches the PR diff itself is technically available (`run_headless_result` already takes
