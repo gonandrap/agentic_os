@@ -805,15 +805,15 @@ def test_every_bucket_of_the_partition_has_a_label_on_the_page():
     assert tuple(cli.PART_SHORT) == inspection.PARTS
 
 
-def test_the_dashboard_renders_no_partition_at_all():
-    """THE THIRD SURFACE THE BRIEF NAMES, and the answer is that it does not exist: the
-    dashboard reads alarms, never an `Anatomy`, so there is no four-way split under
-    `src/jarvis/ui/` for a fifth bucket to go missing from.
+def test_the_dashboards_partition_is_keyed_off_parts():
+    """THE THIRD SURFACE THE BRIEF NAMES — and it now exists: `/wo/{p}/{id}/debug` renders
+    an `Anatomy` (spec §7 of docs/specs/2026-09-24-order-observability.md), which is the
+    case this test's previous form said to convert it to when it arrived.
 
-    Pinned STRUCTURALLY rather than stated in a PR, because the claim is what rots: a
-    later page that renders a turn's clock has to import something from `inspection`
-    beyond the alarm labels, and that is the moment to key it off `PARTS` and add it to
-    the pin above.
+    So the pin moves from "the dashboard reads no anatomy" to the property that actually
+    protects a fifth bucket: the page walks `PARTS` and takes its wording from
+    `cli.PART_LABELS`/`PART_SHORT` rather than keeping a list of its own, so a bucket
+    cannot exist in one renderer and be silently absent from the other.
     """
     import ast
     from pathlib import Path
@@ -822,7 +822,6 @@ def test_the_dashboard_renders_no_partition_at_all():
     ui = Path(inspection.__file__).parent / "ui"
     for path in sorted(ui.rglob("*.py")):
         source = path.read_text()
-        assert "inspect_report" not in source, f"{path.name} reads an anatomy"
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.ImportFrom) and (node.module or "").endswith(
                     "inspection"):
@@ -830,9 +829,12 @@ def test_the_dashboard_renders_no_partition_at_all():
             if isinstance(node, ast.ImportFrom) and node.module in (None, "", "."):
                 imported |= {a.name for a in node.names if a.name == "inspection"}
 
-    assert imported == {"ALARM_KINDS"}, (
-        "the dashboard now reaches into `inspection` for more than the alarm labels — "
-        "if it renders the partition, key it off `PARTS` and pin it like `PART_LABELS`")
+    assert imported == {"ALARM_KINDS", "PARTS"}, (
+        "the dashboard reaches into `inspection` for something new — if it is a bucket "
+        "of the partition, key it off `PARTS` and pin it like `PART_LABELS`")
+    app = (ui / "app.py").read_text()
+    assert "parts=PARTS" in app and "part_labels=PART_LABELS" in app
+    assert "part_short=PART_SHORT" in app
 
 
 def test_the_spend_line_refuses_to_claim_money_for_a_turn_with_no_calls():

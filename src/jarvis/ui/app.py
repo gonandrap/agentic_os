@@ -17,7 +17,7 @@ from .. import bill, fleet, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
-from ..inspection import ALARM_KINDS
+from ..inspection import ALARM_KINDS, PARTS
 from ..paths import PRODUCTION, deployment_env
 from ..project_store import (
     ACTIVE_STATUSES,
@@ -221,6 +221,63 @@ def fmt_ts(ts: float | None) -> str:
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
 #: whatever the path, so a broken poll still leaves a trace.
 QUIET_PATHS = ("/api/status",)
+
+#: The same rule for polls whose path carries an id, so an exact match cannot express it:
+#: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
+#: open (spec §7 of docs/specs/2026-09-24-order-observability.md) and would bury the
+#: user's navigation exactly as `/api/status` did. Suffix, not prefix: the id sits in the
+#: middle.
+QUIET_SUFFIXES = ("/live",)
+
+
+def _quiet(path: str) -> bool:
+    """Is a SUCCESSFUL request on this path beneath the access log's notice? See above."""
+    return path in QUIET_PATHS or path.endswith(QUIET_SUFFIXES)
+
+
+def _stale_link_hint(name: str, wo_id: str) -> str:
+    """Why a work-order deep link went bad, as the visitor should read it.
+
+    Almost every visitor who lands on one followed a deep link out of a notification, so
+    the useful answer is "your link is stale", not the lookup's own phrasing — and it says
+    which half of the link went bad. ONE helper because two routes render it (`/wo/…` and
+    `/wo/…/debug`): two copies would come to tell a visitor two different things about
+    one bad link.
+    """
+    known = sorted(ops.registered_project_paths())
+    if name not in known:
+        return (f"This link points at project {name!r}, which the OS does not "
+                f"know about — it was never registered, or it has since been "
+                f"removed from the catalog. Registered projects: "
+                f"{', '.join(known) or 'none'}.")
+    return (f"Project {name!r} is registered, but it has no work order "
+            f"{wo_id!r} — the link is from before it existed, or the work "
+            f"order was deleted (`jarvis wo delete` erases the record).")
+
+
+def _block(label: str, read, *args, **kwargs) -> dict:
+    """One of the debugging page's four readings, fetched so the other three survive it.
+
+    DEGRADATION IS A FEATURE, NOT AN ERROR PAGE (spec §7): the page is four independent
+    readings of one order, and a dashboard 500 costs more than a missing block — `uilog`
+    turns it into an inbox item and `INV-UI-HEALTHY` into a fleet alarm. So a failure here
+    becomes a note that names what failed, and the block renders it.
+
+    An `ops.OpsError` is an EXPECTED absence (no session, an expired transcript, an order
+    that predates a ledger) and is recorded nowhere; anything else is a defect in the
+    reader, so it still goes to `uilog` and reaches the user through the inbox. Same
+    reading the unhandled-exception handler takes, one block down.
+    """
+    try:
+        return {"payload": read(*args, **kwargs), "error": ""}
+    except ops.OpsError as e:
+        return {"payload": None, "error": f"{label} could not be read — {e}"}
+    except Exception as e:  # noqa: BLE001 — three blocks must outlive the fourth
+        uilog.record_error("GET", f"debug/{label}", e)
+        return {"payload": None,
+                "error": (f"{label} could not be read — {type(e).__name__}: {e}. "
+                          f"The traceback is in {uilog.ui_log_path()} and the daemon "
+                          "will raise it in `jarvis inbox` on its next tick.")}
 
 
 def _rel_url(request: Request) -> str:
@@ -671,6 +728,12 @@ def create_app() -> FastAPI:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    # Inside the factory, like every other same-tier import in this file: `cli` and `ui`
+    # are one tier and the layering runs downward only. The five buckets' wording is READ
+    # from where `jarvis inspect` prints it rather than re-worded here — a legend that says
+    # one thing in the terminal and another on the page is one the reader learns to ignore.
+    from ..cli import PART_LABELS, PART_SHORT
+
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
@@ -713,6 +776,16 @@ def create_app() -> FastAPI:
         # page and another in the terminal is one the reader learns to ignore.
         rate_note=bill.rate_note, tokens_mean=bill.TOKENS_MEAN,
         write_rate_of=bill.write_rate_of,
+        # The debugging page's legends, taken from the modules that MEASURE rather than
+        # spelled into the template — same rule as the bill's two notes above (spec §7).
+        # `PARTS` is the bucket order every renderer walks, `PART_LABELS`/`PART_SHORT` the
+        # wording `jarvis inspect` prints, and `PREFIX_AUTHORITY` the precedence the page
+        # must state beside a prefix break it did not measure (kn-fafe92b7).
+        parts=PARTS, part_labels=PART_LABELS, part_short=PART_SHORT,
+        prefix_authority=ops.PREFIX_AUTHORITY,
+        # The residual's own sentence, shared with `jarvis wo why` for the same reason:
+        # a residual described in two wordings is one the reader learns to ignore.
+        unexplained_note=ops.UNEXPLAINED_NOTE,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -767,7 +840,7 @@ def create_app() -> FastAPI:
             uilog.record_access(request.method, _rel_url(request), 500,
                                 (time.perf_counter() - t0) * 1000)
             raise
-        if response.status_code >= 400 or request.url.path not in QUIET_PATHS:
+        if response.status_code >= 400 or not _quiet(request.url.path):
             uilog.record_access(request.method, _rel_url(request),
                                 response.status_code,
                                 (time.perf_counter() - t0) * 1000)
@@ -990,21 +1063,8 @@ def create_app() -> FastAPI:
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
-            # Almost every visitor who lands here followed a deep link out of a
-            # notification, so the useful answer is "your link is stale", not the
-            # lookup's own phrasing. Say which half of the link went bad.
-            known = sorted(ops.registered_project_paths())
-            if name not in known:
-                hint = (f"This link points at project {name!r}, which the OS does not "
-                        f"know about — it was never registered, or it has since been "
-                        f"removed from the catalog. Registered projects: "
-                        f"{', '.join(known) or 'none'}.")
-            else:
-                hint = (f"Project {name!r} is registered, but it has no work order "
-                        f"{wo_id!r} — the link is from before it existed, or the work "
-                        f"order was deleted (`jarvis wo delete` erases the record).")
-            return render(request, "error.html", message=str(e), hint=hint,
-                          status_code=404)
+            return render(request, "error.html", message=str(e),
+                          hint=_stale_link_hint(name, wo_id), status_code=404)
         store = ProjectStore(path)
         try:
             events = store.list_events(wo_id)
@@ -1096,6 +1156,45 @@ def create_app() -> FastAPI:
                       assumptions=assumptions, unreviewed=unreviewed,
                       approvals=approvals, bill=bill,
                       turn_lines=turn_lines_by_message(bill))
+
+    @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
+    def work_order_debug(request: Request, name: str, wo_id: str):
+        """"Show me all of the above on one page" — spec §7 of
+        docs/specs/2026-09-24-order-observability.md.
+
+        DELIBERATELY NOT `?debug=1` on the page above, which means something else
+        entirely (show debug-level timeline events) and is left alone.
+
+        Four payloads from `ops`, VERBATIM, in the order §1 ranks the questions: the
+        diagnosis first and above the fold, because "why is nothing happening" is the
+        largest bug class; then the live frame, the full anatomy and the context ledger.
+        This route COMPUTES NOTHING — no sum, no percentage, no sentence about a number.
+        If a figure is wrong the fix is in `ops`, once, and both surfaces get it.
+        """
+        try:
+            pname, _path, wo = ops.find_work_order(wo_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e),
+                          hint=_stale_link_hint(name, wo_id), status_code=404)
+        return render(
+            request, "debug.html", project=pname, wo=wo,
+            diagnosis=_block("the diagnosis", ops.diagnose, wo_id, pname),
+            live=_block("the live snapshot", ops.live_report, wo_id, pname),
+            anatomy=_block("the anatomy", ops.inspect_report, wo_id, pname),
+            context=_block("the context ledger", ops.context_report, wo_id, pname))
+
+    @app.get("/api/wo/{name}/{wo_id}/live")
+    def work_order_live(name: str, wo_id: str):
+        """`ops.live_report` as JSON, nothing reshaped — what the debugging page polls.
+
+        A poll and not SSE, no websocket and no JS build step (spec §7). Reshaping one key
+        here would be a second answer for the page to disagree with (PR 65), so the
+        payload goes out as it comes back.
+        """
+        try:
+            return JSONResponse(ops.live_report(wo_id, name))
+        except ops.OpsError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = ""):

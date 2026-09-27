@@ -1,0 +1,67 @@
+{% import "_debug.html" as ui %}
+{# 2. THE LIVE SNAPSHOT — `ops.live_report`, the same frame `jarvis watch` paints.
+   The payload says which regime it is in (`state`, `note`, `stale_seconds`) and this
+   block re-derives none of it: `now` is published ONLY in `working`, because in every
+   other state the open span is a stale reading. The ids are what the poll at the foot of
+   the page writes into — it copies payload keys and composes nothing. #}
+<section id="block-live">
+<h2>What it is doing right now</h2>
+{{ ui.failed(live) }}
+{% if live.payload %}
+{% set f = live.payload %}
+<div class="panel">
+  <div class="row">
+    <span class="kv" style="width: 120px;">state</span>
+    <span class="grow mono" id="live-state">{{ f.state }}</span>
+    <span class="kv">silent <span class="mono" id="live-stale">{{ fmt_dur(f.stale_seconds) }}</span></span>
+  </div>
+  <div class="row"><span class="sub" id="live-note">{{ f.note }}</span></div>
+  {% if f.turn %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">turn</span>
+    <span class="grow mono">{{ turn_label(f.turn.seq) }} · {{ fmt_dur(f.turn.elapsed) }} in</span>
+    <span class="kv">{% for t in f.turn.triggers %}{{ t.kind }}{{ ", " if not loop.last }}{% endfor %}</span>
+  </div>
+  {% endif %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">in flight</span>
+    <span class="grow mono" id="live-tool">{{ f.now.tool if f.now else f.note }}</span>
+    <span class="kv" id="live-detail">{{ f.now.detail if f.now else '' }}</span>
+  </div>
+  {% if f.now %}{{ ui.params(f.now) }}{% endif %}
+  {% if f.tokens %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">this turn</span>
+    <span class="grow mono">in {{ fmt_tok(f.tokens.input) }} · out {{ fmt_tok(f.tokens.output) }} ·
+      written {{ fmt_tok(f.tokens.cache_write) }} · read {{ fmt_tok(f.tokens.cache_read) }}</span>
+    <span class="kv">context <span class="mono" id="live-context">{{ fmt_tok(f.tokens.context) }}</span></span>
+  </div>
+  {% endif %}
+  {% if f.last_write %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">last big write</span>
+    <span class="grow mono">{{ fmt_tok(f.last_write.written) }}</span>
+    <span class="kv">{{ f.last_write.note or f.last_write.cause }}</span>
+  </div>
+  {% endif %}
+  {% for h in f.holds %}
+  <div class="row"><span class="kv" style="width: 120px;">held</span>
+    <span class="grow">{{ h.phrase }}</span></div>
+  {% endfor %}
+  {% if f.recent %}
+  <div class="row"><span class="kv">the last {{ f.recent|length }} finished tool call(s)</span></div>
+  {% for span in f.recent %}
+  <div class="row">
+    <span class="mono" style="width: 120px;">{{ span.tool }}</span>
+    <span class="grow">{{ span.detail }}</span>
+    <span class="kv mono">{{ fmt_dur(span.elapsed) }}</span>
+  </div>
+  {% endfor %}
+  {% endif %}
+  {# The cap is the payload's, stated rather than inferred: without it a reader cannot
+     tell a short command from a truncated one (`live.Live`'s `params_cap`). #}
+  <div class="sub" style="padding: 8px 16px;">Tool parameters in this frame are cut at
+    {{ f.params_cap }} characters and credentials are replaced before they are cut.</div>
+</div>
+{% endif %}
+</section>
