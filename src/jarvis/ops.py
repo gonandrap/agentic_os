@@ -2769,6 +2769,12 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # An ask is a claim about a question, resolved against `questions.status` for the same
+    # reason (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    if newest["kind"] == "autoreview_asked":
+        gone = _unreachable_asks()(newest.get("neo_question_id"))
+        if gone:
+            newest = {**newest, "unreachable": gone}
     # "left with you" is a claim about the PRESENT: resolve it against the row, once
     # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §1).
     if newest["kind"] in _AUTOREVIEW_OWED_BY_USER:
@@ -2880,6 +2886,58 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str):
     return stale
 
 
+def _unreachable_asks():
+    """`question_id -> {"question_id", "hint"} | None` — the asks whose question is DEAD.
+
+    kn-96f47efb at the read side, and the third instance of it after
+    `_AUTOREVIEW_OWED_BY_USER` and `_stale_panel_hold`: `autoreview_asked` is append-only
+    and immortal, so "awaiting ruling" is a present-tense claim about a row in `neo.db`
+    that has since changed status, and it has to be re-derived rather than believed.
+
+    LAZY, `_stale_panel_hold`'s discipline — an order with no ask pays nothing — and
+    cached per question, so `neo.db` is opened and closed once per link actually asked
+    about (`invariants.awaiting_neo`'s shape, and `ops.delete_work_order`'s precedent for
+    ops reaching into it at all). Best-effort in the same direction: any failure opening or
+    reading it yields None, so the line reads as it does today rather than taking
+    `jarvis wo show` down.
+
+    UNREACHABLE IS `status == 'failed'` AND NOTHING ELSE. `escalated` is Neo handing the
+    question back WITH a decision, and reaches the assumption as an `autoreview_escalated`
+    event; `queued`, `answering` and `answered` are genuinely in flight or already
+    delivered. `failed` on an assumption question has exactly two writers —
+    `neo_store.release_claim` and `neo_store.reclaim_stale` — and both stamp
+    `UNREACHABLE_PREFIX`, which is where the hint comes from. The prefix is stripped: the
+    sentence around it already says Neo could not be reached, and printing it twice reads
+    as a quoted status code.
+    """
+    from .neo_store import UNREACHABLE_PREFIX, NeoStore
+
+    cache: dict[int, dict[str, Any] | None] = {}
+
+    def dead(question_id: Any) -> dict[str, Any] | None:
+        qid = int(question_id or 0)
+        if not qid:
+            return None
+        if qid not in cache:
+            cache[qid] = None
+            try:
+                neo = NeoStore()
+                try:
+                    q = neo.get(qid)
+                finally:
+                    neo.close()
+            except Exception:  # noqa: BLE001 — see docstring: never take a surface down
+                q = None
+            if q and str(q["status"] or "") == "failed":
+                hint = str(q["answer_reason"] or "")
+                if hint.startswith(UNREACHABLE_PREFIX):
+                    hint = hint[len(UNREACHABLE_PREFIX):]
+                cache[qid] = {"question_id": qid, "hint": " ".join(hint.split())[:160]}
+        return cache[qid]
+
+    return dead
+
+
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling`.
 
@@ -2923,6 +2981,17 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
+    # Only the rows whose surviving ruling IS an ask can carry the fact, so only those are
+    # asked about — `_overtaken`'s and `objection_response`'s discipline. One branch covers
+    # both links: `propose_confirmation` writes `autoreview_asked` too, with `confirm`
+    # (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    gone = _unreachable_asks()
+    for ruling in newest.values():
+        if ruling["kind"] != "autoreview_asked":
+            continue
+        unreachable = gone(ruling.get("neo_question_id"))
+        if unreachable:
+            ruling["unreachable"] = unreachable
     base = store.all_assumptions(wo_id)
     rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
              # Both derivations read the carrier and the timeline, so they are asked only
@@ -3071,6 +3140,17 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
         held = re.sub(r"^assumption #\d+ ", "", reason)
         return f"Held by the OS — {held}" if held else "Held by the OS"
     if kind == "autoreview_asked":
+        # A dead question is not a ruling on its way — §3 of
+        # 2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md. Neither
+        # "escalated" nor "Neo decided" is sayable here: a crash is not a decision.
+        gone = ruling.get("unreachable") or {}
+        if gone:
+            what = " to confirm its early reading" if ruling.get("confirm") else ""
+            tail = f" — last error: {gone['hint']}" if gone.get("hint") else ""
+            return (f"Neo could not be reached (question {gone['question_id']}) — nobody "
+                    f"judged this{what}; you decide it: `jarvis neo answer "
+                    f"{gone['question_id']} \"…\"` then `jarvis wo review "
+                    f"{a.get('wo_id')}`{tail}")
         return f"Asked Neo (question {question}), awaiting ruling"
     if kind == "autoreview_unconfirmed":
         # The early reading did not survive the diff, so the assumption is the user's and
@@ -3198,6 +3278,14 @@ def _autoreview_line(state: dict[str, Any]) -> str:
         return (f"assumption #{n} left with you — "
                 f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_asked":
+        # `left with you` deliberately: the same claim as the two `_AUTOREVIEW_OWED_BY_USER`
+        # branches, so it sorts into the same reading (§3). No `resolved_status` suffix —
+        # that resolves an event against a SETTLED row and this branch is only reachable
+        # while the row is pending.
+        gone = state.get("unreachable") or {}
+        if gone:
+            return (f"assumption #{n} left with you — Neo could not be reached "
+                    f"(question {gone['question_id']}); nobody judged it")
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
     # The early pass's five. Each gets a branch rather than falling through, because the
     # fallthrough below says "held" — a kind with no branch would claim the OS refused to
