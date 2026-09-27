@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -571,3 +572,37 @@ def test_the_prompt_file_outlives_the_spawn_and_dies_with_the_reap(fleet) -> Non
 
     assert _poll_until_settled(store), "the turn never settled"
     assert not promptfile.exists(), "the reap left the prompt file behind"
+
+
+def test_reaping_a_turn_that_never_spawned_does_not_raise(fleet) -> None:
+    """A turn row exists before the process does, so `outfile` can still be empty.
+
+    `Path("")` is `PosixPath('.')` and `.with_suffix()` raises `ValueError` on it — the
+    prompt-file unlink has to be as guarded as the `errfile` beside it.
+    """
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "never spawned")
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="work")
+    assert turn["outfile"] == ""
+
+    settled = worker_session._reap(store, turn, "proj_a")
+
+    assert settled["state"] == "failed"
+
+
+def test_a_fake_claude_with_no_argv_prompt_never_blocks_on_a_terminal(
+        fake_claude, tmp_path) -> None:
+    """`resolved_prompt` reads stdin for any `-p` call carrying no prompt in argv — a
+    headless `--resume` among them. With an inherited terminal that read never returns,
+    so the fake hangs and takes the test session with it.
+    """
+    leader, follower = os.openpty()
+    try:
+        subprocess.run(  # the pin is that it RETURNS at all
+            [os.environ["JARVIS_CLAUDE_BIN"], "-p", "--output-format", "json"],
+            stdin=follower, capture_output=True, text=True, timeout=20, cwd=tmp_path)
+    finally:
+        os.close(follower)
+        os.close(leader)
+
+    assert fake_claude.calls[-1]["prompt"] == ""

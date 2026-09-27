@@ -237,7 +237,9 @@ def resolved_prompt():
 
     Only ever reads stdin for a `-p` call whose argv carries no prompt: `claude
     --version` and `claude agents --json` must never read it, or a fake invoked with an
-    inherited terminal blocks for ever.
+    inherited terminal blocks for ever. Never reads a TERMINAL either — a headless
+    `--resume` carries no argv prompt, and on an inherited tty that read never returns.
+    A stdin that cannot be read at all counts as empty.
     """
     if _stdin_prompt:
         return _stdin_prompt[0]
@@ -249,7 +251,10 @@ def resolved_prompt():
         if i < len(argv) and not argv[i].startswith("-"):
             found = argv[i]
     if found is None and "-p" in argv:
-        found = sys.stdin.read()
+        try:
+            found = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+        except (OSError, ValueError):
+            found = ""
     _stdin_prompt.append(found or "")
     return _stdin_prompt[0]
 

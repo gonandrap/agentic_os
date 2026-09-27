@@ -676,9 +676,11 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
         Path(turn["errfile"]) if turn["errfile"] else None,
         previous=store.turn_usage_before(wo_id, turn["seq"]))
     # The turn's prompt file, if the brief was too big for argv. Deleted HERE and not in
-    # `spawn_turn`: the process has ended, so stdin has been read or never will be. Spec
-    # §3: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
-    Path(turn["outfile"]).with_suffix(".prompt").unlink(missing_ok=True)
+    # `spawn_turn`: the process has ended, so stdin has been read or never will be. Only
+    # when an outfile was named — a turn row that never spawned has none. Spec §3:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    if turn["outfile"]:
+        Path(turn["outfile"]).with_suffix(".prompt").unlink(missing_ok=True)
     if result is None:
         error = (_stderr_tail(turn) or _transcript_error(store, wo_id, turn)
                  or NO_RESULT)
