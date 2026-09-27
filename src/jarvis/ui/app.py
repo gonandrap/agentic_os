@@ -280,6 +280,23 @@ def _block(label: str, read, *args, **kwargs) -> dict:
                           "will raise it in `jarvis inbox` on its next tick.")}
 
 
+def _fix_filed_notice(filed: str) -> str:
+    """What the fix POST just did, rebuilt from its `?filed=` — `ops` owns every word.
+
+    AN APPROVAL ID, A `pending-<id>`, OR A BOUNDED FLAG, and anything else renders NOTHING:
+    a note built from the query string reads as the OS speaking about what happened to an
+    order (spec §11, and `ops.fix_filed_notice`'s docstring for why that matters even when
+    autoescaped). The pending shape is parsed as the prefix plus an INTEGER — `isdigit`, so
+    `pending-abc` and `pending--1` are not ids and render nothing.
+    """
+    if filed.isdigit():
+        return ops.fix_filed_notice(int(filed))
+    if filed.startswith(ops.FIX_PENDING_PREFIX):
+        rest = filed[len(ops.FIX_PENDING_PREFIX):]
+        return ops.fix_pending_notice(int(rest)) if rest.isdigit() else ""
+    return ops.fix_flag_notice(filed) or ""
+
+
 def _rel_url(request: Request) -> str:
     """Path plus query — `?error=…` is often the whole story of a failed click."""
     q = request.url.query
@@ -1158,7 +1175,7 @@ def create_app() -> FastAPI:
                       turn_lines=turn_lines_by_message(bill))
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
-    def work_order_debug(request: Request, name: str, wo_id: str):
+    def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
         """"Show me all of the above on one page" — spec §7 of
         docs/specs/2026-09-24-order-observability.md.
 
@@ -1179,6 +1196,11 @@ def create_app() -> FastAPI:
         return render(
             request, "debug.html", project=pname, wo=wo,
             diagnosis=_block("the diagnosis", ops.diagnose, wo_id, pname),
+            # §11, under the diagnosis it acts on. `confirm=False`: OPENING A PAGE MUST
+            # WRITE NOTHING — no grant, no Neo question, no event. Only the POST below
+            # confirms, and what it carries back is an id or a bounded flag, never text.
+            fix=_block("the fix", ops.fix, wo_id, pname),
+            fix_filed=_fix_filed_notice(filed),
             live=_block("the live snapshot", ops.live_report, wo_id, pname),
             anatomy=_block("the anatomy", ops.inspect_report, wo_id, pname),
             context=_block("the context ledger", ops.context_report, wo_id, pname))
@@ -1610,6 +1632,40 @@ def create_app() -> FastAPI:
     def resume_auto(name: str, wo_id: str):
         ops.resume_in_auto(wo_id, project_name=name)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/fix")
+    def fix_wo(name: str, wo_id: str):
+        """`jarvis wo fix --confirm` from the debugging page — the SAME `ops.fix`, so the
+        two surfaces cannot come to disagree about what is offered or what it touches.
+
+        IT FILES AND NOTHING MORE: `ops.fix` proposes a `self_heal` grant a reviewer
+        decides, and `Daemon.remedy_tick` applies an approved one. This route adds no
+        authority and AUTHORS NO TEXT — `?filed=` carries the gate request's NUMBER, the
+        way `validation/force` carries a round, and `ops.fix_filed_notice` rebuilds the
+        sentence on the page.
+
+        NOTHING FILED CARRIES NO ID: an unreachable Neo with no request redirects with the
+        bounded flag `unreachable`, and one that left a PENDING request carries its number
+        as `pending-<id>` — a request the user can answer themselves, which is the one thing
+        that gets them unstuck. A payload that proposed nothing redirects with no query at
+        all, so the page cannot claim a request exists. An `ops.OpsError` adds nothing
+        either — the GET re-reads `ops.fix` and `_block` renders that same refusal in place.
+        """
+        back = f"/wo/{name}/{wo_id}/debug"
+        try:
+            out = ops.fix(wo_id, name, confirm=True)
+        except ops.OpsError:
+            return RedirectResponse(f"{back}#block-fix", status_code=303)
+        filed = out["filed"] or {}
+        if filed.get("unreachable"):
+            held = filed.get("approval")
+            tag = (f"{ops.FIX_PENDING_PREFIX}{int(held)}" if held else "unreachable")
+            return RedirectResponse(f"{back}?filed={tag}#block-fix", status_code=303)
+        approval = filed.get("approval")
+        if not approval:
+            return RedirectResponse(f"{back}#block-fix", status_code=303)
+        return RedirectResponse(f"{back}?filed={int(approval)}#block-fix",
+                                status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/validation/force")
     def force_validation(name: str, wo_id: str, reason: str = Form(...)):

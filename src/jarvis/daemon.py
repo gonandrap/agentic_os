@@ -3597,14 +3597,21 @@ class Daemon:
                       if p.supervisor.remedies.enabled]
         if not supervised or self.remedy_applying:
             return
-        ready: list[tuple[ProjectSpec, str]] = []
+        from . import remedies as remedies_mod
+
+        ready: list[tuple[ProjectSpec, str | None, int | None]] = []
         for project in supervised:
             store = self.store_for(project)
             for alarm in store.alarms_across(statuses=("proposed",)):
                 approval_id = alarm.get("remedy_approval_id")
                 approval = store.get_approval(int(approval_id)) if approval_id else None
                 if approval is not None and approval["status"] == "approved":
-                    ready.append((project, alarm["id"]))
+                    ready.append((project, alarm["id"], int(approval["id"])))
+            # §11 of docs/specs/2026-09-24-order-observability.md: a USER-INITIATED fix has
+            # no alarm row, so the scan above would never see it and an approved grant
+            # would sit unspent for ever. Same pool, same `remedies.enabled` gate.
+            for grant in remedies_mod.user_grants(store):
+                ready.append((project, None, int(grant["id"])))
         if not ready:
             return
         self.remedy_applying = True
@@ -3612,7 +3619,8 @@ class Daemon:
         future.add_done_callback(
             lambda f: setattr(self, "remedy_applying", False))
 
-    def _apply_remedies(self, ready: list[tuple[ProjectSpec, str]]) -> None:
+    def _apply_remedies(self,
+                        ready: list[tuple[ProjectSpec, str | None, int | None]]) -> None:
         """Run each approved remedy on the supervisor thread. Re-reads every row.
 
         Re-read rather than carried: the tick chose these under a snapshot taken before
@@ -3623,24 +3631,42 @@ class Daemon:
 
         central = CentralStore()
         try:
-            for project, alarm_id in ready:
+            for project, alarm_id, approval_id in ready:
                 pstore = ProjectStore(project.path)
+                subject_of_log = alarm_id or f"gate request {approval_id}"
                 try:
-                    self._apply_one_remedy(project, pstore, central, alarm_id, remedies)
+                    self._apply_one_remedy(project, pstore, central, alarm_id, remedies,
+                                           approval_id)
                 except remedies.RemedyRefused as exc:
                     log.warning("[%s] remedy for %s refused: %s", project.name,
-                                alarm_id, exc)
+                                subject_of_log, exc)
                 except Exception:  # noqa: BLE001 — one alarm must not stop the rest
                     log.exception("[%s] applying the remedy for %s failed",
-                                  project.name, alarm_id)
+                                  project.name, subject_of_log)
                 finally:
                     pstore.close()
         finally:
             central.close()
 
     def _apply_one_remedy(self, project: ProjectSpec, pstore: ProjectStore,
-                          central: CentralStore, alarm_id: str,
-                          remedies: Any) -> None:
+                          central: CentralStore, alarm_id: str | None,
+                          remedies: Any, approval_id: int | None = None) -> None:
+        if alarm_id is None:
+            # §11's alarm-less grant. Re-read like the alarm path, and refuse rather than
+            # guess when the subject has been deleted since the tick chose it.
+            approval = pstore.get_approval(int(approval_id))  # type: ignore[arg-type]
+            if approval is None:
+                return
+            subject = remedies.subject_of_grant(pstore, approval)
+            if subject is None:
+                log.warning("[%s] gate request %s names a subject that is gone",
+                            project.name, approval_id)
+                return
+            result = remedies.apply(pstore, central, project.name, approval, None,
+                                    subject)
+            log.info("[%s] user fix applied on %s: %s", project.name, subject["id"],
+                     result)
+            return
         alarm = pstore.get_alarm(alarm_id)
         if alarm["status"] != "proposed":
             return

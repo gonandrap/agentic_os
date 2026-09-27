@@ -524,7 +524,8 @@ def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
         alarm = store.get_alarm(alarm["id"])
 
         assert remedies.REMEDIES["nudge"].apply(
-            store, central, "proj_a", store.get_feature_order(fo_id), alarm)
+            store, central, "proj_a", store.get_feature_order(fo_id),
+            remedies.Intent.from_alarm(store, alarm))
         (queued,) = store.queued_messages(carrier["id"])
         assert queued["source"] == "supervisor"
         assert "where are you?" in queued["content"]
@@ -533,7 +534,8 @@ def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
         assert store.carrier_for_feature("fo-nosuchthing") is None
         with pytest.raises(remedies.RemedyRefused, match="fo-nosuchthing"):
             remedies.REMEDIES["nudge"].apply(
-                store, central, "proj_a", {"id": "fo-nosuchthing"}, orphan)
+                store, central, "proj_a", {"id": "fo-nosuchthing"},
+                remedies.Intent.from_alarm(store, orphan))
         assert len(store.queued_messages(carrier["id"])) == 1
     finally:
         central.close()

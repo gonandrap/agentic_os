@@ -330,11 +330,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # entry and `remedy_applied` sit next to each other on a settled order, and a
         # reader who takes the first for the act goes looking for an effect only the
         # second one had.
-        return ("The supervisor asked permission to act",
-                f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}")
+        #
+        # NO `alarm_id` MEANS THE USER ASKED (§11 of
+        # docs/specs/2026-09-24-order-observability.md): `remedies.propose_fix` writes no
+        # alarm row because none was raised, and naming the supervisor here would credit a
+        # judgement nobody made.
+        detail = f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}"
+        if not p.get("alarm_id"):
+            return ("A fix you asked for needs permission", detail)
+        return ("The supervisor asked permission to act", detail)
     if kind == "remedy_applied":
-        return ("The supervisor acted",
-                f"{p.get('remedy') or 'a remedy'}: {p.get('result') or ''}")
+        detail = f"{p.get('remedy') or 'a remedy'}: {p.get('result') or ''}"
+        if not p.get("alarm_id"):
+            return ("The OS applied the fix you asked for", detail)
+        return ("The supervisor acted", detail)
     if kind == "remedy_refused":
         # Two payload shapes arrive here — the catalog refusing to file the proposal at
         # all, and a reviewer denying it — and `by` is what tells them apart (§5).

@@ -22,6 +22,7 @@ has no other record, and each needs the proposal loop to have earned trust first
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -47,11 +48,59 @@ GRANT_USES = 1
 #: because `apply_decision` queues no message for this kind.
 INTENT = "heal {alarm_id}: {remedy} {subject_id} — {argument}"
 
+#: `INTENT`'s sibling for a USER-INITIATED fix — §11 of
+#: docs/specs/2026-09-24-order-observability.md. IT IS NOT A COMMAND EITHER and nothing
+#: will execute it. It names NO alarm because there is none: the user reached the remedy
+#: off §6's diagnosis, and `apply` recovers the remedy and the subject from this string
+#: rather than from an alarm row (Neo q795). The prefix differs from `INTENT`'s so the two
+#: can never be read as each other.
+USER_INTENT = "apply {remedy} to {subject_id}, asked for by the user — {argument}"
+
+#: The parser for the line above, and the two must stay in step — a round-trip test pins
+#: them. A string that is not one of ours yields None rather than a guess: `apply` refuses
+#: on None, and guessing a remedy out of an unrecognised grant is how a reviewer comes to
+#: have authorised something other than what they read.
+_USER_INTENT_RE = re.compile(
+    r"^apply (?P<remedy>[A-Za-z_][A-Za-z0-9_-]*) to (?P<subject_id>\S+), "
+    r"asked for by the user — (?P<argument>.*)$", re.DOTALL)
+
+
+def user_intent(subject_id: str, remedy: str, argument: str) -> str:
+    """`approvals.command` for one user-initiated fix. See `USER_INTENT`."""
+    return USER_INTENT.format(remedy=remedy, subject_id=subject_id,
+                              argument=(argument or "").strip())
+
+
+def parse_user_intent(command: str | None) -> dict[str, str] | None:
+    """`{"remedy", "subject_id", "argument"}`, or None when this grant is not one of ours.
+
+    ONE HOME FOR BOTH DIRECTIONS, beside the formatter: `apply` reads back what `propose_fix`
+    wrote, and a second place that knows the shape is how the two come to disagree.
+    """
+    match = _USER_INTENT_RE.match(command or "")
+    if match is None:
+        return None
+    return {"remedy": match["remedy"], "subject_id": match["subject_id"],
+            "argument": match["argument"]}
+
+
 #: The one message a nudge sends. Short on purpose: delivering it re-sends the worker's
 #: whole conversation at the cache-write rate, which is the very cost the `big-rewrite`
 #: alarm exists to report.
 NUDGE = """[supervisor] The OS flagged this order as possibly unhealthy and was given \
 permission to ask you about it: {reason}
+
+{argument}
+
+Reply on the record with where you are: what you are working on right now, what you are
+waiting on, and whether you are stuck. This is a question, not an instruction — do not
+change course on the strength of it."""
+
+#: The same message when the USER asked for it (§11). A separate literal and not a
+#: parameter: `NUDGE` states that the OS FLAGGED this order and was GIVEN PERMISSION to ask
+#: about it, and both halves are false here — nothing flagged it, and the permission was
+#: granted for the user's own request. A worker told an alarm exists goes looking for one.
+USER_NUDGE = """[the OS] The user asked us to check in with you: {reason}
 
 {argument}
 
@@ -83,10 +132,33 @@ CAUSE rather than the symptom it was measured by. A separate work order is alrea
 to ship your fix once this one completes, so finish behind a pull request as usual and do
 not release anything yourself."""
 
+#: The same brief when the USER asked (§11). `FIX_BRIEF` sends the worker to
+#: `jarvis alarms show <alarm>`, which on this path is a row that does not exist; the
+#: evidence lives on the order's own diagnosis instead (§6's `jarvis wo why`), so that is
+#: where this points. Same frame otherwise: the worker sees only this text.
+USER_FIX_BRIEF = """The user asked for this off the diagnosis of {subject_id}.
+
+WHAT THEY SAW: {reason}
+
+WHAT THEY WANT DONE: {argument}
+
+Read the diagnosis before you start — `jarvis wo why {subject_id}` — and fix the ROOT
+CAUSE rather than the symptom it was noticed by. A separate work order is already filed
+to ship your fix once this one completes, so finish behind a pull request as usual and do
+not release anything yourself."""
+
+#: `_apply_file_work_order`'s refusal, hoisted to module level so §11's entry point can
+#: state it BEFORE a grant is filed instead of after one was spent — one home for the rule,
+#: because a second copy passes every behavioural test and drifts anyway (kn-4ea33fe6).
+NO_ARGUMENT = ("{origin} proposed `file_work_order` with no argument — there is nothing "
+               "to brief a work order with")
+
 #: The ship order's title and brief, and these words are the OS's rather than the judge's
 #: on purpose: "ship it" is the same job every time, and a judge writing its own release
 #: instructions each time is a judge inventing a procedure the `shipit` skill already owns.
 SHIP_TITLE = "Ship the fix for {alarm_id} to production"
+#: The same title with the subject in place of the alarm, for §11's alarm-less path.
+USER_SHIP_TITLE = "Ship the fix for {subject_id} to production"
 SHIP_BRIEF = """This order ships {fix_id}, and runs only after it completes.
 
 Cut a release from ALREADY-MERGED main and deploy it with the `shipit` skill, which is the
@@ -103,6 +175,14 @@ Why it is worth shipping promptly: {reason}"""
 APPROVED_INBOX_TITLE = "{by} approved the {remedy} remedy on {alarm_id}"
 APPLIED_INBOX_TITLE = "The supervisor acted on {subject_id}"
 REFUSED_INBOX_TITLE = "A remedy was refused, and {alarm_id} still needs you"
+
+#: The same three for §11, naming the SUBJECT because there is no alarm to name. The
+#: refusal is not an attention item here and the title says why: the user asked, the
+#: reviewer said no, and nothing was done — there is no unresolved symptom left behind.
+USER_APPROVED_INBOX_TITLE = "{by} approved the {remedy} fix on {subject_id}"
+USER_APPLIED_INBOX_TITLE = "The {remedy} fix you asked for on {subject_id} was applied"
+USER_REFUSED_INBOX_TITLE = ("The {remedy} fix on {subject_id} was refused — nothing was "
+                            "done")
 
 
 class RemedyRefused(Exception):
@@ -150,6 +230,92 @@ def _carrier_id(pstore: Any, alarm: dict[str, Any]) -> str | None:
     return str(carrier["id"]) if carrier else None
 
 
+def subject_kind_of(subject: dict[str, Any]) -> str:
+    """`work_order` or `feature_order` for a SUBJECT dict — §11's path has no alarm row.
+
+    Off the id prefix, because the two live in different tables and nothing on the row
+    says which one it came from. A feature order and an improvement order are both
+    `feature_orders` rows and both are `feature_order` here, which is what `Remedy.subjects`
+    means by it.
+    """
+    return "work_order" if str(subject.get("id") or "").startswith("wo-") else \
+        "feature_order"
+
+
+def _carrier_for_subject(pstore: Any, subject: dict[str, Any]) -> str | None:
+    """`_carrier_id`'s sibling for a subject with no alarm. Same rule, same reason: a
+    feature order has no timeline of its own, so its record rides §1's carrier."""
+    sid = str(subject.get("id") or "")
+    if subject_kind_of(subject) == "work_order":
+        return sid or None
+    carrier = pstore.carrier_for_feature(sid)
+    return str(carrier["id"]) if carrier else None
+
+
+@dataclass(frozen=True)
+class Intent:
+    """Exactly what a handler needs, from EITHER authority — §11 (Neo q795).
+
+    Two constructors and one shape, so the handlers cannot know which path they are on
+    except by asking `alarm_id is None` — which is the one thing they must know, because
+    an OS that names an alarm the user never saw raised is telling them something false.
+    """
+
+    remedy: str
+    subject_id: str
+    carrier_id: str | None
+    argument: str
+    reason: str
+    alarm_id: str | None = None
+    fo_id: str | None = None
+
+    @classmethod
+    def from_alarm(cls, pstore: Any, alarm: dict[str, Any]) -> Intent:
+        """Today's supervisor path. `reason` is left UNSTRIPPED: it goes verbatim into
+        `NUDGE`, and the message a running session receives must not change here."""
+        feature = subject_kind(alarm) == "feature_order"
+        return cls(
+            remedy=str(alarm.get("remedy") or ""),
+            subject_id=str((alarm.get("fo_id") if feature else alarm.get("wo_id")) or ""),
+            carrier_id=_carrier_id(pstore, alarm),
+            argument=(alarm.get("remedy_argument") or "").strip(),
+            reason=str(alarm.get("reason") or ""),
+            alarm_id=str(alarm["id"]),
+            fo_id=alarm.get("fo_id"),
+        )
+
+    @classmethod
+    def from_grant(cls, pstore: Any, approval: dict[str, Any],
+                   subject: dict[str, Any]) -> Intent:
+        """§11's path: the remedy and the subject come from the grant's own command string.
+
+        Raises `RemedyRefused` on a grant that is not one of ours, and on one whose subject
+        is not the subject it was handed — a grant is a receipt for one act on one order.
+        """
+        parsed = parse_user_intent(approval["command"])
+        if parsed is None:
+            raise RemedyRefused(
+                f"gate request {approval['id']} does not name a remedy and a subject "
+                f"this OS can read")
+        if str(subject.get("id") or "") != parsed["subject_id"]:
+            raise RemedyRefused(
+                f"gate request {approval['id']} authorises a fix on "
+                f"{parsed['subject_id']}, not on {subject.get('id')}")
+        return cls(
+            remedy=parsed["remedy"],
+            subject_id=parsed["subject_id"],
+            # The carrier is the order the request was FILED on, which `propose_fix`
+            # already resolved through `_carrier_for_subject`. Re-deriving it here could
+            # pick a different carrier than the one the record is on.
+            carrier_id=str(approval["wo_id"]),
+            argument=parsed["argument"],
+            reason=str(approval.get("justification") or ""),
+            alarm_id=None,
+            fo_id=(parsed["subject_id"]
+                   if subject_kind_of(subject) == "feature_order" else None),
+        )
+
+
 # -- the handlers. EVERY ACTING CALL IN THIS MODULE IS INSIDE ONE OF THESE ------------
 #
 # `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers` walks this
@@ -161,7 +327,7 @@ def _carrier_id(pstore: Any, alarm: dict[str, Any]) -> str | None:
 
 
 def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any],
-                 alarm: dict[str, Any]) -> str:
+                 intent: Intent) -> str:
     """Ask the session where it is. One message, and nothing else.
 
     NOT `ops.send_message`, and this is not a style choice: that function ends with
@@ -170,14 +336,16 @@ def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any
     `ops.nudge_pr_repair` is the precedent for an OS-authored message and does the two
     right things; the event half of it is written by `apply`, once, for every remedy.
     """
-    wo_id = _carrier_id(pstore, alarm)
+    wo_id = intent.carrier_id
     if wo_id is None:
         raise RemedyRefused(
-            f"{alarm.get('fo_id')} has no session to speak to — nothing was sent")
+            f"{intent.fo_id} has no session to speak to — nothing was sent")
+    # §11: the alarm wording claims the OS flagged this order, so it may only be used when
+    # an alarm actually exists. See `USER_NUDGE`.
+    template = NUDGE if intent.alarm_id is not None else USER_NUDGE
     pstore.queue_message(
         wo_id,
-        NUDGE.format(reason=alarm.get("reason") or "",
-                     argument=(alarm.get("remedy_argument") or "").strip()),
+        template.format(reason=intent.reason, argument=intent.argument),
         source=MESSAGE_SOURCE,
     )
     return (f"queued one message on {wo_id} asking it to say where it is "
@@ -185,7 +353,7 @@ def _apply_nudge(pstore: Any, central: Any, project: str, subject: dict[str, Any
 
 
 def _apply_unblock(pstore: Any, central: Any, project: str, subject: dict[str, Any],
-                   alarm: dict[str, Any]) -> str:
+                   intent: Intent) -> str:
     """Cut the dependency edges that can never clear — the DEFAULT mode, never `--all`.
 
     A dependency still working is doing exactly what the edge was drawn for, and
@@ -223,7 +391,7 @@ def _title_from(argument: str) -> str:
 
 
 def _apply_file_work_order(pstore: Any, central: Any, project: str,
-                           subject: dict[str, Any], alarm: dict[str, Any]) -> str:
+                           subject: dict[str, Any], intent: Intent) -> str:
     """File the fix, then the order that ships it, joined by a dependency edge.
 
     TWO ORDERS IN ONE APPLICATION, AND THAT IS THE REMEDY RATHER THAN TWO REMEDIES: a fix
@@ -242,27 +410,33 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
     """
     from . import ops
 
-    argument = (alarm.get("remedy_argument") or "").strip()
+    argument = intent.argument
+    origin = intent.alarm_id or intent.subject_id
     if not argument:
-        raise RemedyRefused(
-            f"{alarm['id']} proposed `file_work_order` with no argument — there is "
-            f"nothing to brief a work order with")
-    reason = (alarm.get("reason") or "").strip()
+        raise RemedyRefused(NO_ARGUMENT.format(origin=origin))
+    reason = intent.reason.strip()
+    # §11: the alarm brief sends the worker to `jarvis alarms show`, which is a row that
+    # does not exist when the user asked. See `USER_FIX_BRIEF`.
+    if intent.alarm_id is not None:
+        brief = FIX_BRIEF.format(alarm_id=intent.alarm_id, reason=reason,
+                                 argument=argument)
+        ship_title = SHIP_TITLE.format(alarm_id=intent.alarm_id)
+    else:
+        brief = USER_FIX_BRIEF.format(subject_id=intent.subject_id, reason=reason,
+                                      argument=argument)
+        ship_title = USER_SHIP_TITLE.format(subject_id=intent.subject_id)
     try:
-        fix = ops.create_work_order(
-            project, _title_from(argument),
-            description=FIX_BRIEF.format(alarm_id=alarm["id"], reason=reason,
-                                         argument=argument))
+        fix = ops.create_work_order(project, _title_from(argument), description=brief)
     except ops.OpsError as exc:
         raise RemedyRefused(str(exc)) from exc
     try:
         ship = ops.create_work_order(
-            project, SHIP_TITLE.format(alarm_id=alarm["id"]),
+            project, ship_title,
             description=SHIP_BRIEF.format(fix_id=fix["id"], reason=reason),
             depends_on=[fix["id"]])
     except ops.OpsError as exc:
         log.warning("filed %s for %s but could not file its ship order: %s",
-                    fix["id"], alarm["id"], exc)
+                    fix["id"], origin, exc)
         return (f"filed {fix['id']} to fix the root cause; its ship order could NOT be "
                 f"filed ({exc}) — file one by hand with `jarvis wo create {project} "
                 f"\"…\" --depends-on {fix['id']}`")
@@ -343,9 +517,8 @@ def render_catalogue(allowed: tuple[str, ...]) -> str:
 # -- proposing -------------------------------------------------------------------------
 
 
-def _refusal(pstore: Any, alarm: dict[str, Any], remedy_id: str,
-             cfg: Any) -> str | None:
-    """Why this proposal may not be filed, or None. Reads only; writes nothing.
+def _config_refusal(remedy_id: str, kind: str, cfg: Any) -> str | None:
+    """Everything the CATALOG refuses, whoever asked — §11 shares this verbatim.
 
     Ordered cheapest-first, and the allow-list comes BEFORE anything that would reach the
     user: they must never be asked to approve something their own catalog forbids.
@@ -359,10 +532,18 @@ def _refusal(pstore: Any, alarm: dict[str, Any], remedy_id: str,
     if remedy_id not in tuple(getattr(cfg, "allowed", ())):
         return (f"`{remedy_id}` is not in this project's "
                 f"`supervisor.remedies.allowed`")
-    kind = subject_kind(alarm)
     if kind not in remedy.subjects:
         return (f"`{remedy_id}` does not apply to a {kind} "
                 f"(it applies to: {', '.join(remedy.subjects)})")
+    return None
+
+
+def _refusal(pstore: Any, alarm: dict[str, Any], remedy_id: str,
+             cfg: Any) -> str | None:
+    """Why this ALARM's proposal may not be filed, or None. Reads only; writes nothing."""
+    refused = _config_refusal(remedy_id, subject_kind(alarm), cfg)
+    if refused is not None:
+        return refused
     existing = alarm.get("remedy_approval_id")
     if existing:
         approval = pstore.get_approval(int(existing))
@@ -373,7 +554,7 @@ def _refusal(pstore: Any, alarm: dict[str, Any], remedy_id: str,
 
 
 def _request_question(project: str, subject_id: str, remedy: Remedy, argument: str,
-                      evidence: str, reason: str) -> str:
+                      evidence: str, reason: str, *, by_user: bool = False) -> str:
     """What the reviewer reads. The alarm's own evidence packet, then the supervisor's
     reading, then the remedy in words.
 
@@ -382,20 +563,42 @@ def _request_question(project: str, subject_id: str, remedy: Remedy, argument: s
     a request that showed only "this turn looks stuck" would be answered on a different
     question from the one it is asking.
     """
-    return "\n\n".join([
+    # §11 changes WHO ASKED and nothing else about the request. A reviewer told the
+    # supervisor judged an order unhealthy, when in fact the user asked off a diagnosis,
+    # would be ruling on a symptom nobody reported.
+    if by_user:
+        lead = (f"The user asked the OS to apply the `{remedy.id}` remedy to "
+                f"{subject_id} in {project}, off that order's own diagnosis. Nothing has "
+                f"been done; this authorises it.")
+        actor, wants = "What the OS would say or do", "# Why it was asked for"
+        tail = ("Approve it to let the OS act, or deny it with a reason. Denying does "
+                "nothing at all and tells the user it was refused, which is the safe "
+                "answer whenever the case for acting is not made.")
+    else:
+        lead = (f"The supervisor judged {subject_id} in {project} unhealthy and wants to "
+                f"apply the `{remedy.id}` remedy. Nothing has been done; this "
+                f"authorises it.")
+        actor, wants = "What the supervisor would say or do", "# Why the supervisor wants it"
+        tail = ("Approve it to let the OS act, or deny it with a reason. Denying leaves "
+                "the alarm open and with the user, which is the safe answer whenever the "
+                "case for acting is not made.")
+    parts = [
         f"SELF-HEAL REQUEST — gate `{GATE_KIND}`",
-        f"The supervisor judged {subject_id} in {project} unhealthy and wants to apply "
-        f"the `{remedy.id}` remedy. Nothing has been done; this authorises it.",
+        lead,
         f"# The remedy\n"
         f"What it does: {remedy.headline}\n"
         f"What it touches, and what it cannot undo: {remedy.blast}\n"
-        f"What the supervisor would say or do: {argument.strip() or '(nothing given)'}",
-        f"# Why the supervisor wants it\n{reason.strip() or '(no reason given)'}",
-        evidence.strip() or "(the evidence packet was empty)",
-        "Approve it to let the OS act, or deny it with a reason. Denying leaves the "
-        "alarm open and with the user, which is the safe answer whenever the case for "
-        "acting is not made.",
-    ])
+        f"{actor}: {argument.strip() or '(nothing given)'}",
+        f"{wants}\n{reason.strip() or '(no reason given)'}",
+    ]
+    # An empty evidence packet is a FACT about an alarm's proposal and worth saying; on
+    # the user's path there is no packet to be empty, so saying it would invent a gap.
+    if evidence.strip():
+        parts.append(evidence.strip())
+    elif not by_user:
+        parts.append("(the evidence packet was empty)")
+    parts.append(tail)
+    return "\n\n".join(parts)
 
 
 def propose(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
@@ -475,6 +678,110 @@ def propose(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
             "question": question}
 
 
+def propose_fix(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
+                remedy_id: str, argument: str, cfg: Any,
+                *, reason: str = "") -> dict[str, Any]:
+    """`propose` for a subject with NO ALARM — §11 of
+    docs/specs/2026-09-24-order-observability.md, on Neo's q795 ruling.
+
+    Same return shape, same registry, same allow-list, same `self_heal` grant, same
+    reviewer, same `GRANT_USES`. THE ONLY NEW THING IS WHO ASKED: the user reached one of
+    the three shipped remedies from §6's diagnosis, which today is reachable only from a
+    supervisor alarm. No remedy is added, no allow-list widened and no gate skipped.
+
+    IT WRITES NO ALARM ROW and calls `update_alarm` for nothing. An alarm is the
+    supervisor's record of a judgement it made; synthesising one here would put a finding
+    nobody found on `/alarms` and hand the user an attention item for their own request.
+
+    A REFUSAL WRITES NOTHING AT ALL, which is where it differs from `propose`: that one
+    escalates the alarm it was refused on, and there is no row here to escalate. The
+    caller has the reason in hand and shows it to the user directly.
+    """
+    refused = _config_refusal(remedy_id, subject_kind_of(subject), cfg)
+    subject_id = str(subject.get("id") or "")
+    carrier = None if refused else _carrier_for_subject(pstore, subject)
+    command = user_intent(subject_id, remedy_id, argument)
+    if refused is None and carrier is None:
+        refused = (f"{subject_id} has no work order to carry the request — nothing has "
+                   f"been planned for it yet")
+    if refused is None:
+        # A DUPLICATE IS REFUSED BY NUMBER, `_refusal`'s alarm-side check in the only form
+        # available here: two live grants for one command are two authorisations for one
+        # act, and the user's next step is to answer the request they already have.
+        for pending in pstore.pending_approvals(carrier):
+            if pending["kind"] == GATE_KIND and pending["command"] == command:
+                refused = (f"this fix is already awaiting a verdict "
+                           f"(gate request {pending['id']})")
+                break
+    if refused is not None:
+        log.info("user fix %s refused on %s: %s", remedy_id, subject_id, refused)
+        return {"proposed": False, "reason": refused, "approval": None, "question": None}
+
+    remedy = REMEDIES[remedy_id]
+    approval = pstore.add_approval(
+        carrier, GATE_KIND, command,
+        matched="",  # no recogniser fired — `propose`'s reason, unchanged
+        justification=reason, evidence="", max_uses=GRANT_USES,
+    )
+    question = neo.ask(
+        project, carrier,
+        _request_question(project, subject_id, remedy, argument, "", reason,
+                          by_user=True),
+        context=f"{subject.get('title') or ''}\n{reason}",
+        kind="approval",   # the existing kind, for `propose`'s reasons
+    )
+    pstore.link_neo_question(approval["id"], question["id"])
+    pstore.add_event(carrier, "remedy_proposed", {
+        # NO `alarm_id` KEY, and `timeline._describe` forks on its absence: an entry that
+        # said "the supervisor asked permission" would credit a judgement nobody made.
+        "remedy": remedy_id, "approval_id": approval["id"],
+        "neo_question_id": question["id"], "subject_id": subject_id,
+        "argument": (argument or "").strip(), "reason": reason,
+        "at_user_request": True})
+    log.info("user fix %s proposed for %s as gate request %s", remedy_id, subject_id,
+             approval["id"])
+    return {"proposed": True, "reason": reason, "approval": approval,
+            "question": question}
+
+
+def user_grants(pstore: Any) -> list[dict[str, Any]]:
+    """The approved, unexpired, unspent §11 grants no alarm claims. Reads only.
+
+    `Daemon.remedy_tick` scans alarms at `proposed`, so an alarm-less grant would sit
+    approved for ever without this. The live-grant test is `usable_grant`'s, not a fresh
+    reading of the columns — `apply` refuses on exactly that predicate, and a tick that
+    used a different one would queue work the applier then declines.
+    """
+    out: list[dict[str, Any]] = []
+    # SCOPED TO THE KIND IN SQL. `list_approvals` is bounded to the 200 newest rows of
+    # every kind, so ordinary gate traffic could bury a grant between its approval and its
+    # application — an approved act that then silently never happens.
+    for approval in pstore.approvals_of_kind(GATE_KIND, "approved"):
+        if parse_user_intent(approval["command"]) is None:
+            continue
+        if pstore.alarm_for_remedy_approval(approval["id"]) is not None:
+            continue
+        grant = pstore.usable_grant(approval["wo_id"], approval["kind"],
+                                    approval["command"])
+        if grant is None or grant["id"] != approval["id"]:
+            continue
+        out.append(approval)
+    return out
+
+
+def subject_of_grant(pstore: Any, approval: dict[str, Any]) -> dict[str, Any] | None:
+    """The work order or feature order one §11 grant is about, or None if it is gone."""
+    parsed = parse_user_intent(approval["command"])
+    if parsed is None:
+        return None
+    sid = parsed["subject_id"]
+    try:
+        return (pstore.get_work_order(sid) if sid.startswith("wo-")
+                else pstore.get_feature_order(sid))
+    except KeyError:
+        return None
+
+
 # -- the verdict, and applying ---------------------------------------------------------
 
 
@@ -496,13 +803,21 @@ def record_verdict(pstore: Any, approval: dict[str, Any], verdict: str, reason: 
     from .central_store import CentralStore
 
     alarm = pstore.alarm_for_remedy_approval(approval["id"])
-    if alarm is None:
+    intent = parse_user_intent(approval["command"])
+    if alarm is None and intent is None:
         log.warning("self_heal approval %s judges no alarm (work order deleted?)",
                     approval["id"])
         return
     own = central is None
     central = central or CentralStore()
     try:
+        if alarm is None:
+            # §11: an alarm-less grant is the USER's own request, so the verdict is
+            # reported in their terms and there is no alarm to re-raise.
+            assert intent is not None
+            _user_verdict(pstore, central, project, approval, intent, verdict, reason,
+                          decided_by)
+            return
         if verdict == "approved":
             central.add_inbox(
                 project=project, level="info",
@@ -530,6 +845,40 @@ def record_verdict(pstore: Any, approval: dict[str, Any], verdict: str, reason: 
             central.close()
 
 
+def _user_verdict(pstore: Any, central: Any, project: str, approval: dict[str, Any],
+                  intent: dict[str, str], verdict: str, reason: str,
+                  decided_by: str) -> None:
+    """The verdict on a §11 fix: an inbox row either way, and NEVER a queued message.
+
+    NO ATTENTION FLAG on a refusal, which is where this differs from `_flag_and_tell`:
+    that one puts an unresolved ALARM back in front of the user, and here there is no
+    finding left outstanding — the user asked, the reviewer said no, nothing was done, and
+    they are told so. Flagging would be the OS inventing a blocker out of its own refusal.
+    """
+    remedy = intent["remedy"]
+    subject_id = intent["subject_id"]
+    if verdict == "approved":
+        central.add_inbox(
+            project=project, level="info",
+            title=USER_APPROVED_INBOX_TITLE.format(by=decided_by, remedy=remedy,
+                                                   subject_id=subject_id),
+            body=f"{reason}\n"
+                 f"The OS will apply it on the next tick and say what it did.\n"
+                 f"Read it with: jarvis wo show {subject_id}",
+            wo_id=approval["wo_id"])
+        return
+    central.add_inbox(
+        project=project, level="warning",
+        title=USER_REFUSED_INBOX_TITLE.format(remedy=remedy, subject_id=subject_id),
+        body=f"{decided_by} {verdict} it: {reason}\n"
+             f"Nothing was done to {subject_id}. Ask again if you still want it.",
+        wo_id=approval["wo_id"])
+    pstore.add_event(approval["wo_id"], "remedy_refused", {
+        "remedy": remedy, "approval_id": approval["id"], "verdict": verdict,
+        "by": decided_by, "reason": reason, "subject_id": subject_id,
+        "at_user_request": True})
+
+
 def _flag_and_tell(pstore: Any, central: Any, project: str, wo_id: str,
                    alarm: dict[str, Any], why: str) -> None:
     """Put the unresolved alarm back in front of the user.
@@ -550,7 +899,7 @@ def _flag_and_tell(pstore: Any, central: Any, project: str, wo_id: str,
 
 
 def apply(pstore: Any, central: Any, project: str, approval: dict[str, Any] | None,
-          alarm: dict[str, Any], subject: dict[str, Any]) -> str:
+          alarm: dict[str, Any] | None, subject: dict[str, Any]) -> str:
     """Run one approved remedy, once, and record what it did. Returns the result string.
 
     REFUSES unless the approval is `approved` AND `usable_grant` still yields it — every
@@ -570,12 +919,28 @@ def apply(pstore: Any, central: Any, project: str, approval: dict[str, Any] | No
     """
     from . import db, gates, ops
 
-    remedy = REMEDIES.get(str(alarm.get("remedy") or ""))
-    if remedy is None:
-        raise RemedyRefused(
-            f"alarm {alarm['id']} names no remedy this OS has ({alarm.get('remedy')!r})")
-    if approval is None:
-        raise RemedyRefused(f"alarm {alarm['id']} has no gate request")
+    # `alarm=None` is §11: the remedy and the subject come from the GRANT, because there is
+    # no alarm row holding them (Neo q795). Every refusal below is the same one, in the
+    # same order.
+    if alarm is not None:
+        remedy = REMEDIES.get(str(alarm.get("remedy") or ""))
+        if remedy is None:
+            raise RemedyRefused(
+                f"alarm {alarm['id']} names no remedy this OS has "
+                f"({alarm.get('remedy')!r})")
+        if approval is None:
+            raise RemedyRefused(f"alarm {alarm['id']} has no gate request")
+        intent = Intent.from_alarm(pstore, alarm)
+    else:
+        if approval is None:
+            raise RemedyRefused(
+                f"a fix on {subject.get('id')} has no gate request — nothing was done")
+        intent = Intent.from_grant(pstore, approval, subject)
+        remedy = REMEDIES.get(intent.remedy)
+        if remedy is None:
+            raise RemedyRefused(
+                f"gate request {approval['id']} names no remedy this OS has "
+                f"({intent.remedy!r})")
     if approval["kind"] != GATE_KIND:
         raise RemedyRefused(
             f"gate request {approval['id']} is a {approval['kind']}, not a {GATE_KIND}")
@@ -590,18 +955,32 @@ def apply(pstore: Any, central: Any, project: str, approval: dict[str, Any] | No
             f"or its uses are spent")
 
     spent = gates.open_gate(pstore, grant)
-    result = remedy.apply(pstore, central, project, subject, alarm)
+    result = remedy.apply(pstore, central, project, subject, intent)
     wo_id = approval["wo_id"]
-    pstore.update_alarm(alarm["id"], status="acked", decided_at=db.now())
+    if alarm is not None:
+        pstore.update_alarm(alarm["id"], status="acked", decided_at=db.now())
     pstore.add_event(wo_id, "remedy_applied", {
-        "alarm_id": alarm["id"], "remedy": remedy.id, "approval_id": approval["id"],
+        # `alarm_id` only when one exists: `timeline._describe` forks on its absence, and
+        # a payload naming an alarm that was never raised is a false record (§11).
+        **({"alarm_id": alarm["id"]} if alarm is not None
+           else {"at_user_request": True}),
+        "remedy": remedy.id, "approval_id": approval["id"],
         "use": spent["uses"], "result": result})
-    central.add_inbox(
-        project=project, level="info",
-        title=APPLIED_INBOX_TITLE.format(subject_id=subject.get("id") or wo_id),
-        body=f"{alarm['reason']}\nThe `{remedy.id}` remedy was applied: {result}\n"
-             f"Read it with: jarvis alarms show {alarm['id']}",
-        wo_id=wo_id)
+    if alarm is not None:
+        central.add_inbox(
+            project=project, level="info",
+            title=APPLIED_INBOX_TITLE.format(subject_id=subject.get("id") or wo_id),
+            body=f"{alarm['reason']}\nThe `{remedy.id}` remedy was applied: {result}\n"
+                 f"Read it with: jarvis alarms show {alarm['id']}",
+            wo_id=wo_id)
+    else:
+        central.add_inbox(
+            project=project, level="info",
+            title=USER_APPLIED_INBOX_TITLE.format(remedy=remedy.id,
+                                                  subject_id=intent.subject_id),
+            body=f"The `{remedy.id}` remedy was applied: {result}\n"
+                 f"Read it with: jarvis wo show {intent.subject_id}",
+            wo_id=wo_id)
 
     # `supervisor._apply`'s ack path exactly: `ops.ack_os_flag` takes down the flag the
     # alarm raised and re-raises whatever else is blocking. Never `ack_attention` (that
@@ -610,6 +989,7 @@ def apply(pstore: Any, central: Any, project: str, approval: dict[str, Any] | No
     try:
         ops.ack_os_flag(wo_id)
     except ops.OpsError as exc:
-        log.info("remedy applied on %s; attention left up: %s", alarm["id"], exc)
-    log.info("remedy %s applied for %s: %s", remedy.id, alarm["id"], result)
+        log.info("remedy applied on %s; attention left up: %s", wo_id, exc)
+    log.info("remedy %s applied for %s: %s", remedy.id,
+             intent.alarm_id or intent.subject_id, result)
     return result
