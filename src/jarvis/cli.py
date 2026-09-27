@@ -234,6 +234,51 @@ def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
+    """One line per status this order was in — the block `jarvis wo show` and `fo show`
+    both print (spec §6 of docs/superpowers/specs/2026-09-27-time-in-each-state.md).
+
+    THE RENDERER FORMATS NOTHING: every duration, every count and every share is read
+    off `ops.state_durations(...).as_dict()`, which is the same document `--json` prints
+    and the dashboard renders. A second derivation of one number is what `jarvis wo why`
+    exists to avoid.
+    """
+    from . import ops
+
+    lines: list[str] = []
+    # Said ONCE, before the rows, and in `ops`' words: a coarse span nothing labels is
+    # read as a measurement (spec §3, Neo's ruling).
+    if payload.get("approximate"):
+        lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    for total in payload.get("totals") or []:
+        entries = total["entries"]
+        word = "entry" if entries == 1 else "entries"
+        line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
+                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{total['share'] * 100:>3.0f}%")
+        if total["status"] and total["status"] == payload.get("current_status"):
+            idle = payload.get("last_activity_age_human")
+            since = (f"nothing since {idle} ago" if idle
+                     else "nothing on the record at all")
+            line += f"   ← now, {payload['current_status_age_human']}, {since}"
+        lines.append(line)
+    return lines
+
+
+def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
+    """The status-span payload collapsed to `time_in_state_lines`, for HUMAN output.
+
+    `_readable_rounds`' trick: `--json` keeps the whole document because the dashboard
+    and other tooling read it, while a person gets one line per status.
+    """
+    row = dict(detail)
+    payload = row.pop("time_in_state", None) or {}
+    lines = time_in_state_lines(payload)
+    if lines:
+        row["time in state"] = lines
+    return row
+
+
 def _readable_config(detail: dict[str, Any]) -> dict[str, Any]:
     """`config_version: cfg-a1b2…` replaced by `config: cfg-a1b2… (3 versions since)`.
 
@@ -2657,6 +2702,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
                 "alarms": store.alarms_of(args.wo_id),
+                # HOW LONG IT HAS BEEN WHERE IT IS, and how long it spent in each status
+                # before that. Always present, on this dict's stated rule — spec §6.
+                "time_in_state": ops.state_durations(store,
+                                                     wo_id=args.wo_id).as_dict(),
                 # THE CEILING AND WHAT HAS GONE AGAINST IT. Always present, even as
                 # nulls: this is the record a user checks a number they typed against,
                 # and a key that comes and goes is one every consumer has to guard.
@@ -2668,8 +2717,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_rounds(_readable_issues(
-                _readable_conversation(detail)))))))
+            _readable_alarms(_readable_time_in_state(_readable_rounds(_readable_issues(
+                _readable_conversation(detail))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2893,6 +2942,12 @@ def cmd_fo(args: argparse.Namespace) -> int:
             # Silent when there is none, which is every feature until a sweep is armed.
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+            # The same block as `jarvis wo show`, from the same formatter — spec §6.
+            states = time_in_state_lines(detail["time_in_state"])
+            if states:
+                print("\ntime in state:")
+                for line in states:
+                    print(f"  {line}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:

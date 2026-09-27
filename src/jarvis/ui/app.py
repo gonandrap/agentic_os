@@ -790,6 +790,10 @@ def create_app() -> FastAPI:
         # The residual's own sentence, shared with `jarvis wo why` for the same reason:
         # a residual described in two wordings is one the reader learns to ignore.
         unexplained_note=ops.UNEXPLAINED_NOTE,
+        # The status-span view's two sentences, from `ops` and not spelled here — the
+        # CLI prints the identical words (spec §6, §7).
+        approximate_note=ops.FO_APPROXIMATE_NOTE,
+        no_trigger_phrase=ops.NO_TRIGGER_PHRASE,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -1003,9 +1007,13 @@ def create_app() -> FastAPI:
         store = ProjectStore(ops.registered_project_paths()[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
+            # Taken in the same block, for the same reason: one connection per page
+            # (spec §7).
+            states = ops.state_durations(store, fo_id=fo_id).as_dict()
         finally:
             store.close()
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
+                      states=states,
                       cap=ops.feature_order_budget(fo_id, detail["project"]),
                       # Already on `detail` for `jarvis fo show`; passed separately so
                       # the template reads the same name on both pages.
@@ -1130,6 +1138,9 @@ def create_app() -> FastAPI:
             # to the template: pasting it here would re-create the duplication the whole
             # change removed — the pointer is the point.
             spec = specs.spec_of(store, wo)
+            # How long it has been where it is — the same document `jarvis wo show`
+            # carries, rendered by `_states.html` (spec §7).
+            states = ops.state_durations(store, wo_id=wo_id).as_dict()
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
@@ -1158,7 +1169,7 @@ def create_app() -> FastAPI:
                       # neither derivable from the other. See `timeline`'s docstring.
                       conversation=build_conversation(events, messages),
                       assumptions=assumptions, unreviewed=unreviewed,
-                      approvals=approvals, bill=bill,
+                      approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
