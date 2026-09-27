@@ -64,6 +64,13 @@
     <p class="kv">⑃ pull request:
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
+    {# Whether it landed, derived by `ops.merge_state` from the timeline and never from
+       `pr_state` — the same helper `jarvis wo show` renders. Absent while nothing has
+       looked yet: "nothing has looked" is not "did not merge". #}
+    {% if merge_state and merge_state.state %}
+      <p class="sub">⑃ state: {{ merge_state.state }}
+        {%- if merge_state.head_oid %} at {{ merge_state.head_oid[:10] }}{% endif %}</p>
+    {% endif %}
     {# What the OS did, or declined to do, about merging it. Absent entirely unless the
        mechanism has touched this order — which is every order on a project that has not
        opted in — and NEVER a warning tone: a held auto-merge means the user merges this
@@ -250,9 +257,15 @@
       {# WHAT THE OS DID with it, as TEXT — a tooltip is a thing nobody reads, and a
          pending assumption Neo has already escalated read as one nobody had looked at
          (GitHub issue #712). Same shape as the pending gate above. #}
+      {# WHERE TO READ THE PANEL'S FULL REASON, on the surface that can carry a link: the
+         hold quotes 120 characters of it, the round below has all of it. A legacy payload
+         carries no round and gets no link, because there is nothing to point at. #}
       {% if ruling %}<div class="sub">{{ ruling }}{% if a.os_ruling
             and a.os_ruling.neo_question_id %}
         · <a href="/neo/question/{{ a.os_ruling.neo_question_id }}">question →</a>
+        {%- endif %}{% if a.os_ruling and a.os_ruling.code == 'panel_gave_up'
+            and a.os_ruling.round %}
+        · <a href="#round-{{ a.os_ruling.round }}">round {{ a.os_ruling.round }} →</a>
         {%- endif %}</div>{% endif %}
       {# NEO'S EARLY READING, THE OBJECTION AND WHAT THE WORKER DID, in the order §8 of
          docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-

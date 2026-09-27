@@ -37,6 +37,7 @@ DEBUG_KINDS = frozenset({
     "turn_ended",               # that turn's process finished and its reply was captured
     "session_released",         # a legacy background agent handed its session over
     "hook_ignored",             # a hook from a session that is not this work order's
+    "tool_managed_paths",       # which tool-owned files the worktree's index now hides
     "permission_mode_changed",  # worker permission plumbing
     "notification_ignored",     # idle prompt on an already-settled work order
     # Same moment as the message carrying the answer, so the message is the entry — §5.
@@ -49,6 +50,12 @@ DEBUG_KINDS = frozenset({
     # ledger of looking out of the surfaces for exactly this reason; the same argument
     # applies to the default timeline.
     "health_reviewed",
+    # The retry sweep DEFERRING a relaunch, restated every five minutes for as long as
+    # the cap holds. `invariants.pause_note` is the user-facing half of one hold — one
+    # sentence — and twelve rows an hour of "still queued" would bury the work in
+    # `jarvis wo show`. Same argument as `health_reviewed` above; spec §1 of
+    # docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+    "retry_held",
 })
 
 #: `background.EVENT`, spelled out here for the reason `SUPERVISOR_SOURCE` is: this
@@ -613,6 +620,15 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
             return ("Validation held — the Claude usage window is spent",
                     (f"resuming by itself at {when}" if when else "")
                     + (f" · {p.get('error')}" if p.get("error") else ""))
+        if p.get("cause") == "auth":  # project_store.VALIDATION_AUTH_CAUSE
+            # A FIFTH cause, and the one whose old reading cost four work orders a round
+            # and a user each (GitHub issue #778): the seats were reached and refused for
+            # want of a sign-in, which is neither a verdict nor a reviewer being down. NO
+            # `_clock(reopens_at)`, unlike the usage window above — that moment is a
+            # recheck interval, not a deadline anything stated (spec §7).
+            attempt = p.get("attempt")
+            return ("Validation held — Claude Code could not authenticate",
+                    f"attempt {attempt}: {p.get('error') or ''}")
         attempt = p.get("attempt")
         return ("Validation could not be run — the reviewer was unreachable",
                 f"attempt {attempt}: {p.get('error') or ''}" if attempt

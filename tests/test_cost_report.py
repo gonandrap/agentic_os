@@ -495,3 +495,148 @@ def test_the_rollup_reports_the_write_split_across_both_halves(store, transcript
     assert totals["cache_1h"] == 100_000
     assert usage.write_rate(totals["cache_write"], totals["cache_1h"],
                             totals["cache_5m"]) == pytest.approx(2.0)
+
+
+# -- improvement orders ----------------------------------------------------------------
+#
+# §6.3 of docs/superpowers/specs/2026-09-23-improvement-orders.md: the cost surface took
+# no code to reach a new kind, so it takes tests to prove it did — a kind whose bill
+# silently reads zero is the one failure nothing else here would catch.
+
+
+def analyst_of(store, io: dict, *, session: str = "sess-analyst") -> dict:
+    """The improvement order's analyst: its planner-shaped child — §3.1."""
+    analyst = store.create_work_order(f"Analyse: {io['title']}"[:200], "the observation",
+                                      kind="analyst", parent_id=io["id"])
+    store.update_feature_order(io["id"], plan_wo_id=analyst["id"])
+    store.set_feature_status(io["id"], "planning")
+    give_session(store, analyst["id"], session)
+    return analyst
+
+
+def seal_pass(tmp_path, store) -> None:
+    """The daemon's seal tick, against the catalog `registered` wrote.
+
+    A real `ProjectSpec`: `seal_bills` swallows a failed seal and writes an error
+    payload in its place, so a hand-rolled stand-in would make an unsealed bill look
+    sealed.
+    """
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    spec = load_catalog(tmp_path / "catalog.json").projects[0]
+    Daemon.__new__(Daemon).seal_bills(spec, store)
+
+
+def test_an_improvement_orders_bill_is_its_analyst_plus_its_own_calls(
+        store, transcripts, improvement_order):
+    """The family is the order plus its analyst — §2.6, and both halves have to land.
+
+    The analyst's session is the WORKER half and must be non-zero: an improvement order
+    whose bill reads zero would say the fleet analysed itself for free.
+    """
+    io = improvement_order
+    analyst = analyst_of(store, io)
+    transcripts("sess-analyst", [assistant_row("m1", write=1_000_000, out=5_000)])
+    _os_call(io["id"])                      # what Jarvis spent on the order itself
+
+    b = ops.bill(io["id"])
+
+    assert b["kind"] == "feature_order" and b["scope"] == io["id"]
+    assert [o["id"] for o in b["orders"]] == [analyst["id"]]
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    assert worker["tokens"]["total"] == 1_005_000
+    # ...and the order's own calls beside it, never folded into the analyst's session.
+    jarvis_half = next(line for line in b["actors"] if line["key"] == "jarvis")
+    assert jarvis_half["tokens"]["total"] == 100_010
+    assert b["total"]["tokens"]["total"] == 1_105_010
+    assert b["checks"]["balanced"], b["checks"]["problems"]
+
+
+def test_a_completed_improvement_orders_bill_is_sealed_and_read_back(
+        store, transcripts, improvement_order, tmp_path, monkeypatch):
+    """Settling it freezes the figure — §6.3. The evidence expires and the order does
+    not: an improvement order costed live for ever gets cheaper the longer it is left.
+    """
+    from jarvis.testing import a_report
+
+    io = improvement_order
+    analyst = analyst_of(store, io, session="sess-sealed")
+    transcripts("sess-sealed", [assistant_row("m1", write=800_000, out=4_000)])
+    # Settled first: §4.1's `finish` step is the analyst's, not this test's.
+    store.set_status(analyst["id"], "completed")
+    ops.submit_findings(io["id"], a_report())
+    ops.review_findings(io["id"], reject={
+        "first-turn-reads": "the brief already names it; the workers ignore it",
+        "stale-code-map": "the map is about to be deleted",
+    })
+    assert store.get_feature_order(io["id"])["status"] == "completed"
+
+    seal_pass(tmp_path, store)
+
+    row = store.get_feature_order(io["id"])
+    assert row["bill_json"] and row["bill_sealed_at"]
+    sealed = json.loads(row["bill_json"])
+    assert "error" not in sealed                       # not the "could not cost it" stub
+    assert sealed["total"]["tokens"]["total"] == 804_000
+
+    # The evidence goes, exactly as Claude Code's pruning takes it...
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path / "gone"))
+    assert ops.bill(io["id"])["total"]["tokens"]["total"] == 804_000
+    assert ops.bill(io["id"])["accuracy"]["sealed_at"]
+    # ...and the proof the seal is doing the work: recomputing now finds nothing.
+    assert ops.bill(io["id"], live=True)["total"]["tokens"]["total"] == 0
+
+
+def test_the_cli_reads_an_io_id_as_an_id_and_not_as_a_project_name(
+        store, transcripts, improvement_order, capsys):
+    """`jarvis cost io-…` resolves through `is_feature_order_id` — §2.5. Without it the
+    id falls through to the fleet report and comes back "project not registered"."""
+    from jarvis import cli
+
+    io = improvement_order
+    analyst = analyst_of(store, io, session="sess-cli")
+    add_turn(store, analyst["id"], recorded_usage(0.05))
+
+    assert cli.main(["cost", io["id"]]) == 0
+
+    out = capsys.readouterr().out
+    assert "not registered" not in out
+    assert io["id"] in out and analyst["id"] in out
+    assert "by who spent it" in out                     # the bill, not the fleet report
+
+
+def test_the_cli_names_the_parents_own_calls_beside_the_orders_under_it(
+        store, transcripts, improvement_order, capsys):
+    """"the orders under it" must add up to the headline, and the parent's own calls
+    belong to no child — unlabelled, the list visibly sums to less than the total."""
+    from jarvis import bill as bill_mod
+    from jarvis import cli
+
+    io = improvement_order
+    analyst = analyst_of(store, io, session="sess-own")
+    add_turn(store, analyst["id"], recorded_usage(0.05))
+    _os_call(io["id"])
+
+    assert cli.main(["cost", io["id"]]) == 0
+
+    out = capsys.readouterr().out
+    assert "the orders under it" in out
+    assert bill_mod.OWN_LABEL in out
+
+
+def test_the_cli_prints_no_own_line_when_the_parent_spent_nothing_of_its_own(
+        store, transcripts, improvement_order, capsys):
+    """A feature that spent nothing of its own must not grow an empty line."""
+    from jarvis import bill as bill_mod
+    from jarvis import cli
+
+    io = improvement_order
+    analyst = analyst_of(store, io, session="sess-no-own")
+    add_turn(store, analyst["id"], recorded_usage(0.05))
+
+    assert cli.main(["cost", io["id"]]) == 0
+
+    out = capsys.readouterr().out
+    assert "the orders under it" in out
+    assert bill_mod.OWN_LABEL not in out

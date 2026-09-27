@@ -19,7 +19,10 @@
 <{{ heading }} id="validation">Validation</{{ heading }}>
 <div class="panel">
   {% for r in validation.rounds %}
-  <div class="row">
+  {# ONE ANCHOR PER ROUND, so a hold that names round 3 can link to round 3 rather than to
+     this section's heading. `work_order.html`'s assumption block emits the matching
+     `href="#round-N"`. #}
+  <div class="row" id="round-{{ r.round }}">
     <div class="grow">
       <strong>Round {{ r.round }}</strong>
       <span class="mono sub">{{ r.fingerprint }}</span>

@@ -164,6 +164,19 @@ def test_validation_config_round_trips_through_the_resolved_map():
     assert cv.validation_config_from_resolved(stored) == cat.os.validation
 
 
+def test_the_stakes_classifier_round_trips_as_the_string_it_is():
+    """`_coerce` hands a `str` field back unchanged, so no new branch was needed — and
+    this is what asserts that, because a mode that came back as something else would
+    judge a historical round under a net it never ran."""
+    cat = catalog.parse_catalog({"os": {"validation": {
+        "stakes_classifier": "shadow"}}})
+    stored = json.loads(json.dumps(cv.resolve(cat)))
+
+    assert stored["os.validation.stakes_classifier"] == "shadow"
+    assert cv.validation_config_from_resolved(stored).stakes_classifier == "shadow"
+    assert cv.validation_config_from_resolved(stored) == cat.os.validation
+
+
 def test_a_project_prefix_is_a_lookup_with_a_whole_block_fallback():
     """A LOOKUP, NOT A MERGE. `projects[].validation` does not exist in the catalog yet —
     the per-project work order adds it — so this builds the map by hand to pin the rule

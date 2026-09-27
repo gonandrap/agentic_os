@@ -127,12 +127,19 @@ VALIDATION_HELD_CAUSE = "usage_limit"
 # point — see `validation_hold_until`.
 VALIDATION_CI_CAUSE = "ci_pending"
 
+#: ...and this one is a round whose seats could not AUTHENTICATE. Its own cause for the
+#: same reason as the two above: no deadline exists, what clears it is a human, and
+#: `reopens_at` on it is a RECHECK INTERVAL that no surface may print as a promise (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7).
+VALIDATION_AUTH_CAUSE = "auth"
+
 #: Every cause that means "this round is not failed, it is WAITING". A round closed with
 #: one of these is `RUNNABLE` and uncounted, so the submitter spends no round number on
 #: it and the next tick owns the same round again. ONE set, because `validation_hold_until`
 #: is the only reader and a cause missing from here is a round that holds once and then
 #: spins every tick for ever.
-VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE})
+VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE,
+                                       VALIDATION_AUTH_CAUSE})
 
 #: HOW A ROUND READS TO A PERSON: one word, one tone, one icon, for every
 #: (outcome, hold_cause) pair. THE POINT IS THAT THERE IS ONE OF THESE — three surfaces
@@ -158,6 +165,7 @@ VALIDATION_STANDINGS: dict[tuple[str, str | None], tuple[str, str, str]] = {
     ("failed", None): ("failed", "bad", "✗"),
     ("failed", VALIDATION_CI_CAUSE): ("waiting for CI", "active", "◑"),
     ("failed", VALIDATION_HELD_CAUSE): ("held for the usage window", "active", "◑"),
+    ("failed", VALIDATION_AUTH_CAUSE): ("held for authentication", "active", "◑"),
 }
 
 
@@ -193,15 +201,15 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     shut again writes a second event for the same round number, and taking the earlier
     moment would send the round straight back into a closed window every tick.
 
-    TWO CAUSES HOLD, and a caller wanting the moment alone is told apart from neither
-    (`validation_hold` below is for the ones that must be): a spent usage window
-    (`VALIDATION_HELD_CAUSE`) and GitHub still running the checks
-    (`VALIDATION_CI_CAUSE`). They are different facts about why nobody is judging yet and
-    identical in what the tick must do about it, so the vocabulary is
-    `VALIDATION_HOLDING_CAUSES` and the behaviour is this one function. A round holding
-    for both — a window that shut while CI was still running — takes the later moment,
-    which is the same "newest wins" rule and the right one: going again before either has
-    lifted is a refusal either way.
+    THREE CAUSES HOLD, and a caller wanting the moment alone is told apart from none of
+    them (`validation_hold` below is for the ones that must be): a spent usage window
+    (`VALIDATION_HELD_CAUSE`), GitHub still running the checks (`VALIDATION_CI_CAUSE`),
+    and Claude Code unable to authenticate (`VALIDATION_AUTH_CAUSE`). They are different
+    facts about why nobody is judging yet and identical in what the tick must do about
+    it, so the vocabulary is `VALIDATION_HOLDING_CAUSES` and the behaviour is this one
+    function. A round holding for more than one — a window that shut while CI was still
+    running — takes the later moment, which is the same "newest wins" rule and the right
+    one: going again before every one of them has lifted is a refusal either way.
 
     Takes ROWS rather than a store because the same rule has to answer for a feature
     order, whose events live on its manager's timeline and come back through
@@ -213,9 +221,11 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
 def validation_hold(events: Iterable[Any], round_no: int) -> tuple[float, str]:
     """The moment above AND THE CAUSE that won it — (0.0, "") when nothing holds.
 
-    The scheduler needs only the moment; a RENDERER needs the cause, because the two
-    holds read to a person as opposite things (GitHub issue #714): a spent usage window
-    names when it reopens, and CI is simply not done yet. Same "newest wins" rule, so
+    The scheduler needs only the moment; a RENDERER needs the cause, because the three
+    holds read to a person as different things (GitHub issue #714): a spent usage window
+    names when it reopens, CI is simply not done yet, and an auth hold
+    (`VALIDATION_AUTH_CAUSE`) has no deadline at all — its `reopens_at` is a recheck
+    interval and a renderer must never print it as a promise. Same "newest wins" rule, so
     the sentence a surface prints is always the hold the tick is actually honouring.
     """
     held, cause = 0.0, ""
@@ -911,6 +921,15 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     -- NULL means "not recorded" — a turn reaped before this column existed (readers
     -- lazily backfill it from the outfile while that survives) — never zero spend.
     usage_json TEXT,
+    -- WHAT JARVIS PUT IN THIS TURN'S CONTEXT WINDOW, per ingredient: the appended system
+    -- prompt, the prompt, the knowledge index, the settings file, the memory files, the
+    -- persona, the --add-dir trees and the MCP server set, each with bytes and an
+    -- ESTIMATED token count (`context.payload`; spec docs/specs/
+    -- 2026-09-24-order-observability.md §5). One blob per turn, same lifetime and same
+    -- owner as the row, which is why it is a column and not a table.
+    -- NULL means "not recorded" — a turn that ran before this landed, or one whose
+    -- measurement failed — and NEVER "nothing was in the window".
+    context_json TEXT,
     outfile TEXT NOT NULL DEFAULT '',
     errfile TEXT NOT NULL DEFAULT ''
 );
@@ -1177,6 +1196,12 @@ ADDED_COLUMNS = {
         # See the CREATE TABLE comment. NULL on every row written before the transcript
         # fallback existed, which reads correctly as "the CLI's own figure".
         "cost_source": "TEXT",
+        # See the CREATE TABLE comment. `wo_turns` already ships, so the context ledger
+        # reaches a live database only through here. NULL is "not recorded" — every turn
+        # that ran before this landed, and any turn whose measurement failed — and never
+        # "nothing was in the window"; `ops.context_report` renders that as a sentence
+        # rather than an empty table (spec §5, forward-only).
+        "context_json": "TEXT",
     },
     "validation_rounds": {
         # WHICH CONFIGURATION JUDGED THIS ROUND — a different question from the work
@@ -2726,6 +2751,41 @@ class ProjectStore:
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def work_orders_with_event(self, kind: str, wo_ids: Sequence[str]) -> set[str]:
+        """Which of `wo_ids` carry an event of `kind`. ONE statement, whatever the count.
+
+        `events_of_kind` per order is what this replaces on a path that runs over every
+        open pull request in the fleet every couple of minutes: the merge poll's read
+        budget is asserted per pull request (`tests/test_pr_checks.py`), so the gate-only
+        exclusion it needs (2026-09-25 spec §4) has to cost one statement per STEP.
+
+        An empty id list never touches the connection — the poll's skip-the-whole-step
+        rule, one level down.
+        """
+        ids = list(wo_ids)
+        if not ids:
+            return set()
+        holes = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT wo_id FROM wo_events WHERE kind=? AND wo_id IN ({holes})",
+            (kind, *ids)).fetchall()
+        return {str(row["wo_id"]) for row in rows}
+
+    def last_event_of_kind(self, wo_id: str, kind: str) -> dict[str, Any] | None:
+        """The NEWEST event of one kind on this work order, or None.
+
+        Neither read beside it answers this: `events_of_kind` is oldest-first and
+        uncapped, and `list_events` takes the oldest `limit` rows — so a caller asking
+        "what did the last pass say" would walk every row of a chatty order to reach it.
+        A hold that RESTATES itself (`Daemon._record_retry_held`, spec
+        docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md §1) is the first
+        reader that wants only the latest, and it asks on every sweep.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM wo_events WHERE wo_id=? AND kind=? ORDER BY ts DESC LIMIT 1",
+            (wo_id, kind)).fetchone()
+        return dict(row) if row is not None else None
+
     def events_across(self, kind: str, limit: int = 200) -> list[dict[str, Any]]:
         """Every event of ONE kind in the project, NEWEST first, with its work order.
 
@@ -3723,6 +3783,18 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq LIMIT ?", (wo_id, limit)
         ).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def all_turns(self, wo_id: str) -> list[dict[str, Any]]:
+        """EVERY turn of the conversation, in order and with no ceiling.
+
+        `list_turns`' default limit of 100 is right for a renderer showing a conversation
+        and wrong for a per-turn ledger: a long work order would silently lose its later
+        turns from a report whose entire subject is what changed between them
+        (`ops.context_report`).
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:

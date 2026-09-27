@@ -387,3 +387,35 @@ def test_the_drift_check_watches_the_newly_swept_rows_too(sweep, status):
                 for v in invariants.check_pause_deadline_stable(store)]
 
     assert reported == [("INV-PAUSE-DRIFT", wo["id"])]
+
+
+def test_the_overdue_invariant_is_quiet_under_a_cap_hold_and_returns_after(sweep,
+                                                                          monkeypatch):
+    """A deferral the sweep took deliberately is not the sweep failing to fire — and
+    absence of evidence still is. Suppression lasts exactly as long as the sweep keeps
+    restating the hold, so a pass that dies mid-hold is reported within
+    `RETRY_HELD_FRESH_FOR` of its last word."""
+    store, _run, _settle = sweep
+    wo = _refused(store, "running", error=_window_shut())
+    pause = worker_session.turn_pause(store, wo["id"])
+    # The moment the check would report this order: its wait is over and the whole grace
+    # has run out on top.
+    asking = pause.retry_at + invariants.PAUSE_OVERDUE_GRACE + 60
+    monkeypatch.setattr("jarvis.invariants.time.time", lambda: asking)
+    store.add_event(wo["id"], invariants.RETRY_HELD_EVENT,
+                    {"cause": "fleet_cap", "seq": pause.turn["seq"],
+                     "reason": pause.reason, "retry_at": pause.retry_at,
+                     "in_flight": 2, "cap": 2})
+    held = store.last_event_of_kind(wo["id"], invariants.RETRY_HELD_EVENT)
+
+    def restated(ago: float) -> None:
+        store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?",
+                           (asking - ago, held["id"]))
+
+    restated(60)  # the sweep said so a minute ago: it is deferring, not failing
+    assert [v.wo_id for v in invariants.check_paused_turns_resume(store)] == []
+
+    # Nothing has restated it since — the pass died, or the hold ended and the relaunch
+    # still did not happen. Absence of evidence is a violation again.
+    restated(invariants.RETRY_HELD_FRESH_FOR + 60)
+    assert [v.wo_id for v in invariants.check_paused_turns_resume(store)] == [wo["id"]]

@@ -897,16 +897,25 @@ def test_a_changed_wording_under_one_code_is_still_a_changed_hold(started, proje
                                                                   fake_gh):
     """The half a code cannot carry: one condition, two values, two different things for
     the user to do. `BEHIND` is a branch to update and `DIRTY` is a conflict to resolve,
-    so the dedupe keys on the sentence as well as the token."""
+    so the dedupe keys on the sentence as well as the token.
+
+    AND BACK TO THE FIRST IS A THIRD ROW (issue #782): the dedupe is against the NEWEST
+    hold for the commit, not every past one, so the reason on screen is the one holding
+    the merge now. Deduped against all of them, the return to `BEHIND` wrote nothing and
+    `ops.automerge_state` sent the user to resolve a conflict that no longer existed.
+    """
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
-    for state in ("BEHIND", "DIRTY", "BEHIND"):        # and back: already said, so no row
+    for state in ("BEHIND", "DIRTY", "BEHIND"):
         fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state=state)
         poll(started, store)
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["reason"] for e in held] == [
         "GitHub reports the merge state as BEHIND, not CLEAN",
-        "GitHub reports the merge state as DIRTY, not CLEAN"]
+        "GitHub reports the merge state as DIRTY, not CLEAN",
+        "GitHub reports the merge state as BEHIND, not CLEAN"]
+    line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "BEHIND" in line and "DIRTY" not in line
 
 
 def test_a_worktree_round_binds_nothing_and_so_merges_nothing(started, project,

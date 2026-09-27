@@ -986,13 +986,17 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
     prime_model = _priming_model(models)
     if prime_model is not None and prompts:
         usage = seats.prime_cache(prefix, PRIMING_TURN, prime_model,
-                                  timeout=cfg.timeout, cwd=ensure_home(), tools="")
+                                  timeout=cfg.timeout, cwd=ensure_home(), tools="",
+                                  # `_record_usage` writes this row, below.
+                                  kind="validation_seat")
         # RECORDED LIKE ANY OTHER SEAT. It is a real call on the round's behalf, and the
         # question this panel has to keep answering is what it costs against the review
         # it replaces — a call the bill cannot see is a saving that cannot be checked.
         _record_usage(usage, project, packet, label="prime", model=prime_model)
     opinions = seats.run_blind(
-        prompts, models=models, timeout=cfg.timeout, cwd=ensure_home(), tools="")
+        prompts, models=models, timeout=cfg.timeout, cwd=ensure_home(), tools="",
+        # `_record` writes every seat's row under this kind.
+        kind="validation_seat")
     opinions += missing
     for op in opinions:
         _record(store, round_id, project, packet, op)
@@ -1012,6 +1016,23 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
         refusal = next((op.refused for op in opinions if op.refused is not None), None)
         if refusal is not None:
             raise claude_cli.UsageLimitError(refusal)
+        # ...OR THE ACCOUNT COULD NOT AUTHENTICATE, which is GitHub issue #778 and the
+        # spec's §1: read from `op.auth` rather than `op.raw`, whose message is prefixed
+        # past the anchor in `_AUTH_RE` (spec
+        # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §2).
+        # ANY seat, and before the transient branch below for `worker_session._diagnose`'s
+        # reason: retrying on a transport schedule cannot fix a sign-in.
+        auth = next((op.auth for op in opinions if op.auth is not None), None)
+        if auth is not None:
+            raise claude_cli.AuthFailureError(auth)
+        # ...OR THE TRANSPORT IS DOWN, in which case the round belongs to the outage budget
+        # it was always meant to reach (`Daemon._validation_outage`). ALL seats, not any:
+        # one seat with a 503 beside three that each failed differently is a panel that is
+        # genuinely down. Spec §1.
+        if all(claude_cli.transient_failure(op.raw) is not None for op in opinions):
+            raise claude_cli.ClaudeCliError(
+                "every validation seat failed on the transport: "
+                f"{opinions[0].raw[:200]}")
         return _out("escalated", "nobody could be reached to review this submission, so "
                                  "the work has not been judged.", opinions,
                     round_no=round_no)
@@ -1162,7 +1183,9 @@ def _run_chair(store: ProjectStore, round_id: int, packet: EvidencePacket,
     try:
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
                                                 timeout=cfg.timeout, cwd=ensure_home(),
-                                                tools="", attribute=False)
+                                                # `_record_usage` writes this row.
+                                                tools="",
+                                                records_itself="validation_seat")
     except claude_cli.ClaudeCliError as e:
         op = seats.Opinion(seat="chair", raw=str(e), status="abstained", model=model,
                            replied=False,

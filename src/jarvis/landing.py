@@ -103,7 +103,7 @@ from pathlib import Path
 from typing import Any
 
 from . import worker_session
-from .evidence import ProjectRef, base_ref
+from .evidence import ProjectRef, base_ref, default_branch_head
 
 log = logging.getLogger("jarvis.landing")
 
@@ -319,6 +319,63 @@ def authored(worktree: Path | None) -> Authored:
     return Authored(branch=branch.strip(), base=base,
                     commits=int(count.strip()) if count.strip().isdigit() else 0,
                     dirty=dirty)
+
+
+def committed_text(project_path: Path, planner_wo: dict[str, Any] | None,
+                   repo_path: str) -> tuple[str, str] | None:
+    """One file as COMMITTED, with human-readable provenance, or None. Never the worktree.
+
+    §6 of docs/superpowers/specs/2026-09-25-plan-review-reads-the-spec-the-os-holds.md.
+    Branch before main, and that order is the fix: in question 658 the older revision was
+    already on main while the newer sat on the planner's branch, so main-first would have
+    served exactly the stale text that caused the bug.
+
+    The ladder never asks whether the branch MERGED — after a squash merge no reachability
+    test is trustworthy (kn-ae871d91) and both rungs carry the same bytes anyway. WHICH
+    RUNG IS READABLE decides: the planner's worktree while it is on disk, the default
+    branch once it has been reclaimed, and None when neither answers. A caller must treat
+    None as "leave the snapshot alone": "" over a good snapshot breaks `specs.spec_of`,
+    the materialised section and the feature agent.
+    """
+    worktree = worktree_of(project_path, planner_wo) if planner_wo else None
+    if worktree is not None:
+        branch = authored(worktree).branch
+        if branch:
+            text = _git(worktree, "show", f"{branch}:{repo_path}")
+            if text is not None:
+                sha = (_git(worktree, "rev-parse", "--short", branch) or "").strip()
+                return text, f"branch {branch} @ {sha}" if sha else f"branch {branch}"
+    ref = base_ref(project_path)
+    if not ref:
+        return None
+    _fetch_ref(project_path, ref)
+    text = _git(project_path, "show", f"{ref}:{repo_path}")
+    if text is None:
+        return None
+    head = default_branch_head(project_path)
+    return text, f"{ref} @ {head[:7]}" if head else ref
+
+
+def _fetch_ref(repo: Path, ref: str) -> None:
+    """Refresh the default branch before reading it, best-effort. §8.
+
+    Only ever before the default-branch rung — the planner's branch is local by
+    construction — because `origin/main` going stale in a local checkout is the same class
+    of bug this feature exists to fix. A failure is not an error: the local ref is read
+    anyway.
+    """
+    branch = ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin",
+                               branch], capture_output=True, text=True,
+                              errors="replace", timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("git fetch origin %s in %s could not run: %s", branch, repo,
+                    _scrub(str(exc)))
+        return
+    if proc.returncode != 0:
+        log.debug("git fetch origin %s in %s exited %d: %s", branch, repo,
+                  proc.returncode, _scrub(proc.stderr.strip())[:200])
 
 
 @dataclass(frozen=True)

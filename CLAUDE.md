@@ -101,6 +101,35 @@ jarvis fo resume <id> [--fix "what still needs doing"]  # a FAILED feature back 
                                            # child. Omit --fix when the work is already
                                            # done. There is a text box on the feature's
                                            # dashboard page that does the same thing.
+jarvis io create <project> "title" -d "<what you saw>" --ref <id|#n|url> ...
+                                           # an IMPROVEMENT order ("io" = improvement
+                                           # order): when the OS MISBEHAVES and you want
+                                           # the CAUSE, not a patch. An analyst reads the
+                                           # evidence, is required to argue AGAINST the
+                                           # obvious fix, and reports findings — root
+                                           # cause, why the cheap fix is not enough, and
+                                           # the orders that would fix it. It never writes
+                                           # code and never opens a pull request. -d and
+                                           # at least one --ref are REQUIRED: an
+                                           # observation with no evidence is a request for
+                                           # an opinion. A --ref is a wo-/fo-/io-/al- id,
+                                           # #<issue>, a URL or free text, stored verbatim
+                                           # and resolved by the analyst; one that does
+                                           # not resolve is a FINDING about the OS's
+                                           # records, not an error.
+jarvis io list [project] [--all] / show <id>    # show leads with the counts — `3
+                                           # findings: 1 accepted, 1 rejected, 1 awaiting
+                                           # you` — then the observation and each finding
+jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--accept-all]
+                                           # decide the findings one by one. ACCEPT writes
+                                           # that finding's root cause to the knowledge
+                                           # base and FILES the orders it proposed, as
+                                           # ordinary independent orders with a back-link.
+                                           # REJECT needs --feedback: the reason teaches
+                                           # Neo. NOTHING is filed until you decide.
+jarvis io cancel <id>                      # stops the order and its analyst. Orders
+                                           # already filed from accepted findings stay:
+                                           # those were your decision.
 jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on

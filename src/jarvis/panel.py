@@ -205,7 +205,8 @@ def _round(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     opinions = seats.run_blind(
         {seat: (system, prompt) for seat, system in systems.items()},
         models={seat: seat_model(seat, cfg) for seat in systems},
-        timeout=cfg.panel.timeout, cwd=home)
+        # `_record` writes every seat's row under this kind.
+        timeout=cfg.panel.timeout, cwd=home, kind="panel_seat")
     opinions += missing
     for op in opinions:
         _record(store, q, op, record)
@@ -608,7 +609,9 @@ def _run_chair(store: NeoStore, q: dict[str, Any], cfg: NeoConfig,
     try:
         result = claude_cli.run_headless_result(prompt, system_prompt=system, model=model,
                                                 timeout=cfg.panel.timeout,
-                                                cwd=ensure_home(), attribute=False)
+                                                cwd=ensure_home(),
+                                                # `_record` writes this row itself.
+                                                records_itself="panel_seat")
     except claude_cli.ClaudeCliError as e:
         op = Opinion(seat="chair", raw=str(e), status="abstained", model=model,
                      latency_ms=int((time.monotonic() - started) * 1000))
