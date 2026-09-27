@@ -29,19 +29,21 @@ window is small: worker questions 0.9-2.6K, first-pass assumption reviews 1-3.8K
 approvals 2-10K, plans 12-15K. One kind is the outlier and it is the one nobody sized.
 
 The class this feature closes is **an OS-built prompt that interpolates producer-sized
-text**. Four layers, in the order they bind:
+text**. Five layers, in the order they bind:
 
 1. the per-purpose budget, which is what actually holds (section 2);
-2. a measured, generous backstop at the single transport every OS call runs through, so a
-   future caller cannot do this again silently (section 3);
-3. the worker side, where an agent is told to pass a reference and refused when it pastes
-   a payload anyway (section 4);
-4. proof that the trimmed evidence still judges the same (section 5).
+2. the measurement: every OS call records how big its own prompt was, and the surfaces show
+   it (section 3);
+3. a generous backstop at the single transport every OS call runs through, its default read
+   off that measurement, so a future caller cannot do this again silently (section 4);
+4. the worker side, where an agent is told to pass a reference and refused when it pastes
+   a payload anyway (section 5);
+5. proof that the trimmed evidence still judges the same (section 6).
 
 **What this is NOT.** It is not the argv transport bug — a `-p` prompt over
 `MAX_ARG_STRLEN` (131,072 bytes per argument, see the comment at claude_cli.py:74) fails
 `exec` outright. That is issue #797 / wo-956c29bc, already dispatched. No child here may
-"fix" it, and the backstop in section 3 is deliberately ABOVE that limit, because its job
+"fix" it, and the backstop in section 4 is deliberately ABOVE that limit, because its job
 is to stop an absurd payload being sent, not to make a doomed `exec` succeed.
 
 ## 2 — The confirmation question gets its own budget, sized for what it is
@@ -80,7 +82,7 @@ user). The confirmation question carries the pull request URL and the head SHA a
 text, in their own line, whether or not anything was cut. That is the reference the user
 asked for in place of an immense payload, and it is what makes the truncation marker
 actionable rather than an apology. Neo stays UNTOOLED — it cannot fetch that diff, and that
-is deliberate (section 6); the reference is there so the human reading the question, or a
+is deliberate (section 7); the reference is there so the human reading the question, or a
 later reader of the record, can.
 
 **Do not print a branch name labelled as a SHA.** `EvidencePacket.base`/`head` mean
@@ -120,9 +122,9 @@ this change never cuts.
 **Already true, do not "fix" it twice.** The packet is collected lazily and exactly once
 per work order per pass (the `if packet is None` guard, daemon.py:5327-5330). N assumptions
 cost one `git diff`, not N. What they do cost is N model calls each carrying that diff —
-that is answered in section 6, not here.
+that is answered in section 7, not here.
 
-## 3 — The transport measures its own input, and refuses an absurd one out loud
+## 3 — The transport measures its own input, and the OS can see it
 
 Nothing in the OS knows how big its own prompts are. `agent_calls` (central_store.py:194)
 records `input`, `cache_write`, `cache_read`, `output`, `cost_usd`, `kind`, `label`,
@@ -146,13 +148,21 @@ Surface it: `jarvis cost` gains the largest inputs by kind (it already splits wo
 from `jarvis` spend — this is a column in the `jarvis` half), and `jarvis inspect` names the
 biggest OS-side input for the order it is inspecting.
 
-**Then cap it, as a BACKSTOP and not as the binding limit.** A new fleet-wide,
-catalog-settable ceiling on the combined prompt of an OS-originated call. Two rules:
+**This section caps nothing.** A measurement that lands on its own is worth having on its
+own — it is what the next section's default is read off, and it is what makes an oversized
+prompt visible in `jarvis cost` before anybody decides what to do about one. The ceiling is
+section 4 and it cannot be built before this is in place.
+
+## 4 — The backstop ceiling: refuse an absurd prompt out loud, never silently
+
+**A BACKSTOP, not the binding limit.** A new fleet-wide, catalog-settable ceiling on the
+combined prompt of an OS-originated call. Two rules:
 
 * It sits **above** the validation panel's measured worst case. A seat prompt legitimately
   carries a 150,000-char diff (catalog.py:396, kn-2feecdbd). Any ceiling under that
   silently disables validation, which is far worse than the bug being fixed. Read a real
-  seat prompt's size off the new columns before fixing the default.
+  seat prompt's size off the columns section 3 added — the default is a MEASURED number
+  with the measurement in a comment beside it, never a number somebody liked the look of.
 * Over the ceiling the OS **trims and labels, or refuses loudly** — an attention item and
   an inbox row naming the kind, the size and the work order. Never a silent trim, and never
   a fabricated verdict: a call that was never made has decided nothing.
@@ -185,7 +195,7 @@ it as an `invariants` check over `agent_calls` — not as a sixth `ALARM_KINDS` 
 at 151.7K plus up to two digest calls at 151.7K each. The digest is display-only, so a
 truncated input digests to an honest headline: clip the input.
 
-## 4 — The worker side: pass a reference, and be refused when you paste a payload
+## 5 — The worker side: pass a reference, and be refused when you paste a payload
 
 **What already exists, so nobody builds it twice.** `jarvis wo ask` / `neo ask` is ALREADY
 capped: `sections.QUESTION_MAX_CHARS = 4000` with a warning at `QUESTION_WARN_CHARS = 1500`,
@@ -232,9 +242,9 @@ A refusal there would be discipline for its own sake.
 hook can only inject `additionalContext`, and therefore cannot remove a flood it is
 reacting to, is read off this codebase's two handlers (hooks.py:919, 1332-1346) and must be
 checked against the current Claude Code hook documentation. Write what you find into the
-pull request either way: the negative result is the justification for section 6's cut.
+pull request either way: the negative result is the justification for section 7's cut.
 
-## 5 — Proof: does a trimmed packet judge the same?
+## 6 — Proof: does a trimmed packet judge the same?
 
 A budget that changes verdicts is not a saving, it is a downgrade with a nice bill. This is
 one measurement under `evals/llm/`, behind the existing `JARVIS_EVALS_LLM=1` opt-in, run
@@ -259,7 +269,7 @@ Optional, and speculative: measure whether rendering the evidence block FIRST in
 knows where the CLI places a cache breakpoint inside a user message. Measure it; do not
 build on it, and do not reorder that prompt on the strength of a guess.
 
-## 6 — Refused and deferred, with reasons, so nobody re-litigates them
+## 7 — Refused and deferred, with reasons, so nobody re-litigates them
 
 All three refusals below were put to Neo as question 753, on wo-7c7347e1, and sanctioned —
 with one condition, now in section 2: the trimmed evidence must carry the pull request link
@@ -299,8 +309,8 @@ section 2's fix.
 
 **A `PostToolUse` guard against flooding tool outputs — cut.** It fires after the output is
 already in the conversation: it pays the tokens and then scolds. The decidable version is
-the `PreToolUse` command-substitution refusal in section 4. Subject to the verification
-section 4 requires.
+the `PreToolUse` command-substitution refusal in section 5. Subject to the verification
+section 5 requires.
 
 **Same class, not assigned here:** `dispatch.build_worker_prompt` interpolates
 `wo["description"]` raw (dispatch.py:337), and `plans.py` bounds a planned child's
