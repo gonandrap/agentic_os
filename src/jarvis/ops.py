@@ -38,7 +38,10 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, invariants
+from . import budget, bus, config_version, db, fleet, invariants, observability
+from .agent_usage import (
+    OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
+)
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -772,6 +775,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       issue_url: str | None = None,
                       issue_priority: str | None = None,
                       budget_usd: float | None = None,
+                      observability: str | None = None,
                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
@@ -820,6 +824,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             metadata=metadata,
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
+            # Stamped, never resolved against the catalog here: NULL means "this order
+            # has no answer" and the project config is read at write time
+            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
@@ -1642,6 +1650,9 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     return out, refusals
 
 
+# Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
+# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+@observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
@@ -8901,7 +8912,15 @@ def _partition_calls(
 
     os_side, worker_side = [], []
     for g in groups:
-        target = worker_side if agent_usage.is_subprocess(g.get("kind") or "") else os_side
+        kind = g.get("kind") or ""
+        # A METERED LOOK IS NEITHER, and is dropped from both: §10's rows are not `claude`
+        # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
+        # one as an OS call would report two calls where Jarvis made one. Money spent
+        # LOOKING at an order is reported by `bill.py`, in its own class
+        # (docs/specs/2026-09-24-order-observability.md §10).
+        if agent_usage.is_observability(kind):
+            continue
+        target = worker_side if agent_usage.is_subprocess(kind) else os_side
         target.append(g)
     return os_side, worker_side
 
@@ -9433,6 +9452,7 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+@observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
                    join_floor: int | None = None) -> dict[str, Any]:
@@ -9519,6 +9539,7 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+@observability.metered(OBSERVE_LIVE, target="target", project="project")
 def live_report(target: str, project: str | None = None, *,
                 reader: Any = None, now: float | None = None) -> dict[str, Any]:
     """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point.
@@ -9580,6 +9601,7 @@ TURN_NOT_RECORDED = ("not recorded for this turn — it ran before the context l
                      "landed, or its measurement failed")
 
 
+@observability.metered(OBSERVE_CONTEXT, target="wo_id", project="project")
 def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
@@ -10184,7 +10206,11 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         central.close()
     out = []
     for row in rows:
-        if agent_usage.is_subprocess(row["kind"]):
+        # Subprocesses go to `_subproc_detail`; §10's metered looks at the order go to the
+        # bill's own class and nowhere else — this table is Jarvis's `claude -p` calls, and
+        # a zero-token row that bought no model call is not one of them.
+        if agent_usage.is_subprocess(row["kind"]) or agent_usage.is_observability(
+                row["kind"]):
             continue
         u = usage_mod.priced(row["model"] or "unknown", input=row["input"],
                              cache_write=row["cache_write"],

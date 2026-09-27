@@ -542,6 +542,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "in its tree (the feature must still be open)")
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
 
+    c.add_argument("--observability", choices=["off", "normal", "full"],
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
+
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
     b.add_argument("wo_id")
@@ -1684,22 +1687,13 @@ def _print_bill(bill: dict) -> None:
         print(f"{total['cost']['by_class'][cls]:>9.3f} "
               f"{_tok(total['tokens'][cls]):>8}  {label:<12} {why}")
     print(f"\n'tokens' above is {bill_mod.TOKENS_MEAN}.")
-    # What is NOT here, named. An absent line reads as an omission, and "was nothing at
-    # all spent on the OS?" was one of the four questions this surface exists to answer.
-    # Said in the terminal exactly as the page says it: a caveat that appears in one
-    # renderer and not the other is one the reader learns to ignore.
-    absent = {
-        "worker": "the worker's own session — nothing measurable (never dispatched, or "
-                  "its transcript and every turn's result JSON are gone)",
-        "jarvis": "jarvis spent nothing of its own — no Neo question, no panel, no "
-                  "digest",
-        "subprocesses": "no claude processes the worker spawned itself were recorded",
-    }
-    present = {line["key"] for line in bill.get("actors") or []}
-    missing = [text for key, text in absent.items() if key not in present]
+    # What is NOT here, named — the sentences come from `bill.ABSENT_NOTES`, which the page
+    # reads too: a caveat worded differently in one renderer is one the reader learns to
+    # ignore, and it was duplicated in both until §10 needed a fourth.
+    missing = bill_mod.absent_notes(bill)
     if missing and bill["kind"] == "work_order":
         print("\nnot on this bill:")
-        for text in missing:
+        for _key, text in missing:
             print(f"  · {text}")
     rewrite = bill.get("rewrite") or {}
     if rewrite.get("tokens"):
@@ -2525,6 +2519,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
             parent_id=parent or None, budget_usd=_budget_arg(args),
+            observability=getattr(args, "observability", None),
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
