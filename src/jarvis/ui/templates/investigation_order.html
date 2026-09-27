@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}{{ inv.id }} — Jarvis{% endblock %}
+{% block content %}
+{# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md. The CLASSIFICATION
+   and the SUBJECT first, then the root cause, then the evidence, then what was filed or
+   the duplicate it matched. NO POST action anywhere on this page: there is nothing to
+   decide, and that absence is what "the order settles itself" looks like on a screen. #}
+{% set m = fo_status_meta.get(inv.status, {'word': inv.status, 'icon': '•', 'tone': 'muted'}) %}
+{% set v = inv.verdict or {} %}
+
+<h2><span class="mono">{{ inv.id }}</span> {{ inv.title }}</h2>
+<p class="sub">
+  {# The kind-aware word, from `ops`: `planning` on an investigation means the
+     investigator is reading, and a page spelling that itself would be a second label
+     table. #}
+  <span class="st tone-{{ m.tone }}"><span class="i">{{ m.icon }}</span>{{ inv.status_label }}</span>
+  · <a href="/project/{{ project }}">{{ project }}</a>
+  · {{ inv.classification or 'no verdict yet' }}
+  · subject <span class="mono">{{ inv.subject }}</span>
+  · {{ fmt_age(inv.created_at) }}
+  · <a href="/cost/{{ project }}/{{ inv.id }}">its bill →</a>
+</p>
+
+{% if error %}<div class="panel"><div class="row tone-bad">✗ {{ error }}</div></div>{% endif %}
+
+{% if inv.needs_attention %}
+<div class="panel"><div class="row tone-warn">◭ {{ inv.attention_reason }}</div></div>
+{% endif %}
+
+<h3>Why it was opened</h3>
+<div class="panel"><div class="row"><div class="grow">{{ inv.why }}</div></div></div>
+
+{% if inv.investigator %}
+<p class="sub">investigator:
+  <a class="mono" href="/wo/{{ project }}/{{ inv.investigator.id }}">{{ inv.investigator.id }}</a>
+  ({{ inv.investigator.status }})
+  {% if inv.investigator.result_summary %}— {{ inv.investigator.result_summary }}{% endif %}
+</p>
+{% endif %}
+
+{% if v %}
+<h3>{{ v.classification }} — root cause</h3>
+<div class="panel">
+  <div class="row"><div class="grow">{{ v.root_cause }}</div></div>
+  {% if v.submitted_classification %}
+  {# Recorded as `ops`' decision, never the investigator's — finding the duplicate was
+     never its job (§2.5). #}
+  <div class="row"><div class="sub">classified by the OS, not the investigator: it
+    submitted {{ v.submitted_classification }} and the duplicate check found one</div></div>
+  {% endif %}
+</div>
+
+<h3>Evidence</h3>
+<div class="panel">
+  {% for e in v.evidence or [] %}
+  <div class="row">
+    <div class="grow">
+      <span class="mono">{{ e.source }}</span>
+      <div class="sub">“{{ e.quote }}”</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<h3>What it asked for</h3>
+<div class="panel">
+  {% if inv.filing_error %}
+  {# Not a classification: `gh` unreachable keeps the order in `planning` so the verdict
+     can be resubmitted (§2.5). #}
+  <div class="row tone-bad">✗ {{ inv.filing_error }}</div>
+  {% elif inv.filed %}
+  <div class="row">
+    <div class="grow">
+      filed as an EXPEDITED bug — it ships a release when the fix lands:
+      <a href="{{ inv.filed.issue_url }}">{{ inv.filed.issue_url }}</a>
+      {% if inv.filed.wo_id %}
+      · <a class="mono" href="/wo/{{ project }}/{{ inv.filed.wo_id }}">{{ inv.filed.wo_id }}</a>
+      {% endif %}
+    </div>
+  </div>
+  {% elif v.duplicate_of %}
+  <div class="row"><div class="grow">already tracked by
+    <span class="mono">{{ v.duplicate_of }}</span> — nothing was filed</div></div>
+  {% elif v.user_owes %}
+  <div class="row"><div class="grow">waiting on you: {{ v.user_owes }}</div></div>
+  {% elif v.unsticks %}
+  <div class="row"><div class="grow">it clears itself: {{ v.unsticks.what }}
+    ({{ v.unsticks.when }})</div></div>
+  {% endif %}
+  {% if v.proposed_fix %}
+  <div class="row">
+    <div class="grow">
+      <strong>{{ v.proposed_fix.title }}</strong> ({{ v.proposed_fix.priority }})
+      <div class="sub">{{ v.proposed_fix.description }}</div>
+      <div class="sub">expected: {{ v.proposed_fix.expected }}</div>
+      <div class="sub">actual: {{ v.proposed_fix.actual }}</div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% else %}
+<div class="panel"><div class="empty">
+  no verdict yet — the investigator is still reading, and an investigation in progress
+  asks nothing
+</div></div>
+{% endif %}
+
+{% endblock %}

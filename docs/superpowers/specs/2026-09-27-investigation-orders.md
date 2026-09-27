@@ -190,8 +190,8 @@ What it must say, and what is different from the analyst's:
 3. **Evidence is quoted verbatim or the verdict is refused by the validator.** Reuse
    `_analyst_prompt`'s wording at src/jarvis/dispatch.py:743-747, and say that the
    validator enforces `findings.MIN_QUOTE_CHARS`.
-4. **The terminal action**: `jarvis inv verdict <inv-id> --from-file verdict.json`, which
-   IS its `jarvis wo finish` (it must not call `wo finish`). `--from-file` for
+4. **The terminal action**: `jarvis investigate verdict <inv-id> --from-file verdict.json`,
+   which IS its `jarvis wo finish` (it must not call `wo finish`). `--from-file` for
    `_planner_prompt`'s documented reason (src/jarvis/dispatch.py:410-415): the gate
    classifier's quote-blanking fails on nested and mixed quoting, and a verdict is full of
    repo paths and quoted log lines. `verdict.json` in the worktree root, and the prompt
@@ -262,8 +262,7 @@ is how a validator stops being more trustworthy than the thing it checks (the pr
 it plus `findings.MIN_QUOTE_CHARS`. Two leaves, one dependency edge, one definition of what
 a quote is. `verdicts.py` mirrors findings' surface: `CLASSIFICATIONS`,
 `MAX_VERDICT_CHARS`, `VerdictError` with a `problems` list (every problem named at once, so
-one revision fixes all of them), `parse_verdict`, `render_verdict`, `settle_headline`,
-`knowledge_text`.
+one revision fixes all of them), `parse_verdict`, `render_verdict`, `settle_headline`.
 
 ### 2.5 `ops` does the duplicate check and the filing (decided — my ruling, recorded as an assumption on wo-4beada49)
 
@@ -378,17 +377,17 @@ It denies unless the command satisfies one of:
   tuple[tuple[str, str], ...]` returning each segment's `(verb, subverb)`, reusing the
   same `_SHELL_DANGEROUS` / `shlex` parse, and keep `is_jarvis_command_chain` untouched so
   no other kind's behaviour changes. Permitted for an investigator: every read verb
-  (`status`, `wo show|list`, `fo show|list`, `io show|list`, `inv show|list`, `validation
-  show`, `inspect`, `cost`, `alarms`, `doctor`, `search`, `issues`, `gate list|show|
-  explain|rules`, `neo list|show|learnings`, `learn show|list|search|topics|stats`,
-  `config wiring`, `brief`, `inbox`), plus exactly four mutations: `jarvis wo ask`,
-  `jarvis wo assume`, `jarvis learn add`, and `jarvis inv verdict`. Anything else is
-  denied.
+  (`status`, `wo show|list`, `fo show|list`, `io show|list`, `investigate show|list`,
+  `validation show`, `inspect`, `cost`, `alarms`, `doctor`, `search`, `issues`, `gate
+  list|show|explain|rules`, `neo list|show|learnings`, `learn show|list|search|topics|
+  stats`, `config wiring`, `brief`, `inbox`), plus exactly four mutations: `jarvis wo ask`,
+  `jarvis wo assume`, `jarvis learn add`, and `jarvis investigate verdict`. Anything else
+  is denied.
 
 Both denials name the alternative in their reason string, as every refusal in this module
 does: the write denial says "put your verdict in `verdict.json` and submit it with
-`jarvis inv verdict <inv-id> --from-file verdict.json`; you change no other file", the
-Bash denial says which command it refused and that an investigation reads.
+`jarvis investigate verdict <inv-id> --from-file verdict.json`; you change no other file",
+the Bash denial says which command it refused and that an investigation reads.
 
 MCP tools are not `Bash` and are unaffected: Serena reaches the investigator through
 `dispatch.serena_allow_rules()` (src/jarvis/dispatch.py:51), which grants **read-only**
@@ -398,9 +397,10 @@ back everything the two hooks just took away.
 
 ### 2.7 CLI and the daemon seam (decided — Neo question 3)
 
-`jarvis investigate <subject> --why '...'` creates; `jarvis inv list|show|cancel` and
-`jarvis inv verdict` are the sub-verbs. One word, `inv`, with `investigate` as the
-creating alias so the sentence reads like the ask.
+`jarvis investigate <subject> --why '...'` creates; `jarvis investigate list|show|cancel`
+and `jarvis investigate verdict` are the sub-verbs. The shipped surface is one word,
+`investigate`, with a closed set of sub-verbs (create/list/show/cancel/verdict), so the
+crib sheet has a single entry.
 
 **The CLI is a thin wrapper over `ops` functions and holds no logic**, because the
 companion fleet-health order is the main caller and calls them directly from the daemon —
@@ -471,7 +471,7 @@ and the subject, then the root cause, then the evidence table, then what was fil
 URL + work order id) or why nothing was.
 
 Everything it renders comes off `ops.show_investigation_order` — a second resolution in
-the route would make the page and `jarvis inv show` two answers to one question
+the route would make the page and `jarvis investigate show` two answers to one question
 (src/jarvis/ui/app.py:1016-1018). **No POST action**: there is nothing to decide. That
 absence is the visible difference from the improvement-order page and is what "the order
 settles itself" means on a screen. The project page lists open investigations beside
@@ -565,7 +565,7 @@ New `tests/test_investigation_orders.py`, plus additions to existing files:
    `verdict.json`; `investigator_bash_decision` denies `sed -i`, a `cat > file <<EOF`
    heredoc, `git commit`, `jarvis bug report …` and `jarvis wo finish …`, and allows
    `git log -5`, `gh pr view <url>`, `jarvis wo show wo-x`, `jarvis wo ask`,
-   `jarvis inv verdict`. Plus a **negative control**: the same payloads with
+   `jarvis investigate verdict`. Plus a **negative control**: the same payloads with
    `JARVIS_WO_KIND=worker` are untouched, so nothing here narrows an ordinary worker —
    the shape `tests/test_feature_order_team.py` uses for the seats. And a
    reachability test that goes through `preflight_decision`, not the decision function
@@ -616,16 +616,18 @@ UI smoke test that every route renders.
   burning turn; whether an investigation should be raised from a probe belongs to the
   companion order.
 
-## 7. Open questions for the lead
+## 7. Questions for the lead — all resolved
 
 1. `investigation_budget_usd`'s shipped default number. §2.8 argues it must be non-None
-   and I have no measurement to pick the figure from — the nearest datum is `jarvis cost`
-   on the improvement orders already run in this checkout.
-2. Whether `jarvis inv verdict` should be spelled `jarvis inv report` for symmetry with
-   `jarvis io report`. I chose `verdict` because the document is a verdict and not a
-   report, and the two commands must not be confusable at 2am; symmetry is the argument
-   the other way.
-3. Whether `jarvis learn add` is worth keeping in the allowlist at all. The investigator's
-   durable output is the verdict, which `ops` already turns into knowledge on the
-   improvement order's path (`findings.knowledge_text` -> `learn_add`); a second write
-   channel is a second place the same lesson lands.
+   and I had no measurement to pick the figure from. **Decided: ships at `2.00`, as
+   `catalog.DEFAULT_INVESTIGATION_BUDGET_USD`, recorded as PENDING the user's answer on
+   escalated Neo question 826.** It is one constant and one line to change when the
+   measurement arrives.
+2. Whether `jarvis investigate verdict` should be spelled `jarvis investigate report` for
+   symmetry with `jarvis io report`. **Decided in favour of `verdict`**, for the reason
+   already given: the document is a verdict and not a report, and the two commands must
+   not be confusable at 2am; symmetry is the argument the other way.
+3. Whether `jarvis learn add` is worth keeping in the allowlist at all. **Decided: it
+   STAYS** (the user confirmed). `ops.submit_verdict` deliberately writes no knowledge —
+   there is no knowledge-write path on the verdict — so the investigator's own
+   `jarvis learn add` is the single channel, not a second one.

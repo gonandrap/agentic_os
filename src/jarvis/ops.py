@@ -6545,14 +6545,16 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 SUBJECT_KEY = "subject"
 
 
-def create_investigation_order(project_name: str, subject: str, why: str,
+def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
                                origin: str = "jarvis") -> dict[str, Any]:
     """Open an investigation into one stuck order. Nothing runs here.
 
     A thin `ops` function holding all the logic, because the CLI is not its main caller:
     the companion fleet-health order calls this from the daemon and never by shelling out
-    to `jarvis` (§2.7).
+    to `jarvis` (§2.7). `project_name=None` resolves it from the SUBJECT — the id already
+    names one project, so `jarvis investigate wo-x` needs no second answer and the CLI
+    holds no rule of its own (§2.7).
 
     Two refusals of its own, both at this level rather than in a prompt:
 
@@ -6563,7 +6565,7 @@ def create_investigation_order(project_name: str, subject: str, why: str,
       diagnostician is a loop with a budget attached.
     """
     paths = registered_project_paths()
-    if project_name not in paths:
+    if project_name is not None and project_name not in paths:
         raise OpsError(f"project {project_name!r} not registered "
                        f"(known: {sorted(paths)}). Run `jarvis start` first.")
     subject = (subject or "").strip()
@@ -6576,7 +6578,7 @@ def create_investigation_order(project_name: str, subject: str, why: str,
             f"session with no memory of the conversation that produced it. Say what you "
             f"saw — `jarvis investigate {subject} --why \"...\"`."
         )
-    title, kind = _subject_identity(subject, project_name)
+    project_name, title, kind = _subject_identity(subject, project_name)
     if kind in ("investigation", "investigator"):
         raise OpsError(
             f"{subject} is an {kind} — an investigation never investigates the "
@@ -6606,18 +6608,20 @@ def create_investigation_order(project_name: str, subject: str, why: str,
         store.close()
 
 
-def _subject_identity(subject: str, project_name: str) -> tuple[str, str]:
-    """The subject's title and its kind, or an `OpsError` naming that it does not exist.
+def _subject_identity(subject: str,
+                      project_name: str | None) -> tuple[str, str, str]:
+    """The subject's project, title and kind, or an `OpsError` naming that it does not
+    exist.
 
     Resolved at creation, unlike an improvement order's `--ref` strings, which are stored
     verbatim on purpose: a ref that does not resolve is a FINDING there. Here the subject
     is what both refusals are about, so an unresolvable one is a bad order.
     """
     if is_feature_order_id(subject):
-        _n, _p, fo = find_feature_order(subject, project_name)
-        return str(fo["title"]), str(fo.get("kind") or "feature")
-    _n, _p, wo = find_work_order(subject, project_name)
-    return str(wo["title"]), str(wo.get("kind") or "worker")
+        name, _p, fo = find_feature_order(subject, project_name)
+        return name, str(fo["title"]), str(fo.get("kind") or "feature")
+    name, _p, wo = find_work_order(subject, project_name)
+    return name, str(wo["title"]), str(wo.get("kind") or "worker")
 
 
 def _live_investigation(project_name: str, subject: str) -> str:

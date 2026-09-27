@@ -1041,6 +1041,10 @@ class Daemon:
         than one loop over both kinds, because `list_feature_orders` filters kind
         POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
         undo that. See §3.1.
+
+        An INVESTIGATION order gets a third one, identical in shape: one work order,
+        `kind='investigator'`, the `why` verbatim, and `pending` left last (§2.7 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md).
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -1077,6 +1081,30 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+        # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: a third
+        # sibling loop, for the same reason as the second — `list_feature_orders` filters
+        # kind POSITIVELY and a shared loop would have to undo that.
+        for fo in store.list_feature_orders(statuses=("pending",),
+                                            kind="investigation"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Investigate: {fo['title']}"[:200],
+                    # The `why` verbatim; the investigator CONTRACT is composed at
+                    # dispatch (dispatch._investigator_prompt), as the analyst's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
+                log.exception("[%s] could not open an investigator for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, which is what makes a crashed tick re-file rather than strand an
+            # investigation with no investigator.
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
+                     wo["id"])
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over. Thin, like its

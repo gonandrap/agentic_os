@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, dispatch, hooks, ops, project_store, verdicts
+from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
 from jarvis.catalog import load_catalog
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
@@ -134,7 +134,22 @@ def test_an_investigator_may_not_mutate_anything():
 
 def test_an_investigator_may_read_everything_it_needs():
     for command in READS:
-        assert hooks.investigator_bash_decision(_bash(command), _env()) is None, command
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "allow", command
+
+
+def test_a_permitted_read_is_an_explicit_allow_and_never_a_prompt():
+    """`preflight_decision`'s docstring: these auto-approvals exist because a background
+    session otherwise stalls on a permission prompt (verified live). An investigator's
+    CORE evidence reads must not be the calls that can stall it — `None` means "no
+    opinion" and falls through to the normal permission flow."""
+    for command in ("git log --oneline", "gh pr view 5"):
+        assert _decision(
+            hooks.preflight_decision(_bash(command), _env())) == "allow", command
+        # The control: an ordinary worker's identical read is untouched by this kind's
+        # rule, so nothing here widens or narrows any other kind.
+        assert hooks.investigator_bash_decision(
+            _bash(command), _env("worker")) is None, command
 
 
 def test_the_bash_hook_leaves_every_other_kind_alone():
@@ -428,6 +443,119 @@ def test_cancelling_one_settles_it_and_stops_the_investigator(started, store):
 def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_order):
     with pytest.raises(ops.OpsError, match="improvement order"):
         ops.show_investigation_order(improvement_order["id"])
+
+
+# -- §2.7: the daemon seam ------------------------------------------------------------
+
+
+def _investigators(store) -> list[dict]:
+    return [w for w in store.list_work_orders(limit=200)
+            if w.get("kind") == "investigator"]
+
+
+def test_the_daemon_opens_the_investigator_with_no_cli_in_the_way(started, store,
+                                                                 catalog_file):
+    """§2.7: the assertion that the companion fleet-health order HAS a seam — it calls
+    `ops.create_investigation_order` from the daemon and never shells out to `jarvis`."""
+    from jarvis.daemon import Daemon
+
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.plan_features(daemon.catalog.projects[0], store)
+
+    opened = _investigators(store)
+    assert len(opened) == 1, opened
+    assert opened[0]["parent_id"] == inv["id"]
+    assert opened[0]["description"] == WHY   # the `why` verbatim
+    row = store.get_feature_order(inv["id"])
+    assert row["status"] == "planning"
+    assert row["plan_wo_id"] == opened[0]["id"]
+
+
+def test_a_second_tick_files_no_second_investigator(started, store, catalog_file):
+    from jarvis.daemon import Daemon
+
+    ops.create_investigation_order("proj_a", _subject(store), WHY)
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.plan_features(daemon.catalog.projects[0], store)
+    daemon.plan_features(daemon.catalog.projects[0], store)
+
+    assert len(_investigators(store)) == 1
+
+
+def test_a_feature_and_an_improvement_order_in_the_same_tick_keep_their_own_children(
+        started, store, catalog_file, improvement_order):
+    """The sibling loops read one table, so a kind filter dropped on any side is
+    invisible from the others (src/jarvis/daemon.py's own reason for three loops)."""
+    from jarvis.daemon import Daemon
+
+    ops.create_investigation_order("proj_a", _subject(store), WHY)
+    ops.create_feature_order("proj_a", "CSV export", description=(
+        "Add a CSV exporter to the reporting module, with a command that calls it and "
+        "tests over the happy path and an empty result set."))
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.plan_features(daemon.catalog.projects[0], store)
+
+    kinds = sorted(w["kind"] for w in store.list_work_orders(limit=200)
+                   if w["kind"] in ("analyst", "planner", "investigator"))
+    assert kinds == ["analyst", "investigator", "planner"], kinds
+    assert _investigators(store)[0]["parent_id"].startswith("inv-")
+
+
+# -- §2.7: the CLI, a thin wrapper over those ops functions ---------------------------
+
+
+def test_the_cli_drives_the_whole_surface(started, store, tmp_path, capsys):
+    subject = _subject(store)
+    assert cli.main(["investigate", subject, "--why", WHY, "--json"]) == 0
+    inv_id = json.loads(capsys.readouterr().out)["created"]
+    assert inv_id.startswith("inv-")
+
+    assert cli.main(["investigate", "list", "--json"]) == 0
+    assert [r["id"] for r in json.loads(capsys.readouterr().out)] == [inv_id]
+
+    assert cli.main(["investigate", "show", inv_id, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["subject"] == subject
+
+    _investigating(store, {"id": inv_id})
+    path = tmp_path / "verdict.json"
+    path.write_text(json.dumps(a_verdict("TRANSIENT", subject=subject)))
+    assert cli.main(["investigate", "verdict", inv_id,
+                     "--from-file", str(path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["classification"] == "TRANSIENT"
+    assert store.get_feature_order(inv_id)["status"] == "completed"
+
+    # …and it stays out of the feature-order listing throughout
+    assert cli.main(["fo", "list", "--all", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_a_sub_verb_is_never_read_as_a_subject(started, store, capsys):
+    """`jarvis investigate list` is the listing, not "investigate the subject named
+    list" — the sub-verbs are a closed set and anything else is a subject."""
+    assert cli.main(["investigate", "list", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert cli.main(["investigate", "cancel", inv["id"], "--json"]) == 0
+    capsys.readouterr()
+    assert store.get_feature_order(inv["id"])["status"] == "cancelled"
+
+
+def test_the_cli_refuses_a_subjectless_create_and_a_whyless_one(started, store, capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["investigate", _subject(store)])   # --why is required
+    assert cli.main(["investigate", "wo-nosuchid", "--why", WHY, "--json"]) != 0
+
+
+def test_a_bad_verdict_file_is_named_and_not_a_traceback(started, store, tmp_path,
+                                                         capsys):
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    _investigating(store, inv)
+    path = tmp_path / "verdict.json"
+    path.write_text("{not json")
+    assert cli.main(["investigate", "verdict", inv["id"], "--from-file", str(path)]) != 0
+    assert cli.main(["investigate", "verdict", inv["id"],
+                     "--from-file", str(tmp_path / "missing.json")]) != 0
 
 
 # -- §2.2/§2.3: the investigator is never handed the worker contract -------------------

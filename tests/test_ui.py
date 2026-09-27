@@ -1895,6 +1895,105 @@ def test_the_project_page_lists_improvement_orders_without_expanding_findings(im
     assert "before touching the dispatch path" not in page
 
 
+# -- investigation orders ------------------------------------------------------------
+#
+# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the page leads with
+# the classification and the subject, then the root cause, the evidence and what was
+# filed. NO POST action — there is nothing to decide, and that absence is what "the order
+# settles itself" looks like on a screen.
+
+
+@pytest.fixture()
+def investigation(client, project):
+    """A settled investigation with a WAITING_ON_USER verdict on it."""
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order(
+        "proj_a", subject,
+        "wo-x has been `validating` for six hours with no turn in flight.")
+    store = ProjectStore(project)
+    try:
+        investigator = store.create_work_order(f"investigate {subject}",
+                                               kind="investigator",
+                                               parent_id=inv["id"], status="running")
+        store.update_feature_order(inv["id"], plan_wo_id=investigator["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+    return client, ops.show_investigation_order(inv["id"]), investigator, subject
+
+
+def test_the_investigation_page_leads_with_the_classification_and_the_subject(
+        investigation):
+    client, inv, investigator, subject = investigation
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+
+    assert "WAITING_ON_USER" in page
+    assert subject in page
+    assert "is written once and never" in page          # the root cause
+    assert "the panel gave up after 3 rounds" in page   # the evidence quote
+    assert html.escape(f"jarvis wo show {subject}") in page   # its source
+    assert "as-4" in page                               # what the user owes
+    assert f"/wo/proj_a/{investigator['id']}" in page
+    # Nothing to decide: the difference from the improvement-order page. The base
+    # layout's search box is a GET, so the assertion is about POSTs.
+    assert 'method="post"' not in page
+
+
+def test_the_investigation_page_says_what_was_filed(client, project):
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "it has not moved in 6h.")
+    store = ProjectStore(project)
+    try:
+        child = store.create_work_order("investigate it", kind="investigator",
+                                        parent_id=inv["id"])
+        store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    out = ops.submit_verdict(inv["id"], a_verdict("ALREADY_TRACKED", subject=subject))
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+    assert "ALREADY_TRACKED" in page
+    assert "#790" in page          # the duplicate it matched
+    assert out["filed"] is None
+
+
+def test_an_unknown_investigation_says_so_instead_of_failing(client):
+    page = client.get("/inv/proj_a/inv-nosuchid")
+    assert page.status_code == 200
+    assert "inv-nosuchid" in page.text
+
+
+def test_the_project_page_lists_live_investigations_beside_the_other_kinds(client,
+                                                                          project):
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "no turn in six hours.")
+
+    page = client.get("/project/proj_a").text
+
+    assert page.count(f"/inv/proj_a/{inv['id']}") == 1
+    assert "Investigations" in page
+    assert subject in page   # the subject is what the line is about
+
+
 def _settle_feature(project, title, status):
     """A feature order in a terminal status, with no ceremony about how it got there."""
     fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "

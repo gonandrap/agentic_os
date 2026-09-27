@@ -282,37 +282,6 @@ def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
             f"{verdict.get('user_owes', '')} (`jarvis investigate show {inv_id}`)")
 
 
-def knowledge_text(verdict: dict[str, Any]) -> str:
-    """The knowledge-base entry a verdict becomes.
-
-    THE FIRST LINE IS THE ROOT CAUSE STATED AS A RULE, alone and whitespace-collapsed —
-    `findings.knowledge_text`'s reasoning, unchanged: an entry body never reaches a
-    worker's prompt, an index of first lines does.
-    """
-    root = " ".join(str(verdict.get("root_cause") or "").split())
-    lines = [root, "",
-             f"Subject: {verdict.get('subject', '')}",
-             f"Classification: {verdict.get('classification', '')}"]
-    for name in ("user_owes", "duplicate_of"):
-        if verdict.get(name):
-            lines.append(f"{name}: {verdict[name]}")
-    unsticks = verdict.get("unsticks") or {}
-    if unsticks:
-        lines.append(f"Unsticks: {unsticks.get('what', '')} ({unsticks.get('when', '')})")
-    fix = verdict.get("proposed_fix") or {}
-    if fix:
-        lines += ["", f"Proposed fix: {fix.get('title', '')}",
-                  f"  expected: {fix.get('expected', '')}",
-                  f"  actual: {fix.get('actual', '')}"]
-    evidence = verdict.get("evidence") or []
-    if evidence:
-        lines += ["", "Evidence:"]
-        # Attributed on the quote's OWN line, `findings.knowledge_text`'s rule.
-        lines += [f"  - {item.get('quote', '')!r} ({item.get('source', '')})"
-                  for item in evidence]
-    return "\n".join(lines)
-
-
 def render_verdict(verdict: dict[str, Any]) -> list[str]:
     """One verdict as lines a human reads: the decision first, then the argument.
 

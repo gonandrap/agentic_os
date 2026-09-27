@@ -622,7 +622,12 @@ def investigator_bash_decision(payload: dict[str, Any],
     if not command:
         return None
     if _investigator_may_run(command):
-        return None
+        # An EXPLICIT allow, not `None`: `preflight_decision`'s docstring records that
+        # these auto-approvals exist because a background session otherwise stalls on a
+        # permission prompt, and this kind's core evidence reads (`git log`, `gh pr view`)
+        # must not be the calls that can stall it. Safe in this position and only here:
+        # `gate_decision` has already had its say above (§2.6).
+        return _allow("investigator read")
     return _deny(
         f"Refused: `{command[:160]}`. An investigation READS — it changes no file, "
         f"commits nothing, opens no pull request and files nothing. Read the evidence "
