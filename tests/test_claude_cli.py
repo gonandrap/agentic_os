@@ -11,7 +11,10 @@ call site.
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
+
+import pytest
 
 from jarvis import claude_cli
 
@@ -98,3 +101,125 @@ def test_call_runs_in_the_requested_directory(fake_claude, tmp_path) -> None:
     neutral.mkdir()
     claude_cli.run_headless("hi", cwd=neutral)
     assert fake_claude.calls[-1]["cwd"] == str(neutral.resolve())
+
+
+# -- the USER prompt's second door -----------------------------------------------------
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+
+
+#: Past `MAX_ARG_STRLEN` itself, not merely past `PROMPT_ARGV_LIMIT`: the prompts that
+#: motivated this (a 151.7K `auto_review` confirmation) are on the far side of the real
+#: `execve` ceiling, and a test built at the door's own threshold would not be.
+OVER_EXECVE = 131_072 + 1
+
+
+def test_a_user_prompt_past_the_argv_ceiling_goes_by_stdin(fake_claude, tmp_path) -> None:
+    """errno 7 out of `execve` is not a CLI failure — there is no CLI yet to report it."""
+    prompt = "x" * OVER_EXECVE + "\nTHE_USER_PROMPT_MARKER"
+
+    claude_cli.run_headless(prompt, cwd=tmp_path)
+
+    record = fake_claude.calls[-1]
+    argv = record["argv"]
+    assert "-p" in argv
+    assert argv[argv.index("-p") + 1] == "--output-format", (
+        f"the prompt is still in argv; argv={argv[:4]}")
+    assert prompt not in argv
+    assert record["prompt"] == prompt
+
+
+def test_a_multibyte_prompt_arrives_byte_identical_under_a_c_locale(
+        fake_claude, monkeypatch, tmp_path) -> None:
+    """`text=True` encodes stdin with the LOCALE encoding, so a daemon under `LANG=C`
+    would raise `UnicodeEncodeError` on the first non-ASCII prompt to take this door."""
+    monkeypatch.setenv("LANG", "C")
+    monkeypatch.setenv("LC_ALL", "C")
+    prompt = "héllo — ünïcode ✓\n" * 9000
+    assert len(prompt.encode()) > OVER_EXECVE
+
+    claude_cli.run_headless(prompt, cwd=tmp_path)
+
+    assert fake_claude.calls[-1]["prompt"] == prompt
+
+
+def test_the_stdin_door_is_explicitly_utf8(monkeypatch, tmp_path) -> None:
+    """The pin for the line above, at the seam: locale-dependent encoding here is a
+    fleet-wide failure that only shows on a host whose locale the suite does not have."""
+    seen: dict = {}
+
+    class _Done:
+        returncode = 0
+        stdout = "{}"
+        stderr = ""
+
+    def _capture(argv, **kwargs):
+        seen.update(kwargs)
+        return _Done()
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", _capture)
+    prompt = "ü" * OVER_EXECVE
+
+    claude_cli.run_headless(prompt, cwd=tmp_path)
+
+    assert seen["encoding"] == "utf-8"
+    assert seen["input"] == prompt
+
+
+def test_a_small_user_prompt_still_rides_in_argv(fake_claude, tmp_path) -> None:
+    """The no-change pin: ~30 test files read `argv[argv.index("-p") + 1]`, and the argv
+    door is the one that survives a CLI build that reads its prompt differently."""
+    claude_cli.run_headless("hi", cwd=tmp_path)
+    argv = _argv(fake_claude)
+    assert argv[argv.index("-p") + 1] == "hi"
+    assert fake_claude.calls[-1]["prompt"] == "hi"
+
+
+def test_a_worker_turn_past_the_ceiling_takes_stdin_from_a_prompt_file(
+        fake_claude, tmp_path) -> None:
+    """The dispatch brief is spec text plus a knowledge index and grows monotonically."""
+    prompt = "y" * OVER_EXECVE + "\nTHE_BRIEF_MARKER"
+    gate = fake_claude.hold_turns()
+    outfile = tmp_path / "1.json"
+
+    claude_cli.spawn_turn(prompt, cwd=tmp_path, session_id="s-big", outfile=outfile,
+                          errfile=tmp_path / "1.err")
+
+    promptfile = tmp_path / "1.prompt"
+    assert promptfile.exists(), "the turn's prompt file must outlive spawn_turn"
+    assert promptfile.read_text() == prompt
+    record = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])[-1]
+    assert "--" not in record["argv"], (
+        "no prompt in argv means nothing to fence; a bare -- is a token the fake would "
+        f"have to special-case; argv={record['argv']}")
+    assert prompt not in record["argv"]
+    assert record["prompt"] == prompt
+    gate.unlink()
+
+
+def test_errno_e2big_is_deterministic_not_an_outage(monkeypatch, tmp_path) -> None:
+    """A retry of a call `execve` refused is only a delay."""
+    def _boom(argv, **kwargs):
+        raise OSError(errno.E2BIG, "Argument list too long")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", _boom)
+
+    with pytest.raises(claude_cli.InputTooLargeError) as caught:
+        claude_cli.run_headless("hi", cwd=tmp_path)
+
+    assert isinstance(caught.value, claude_cli.ClaudeCliError)
+    assert "too large" in str(caught.value)
+    assert "not found" not in str(caught.value)
+
+
+def test_any_other_oserror_is_still_classified(monkeypatch, tmp_path) -> None:
+    """Today ANY `OSError` from `subprocess.run` escapes `claude_cli` unclassified, so
+    `neo.drain_queue` never sees it and the whole drain tick is abandoned."""
+    def _boom(argv, **kwargs):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(claude_cli.subprocess, "run", _boom)
+
+    with pytest.raises(claude_cli.ClaudeCliError) as caught:
+        claude_cli.run_headless("hi", cwd=tmp_path)
+
+    assert not isinstance(caught.value, claude_cli.InputTooLargeError)
