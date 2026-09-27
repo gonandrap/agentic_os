@@ -1895,6 +1895,51 @@ def test_a_secret_two_levels_down_in_a_dict_never_reaches_the_payload(write_tran
     assert "stage" in span.params["env"]
 
 
+@pytest.mark.parametrize("payload, leak", [
+    ({"password": "hunter2000000"}, "hunter2000000"),
+    ({"api_key": "abc123def456"}, "abc123def456"),
+    ({"env": {"DB_PASSWORD": "hunter2000abc"}}, "hunter2000abc"),
+    ({"env": {"API_TOKEN": "abc123def456"}}, "abc123def456"),
+])
+def test_a_credential_under_a_credential_named_key_never_reaches_the_payload(
+        write_transcript, payload, leak):
+    """Round 3 blocker 1: `_redact_leaves` redacted key and value as SEPARATE strings, so
+    the name-AND-value test never ran on the pair. None of these values matches a shape,
+    and the dumped `{"password": "hunter2000000"}` matches neither assignment regex — the
+    whole-line one is anchored at ^, the inline one needs `=`. So all four printed."""
+    session = write_transcript(f"pair-{list(payload)[0]}-{len(leak)}", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "mcp__deploy__run", payload),
+    ])
+    anatomy = inspection.read_session(session)
+
+    assert leak not in json.dumps(anatomy.as_dict())
+    assert inspection.CREDENTIAL_VALUE_MARKER in json.dumps(anatomy.as_dict())
+
+
+def test_a_placeholder_under_a_credential_named_key_survives_unchanged(write_transcript):
+    """The negative control the pair test must not break: a report that redacts
+    `password=changeme` is useless for reading what the worker actually ran."""
+    session = write_transcript("pair-placeholder", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "mcp__deploy__run", {"password": "changeme"}),
+    ])
+    span = inspection.read_session(session).turns[0].spans[0]
+
+    assert span.params["password"] == "changeme"
+
+
+def test_two_keys_that_redact_alike_are_both_kept(write_transcript):
+    """Round 3 follow-up: the dict keys are redacted in a comprehension, so two distinct
+    keys collapsing to one marker silently dropped an entry — against `_params_of`'s
+    promise that every key is kept, shortened or listed as dropped."""
+    walked = inspection._redact_leaves(
+        {"TOKEN=abc123def456": 1, "TOKEN=zzz999yyy888": 2})
+
+    assert len(walked) == 2
+    assert sorted(walked.values()) == [1, 2]
+
+
 def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
         write_transcript):
     """Belt and braces must not read as two findings: the leaf pass and the line pass
@@ -1908,19 +1953,21 @@ def test_a_leaf_marker_is_not_marked_a_second_time_by_the_serialised_pass(
     assert value.count(inspection.CREDENTIAL_VALUE_MARKER) == 1
 
 
-def test_a_pathologically_deep_input_is_bounded_and_still_redacted(write_transcript):
-    """The walk is bounded, so a nested input cannot blow the stack — and what sits
-    below the bound is still redacted, as text."""
+def test_a_pathologically_deep_input_is_bounded_and_not_reported():
+    """Round 3 blocker 2: the old version passed only because 40 levels of escaped JSON
+    pushed the secret past `ParamCaps.per_value` — a SHORTER deep input printed it, since
+    `redact_param` cannot match `"TOKEN": "abc123def456"` at all. Walk the value directly
+    so the cap cannot be what hides it: below the bound nothing is reported, and the
+    marker states the bound."""
     nested: object = {"TOKEN": "abc123def456"}
-    for _ in range(inspection._PARAM_WALK_MAX_DEPTH + 40):
+    for _ in range(inspection._PARAM_WALK_MAX_DEPTH + 2):
         nested = {"next": nested}
-    session = write_transcript("deep", [
-        prompt_row(0, "You are the worker agent for wo-1"),
-        *tool_rows(1, 2, "t1", "Bash", {"deep": nested}),
-    ])
 
-    assert "abc123def456" not in json.dumps(
-        inspection.read_session(session).as_dict())
+    walked = json.dumps(inspection._redact_leaves(nested))
+
+    assert inspection.PARAM_DEPTH_MARKER in walked
+    assert str(inspection._PARAM_WALK_MAX_DEPTH) in inspection.PARAM_DEPTH_MARKER
+    assert "abc123def456" not in walked
 
 
 def test_a_nested_input_is_redacted_before_it_is_capped(write_transcript):

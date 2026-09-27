@@ -334,9 +334,25 @@ def redact_param(text: str) -> str:
 
 #: How deep the leaf walk goes. 12 is far past any real tool input (`MultiEdit` is two),
 #: and a bound is needed because the input is a worker's JSON, not a schema we control.
-#: At the bound the subtree is redacted as serialised TEXT — best effort, not the leaf
-#: guarantee above it.
+#: At the bound the subtree is NOT reported at all (review round 3): the only other
+#: option is to redact it as serialised text, which is exactly the bug the leaf walk
+#: exists to prevent.
 _PARAM_WALK_MAX_DEPTH = 12
+
+#: What stands in for that subtree. States the bound in the payload, the rule `ParamCaps`
+#: follows: a report that drops something without saying so is not reproducible.
+PARAM_DEPTH_MARKER = f"<not walked: nested past depth {_PARAM_WALK_MAX_DEPTH}>"
+
+
+def _credential_pair(key: Any, value: Any) -> bool:
+    """A credential-NAMED key holding a credential-SHAPED value — the two-part test on a
+    `dict` pair, which the leaf walk could not run while it redacted key and value as
+    separate strings (review round 3, spec §4a): `{"password": "hunter2000000"}` matches
+    no shape, and dumped it matches neither assignment regex (one is anchored at ^, the
+    other needs `=`), so it printed verbatim.
+    """
+    return (isinstance(key, str) and isinstance(value, str)
+            and _names_a_credential(key) and _assigned_credential(value)[0])
 
 
 def _redact_leaves(value: Any, depth: int = 0) -> Any:
@@ -347,14 +363,30 @@ def _redact_leaves(value: Any, depth: int = 0) -> Any:
     one escaped line — `"DB_PASSWORD=hunter2000abc\\n"` — where no assignment regex can
     see it, so `MultiEdit`'s `edits[].new_string` printed verbatim. Do not move redaction
     back after the dump. Non-string scalars have no secret to carry and pass through.
+
+    At `_PARAM_WALK_MAX_DEPTH` the subtree is replaced by `PARAM_DEPTH_MARKER`, not
+    redacted as text, for that same reason.
     """
     if isinstance(value, str):
         return redact_param(value)
     if depth >= _PARAM_WALK_MAX_DEPTH:
-        return redact_param(json.dumps(value, default=str))
+        return PARAM_DEPTH_MARKER
     if isinstance(value, dict):
-        return {_redact_leaves(k, depth + 1): _redact_leaves(v, depth + 1)
-                for k, v in value.items()}
+        walked: dict[Any, Any] = {}
+        for k, v in value.items():
+            redacted_key = _redact_leaves(k, depth + 1)
+            # Two distinct keys can redact ALIKE, and a comprehension would drop the
+            # first silently — against `_params_of`'s promise that every key is
+            # accounted for (review round 3). Suffix the later one instead.
+            if isinstance(redacted_key, str) and redacted_key in walked:
+                nth = 2
+                while f"{redacted_key} #{nth}" in walked:
+                    nth += 1
+                redacted_key = f"{redacted_key} #{nth}"
+            walked[redacted_key] = (CREDENTIAL_VALUE_MARKER
+                                    if _credential_pair(k, v)
+                                    else _redact_leaves(v, depth + 1))
+        return walked
     if isinstance(value, (list, tuple)):
         return [_redact_leaves(v, depth + 1) for v in value]
     return value
@@ -402,7 +434,8 @@ def _params_of(payload: Any, spent: int,
     span_spent = 0
     for key, value in payload.items():
         if isinstance(value, str):
-            text = value
+            # Same pair test the leaf walk runs, at the top level it never reaches.
+            text = CREDENTIAL_VALUE_MARKER if _credential_pair(key, value) else value
         else:
             text = json.dumps(_redact_leaves(value), default=str)
         # Belt and braces: the line pass also runs over the serialised form, which is the
