@@ -154,12 +154,16 @@ def test_a_pull_request_with_no_head_oid_at_all_is_not_a_match():
     ({"merge_state": "BLOCKED"}, automerge.HELD_MERGE_STATE_UNCLEAN),   # a requirement out
     ({"merge_state": "UNSTABLE"}, automerge.HELD_MERGE_STATE_UNCLEAN),  # non-required red
     ({"merge_state": "BEHIND"}, automerge.HELD_MERGE_STATE_UNCLEAN),
-    ({"checks": ()}, automerge.HELD_CHECKS_NOT_GREEN),     # no checks is not green
-    ({"checks": (check("unit", "FAILURE"),)}, automerge.HELD_CHECKS_NOT_GREEN),
+    ({"checks": ()}, automerge.HELD_CHECKS_NONE),          # nothing has reported
+    ({"checks": (check("unit", "FAILURE"),)}, automerge.HELD_CHECKS_FAILED),
     ({"checks": (check("unit", "", "IN_PROGRESS"),)},      # queued is not passed
-     automerge.HELD_CHECKS_NOT_GREEN),
+     automerge.HELD_CHECKS_RUNNING),
     ({"checks": (check("unit"), check("evals", "", "QUEUED"))},
-     automerge.HELD_CHECKS_NOT_GREEN),
+     automerge.HELD_CHECKS_RUNNING),
+    # Failed beside running: one shard fails while its siblings queue, and the failure is
+    # the actionable fact (spec §5).
+    ({"checks": (check("unit (3.13)", "FAILURE"), check("evals", "", "QUEUED"))},
+     automerge.HELD_CHECKS_FAILED),
 ])
 def test_github_must_positively_say_open_mergeable_green_and_clean(kw, code):
     """Each condition holds, and each holds under ITS OWN code (issue #263).
@@ -170,6 +174,66 @@ def test_github_must_positively_say_open_mergeable_green_and_clean(kw, code):
     """
     decision = decide(rnd(), pull=pr(**kw))
     assert not decision.armed and decision.code == code
+
+
+def test_a_failed_check_is_named_in_the_reason_and_a_running_one_is_counted():
+    """Three worlds, three sentences: the split exists because one code over all three
+    was deduped into whichever held first (spec §5, issue #263)."""
+    failed = decide(rnd(), pull=pr(checks=(check("unit (3.13)", "FAILURE"),
+                                           check("evals", "", "QUEUED"))))
+    assert failed.code == automerge.HELD_CHECKS_FAILED
+    assert "unit (3.13)" in failed.reason
+    running = decide(rnd(), pull=pr(checks=(check("unit", "", "IN_PROGRESS"),)))
+    assert running.code == automerge.HELD_CHECKS_RUNNING and "1 check" in running.reason
+    none = decide(rnd(), pull=pr(checks=()))
+    assert none.code == automerge.HELD_CHECKS_NONE and "no check" in none.reason
+
+
+# -- a red default branch pauses every merge (spec §4) --------------------------------
+
+BASE_RED = automerge.BaseRed(base="main", workflow="ci",
+                             run_url="https://github.com/acme/proj/actions/runs/362732",
+                             head_sha="dead00beef0000000000000000000000000000cc",
+                             wo_id="wo-15f5d969")
+
+
+def test_no_base_red_fact_arms_it_and_a_red_base_holds_the_merge():
+    """`None` is "the OS holds no fresh fact" — no pause, no claim. The daemon judges
+    freshness; `decide` gets a fact or nothing."""
+    assert decide(rnd(), base_red=None).armed
+    held = decide(rnd(), base_red=BASE_RED)
+    assert not held.armed and held.code == automerge.HELD_BASE_RED
+    assert BASE_RED.run_url in held.reason
+    assert "ci" in held.reason and "wo-15f5d969" in held.reason
+
+
+def test_an_assumption_the_user_owes_outranks_a_red_default_branch():
+    """Conditions 1-3 are about permission and ownership and must dominate a fact about
+    the world."""
+    decision = decide(rnd(), base_red=BASE_RED, pending_assumptions=True)
+    assert decision.code == automerge.HELD_ASSUMPTIONS
+
+
+def test_a_red_base_holds_before_the_sha_checks_so_no_round_is_spent():
+    """THE COST THIS ORDERING SAVES. `Daemon._rejudge_moved_head` fires on
+    `HELD_SHA_MOVED` alone, so a moved head under a red `main` must not reach it: the
+    re-judge is deferred to the tick after `main` goes green, not lost."""
+    decision = decide(rnd(), pull=pr(head_oid=PUSHED), base_red=BASE_RED)
+    assert decision.code == automerge.HELD_BASE_RED
+    assert decision.round_id == 0 and decision.judged_sha == ""
+
+
+def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
+    """Matched on WORKFLOW and never on job name: fail-fast makes the base and the branch
+    different shards of one matrix (`ci.inherited`)."""
+    same = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
+        {**check("unit (3.13)", "FAILURE"), "workflow": "ci"},)))
+    assert "not its fault" in same.reason
+    other = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
+        {**check("lint", "FAILURE"), "workflow": "lint"},)))
+    assert "not its fault" not in other.reason
+    green = decide(rnd(), base_red=BASE_RED)
+    assert "not its fault" not in green.reason
 
 
 def test_no_two_conditions_share_a_hold_code():
@@ -843,7 +907,7 @@ def test_the_hold_the_user_reads_is_the_one_blocking_the_merge_now(started, proj
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
-        automerge.HELD_CHECKS_NOT_GREEN, automerge.HELD_NOT_MERGEABLE]
+        automerge.HELD_CHECKS_RUNNING, automerge.HELD_NOT_MERGEABLE]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
     assert "merges cleanly" in line and "CI" not in line
     # The repair still ran: the hold is a sentence about the pull request, not a claim
@@ -872,9 +936,9 @@ def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
-        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_NOT_GREEN]
+        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_FAILED]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
-    assert "CI has not finished" in line and "BEHIND" not in line
+    assert "CI failed: unit (3.13)" in line and "BEHIND" not in line
     # The nudge went out and the merge did not: recording a hold claims nothing.
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
     assert store.list_approvals(wo["id"]) == []

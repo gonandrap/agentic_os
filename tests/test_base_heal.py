@@ -452,7 +452,7 @@ def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
     # The first tick held on CI — the rebuild was still running, which is true. The
     # SECOND is the one this test is about.
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
-        automerge.HELD_CHECKS_NOT_GREEN, automerge.HELD_SHA_MOVED]
+        automerge.HELD_CHECKS_FAILED, automerge.HELD_SHA_MOVED]
     assert db.from_json(held[-1]["payload"], {})["judged_sha"] == UPDATED
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 

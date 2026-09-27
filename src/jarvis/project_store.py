@@ -1667,6 +1667,27 @@ class ProjectStore:
             (issue_url,)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def work_orders_for_pr_number(self, number: int,
+                                  limit: int = 20) -> list[dict[str, Any]]:
+        """Every work order whose pull-request URL ends `/pull/<number>`, newest first.
+
+        WHAT ATTRIBUTES A RED DEFAULT BRANCH (spec
+        docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2): the
+        squash subject carries the number, and the shas cannot be compared.
+
+        **A LOOKUP AND NEVER A SCAN OF A LISTING.** `list_work_orders` is `created_at DESC
+        LIMIT 200`, so on a mature project the order that merged five minutes ago — filed
+        months ago — falls outside the window and would be attributed to nobody. Every
+        status, hidden included: the question is which order's merge landed this commit,
+        and it was answered before the order was settled or tidied away.
+
+        The suffix is anchored with the separator, so `/pull/7` cannot claim `/pull/17`.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE pr_url LIKE ? ORDER BY created_at DESC "
+            "LIMIT ?", (f"%/pull/{int(number)}", limit)).fetchall()
+        return db.rows_to_dicts(rows)
+
     # -- the issue <-> work order relation ------------------------------------------
     #
     # Both directions answerable WITHOUT A NETWORK CALL, which is the whole of why the
@@ -3842,6 +3863,24 @@ class ProjectStore:
             self.conn.execute(
                 "DELETE FROM violation_reports WHERE invariant=? AND wo_id=?", key)
         return gone
+
+    def close_violation_report(self, invariant: str, wo_id: str | None = None) -> bool:
+        """Forget ONE report, so the same violation coming back is announced again.
+
+        **`close_violation_reports` above is unusable for this** and the difference is not
+        stylistic: the plural version DELETES every report not in the iterable it is
+        given, so calling it with one key would wipe every other standing report in the
+        project. It is sound only where every check ran — `Daemon.check_invariants` on a
+        sweep tick. A caller that knows one violation is over (the base went green, spec
+        docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2) knows
+        nothing about the others and must say so by closing one row.
+
+        True when a row went. False means nothing was standing, which is not an error.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM violation_reports WHERE invariant=? AND wo_id=?",
+            (invariant, wo_id or ""))
+        return cur.rowcount > 0
 
     def violation_reports(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
