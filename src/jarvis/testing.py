@@ -1730,7 +1730,8 @@ def fake_gh(tmp_path, monkeypatch):
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
-                   merge_state: str | None = None, head_oid: str = "") -> None:
+                   merge_state: str | None = None, head_oid: str = "",
+                   merge_commit: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1765,6 +1766,11 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,
+            # which is the shape the extractor has to survive, and omitted rather than
+            # null when unset because GitHub answers null only on an unmerged PR.
+            if merge_commit:
+                row["mergeCommit"] = {"oid": merge_commit}
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed:
