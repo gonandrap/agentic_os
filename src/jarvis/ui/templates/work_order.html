@@ -199,6 +199,14 @@
     · <a href="/cost/{{ project }}/{{ wo.id }}">details →</a>
   </p>
   {% endif %}
+  {# The four readings this page does not carry: why it is not moving, what its turn is
+     doing right now, where the time went and what was in the window (spec §7 of
+     docs/specs/2026-09-24-order-observability.md). Linked from here as well as from the
+     bill, because a page reachable only from the bill is unreachable in practice. #}
+  <p class="kv mono" style="margin-bottom:0;">
+    <a href="/wo/{{ project }}/{{ wo.id }}/debug">why it is not moving, and where the
+      time went →</a>
+  </p>
   {# THE CEILING AND THE CONTROL THAT CHANGES IT, together. The box is always offered,
      because setting a budget on an order that has none is as much a thing the reader
      came here to do as raising one that ran out. The numbers beside it are

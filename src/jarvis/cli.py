@@ -2402,6 +2402,10 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res.get("floor_reason"):
         print(f"\nEvery figure above is {res['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
+    # Money is all this command has ever shown, and the complaint behind spec §7 of
+    # docs/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
+    print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
+          "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
 
 

@@ -11,7 +11,12 @@
     {% if bill.kind == 'feature_order' %}
       <a href="/fo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
     {% else %}
-      <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
+      <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a> ·
+      {# This page shows only money, on purpose. Where the TIME went, what the turn is
+         doing now and why it is not moving are one click away — spec §7 of
+         docs/specs/2026-09-24-order-observability.md. Work orders only: a feature order
+         has no session, no turn and no live frame. #}
+      <a href="/wo/{{ bill.project }}/{{ bill.id }}/debug">where the time went</a>
     {% endif %} ·
     {{ bill.title }}
   </span>
