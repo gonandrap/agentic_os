@@ -273,6 +273,52 @@ def test_an_open_span_with_no_turn_in_flight_reports_nothing_current(write_trans
     assert payload["now"] is None
 
 
+def test_an_orphan_span_from_a_killed_turn_is_not_the_next_turn_s_activity(
+        write_transcript):
+    """kn-73bcc2dd, the half `turn_in_flight` alone cannot cover: the turn that opened
+    `t1` was KILLED, a new turn started, and the record says a turn is in flight again —
+    for the new one. Deciding `working` off `_open` publishes the dead turn's span as
+    `now` with an elapsed measured from 1015, which is §3's stale-reading-as-current."""
+    session = write_transcript.write("orphan", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash", {"command": "uv run pytest -q"}),
+        prompt_row(5000, DISPATCH),
+        assistant_row(5010, "m2"),
+    ])
+
+    _, payload = snap(session, turn_in_flight=True, now=5600.0)
+
+    assert payload["state"] == "generating"
+    assert payload["now"] is None
+    assert "Bash" not in payload["note"]
+    assert "running" not in payload["note"]
+
+
+def test_a_late_tool_result_still_closes_its_span_into_recent(write_transcript):
+    """The filter scopes what may be READ as current; it must not stop a span closing.
+    `_open` keeps every span so a `tool_result` that lands a frame later still pairs."""
+    session = write_transcript.write("late", [
+        prompt_row(1000, DISPATCH),
+        assistant_row(1010, "m1"),
+        tool_use_row(1015, "t1", "Bash", {"command": "uv run pytest -q"}),
+    ])
+    reader = live.Reader()
+    reader.bind(session)
+    assert frame(reader, turn_in_flight=True, now=1030.0)["state"] == "working"
+
+    write_transcript.append(session, [
+        {"type": "user", "timestamp": stamp(1040),
+         "message": {"content": [{"type": "tool_result", "tool_use_id": "t1"}]}},
+    ])
+    payload = frame(reader, turn_in_flight=True, now=1050.0)
+
+    assert payload["state"] == "generating"
+    assert payload["now"] is None
+    assert [s["tool"] for s in payload["recent"]] == ["Bash"]
+    assert payload["recent"][0]["elapsed"] == 25.0
+
+
 def test_generating_names_the_time_nothing_has_been_written_since(write_transcript):
     """THE BLIND SPOT, in words. A row lands when a message completes, so a model that
     has been generating for ten minutes has written nothing — and the honest report is

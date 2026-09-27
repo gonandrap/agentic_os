@@ -179,7 +179,7 @@ def clock(ts: float) -> str:
 def redact_params(payload: Any, cap: int = PARAMS_CAP) -> dict[str, str]:
     """A tool call's input, safe and bounded — the one path every parameter takes.
 
-    Three jobs, and none is cosmetic.
+    Four jobs, and none is cosmetic.
 
     A value whose KEY names a secret is REPLACED rather than shortened. The key survives,
     so a reader still sees what the tool was called with.
@@ -593,16 +593,31 @@ class Reader:
             return NO_TRANSCRIPT
         if settled:
             return SETTLED
-        if turn_in_flight and self._open:
+        if turn_in_flight and self._open_this_turn():
             return WORKING
         if turn_in_flight:
             return GENERATING
         return IDLE
 
+    def _open_this_turn(self) -> list[_Span]:
+        """Open spans started by the CURRENT turn. An orphan left by a killed turn is not
+        evidence of activity (kn-73bcc2dd), and §3 never publishes a stale reading as the
+        current one — same class of false claim as printing 0 for an absent transcript
+        (issue #227). `_open` itself is NEVER dropped at a turn boundary: a late
+        `tool_result` must still find its span and close it into `recent`.
+        """
+        if self._turn is None:
+            return []
+        return [s for s in self._open.values() if s.started >= self._turn.started]
+
     def _open_span(self) -> _Span:
-        """The newest open span: an agent asks for one tool at a time, and if the
-        transcript shows two, the later one is what it is waiting on."""
-        return max(self._open.values(), key=lambda s: s.started)
+        """The newest span open IN THIS TURN: an agent asks for one tool at a time, and if
+        the transcript shows two, the later one is what it is waiting on.
+
+        PRECONDITION: state is `working`, which is the only state in which that list is
+        non-empty; raises otherwise, and callers must not ask in any other state.
+        """
+        return max(self._open_this_turn(), key=lambda s: s.started)
 
     def _turn_dict(self, now: float) -> dict[str, Any] | None:
         if self._turn is None:
@@ -695,8 +710,9 @@ def subagent_labels(path: Path) -> dict[str, str]:
     """Task id -> label, from the `agent-*.meta.json` files beside a transcript.
 
     The task id IS the subagent transcript's stem minus its `agent-` prefix, which is the
-    only join between "what the lead agent is waiting on" and "what that thing is". The
-    MIRRORS `inspection._subagent_labels`, copied here for `detail_of`'s reason: it is
+    only join between "what the lead agent is waiting on" and "what that thing is".
+
+    This MIRRORS `inspection._subagent_labels`, copied here for `detail_of`'s reason: it is
     private on a file §4 is rewriting, so reconcile the two when §4 lands — and no subagent
     TRANSCRIPT is opened: §8 owns those, and one read per frame is the cost this module
     exists to avoid.
