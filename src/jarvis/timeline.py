@@ -746,6 +746,27 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # batched release reads as the list of bugs the next version closes.
         return ("Carrying a landed fix into the next release",
                 " — ".join(x for x in (p.get("issue_url"), p.get("wo_id")) if x))
+    if kind == "release_overtaken":
+        # On the RELEASE order: another release already carries its batch, and production
+        # has not caught up. Open on purpose, so the line says what it is waiting for —
+        # issue #784's spec §6, and kn-3f133363 for why it is not left to the fallback.
+        return ("Another release already carries these fixes",
+                p.get("detail") or (p.get("tag") or ""))
+    if kind == "release_held_red_base":
+        # On the RELEASE order: the base is red, so the ship is deferred rather than
+        # attempted. Deduped per head sha, so one line per broken commit.
+        return ("Holding the release — the base branch is red",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_completed":
+        # The ending itself, whichever path reached it: `why` is which one (release.py
+        # `settle`), and it is the whole difference between "we shipped it" and
+        # "somebody else did and the fleet is on it".
+        return "The release this order was filed for is done", p.get("why") or ""
+    if kind == "pr_merge_commit_recorded":
+        # On the FIXING order, and NOT the branch tip: the commit the squash merge put on
+        # `main`, back-filled for a pull request that merged before the poller read it.
+        return ("Recorded the commit its merge put on the base branch",
+                p.get("merge_commit") or "")
     if kind == "deferral_submitted":
         # The worker deciding something is not its job is a scope decision, and the
         # timeline is the only place the user ever sees it: the item itself lands on the

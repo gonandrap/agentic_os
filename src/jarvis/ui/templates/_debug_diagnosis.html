@@ -1,0 +1,107 @@
+{% import "_debug.html" as ui %}
+{# 1. THE DIAGNOSIS — `ops.diagnose`, and it is at the TOP of the page always: "why is
+   nothing happening" is the largest bug class and must not be below the fold (spec §7).
+   Rendered in the order `cli._print_diagnosis` asks the questions in, off the same keys:
+   what it waits for, whether the OS's two answers agree, when anything last happened,
+   what held it, what the OS spent on it, and what to type. Every sentence below is the
+   payload's; this block authors none. #}
+<section id="block-diagnosis">
+<h2>Why is it not moving</h2>
+{{ ui.failed(diagnosis) }}
+{% if diagnosis.payload %}
+{% set d = diagnosis.payload %}
+<div class="panel">
+  <div class="row">
+    <span class="st tone-active wrap">{{ d.status_label }}</span>
+  </div>
+  <div class="row">
+    <span class="kv" style="width: 120px;">waiting on</span>
+    <span class="grow">{{ d.blocker.what }} — {{ d.blocker.detail }}</span>
+  </div>
+  {% for blocker in d.needs_you %}
+  <div class="row"><span class="kv" style="width: 120px;">needs you</span>
+    <span class="grow st tone-warn wrap">{{ blocker }}</span></div>
+  {% endfor %}
+  {% for note in (d.notes.parked, d.notes.pause, d.notes.fleet_hold) if note %}
+  <div class="row"><span class="sub">{{ note }}</span></div>
+  {% endfor %}
+  {# The one thing a diagnosis must never hide: where `waiting_on` and `true_blockers`
+     disagree it says so and picks neither. #}
+  {% for sentence in d.disagreements %}
+  <div class="row"><span class="st tone-warn wrap"><span class="i">⚠</span>{{ sentence }}</span></div>
+  {% endfor %}
+</div>
+
+<h2>The OS's record</h2>
+<div class="panel">
+  {% if d.clock.last_status %}
+  <div class="row"><span class="kv" style="width: 120px;">last status</span>
+    <span class="grow mono">{{ d.clock.last_status.status }}</span>
+    <span class="kv">{{ d.clock.last_status.ago }} ago</span></div>
+  {% endif %}
+  {% if d.clock.last_turn %}
+  <div class="row"><span class="kv" style="width: 120px;">last turn</span>
+    <span class="grow mono">{{ d.clock.last_turn.label }} {{ d.clock.last_turn.state }}</span>
+    <span class="kv">{{ d.clock.last_turn.ago }} ago</span></div>
+  {% endif %}
+  {% if d.clock.last_event %}
+  <div class="row"><span class="kv" style="width: 120px;">last event</span>
+    <span class="grow mono">{{ d.clock.last_event.kind }}</span>
+    <span class="kv">{{ d.clock.last_event.ago }} ago</span></div>
+  {% endif %}
+  {{ ui.note(d.clock.note) }}
+  {{ ui.note(d.clock.live_note) }}
+</div>
+
+{% if d.holds.episodes or d.holds.unexplained.note %}
+<h2>Held by the OS</h2>
+<div class="panel">
+  {% for episode in d.holds.episodes %}
+  <div class="row">
+    <span class="grow">{{ episode.phrase }}</span>
+    <span class="kv mono">{{ episode.seconds_human }}{{ ' · still held' if episode.open }}</span>
+  </div>
+  {% endfor %}
+  {# THE RESIDUAL, labelled as one: idle the record does not account for, not a cause.
+     `seconds: None` is unmeasurable and never zero (issue #227). #}
+  <div class="row">
+    <span class="kv" style="width: 120px;">unexplained</span>
+    <span class="grow sub">{{ d.holds.unexplained.note }}</span>
+    <span class="kv mono">{{ d.holds.unexplained.seconds_human or 'none measurable' }}</span>
+  </div>
+</div>
+{% endif %}
+
+{% if d.os_calls.calls %}
+<h2>The OS's own calls for this order</h2>
+<div class="panel">
+  <div class="row"><span class="grow">{{ d.os_calls.calls }} call(s),
+    {{ d.os_calls.failed }} unreachable</span></div>
+  {% for row in d.os_calls.rows[:d.os_calls.shown_limit] %}
+  <div class="row"><span class="kv mono" style="width: 110px;">{{ row.outcome }}</span>
+    <span class="grow">{{ row.kind }} · {{ row.label }}</span></div>
+  {% endfor %}
+  {% if d.os_calls.more %}
+  <div class="sub" style="padding: 8px 16px;">… and {{ d.os_calls.more }} older call(s) —
+    <code>jarvis wo why {{ d.wo_id }} --json</code> has them all.</div>
+  {% endif %}
+  {% if d.os_calls.failed or d.os_calls.capped %}{{ ui.note(d.os_calls.note) }}{% endif %}
+</div>
+{% endif %}
+
+<h2>The way through</h2>
+<div class="panel">
+  {{ ui.note(d.way_through.note) }}
+  {% for command in d.commands %}
+  <div class="row">
+    <code style="width: 46%;">{{ command.command }}</code>
+    <span class="grow sub">{{ command.why }}</span>
+  </div>
+  {% endfor %}
+  {% for refusal in d.refusals %}
+  <div class="row"><span class="kv" style="width: 110px;">not offered</span>
+    <span class="grow sub">{{ refusal }}</span></div>
+  {% endfor %}
+</div>
+{% endif %}
+</section>

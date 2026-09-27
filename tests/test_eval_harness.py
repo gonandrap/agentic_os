@@ -89,3 +89,69 @@ def test_every_routing_scenario_is_reachable(eval_module) -> None:
     assert "pulse" in names
     pulse = next(r for r in eval_module.ROUTING if r[0] == "pulse")
     assert pulse[2] == ["jarvis status"]
+
+
+# An eval that spawns `claude` itself re-implements the isolation `claude_cli` owns, and
+# those flags are what keep the call off the CLI's default context. Empty: no eval has a
+# reason. Spec: docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+SELF_SPAWN_ALLOWED: dict[str, str] = {}
+
+_SPAWNERS = {("subprocess", "run"), ("subprocess", "Popen")}
+
+
+def _spawns_claude(tree: ast.AST) -> list[str]:
+    """The spawn calls in `tree` whose argv[0] is the `claude` binary.
+
+    AST, not grep, for the reason at line 43: an eval's prose about the flags keeps a
+    substring check green long after the argv was deleted.
+    """
+    lists: dict[str, ast.List] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.List):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    lists[target.id] = node.value
+
+    def is_claude(argv: ast.expr) -> bool:
+        if isinstance(argv, ast.Name):
+            argv = lists.get(argv.id, argv)
+        if isinstance(argv, ast.BinOp) and isinstance(argv.op, ast.Add):
+            argv = argv.left
+        if not isinstance(argv, ast.List) or not argv.elts:
+            return False
+        first = argv.elts[0]
+        if isinstance(first, ast.Constant):
+            return Path(str(first.value)).name == "claude"
+        return isinstance(first, ast.Call) and getattr(
+            first.func, "attr", getattr(first.func, "id", "")) == "claude_bin"
+
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        func = node.func
+        if not isinstance(func.value, ast.Name):
+            continue
+        name = ""
+        if (func.value.id, func.attr) in _SPAWNERS:
+            name = f"{func.value.id}.{func.attr}"
+        elif func.value.id == "os" and func.attr.startswith("exec"):
+            name = f"os.{func.attr}"
+        if name and node.args and is_claude(node.args[0]):
+            found.append(f"{name} at line {node.lineno}")
+    return found
+
+
+@pytest.mark.parametrize("path", sorted((REPO_ROOT / "evals" / "llm").glob("*.py")),
+                         ids=lambda p: p.name)
+def test_no_eval_spawns_claude_itself(path: Path) -> None:
+    """The one transport is `claude_cli.run_headless[_result]`, which carries the
+    minimal-context flags. A new file under evals/llm/ rolling its own `claude -p`
+    therefore fails on arrival."""
+    if path.name in SELF_SPAWN_ALLOWED:
+        pytest.skip(SELF_SPAWN_ALLOWED[path.name])
+    spawns = _spawns_claude(ast.parse(path.read_text()))
+    assert not spawns, (
+        f"{path.name} spawns claude directly ({', '.join(spawns)}); "
+        "call claude_cli.run_headless instead"
+    )

@@ -1,0 +1,89 @@
+{# Shared furniture for the four blocks of the debugging page (spec §7 of
+   docs/specs/2026-09-24-order-observability.md).
+
+   `failed` is the whole of "degradation is a feature, not an error page": each block is
+   read independently and one that could not be read says so, in the sentence the route
+   composed, while the other three render as usual. A 500 here would cost an inbox item
+   and an `INV-UI-HEALTHY` fleet alarm.
+
+   `note` exists so an ABSENCE is never a zero (issue #227): every payload that cannot be
+   read carries its own sentence, and this prints that sentence rather than an empty
+   table a reader would report as a bug. #}
+
+{% macro failed(block) %}
+{% if block.error %}
+<div class="panel" style="padding: 12px 16px;">
+  <span class="st tone-bad wrap"><span class="i">✗</span>{{ block.error }}</span>
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro note(text) %}
+{% if text %}<div class="sub" style="padding: 10px 16px; color: var(--ink-2);">{{ text }}</div>{% endif %}
+{% endmacro %}
+
+{# The per-turn partition bar. Widths come STRAIGHT off `share`, which `inspection`
+   already rounded — the template's only arithmetic is the CSS percentage, and the glyph
+   legend is `part_short`, the same keys `jarvis inspect` prints (spec §4c). #}
+{% macro bar(share) %}
+<div style="display: flex; height: 9px; width: 220px; border: 1px solid var(--line);
+            border-radius: 3px; overflow: hidden; background: var(--raised);">
+  {% for k in parts %}
+  <div title="{{ part_labels[k] }}" style="width: {{ share[k] * 100 }}%;
+       {# `.get` and not `[k]`: a sixth bucket in `inspection.PARTS` must render as a grey
+          slice, never as a 500 on a page someone opened to find out why nothing moved. #}
+       background: {{ {'generating': 'var(--cyan)', 'blocked': 'var(--amber)',
+                       'tools': 'var(--green)', 'idle': 'var(--ink-3)',
+                       'unaccounted': 'var(--red)'}.get(k, 'var(--ink-2)') }};"></div>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro bar_legend() %}
+<div class="kv" style="padding: 8px 16px;">
+  {% for k in parts %}<span class="mono">{{ part_short[k] }}</span> {{ part_labels[k] }}{{ " · " if not loop.last }}{% endfor %}
+</div>
+{% endmacro %}
+
+{# One tool call's parameters, with every key accounted for: kept, shortened or dropped.
+   Autoescaped like everything else here — a tool input is text a worker (or whatever it
+   read) wrote, and `|safe` on any of it would be an injection. #}
+{% macro params(span) %}
+{% if span.params %}
+<table style="margin: 4px 0 0;">
+  {% for key, value in span.params.items() %}
+  <tr><td class="mono" style="width: 140px; color: var(--ink-2);">{{ key }}</td>
+      <td class="mono" style="word-break: break-all;">{{ value }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% if span.params_truncated %}
+<div class="sub">shortened to the per-value cap: <span class="mono">{{ span.params_truncated|join(', ') }}</span></div>
+{% endif %}
+{% if span.params_dropped %}
+<div class="sub">not printed — the call or turn budget ran out: <span class="mono">{{ span.params_dropped|join(', ') }}</span></div>
+{% endif %}
+{% endmacro %}
+
+{# A subagent's own anatomy, drawn OUT of the turn it ran in and never added to it
+   (spec §4b). `deeper` is stated even at zero, because silence would read as "there were
+   none deeper" while only `depth_read` levels were looked at. #}
+{% macro subagent(s) %}
+{# Indented under the turn that joined it, because it IS a partition of that turn: at the
+   same offset as the turn's own rows it reads as another turn (screenshot review). #}
+<div style="margin-left: 28px; border-left: 2px solid var(--line);">
+<div class="row">
+  <span class="mono">{{ s.task_id }}</span>
+  <span class="grow">{{ s.label or 'no label recorded' }}</span>
+  <span class="kv mono">{{ fmt_dur(s.wall) }} · {{ s.api_calls }} API calls ·
+    peak {{ fmt_tok(s.context_peak) }}</span>
+</div>
+{% if s.writes_by_cause %}
+<div class="sub" style="padding: 0 16px 8px;">cache writes:
+  {% for cause, written in s.writes_by_cause.items() %}<span class="mono">{{ cause }}</span> {{ fmt_tok(written) }}{{ " · " if not loop.last }}{% endfor %}
+</div>
+{% endif %}
+<div class="sub" style="padding: 0 16px 8px;">{{ s.deeper }} subagent(s) of its own,
+  counted and not read — this report reads {{ s.depth_read }} level deep.</div>
+</div>
+{% endmacro %}

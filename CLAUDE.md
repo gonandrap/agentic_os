@@ -404,17 +404,23 @@ jarvis bug report "title" -d "..." -e "expected" -a "actual" -p <priority>
                                            # start` would do, in one step, printed as the
                                            # wo-id. Use it so the priority can stay an
                                            # honest description of the defect instead of
-                                           # being inflated to buy attention. On
-                                           # critical/blocker it does NOT skip Neo, and
-                                           # A CLAIM STILL BUYS NO RELEASE: the work
-                                           # order is dispatched carrying NO rating, the
-                                           # re-assessment runs alongside, and only Neo
-                                           # confirming writes the rating on and lets a
-                                           # release ship when the fix lands. A fix that
-                                           # lands before the verdict ships none — cut
-                                           # one by hand if it was wanted. What the
-                                           # verdict no longer decides is whether the
-                                           # work happens.
+                                           # being inflated to buy attention. AN
+                                           # EXPEDITED FIX SHIPS A RELEASE WHEN IT LANDS,
+                                           # at ANY priority and whatever Neo later says
+                                           # about the rating: expediting IS the user
+                                           # saying they want this in production now, so
+                                           # making them ask again once it merges is
+                                           # asking twice. Several landing close together
+                                           # make ONE release, and a red `main` holds it
+                                           # rather than shipping it. The rule that has
+                                           # NOT changed is the other one: a CLAIMED
+                                           # critical/blocker buys no release ON ITS OWN
+                                           # — an unexpedited claim is dispatched only
+                                           # once Neo confirms, and an expedited one is
+                                           # dispatched carrying NO rating while the
+                                           # re-assessment runs alongside. Neo's verdict
+                                           # decides the RATING; the user's --expedite
+                                           # decides the release. Don't cut one by hand.
 jarvis config wiring [project]             # which of the USER'S OWN MCP servers, skills
                                            # and plugins reach this project's workers.
                                            # Everything is wired by default, including

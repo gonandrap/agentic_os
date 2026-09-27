@@ -690,6 +690,16 @@ switch — the two are separate, as above.
 rows. The class renders as *not recorded*, never as `0.00` spent — §2's standing rule
 governs this section's own numbers exactly as it governs every other section's.
 
+**The absent list is read, not re-written.** Work order wo-92b0a58d's brief says "Change no
+bill arithmetic, no route, no template, no payload." Where that collides with this section,
+this section wins — Neo, question 766 on that order, 2026-09-26. The brief's "no template"
+does not bar the one read of `bill.py`'s absent list that this section's *not recorded* line
+needs. Today that list is hard-coded twice: `cli._print_bill`'s `absent` dict
+(`src/jarvis/cli.py`) and `src/jarvis/ui/templates/bill.html`. `bill.py` becomes the single
+source of it, the sentence text included, and both renderers only read it; the observability
+entry is added there. No other template change, and no arithmetic or payload change. Do not
+re-open this on a later child.
+
 ---
 
 ## 11. Clearing the blocker the diagnosis just named

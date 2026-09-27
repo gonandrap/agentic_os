@@ -199,7 +199,7 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 #:   on the `pr_merged` event so the landing sweep can ask months later without a second
 #:   round trip (`landing.assess`).
 PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,"
-             "statusCheckRollup,headRefOid")
+             "statusCheckRollup,headRefOid,mergeCommit")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
 #: distinction is the whole of the red-pull-request spec's §2: a run that is PENDING,
@@ -303,6 +303,13 @@ class PullRequest:
     #: (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5.1).
     #: `ops.catch_up_needed` asks the ancestry question this is the input to.
     base_oid: str = ""
+    #: `mergeCommit.oid`: the commit THIS PULL REQUEST PUT ON ITS BASE, and `""` when
+    #: GitHub did not answer it (an open pull request has none, which is not an error).
+    #: NOT `head_oid` and never interchangeable with it: `automerge._merge_args` merges
+    #: with `--squash`, so the branch tip above is never an ancestor of `main` and this
+    #: is the only sha a tag can contain. Read by the release settlement
+    #: (docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md §2).
+    merge_commit_oid: str = ""
 
     @property
     def merged(self) -> bool:
@@ -421,6 +428,8 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         checks=read_checks(payload),
         head_oid=str(payload.get("headRefOid") or ""),
         base_oid=str(payload.get("baseRefOid") or ""),
+        # A nested object, so one `or {}` guard — spec §2.
+        merge_commit_oid=str((payload.get("mergeCommit") or {}).get("oid") or ""),
     )
 
 
