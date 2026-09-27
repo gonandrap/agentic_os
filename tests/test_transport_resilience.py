@@ -20,13 +20,19 @@ import time
 
 import pytest
 
+from jarvis import claude_cli, invariants
 from jarvis import neo as neo_mod
 from jarvis import ops, panel, supervisor
 from jarvis import testing as T
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import MAX_ANSWER_ATTEMPTS, UNREACHABLE_PREFIX, NeoStore
+from jarvis.neo_store import (
+    MAX_ANSWER_ATTEMPTS,
+    STALE_ANSWERING_SECONDS,
+    UNREACHABLE_PREFIX,
+    NeoStore,
+)
 from jarvis.project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
 from jarvis.seats import Opinion
 
@@ -243,6 +249,80 @@ def test_the_inbox_says_unreachable_and_never_escalated(asked, project):
         assert "could not answer" in fresh["attention_reason"]
     finally:
         store.close()
+
+
+def test_a_question_stranded_in_answering_is_surfaced_too(asked, project):
+    """THE SILENT PATH (2026-09-26-an-unreachable-neo-question… §5): `reclaim_stale` marks
+    a stranded question `failed` with no callback and `neo_tick` only logged the ids, so
+    half the unreachable rows reached neither the inbox nor the attention flag."""
+    daemon, wo = asked
+    store = NeoStore()
+    try:
+        q = store.claim_next()
+        store.conn.execute("UPDATE questions SET attempts=?, claimed_at=? WHERE id=?",
+                           (MAX_ANSWER_ATTEMPTS,
+                            time.time() - STALE_ANSWERING_SECONDS - 60, q["id"]))
+    finally:
+        store.close()
+
+    daemon.neo_tick()
+    daemon.neo_tick()
+
+    failed = _q(q["id"])
+    assert failed["status"] == "failed"
+    central = CentralStore()
+    try:
+        rows = [r for r in central.unacked_inbox()
+                if "could not be reached" in r["title"]]
+    finally:
+        central.close()
+    assert len(rows) == 1, "a second tick announced the same outage again"
+    assert rows[0]["level"] == "warning"
+    assert "NOBODY HAS JUDGED THIS" in rows[0]["body"]
+
+    pstore = ProjectStore(project)
+    try:
+        fresh = pstore.get_work_order(wo["id"])
+    finally:
+        pstore.close()
+    assert fresh["needs_attention"]
+    assert fresh["attention_reason"] == invariants.neo_question_blocker(failed)
+
+
+def test_one_unsurfaceable_stranded_question_does_not_silence_the_rest(asked, project):
+    """The guard is PER QUESTION: a batch of two, the first one blowing up on the way to
+    the inbox, and the second still gets its warning."""
+    daemon, wo = asked
+    ops.ask_question(wo["id"], "And should it gzip the export?")
+    store = NeoStore()
+    try:
+        first, second = store.claim_next(), store.claim_next()
+        assert first and second
+        store.conn.execute(
+            "UPDATE questions SET attempts=?, claimed_at=? WHERE id IN (?, ?)",
+            (MAX_ANSWER_ATTEMPTS, time.time() - STALE_ANSWERING_SECONDS - 60,
+             first["id"], second["id"]))
+    finally:
+        store.close()
+
+    real = daemon._note_question_unreachable                            # noqa: SLF001
+
+    def boom(central, q, detail):
+        if q["id"] == first["id"]:
+            raise RuntimeError("inbox write blew up on the first row")
+        real(central, q, detail)
+
+    daemon._note_question_unreachable = boom                            # noqa: SLF001
+    daemon.neo_tick()
+
+    central = CentralStore()
+    try:
+        rows = [r for r in central.unacked_inbox()
+                if "could not be reached" in r["title"]]
+    finally:
+        central.close()
+    assert len(rows) == 1, "the first bad row cost the second its inbox warning"
+    assert "NOBODY HAS JUDGED THIS" in rows[0]["body"]
 
 
 def test_an_approval_gate_is_never_decided_by_a_crash(asked, project):
@@ -529,3 +609,47 @@ def test_a_recovered_transport_delivers_the_message_it_held(started, project):
             == ["actually, use JSON"]
     finally:
         store.close()
+
+
+# -- a prompt too big for argv is not an outage ----------------------------------------
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md §5
+
+
+def test_a_prompt_too_big_for_argv_gives_up_at_the_first_attempt(asked):
+    """Production question 722, ~151.7K chars: three identical doomed `execve` calls and
+    45 minutes of a worker parked on `waiting_input`, for an outcome knowable at the
+    first byte count. The retries are only a delay, so there are none — and the rest of
+    the FIFO queue is still drained.
+    """
+    daemon, wo = asked
+    ops.ask_question(wo["id"], "And should it gzip the export?")
+    deliver, unreachable = T.Recorder(), T.Recorder()
+    seen: list[int] = []
+
+    def answerer(store, q, model, learnings_limit):
+        seen.append(q["id"])
+        if len(seen) == 1:
+            raise claude_cli.InputTooLargeError(
+                "`claude` could not be started: the input was too large for the "
+                "command line (151700 bytes of arguments)")
+        return {"escalate": False, "answer": "CSV", "reason": "the exporter is a feed"}
+
+    store = NeoStore()
+    try:
+        results = neo_mod.drain_queue(store, model="sonnet", deliver=deliver,
+                                      unreachable=unreachable, answer=answerer)
+    finally:
+        store.close()
+
+    q = _q(1)
+    assert q["status"] == "failed", "a deterministic refusal was queued for a retry"
+    assert q["attempts"] == 0, "a history of retries that never happened"
+    assert q["answer"] is None
+    assert q["answer_reason"].startswith(UNREACHABLE_PREFIX)
+    assert "input too large" in q["answer_reason"]
+    assert len(unreachable) == 1
+    assert results[0]["verdict"] is None, "a call that never happened is not an answer"
+    assert results[0]["outcome"] == "unreachable"
+    assert [c[0]["id"] for c in deliver.calls] == [2], \
+        "the failure was delivered downstream, or the next question was abandoned"
+    assert _q(2)["status"] == "answered"

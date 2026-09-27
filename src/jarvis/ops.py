@@ -2602,6 +2602,42 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
+def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the surfaces say about this order's pull request landing, or None.
+
+    `automerge_state`'s shape and its reasons: None — and therefore no line at all — for
+    an order with no pull request and no `pr_merged` event, so an order the mechanism
+    never touched gains nothing. ONE derivation for `jarvis wo show` (`cli.py`) and the
+    dashboard work-order page (`ui/app.py`), because a derivation duplicated across those
+    two files is how they drift (2026-09-25 spec §7).
+
+    **NEVER FROM `pr_state`** (kn-dbc4971d): that column is stale by construction, has one
+    permitted reader, and gains no writer in this change. MERGED comes from the
+    `pr_merged` event — written by `ops.complete_merged` when the merge ended the order and
+    by `Daemon.refresh_landings` when it was observed afterwards — and any other state from
+    the newest `landing_seen`, which is dated and audited.
+
+    An empty `state` means NOTHING HAS LOOKED YET, which `landing` is careful never to read
+    as "did not merge".
+    """
+    from . import db
+
+    pr_url = str(wo.get("pr_url") or "")
+    merged = store.events_of_kind(wo["id"], "pr_merged")
+    if not pr_url and not merged:
+        return None
+    if merged:
+        payload = db.from_json(merged[-1]["payload"], {})
+        return {"pr_url": str(payload.get("pr_url") or pr_url), "state": "MERGED",
+                "head_oid": str(payload.get("head_oid") or ""),
+                "merged_at": payload.get("merged_at"),
+                "source": str(payload.get("source") or "")}
+    seen = store.events_of_kind(wo["id"], "landing_seen")
+    payload = db.from_json(seen[-1]["payload"], {}) if seen else {}
+    return {"pr_url": pr_url, "state": str(payload.get("pr_state") or ""),
+            "head_oid": "", "merged_at": None, "source": ""}
+
+
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
 
@@ -2733,6 +2769,12 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # An ask is a claim about a question, resolved against `questions.status` for the same
+    # reason (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    if newest["kind"] == "autoreview_asked":
+        gone = _unreachable_asks()(newest.get("neo_question_id"))
+        if gone:
+            newest = {**newest, "unreachable": gone}
     # "left with you" is a claim about the PRESENT: resolve it against the row, once
     # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §1).
     if newest["kind"] in _AUTOREVIEW_OWED_BY_USER:
@@ -2844,6 +2886,58 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str):
     return stale
 
 
+def _unreachable_asks():
+    """`question_id -> {"question_id", "hint"} | None` — the asks whose question is DEAD.
+
+    kn-96f47efb at the read side, and the third instance of it after
+    `_AUTOREVIEW_OWED_BY_USER` and `_stale_panel_hold`: `autoreview_asked` is append-only
+    and immortal, so "awaiting ruling" is a present-tense claim about a row in `neo.db`
+    that has since changed status, and it has to be re-derived rather than believed.
+
+    LAZY, `_stale_panel_hold`'s discipline — an order with no ask pays nothing — and
+    cached per question, so `neo.db` is opened and closed once per link actually asked
+    about (`invariants.awaiting_neo`'s shape, and `ops.delete_work_order`'s precedent for
+    ops reaching into it at all). Best-effort in the same direction: any failure opening or
+    reading it yields None, so the line reads as it does today rather than taking
+    `jarvis wo show` down.
+
+    UNREACHABLE IS `status == 'failed'` AND NOTHING ELSE. `escalated` is Neo handing the
+    question back WITH a decision, and reaches the assumption as an `autoreview_escalated`
+    event; `queued`, `answering` and `answered` are genuinely in flight or already
+    delivered. `failed` on an assumption question has exactly two writers —
+    `neo_store.release_claim` and `neo_store.reclaim_stale` — and both stamp
+    `UNREACHABLE_PREFIX`, which is where the hint comes from. The prefix is stripped: the
+    sentence around it already says Neo could not be reached, and printing it twice reads
+    as a quoted status code.
+    """
+    from .neo_store import UNREACHABLE_PREFIX, NeoStore
+
+    cache: dict[int, dict[str, Any] | None] = {}
+
+    def dead(question_id: Any) -> dict[str, Any] | None:
+        qid = int(question_id or 0)
+        if not qid:
+            return None
+        if qid not in cache:
+            cache[qid] = None
+            try:
+                neo = NeoStore()
+                try:
+                    q = neo.get(qid)
+                finally:
+                    neo.close()
+            except Exception:  # noqa: BLE001 — see docstring: never take a surface down
+                q = None
+            if q and str(q["status"] or "") == "failed":
+                hint = str(q["answer_reason"] or "")
+                if hint.startswith(UNREACHABLE_PREFIX):
+                    hint = hint[len(UNREACHABLE_PREFIX):]
+                cache[qid] = {"question_id": qid, "hint": " ".join(hint.split())[:160]}
+        return cache[qid]
+
+    return dead
+
+
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling`.
 
@@ -2887,6 +2981,17 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
+    # Only the rows whose surviving ruling IS an ask can carry the fact, so only those are
+    # asked about — `_overtaken`'s and `objection_response`'s discipline. One branch covers
+    # both links: `propose_confirmation` writes `autoreview_asked` too, with `confirm`
+    # (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    gone = _unreachable_asks()
+    for ruling in newest.values():
+        if ruling["kind"] != "autoreview_asked":
+            continue
+        unreachable = gone(ruling.get("neo_question_id"))
+        if unreachable:
+            ruling["unreachable"] = unreachable
     base = store.all_assumptions(wo_id)
     rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
              # Both derivations read the carrier and the timeline, so they are asked only
@@ -2914,8 +3019,12 @@ def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
     already landed, else None.
 
     From the TIMELINE, never from `work_orders.pr_state` — kn-dbc4971d, that column is
-    stale by construction. `pr_merged` is written by `complete_merged`, the single
-    close-out for a hand-merge and an auto-merge alike, so one read covers both routes.
+    stale by construction. `pr_merged` has TWO writers since the 2026-09-25 spec §5:
+    `complete_merged`, the close-out for a hand-merge and an auto-merge alike, and
+    `Daemon.refresh_landings`, which records a merge it observed after the order had
+    already settled. Both mean the child's code is on the default branch, which is the
+    only thing counted here, so one read still covers every route — and the second writer
+    ADDS the children that reached `completed` without the merge ending them.
     """
     fo = store.feature_order_for_planner(wo_id)
     if fo is None or fo.get("plan_wo_id") != wo_id:
@@ -3031,6 +3140,17 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
         held = re.sub(r"^assumption #\d+ ", "", reason)
         return f"Held by the OS — {held}" if held else "Held by the OS"
     if kind == "autoreview_asked":
+        # A dead question is not a ruling on its way — §3 of
+        # 2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md. Neither
+        # "escalated" nor "Neo decided" is sayable here: a crash is not a decision.
+        gone = ruling.get("unreachable") or {}
+        if gone:
+            what = " to confirm its early reading" if ruling.get("confirm") else ""
+            tail = f" — last error: {gone['hint']}" if gone.get("hint") else ""
+            return (f"Neo could not be reached (question {gone['question_id']}) — nobody "
+                    f"judged this{what}; you decide it: `jarvis neo answer "
+                    f"{gone['question_id']} \"…\"` then `jarvis wo review "
+                    f"{a.get('wo_id')}`{tail}")
         return f"Asked Neo (question {question}), awaiting ruling"
     if kind == "autoreview_unconfirmed":
         # The early reading did not survive the diff, so the assumption is the user's and
@@ -3158,6 +3278,14 @@ def _autoreview_line(state: dict[str, Any]) -> str:
         return (f"assumption #{n} left with you — "
                 f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_asked":
+        # `left with you` deliberately: the same claim as the two `_AUTOREVIEW_OWED_BY_USER`
+        # branches, so it sorts into the same reading (§3). No `resolved_status` suffix —
+        # that resolves an event against a SETTLED row and this branch is only reachable
+        # while the row is pending.
+        gone = state.get("unreachable") or {}
+        if gone:
+            return (f"assumption #{n} left with you — Neo could not be reached "
+                    f"(question {gone['question_id']}); nobody judged it")
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
     # The early pass's five. Each gets a branch rather than falling through, because the
     # fallthrough below says "held" — a kind with no branch would claim the OS refused to
@@ -3336,7 +3464,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     off the same predicate: see `unlanded_work`.
     """
     wo_id = wo["id"]
-    pr_url = pr_url or wo.get("pr_url") or None
+    pr_url = pr_url or (str(wo.get("pr_url") or "")
+                        if routes_on_pull_request(store, wo) else "") or None
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
@@ -3351,6 +3480,55 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The pull request the SUBMITTER declared — the only one that routes the merge queue.
+
+    `work_orders.pr_url` has two sources since issue #742. `ops.finish` writes it from
+    `jarvis wo finish --pr` and records `finished {pr_url}`; `gates._record_pull_request`
+    writes it from an approved merge gate and records `pr_url_recorded {source: "gate"}`,
+    which is the only record a planner's pull request leaves. A gate-derived URL is
+    DELIBERATELY NOT A DECLARATION: it is recorded for every reader (INV-PR-RECORDED, the
+    landing sweep, the CLI and the dashboard) and inert for routing, so a planner whose
+    gate was decided before `ops.submit_plan` settles `completed` rather than parking in
+    `waiting_pr_merge` and opening a validation round over a pull request that has already
+    merged (2026-09-25 spec §3).
+
+    **THIS PREDICATE IS THE ONE LINE TO REVISIT** if another route is ever to reach the
+    merge queue. Nothing else branches on where the column came from, and every router
+    asks `routes_on_pull_request`, which is this read plus the gate-only test.
+
+    It says WHETHER a declaration exists, and the routers still route on the caller's own
+    `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
+    BLANKED once the poll has settled that pull request, and returning a URL out of the
+    timeline there would put a closed pull request back in the merge queue.
+    """
+    for event in reversed(store.events_of_kind(wo["id"], "finished")):
+        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
+        if declared:
+            return declared
+    return ""
+
+
+def routes_on_pull_request(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Whether `wo['pr_url']` may move this work order — the merge queue's one test.
+
+    ONE rule, read by `land_finished`, by the reconciler's park and by
+    `Daemon.poll_pull_requests`, because three copies of it is how a gate-recorded URL
+    stayed inert at one site and settled a planner at the others (2026-09-25 spec §4).
+
+    A NEGATIVE test, deliberately: the column routes unless it is GATE-ONLY — a
+    `pr_url_recorded` event with no declaration behind it (`declared_pull_request`). A row
+    carrying a `pr_url` and no event about it at all is a legacy row, and it keeps routing
+    exactly as it did. Requiring a declaration instead would take every record written
+    before issue #742 out of the merge queue.
+    """
+    if not wo.get("pr_url"):
+        return False
+    if not store.events_of_kind(wo["id"], "pr_url_recorded"):
+        return True
+    return bool(declared_pull_request(store, wo))
 
 
 def unlanded_work(store: ProjectStore, wo: dict[str, Any],
@@ -9330,6 +9508,45 @@ def inspect_report(target: str, project: str | None = None, *,
     return {"scope": fo["id"], "title": fo["title"], "status": fo["status"],
             "write_floor": cfg.report_write_floor,
             "join_floor": cfg.report_join_floor, "units": units}
+
+
+def live_report(target: str, project: str | None = None, *,
+                reader: Any = None, now: float | None = None) -> dict[str, Any]:
+    """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point.
+
+    THE SINGLE SHIPPED ENTRY POINT, and both renderers consume the payload without
+    reshaping it: a renderer that derives a number is one the other surface will disagree
+    with (PR 65). Returns `live.Live.as_dict()` verbatim.
+
+    A WORK ORDER ONLY. A feature order is not a live turn — it has no session and no
+    clock of its own — so `find_work_order`'s OpsError is the right answer for one, and
+    `inspect_report`'s feature-order-first resolution deliberately is not copied.
+
+    `reader` is the caller's `live.Reader`, reused across frames (Neo q678 (1)): it holds
+    the resolved transcript path and the rows already parsed, which is what makes a
+    two-second refresh cheap. None builds one for this call. Nothing is cached at module
+    level and nothing is persisted.
+    """
+    from . import holds, live
+    from . import worker_session as ws
+
+    name, path, wo = find_work_order(target, project)
+    reader = live.Reader() if reader is None else reader
+    reader.bind(wo.get("session_id") or "")
+    store = ProjectStore(path)
+    try:
+        # The two facts only the record knows, plus the holds — `live` opens no database,
+        # so they are read here and passed in (`inspection.read_session`'s `spans` rule).
+        return reader.snapshot(
+            wo_id=wo["id"], project=name,
+            turn_in_flight=ws.busy(store, wo["id"]) is not None,
+            settled=wo["status"] not in OPEN_STATUSES,
+            now=time.time() if now is None else now,
+            holds=holds.held(store, wo["id"]),
+            write_floor=inspect_config(name).report_write_floor,
+        ).as_dict()
+    finally:
+        store.close()
 
 
 #: The precedence, carried in the PAYLOAD and not only in this file's prose, because the

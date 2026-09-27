@@ -7,6 +7,7 @@ All interaction with Claude Code goes through here so tests can substitute a fak
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -73,9 +74,25 @@ def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
 #: docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
 
+#: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv.
+#: Same number and same reasoning as `SYSTEM_PROMPT_ARGV_LIMIT`, and a SEPARATE constant
+#: because the two doors are different mechanisms (`--append-system-prompt-file` vs
+#: stdin). Spec: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+PROMPT_ARGV_LIMIT = 64 * 1024
+
 
 class ClaudeCliError(RuntimeError):
     pass
+
+
+class InputTooLargeError(ClaudeCliError):
+    """`execve` refused the argv: one argument was past `MAX_ARG_STRLEN`.
+
+    A ClaudeCliError subclass so existing handlers still catch it, but a SEPARATE class
+    because it is deterministic: the same call will fail the same way for ever, so a
+    retry is only a delay. Distinguished from every transient outage by that fact.
+    Spec §4: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    """
 
 
 class AttributionRefused(RuntimeError):
@@ -155,7 +172,15 @@ def version() -> str:
 
 
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
-         env_extra: dict[str, str] | None = None) -> str:
+         env_extra: dict[str, str] | None = None,
+         stdin_text: str | None = None) -> str:
+    """One `claude` call, waited for. `stdin_text` is the prompt's second door.
+
+    `input=None` leaves stdin inherited exactly as before, so no existing caller
+    changes. `encoding="utf-8"` rather than bare `text=True`: the locale encoding would
+    raise `UnicodeEncodeError` on a non-ASCII prompt under `LANG=C`. Spec §2:
+    docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    """
     env = os.environ.copy()
     # `env_extra` is caller intent and must win over the cache default; ambient env loses.
     env.update(cache_env(env_extra))
@@ -166,12 +191,22 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            input=stdin_text,
             timeout=timeout,
         )
     except FileNotFoundError as e:
         raise ClaudeCliError(f"`{claude_bin()}` not found on PATH") from e
     except subprocess.TimeoutExpired as e:
         raise ClaudeCliError(f"`claude {' '.join(args[:3])}...` timed out after {timeout}s") from e
+    except OSError as e:
+        # AFTER `FileNotFoundError`, which is an `OSError` and keeps its own message.
+        if e.errno == errno.E2BIG:
+            raise InputTooLargeError(
+                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
+            ) from e
+        raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
     if proc.returncode != 0:
         raise _cli_failure(args, proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout
@@ -774,6 +809,7 @@ def turn_args(
     autocompact_window: int | None = None,
     agent: str | None = None,
     max_budget_usd: float | None = None,
+    prompt_via_stdin: bool = False,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -807,6 +843,10 @@ def turn_args(
         # Formatted rather than str()'d so a computed remainder never reaches argv in
         # scientific notation, which the CLI's parser does not accept.
         args += ["--max-budget-usd", f"{max_budget_usd:.6f}"]
+    if prompt_via_stdin:
+        # Neither the fence nor the prompt: with no prompt in argv there is nothing to
+        # fence. Spec §3: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+        return args
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.
@@ -854,12 +894,21 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     that same environment, which is the whole reason they share this one function.
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
-    args = turn_args(prompt, session_id, resume, **kwargs)
+    # THE PROMPT FILE BELONGS TO THE TURN, like `<seq>.json` and `<seq>.err`, and
+    # `worker_session._reap` deletes it: this function returns before the detached
+    # `claude` has read its stdin. Spec §3:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    big = len(prompt.encode()) > PROMPT_ARGV_LIMIT
+    promptfile = outfile.with_suffix(".prompt") if big else None
+    if promptfile is not None:
+        promptfile.write_text(prompt, encoding="utf-8")
+    args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
     env = {**os.environ, **cache_env()}
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,
             description=f"jarvis worker turn ({session_id})",
+            stdin=promptfile,
         )
         try:
             # No redirection here: the unit's own StandardOutput= writes the result file,
@@ -882,17 +931,30 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             log.warning("systemd-run failed for %s (%s): %s — spawning directly",
                         unit, done.returncode, (done.stderr or "").strip()[:300])
     try:
-        with outfile.open("w") as out, errfile.open("w") as err:
+        with contextlib.ExitStack() as stack:
+            out = stack.enter_context(outfile.open("w"))
+            err = stack.enter_context(errfile.open("w"))
+            # The child inherits a dup of the fd, so the parent's handle closing here is
+            # harmless. DEVNULL for the small case, unchanged: that is what stops the
+            # three-second wait.
+            stdin: Any = subprocess.DEVNULL
+            if promptfile is not None:
+                stdin = stack.enter_context(promptfile.open("rb"))
             proc = subprocess.Popen(
                 [claude_bin(), *args],
                 cwd=cwd,
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin,
                 stdout=out,
                 stderr=err,
                 start_new_session=True,
             )
-    except (FileNotFoundError, OSError) as e:
+    except OSError as e:
+        if e.errno == errno.E2BIG:
+            raise InputTooLargeError(
+                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
+            ) from e
         raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
     return SpawnedTurn(pid=proc.pid)
 
@@ -1719,7 +1781,10 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         _check_kind(records_itself.kind)
     elif records_itself:
         _check_records_itself(records_itself)
-    args: list[str] = ["-p", prompt, "--output-format", "json",
+    # THE PROMPT'S SECOND DOOR, spec §2:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
+    args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
                        "--no-session-persistence"]
     if model:
         args += ["--model", model]
@@ -1740,7 +1805,8 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                      "--setting-sources", "", "--disable-slash-commands"]
         args += stack.enter_context(
             _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
-        out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra)
+        out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
+                   stdin_text=prompt if over else None)
     data: Any = None
     try:
         data = json.loads(out)
