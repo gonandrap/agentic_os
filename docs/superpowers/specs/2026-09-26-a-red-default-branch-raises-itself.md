@@ -101,12 +101,13 @@ its reason (`src/jarvis/ops.py:5015-5020`) — a red `main` across a day would o
 write ~700 identical rows. Comparison is against the STORED state, so it is independent of
 the invariant ledger's cadence.
 
-* RED transition — `CentralStore.add_inbox(level="warning")`
-  (`src/jarvis/central_store.py:456-462`), naming the workflow, the run URL, the head
-  commit, and the work order when one is attributed (below). `level="warning"` because
-  `route_new_inbox` has no level filter and this is news worth a ping.
+* RED transition — the poll writes the STATE only, no row of its own. The single RED
+  announcement is the invariant's: `check_invariants`' `add_notification`, deduped on
+  `open_violation_report`, one writer per direction (§3).
 * GREEN transition — one `level="info"` row, so the user learns it recovered, and
-  `store.close_violation_reports` for the invariant's key (§3).
+  `store.close_violation_report` for the invariant's key (§3). SINGULAR: the plural
+  `close_violation_reports` deletes every report NOT in the iterable it is given, so it
+  would wipe every other standing report in the project.
 
 **Attributing the red commit to a work order cannot be done by sha, and the framing in
 the work order is wrong here.** `automerge_merged` carries `head_sha =
@@ -155,8 +156,9 @@ RED row; the poll step writes no red row of its own. It is deduped by
 `open_violation_report` per (invariant, wo_id) — which only closes on the landing-sweep
 cadence, an hour (`src/jarvis/daemon.py:3823-3827`, `LANDING_SWEEP_EVERY_TICKS = 720`), so
 a break-recover-break inside one hour would otherwise be silent. That is why the GREEN
-transition in §2 calls `close_violation_reports` explicitly: recovery re-arms the report,
-and the next break notifies again.
+transition in §2 calls `close_violation_report` explicitly — the singular, because the
+plural closes by omission and would wipe the project's other standing reports: recovery
+re-arms the report, and the next break notifies again.
 
 Not repairable, and it must not try: the remedy is a commit on `main`.
 

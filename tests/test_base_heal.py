@@ -449,8 +449,8 @@ def test_a_worker_push_after_the_heal_is_not_carried(started, project, fake_gh):
 
     assert store.list_approvals(wo["id"]) == []
     held = store.events_of_kind(wo["id"], "automerge_held")
-    # The first tick held on CI — the rebuild was still running, which is true. The
-    # SECOND is the one this test is about.
+    # The first tick held on CI — it had finished and FAILED on that commit, the
+    # inherited failure. The SECOND is the one this test is about.
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
         automerge.HELD_CHECKS_FAILED, automerge.HELD_SHA_MOVED]
     assert db.from_json(held[-1]["payload"], {})["judged_sha"] == UPDATED
