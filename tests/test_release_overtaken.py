@@ -406,15 +406,148 @@ def test_a_project_that_does_not_own_the_os_pays_nothing(
 
 def test_the_tick_runs_the_step_after_the_issue_sweep(project, daemon, monkeypatch):
     """§4: inside the existing `if poll_prs:` block, immediately after
-    `sync_issue_references` — so after `sync_issues`, which is what files these orders."""
+    `sync_issue_references` — so after `sync_issues`, which is what files these orders.
+
+    And the red-base hold immediately BEFORE `dispatch_pending` (2026-09-27 spec §5):
+    a release order filed late in one tick is claimed early in the next, so a hold
+    running after dispatch would hold nothing on the first opportunity."""
     order: list[str] = []
-    for name in ("poll_pull_requests", "sync_issues", "sync_issue_references",
-                 "settle_shipped_releases"):
+    for name in ("hold_red_release", "dispatch_pending", "poll_pull_requests",
+                 "sync_issues", "sync_issue_references", "settle_shipped_releases"):
         monkeypatch.setattr(daemon, name,
                             lambda *a, _n=name, **k: order.append(_n))
     daemon.tick_count = 0
 
     daemon.tick()
 
-    assert order == ["poll_pull_requests", "sync_issues", "sync_issue_references",
-                     "settle_shipped_releases"]
+    assert order == ["hold_red_release", "dispatch_pending", "poll_pull_requests",
+                     "sync_issues", "sync_issue_references", "settle_shipped_releases"]
+
+
+# -- the red-`main` hold ---------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5.
+# `ensure_release` always files, so the hold is on DISPATCH: a call skipped because the
+# base was red never comes back, and the fix would be dropped from every future batch.
+
+
+def run(sha_: str, conclusion: str = "failure", workflow: str = "tests",
+        run_id: int = 1, status: str = "completed"):
+    """One base run, as `ci.base_runs` normalises it."""
+    from jarvis import ci
+    return ci.Run(run_id=run_id, head_sha=sha_, conclusion=conclusion, status=status,
+                  started_at=1.0, workflow=workflow)
+
+
+@pytest.fixture()
+def base_ci(monkeypatch):
+    """What `ci.base_runs` answers for the base branch, newest first."""
+    from jarvis import ci
+
+    state: dict = {"runs": (), "error": None, "calls": []}
+
+    def fake(base_ref, cwd=None, limit=None):
+        state["calls"].append(base_ref)
+        if state["error"] is not None:
+            raise state["error"]
+        return state["runs"]
+
+    monkeypatch.setattr(ci, "base_runs", fake)
+    return state
+
+
+def pending_release(store: ProjectStore) -> str:
+    """A release order waiting to be claimed — what the hold acts on."""
+    rel = store.create_work_order("Ship the fix", status="pending",
+                                  metadata={Daemon.RELEASE_BATCH_KEY: [ISSUE]})
+    return str(rel["id"])
+
+
+def hold(daemon: Daemon, store: ProjectStore) -> None:
+    daemon.hold_red_release(daemon.catalog.project("proj_a"), store)
+
+
+def test_a_red_main_holds_a_pending_release(project, store, daemon, base_ci):
+    """§5: red base, so the order is not claimable and the timeline says why."""
+    rel = pending_release(store)
+    base_ci["runs"] = (run("deadbeefcafe"),)
+
+    hold(daemon, store)
+
+    assert float(store.get_work_order(rel)["retry_after"] or 0) > db.now()
+    assert store.claim_next_pending() is None, "a held order is not dispatched"
+    said = events(store, rel, Daemon.RED_HOLD_EVENT)
+    assert len(said) == 1
+    assert "deadbeefca" in said[0]["detail"] and "tests" in said[0]["detail"]
+
+
+def test_a_green_main_lets_the_release_go(project, store, daemon, base_ci):
+    """The other half: nothing is written and the order is claimed."""
+    rel = pending_release(store)
+    base_ci["runs"] = (run("deadbeefcafe", conclusion="success"),)
+
+    hold(daemon, store)
+
+    assert store.get_work_order(rel)["retry_after"] is None
+    assert events(store, rel, Daemon.RED_HOLD_EVENT) == []
+    claimed = store.claim_next_pending()
+    assert claimed is not None and str(claimed["id"]) == rel
+
+
+def test_a_still_red_main_says_so_once_per_commit(project, store, daemon, base_ci):
+    """kn-7b122cd9: a code per CONDITION is also a code per WORLD. Same broken commit is
+    the same news; a DIFFERENT broken commit is not."""
+    rel = pending_release(store)
+    base_ci["runs"] = (run("aaaaaaaaaaaa"),)
+
+    hold(daemon, store)
+    store.update_work_order(rel, retry_after=None)  # the hold lapsed; still red
+    hold(daemon, store)
+
+    assert len(events(store, rel, Daemon.RED_HOLD_EVENT)) == 1
+    base_ci["runs"] = (run("bbbbbbbbbbbb", run_id=2),)
+    store.update_work_order(rel, retry_after=None)
+    hold(daemon, store)
+
+    said = events(store, rel, Daemon.RED_HOLD_EVENT)
+    assert len(said) == 2
+    assert [e["head_sha"] for e in said] == ["aaaaaaaaaaaa", "bbbbbbbbbbbb"]
+
+
+def test_an_unreadable_ci_does_not_hold_the_release(project, store, daemon, base_ci):
+    """§5: an unreadable base must never strand the user's release on a `gh` outage.
+    The brief still tells the worker to check, and the ship is a gated action."""
+    from jarvis.github import GitHubError
+    rel = pending_release(store)
+    base_ci["error"] = GitHubError("gh is off", GitHubError.NO_GH)
+
+    hold(daemon, store)
+
+    assert store.get_work_order(rel)["retry_after"] is None
+    assert events(store, rel, Daemon.RED_HOLD_EVENT) == []
+    claimed = store.claim_next_pending()
+    assert claimed is not None and str(claimed["id"]) == rel
+
+
+def test_a_red_hold_never_shortens_a_dispatch_backoff(project, store, daemon, base_ci):
+    """`dispatch_attempts` and its ladder belong to `release_dispatch_claim`. A red hold
+    may extend that backoff, never shorten it, and green may not erase it."""
+    rel = pending_release(store)
+    for _ in range(3):
+        store.release_dispatch_claim(rel, "claude would not launch", max_attempts=10)
+    backoff = float(store.get_work_order(rel)["retry_after"])
+    attempts = store.get_work_order(rel)["dispatch_attempts"]
+    assert backoff > db.now() + Daemon.RED_HOLD_SECONDS and attempts
+
+    base_ci["runs"] = (run("aaaaaaaaaaaa"),)
+    hold(daemon, store)
+    assert float(store.get_work_order(rel)["retry_after"]) == backoff
+
+    # The ladder LAPSED, and the base is green: still not this step's to erase.
+    store.update_work_order(rel, retry_after=db.now() - 1)
+    lapsed = float(store.get_work_order(rel)["retry_after"])
+    base_ci["runs"] = (run("aaaaaaaaaaaa", conclusion="success"),)
+    hold(daemon, store)
+    row = store.get_work_order(rel)
+    assert float(row["retry_after"]) == lapsed, "green may not clear a launch backoff"
+    assert row["dispatch_attempts"] == attempts

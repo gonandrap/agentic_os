@@ -718,6 +718,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # issue #784's spec §6, and kn-3f133363 for why it is not left to the fallback.
         return ("Another release already carries these fixes",
                 p.get("detail") or (p.get("tag") or ""))
+    if kind == "release_held_red_base":
+        # On the RELEASE order: the base is red, so the ship is deferred rather than
+        # attempted. Deduped per head sha, so one line per broken commit.
+        return ("Holding the release — the base branch is red",
+                p.get("detail") or (p.get("base") or ""))
     if kind == "release_completed":
         # The ending itself, whichever path reached it: `why` is which one (release.py
         # `settle`), and it is the whole difference between "we shipped it" and
