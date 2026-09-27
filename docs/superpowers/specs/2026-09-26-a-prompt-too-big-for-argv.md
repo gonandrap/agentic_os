@@ -9,14 +9,14 @@ Linux caps ONE argv entry at `MAX_ARG_STRLEN` = 131,072 bytes. `execve` fails wi
 output, no result envelope, nothing for `_cli_failure` to classify. Two sites put a whole
 prompt in one argv entry:
 
-* `src/jarvis/claude_cli.py:1674` — `run_headless_result`: `args = ["-p", prompt, …]`.
+* `src/jarvis/claude_cli.py` — `run_headless_result`: `args = ["-p", prompt, …]`.
   This is the transport for Neo (`neo.answer_question`), every panel seat
   (`panel`, `validation`, `seats`) and the dashboard digest.
-* `src/jarvis/claude_cli.py:776` — `turn_args`: `args += ["--", prompt]`, the worker's
-  whole dispatch brief, on both spawn paths in `spawn_turn` (`claude_cli.py:790-860`).
+* `src/jarvis/claude_cli.py` — `turn_args`: `args += ["--", prompt]`, the worker's
+  whole dispatch brief, on both spawn paths in `spawn_turn` (`claude_cli.py`).
 
-The system prompt already has the door: `SYSTEM_PROMPT_ARGV_LIMIT` (`claude_cli.py:74`)
-and `_system_prompt_arg` (`claude_cli.py:97`) switch to
+The system prompt already has the door: `SYSTEM_PROMPT_ARGV_LIMIT` (`claude_cli.py`)
+and `_system_prompt_arg` (`claude_cli.py`) switch to
 `--append-system-prompt-file` above 64 KiB. The USER prompt has no such door on either
 site.
 
@@ -29,19 +29,19 @@ question failed identically.
 Those three failures each cost ~15 minutes and were not retries in any useful sense,
 because errno 7 does not travel the failure path Neo has:
 
-1. `_run` (`claude_cli.py:120-140`) catches `FileNotFoundError` and
+1. `_run` (`claude_cli.py`) catches `FileNotFoundError` and
    `subprocess.TimeoutExpired`. A bare `OSError` is neither, so it propagates RAW out of
    `claude_cli` — it is never a `ClaudeCliError`.
-2. `neo.drain_queue` (`src/jarvis/neo.py:427`) branches on
+2. `neo.drain_queue` (`src/jarvis/neo.py`) branches on
    `claude_cli.UsageLimitError` then `claude_cli.ClaudeCliError`. The raw `OSError`
    matches neither and escapes the whole drain loop, so the REST of the FIFO queue is
    abandoned for that tick too.
-3. It lands in `Daemon._neo_drain`'s `except Exception` (`src/jarvis/daemon.py:3131`),
+3. It lands in `Daemon._neo_drain`'s `except Exception` (`src/jarvis/daemon.py`),
    logged as "neo drain failed". `store.release_claim` is never called, so the row stays
    `status='answering'` with `attempts` unchanged.
 4. Only `NeoStore.reclaim_stale` recovers it, after `STALE_ANSWERING_SECONDS = 900`
-   (`neo_store.py:107`), and it takes `MAX_ANSWER_ATTEMPTS = 3` sweeps
-   (`neo_store.py:114`) to reach `failed`. ≥45 minutes of a worker parked on
+   (`neo_store.py`), and it takes `MAX_ANSWER_ATTEMPTS = 3` sweeps
+   (`neo_store.py`) to reach `failed`. ≥45 minutes of a worker parked on
    `waiting_input`, three identical doomed `execve` calls, to arrive at an outcome that
    was knowable deterministically at the first byte count.
 
@@ -86,10 +86,10 @@ argv door is also the one that survives a CLI build that reads its prompt differ
 
 `claude -p` with no positional prompt reads the prompt from stdin. That is a documented
 property of the CLI and it is the reason `spawn_turn` passes `stdin=DEVNULL`
-(`claude_cli.py:853`, docstring at `:811`): otherwise `claude -p` waits three seconds for
+(`claude_cli.py`, stated in its docstring): otherwise `claude -p` waits three seconds for
 input that never comes.
 
-In `run_headless_result` (`claude_cli.py:1674`):
+In `run_headless_result` (`claude_cli.py`):
 
 ```python
 over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
@@ -98,7 +98,7 @@ args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json"]
 
 and pass `stdin_text=prompt if over else None` down to `_run`.
 
-`_run` (`claude_cli.py:120`) grows `stdin_text: str | None = None` and passes
+`_run` (`claude_cli.py`) grows `stdin_text: str | None = None` and passes
 `input=stdin_text` to `subprocess.run`. Two required details:
 
 * **`encoding="utf-8"` on that `subprocess.run` call.** It currently uses bare
@@ -110,11 +110,11 @@ and pass `stdin_text=prompt if over else None` down to `_run`.
   with `input=None` and no `stdin=` leaves stdin inherited, exactly as today. No caller
   outside this function changes.
 
-`run_headless` (`claude_cli.py:1713`) forwards unchanged; it already delegates.
+`run_headless` (`claude_cli.py`) forwards unchanged; it already delegates.
 
 ### 3. Worker turn: a prompt FILE opened as stdin, on both transports
 
-`turn_args` (`claude_cli.py:725`) grows a keyword:
+`turn_args` (`claude_cli.py`) grows a keyword:
 
 ```python
 def turn_args(prompt: str, session_id: str, resume: bool, …,
@@ -127,7 +127,7 @@ ENTIRELY — both the fence and the prompt. The `--` fence exists to stop `--add
 fence, and a trailing bare `--` is a token the fake would have to special-case. Argv ends
 after the briefing flags.
 
-`spawn_turn` (`claude_cli.py:790`) decides, before building args:
+`spawn_turn` (`claude_cli.py`) decides, before building args:
 
 ```python
 big = len(prompt.encode()) > PROMPT_ARGV_LIMIT
@@ -136,7 +136,7 @@ args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
 
 **The prompt file.** When `big`, write the prompt UTF-8 to `outfile.with_suffix(".prompt")`
 — i.e. `<turns_dir>/<seq>.prompt`, beside the `<seq>.json` and `<seq>.err` that
-`worker_session._launch` (`src/jarvis/worker_session.py:557-564`) already created for this
+`worker_session._launch` (`src/jarvis/worker_session.py`) already created for this
 turn. Not `tempfile.NamedTemporaryFile` and not `/tmp`.
 
 **Why a context manager is wrong here, and who deletes it.** `spawn_turn` RETURNS
@@ -147,7 +147,7 @@ read EOF — a turn dispatched with an EMPTY BRIEF, which fails silently and loo
 confused worker, not like a transport bug. Ownership instead:
 
 * the file belongs to the TURN, like `<seq>.json` and `<seq>.err`;
-* `worker_session._reap` (`worker_session.py:670`) deletes it —
+* `worker_session._reap` (`worker_session.py`) deletes it —
   `Path(turn["outfile"]).with_suffix(".prompt").unlink(missing_ok=True)` — after
   `read_turn_result` has returned, at which point the process has ended and stdin has
   been read or never will be;
@@ -155,12 +155,12 @@ confused worker, not like a transport bug. Ownership instead:
   `ops.delete_work_order`'s tree removal takes it with everything else. A stale prompt
   file is bytes on disk in the work order's own state directory, not a leak into `/tmp`.
 
-**Direct `Popen` path** (`claude_cli.py:847-857`): open the prompt file for reading inside
+**Direct `Popen` path** (`claude_cli.spawn_turn`): open the prompt file for reading inside
 the existing `with` block and pass it as `stdin=`. The child inherits a dup of the fd;
 the parent's handle closing on block exit is harmless. Keep `stdin=subprocess.DEVNULL`
 for the small case, unchanged — that is what stops the 3-second wait.
 
-**systemd path**: `systemd_units.run_prefix` (`src/jarvis/systemd_units.py:160`) hardcodes
+**systemd path**: `systemd_units.run_prefix` (`src/jarvis/systemd_units.py`) hardcodes
 `--property=StandardInput=null`. It grows `stdin: Path | None = None` and emits
 `--property=StandardInput=file:{stdin}` when given one, `null` otherwise. `spawn_turn`
 passes the prompt file through. `StandardInput=file:<path>` is systemd's own documented
@@ -197,9 +197,9 @@ except OSError as e:
 
 The second arm matters on its own: today ANY `OSError` from `subprocess.run` escapes
 `claude_cli` unclassified. `spawn_turn` already wraps `OSError` into `ClaudeCliError`
-(`claude_cli.py:858`) and gains the same errno branch, so a too-large worker brief on
+(`claude_cli.py`) and gains the same errno branch, so a too-large worker brief on
 either transport surfaces as `InputTooLargeError` and `worker_session._launch`'s existing
-`except claude_cli.ClaudeCliError` (`worker_session.py:581`) fails the turn with a message
+`except claude_cli.ClaudeCliError` (`worker_session.py`) fails the turn with a message
 that says what happened.
 
 The message must say the input was too large. It must NOT read as an outage: this string
@@ -207,7 +207,7 @@ reaches the user through `answer_reason` and the inbox.
 
 ### 5. `neo.drain_queue`: straight to unreachable, no retries, no verdict
 
-In `drain_queue` (`neo.py:427`), a new arm BEFORE `except claude_cli.ClaudeCliError` —
+In `drain_queue` (`neo.py`), a new arm BEFORE `except claude_cli.ClaudeCliError` —
 ordering is the whole mechanism, exactly as it is for `UsageLimitError` above it:
 
 ```python
@@ -221,14 +221,15 @@ except claude_cli.InputTooLargeError as e:
 ```
 
 **The give-up mechanism is `release_claim`'s existing `max_attempts` parameter**
-(`neo_store.py:366-367`), and no new store method is needed. `release_claim` reads
+(`neo_store.release_claim`), and no new store method is needed. `release_claim` reads
 `attempts` and takes the `failed` branch when `attempts >= max_attempts`; passing
 `max_attempts=0` makes that true at the first attempt, writes
 `status='failed'`, `claimed_at=NULL` and
 `answer_reason = UNREACHABLE_PREFIX + detail + " (after 0 retries — nobody has judged
 this)"`, and returns `"unreachable"`. `UNREACHABLE_PREFIX` is what every surface keys on
 to tell "Neo was never reached" from "Neo could not settle it"
-(`neo_store.py:120`, read by `ops.py:2932`, `daemon.py:2985`, `cli.py:3652`), so this
+(`neo_store.py`, read by `ops._unreachable_asks`,
+`daemon.Daemon._note_stranded_unreachable`, `cli.cmd_neo`), so this
 outcome renders correctly on `jarvis neo list`, the dashboard and the attention list with
 no further change.
 
@@ -250,16 +251,17 @@ is honest; a default verdict would be a decision nobody made.
 
 `src/jarvis/testing.py`. kn-39a4dc03 is precisely this failure mode: a fake that parses
 argv goes stale silently and makes one caller look like another. The existing
-`system_prompt_seen` resolution (`testing.py:237-250`) is the precedent to follow — it
-exists because the system prompt already arrives by two doors.
+`system_prompt_seen` resolution (`testing.py`, in `FAKE_CLAUDE`'s `_write_call_record`)
+is the precedent to follow — it exists because the system prompt already arrives by two
+doors.
 
 **Resolution rule, used identically by both dispatch branches and by the call record:**
 the prompt is the token after `-p` (headless) or `argv[-1]` after a `--` fence (worker
 turn) when argv carries it, and `sys.stdin.read()` when it does not. Precisely:
 
-* worker-turn branch (`testing.py:358`, `prompt = argv[-1]` at `:364`): argv carries the
+* worker-turn branch (`testing.py`'s `FAKE_CLAUDE`, `prompt = argv[-1]`): argv carries the
   prompt iff `"--" in argv`;
-* headless branch (`testing.py:537`, `prompt = argv[argv.index("-p") + 1]` at `:540`):
+* headless branch (`testing.py`'s `FAKE_CLAUDE`, `prompt = argv[argv.index("-p") + 1]`):
   argv carries the prompt iff a token follows `-p` and it does not start with `-`.
 
 Read stdin AT MOST ONCE, into a module-level cache, and ONLY when the guard above says
@@ -267,7 +269,7 @@ argv has no prompt — `claude --version` and `claude agents --json` must never 
 or a fake invoked with an inherited terminal blocks for ever.
 
 The read has to happen at ENTRY, because `_write_call_record` runs at entry
-(`testing.py:262`) as well as at exit, and a record that resolved the prompt only at exit
+(`testing.py`) as well as at exit, and a record that resolved the prompt only at exit
 would never arrive for a test using `hold_turns`.
 
 **The call record gains a `"prompt"` key** carrying the resolved prompt whichever door it
@@ -282,17 +284,17 @@ today (the real CLI misparses it too) and is out of scope; note it in the fake's
 fixture prompt and therefore keep passing unchanged; they are listed so the implementer
 can confirm rather than assume, and any that are moved to a large prompt must move to
 `c["prompt"]`:
-`tests/test_digest.py:384`, `tests/test_neo.py:153`, `tests/test_structured.py:265`,
-`tests/test_validation_seats.py:233,1248`, `tests/test_validation_panel.py:76,175`,
-`tests/test_validation_loop.py:765,775`, `tests/test_health_sweep.py:677`,
-`tests/test_pipeline.py:130,173,362,399,431`, `tests/test_question_diet.py:209,228`,
-`tests/test_feature_orders.py:151`, `tests/test_feature_order_team.py:341`,
-`tests/test_feature_agent.py:149`, `tests/test_analyst_dispatch.py:247`,
-`tests/test_worker_spawn_args.py:67`, `tests/test_claude_cli.py:20`.
+`tests/test_digest.py`, `tests/test_neo.py`, `tests/test_structured.py`,
+`tests/test_validation_seats.py`, `tests/test_validation_panel.py`,
+`tests/test_validation_loop.py`, `tests/test_health_sweep.py`,
+`tests/test_pipeline.py`, `tests/test_question_diet.py`,
+`tests/test_feature_orders.py`, `tests/test_feature_order_team.py`,
+`tests/test_feature_agent.py`, `tests/test_analyst_dispatch.py`,
+`tests/test_worker_spawn_args.py`, `tests/test_claude_cli.py`.
 `testing.py`'s own `Handle.turns` reads the fake's per-session log, which is written from
 the resolved `prompt` variable, so it needs no change once the branch resolves correctly.
 
-**The fake `systemd-run`** (`testing.py:1366-1415`) parses `--unit`,
+**The fake `systemd-run`** (`testing.py`'s `FAKE_SYSTEMD_RUN`) parses `--unit`,
 `--working-directory`, `StandardOutput=`, `StandardError=` and `--setenv`, and hardcodes
 `stdin=subprocess.DEVNULL`. It must parse `--property=StandardInput=file:<path>` and open
 that file as the child's stdin. Without it the transient-unit case cannot be tested at
