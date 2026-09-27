@@ -221,6 +221,27 @@ def test_boot_verifies_and_settles_the_failed_work_order(store, store_for,
     assert release.read_marker() is None  # marker deleted on success
 
 
+def test_the_verify_on_boot_wording_is_unchanged_and_a_caller_may_say_otherwise(store):
+    """`_settle` gained `why` and did not gain a sibling — issue #784's spec §5.
+
+    The default is this path's own sentence, byte for byte, so a release the OS shipped
+    still reads the same; the overtaken-release caller passes its own, which is the whole
+    difference between "we shipped it" and "somebody else did and the fleet is on it".
+    """
+    mine = store.create_work_order("ship 0.6.0")
+    theirs = store.create_work_order("ship the fix")
+
+    release._settle(store, mine["id"], "jarvis-0.6.0")
+    release._settle(store, theirs["id"], "jarvis-0.6.0", why="another release did it")
+
+    def why(wo_id: str) -> str:
+        return [e for e in store.list_events(wo_id)
+                if e["kind"] == "release_completed"][0]["payload"]
+
+    assert "release jarvis-0.6.0 verified live" in why(mine["id"])
+    assert "another release did it" in why(theirs["id"])
+
+
 def test_boot_verification_leaves_a_completed_work_order_completed(
         store, store_for, prod_checkout):
     wo = store.create_work_order("ship 0.6.0")

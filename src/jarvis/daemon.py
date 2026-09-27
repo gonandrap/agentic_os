@@ -825,6 +825,11 @@ class Daemon:
                     # tracker is the surface a person scans when choosing what to pick
                     # up, and a reference count that lags is one they act on wrongly.
                     self.sync_issue_references(project, store)
+                    # After `sync_issues`, which is what files release orders, and on
+                    # this beat because the merge commit recorded by the poll above is
+                    # the only other thing that changes the answer — the reconcile beat
+                    # would be too slow to save the worker turn this exists to save.
+                    self.settle_shipped_releases(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -4670,7 +4675,8 @@ class Daemon:
                     log.info("[%s] %s merged — completing %s", project.name,
                              wo["pr_url"], wo["id"])
                     ops.complete_merged(store, wo, merged_at=pr.merged_at,
-                                        head_oid=pr.head_oid)
+                                        head_oid=pr.head_oid,
+                                        merge_commit=pr.merge_commit_oid)
                 elif pr.closed_unmerged:
                     # ONCE PER CLOSURE. Before the poll widened, `record_pr_closed` moved
                     # the work order to `needs_review` and out of the polled set, so
@@ -6481,6 +6487,164 @@ the place to fix a red build."""
                         {"issue_url": url, "wo_id": wo["id"]})
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
         return str(fresh["id"])
+
+    #: Said once per TAG on a release order another release overtook (spec §6).
+    OVERTAKEN_EVENT = "release_overtaken"
+
+    #: The back-fill of spec §2, on the FIXING order: the commit a merge put on `main`,
+    #: read from GitHub once for a pull request that merged before the poller recorded it.
+    MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
+
+    def settle_shipped_releases(self, project: ProjectSpec,
+                                store: ProjectStore) -> None:
+        """End a release order whose fixes another release already shipped — issue #784.
+
+        `ensure_release`'s missing ending. A release order's only settlement path was the
+        marker handshake, whose marker names the SHIPPING work order, so a release cut by
+        another path while this order waited ~9 minutes for CI settled nothing and a
+        worker turn was spent closing it by hand (wo-e5816dd7, wo-4301a7a6).
+
+        Done means **a `jarvis-*` tag contains every payload commit of the batch AND
+        production runs that tag** — Neo question 751, option B: the order was filed
+        because the fleet owed the user a running fix, and a tag nobody deployed does not
+        pay that debt. Tag but no deploy leaves it open with one note on the timeline (§6).
+
+        Cost, in the order of the guards: zero queries for every project but the OS
+        owner; one indexed query and a metadata parse when it owns none; git and the
+        production checkout only with an open release order in hand. `include_hidden`
+        matches `ensure_release` — hiding drops a record from listings, not from the
+        arithmetic that decides whether it is over.
+
+        docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md
+        """
+        from . import release
+        from .project_store import OPEN_STATUSES
+
+        # §8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both
+        # facts about the OS's own release path. Another project keeps today's behaviour.
+        if project.name != self._os_owner():
+            return
+        orders: list[tuple[dict[str, Any], list[str]]] = []
+        for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
+                                                include_hidden=True):
+            meta = db.from_json(candidate.get("metadata"), {}) or {}
+            batch = meta.get(self.RELEASE_BATCH_KEY)
+            if isinstance(batch, list) and batch:
+                orders.append((candidate, [str(u) for u in batch]))
+        if not orders:
+            return
+        marker = release.read_marker() or {}
+        for wo, batch in orders:
+            try:
+                self._settle_shipped_release(project, store, wo, batch, marker)
+            except Exception:  # noqa: BLE001 — one release order must not stall the tick
+                log.exception("[%s] settling the release %s failed", project.name,
+                              wo["id"])
+                continue
+
+    def _settle_shipped_release(self, project: ProjectSpec, store: ProjectStore,
+                                wo: dict[str, Any], batch: list[str],
+                                marker: dict[str, Any]) -> str | None:
+        """One release order. `None` is every refusal in spec §7: the row is untouched."""
+        from . import release
+
+        wo_id = str(wo["id"])
+        # §7.5: a marker naming this order, in ANY state including failed_verification —
+        # it staged its own release and the handshake owns it. Only `verify_on_boot` may
+        # settle a release the OS performed, because only it checks the unit timestamps.
+        if str(marker.get("wo_id") or "") == wo_id:
+            return None
+        shas = self._release_payload(project, store, wo_id, batch)
+        if shas is None:
+            return None
+        found = release.overtaken_by(project.path, shas)
+        if found.error:
+            log.debug("[%s] %s: cannot tell whether its batch shipped: %s",
+                      project.name, wo_id, found.error)
+            return None
+        if not found.tag:
+            return None  # §7.3: the ordinary case, and what the order was filed for
+        if not found.live:
+            # Deduped on the TAG, not the kind: by kind alone this would go silent if the
+            # first tag never deploys and a later one does, and that second tag is news.
+            # No attention flag — a normal few minutes must not read as a fault (§6).
+            if any(db.from_json(e["payload"], {}).get("tag") == found.tag
+                   for e in store.events_of_kind(wo_id, self.OVERTAKEN_EVENT)):
+                return None
+            store.add_event(wo_id, self.OVERTAKEN_EVENT, {
+                "tag": found.tag, "shas": list(shas), "deployed": found.deployed,
+                "detail": (f"{found.tag} already carries these fixes; production is on "
+                           f"{found.deployed}")})
+            log.info("[%s] %s already carries %s's fixes; production is on %s",
+                     project.name, found.tag, wo_id, found.deployed)
+            return self.OVERTAKEN_EVENT
+        settled = release._settle(
+            store, wo_id, found.tag,
+            why=(f"{found.tag} already carries this release's fixes and production "
+                 f"runs it"))
+        log.info("[%s] %s shipped %s's batch and is live — %s", project.name,
+                 found.tag, wo_id, settled)
+        return "completed"
+
+    def _release_payload(self, project: ProjectSpec, store: ProjectStore, wo_id: str,
+                         batch: list[str]) -> list[str] | None:
+        """Every payload commit of this batch, or None if ONE of them cannot be resolved.
+
+        A partial payload must never be tested (§7.1): a tag containing the known half
+        would complete an order whose other fix never shipped.
+
+        The batch is a list of issue urls; `release_batched` is the event that names the
+        order which fixed each, so the mapping is read back from what wrote the batch.
+        """
+        fixers = {}
+        for event in store.events_of_kind(wo_id, "release_batched"):
+            said = db.from_json(event["payload"], {})
+            fixers[said.get("issue_url")] = said.get("wo_id")
+        shas: list[str] = []
+        for url in batch:
+            fix_id = fixers.get(url)
+            if not fix_id:
+                return None
+            try:
+                fix = store.get_work_order(str(fix_id))
+            except KeyError:
+                return None
+            sha = self._merge_commit_of(project, store, fix)
+            if not sha:
+                return None
+            shas.append(sha)
+        return shas
+
+    def _merge_commit_of(self, project: ProjectSpec, store: ProjectStore,
+                         fix: dict[str, Any]) -> str:
+        """The commit this fix put on `main`, or `""` when it cannot be resolved.
+
+        Recorded on `pr_merged` by the merge poller (§2). A fix that merged BEFORE that
+        shipped has none, so ONE `github.pr_view` back-fills it and the answer is written
+        to `pr_merge_commit_recorded` — one `gh` call per fix, once ever, not once a tick.
+        """
+        from . import github
+
+        for kind in ("pr_merged", self.MERGE_COMMIT_EVENT):
+            rows = store.events_of_kind(fix["id"], kind)
+            if rows:
+                sha = db.from_json(rows[-1]["payload"], {}).get("merge_commit") or ""
+                if sha:
+                    return str(sha)
+        pr_url = fix.get("pr_url") or ""
+        if not pr_url:
+            return ""
+        try:
+            pr = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] %s: could not read %s for its merge commit: %s",
+                      project.name, fix["id"], pr_url, e)
+            return ""
+        if not (pr.merged and pr.merge_commit_oid):
+            return ""
+        store.add_event(fix["id"], self.MERGE_COMMIT_EVENT,
+                        {"pr_url": pr_url, "merge_commit": pr.merge_commit_oid})
+        return pr.merge_commit_oid
 
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:

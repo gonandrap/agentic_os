@@ -4789,6 +4789,7 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
                     merged_at: str | None = None,
                     head_oid: str = "",
+                    merge_commit: str = "",
                     automerge: dict[str, Any] | None = None) -> dict[str, Any]:
     """The pull request landed: end the work order, exactly as the user closing it does.
 
@@ -4812,6 +4813,12 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     because a merge whose commit is not written down anywhere is a hole in the record,
     and this is the one path that knows it.
 
+    `merge_commit` is `mergeCommit.oid` — THE COMMIT THIS PULL REQUEST PUT ON `main`,
+    which `head_oid` (the branch tip) is not and cannot be under `--squash`. Recorded
+    here for the same reason and on the same round trip, and read by the release
+    settlement to ask whether a tag contains it
+    (docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md §2).
+
     `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
     above cutting the other way. A merge the OS performed itself is indistinguishable
     here from one the user performed — the same `gh pr view` reports both — so the ONE
@@ -4829,7 +4836,9 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     store.update_work_order(wo["id"], pr_state="MERGED")
     stopped = close_out(store, wo, "pr_merged", why="pull request merged",
                         payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at,
-                                 **({"head_oid": head_oid} if head_oid else {})})
+                                 **({"head_oid": head_oid} if head_oid else {}),
+                                 **({"merge_commit": merge_commit}
+                                    if merge_commit else {})})
     mark_backlog_done(wo)
     return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,

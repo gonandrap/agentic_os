@@ -1175,6 +1175,9 @@ def _escalate(fleet, reason="not enough evidence"):
     ("issue_released", "handed back"),
     ("issue_closed", "closed"),
     ("release_batched", "release"),
+    # The two the overtaken-release settlement adds (issue #784, its spec §6).
+    ("release_overtaken", "already carries"),
+    ("pr_merge_commit_recorded", "merge"),
 ])
 def test_every_event_this_feature_writes_has_a_label_a_reader_can_read(kind, label):
     """kn-3f133363: falling through to the generic renderer is NOT the same claim as a
