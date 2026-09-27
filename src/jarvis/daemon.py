@@ -6544,8 +6544,8 @@ the place to fix a red build."""
 
     def _settle_shipped_release(self, project: ProjectSpec, store: ProjectStore,
                                 wo: dict[str, Any], batch: list[str],
-                                marker: dict[str, Any]) -> str | None:
-        """One release order. `None` is every refusal in spec §7: the row is untouched."""
+                                marker: dict[str, Any]) -> None:
+        """One release order. Every refusal in spec §7 leaves the row untouched."""
         from . import release
 
         wo_id = str(wo["id"])
@@ -6553,38 +6553,37 @@ the place to fix a red build."""
         # it staged its own release and the handshake owns it. Only `verify_on_boot` may
         # settle a release the OS performed, because only it checks the unit timestamps.
         if str(marker.get("wo_id") or "") == wo_id:
-            return None
+            return
         shas = self._release_payload(project, store, wo_id, batch)
         if shas is None:
-            return None
+            return
         found = release.overtaken_by(project.path, shas)
         if found.error:
             log.debug("[%s] %s: cannot tell whether its batch shipped: %s",
                       project.name, wo_id, found.error)
-            return None
+            return
         if not found.tag:
-            return None  # §7.3: the ordinary case, and what the order was filed for
+            return  # §7.3: the ordinary case, and what the order was filed for
         if not found.live:
             # Deduped on the TAG, not the kind: by kind alone this would go silent if the
             # first tag never deploys and a later one does, and that second tag is news.
             # No attention flag — a normal few minutes must not read as a fault (§6).
             if any(db.from_json(e["payload"], {}).get("tag") == found.tag
                    for e in store.events_of_kind(wo_id, self.OVERTAKEN_EVENT)):
-                return None
+                return
             store.add_event(wo_id, self.OVERTAKEN_EVENT, {
                 "tag": found.tag, "shas": list(shas), "deployed": found.deployed,
                 "detail": (f"{found.tag} already carries these fixes; production is on "
                            f"{found.deployed}")})
             log.info("[%s] %s already carries %s's fixes; production is on %s",
                      project.name, found.tag, wo_id, found.deployed)
-            return self.OVERTAKEN_EVENT
-        settled = release._settle(
+            return
+        settled = release.settle(
             store, wo_id, found.tag,
             why=(f"{found.tag} already carries this release's fixes and production "
                  f"runs it"))
         log.info("[%s] %s shipped %s's batch and is live — %s", project.name,
                  found.tag, wo_id, settled)
-        return "completed"
 
     def _release_payload(self, project: ProjectSpec, store: ProjectStore, wo_id: str,
                          batch: list[str]) -> list[str] | None:

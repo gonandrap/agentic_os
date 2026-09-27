@@ -306,7 +306,7 @@ def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
             "version": version, "tag": tag,
             "detail": f"release {tag} verified live",
         })
-        settled = _settle(store, wo_id, tag)
+        settled = settle(store, wo_id, tag)
         store.add_notification(
             title=f"Shipped {tag} to production",
             body=(f"{tag} verified live: production is on version {version} and both "
@@ -340,7 +340,7 @@ def _report_failure(store: ProjectStore, wo_id: str, tag: str, reason: str) -> N
     )
 
 
-def _settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) -> str:
+def settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) -> str:
     """Move the shipping work order to `completed`, respecting kn-99d3f1d4's traps.
 
     Returns a phrase for the notification body describing what was done.

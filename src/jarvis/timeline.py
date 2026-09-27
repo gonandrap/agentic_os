@@ -720,7 +720,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 p.get("detail") or (p.get("tag") or ""))
     if kind == "release_completed":
         # The ending itself, whichever path reached it: `why` is which one (release.py
-        # `_settle`), and it is the whole difference between "we shipped it" and
+        # `settle`), and it is the whole difference between "we shipped it" and
         # "somebody else did and the fleet is on it".
         return "The release this order was filed for is done", p.get("why") or ""
     if kind == "pr_merge_commit_recorded":

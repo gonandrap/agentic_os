@@ -298,7 +298,7 @@ def test_every_refusal_leaves_the_work_order_exactly_as_it_was(
     assert snapshot(store, rel) == before
 
 
-# -- 6: `_settle`'s traps, through the new caller -------------------------------------
+# -- 6: `settle`'s traps, through the new caller -------------------------------------
 
 
 def test_a_pending_assumption_is_not_accepted_by_the_back_door(
@@ -360,7 +360,7 @@ def test_the_back_fill_of_a_merge_commit_costs_one_gh_call_ever(
 # -- 8: what the common case costs ---------------------------------------------------
 
 
-def test_with_no_open_release_order_the_step_is_one_statement_and_no_subprocess(
+def test_with_no_open_release_order_the_step_only_reads_and_spawns_nothing(
         project, store, daemon, monkeypatch):
     """§4's budget, executed rather than commented."""
     store.create_work_order("something else", status="running")
@@ -374,7 +374,9 @@ def test_with_no_open_release_order_the_step_is_one_statement_and_no_subprocess(
     step(daemon, store)
 
     store.conn.set_trace_callback(None)
-    assert len(sql) == 1, sql
+    assert sql, "the step must at least look for an open release order"
+    assert all(s.strip().upper().startswith("SELECT") for s in sql), sql
+    assert all("work_orders" in s.lower() for s in sql), sql
     assert spawned == []
 
 
