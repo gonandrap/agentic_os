@@ -222,6 +222,37 @@ os.makedirs(calls_dir, exist_ok=True)
 _started = time.time()
 _record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
 
+# THE USER PROMPT ARRIVES BY ONE OF TWO DOORS, exactly as the system prompt does: in
+# argv below `claude_cli.PROMPT_ARGV_LIMIT`, on stdin above it. A fake that parsed argv
+# only would read a large call as having an EMPTY prompt and make one caller look like
+# another (kn-39a4dc03). Spec §6:
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+#
+# A prompt whose FIRST CHARACTER is `-` is misread by the headless rule here. The real
+# CLI misparses it too; out of scope.
+_stdin_prompt = []
+
+def resolved_prompt():
+    """The prompt whichever door it came through, reading stdin AT MOST ONCE.
+
+    Only ever reads stdin for a `-p` call whose argv carries no prompt: `claude
+    --version` and `claude agents --json` must never read it, or a fake invoked with an
+    inherited terminal blocks for ever.
+    """
+    if _stdin_prompt:
+        return _stdin_prompt[0]
+    found = None
+    if "--" in argv:                     # worker turn: fenced, prompt last
+        found = argv[-1]
+    elif "-p" in argv:
+        i = argv.index("-p") + 1
+        if i < len(argv) and not argv[i].startswith("-"):
+            found = argv[i]
+    if found is None and "-p" in argv:
+        found = sys.stdin.read()
+    _stdin_prompt.append(found or "")
+    return _stdin_prompt[0]
+
 def _write_call_record(finished=None):
     # WRITTEN TWICE, AND BOTH TIMES MATTER. At entry, because tests observe a call while
     # it is deliberately still running (`hold_turns`) and a record that appeared only at
@@ -251,6 +282,7 @@ def _write_call_record(finished=None):
     tmp = _record_path + f".part{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump({"argv": argv, "cwd": os.getcwd(), "system_prompt_seen": seen,
+                   "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
                    "cache_env": {k: os.environ[k] for k in
                                  ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
@@ -361,7 +393,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # the id passed in is the id that comes back, on the opening turn AND on every
     # resume — a headless resume does not fork.
     sid = opt("--session-id") or opt("--resume")
-    prompt = argv[-1]
+    prompt = resolved_prompt()
     os.makedirs(turns_dir, exist_ok=True)
     log = os.path.join(turns_dir, sid + ".jsonl")
     if "--resume" in argv and not os.path.exists(log):
@@ -537,7 +569,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
 elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
-    prompt = argv[argv.index("-p") + 1]
+    prompt = resolved_prompt()
     # THE SYSTEM PROMPT ARRIVES BY ONE OF TWO DOORS and a fake that knew only the argv
     # one would read every large call as having no system prompt at all — silently, and
     # in the direction that makes a seat look like a Neo question. See
@@ -1380,6 +1412,7 @@ if fail:
     sys.exit(1)
 
 unit, workdir, stdout, stderr, setenv = None, None, None, None, {}
+stdin = None  # --property=StandardInput=file:<path>, a brief too big for argv
 rest = []
 i = 0
 while i < len(argv):
@@ -1398,6 +1431,9 @@ while i < len(argv):
         stdout = a.split("file:", 1)[1]
     elif a.startswith("--property=StandardError=file:"):
         stderr = a.split("file:", 1)[1]
+    elif a.startswith("--property=StandardInput=file:"):
+        # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md §6
+        stdin = a.split("file:", 1)[1]
     i += 1
 
 if not unit or not rest:
@@ -1409,7 +1445,8 @@ env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LANG")
 env.update(setenv)
 out = open(stdout, "w") if stdout else subprocess.DEVNULL
 err = open(stderr, "w") if stderr else subprocess.DEVNULL
-proc = subprocess.Popen(rest, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+inp = open(stdin, "rb") if stdin else subprocess.DEVNULL
+proc = subprocess.Popen(rest, cwd=workdir, env=env, stdin=inp,
                         stdout=out, stderr=err, start_new_session=True)
 with open(os.path.join(units_dir, unit + ".json"), "w") as f:
     json.dump({"unit": unit, "pid": proc.pid, "argv": rest, "cwd": workdir,

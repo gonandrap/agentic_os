@@ -20,7 +20,7 @@ import time
 
 import pytest
 
-from jarvis import invariants
+from jarvis import claude_cli, invariants
 from jarvis import neo as neo_mod
 from jarvis import ops, panel, supervisor
 from jarvis import testing as T
@@ -609,3 +609,47 @@ def test_a_recovered_transport_delivers_the_message_it_held(started, project):
             == ["actually, use JSON"]
     finally:
         store.close()
+
+
+# -- a prompt too big for argv is not an outage ----------------------------------------
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md §5
+
+
+def test_a_prompt_too_big_for_argv_gives_up_at_the_first_attempt(asked):
+    """Production question 722, ~151.7K chars: three identical doomed `execve` calls and
+    45 minutes of a worker parked on `waiting_input`, for an outcome knowable at the
+    first byte count. The retries are only a delay, so there are none — and the rest of
+    the FIFO queue is still drained.
+    """
+    daemon, wo = asked
+    ops.ask_question(wo["id"], "And should it gzip the export?")
+    deliver, unreachable = T.Recorder(), T.Recorder()
+    seen: list[int] = []
+
+    def answerer(store, q, model, learnings_limit):
+        seen.append(q["id"])
+        if len(seen) == 1:
+            raise claude_cli.InputTooLargeError(
+                "`claude` could not be started: the input was too large for the "
+                "command line (151700 bytes of arguments)")
+        return {"escalate": False, "answer": "CSV", "reason": "the exporter is a feed"}
+
+    store = NeoStore()
+    try:
+        results = neo_mod.drain_queue(store, model="sonnet", deliver=deliver,
+                                      unreachable=unreachable, answer=answerer)
+    finally:
+        store.close()
+
+    q = _q(1)
+    assert q["status"] == "failed", "a deterministic refusal was queued for a retry"
+    assert q["attempts"] == 0, "a history of retries that never happened"
+    assert q["answer"] is None
+    assert q["answer_reason"].startswith(UNREACHABLE_PREFIX)
+    assert "input too large" in q["answer_reason"]
+    assert len(unreachable) == 1
+    assert results[0]["verdict"] is None, "a call that never happened is not an answer"
+    assert results[0]["outcome"] == "unreachable"
+    assert [c[0]["id"] for c in deliver.calls] == [2], \
+        "the failure was delivered downstream, or the next question was abandoned"
+    assert _q(2)["status"] == "answered"

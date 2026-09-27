@@ -526,3 +526,48 @@ def test_env_extra_reaches_the_subprocess_environment(monkeypatch, tmp_path) -> 
     assert seen["env"][claude_cli.TURN_TRANSPORT_ENV] == claude_cli.TRANSPORT_BACKGROUND
     # and the ambient environment still rides along, or the turn loses PATH
     assert "PATH" in seen["env"]
+
+
+# -- a brief too big for argv ----------------------------------------------------------
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+
+
+#: Past `MAX_ARG_STRLEN`, not merely past the door's own threshold.
+OVER_EXECVE = 131_072 + 1
+
+
+def test_a_big_brief_reaches_a_transient_unit_on_stdin(
+        fake_claude, fake_systemd, tmp_path) -> None:
+    """`StandardInput=file:` is the transient unit's counterpart of the `stdin=` the
+    direct path passes; without it the turn launches with an EMPTY brief."""
+    prompt = "z" * OVER_EXECVE + "\nTHE_UNIT_BRIEF_MARKER"
+
+    claude_cli.spawn_turn(prompt, cwd=tmp_path, session_id="s-unit",
+                          outfile=tmp_path / "1.json", errfile=tmp_path / "1.err",
+                          unit="jarvis-turn-wo-9-1.service")
+
+    promptfile = tmp_path / "1.prompt"
+    run = fake_systemd.runs[-1]["argv"]
+    assert f"--property=StandardInput=file:{promptfile}" in run
+    assert "--property=StandardInput=null" not in run
+    unit = fake_systemd.units["jarvis-turn-wo-9-1.service"]
+    assert "--" not in unit["argv"], f"the prompt is still in argv; argv={unit['argv']}"
+    record = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])[-1]
+    assert record["prompt"] == prompt
+
+
+def test_the_prompt_file_outlives_the_spawn_and_dies_with_the_reap(fleet) -> None:
+    """A context manager here would unlink the file before the detached `claude` read
+    it — a turn dispatched with an empty brief, which fails silently."""
+    store = fleet["store"]
+    prompt = "w" * OVER_EXECVE
+    wo = ops.create_work_order("proj_a", "task")
+    turn, _ = worker_session.start(store, fleet["project"],
+                                   store.get_work_order(wo["id"]), prompt)
+
+    promptfile = Path(turn["outfile"]).with_suffix(".prompt")
+    assert promptfile.exists(), "unlinked before the turn could read it"
+    _wait_for_result(Path(turn["outfile"]))
+
+    assert _poll_until_settled(store), "the turn never settled"
+    assert not promptfile.exists(), "the reap left the prompt file behind"
