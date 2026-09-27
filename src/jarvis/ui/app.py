@@ -1042,6 +1042,9 @@ def create_app() -> FastAPI:
             # None for every order the automatic merge has never touched, which is what
             # keeps the line off the page entirely rather than rendering "off" forever.
             auto_merge = ops.automerge_state(store, wo)
+            # Whether the pull request landed, from the timeline and never from
+            # `pr_state` — the same helper `jarvis wo show` reads (spec §7).
+            merge_state = ops.merge_state(store, wo)
             # The re-judge control and the diagnosis behind it, off the SAME hold the
             # auto-merge line above renders — a parked order's page has to say why it is
             # parked, and `automerge.decide` already worked that out on the tick that
@@ -1081,6 +1084,7 @@ def create_app() -> FastAPI:
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
                       validation=validation, spec=spec, auto_merge=auto_merge,
+                      merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
                       timeline=build_timeline(wo, events, messages,

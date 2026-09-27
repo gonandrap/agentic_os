@@ -96,6 +96,25 @@ def _order(project: Path, title: str = "add feature X", *, code: str | None = No
     return {**wo, "worktree_path": wt}
 
 
+def _gate_records(store: ProjectStore, wo_id: str, pr_url: str) -> None:
+    """Put `pr_url` on the record the way a planner's does — through an approved gate.
+
+    Written through `gates.apply_decision` rather than into the column, because what the
+    routing predicate reads is the `pr_url_recorded` event that path leaves behind
+    (2026-09-25 spec §4).
+    """
+    from jarvis import gates
+
+    approval = store.add_approval(wo_id, gates.PR_MERGE, f"gh pr merge {pr_url} --squash")
+    gates.apply_decision(store, approval["id"], verdict="approved",
+                         reason="the plan's own docs PR", decided_by="neo")
+    assert store.get_work_order(wo_id)["pr_url"] == pr_url
+    # The verdict message reaches the worker before its turn settles; left queued, it
+    # short-circuits `settle_work_order` before the branch under test.
+    for message in store.queued_messages(wo_id):
+        store.mark_message(message["id"], "delivered")
+
+
 def _row(project: Path, wo_id: str) -> dict:
     store = ProjectStore(project)
     try:
@@ -370,6 +389,32 @@ def test_route_the_reconciler_still_completes_an_order_that_wrote_nothing(starte
     assert settled["status"] == "completed"
     assert settled["needs_attention"] == 0, "a settled no-code order still wants the user"
     assert settled["attention_reason"] is None
+
+
+def test_the_reconciler_never_parks_a_gate_recorded_pull_request_in_the_merge_queue(
+        started, project):
+    """ROUTE 4's OTHER COLUMN READER. `settle_work_order`'s `elif fresh["pr_url"]` branch
+    parks a finished order in `waiting_pr_merge` off the RAW column, bypassing
+    `land_finished` entirely — so a planner whose merge was gated ended up in the merge
+    queue and in front of the validation panel, over a pull request that already merged
+    (2026-09-25 spec §4).
+    """
+    wo = _order(project, "plan the feature", kind="planner")
+    store = ProjectStore(project)
+    try:
+        _gate_records(store, wo["id"], PR)
+        turn = store.create_turn(wo["id"], "dispatch", "go")
+        store.finish_turn(turn["id"] if isinstance(turn, dict) else turn, "done")
+        store.update_work_order(wo["id"], result_summary="submitted a plan")
+        store.set_status(wo["id"], "running")
+        started.settle_work_order(started.catalog.projects[0], store,
+                                  store.get_work_order(wo["id"]))
+        settled = store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+    assert settled["status"] == "completed"
+    assert settled["pr_url"] == PR      # recorded for every reader, inert for routing
 
 
 def test_route_wo_done_records_rather_than_refusing(started, project):
