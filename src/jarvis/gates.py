@@ -55,6 +55,7 @@ from .gate_rules import (  # re-exported: this is still the module callers impor
     AUTO_MERGE,
     KIND_NAMES,
     KINDS,
+    PR_MERGE,
     SELF_HEAL,
     GateKind,
     RuleSet,
@@ -76,6 +77,8 @@ from .provenance import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pathlib import Path
+
     from .central_store import CentralStore
     from .neo_store import NeoStore
     from .project_store import ProjectStore
@@ -85,7 +88,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "APPROVAL_STATUSES", "AWAITING_CASE", "CASE_TTL_CEILING_SECONDS",
     "DEFAULT_CASE_TTL_SECONDS", "GRANT_MAX_USES",
-    "GRANT_TTL_SECONDS", "SELF_HEAL", "AUTO_MERGE",
+    "GRANT_TTL_SECONDS", "PR_MERGE", "SELF_HEAL", "AUTO_MERGE",
     "GateConfig",
     "CONTEST_HEADER", "CONTEST_NOT_AN_AUTHORISATION",
     "GateKind", "GatedAction", "KINDS", "KIND_NAMES", "NO_CASE_JUSTIFICATION",
@@ -96,6 +99,7 @@ __all__ = [
     "build_contest_question", "build_request_question", "classify", "contest_command",
     "deny_conflicts", "exits_advice", "file_request", "open_gate", "queue_for_review",
     "asks", "explain_command", "kind_of",
+    "pull_request_in",
     "question_text", "reads_only", "render_user_messages", "request_command", "scannable",
     "summarise", "sweep_unargued",
 ]
@@ -359,6 +363,70 @@ def classify(command: str, config: GateConfig, rules: RuleSet | None = None,
                        summary=_SUMMARIES.get(decision.match.kind, decision.match.kind),
                        command=command.strip(), matched=decision.match.pattern,
                        rule_id=decision.match.rule_id)
+
+
+# -- what pull request a merge command names ------------------------------------------
+
+#: A literal pull-request URL sitting in the command. `github.PR_URL_RE` without the
+#: anchors, because here it is one token inside a longer string.
+_PR_URL_IN = re.compile(
+    r"https://[A-Za-z0-9.-]+/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+")
+
+#: `gh pr merge 735 --squash`, flags in any position before the number.
+_PR_NUMBER_IN = re.compile(r"\bgh\s+pr\s+merge\s+(?:-{1,2}[^\s]+\s+)*?([0-9]+)\b")
+
+#: `--repo owner/name` / `-R owner/name`: the number is then about THAT repository, not
+#: about `origin`, and composing it against `origin` would record a different pull request
+#: than the one the command merges.
+_REPO_FLAG_IN = re.compile(r"(?:--repo[=\s]|-R\s*)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)")
+
+#: `gh api --method PUT repos/<owner>/<repo>/pulls/735/merge` — owner and repo in-string,
+#: and worker-supplied, so they are checked against `origin` like any other.
+_PR_API_IN = re.compile(
+    r"\brepos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pulls/([0-9]+)/merge\b")
+
+
+def pull_request_in(command: str, cwd: Path | None) -> str:
+    """The pull request a merge command names, checked, or `""`.
+
+    Three shapes resolve offline and the rest resolve to nothing — a branch ref and a
+    bare `gh pr merge --auto` need a `gh pr view`, and no network call belongs on a
+    decision path. See the shape table in
+    docs/superpowers/specs/2026-09-25-a-gate-records-the-pull-request.md §1.
+
+    **THE COMMAND IS WORKER-WRITTEN TEXT** (kn-c748e0fe). Nothing is returned that
+    `github.checked_pr_url` did not return: a string `gh` could read as a flag, and a
+    well-formed URL on somebody else's repository, are both refused rather than recorded
+    — including the `repos/o/r/pulls/N/merge` form, whose owner and repo the worker
+    chose. `UntrustedPullRequest` reads as "no pull request", because refusing to record
+    is the safe direction (spec §2). A `--repo`/`-R` beside a bare number is read too, so
+    a number about somebody else's repository is refused rather than composed against
+    `origin` and recorded as this project's.
+    """
+    from . import github
+
+    text = command or ""
+    url = ""
+    literal = _PR_URL_IN.search(text)
+    api = _PR_API_IN.search(text)
+    number = _PR_NUMBER_IN.search(text)
+    if literal:
+        url = literal.group(0)
+    elif api:
+        url = f"https://github.com/{api.group(1)}/{api.group(2)}/pull/{api.group(3)}"
+    elif number:
+        # The host is not in the command, and `checked_pr_url` constrains owner and repo
+        # rather than host — `origin_repo` is a local `git remote get-url`, no network.
+        named = _REPO_FLAG_IN.search(text)
+        repo = (named.group(1), named.group(2)) if named else github.origin_repo(cwd)
+        if repo is not None:
+            url = f"https://github.com/{repo[0]}/{repo[1]}/pull/{number.group(1)}"
+    if not url:
+        return ""
+    try:
+        return github.checked_pr_url(url, cwd=cwd)
+    except github.UntrustedPullRequest:
+        return ""
 
 
 # -- misconfiguration that silently shuts a gate --------------------------------------
@@ -1396,11 +1464,48 @@ def apply_decision(store: ProjectStore, approval_id: int, verdict: str,
     # A `self_heal` or `auto_merge` verdict skips it entirely, for the reason at the top
     # of the guard: there was no wait to end, so the only thing this could do here is
     # move a status nothing in this flow set.
+    _record_pull_request(store, approval, verdict)
     if not filed_by_the_os:
         from .invariants import end_wait_if_nothing_is_out
 
         end_wait_if_nothing_is_out(store, approval["wo_id"])
     return approval
+
+
+def _record_pull_request(store: ProjectStore, approval: dict[str, Any],
+                         verdict: str) -> None:
+    """Write the pull request an APPROVED merge authorised, if the record has none.
+
+    The second source for `work_orders.pr_url`, and the only one a planner ever reaches:
+    `ops.finish` is fed by `jarvis wo finish --pr`, and `ops.submit_plan` settles the
+    planner without one, so a planner that opened, gated and merged a pull request
+    recorded nothing (issue #742, wo-83e4183c).
+
+    Four conditions, each doing work. `approved` only — a denial never ran the command
+    and a DISMISSAL asserts the command was not a privileged action at all, so neither is
+    evidence of a merge. The two merge kinds only. A URL the parser could resolve and
+    `github.checked_pr_url` accepted. And an empty column, so a submitter's declaration
+    is never overwritten by a gate's inference.
+
+    `pr_url_recorded` rather than a second `finished {pr_url}`: the record has to say
+    where the column came from, because only a declaration routes the merge queue
+    (`ops.declared_pull_request`). Nothing here raises: a verdict that fails to record a
+    URL must still be a verdict. Spec §3.
+    """
+    try:
+        if verdict != "approved" or approval["kind"] not in (PR_MERGE, AUTO_MERGE):
+            return
+        wo = store.get_work_order(approval["wo_id"])
+        if wo is None or wo.get("pr_url"):
+            return
+        pr_url = pull_request_in(approval["command"], store.project_path)
+        if not pr_url:
+            return
+        store.update_work_order(wo["id"], pr_url=pr_url)
+        store.add_event(wo["id"], "pr_url_recorded", {
+            "approval_id": approval["id"], "pr_url": pr_url, "source": "gate"})
+    except Exception:  # noqa: BLE001 — see the docstring
+        log.exception("could not record the pull request of gate %s", approval.get("id"))
 
 
 def summarise(approvals: Iterable[dict[str, Any]]) -> str:

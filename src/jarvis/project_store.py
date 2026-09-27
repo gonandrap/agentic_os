@@ -127,12 +127,19 @@ VALIDATION_HELD_CAUSE = "usage_limit"
 # point — see `validation_hold_until`.
 VALIDATION_CI_CAUSE = "ci_pending"
 
+#: ...and this one is a round whose seats could not AUTHENTICATE. Its own cause for the
+#: same reason as the two above: no deadline exists, what clears it is a human, and
+#: `reopens_at` on it is a RECHECK INTERVAL that no surface may print as a promise (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §7).
+VALIDATION_AUTH_CAUSE = "auth"
+
 #: Every cause that means "this round is not failed, it is WAITING". A round closed with
 #: one of these is `RUNNABLE` and uncounted, so the submitter spends no round number on
 #: it and the next tick owns the same round again. ONE set, because `validation_hold_until`
 #: is the only reader and a cause missing from here is a round that holds once and then
 #: spins every tick for ever.
-VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE})
+VALIDATION_HOLDING_CAUSES = frozenset({VALIDATION_HELD_CAUSE, VALIDATION_CI_CAUSE,
+                                       VALIDATION_AUTH_CAUSE})
 
 #: HOW A ROUND READS TO A PERSON: one word, one tone, one icon, for every
 #: (outcome, hold_cause) pair. THE POINT IS THAT THERE IS ONE OF THESE — three surfaces
@@ -158,6 +165,7 @@ VALIDATION_STANDINGS: dict[tuple[str, str | None], tuple[str, str, str]] = {
     ("failed", None): ("failed", "bad", "✗"),
     ("failed", VALIDATION_CI_CAUSE): ("waiting for CI", "active", "◑"),
     ("failed", VALIDATION_HELD_CAUSE): ("held for the usage window", "active", "◑"),
+    ("failed", VALIDATION_AUTH_CAUSE): ("held for authentication", "active", "◑"),
 }
 
 
@@ -193,15 +201,15 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
     shut again writes a second event for the same round number, and taking the earlier
     moment would send the round straight back into a closed window every tick.
 
-    TWO CAUSES HOLD, and a caller wanting the moment alone is told apart from neither
-    (`validation_hold` below is for the ones that must be): a spent usage window
-    (`VALIDATION_HELD_CAUSE`) and GitHub still running the checks
-    (`VALIDATION_CI_CAUSE`). They are different facts about why nobody is judging yet and
-    identical in what the tick must do about it, so the vocabulary is
-    `VALIDATION_HOLDING_CAUSES` and the behaviour is this one function. A round holding
-    for both — a window that shut while CI was still running — takes the later moment,
-    which is the same "newest wins" rule and the right one: going again before either has
-    lifted is a refusal either way.
+    THREE CAUSES HOLD, and a caller wanting the moment alone is told apart from none of
+    them (`validation_hold` below is for the ones that must be): a spent usage window
+    (`VALIDATION_HELD_CAUSE`), GitHub still running the checks (`VALIDATION_CI_CAUSE`),
+    and Claude Code unable to authenticate (`VALIDATION_AUTH_CAUSE`). They are different
+    facts about why nobody is judging yet and identical in what the tick must do about
+    it, so the vocabulary is `VALIDATION_HOLDING_CAUSES` and the behaviour is this one
+    function. A round holding for more than one — a window that shut while CI was still
+    running — takes the later moment, which is the same "newest wins" rule and the right
+    one: going again before every one of them has lifted is a refusal either way.
 
     Takes ROWS rather than a store because the same rule has to answer for a feature
     order, whose events live on its manager's timeline and come back through
@@ -213,9 +221,11 @@ def validation_hold_until(events: Iterable[Any], round_no: int) -> float:
 def validation_hold(events: Iterable[Any], round_no: int) -> tuple[float, str]:
     """The moment above AND THE CAUSE that won it — (0.0, "") when nothing holds.
 
-    The scheduler needs only the moment; a RENDERER needs the cause, because the two
-    holds read to a person as opposite things (GitHub issue #714): a spent usage window
-    names when it reopens, and CI is simply not done yet. Same "newest wins" rule, so
+    The scheduler needs only the moment; a RENDERER needs the cause, because the three
+    holds read to a person as different things (GitHub issue #714): a spent usage window
+    names when it reopens, CI is simply not done yet, and an auth hold
+    (`VALIDATION_AUTH_CAUSE`) has no deadline at all — its `reopens_at` is a recheck
+    interval and a renderer must never print it as a promise. Same "newest wins" rule, so
     the sentence a surface prints is always the hold the tick is actually honouring.
     """
     held, cause = 0.0, ""
@@ -2761,6 +2771,26 @@ class ProjectStore:
             "SELECT * FROM wo_events WHERE wo_id=? AND kind=? ORDER BY ts",
             (wo_id, kind)).fetchall()
         return db.rows_to_dicts(rows)
+
+    def work_orders_with_event(self, kind: str, wo_ids: Sequence[str]) -> set[str]:
+        """Which of `wo_ids` carry an event of `kind`. ONE statement, whatever the count.
+
+        `events_of_kind` per order is what this replaces on a path that runs over every
+        open pull request in the fleet every couple of minutes: the merge poll's read
+        budget is asserted per pull request (`tests/test_pr_checks.py`), so the gate-only
+        exclusion it needs (2026-09-25 spec §4) has to cost one statement per STEP.
+
+        An empty id list never touches the connection — the poll's skip-the-whole-step
+        rule, one level down.
+        """
+        ids = list(wo_ids)
+        if not ids:
+            return set()
+        holes = ",".join("?" * len(ids))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT wo_id FROM wo_events WHERE kind=? AND wo_id IN ({holes})",
+            (kind, *ids)).fetchall()
+        return {str(row["wo_id"]) for row in rows}
 
     def last_event_of_kind(self, wo_id: str, kind: str) -> dict[str, Any] | None:
         """The NEWEST event of one kind on this work order, or None.

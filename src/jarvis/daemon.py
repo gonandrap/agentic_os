@@ -74,6 +74,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_AUTH_CAUSE,
     VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
     ProjectStore,
@@ -298,6 +299,13 @@ CI_HOLD_RECHECK_SECONDS = 60.0
 #: watching, which is the silent stall `VALIDATION_OUTAGE_LIMIT` exists to prevent one
 #: authority along. Forty-five minutes is CI's ~20-minute suite with room for a queue.
 CI_HOLD_DEADLINE_SECONDS = 45.0 * 60.0
+
+#: How long a round whose seats could not authenticate waits before going again: 1m, 5m,
+#: 15m, then 60m FOR EVER — the last entry is a cap and not a final attempt. What clears
+#: an auth failure is a human running `/login`, which may be thirty seconds or next week
+#: away, so nothing here gives up on a count (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §4).
+AUTH_HOLD_BACKOFF = (60.0, 300.0, 900.0, 3600.0)
 
 #: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
 #: nothing judged this work, so there is nothing for its author to fix, and the reason
@@ -1990,6 +1998,13 @@ class Daemon:
                 log.info("[%s] %s: round %d held until the usage window reopens",
                          project.name, wo_id, n)
                 return
+            if isinstance(failure, claude_cli.AuthFailureError):
+                # BEFORE the generic outage below, and Neo's hard condition on question
+                # 723: an auth failure must never consume one of its three attempts.
+                self._validation_auth_held(store, wo, round_id, n, failure.auth)
+                log.info("[%s] %s: round %d held until Claude Code can authenticate",
+                         project.name, wo_id, n)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -2291,6 +2306,46 @@ class Daemon:
                         {"round": n, "cause": VALIDATION_CI_CAUSE,
                          "reopens_at": reopens, "pending": list(pending)})
 
+    @staticmethod
+    def _validation_auth_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                              auth: claude_cli.AuthFailure) -> None:
+        """Claude Code could not authenticate. WAIT — this costs no outage attempt.
+
+        `_validation_ci_held`'s twin in every mechanical respect, and read that one first:
+        the round is closed `failed` because `failed` is `RUNNABLE` and
+        `counted_validation_rounds` ignores it, so the submitter spends no round number and
+        the next tick owns the same round again. GitHub issue #778: four work orders on
+        2026-09-25/26 were closed `escalated` on the FIRST auth failure of an OAuth refresh
+        race that fixed itself, each spending a round number and a user's attention.
+
+        IT NEVER ESCALATES ON A COUNT. `attempt` is recorded so a reader can see the streak
+        and so the backoff is derivable, and it is compared against nothing —
+        `worker_session.TurnPause.exhausted`'s reasoning one authority along: what clears
+        an auth failure is a human, and a count that gives up turns something a sign-in
+        fixes into a spent round. The 60m cap is what bounds the cost of waiting for ever:
+        one round, four seats, ~1.5s and zero tokens each, once an hour.
+
+        Counted FROM THE EVENTS, like `_validation_outage`, so a daemon restart does not
+        hand the round a fresh schedule. No `not recorded` backstop, for
+        `_validation_ci_held`'s reason: this holds on a moment, so an unwritten event costs
+        one unnecessary retry on the next tick rather than a silent stall.
+        """
+        from .invariants import AUTH_HOLD_NOTE
+
+        wo_id = wo["id"]
+        attempt = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                         "reopens_at": reopens, "attempt": attempt,
+                         "error": auth.message[:500]})
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -2542,6 +2597,13 @@ class Daemon:
                 log.info("[%s] feature %s: round %d held until the window reopens",
                          project.name, fo_id, n)
                 return
+            except claude_cli.AuthFailureError as e:
+                # BEFORE the generic clause — a `ClaudeCliError` subclass, so Python would
+                # never reach it after — and held rather than spent, GitHub issue #778.
+                self._feature_auth_held(store, fo, round_id, n, e.auth)
+                log.info("[%s] feature %s: round %d held until Claude Code can "
+                         "authenticate", project.name, fo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -2714,6 +2776,32 @@ class Daemon:
                            "reopens_at": reopens, "error": limit.message[:500],
                            "feature_order": fo_id})
 
+    def _feature_auth_held(self, store: ProjectStore, fo: dict, round_id: int, n: int,
+                           auth: claude_cli.AuthFailure) -> None:
+        """`_validation_auth_held` for a feature round — read that one; this is its twin.
+
+        The only difference is the carrier, the same one `_feature_held` has: these events
+        live on the MANAGER's timeline (`ops.feature_event`), because `wo_events.wo_id` is
+        a foreign key into `work_orders`, and the streak is counted back through
+        `ops.feature_events_of_kind`.
+        """
+        from . import ops
+        from .invariants import AUTH_HOLD_NOTE
+
+        fo_id = fo["id"]
+        attempt = 1 + sum(
+            1 for e in ops.feature_events_of_kind(store, fo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        ops.feature_event(store, fo_id, "validation_failed",
+                          {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                           "reopens_at": reopens, "attempt": attempt,
+                           "error": auth.message[:500], "feature_order": fo_id})
+
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
         """The validator could not be reached. A transport failure, NOT a verdict.
@@ -2870,6 +2958,8 @@ class Daemon:
             if stale["requeued"] or stale["failed"]:
                 log.warning("neo reclaimed stranded questions: requeued=%s failed=%s",
                             stale["requeued"], stale["failed"])
+            if stale["failed"]:
+                self._note_stranded_unreachable(store, stale["failed"])
             queued = store.counts().get("queued", 0)
         finally:
             store.close()
@@ -2878,6 +2968,74 @@ class Daemon:
         self.neo_draining = True
         future = self.neo_pool.submit(self._neo_drain)
         future.add_done_callback(lambda f: setattr(self, "neo_draining", False))
+
+    def _note_stranded_unreachable(self, store: Any, failed: list[int]) -> None:
+        """Tell the user about the questions `reclaim_stale` just gave up on (§5).
+
+        One `CentralStore` for the batch, closed in a `finally`, and the guard is PER
+        QUESTION for `auto_review`'s reason — one bad row must never stop the rest, nor
+        cost the tick its drain. No duplicate rows — `reclaim_stale`'s UPDATE matches `status='answering'`,
+        so an id is returned in `failed` exactly once in its life, and the drain path is
+        mutually exclusive with this one by status.
+        """
+        from .neo_store import UNREACHABLE_PREFIX
+
+        central = CentralStore()
+        try:
+            for qid in failed:
+                try:
+                    q = store.get(qid)
+                    if not q:
+                        continue
+                    detail = str(q["answer_reason"] or "")
+                    if detail.startswith(UNREACHABLE_PREFIX):
+                        detail = detail[len(UNREACHABLE_PREFIX):]
+                    self._note_question_unreachable(central, q, detail)
+                except Exception:  # noqa: BLE001
+                    log.exception("could not surface stranded neo question %s", qid)
+        finally:
+            central.close()
+
+    def _note_question_unreachable(self, central: CentralStore, q: dict,
+                                   detail: str) -> None:
+        """Neo's retries are spent. SAY SO — do not dress it as an escalation.
+
+        No per-kind branch, and that is the difference from `_neo_drain`'s `deliver`: there
+        is no verdict to apply, so the gate stays shut, the plan stays unreviewed and the
+        worker is told nothing. The only thing that happens is the user finding out that
+        nobody judged their question.
+
+        ONE METHOD BECAUSE THERE ARE TWO PATHS INTO IT (2026-09-26-an-unreachable-neo-
+        question-is-not-a-question-in-flight.md §5): the drain, where `release_claim`
+        returns `"unreachable"`, and `neo_tick`, where `reclaim_stale` fails a question
+        stranded in `answering` with a bare UPDATE. The second used to be logged and
+        nothing else, so half the unreachable rows reached neither the inbox nor the
+        attention flag. `invariants.neo_question_blocker` writes the reason so
+        `true_blockers` can re-derive it on every tick afterwards (kn-78346a2d).
+        """
+        from . import invariants
+
+        head = q["question"].strip().splitlines()[0][:200]
+        central.add_inbox(
+            project=q["project"], level="warning",
+            title=f"Neo could not be reached for a question from {q['wo_id']}",
+            body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
+                 f"every time it was tried. This is not an escalation: Neo made no "
+                 f"decision.\nLast error: {detail[:200]}\n"
+                 f"Read it and answer it: "
+                 f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                 f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
+            wo_id=q["wo_id"],
+        )
+        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
+        if ppath and ppath.is_dir():
+            pstore = ProjectStore(ppath)
+            try:
+                pstore.flag_attention(
+                    q["wo_id"],
+                    invariants.neo_question_blocker({**q, "status": "failed"}))
+            finally:
+                pstore.close()
 
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
@@ -2966,41 +3124,12 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
-        def unreachable(q: dict, detail: str) -> None:
-            """Neo's retries are spent. SAY SO — do not dress it as an escalation.
-
-            No per-kind branch, and that is the difference from `deliver`: there is no
-            verdict to apply, so the gate stays shut, the plan stays unreviewed and the
-            worker is told nothing. The only thing that happens is the user finding out
-            that nobody judged their question.
-            """
-            head = q["question"].strip().splitlines()[0][:200]
-            central.add_inbox(
-                project=q["project"], level="warning",
-                title=f"Neo could not be reached for a question from {q['wo_id']}",
-                body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
-                     f"every time it was tried. This is not an escalation: Neo made no "
-                     f"decision.\nLast error: {detail[:200]}\n"
-                     f"Read it and answer it: "
-                     f"{notify.neo_question_url(self.catalog, q['id'])}\n"
-                     f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
-                wo_id=q["wo_id"],
-            )
-            ppath = paths.get(q["project"])
-            if ppath and ppath.is_dir():
-                pstore = ProjectStore(ppath)
-                try:
-                    pstore.flag_attention(
-                        q["wo_id"],
-                        invariants.neo_question_blocker({**q, "status": "failed"}))
-                finally:
-                    pstore.close()
-
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
-                unreachable=unreachable,
+                unreachable=lambda q, detail: self._note_question_unreachable(
+                    central, q, detail),
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -4216,6 +4345,8 @@ class Daemon:
         if store.queued_messages(wo["id"]):
             return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        from . import ops as ops_mod
+
         # THE LANDING THE ROUND MACHINE DEFERRED, taken explicitly rather than left to
         # the coincidence that the branches below usually reach the same status: they
         # re-derive the join from the TURN, skipping the two rules only
@@ -4224,8 +4355,6 @@ class Daemon:
         # of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
         deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
         if deferred is not None:
-            from . import ops as ops_mod
-
             ops_mod.land_when_cleared(store, fresh)
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
@@ -4234,7 +4363,7 @@ class Daemon:
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
-            elif fresh.get("pr_url"):
+            elif ops_mod.routes_on_pull_request(store, fresh):
                 # Finished behind a pull request: it is the user's merge that ends this
                 # work order, not the worker's last turn. Settling it to `completed`
                 # here would take it off the open list before anyone had merged it.
@@ -4248,7 +4377,9 @@ class Daemon:
                 # question 275). The flag comes back on its own once the status does —
                 # INV-ATTENTION-MISSING re-derives it — so nothing has to be remembered
                 # beyond the status itself.
-                from . import ops as ops_mod
+                #
+                # A GATE-RECORDED URL IS NOT ONE OF THESE, and that exclusion is the
+                # predicate's, not this branch's: 2026-09-25 spec §4.
 
                 # `resumed_from` is the same rule as `pr_repair_origin` for the other
                 # way the OS takes a work order out of its status (issue #259): a
@@ -4278,8 +4409,7 @@ class Daemon:
                 # and no `pr_url` — used to be the one route to `completed` that walked
                 # past it. It also unparks: `park_unlanded` leaves `needs_review` behind,
                 # and this ran a tick later and completed the order it had just held.
-                from . import ops as ops_mod
-
+                # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
         elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
@@ -4645,14 +4775,28 @@ class Daemon:
         attention list; it does not mean the record may go on saying something untrue.
 
         The step is skipped whole when nothing is parked — one indexed query — so a
-        fleet with no open pull requests never spawns a subprocess for this.
+        fleet with no open pull requests never spawns a subprocess for this. One further
+        statement per STEP excludes the gate-only columns (2026-09-25 spec §4), and it is
+        per step and not per pull request on purpose: see below.
         """
-        parked = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
-                                                      include_hidden=True)
-                  if wo.get("pr_url")]
-        if not parked:
+        candidates = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
+                                                          include_hidden=True)
+                      if wo.get("pr_url")]
+        if not candidates:
             return
         from . import github, ops
+
+        # GATE-ONLY COLUMNS OUT, AND FOR ONE STATEMENT PER STEP. A URL a merge gate
+        # recorded routes nothing (2026-09-25 spec §4): polling one would see MERGED and
+        # `complete_merged` would close out a planner that never submitted its plan. The
+        # bulk read is what keeps the budget above per-pull-request — `pr_url_recorded` is
+        # rare, so `routes_on_pull_request` is asked only about the ids it names.
+        recorded = store.work_orders_with_event("pr_url_recorded",
+                                                [wo["id"] for wo in candidates])
+        parked = [wo for wo in candidates
+                  if wo["id"] not in recorded or ops.routes_on_pull_request(store, wo)]
+        if not parked:
+            return
 
         # THE BASE'S CI, READ ONCE PER PROJECT PER TICK AND LAZILY — `heal_inherited_
         # failure` fills this only when some pull request is actually failing, so a
@@ -4873,6 +5017,14 @@ class Daemon:
                 continue
             found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
             store.add_event(wo_id, "landing_seen", found.record())
+            # THE MERGE ITSELF, as an event and never as `pr_state` — kn-dbc4971d keeps
+            # that column's two writers, and `ops.complete_merged` would `close_out` an
+            # order that is already `completed`. Once only: two events are two merge lines
+            # on every surface. 2026-09-25-a-gate-records-the-pull-request.md §5.
+            if pr.state == "MERGED" and not store.events_of_kind(wo_id, "pr_merged"):
+                store.add_event(wo_id, "pr_merged", {
+                    "pr_url": str(wo["pr_url"]), "head_oid": pr.head_oid,
+                    "merged_at": pr.merged_at, "source": "landing_sweep"})
             log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
 
     def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:
@@ -5268,6 +5420,32 @@ class Daemon:
             "reason": OBJECTION_WITHDRAWN_REASON,
             "envelope_id": assumption.get("objection_envelope_id")})
 
+    def _unreachable_question_ids(self, neo_store: Any,
+                                  assumptions: list[dict]) -> set[int]:
+        """The links among these rows that point at a question NOBODY WILL EVER ANSWER.
+
+        `status == 'failed'` and nothing else: the ladder is spent, so the hold the pointer
+        buys in `autoreview.decide` condition 6 — and in `decide_confirm`'s own column —
+        would otherwise last the life of the work order
+        (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §4).
+
+        ONE READ PER LINK PER TICK, beside the other facts about the ORDER above, and on
+        the handle `auto_review` already opened on this thread — so it costs no connection
+        and nothing at all on an order nobody has asked about. Derived here rather than in
+        `autoreview`, which is pure by contract; `ops._unreachable_asks` is the read-side
+        twin for the surfaces.
+        """
+        dead: set[int] = set()
+        for a in assumptions:
+            for column in ("neo_question_id", "confirm_question_id"):
+                qid = int(a.get(column) or 0)
+                if not qid or qid in dead:
+                    continue
+                q = neo_store.get(qid)
+                if q and str(q["status"] or "") == "failed":
+                    dead.add(qid)
+        return dead
+
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
                                assumptions: list[dict], *, early: bool = False) -> None:
@@ -5300,6 +5478,7 @@ class Daemon:
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
         objecting = bool(store.outstanding_objections(wo["id"]))
+        dead_questions = self._unreachable_question_ids(neo_store, assumptions)
         packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
@@ -5311,7 +5490,8 @@ class Daemon:
                     return autoreview.decide_confirm(
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
                         round_reason=round_reason, refusal_answered=answered,
-                        objections_outstanding=objecting, stakes=stakes_verdict)
+                        objections_outstanding=objecting,
+                        unreachable_question_ids=dead_questions, stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -5338,7 +5518,9 @@ class Daemon:
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
-                            refusal_answered=answered, stakes=stakes_verdict)
+                            refusal_answered=answered,
+                            unreachable_question_ids=dead_questions,
+                            stakes=stakes_verdict)
 
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
@@ -6316,8 +6498,15 @@ class Daemon:
             # merged pull request or an order that produced nothing to land, so this
             # inherits issue #232's distinction rather than restating it — a fix sitting
             # on an unmerged branch never gets here. `pr_url` separates those two routes:
-            # an order with no code to land has nothing to put in a release.
-            if (applied == issues.CLOSED and wo.get("pr_url")
+            # an order with no code to land has nothing to put in a release — and it is
+            # read through the routing predicate, because cutting a RELEASE is the largest
+            # move the column makes and a gate-recorded one makes none (2026-09-25 spec
+            # §4). The closing COMMENT still names the raw column, which is the whole
+            # point of recording it.
+            from . import ops as ops_mod
+
+            if (applied == issues.CLOSED
+                    and ops_mod.routes_on_pull_request(store, wo)
                     and issues.dispatches(wo.get("issue_priority") or "")):
                 self.ensure_release(project, store, wo)
 

@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -766,7 +767,9 @@ def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            round_outcome: str = "", round_n: int = 0, round_reason: str = "",
            refusal_answered: bool = True,
-           asked_question_id: int = 0, stakes: Stakes | None = None) -> Decision:
+           asked_question_id: int = 0,
+           unreachable_question_ids: Collection[int] = (),
+           stakes: Stakes | None = None) -> Decision:
     """May the OS decide this assumption right now? PURE — no store, no clock, no model.
 
     Dicts in, armed-or-held-with-a-reason out, for `automerge.decide`'s reason: the whole
@@ -818,6 +821,12 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     the very question being delivered, so passing its id excludes it — while a link to a
     DIFFERENT question still holds, because two rulings on one assumption is a state
     nobody designed and not one to settle under.
+
+    `unreachable_question_ids` — AN ID IN THIS SET IS A QUESTION NOBODY WILL EVER ANSWER:
+    its retry ladder is spent and `questions.status` is `failed`, so condition 6's mandate
+    of one question per assumption is untouched by excluding it
+    (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §4). The caller
+    derives it — `Daemon._unreachable_question_ids` — because this function is pure.
     """
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
@@ -844,7 +853,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "you refused an assumption on this work order and the worker has "
                      "not delivered again since", **fields)
     asked = int(assumption.get("neo_question_id") or 0)
-    if asked and asked != int(asked_question_id or 0):
+    if asked and asked != int(asked_question_id or 0) \
+            and asked not in unreachable_question_ids:
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
     if stakes is not None:
@@ -866,6 +876,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    round_outcome: str = "", round_n: int = 0, round_reason: str = "",
                    refusal_answered: bool = True,
                    objections_outstanding: bool = False,
+                   unreachable_question_ids: Collection[int] = (),
                    stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
 
@@ -888,6 +899,10 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
       on one assumption, one settling it while the other has a message to the worker in
       flight about it.
 
+    `unreachable_question_ids` covers `confirm_question_id` as well as condition 6, and it
+    means what it means in `decide`: the id is a question nobody will ever answer, so a
+    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4).
+
     **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
     own docstring documents for condition 6. `neo_question_id` points at the EARLY
     question and always will, so without it every confirmation would hold as "already
@@ -907,7 +922,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      f"nothing, so there is nothing to confirm and it is yours",
                      **fields)
     confirming = int(assumption.get("confirm_question_id") or 0)
-    if confirming:
+    if confirming and confirming not in unreachable_question_ids:
         return _held(HELD_CONFIRMING,
                      f"assumption #{n} is already with Neo to confirm "
                      f"(question {confirming})", **fields)
@@ -921,6 +936,9 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                   round_n=round_n, round_reason=round_reason,
                   refusal_answered=refusal_answered,
                   asked_question_id=int(assumption.get("neo_question_id") or 0),
+                  # Forwarded, not consumed: both gates need it, and an id in it is a
+                  # question nobody will ever answer (2026-09-26 spec §4).
+                  unreachable_question_ids=unreachable_question_ids,
                   # Forwarded unchanged (2026-09-25 spec SS3.7): the confirmation pass is
                   # gated by the same verdict the ask pass was.
                   stakes=stakes)
@@ -930,6 +948,7 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  round_outcome: str = "", round_n: int = 0, round_reason: str = "",
                  refusal_answered: bool = True,
                  asked_question_id: int | None = None,
+                 unreachable_question_ids: Collection[int] = (),
                  stakes: Stakes | None = None) -> Decision:
     """May the OS put this assumption to Neo WHILE THE WORKER IS STILL TYPING? PURE.
 
@@ -963,6 +982,10 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     this pass has no settle site to re-check against, and a second call excluding its own
     question is what §7 does with `confirm_question_id`. It stays in the signature so the
     two functions are called the same way, and `None` and `0` mean the same thing.
+
+    `unreachable_question_ids` is `decide`'s, meaning the same thing — an id in it is a
+    question nobody will ever answer — and this pass can reach a dead early link on an
+    order that is still `running` (2026-09-26 spec §4).
     """
     if not (getattr(cfg, "enabled", False) and getattr(cfg, "auto_review", False)):
         return _held(HELD_DISABLED,
@@ -993,7 +1016,8 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "you refused an assumption on this work order and the worker has "
                      "not delivered again since", **fields)
     asked = int(assumption.get("neo_question_id") or 0)
-    if asked and asked != int(asked_question_id or 0):
+    if asked and asked != int(asked_question_id or 0) \
+            and asked not in unreachable_question_ids:
         return _held(HELD_ASKED,
                      f"assumption #{n} is already with Neo (question {asked})", **fields)
     if stakes is not None:

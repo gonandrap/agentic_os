@@ -20,13 +20,19 @@ import time
 
 import pytest
 
+from jarvis import invariants
 from jarvis import neo as neo_mod
 from jarvis import ops, panel, supervisor
 from jarvis import testing as T
 from jarvis.catalog import load_catalog
 from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
-from jarvis.neo_store import MAX_ANSWER_ATTEMPTS, UNREACHABLE_PREFIX, NeoStore
+from jarvis.neo_store import (
+    MAX_ANSWER_ATTEMPTS,
+    STALE_ANSWERING_SECONDS,
+    UNREACHABLE_PREFIX,
+    NeoStore,
+)
 from jarvis.project_store import MAX_DISPATCH_ATTEMPTS, ProjectStore
 from jarvis.seats import Opinion
 
@@ -243,6 +249,80 @@ def test_the_inbox_says_unreachable_and_never_escalated(asked, project):
         assert "could not answer" in fresh["attention_reason"]
     finally:
         store.close()
+
+
+def test_a_question_stranded_in_answering_is_surfaced_too(asked, project):
+    """THE SILENT PATH (2026-09-26-an-unreachable-neo-question… §5): `reclaim_stale` marks
+    a stranded question `failed` with no callback and `neo_tick` only logged the ids, so
+    half the unreachable rows reached neither the inbox nor the attention flag."""
+    daemon, wo = asked
+    store = NeoStore()
+    try:
+        q = store.claim_next()
+        store.conn.execute("UPDATE questions SET attempts=?, claimed_at=? WHERE id=?",
+                           (MAX_ANSWER_ATTEMPTS,
+                            time.time() - STALE_ANSWERING_SECONDS - 60, q["id"]))
+    finally:
+        store.close()
+
+    daemon.neo_tick()
+    daemon.neo_tick()
+
+    failed = _q(q["id"])
+    assert failed["status"] == "failed"
+    central = CentralStore()
+    try:
+        rows = [r for r in central.unacked_inbox()
+                if "could not be reached" in r["title"]]
+    finally:
+        central.close()
+    assert len(rows) == 1, "a second tick announced the same outage again"
+    assert rows[0]["level"] == "warning"
+    assert "NOBODY HAS JUDGED THIS" in rows[0]["body"]
+
+    pstore = ProjectStore(project)
+    try:
+        fresh = pstore.get_work_order(wo["id"])
+    finally:
+        pstore.close()
+    assert fresh["needs_attention"]
+    assert fresh["attention_reason"] == invariants.neo_question_blocker(failed)
+
+
+def test_one_unsurfaceable_stranded_question_does_not_silence_the_rest(asked, project):
+    """The guard is PER QUESTION: a batch of two, the first one blowing up on the way to
+    the inbox, and the second still gets its warning."""
+    daemon, wo = asked
+    ops.ask_question(wo["id"], "And should it gzip the export?")
+    store = NeoStore()
+    try:
+        first, second = store.claim_next(), store.claim_next()
+        assert first and second
+        store.conn.execute(
+            "UPDATE questions SET attempts=?, claimed_at=? WHERE id IN (?, ?)",
+            (MAX_ANSWER_ATTEMPTS, time.time() - STALE_ANSWERING_SECONDS - 60,
+             first["id"], second["id"]))
+    finally:
+        store.close()
+
+    real = daemon._note_question_unreachable                            # noqa: SLF001
+
+    def boom(central, q, detail):
+        if q["id"] == first["id"]:
+            raise RuntimeError("inbox write blew up on the first row")
+        real(central, q, detail)
+
+    daemon._note_question_unreachable = boom                            # noqa: SLF001
+    daemon.neo_tick()
+
+    central = CentralStore()
+    try:
+        rows = [r for r in central.unacked_inbox()
+                if "could not be reached" in r["title"]]
+    finally:
+        central.close()
+    assert len(rows) == 1, "the first bad row cost the second its inbox warning"
+    assert "NOBODY HAS JUDGED THIS" in rows[0]["body"]
 
 
 def test_an_approval_gate_is_never_decided_by_a_crash(asked, project):

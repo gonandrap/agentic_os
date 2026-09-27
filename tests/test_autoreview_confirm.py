@@ -134,6 +134,25 @@ def test_a_different_question_still_holds_it():
     assert d.code == autoreview.HELD_ASKED
 
 
+def test_a_confirmation_nobody_will_ever_answer_is_asked_again():
+    """The confirm pass is guarded by its own column, so without this it holds for ever on
+    a dead confirmation (2026-09-26-an-unreachable-neo-question… §4)."""
+    a = judged(confirm_question_id=77)
+
+    assert confirm(assumption=a, unreachable_question_ids=(77,)).armed
+    assert confirm(assumption=a).code == autoreview.HELD_CONFIRMING
+    assert confirm(assumption=a,
+                   unreachable_question_ids=(9,)).code == autoreview.HELD_CONFIRMING
+
+
+def test_the_set_reaches_the_conditions_decide_owns_too():
+    """It is forwarded, not consumed: a dead EARLY link on a row being confirmed must not
+    hold in `decide`'s condition 6 either."""
+    a = judged(confirm_question_id=77, neo_question_id=41)
+
+    assert confirm(assumption=a, unreachable_question_ids=(77, 41)).armed
+
+
 # -- the daemon: asking the second question --------------------------------------------
 
 

@@ -1097,6 +1097,34 @@ def test_a_blocker_that_produced_no_code_closes_its_issue_and_ships_nothing(flee
     assert not fleet.releases()
 
 
+def test_a_gate_recorded_pull_request_closes_the_issue_and_ships_nothing(fleet):
+    """The third reader of the column, audited: a RELEASE is the largest move `pr_url`
+    makes, and a gate-recorded one makes none (2026-09-25 spec §4).
+
+    The pairing is in the same assertion: the issue still CLOSES with the link on it, which
+    is what recording the gate's URL was for — only the ship is withheld, because nobody
+    declared that this order's code is what landed.
+    """
+    from jarvis import gates, ops
+
+    wo_id = fleet.blocker_wo()
+    store = fleet.store()
+    try:
+        approval = store.add_approval(wo_id, gates.PR_MERGE, f"gh pr merge {PR} --squash")
+        gates.apply_decision(store, approval["id"], verdict="approved",
+                             reason="checks green", decided_by="neo")
+        assert store.get_work_order(wo_id)["pr_url"] == PR
+        ops.complete_merged(store, store.get_work_order(wo_id))
+    finally:
+        store.close()
+
+    fleet.sweep()
+    issue = fleet.gh.issue()
+    assert issue["state"] == "CLOSED"
+    assert PR in "\n".join(issue["comments"])
+    assert not fleet.releases()
+
+
 def test_a_landed_fix_for_a_backlog_priority_ships_nothing(fleet):
     """Only `critical` and `blocker` commit the fleet to a release. A `high` the user
     promoted themselves closes its issue and stops there."""
