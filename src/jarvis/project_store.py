@@ -1063,6 +1063,12 @@ ADDED_COLUMNS = {
         # "what the family lent it" are different claims and an escalation has to name
         # which one ran out.
         "budget_reserved_usd": "REAL",
+        # WHAT DEBUG DATA IS COLLECTED for this one order — `off`/`normal`/`full`, or NULL
+        # for "this order has no answer", which is `budget_usd`'s precedent and what every
+        # row written before this existed says. NULL is NOT `off`: it falls through to the
+        # project config (`observability.level_for`). See
+        # docs/specs/2026-09-24-order-observability.md §10 for the one write it gates.
+        "observability": "TEXT",
         "job_id": "TEXT",
         "reply_job_id": "TEXT",
         # Hidden orders stay on the record but stop competing for the user's attention:
@@ -1611,6 +1617,7 @@ class ProjectStore:
         issue_url: str | None = None,
         issue_priority: str | None = None,
         budget_usd: float | None = None,
+        observability: str | None = None,
     ) -> dict[str, Any]:
         """Create a work order. `status` and `session_id` are set in the same INSERT
         rather than afterwards, because the row is visible to the daemon the instant it
@@ -1627,6 +1634,12 @@ class ProjectStore:
         assert origin in WO_ORIGINS, origin
         assert status in WO_STATUSES, status
         assert kind in WO_KINDS, kind
+        if observability is not None:
+            from . import observability as _observability  # local: see set_observability
+
+            if observability not in _observability.LEVELS:
+                raise ValueError(f"observability {observability!r} not in "
+                                 f"{list(_observability.LEVELS)}")
         wo_id = wo_id or db.new_id("wo")
         deps = list(depends_on or [])
         if wo_id in deps:
@@ -1641,14 +1654,14 @@ class ProjectStore:
                    created_at, updated_at, model, effort, permission_mode,
                    append_system_prompt, backlog_id, metadata, session_id, depends_on,
                    parent_id, kind, spec_section, issue_url, issue_priority,
-                   budget_usd)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   budget_usd, observability)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 wo_id, title, description, status, origin, ts, ts, model, effort,
                 permission_mode, append_system_prompt, backlog_id,
                 db.to_json(metadata or {}), session_id, db.to_json(deps),
                 parent_id, kind, spec_section or None, issue_url or None,
-                issue_priority or None, budget_usd,
+                issue_priority or None, budget_usd, observability,
             ),
         )
         self.add_event(wo_id, "created", {"origin": origin, "depends_on": deps,
@@ -2345,6 +2358,23 @@ class ProjectStore:
         self.get_work_order(wo_id)  # KeyError if it doesn't exist
         self.update_work_order(wo_id, hidden=1 if hidden else 0)
         self.add_event(wo_id, "hidden", {"hidden": bool(hidden)})
+
+    def set_observability(self, wo_id: str, level: str | None) -> None:
+        """Set this order's debug-collection level, or None to clear it back to "no
+        answer" (§10 of docs/specs/2026-09-24-order-observability.md).
+
+        The vocabulary is validated HERE and not at the surface: a level outside it would
+        fall through the resolver silently and leave the user believing they had changed
+        something. `observability` is imported locally to keep this store off a
+        module-level dependency it needs nowhere else.
+        """
+        from . import observability
+
+        if level is not None and level not in observability.LEVELS:
+            raise ValueError(f"observability {level!r} not in "
+                             f"{list(observability.LEVELS)}")
+        self.get_work_order(wo_id)  # KeyError if it doesn't exist
+        self.update_work_order(wo_id, observability=level)
 
     # -- the scheduler's clock (`scheduled_jobs`) -------------------------------------
     #
