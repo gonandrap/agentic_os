@@ -582,6 +582,15 @@ def investigator_write_decision(payload: dict[str, Any],
     """
     if env.get(WO_KIND_ENV) != "investigator":
         return None
+    tool = payload.get("tool_name") or ""
+    # FAIL CLOSED on every MCP tool but the read-only Serena ones: an MCP write reaches no
+    # `Edit`/`Write` branch, and `dispatch.serena_allow_rules()` denies nothing (§2.6).
+    if tool.startswith("mcp__"):
+        from . import dispatch
+
+        for prefix in dispatch.SERENA_TOOL_PREFIXES:
+            if tool.startswith(prefix) and tool[len(prefix):] in dispatch.SERENA_READ_TOOLS:
+                return None
     tool_input = payload.get("tool_input") or {}
     file_path = tool_input.get("file_path") or tool_input.get("notebook_path") or ""
     cwd = payload.get("cwd") or ""
@@ -645,7 +654,12 @@ def _investigator_git_read(segment: str) -> bool:
 
     §2.6 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
     """
-    words = segment.split()
+    # PARSED, never `segment.split()`: the shell strips quotes and backslashes before git
+    # sees the argument, so `"--output=x"` would otherwise pass the test below (§2.6).
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return False
     program = Path(words[0]).name if words else ""
     sub = words[1] if len(words) > 1 else ""
     if (program, sub) not in INVESTIGATOR_READS:
@@ -653,8 +667,14 @@ def _investigator_git_read(segment: str) -> bool:
     # `git diff --output=src/a.py` writes a file with no chaining at all, and this path
     # never reaches `reads_only`. A global option before the subcommand needs no test:
     # the pair check reads `-C` as the subcommand and fails already — leave it that way.
-    if program == "git" and any(w.startswith("--output") for w in words[2:]):
-        return False
+    # git's parse-options takes any unambiguous prefix, so `--outp=x` writes too;
+    # `--output-indicator-new=` and friends are NOT prefixes of `--output`, write nothing,
+    # and must stay allowed — do not "tighten" this into a false refusal (§2.6).
+    if program == "git":
+        for word in words[2:]:
+            name = word.split("=", 1)[0]
+            if "--output".startswith(name) and len(name) >= 4:
+                return False
     allowed = INVESTIGATOR_GH_ACTIONS.get(sub) if program == "gh" else None
     if allowed is not None:
         return (words[2] if len(words) > 2 else "") in allowed
@@ -1102,6 +1122,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
+
+    # Its own branch: an `mcp__` tool name enters neither the Bash block above nor the
+    # `Edit`/`Write` one below, so the refusal is unreachable anywhere else (§2.6 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md).
+    if isinstance(tool, str) and tool.startswith("mcp__"):
+        return investigator_write_decision(payload, env)
 
     if tool in ("Edit", "Write", "NotebookEdit") and env.get("JARVIS_WO_ID"):
         narrowed = under_review_decision(payload, env)

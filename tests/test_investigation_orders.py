@@ -201,10 +201,43 @@ SMUGGLED = (
     "git diff --output=src/a.py",
 )
 
+#: The same write, QUOTED or backslash-escaped. The shell strips both before git sees the
+#: argument, so a test on unparsed text fails OPEN. §2.6.
+QUOTED_SMUGGLED = (
+    'git diff "--output=src/a.py"',
+    "git diff '--output=src/a.py'",
+    "git log -p \\--output=src/a.py",
+    # git's parse-options accepts an unambiguous abbreviation, which writes too.
+    "git diff --outp=src/a.py",
+)
+
 #: The pipelines an investigator actually needs, which the segment loop must keep.
 PIPED_READS = (
     "git log --oneline -5 | head -20",
     "git diff HEAD~1 | grep def",
+)
+
+#: Legitimate quoted arguments: parsing must not turn the refusal into a false one.
+QUOTED_READS = (
+    'git log --grep="fix the bug" -5',
+    'git diff "HEAD~1"',
+    # Not a prefix of `--output` and writes nothing.
+    "git log --output-indicator-new=X -1",
+)
+
+#: MCP write tools reach no `Edit`/`Write` branch, so without a branch of their own they
+#: are seen by NO investigator hook. §2.6.
+MCP_WRITES = (
+    "mcp__serena__replace_symbol_body",
+    "mcp__serena__create_text_file",
+    "mcp__serena__insert_after_symbol",
+    "mcp__serena__replace_content",
+    "mcp__plugin_serena_serena__execute_shell_command",
+)
+
+MCP_READS = (
+    "mcp__serena__find_symbol",
+    "mcp__plugin_serena_serena__get_symbols_overview",
 )
 
 
@@ -215,6 +248,41 @@ def test_a_read_may_not_smuggle_a_write_into_a_later_segment():
         # Directly too, so the refusal is this kind's own and not a gate firing first.
         assert _decision(
             hooks.investigator_bash_decision(_bash(command), _env())) == "deny", command
+
+
+def test_a_quoted_write_argument_is_refused_too():
+    for command in QUOTED_SMUGGLED:
+        assert _decision(hooks.preflight_decision(_bash(command), _env())) == "deny", (
+            command)
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "deny", command
+
+
+def test_a_quoted_read_still_runs():
+    for command in QUOTED_READS:
+        assert _decision(
+            hooks.preflight_decision(_bash(command), _env())) == "allow", command
+
+
+def test_an_investigator_may_not_use_an_mcp_write_tool():
+    for tool in MCP_WRITES:
+        payload = {"tool_name": tool, "cwd": "/tmp", "tool_input": {}}
+        result = hooks.preflight_decision(payload, _env())
+        assert _decision(result) == "deny", tool
+        assert hooks.VERDICT_FILE in _reason(result), tool
+
+
+def test_an_investigator_keeps_the_serena_read_tools():
+    for tool in MCP_READS:
+        payload = {"tool_name": tool, "cwd": "/tmp", "tool_input": {}}
+        assert _decision(hooks.preflight_decision(payload, _env())) in (None, "allow"), (
+            tool)
+
+
+def test_an_ordinary_worker_is_untouched_by_the_mcp_rule():
+    for tool in MCP_WRITES + MCP_READS:
+        payload = {"tool_name": tool, "cwd": "/tmp", "tool_input": {}}
+        assert hooks.preflight_decision(payload, _env(kind="worker")) is None, tool
 
 
 def test_a_piped_read_still_runs():
