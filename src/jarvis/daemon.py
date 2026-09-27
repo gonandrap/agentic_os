@@ -813,6 +813,10 @@ class Daemon:
                 # Only the OS-owning project does any work here — see `check_cache_ttl`.
                 if scan_cache_ttl:
                     self.check_cache_ttl(project, store)
+                # IMMEDIATELY BEFORE dispatch, not after: `sync_issues` files a release
+                # order late in one tick and this claim takes it early in the next, so a
+                # hold running after dispatch holds nothing on the first opportunity.
+                self.hold_red_release(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     self.poll_pull_requests(project, store)
@@ -6336,9 +6340,14 @@ class Daemon:
             # point of recording it.
             from . import ops as ops_mod
 
+            # TWO ROUTES TO A RELEASE, and expediting is the user's own: an expedited
+            # order carries an honest low/medium rating or none at all, so the rating
+            # column alone could never see that they asked for this in production now
+            # (2026-09-27 spec §2).
             if (applied == issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
-                    and issues.dispatches(wo.get("issue_priority") or "")):
+                    and (issues.dispatches(wo.get("issue_priority") or "")
+                         or issues.was_expedited(wo))):
                 self.ensure_release(project, store, wo)
 
     #: How long a cached issue state is good for. An hour, because nothing the OS does
@@ -6419,9 +6428,12 @@ class Daemon:
     #: would (the user's instruction). `--stage` rather than an inline restart because
     #: restarting inline kills the worker's own session: 0.5.1 landed as `failed` after a
     #: perfect deploy, which is the whole reason staged mode exists.
+    #: WHY each fix earned this release is on the per-fix LINE, not here: a batch can
+    #: mix a confirmed blocker with an expedited `low`, and one sentence about both
+    #: would be false about one of them (2026-09-27 spec §4).
     RELEASE_BRIEF = """\
-Ship a release. These fixes have LANDED on `main` and the bugs they close were confirmed \
-`critical` or `blocker` by Neo, so the OS owes the fleet a release carrying them:
+Ship a release. These fixes have LANDED on `main` and the OS owes the fleet a release \
+carrying them:
 
 {fixes}
 
@@ -6450,12 +6462,17 @@ the place to fix a red build."""
         Idempotent for the same reason the rest of the lifecycle is — a fix already in
         the batch is not added twice, so a sweep that runs again changes nothing.
         """
-        from . import db
+        from . import db, issues
         from .project_store import OPEN_STATUSES
 
         url = wo.get("issue_url") or ""
+        # Expedited first: an order can be both, and the user's scheduling act is the
+        # one that is never contingent on a verdict (spec §4).
+        reason = ("expedited by the filer" if issues.was_expedited(wo)
+                  else f"confirmed `{wo.get('issue_priority')}` by Neo")
         line = (f"- {url} — fixed by `{wo['id']}`"
-                + (f" ({wo['pr_url']})" if wo.get("pr_url") else ""))
+                + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
+                + f" — {reason}")
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
@@ -6487,6 +6504,120 @@ the place to fix a red build."""
                         {"issue_url": url, "wo_id": wo["id"]})
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
         return str(fresh["id"])
+
+    #: How long a red base defers a release order's dispatch. Only a RE-CHECK INTERVAL:
+    #: a fixed `main` ships within five minutes, so being wrong about the number is
+    #: cheap, and it is deliberately not a config key until someone wants a different one.
+    RED_HOLD_SECONDS = 300
+
+    #: Said once per BROKEN COMMIT on a release order held back by a red base
+    #: (2026-09-27 spec §5.2).
+    RED_HOLD_EVENT = "release_held_red_base"
+
+    def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep a pending release order out of dispatch while the base branch is red.
+
+        **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
+        fires only on the issue-state TRANSITION, so a release skipped because `main`
+        was red would never be filed again and the fix would drop out of every future
+        batch. The order is always created; this defers it until the base is buildable.
+
+        Now that an expedited `low` ships on landing, releases go out unattended and
+        routinely, and the only thing standing between a red `main` and a release was a
+        sentence in `RELEASE_BRIEF` asking the worker to check — a worker's judgement in
+        place of a post-condition.
+
+        **AN UNREADABLE CI DOES NOT HOLD.** `ci.base_runs` raises on any doubt; a `gh`
+        outage must not strand the user's release for ever, and the brief plus the
+        release gate are the fallback. `_heal_inherited_red`'s direction for the same call.
+
+        Cost, in guard order: nothing at all for a project that does not own the OS, one
+        indexed listing when it owns no pending release, and a `gh` call only once a
+        hold has lapsed — an in-force hold IS the rate limit.
+
+        docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
+        """
+        from . import ci, evidence, github
+
+        # Same scope as `settle_shipped_releases`: the release path is the OS's own
+        # release script and the production checkout, both facts about this repository.
+        if project.name != self._os_owner():
+            return
+        due: list[dict[str, Any]] = []
+        for candidate in store.list_work_orders(statuses=("pending",),
+                                                include_hidden=True):
+            meta = db.from_json(candidate.get("metadata"), {}) or {}
+            # A hold already in force is the throttle: no `gh` call until it lapses,
+            # and that is the whole rate limit (§5.3).
+            if (isinstance(meta.get(self.RELEASE_BATCH_KEY), list)
+                    and float(candidate.get("retry_after") or 0) <= db.now()):
+                due.append(candidate)
+        if not due:
+            return
+
+        base = evidence.base_ref(project.path) or "main"
+        # `base_runs` asks `gh run list --branch`, which wants the BRANCH — and
+        # `BRANCH_RE` admits a slash, so `origin/main` would pass the check and select
+        # nothing. `landing._fetch_ref`'s strip.
+        branch = base.split("/", 1)[1] if base.startswith("origin/") else base
+        try:
+            # One call for the whole step, `_heal_inherited_red`'s caching by base ref.
+            runs = ci.base_runs(branch, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] could not read %s's CI, so no release is held: %s",
+                      project.name, branch, e)
+            return
+        red = self._red_base_run(runs)
+        for wo in due:
+            wo_id = str(wo["id"])
+            if red is None:
+                # Green with no hold in force writes nothing, and a non-zero ladder
+                # belongs to `release_dispatch_claim` — not this step's to erase (§5.7).
+                if wo.get("retry_after") is not None and not int(
+                        wo.get("dispatch_attempts") or 0):
+                    store.hold_dispatch(wo_id, until=None)
+                continue
+            until = max(float(wo.get("retry_after") or 0),
+                        db.now() + self.RED_HOLD_SECONDS)
+            store.hold_dispatch(wo_id, until=until)
+            self._say_base_is_red(store, wo_id, base, red, until)
+
+    def _red_base_run(self, runs: tuple[Any, ...]) -> Any | None:
+        """The run that says the base is broken right now, or None.
+
+        Scoped to the workflows that reported on the base's NEWEST head (§5.1): asking
+        about every workflow in the window would let one that ran once, failed and was
+        then deleted latch the base red for ever, because `ci.latest` keeps returning it.
+        """
+        from . import ci
+
+        head = runs[0].head_sha if runs else ""
+        workflows = tuple(dict.fromkeys(
+            r.workflow for r in runs if r.head_sha == head and r.workflow))
+        for workflow in workflows:
+            latest = ci.latest(runs, workflow)
+            if latest is not None and latest.red:
+                return latest
+        return None
+
+    def _say_base_is_red(self, store: ProjectStore, wo_id: str, base: str,
+                         red: Any, until: float) -> None:
+        """One line per BROKEN COMMIT on the release order's timeline.
+
+        Deduped on the head sha and not on the kind: kn-7b122cd9 — a code per condition
+        is also a code per world, and `main` breaking again on a different commit is
+        news. No attention flag; a red base for a few minutes is ordinary.
+        """
+        head = red.head_sha
+        if any(db.from_json(e["payload"], {}).get("head_sha") == head
+               for e in store.events_of_kind(wo_id, self.RED_HOLD_EVENT)):
+            return
+        store.add_event(wo_id, self.RED_HOLD_EVENT, {
+            "base": base, "head_sha": head, "run_id": red.run_id,
+            "workflow": red.workflow, "until": until,
+            "detail": (f"{base} is red at {head[:10]} ({red.workflow}) — holding the "
+                       f"release until it is green")})
+        log.info("%s is red at %s — holding the release %s", base, head[:10], wo_id)
 
     #: Said once per TAG on a release order another release overtook (spec §6).
     OVERTAKEN_EVENT = "release_overtaken"

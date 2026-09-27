@@ -812,6 +812,14 @@ EXPEDITED_WHY = """\
 This bug is `{priority}` on the tracker and the filing EXPEDITED it: work starts now, \
 whatever the rating says.{tail}"""
 
+#: The key under an expedited work order's `metadata` that says the USER asked for this
+#: in production now. On the work order and not the issue because the issue's labels are
+#: the RATING, which is Neo's to move (`settle_work_order_priority`); a scheduling act
+#: that a downgrade could erase would be the defect again. In `metadata` and not a column
+#: for `RELEASE_BATCH_KEY`'s reason: one boolean, read by one daemon step, joined by
+#: nothing.
+EXPEDITED_KEY = "expedited"
+
 #: `EXPEDITED_WHY`'s tail on a `critical`/`blocker` filing. Expediting does not skip the
 #: re-assessment, it only stops the work WAITING for it — so the worker is told that the
 #: rating on this order is still open, and what that costs it: nothing it can act on.
@@ -902,6 +910,7 @@ def route_filing(issue_url: str, title: str, body: str, priority: str,
                        # level onto the order. The claim itself is not lost: it is in the
                        # brief below, in the issue body and on the `priority:` label.
                        "priority": "" if dispatches(priority) else priority},
+                metadata={EXPEDITED_KEY: True},
                 why=EXPEDITED_WHY.format(
                     priority=priority,
                     tail=EXPEDITED_TRIAGE_TAIL if dispatches(priority) else ""))
@@ -1269,7 +1278,20 @@ def live_work_order(spec: Any, issue_url: str) -> str:
     return ""
 
 
-def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "") -> str:
+def was_expedited(wo: dict[str, Any]) -> bool:
+    """Did the user expedite this work order's filing?
+
+    The one reader of `EXPEDITED_KEY`, so the daemon never hand-rolls the metadata parse
+    and a row written before the flag existed answers False rather than raising.
+    A release on landing is cut from this OR the rating (`daemon.sync_issues`).
+    """
+    from . import db
+
+    return bool((db.from_json(wo.get("metadata"), {}) or {}).get(EXPEDITED_KEY))
+
+
+def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "",
+                      metadata: dict[str, Any] | None = None) -> str:
     """Create the work order a confirmed `critical`/`blocker` earned. Returns its id.
 
     **NO SECOND WORK ORDER FOR ONE ISSUE** (#240 D). An issue that already has a LIVE work
@@ -1282,6 +1304,10 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "") -> str:
     `critical`/`blocker` is told a release is coming, and an expedited claim's
     `issue_priority` is rewritten if Neo later downgrades it
     (`settle_work_order_priority`).
+
+    `metadata` is written AT CREATION rather than by a follow-up update, because the
+    daemon can claim and dispatch the row before a second write lands — the reason
+    `ops.create_work_order` takes it at all.
     """
     from .ops import create_work_order
     from .project_store import ProjectStore
@@ -1297,7 +1323,7 @@ def promote_confirmed(spec: Any, payload: dict[str, Any], why: str = "") -> str:
         description=WORK_ORDER_BRIEF.format(
             url=url, body=payload.get("body") or "",
             why=why or TRIAGED_WHY.format(priority=priority)),
-        origin="jarvis", issue_url=url, issue_priority=priority)
+        origin="jarvis", issue_url=url, issue_priority=priority, metadata=metadata)
     store = ProjectStore(spec.path)
     try:
         # Label it now rather than only on the next sweep: the promotion and the tracker

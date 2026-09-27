@@ -2021,6 +2021,21 @@ class ProjectStore:
             (attempts, db.now() + delay, db.now(), wo_id))
         return "pending"
 
+    def hold_dispatch(self, wo_id: str, until: float | None) -> None:
+        """Defer, or stop deferring, a pending order's dispatch. `retry_after` ONLY.
+
+        Pointedly not `dispatch_attempts`: that ladder's only author is
+        `release_dispatch_claim`, and a deferral for a reason outside the order — the
+        base branch being red (`Daemon.hold_red_release`) — must not spend a launch or
+        erase the record of one. `claim_next_pending`'s guard 4 already refuses a row
+        whose `retry_after` is in the future, so this needs no new status and no column.
+
+        docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
+        """
+        self.conn.execute(
+            "UPDATE work_orders SET retry_after=?, updated_at=? WHERE id=?",
+            (until, db.now(), wo_id))
+
     def clear_dispatch_attempts(self, wo_id: str) -> None:
         """A launch that worked spends the record of the ones that did not."""
         self.conn.execute(
