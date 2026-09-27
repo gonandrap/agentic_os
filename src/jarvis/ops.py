@@ -5375,6 +5375,14 @@ def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
     `facts` is the caller's own proof, given the round row so it can name the round in its
     refusal log; it returns `(reason, payload extras)` or None to refuse. Nothing is written
     until it holds, so a refusal at either level leaves the record exactly as it was.
+
+    **AND IT PUTS THE FLAG DOWN ITSELF when nothing else is blocking** (spec §6 item 4):
+    the carry made `sha_moved` untrue, and nothing else lowers a stored flag before the
+    order completes on the merge, so without this the user keeps an attention item about a
+    stall that is over. Only when `true_blockers` is EMPTY — another blocker is somebody
+    else's reason and is left exactly as it was — and only while the flag is actually up,
+    which is what makes it idempotent across reconcile ticks and keeps it off the user's
+    acks (kn-089de524).
     """
     row = store.latest_validation_round(wo_id=wo["id"])
     if row is None or not judged or not head or head == judged:
@@ -5388,7 +5396,18 @@ def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
     store.carry_round_head(int(row["id"]), head, reason)
     carried = {"round": int(row["round"]), "round_id": int(row["id"]),
                "judged_sha": judged, "carried_head_sha": head, "reason": reason, **extra}
+    # AFTER the binding, so `rejudge_exhausted`'s last clause reads the carried head, and
+    # from the live row rather than the caller's snapshot (spec §6 item 4).
+    from . import invariants as invariants_mod
+
+    fresh = store.get_work_order(wo["id"])
+    lowered = bool(fresh["needs_attention"]) and not invariants_mod.true_blockers(
+        store, fresh)
+    if lowered:
+        carried["attention_cleared"] = True
     store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    if lowered:
+        store.clear_attention(wo["id"])
     return carried
 
 

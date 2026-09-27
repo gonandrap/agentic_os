@@ -240,6 +240,7 @@ merged_branch_shas: [sha, …]  # second parents the JUDGED commit already held 
 base, base_sha                # base_ref and origin/<base_ref> at proof time
 patch_id                      # the diff hash both commits produced
 reason                        # the sentence below
+attention_cleared             # true when the carry lowered the flag; absent otherwise (§6)
 ```
 
 `reason`: `` `main` was merged into this branch N time(s), and the pull request's own diff
@@ -376,12 +377,18 @@ reconcile tick after this ships, with nothing typed.** The paths that make it tr
    live head (project_store.py:4287).
 4. `invariants.rejudge_exhausted` (invariants.py:513) therefore returns **False** at its
    last clause — `store.validated_head(...) != head` is no longer true (invariants.py:544)
-   — so `SHA_MOVED_BLOCKER` stops being derived and nothing re-raises it. **No invariant
-   lowers the STORED `needs_attention` flag for a non-terminal status**:
+   — so `SHA_MOVED_BLOCKER` stops being derived and nothing re-raises it. **And the carry
+   lowers the STORED `needs_attention` flag itself**, in `ops._carry_round_onto` after the
+   binding, because no invariant does it for a non-terminal status:
    `check_attention_reason_is_true` only relabels the reason and
-   `check_no_phantom_attention` is terminal-only. So the attention item stops being
-   derived at once and the flag itself comes down when the order COMPLETES on the merge
-   (step 5) — still with no ack and no `jarvis validation force`.
+   `check_no_phantom_attention` is terminal-only, so the flag would otherwise stay up
+   until the order COMPLETES on the merge (step 5). Only when `invariants.true_blockers`
+   is EMPTY, re-derived from the live row: another true blocker — a pending assumption —
+   is somebody else's reason and the flag is left exactly as it was. Only while the flag
+   is up, which makes it idempotent across reconcile ticks and never spends a user's ack
+   (kn-089de524). `HEAD_CARRIED_EVENT` carries `attention_cleared: true` when it happened
+   and the field is absent when it did not, so "it fixed itself" is provable from
+   `jarvis wo show`. No ack, no `jarvis validation force`.
 5. Same tick, §3.5 step 3 re-decides: green, mergeable, CLEAN, verdict bound → the
    `AUTO_MERGE` gate request is filed for Neo and the pull request merges on approval.
 

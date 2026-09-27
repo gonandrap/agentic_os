@@ -830,3 +830,84 @@ def test_an_evil_merge_on_the_last_round_is_still_left_for_the_user(
     assert len(declined) == 1
     assert db.from_json(declined[0]["payload"], {})["head_sha"] == CAUGHT_UP
     assert invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
+
+
+# -- the flag the carry itself puts down (spec §6 item 4) ------------------------------
+
+
+def _stranded(tmp_path, project, fake_gh) -> tuple[object, object, dict]:
+    """An order flagged `sha_moved` with its round budget spent — the state the carry
+    inherits. Parents unreadable on the first poll, so the carry refuses and the round
+    machine declines and flags."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    artifact(fake_gh, head_oid=CAUGHT_UP)
+    poll(fleet, store)
+    list(invariants.check_blocked_work_is_surfaced(store))
+    assert store.get_work_order(wo["id"])["attention_reason"] == \
+        invariants.SHA_MOVED_BLOCKER
+    return fleet, store, wo
+
+
+def test_the_carry_puts_the_flag_down_itself(tmp_path, project, jarvis_home,
+                                             fake_claude, fake_gh, local_proof):
+    """§6 item 4. `sha_moved` was the only blocker, so the carry that made it untrue takes
+    the flag down there and then — the user does not keep an attention item until the
+    pull request merges."""
+    fleet, store, wo = _stranded(tmp_path, project, fake_gh)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
+
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"] == 0
+    assert not row["attention_reason"]
+    carried = db.from_json(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)[-1]
+                           ["payload"], {})
+    assert carried["attention_cleared"] is True
+
+
+def test_another_true_blocker_keeps_the_flag_up(fleet, project):
+    """The carry clears the reason it made untrue, never somebody else's. A pending
+    assumption is still the user's to decide, so the flag stays up and says so.
+
+    Asked of `ops.carry_merge_chain` directly: with an assumption pending, `decide` holds
+    on `assumptions` rather than `sha_moved`, so the daemon's carry is never reached and
+    the rule has to be proved where it lives."""
+    store, wo = parked(project)
+    store.add_assumption(wo["id"], "used sqlite rather than postgres")
+    store.flag_attention(wo["id"], invariants.SHA_MOVED_BLOCKER)
+
+    carried = ops.carry_merge_chain(
+        store, wo, judged=JUDGED, head=CAUGHT_UP,
+        chain=((CAUGHT_UP, BASE, True),), base="main", base_sha=BASE,
+        patch_ids=("cafe12345678", "cafe12345678"))
+
+    assert carried is not None
+    assert "attention_cleared" not in carried
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"] == 1
+    assert row["attention_reason"] == invariants.SHA_MOVED_BLOCKER
+    list(invariants.check_attention_reason_is_true(store))
+    assert store.get_work_order(wo["id"])["attention_reason"] == \
+        "1 assumption pending your review"
+
+
+def test_the_lowered_flag_is_not_re_raised_on_the_next_tick(tmp_path, project,
+                                                            jarvis_home, fake_claude,
+                                                            fake_gh, local_proof):
+    """kn-089de524: attention is re-derived every tick, so a flag lowered on this path
+    must stay down without an ack and the carry must not write a second one."""
+    fleet, store, wo = _stranded(tmp_path, project, fake_gh)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE])
+    poll(fleet, store)
+
+    list(invariants.check_blocked_work_is_surfaced(store))
+    list(invariants.check_attention_reason_is_true(store))
+    poll(fleet, store)
+
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"] == 0
+    assert not row["attention_reason"]
+    assert row["acknowledged_blockers"] is None
+    assert len(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)) == 1
