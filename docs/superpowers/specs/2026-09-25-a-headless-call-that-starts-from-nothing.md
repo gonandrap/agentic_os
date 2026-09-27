@@ -1,15 +1,25 @@
 # A headless call that starts from nothing
 
 Work order wo-00bd1096. GitHub issue #750. Neo question 670 ruled option B: minimal
-context is the DEFAULT of `run_headless_result`, for every caller, production included.
+context is the DEFAULT of `run_headless_result`, for every caller OF IT, production
+included.
 That decision is settled; this spec is how.
 
 ## The problem
 
-**Every `claude -p` call the OS makes pays for Claude Code's whole default context, and no
-caller wants any of it.**
+**Every HEADLESS JUDGE the OS runs pays for Claude Code's whole default context, and none
+of them wants any of it.**
 
-One transport: `claude_cli.run_headless_result` (src/jarvis/claude_cli.py:1503).
+Scope, because the OS spawns `claude` two ways and only one is wrong. A WORKER is a
+`claude` session doing real work in a real checkout: it NEEDS the default context — the
+project's CLAUDE.md, the user's skills, plugins, hooks and MCP servers are what it works
+with, and it keeps them. Those go out through `_briefing_args`
+(src/jarvis/claude_cli.py:282), `spawn_background` (:339) and `turn_args` (:757), and this
+spec does not touch them. The other way is a HEADLESS JUDGE — Neo, the validation panel's
+seats, the supervisor's health sweep, the dashboard digest and the `evals/llm/` suite — a
+one-shot call that must answer from its prompt and nothing else. That is the subject here.
+
+One transport for those: `claude_cli.run_headless_result` (src/jarvis/claude_cli.py:1503).
 `run_headless` (:1589) is that function keeping only `.text`. Its system-prompt plumbing,
 `_system_prompt_arg` (:80), emits `--append-system-prompt` or, past
 `SYSTEM_PROMPT_ARGV_LIMIT` (:74, 64 KiB), `--append-system-prompt-file`. APPEND means the
