@@ -305,6 +305,50 @@ def test_the_page_polls_that_route_and_stops_on_a_bad_response(client, dispatche
 
 # -- 6. the residual is labelled, and the authority travels with the hypothesis -------
 
+def test_the_polls_formatters_carry_the_same_thresholds_as_the_servers(client,
+                                                                      dispatched):
+    """The poll writes into spans the server rendered through `app.fmt_tok`/`app.fmt_dur`,
+    so an unformatted value turns "silent 4m" into "silent 243.7" on the first refresh.
+
+    Pinned by DERIVING both sides rather than by quoting the numbers here, and IN ORDER:
+    a set comparison passes a comparison skewed to 3599 while the division beside it still
+    says 3600, which is exactly the shape of the bug this pins.
+    """
+    import ast
+    import inspect as pyinspect
+    import re
+    import textwrap
+
+    from jarvis.ui import app as ui_app
+
+    def scales(text: str) -> list[str]:
+        return [n.replace("_", "") for n in re.findall(r"\b\d[\d_]*\d\b", text)]
+
+    def body(fn) -> str:
+        # Statements only: the docstring's own examples ("1.3M / 47k / 812") are not
+        # thresholds, so the source is parsed and the docstring node dropped.
+        tree = ast.parse(textwrap.dedent(pyinspect.getsource(fn))).body[0]
+        return "\n".join(ast.unparse(node) for node in tree.body
+                         if not (isinstance(node, ast.Expr)
+                                 and isinstance(node.value, ast.Constant)
+                                 and isinstance(node.value.value, str)))
+
+    script = client.get(f"/wo/proj_a/{dispatched['wo_id']}/debug").text.split("<script>")[1]
+
+    def helper(name: str) -> str:
+        return script.split(f"var {name} = function")[1].split("};")[0]
+
+    for server_fn, js in ((ui_app.fmt_tok, "fmtTok"), (ui_app.fmt_dur, "fmtDur")):
+        thresholds = scales(body(server_fn))
+        assert thresholds, f"{server_fn.__name__} carries no threshold — rewritten?"
+        assert scales(helper(js)) == thresholds
+    # The output strings too: a threshold kept and a suffix changed disagrees just as
+    # loudly, and `—` is `fmt_dur`'s answer for an absent duration.
+    for suffix in ('+ "M"', '+ "k"', '+ "h"', '+ "m"', '+ "s"', '"—"'):
+        assert suffix in script
+    assert "fmtTok(d.tokens.context)" in script and "fmtDur(d.stale_seconds)" in script
+
+
 def test_a_prefix_break_is_shown_with_the_authority_and_the_residual_labelled(
         client, dispatched, transcripts):
     """The write classification is the authority and the delta is the hypothesis

@@ -38,6 +38,25 @@
 <script>
 (function () {
   var url = "/api/wo/{{ project }}/{{ wo.id }}/live";
+  // The two spans the server rendered through `app.fmt_tok`/`app.fmt_dur` are refreshed
+  // through these, which copy those two functions' thresholds and output strings exactly —
+  // otherwise the first poll turns "silent 4m" into "silent 243.7". Allowed because
+  // FORMATTING THE PAYLOAD'S OWN NUMBER IS NOT COMPUTING A FACT, which is the same
+  // licence `fmt_tok`'s docstring takes for mirroring `cli._tok`: the shared thing is a
+  // formatting convention, not behaviour. Nothing below composes a sentence or derives a
+  // figure — an absent value still falls back to the payload's own `note`.
+  var fmtTok = function (n) {
+    if (!n) { return "0"; }
+    if (n >= 1000000) { return (n / 1000000).toFixed(1) + "M"; }
+    if (n >= 1000) { return (n / 1000).toFixed(0) + "k"; }
+    return String(n);
+  };
+  var fmtDur = function (s) {
+    if (s === null || s === undefined) { return "—"; }
+    if (s >= 3600) { return (s / 3600).toFixed(1) + "h"; }
+    if (s >= 60) { return (s / 60).toFixed(0) + "m"; }
+    return s.toFixed(0) + "s";
+  };
   var set = function (id, value, note) {
     var el = document.getElementById(id);
     if (!el) { return; }
@@ -53,8 +72,10 @@
       set("live-note", d.note, d.note);
       set("live-tool", d.now ? d.now.tool : null, d.note);
       set("live-detail", d.now ? d.now.detail : null, "");
-      set("live-context", d.tokens ? d.tokens.context : null, d.note);
-      set("live-stale", d.stale_seconds, d.note);
+      set("live-context", d.tokens ? fmtTok(d.tokens.context) : null, d.note);
+      set("live-stale",
+          (d.stale_seconds === null || d.stale_seconds === undefined)
+            ? null : fmtDur(d.stale_seconds), d.note);
     }).catch(function () { clearInterval(timer); });
   }, 2000);
 })();
