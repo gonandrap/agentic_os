@@ -1208,3 +1208,114 @@ def test_a_catalog_that_cannot_be_parsed_fails_the_bill_too(store, wo, transcrip
 
     with pytest.raises(Exception, match="cold_prefix_floor"):
         ops.bill(wo["id"])
+
+
+# -- the observability class -------------------------------------------------------------
+#
+# §10 of docs/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
+# reported as its own class for `WORKER_SUBPROCESS`'s reason: mixing it with what was spent
+# DOING the order answers neither question. Zero dollars beside a non-zero count and wall
+# clock is the honest rendering of a mechanical path, not a bug.
+
+
+def observability_call(wo_id: str, kind: str = "observe_why", *,
+                       ts: float | None = None) -> None:
+    """One metered look at the order — the envelope the meter writes: wall clock, zeros."""
+    agent_usage.record(kind, project="proj_a", wo_id=wo_id,
+                       usage={"wall_ms": 12, "total_cost_usd": 0.0, "input": 0,
+                              "cache_write": 0, "cache_read": 0, "output": 0})
+    if ts is not None:
+        central = CentralStore()
+        try:
+            central.conn.execute(
+                "UPDATE agent_calls SET ts=? WHERE id=(SELECT MAX(id) FROM agent_calls)",
+                (ts,))
+            central.conn.commit()
+        finally:
+            central.close()
+
+
+def test_looking_at_an_order_is_its_own_class_costing_nothing(store, wo):
+    """Its own class, balanced, and `0.00` — with no division by a zero token count
+    anywhere in the arithmetic that prices it."""
+    observability_call(wo["id"], "observe_why")
+    observability_call(wo["id"], "observe_live")
+
+    b = ops.bill(wo["id"])
+    by_actor = {line["key"]: line for line in b["actors"]}
+
+    assert set(by_actor) == {bill_mod.OBSERVE}
+    line = by_actor[bill_mod.OBSERVE]
+    assert line["cost"]["list_usd"] == 0.0 and line["tokens"]["total"] == 0
+    assert {child["label"] for child in line["children"]} == {
+        agent_usage.describe("observe_why"), agent_usage.describe("observe_live")}
+    assert b["checks"]["balanced"], b["checks"]["problems"]
+    assert b["total"]["cost"]["list_usd"] == 0.0
+    # A zero-token line prices its cache writes at the floor rather than dividing by zero.
+    assert bill_mod.write_rate_of(line) > 0
+
+
+def test_an_order_nobody_looked_at_says_not_recorded_and_never_zero(store, wo, capsys):
+    """Absent is not zero, here too (Neo's ruling on question 766). An order with no
+    observability rows ran before this landed or nobody opened a report on it — which is a
+    different fact from nothing having been spent."""
+    from jarvis import cli
+
+    add_turn(store, wo["id"], recorded_usage(0.05))
+
+    b = ops.bill(wo["id"])
+    absent = dict(bill_mod.absent_notes(b))
+
+    assert bill_mod.OBSERVE in absent
+    assert "not recorded" in absent[bill_mod.OBSERVE]
+    assert "0.00" not in absent[bill_mod.OBSERVE]
+
+    cli.main(["cost", wo["id"]])
+    out = capsys.readouterr().out
+    assert absent[bill_mod.OBSERVE] in out
+
+
+def test_a_metered_look_has_no_reading_so_it_discloses_no_under_reading(store, wo,
+                                                                       tmp_path,
+                                                                       transcripts):
+    """Its envelope carries NO `usage_v` — no reading was derived, so the stamp is absent
+    rather than current — and `_call_versions` skips the row instead of reading a stampless
+    envelope as the old parser's. Stamping one would claim a `derive_turn_usage` that never
+    ran; counting it as version 1 would disclose an under-reading that is not there."""
+    from tests.test_turn_usage import spend
+
+    turns = [spend(0, 2_000, 1_000, 100), spend(0, 500, 4_000, 60)]
+    cumulative_turns(store, wo, tmp_path, turns, [1.0, 2.5], session="sess-v3-look")
+    transcripts("sess-v3-look", [
+        assistant_row(f"m{i}", write=own["cache_write"], read=own["cache_read"],
+                      out=own["output"], at=1_000 + 100 * i + 5)
+        for i, own in enumerate(turns, start=1)
+    ])
+    observability_call(wo["id"], "observe_inspect", ts=1_150)
+
+    b = ops.bill(wo["id"], live=True)
+
+    assert [row["usage_v"] for row in b["turn_rows"]] == [3, 3], "the turns are current"
+    assert not [gap for gap in b["accuracy"]["gaps"]
+                if "lead agent's spend only" in gap], b["accuracy"]["gaps"]
+    central = CentralStore()
+    try:
+        (row,) = [r for r in central.agent_calls(wo_id=wo["id"])
+                  if agent_usage.is_observability(r["kind"])]
+    finally:
+        central.close()
+    envelope = json.loads(row["usage_json"])
+    assert envelope["wall_ms"] == 12 and "usage_v" not in envelope
+
+
+def test_the_absent_sentences_have_one_source(store, wo):
+    """The four sentences were duplicated in `cli._print_bill` and in bill.html; wording
+    that differs between two renderers is wording the reader stops trusting."""
+    observability_call(wo["id"])
+
+    keys = dict(bill_mod.absent_notes(ops.bill(wo["id"])))
+
+    assert bill_mod.OBSERVE not in keys
+    assert set(keys) == {bill_mod.WORKER, bill_mod.JARVIS, bill_mod.SUBPROC}
+    assert set(bill_mod.ABSENT_NOTES) == {bill_mod.WORKER, bill_mod.JARVIS,
+                                          bill_mod.SUBPROC, bill_mod.OBSERVE}

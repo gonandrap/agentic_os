@@ -760,6 +760,35 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+#: The legal observability levels and the shipped default, as LITERALS. `observability.py`
+#: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
+#: repeated here rather than imported so the dependency runs one way only — that module
+#: reads a config object and catalog importing it back would be the cycle.
+#: docs/specs/2026-09-24-order-observability.md §10.
+OBSERVABILITY_LEVELS = ("off", "normal", "full")
+DEFAULT_OBSERVABILITY_LEVEL = "normal"
+
+
+@dataclass
+class ObservabilityConfig:
+    """What debug data Jarvis COLLECTS. §10 of
+    docs/specs/2026-09-24-order-observability.md.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_observability`), and a per-order override on `work_orders.observability`
+    beats both — precedence resolved in one place, `observability.level_for`.
+
+    `off` GATES EXACTLY ONE WRITE: §5's per-turn ingredient row on
+    `wo_turns.context_json`. It does NOT disable `jarvis watch`, `jarvis inspect`,
+    `jarvis wo why` or the debug page — those are arithmetic over files that already
+    exist, so gating them would remove the view and save nothing. The consequence at
+    `off` is that the order has no context ledger and `jarvis wo context` says it was
+    not recorded. `full` currently records exactly what `normal` does.
+    """
+
+    level: str = DEFAULT_OBSERVABILITY_LEVEL
+
+
 # -- message delivery: how long a queued message may stay undelivered before the OS
 # calls it stuck. A threshold a surface judges by, so it is a setting and not a module
 # constant (kn-67cdb54b), and ABOVE `ProjectSpec` for the `field(default_factory=…)`
@@ -1063,6 +1092,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
@@ -1173,6 +1203,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
@@ -1494,6 +1525,25 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
         elif name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
+
+
+def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
+                        where: str = "os.observability") -> ObservabilityConfig:
+    """`os.observability`, or a project's override of it — field-level, like
+    `_parse_inspect`: `os.observability` parses against the shipped default and each
+    project against the OS answer, so one caller reads one object.
+
+    An unknown level is REFUSED naming the legal three, on `GateConfig.parse`'s rule: a
+    typo in `jarvis config set` must not silently leave debugging off.
+    """
+    base = base or ObservabilityConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    level = str(raw.get("level", base.level))
+    if level not in OBSERVABILITY_LEVELS:
+        raise _err(f"{where}.level {level!r} not in "
+                   f"{list(OBSERVABILITY_LEVELS)}")
+    return ObservabilityConfig(level=level)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -1844,6 +1894,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
@@ -1919,6 +1970,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        observability_cfg = _parse_observability(
+            p.get("observability", {}), base=os_cfg.observability,
+            where=f"projects[{i}] ({name}).observability")
         concision_cfg = _parse_concision(
             p.get("concision", {}), base=os_cfg.concision,
             where=f"projects[{i}] ({name}).concision")
@@ -1952,6 +2006,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,

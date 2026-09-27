@@ -28,6 +28,11 @@ from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
 
+# A really dispatched order, shared rather than rebuilt: the meter tests below have to run
+# against the real report functions, and a hand-built turn row would pass while the
+# instrumentation was missing.
+from tests.test_context import dispatched  # noqa: F401
+
 #: What `testing.FAKE_CLAUDE`'s `emit_headless` reports for every one-shot call.
 FAKE_CALL = {"input": 5, "cache_write": 200, "cache_read": 800, "output": 60,
              "cost_usd": 0.002}
@@ -39,6 +44,17 @@ def calls(**filters) -> list[dict]:
         return central.agent_calls(**filters)
     finally:
         central.close()
+
+
+def paid_calls(**filters) -> list[dict]:
+    """The calls that cost MONEY — the rows below without §10's metered looks at the order.
+
+    Every dispatch now also records one `observe_context_write` row (a measured zero, see
+    the meter section at the foot of this file), so a test about what Jarvis SPENT filters
+    them out rather than counting to two.
+    """
+    return [row for row in calls(**filters)
+            if not agent_usage.is_observability(row["kind"])]
 
 
 # -- the store ------------------------------------------------------------------------
@@ -138,7 +154,7 @@ def test_neo_answering_a_question_is_billed_to_the_work_order_that_asked(asked):
     and until now not one of them appeared anywhere."""
     _, wo = asked
 
-    (row,) = calls(wo_id=wo["id"])
+    (row,) = paid_calls(wo_id=wo["id"])
     assert row["kind"] == "neo_answer" and row["project"] == "proj_a"
     assert row["question_id"] == 1
     assert (row["input"], row["output"]) == (FAKE_CALL["input"], FAKE_CALL["output"])
@@ -167,7 +183,7 @@ def test_the_panel_records_one_row_per_seat(started, monkeypatch):
     # Four seats blind (the fake routes `panel`), then the chair synthesising.
     assert sorted(seats) == ["blast", "chair", "premise", "record", "taste"]
     assert all(c["output"] == FAKE_CALL["output"]
-               for c in calls(wo_id=wo["id"]))
+               for c in paid_calls(wo_id=wo["id"]))
 
 
 def load_catalog_neo_with_panel():
@@ -229,6 +245,8 @@ def test_the_work_order_total_is_the_worker_plus_jarvis(asked):
     _, wo = asked
 
     unit = ops.cost_report(target=wo["id"], project="proj_a")["units"][0]
+    # ONE, still, with §10's meter recording a row on every dispatch: a metered look is
+    # not a `claude -p` call and is reported only by the bill, in its own class.
     assert unit["os_calls"] == 1
     assert unit["os_cost_usd"] > 0
     assert unit["total_cost_usd"] == pytest.approx(
@@ -276,5 +294,133 @@ def test_deleting_a_work_order_takes_its_os_spend_with_it(asked):
 
     deleted = ops.delete_work_order(wo["id"], "proj_a")
 
-    assert deleted["deleted"]["agent_calls"] == 1
+    assert deleted["deleted"]["agent_calls"] == 2  # the Neo answer and the metered write
     assert calls(wo_id=wo["id"]) == []
+
+
+# -- the meter over the observability paths --------------------------------------------
+#
+# §10 of docs/specs/2026-09-24-order-observability.md. A THIRD CLASS beside the worker's
+# turns and Jarvis's overhead: what the user spent LOOKING at an order. Its dollars are a
+# measured zero, and the measured zero is the point — "debugging is mechanical" becomes a
+# number instead of an assertion, and a path that ever gains a model call stops reading
+# zero on its own. The meter is NEVER switched off and never consults §10's gate; the
+# gate's own tests are in tests/test_context.py.
+
+
+def collector(rows: list[dict]):
+    """A stand-in for `agent_usage.record` — asserts on what WOULD be written, no DB."""
+    def fake(kind, **kwargs):
+        rows.append({"kind": kind, **kwargs})
+        return len(rows)
+
+    return fake
+
+
+def test_the_observability_kinds_are_their_own_class():
+    """Named beside `SUBPROCESS_KINDS`, and every one labelled: an unlabelled kind reaches
+    the bill as a bare column name."""
+    assert agent_usage.OBSERVABILITY_KINDS == frozenset({
+        agent_usage.OBSERVE_LIVE, agent_usage.OBSERVE_INSPECT,
+        agent_usage.OBSERVE_CONTEXT, agent_usage.OBSERVE_WHY,
+        agent_usage.OBSERVE_CONTEXT_WRITE})
+    for kind in agent_usage.OBSERVABILITY_KINDS:
+        assert agent_usage.is_observability(kind)
+        assert kind in agent_usage.KIND_LABELS
+    assert not agent_usage.is_observability(agent_usage.WORKER_SUBPROCESS)
+    assert not agent_usage.is_subprocess(agent_usage.OBSERVE_LIVE)
+
+
+def test_one_row_per_invocation_with_wall_clock_and_zero_tokens():
+    """Wall clock in the envelope and the four token classes written as explicit zeros —
+    Neo's ruling on question 767. A zero is a measurement; an absent figure is not."""
+    from jarvis import observability
+
+    rows: list[dict] = []
+
+    @observability.metered(agent_usage.OBSERVE_LIVE, target="wo_id", project="project",
+                           record=collector(rows))
+    def report(wo_id, project=None):
+        return {"id": wo_id}
+
+    assert report("wo-1", project="proj_a") == {"id": "wo-1"}
+    assert report("wo-2") == {"id": "wo-2"}
+
+    assert [r["kind"] for r in rows] == [agent_usage.OBSERVE_LIVE] * 2
+    assert [r["wo_id"] for r in rows] == ["wo-1", "wo-2"]
+    assert [r["project"] for r in rows] == ["proj_a", ""]
+    for row in rows:
+        assert row["usage"]["wall_ms"] >= 0
+        assert row["usage"]["total_cost_usd"] == 0
+        assert [row["usage"][cls] for cls in
+                ("input", "cache_write", "cache_read", "output")] == [0, 0, 0, 0]
+        assert row["ok"] is True
+
+
+def test_a_failing_report_still_records_a_row_and_re_raises():
+    from jarvis import observability
+
+    rows: list[dict] = []
+
+    @observability.metered(agent_usage.OBSERVE_WHY, target="wo_id",
+                           record=collector(rows))
+    def report(wo_id):
+        raise ValueError("no such order")
+
+    with pytest.raises(ValueError, match="no such order"):
+        report("wo-9")
+
+    assert len(rows) == 1
+    assert rows[0]["ok"] is False and rows[0]["wo_id"] == "wo-9"
+
+
+def test_a_broken_meter_never_touches_the_report():
+    """Accounting is an observer (this module's docstring). A report returns the same
+    payload byte-for-byte whether or not the meter worked."""
+    from jarvis import observability
+
+    def explode(kind, **kwargs):
+        raise RuntimeError("the meter is broken")
+
+    @observability.metered(agent_usage.OBSERVE_INSPECT, target="target", record=explode)
+    def report(target):
+        return {"target": target, "found": True}
+
+    assert report("wo-1") == {"target": "wo-1", "found": True}
+
+    @observability.metered(agent_usage.OBSERVE_INSPECT, target="target", record=explode)
+    def failing(target):
+        raise ValueError("gone")
+
+    with pytest.raises(ValueError, match="gone"):
+        failing("wo-1")
+
+
+def test_each_observability_path_is_metered_at_its_definition(dispatched, monkeypatch):
+    """All five paths, wrapped where they are DEFINED — which is why §7's dashboard routes
+    need no edit: they call these same functions."""
+    import contextlib
+
+    from jarvis import context as context_mod
+
+    wo_id = dispatched["wo_id"]
+    rows: list[dict] = []
+    monkeypatch.setattr(agent_usage, "record", collector(rows))
+
+    for call in (lambda: ops.diagnose(wo_id),
+                 lambda: ops.context_report(wo_id),
+                 lambda: ops.inspect_report(wo_id),
+                 lambda: ops.live_report(wo_id)):
+        with contextlib.suppress(Exception):  # a report may fail; the row still lands
+            call()
+    context_mod.record(dispatched["store"], dispatched["spec"], dispatched["wo"],
+                       dispatched["store"].latest_turn(wo_id),
+                       {"append_system_prompt": "x", "add_dirs": []})
+
+    assert [r["kind"] for r in rows] == [
+        agent_usage.OBSERVE_WHY, agent_usage.OBSERVE_CONTEXT,
+        agent_usage.OBSERVE_INSPECT, agent_usage.OBSERVE_LIVE,
+        agent_usage.OBSERVE_CONTEXT_WRITE]
+    assert {r["wo_id"] for r in rows} == {wo_id}
+    assert all(r["usage"]["wall_ms"] >= 0 and r["usage"]["total_cost_usd"] == 0
+               for r in rows)

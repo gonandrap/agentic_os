@@ -458,3 +458,153 @@ def test_the_column_is_a_plain_text_blob_the_store_can_read_back(dispatched):
     assert isinstance(json.loads(raw)["ingredients"], list)
     with pytest.raises(sqlite3.OperationalError):
         store.conn.execute("SELECT context_json FROM work_orders").fetchone()
+
+
+# -- 8. the gate: who turns the write off ----------------------------------------------
+#
+# §10 of docs/specs/2026-09-24-order-observability.md. The gate governs THIS write and
+# nothing else: `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page are
+# arithmetic over files that already exist and are never gated.
+
+
+def _obs(level=None):
+    """A resolved project/fleet `ObservabilityConfig` — one object, already inherited."""
+    from jarvis.catalog import ObservabilityConfig
+
+    return ObservabilityConfig() if level is None else ObservabilityConfig(level=level)
+
+
+def test_the_precedence_is_the_order_then_the_project_then_the_default():
+    """Stated as a rule and tested as one (§10): the order's column wins over the
+    project's config, the project's over the fleet's, and the fleet default is
+    `normal`."""
+    from jarvis import observability
+    from jarvis.catalog import parse_catalog
+
+    assert observability.level_for({"observability": "off"}, _obs("full")) == "off"
+    assert observability.level_for({"observability": None}, _obs("full")) == "full"
+    assert observability.level_for(None, None) == "normal"
+    assert parse_catalog({"projects": []}).os.observability.level == "normal"
+    # The project object is ALREADY resolved against the fleet one, so a project that
+    # names nothing carries the fleet answer and this resolver reads one object.
+    cat = parse_catalog({"os": {"observability": {"level": "off"}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert observability.level_for({}, cat.projects[0].observability) == "off"
+
+
+def test_a_null_order_column_is_no_answer_and_never_off():
+    """NULL means "this order has no answer" — `budget_usd`'s precedent — so it falls
+    through to the config and must not read as `off`."""
+    from jarvis import observability
+
+    for empty in (None, ""):
+        assert observability.level_for({"observability": empty}, _obs("normal")) \
+            == "normal"
+        assert observability.records_context({"observability": empty}, _obs()) is True
+
+
+def test_an_unrecognised_stored_level_falls_back_to_the_config():
+    """A read path must not explode on a bad row."""
+    from jarvis import observability
+
+    assert observability.level_for({"observability": "verbose"}, _obs("off")) == "off"
+    assert observability.level_for({"observability": "verbose"}, None) == "normal"
+
+
+def test_only_off_stops_the_write_and_full_is_not_a_third_behaviour():
+    """`full` records exactly what `normal` does — §10 lets this child say so rather than
+    invent a difference."""
+    from jarvis import observability
+
+    assert observability.records_context({"observability": "off"}, _obs()) is False
+    assert observability.records_context({"observability": "normal"}, _obs()) is True
+    assert observability.records_context({"observability": "full"}, _obs()) is True
+
+
+def test_at_off_the_ledger_writes_nothing_and_does_not_stop_the_turn(dispatched):
+    """The one consumer of the gate: the column stays NULL, which `ops.context_report`
+    already renders as "not recorded"."""
+    store, spec, wo_id = dispatched["store"], dispatched["spec"], dispatched["wo_id"]
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET context_json=NULL WHERE id=?", (turn["id"],))
+    store.conn.commit()
+    store.set_observability(wo_id, "off")
+
+    context.record(store, spec, store.get_work_order(wo_id), turn,
+                   {"append_system_prompt": "x", "add_dirs": []})
+
+    (raw,) = store.conn.execute("SELECT context_json FROM wo_turns WHERE id=?",
+                                (turn["id"],)).fetchone()
+    assert raw is None
+
+    store.set_observability(wo_id, "full")
+    context.record(store, spec, store.get_work_order(wo_id), turn,
+                   {"append_system_prompt": "x", "add_dirs": []})
+    (raw,) = store.conn.execute("SELECT context_json FROM wo_turns WHERE id=?",
+                                (turn["id"],)).fetchone()
+    assert json.loads(raw)["ingredients"]
+
+
+def test_at_off_the_meter_still_records_because_the_gate_is_not_its_switch(dispatched,
+                                                                          monkeypatch):
+    """§10 keeps the two apart: the gate governs the WRITE, the meter observes the call.
+    A meter with a hole reports a number lower than the truth, which is worse than no
+    number — so the wrapper sits OUTSIDE the guard and an order at `off` still costs a
+    near-zero row."""
+    from jarvis import agent_usage
+
+    store, spec, wo_id = dispatched["store"], dispatched["spec"], dispatched["wo_id"]
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET context_json=NULL WHERE id=?", (turn["id"],))
+    store.conn.commit()
+    store.set_observability(wo_id, "off")
+    rows: list[dict] = []
+    monkeypatch.setattr(agent_usage, "record",
+                        lambda kind, **kw: rows.append({"kind": kind, **kw}))
+
+    context.record(store, spec, store.get_work_order(wo_id), turn,
+                   {"append_system_prompt": "x", "add_dirs": []})
+
+    (raw,) = store.conn.execute("SELECT context_json FROM wo_turns WHERE id=?",
+                                (turn["id"],)).fetchone()
+    assert raw is None
+    assert [r["kind"] for r in rows] == [agent_usage.OBSERVE_CONTEXT_WRITE]
+    assert rows[0]["wo_id"] == wo_id and rows[0]["usage"]["wall_ms"] >= 0
+
+
+def test_the_project_config_alone_can_switch_the_write_off(dispatched, monkeypatch):
+    """No per-order override needed: `off` on the project object — which already carries
+    the fleet answer — is enough."""
+    from jarvis.catalog import ObservabilityConfig
+
+    store, spec, wo_id = dispatched["store"], dispatched["spec"], dispatched["wo_id"]
+    turn = store.latest_turn(wo_id)
+    store.conn.execute("UPDATE wo_turns SET context_json=NULL WHERE id=?", (turn["id"],))
+    store.conn.commit()
+    monkeypatch.setattr(spec, "observability", ObservabilityConfig(level="off"),
+                        raising=False)
+
+    context.record(store, spec, store.get_work_order(wo_id), turn,
+                   {"append_system_prompt": "x", "add_dirs": []})
+
+    (raw,) = store.conn.execute("SELECT context_json FROM wo_turns WHERE id=?",
+                                (turn["id"],)).fetchone()
+    assert raw is None
+
+
+def test_jarvis_wo_create_stamps_the_level_on_the_order(jarvis_home, fake_claude,
+                                                        catalog_file, project, capsys):
+    """`--observability` only, mirroring `--budget`: no `jarvis wo observability`."""
+    from jarvis import cli
+
+    ops.start_os(str(catalog_file), foreground=True)
+
+    assert cli.main(["wo", "create", "proj_a", "watch me", "--observability", "full",
+                     "--json"]) == 0
+
+    created = json.loads(capsys.readouterr().out)["created"]
+    store = ProjectStore(project)
+    try:
+        assert store.get_work_order(created)["observability"] == "full"
+    finally:
+        store.close()

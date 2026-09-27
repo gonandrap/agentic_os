@@ -28,27 +28,17 @@
 {# What is NOT here, said out loud. The question that prompted this page was "not a
    single token spent on the OS that wasn't jarvis?" — and the honest answer is a list
    of the things that would appear if they had spent anything, plus the two that never
-   can. An absence nobody names reads as an omission. #}
-{% set present = bill.actors|map(attribute='key')|list %}
+   can. An absence nobody names reads as an omission.
+
+   The per-class sentences come from `bill.ABSENT_NOTES`, which `jarvis cost` prints too:
+   they were spelled out here AND in `cli._print_bill` until §10 needed a fourth, and a
+   caveat worded two ways is one the reader stops trusting. #}
 <h2>What is not on this bill</h2>
 <div class="panel" style="padding: 14px 16px;">
   <ul style="margin: 0; padding-left: 18px;">
-    {% if 'worker' not in present %}
-    <li class="sub">The worker's own session — nothing measurable. Either it was never
-      dispatched, or Claude Code has pruned the transcript AND the result JSON of every
-      turn is gone.</li>
-    {% endif %}
-    {% if 'jarvis' not in present %}
-    <li class="sub">Jarvis's own calls — <strong>nothing</strong>.
-      This order asked Neo no questions, no panel deliberated on it, and nothing was
-      digested for it. Every question a worker asks costs one Neo call (five when the
-      panel sits), and they would be itemised here.</li>
-    {% endif %}
-    {% if 'subprocesses' not in present %}
-    <li class="sub">Claude processes the worker spawned itself —
-      <strong>nothing recorded</strong>. An eval suite or a script run through Jarvis's
-      transport would be itemised here.</li>
-    {% endif %}
+    {% for key, text in absent_notes(bill) %}
+    <li class="sub">{{ text }}</li>
+    {% endfor %}
     <li class="sub">Any <code>claude</code> call made outside Jarvis's transport — a
       bare <code>claude -p</code> from a shell leaves nothing behind that names an
       order, so it cannot be counted at all. This is why every figure here is a floor.</li>
