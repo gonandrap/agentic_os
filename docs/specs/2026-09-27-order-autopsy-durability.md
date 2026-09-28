@@ -125,6 +125,16 @@ not sealed: already durable, per section 2. The module legends `hold_causes`, `P
 `subagent_depth_read` and `param_caps` are not sealed either: they are re-derived at render
 from the module, so a raised cap is reflected on an old seal.
 
+**What a `normal` seal carries, so section 6 is the ONLY difference between the levels.**
+Sealed at `normal`: turn boundaries, `active_ended`, `triggers` (the prompt text that started
+each turn), span BOUNDARIES (tool name, start, end, seconds), `calls`, classified `writes` and
+the subagent shape. NOT sealed at `normal`: span `params`, and nested subagent params — section
+6, and the whole of what the level buys. Triggers and span detail are user-authored text and CAN
+carry a secret, so the redaction battery of section 6 runs over a `normal` seal TOO: the
+bash-token and credential-named-key cases must be absent from `json.dumps(to_seal(a,
+level="normal"))`. A `normal` seal leaking a secret would be the same permanent store with none
+of the gate.
+
 **The payload records `autopsy_level` from day one, even though this child has no gate.**
 Without it, "no params" is ambiguous between "sealed at `normal`" and "this order ran no
 tools", and that ambiguity is rule (b) reappearing one level down. A seal written before the
@@ -174,7 +184,8 @@ the dark state cannot be undone by accident.
 
 The round trip, with the correction that makes it true:
 `from_seal(to_seal(a, level=...), spans=a.holds).as_dict() == a.as_dict()` over the committed
-fixture session. Plain `from_seal(to_seal(a)).as_dict() == a.as_dict()` is FALSE the moment a
+fixture session. `spans` is REQUIRED, so write the wrong form as
+`from_seal(to_seal(a), spans=[]).as_dict() == a.as_dict()`: it is FALSE the moment a
 hold exists, because `Anatomy.as_dict` (`src/jarvis/inspection.py:913-944`) emits `holds`,
 `held_by` and a `partition` whose `active` and `held` buckets are hold-derived. So assert it
 in BOTH shapes: with `a.holds == []` the equality holds with no exclusions; with holds
@@ -299,12 +310,21 @@ THIS SECTION IS WHAT TURNS THE FEATURE ON. Section 3's writer ships with its pre
 returning False, so until this child lands no order anywhere gains an autopsy. That is
 deliberate.
 
-**The ruling, and it is the planner's:** `normal` covers the autopsy, and the autopsy is OPT IN
-PER PROJECT. So the predicate is `observability.records_autopsy(wo, cfg)` returning
-`level_for(wo, cfg) != OFF`, the exact shape `records_context` already has, and a project
-declines with `jarvis config set <project> observability.level off`. This child replaces the
-body of section 3's `autopsy.records_autopsy` seam with a call to it, and nothing else about
-the writer changes.
+**The ruling, and it is the USER'S** (Neo question 820, confirmed again on the plan's second
+round): `normal` covers the autopsy, and the autopsy is "opt in per project".
+
+**The mechanics, written out because the phrase and the behaviour do not match.** The predicate
+is `level_for(wo, cfg) != OFF` — the exact shape `records_context` already has. So the fleet
+default `normal` SEALS, and a project declines with `jarvis config set <project>
+observability.level off`. That is opt-OUT mechanics under an opt-in name. Where the two
+disagree, THIS PARAGRAPH is what gets built, and no test asserts a project must name a level
+before its orders are sealed.
+
+**One function keeps that name, not two.** This child replaces the BODY of section 3's
+`autopsy.records_autopsy(wo, cfg)` with `observability.level_for(wo, cfg) != observability.OFF`.
+It does NOT add a second `records_autopsy` to `src/jarvis/observability.py`: two functions with
+one name across two modules is the `read_session` trap of section 4, invited deliberately.
+Nothing else about the writer changes.
 
 The parent spec's section 10 said the gate governs exactly ONE write and no read. It now
 governs TWO, so its wording, the `ObservabilityConfig` docstring, the `jarvis config` CLI help
@@ -317,8 +337,8 @@ conclusion. And `full` stops being collapsed into `normal`: it now differs by ex
 thing, the retained content of section 6.
 
 A project with no `observability` block in its catalog gets the fleet default `normal` and
-therefore SEALS. Assert that, because "opt in per project" and "the default is `normal`" are
-only compatible if it is written down which one wins.
+therefore SEALS. Assert that: it is the point where "opt in per project" and "the default is
+`normal`" collide, and the assertion is what records that the default wins.
 
 **Acceptance.** A shape test over the revised section 10 text in the idiom of
 `tests/test_spec_shape.py`, asserting it names `full` and `normal`, names the retained content,
@@ -384,7 +404,9 @@ to the hot path.
 
 **`live_report` does NOT fall back to a seal.** It is a byte-cursor live reader of one file and
 the parent spec's section 3 forbids persistence there outright. Its `state: "no-transcript"`
-frame gains only a note pointing at `jarvis inspect`.
+frame gains only a note pointing at `jarvis inspect`. That note is the ONE change this section
+names, and it is NOT unowned: the `read-side` child builds it with the rest of section 4's
+readers, and the same child owns its test.
 
 **No OTEL.** Declined in the parent spec's section 9 on a measurement.
 
@@ -393,7 +415,14 @@ committed session.
 
 **No change to `bill_json`, `bill_sealed_at` or `unsealed_terminal_orders`.**
 
-**No retention policy and no pruning of old seals.**
+**No retention policy and no pruning of old seals — stated with the consequence.** A `full`
+seal is PERMANENT and holds redacted tool parameters: file contents and Bash command lines.
+Nothing in this feature deletes one, and `ProjectStore.delete_work_order`
+(`src/jarvis/project_store.py:258`) erasing the whole order is the only removal there is. A
+purge command and a retention window are FILED TO THE BACKLOG rather than smuggled in behind a
+level name — the mistake the parent spec's section 10 refused to make. A project that does not
+want permanent parameter retention sets `observability.level normal`, which seals no params at
+all.
 
 **No backfill of orders whose transcripts have already expired.** There is nothing to read, and
 rule (b) already renders them correctly.
