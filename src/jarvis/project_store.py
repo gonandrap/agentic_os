@@ -490,6 +490,10 @@ SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
 ALARM_STATUSES = (
     "raised",     # on the supervisor's queue, awaiting a look
+    # A NOTE, NOT AN INTERRUPTION: recorded and rendered, never claimed. Spec of
+    # 2026-09-27 §2 — `claim_next_alarm` selects `status='raised'`, so this status IS
+    # the enforcement and no filter is added anywhere downstream.
+    "informational",
     "reviewing",  # claimed by a supervisor tick
     "acked",      # judged and answered with a note to the user
     "escalated",  # judged and handed to Neo
@@ -3010,18 +3014,22 @@ class ProjectStore:
 
     # -- cost alarms ---------------------------------------------------------
 
-    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str) -> dict[str, Any]:
+    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str,
+                  status: str = "raised") -> dict[str, Any]:
         """Record one raised alarm and return it. The caller still writes the event.
 
         Both, not one: the row is the identity everything downstream hangs off, and the
         `cost_alarm` event remains the raise's dedupe memory and the work order's
         timeline entry. See ALARM_EVENT_KINDS for the payloads of all four kinds.
+
+        `status` is `informational` for a kind in `inspection.INFORMATIONAL_KINDS` (spec
+        of 2026-09-27 §2): `claim_next_alarm` never sees it, so nothing escalates.
         """
         alarm_id = db.new_id("al")
         self.conn.execute(
-            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason)
-               VALUES (?,?,?,?,?,?)""",
-            (alarm_id, wo_id, db.now(), kind, int(seq), reason),
+            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (alarm_id, wo_id, db.now(), kind, int(seq), reason, status),
         )
         return self.get_alarm(alarm_id)
 
@@ -3997,6 +4005,15 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
+
+    def turn_starts(self, wo_id: str) -> list[tuple[int, float]]:
+        """`(seq, started_at)` for every turn — what `inspection.read_session` binds its
+        transcript turns to (spec 2026-09-27 §3). One indexed read, no JSON.
+        """
+        rows = self.conn.execute(
+            "SELECT seq, started_at FROM wo_turns WHERE wo_id=? ORDER BY seq",
+            (wo_id,)).fetchall()
+        return [(int(r["seq"]), float(r["started_at"])) for r in rows]
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first.

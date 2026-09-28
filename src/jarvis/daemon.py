@@ -4027,7 +4027,10 @@ class Daemon:
                     # What the OS was itself holding this order for, so a threshold
                     # judges the time it could work rather than the time that passed.
                     # Two indexed reads, no model — `holds.held`.
-                    spans=holds.held(store, wo["id"], now=now))
+                    spans=holds.held(store, wo["id"], now=now),
+                    # Spec 2026-09-27 §3: the alarm and `jarvis inspect` name one turn
+                    # the same way.
+                    turn_starts=store.turn_starts(wo["id"]))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}
@@ -4039,7 +4042,12 @@ class Daemon:
                 # `alarm_id` is purely additive to a payload whose other three keys are
                 # what `already` above matches on. Move the dedupe onto `wo_alarms` and
                 # this re-raises every tick for the life of the turn.
-                row = store.add_alarm(wo["id"], alarm.kind, turn["seq"], alarm.reason)
+                # Spec of 2026-09-27 §2: a note, not an interruption.
+                row = store.add_alarm(
+                    wo["id"], alarm.kind, turn["seq"], alarm.reason,
+                    status=("informational"
+                            if alarm.kind in inspection.INFORMATIONAL_KINDS
+                            else "raised"))
                 store.add_event(wo["id"], "cost_alarm",
                                 {"kind": alarm.kind, "seq": turn["seq"],
                                  "reason": alarm.reason, "alarm_id": row["id"]})
@@ -4047,8 +4055,12 @@ class Daemon:
             # Every alarm goes on the timeline; only the first reaches the attention
             # line, because `alarms` returns them most-actionable first and a flag can
             # carry one sentence.
-            if fresh and not wo["needs_attention"]:
-                store.flag_attention(wo["id"], fresh[0].reason)
+            # AFTER the loop above, so an informational kind still gets its row, its
+            # event and its dedupe memory — it is only kept off the attention line.
+            interrupting = [a for a in fresh
+                            if a.kind not in inspection.INFORMATIONAL_KINDS]
+            if interrupting and not wo["needs_attention"]:
+                store.flag_attention(wo["id"], interrupting[0].reason)
 
     def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise a project's STANDING re-write tax, split by the cause that produced it.

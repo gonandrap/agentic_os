@@ -1766,7 +1766,8 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
     # so the spans are passed in. The walk itself is not touched here — this report reads
     # one number off it (Neo, question 680).
     anatomy = (inspection.read_session(session, inspect_config(project),
-                                       spans=list(episodes))
+                                       spans=list(episodes),
+                                       turn_starts=store.turn_starts(wo["id"]))
                if session else None)
     if anatomy is not None and anatomy.found:
         unexplained = {"seconds": round(anatomy.unexplained, 2),
@@ -2078,6 +2079,7 @@ def round_line(rnd: dict[str, Any]) -> str:
 #: not the interesting one: the supervisor ships off.
 ALARM_STANDING = {
     "raised": "raised",
+    "informational": "a note, never escalated",
     "reviewing": "with the supervisor",
     "acked": "acked by the supervisor",
     "escalated": "escalated to Neo",
@@ -9977,7 +9979,9 @@ def inspect_report(target: str, project: str | None = None, *,
         # The OS's own record of what it was holding this order for, so the report can
         # state both clocks and name the difference (`holds`). Two indexed reads.
         spans = holds.held(store, wo["id"])
-        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans)
+        # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
+        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
+                                           turn_starts=store.turn_starts(wo["id"]))
                    if session
                    else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,
@@ -10091,11 +10095,11 @@ def context_report(wo_id: str, project: str | None = None, *,
     the renderers compute nothing: the residual subtraction, the per-turn delta and the
     sentence naming a prefix break are keys of this payload.
 
-    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`,
-    never by transcript turn numbering — `inspection` renumbers the turns it finds in the
-    transcript files, and that sequence is not `wo_turns.seq` (a coalesced delivery, an
-    adopted session or a second segment file makes them disagree). The window is the OS's
-    own record of when the process ran, which is the thing both sides share.
+    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`:
+    the window is the OS's own record of when the process ran, which is the thing both
+    sides share. The two numberings now AGREE — `read_session` takes `turn_starts` and
+    binds every transcript turn to a `wo_turns.seq` (spec 2026-09-27 §3) — so this join
+    is no longer a workaround for a sequence that meant something else.
     """
     from . import context as context_mod
     from . import inspection
@@ -10109,8 +10113,12 @@ def context_report(wo_id: str, project: str | None = None, *,
         rows = store.all_turns(wo_id)
         session = wo.get("session_id") or ""
         cfg = inspect_config(name)
-        anatomy = (inspection.read_session(session, cfg,
-                                          index=usage_mod.index_sessions())
+        # Spec 2026-09-27 §3: the same rows this report already read, reused to bind
+        # inspect's numbering to `wo_turns.seq`.
+        anatomy = (inspection.read_session(
+                       session, cfg, index=usage_mod.index_sessions(),
+                       turn_starts=[(int(r["seq"]), float(r["started_at"]))
+                                    for r in rows])
                    if session else None)
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "
