@@ -133,15 +133,10 @@ def _alarm(wo_id: str) -> dict:
 
 def _supervisor_calls(fake_claude) -> list[dict]:
     """Every `claude` invocation that was a supervisor review, identified the way the
-    fake identifies one: by the persona in `--append-system-prompt`."""
-    out = []
-    for call in fake_claude.calls:
-        argv = call.get("argv") or []
-        if "--append-system-prompt" in argv:
-            system = argv[argv.index("--append-system-prompt") + 1]
-            if supervisor.SUPERVISOR_PERSONA.splitlines()[0] in system:
-                out.append(call)
-    return out
+    fake identifies one: by the persona in its system prompt."""
+    return [call for call in fake_claude.calls
+            if supervisor.SUPERVISOR_PERSONA.splitlines()[0]
+            in (call.get("system_prompt_seen") or "")]
 
 
 def _agent_calls(kind: str) -> list[dict]:
@@ -779,6 +774,33 @@ def test_the_packet_says_a_turn_cost_nothing_rather_than_leaving_it_to_be_inferr
     assert "3900s unaccounted" in stalled and "0s generating" in stalled
     # The turn that answered the re-delivered message in 131 seconds is not swallowed.
     assert "1 API call costing" in packet
+
+
+def test_the_packet_never_calls_a_request_in_flight_a_stall(
+        started, monkeypatch, tmp_path):
+    """Spec §1: this is the line that fed the judge, and a kill remedy acting on it
+    would have destroyed 19 minutes of live generation."""
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = ops.create_work_order("proj_a", "the slow turn")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        # A prompt and nothing after it: the request has completed no block yet.
+        (root / "-proj" / f"{wo['id']}.jsonl").write_text(
+            json.dumps(_prompt_row(FIXED_TURN_AT,
+                                   "You are the worker agent for wo-1")) + "\n")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                           CFG, daemon.catalog.projects[0].inspect)
+    finally:
+        store.close()
+
+    line = next(l for l in packet.splitlines() if l.startswith("- turn 1:"))
+    assert "NO API CALL" not in line and "cost nothing" not in line
+    assert "awaiting the model since" in line
+    assert "this is not a stall" in line
 
 
 #: A clock and a transcript that do not move, so the packet below is a literal rather

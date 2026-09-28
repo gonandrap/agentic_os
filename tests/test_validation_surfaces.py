@@ -138,7 +138,9 @@ def test_wo_show_json_adds_the_rounds_and_changes_nothing_else(
 
     assert set(after) == set(before)
     for key in before:
-        if key == "validation_rounds":
+        # `time_in_state` is a present-tense reading (`ops.state_durations`), so it moves
+        # between two calls by design — spec 2026-09-27-time-in-each-state §4.
+        if key in ("validation_rounds", "time_in_state"):
             continue
         assert type(after[key]) is type(before[key]), key
         assert after[key] == before[key], key
@@ -348,3 +350,95 @@ def test_validation_show_carries_the_delivered_envelopes_too(
     deep = _out(capsys, ["validation", "show", wo["id"]])
     assert "review_feedback" in deep
     assert "delivered" in deep
+
+
+# -- the review control an escalated round owes -----------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2, §4.
+# THE FIXTURE GOES THROUGH `ops.escalate_validation_round`, never `set_status` plus a
+# hand-written round: ruling kn-303839ee — `set_status` alone leaves no attention flag and
+# no closed round, so the test cannot tell a flagged order from an unflagged one.
+
+
+def escalated(project, title: str = "the panel gave up on it") -> dict:
+    """A work order in the live shape of wo-659be188: `needs_review`, latest round
+    `escalated`, and NO assumption rows at all."""
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order(title)
+        round_row = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333",
+                                               summary="ship it", evidence="ran pytest")
+        ops.escalate_validation_round(store, wo, round_row["id"], round_row["round"],
+                                      "two rounds running asked for the same test")
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_review_state_owes_a_decision_on_an_escalated_round(jarvis_home, catalog_file,
+                                                            project):
+    wo = escalated(project)
+    store = ProjectStore(project)
+    try:
+        owed = ops.review_state(store, wo)
+    finally:
+        store.close()
+
+    assert owed["pending"] == 0
+    assert owed["escalated"] is True
+    assert owed["round"] == 1
+    assert owed["placement"] == "validation"          # no assumption to host it
+    assert "over the panel's objection" in owed["accept"]
+    assert "worker" in owed["reject"]
+    assert "whole" in owed["scope"]
+    assert "flagged" in owed["strands"]
+
+
+def test_review_state_places_the_one_control_in_the_assumptions_block(
+        jarvis_home, catalog_file, project):
+    """Both true at once is reachable (issue 212). `placement` is the mutual exclusion,
+    computed once, so the page can never render two forms."""
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project)
+    ops.assume(wo["id"], "assumed the API is v2")
+    store = ProjectStore(project)
+    try:
+        owed = ops.review_state(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert owed["pending"] == 1
+    assert owed["escalated"] is True
+    assert owed["round"] == 1
+    assert owed["placement"] == "assumptions"
+    assert "assumption" in owed["accept"] and "assumption" in owed["reject"]
+
+
+def test_wo_show_prints_the_owed_decision_and_json_keeps_the_counts(
+        jarvis_home, catalog_file, project, capsys):
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = escalated(project)
+
+    out = _out(capsys, ["wo", "show", wo["id"]])
+    assert "over the panel's objection" in out
+    assert "round 1" in out
+
+    doc = json.loads(_out(capsys, ["--json", "wo", "show", wo["id"]]))
+    assert doc["review"]["placement"] == "validation"
+    assert doc["review"]["pending"] == 0
+    assert doc["review"]["round"] == 1
+
+
+def test_no_decision_owed_means_no_key_at_all(jarvis_home, catalog_file, project,
+                                              capsys):
+    """§4's never-always rule: `None` means the key is ABSENT, like `auto_merge`."""
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("nothing owed")
+        assert ops.review_state(store, wo) is None
+    finally:
+        store.close()
+
+    doc = json.loads(_out(capsys, ["--json", "wo", "show", wo["id"]]))
+    assert "review" not in doc

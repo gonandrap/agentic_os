@@ -2,6 +2,8 @@
 {% import "_bill.html" as bill_ui %}
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
+{% import "_states.html" as states_ui %}
+{% import "_review.html" as review_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -9,7 +11,9 @@
 {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
 {# #pending is the deep-link target used by notifications: it lands on whatever
    is actually waiting on the user, falling back to the reply box. #}
-{% set pending = 'assumptions' if unreviewed else ('attention' if wo.needs_attention else 'reply') %}
+{# `review.placement`, never `unreviewed` — spec
+   docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §7. #}
+{% set pending = review.placement if review else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -100,10 +104,18 @@
      it is NAMED here rather than inlined: repeating it under every order is exactly the
      duplication the spec-driven change removed. See
      docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md §4. #}
+  {% set spec_href = '/spec/' ~ project ~ '/' ~ spec_link.fo_id ~ ('#' ~ spec_link.anchor if spec_link and spec_link.anchor else '') if spec_link %}
   {% if spec and spec.section %}
   <p class="kv">📄 <strong>Spec section {{ spec.section }}</strong>
-    of <span class="mono">{{ spec.repo_path }}</span> — that section is what this order
-    builds; the brief above is the boundary around it.</p>
+    of <a class="mono" href="{{ spec_href }}">{{ spec.repo_path }}</a> — that section is
+    what this order builds; the brief above is the boundary around it.</p>
+  {% elif spec_link %}
+  {# The planner's case, which had nothing at all: `specs.spec_of` answers None for a
+     planner by design, so this is the second, narrow projection beside it — §5(a) of
+     docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. #}
+  <p class="kv">📄 <strong>The spec this feature is built from</strong>:
+    <a class="mono" href="{{ spec_href }}">{{ spec_link.repo_path }}</a>
+    {% if spec_link.source %}<span class="mono">— {{ spec_link.source }}</span>{% endif %}</p>
   {% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
@@ -199,6 +211,14 @@
     · <a href="/cost/{{ project }}/{{ wo.id }}">details →</a>
   </p>
   {% endif %}
+  {# The four readings this page does not carry: why it is not moving, what its turn is
+     doing right now, where the time went and what was in the window (spec §7 of
+     docs/specs/2026-09-24-order-observability.md). Linked from here as well as from the
+     bill, because a page reachable only from the bill is unreachable in practice. #}
+  <p class="kv mono" style="margin-bottom:0;">
+    <a href="/wo/{{ project }}/{{ wo.id }}/debug">why it is not moving, and where the
+      time went →</a>
+  </p>
   {# THE CEILING AND THE CONTROL THAT CHANGES IT, together. The box is always offered,
      because setting a budget on an order that has none is as much a thing the reader
      came here to do as raising one that ran out. The numbers beside it are
@@ -299,18 +319,10 @@
     {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
-  {% if unreviewed %}
-  <div class="row">
-    <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
-          style="flex:1; display:flex; gap:8px; align-items:center">
-      <input type="text" name="feedback" style="flex:1"
-             placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
-      <button name="decision" value="accept" class="accept">Accept all</button>
-      <button name="decision" value="reject" class="danger">Reject all</button>
-    </form>
-  </div>
-  <div class="row"><span class="sub">Rejecting without a reason keeps the work order
-    flagged — send guidance below.</span></div>
+  {# ONE renderer, and `review.placement` alone decides which of its two call sites runs —
+     spec 2026-09-27-a-review-control-for-an-escalated-round §3. #}
+  {% if review and review.placement == 'assumptions' %}
+  {{ review_ui.review_form(project, wo, review) }}
   {% endif %}
 </div>
 {% endif %}
@@ -398,6 +410,17 @@
    escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}
 
+{# THE CALL IS HERE AND NOT INSIDE `section()`: that macro is shared with
+   `feature_order.html`, which has no `review_work_order` to post to — spec §5. Rendered
+   only when no assumption is pending, which is where the other call site puts it. #}
+{% if review and review.placement == 'validation' %}
+<h2{% if pending == 'validation' %} id="pending"{% endif %}>Round {{ review.round }} gave
+  up — your judgement <a href="#round-{{ review.round }}">round {{ review.round }} →</a></h2>
+<div class="panel">
+  {{ review_ui.review_form(project, wo, review) }}
+</div>
+{% endif %}
+
 {# Below the rounds, because it is what came OUT of them — and once for the whole order
    rather than once per round, which is the thing the per-round fragment could not be. #}
 {{ issues_ui.unit(issues) }}
@@ -418,6 +441,12 @@
     <button role="tab" data-panel="tab-timeline" aria-selected="false"
             aria-controls="tab-timeline">Timeline
       {%- if timeline %}<span class="n">{{ timeline|length }}</span>{% endif %}</button>
+    {# A tab and not a header block: the ask is diagnostic, and only what asks something
+       of the reader lives above the tabs (spec §7). #}
+    <button role="tab" data-panel="tab-states" aria-selected="false"
+            aria-controls="tab-states">Time in state
+      {%- if states.current_status_age_human %}
+      <span class="n">{{ states.current_status_age_human }}</span>{% endif %}</button>
   </div>
 
 <section class="tabpanel on" id="tab-conversation" role="tabpanel">
@@ -517,6 +546,10 @@
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+</section>
+
+<section class="tabpanel" id="tab-states" role="tabpanel">
+{{ states_ui.view(states) }}
 </section>
 </div>
 

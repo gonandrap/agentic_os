@@ -222,6 +222,65 @@ os.makedirs(calls_dir, exist_ok=True)
 _started = time.time()
 _record_path = os.path.join(calls_dir, f"{time.time_ns()}-{os.getpid()}.json")
 
+def _system_prompt():
+    """THE SYSTEM PROMPT, RESOLVED THROUGH ALL FOUR DOORS, concatenated in CLI order.
+
+    It arrives by argv or by file depending on its size
+    (`claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`), and the file is a temporary one that is gone
+    by the time a test reads the call record — so an argv-only resolution would read
+    every large call as having NO system prompt, silently, in the direction that makes a
+    validation seat look like a Neo question. An oversize prompt is SPLIT across the
+    replacing and appending doors, so ASSIGNING per door dropped whichever half came
+    first; both halves are needed and their order is the model's.
+    """
+    parts = []
+    for flag in ("--system-prompt", "--append-system-prompt"):
+        if flag + "-file" in argv:
+            try:
+                with open(argv[argv.index(flag + "-file") + 1]) as f:
+                    parts.append(f.read())
+            except OSError:
+                pass
+        elif flag in argv:
+            parts.append(argv[argv.index(flag) + 1])
+    return "".join(parts)
+
+# THE USER PROMPT ARRIVES BY ONE OF TWO DOORS, exactly as the system prompt does: in
+# argv below `claude_cli.PROMPT_ARGV_LIMIT`, on stdin above it. A fake that parsed argv
+# only would read a large call as having an EMPTY prompt and make one caller look like
+# another (kn-08c90530). Spec §6:
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+#
+# A prompt whose FIRST CHARACTER is `-` is misread by the headless rule here. The real
+# CLI misparses it too; out of scope.
+_stdin_prompt = []
+
+def resolved_prompt():
+    """The prompt whichever door it came through, reading stdin AT MOST ONCE.
+
+    Only ever reads stdin for a `-p` call whose argv carries no prompt: `claude
+    --version` and `claude agents --json` must never read it, or a fake invoked with an
+    inherited terminal blocks for ever. Never reads a TERMINAL either — a headless
+    `--resume` carries no argv prompt, and on an inherited tty that read never returns.
+    A stdin that cannot be read at all counts as empty.
+    """
+    if _stdin_prompt:
+        return _stdin_prompt[0]
+    found = None
+    if "--" in argv:                     # worker turn: fenced, prompt last
+        found = argv[-1]
+    elif "-p" in argv:
+        i = argv.index("-p") + 1
+        if i < len(argv) and not argv[i].startswith("-"):
+            found = argv[i]
+    if found is None and "-p" in argv:
+        try:
+            found = "" if sys.stdin is None or sys.stdin.isatty() else sys.stdin.read()
+        except (OSError, ValueError):
+            found = ""
+    _stdin_prompt.append(found or "")
+    return _stdin_prompt[0]
+
 def _write_call_record(finished=None):
     # WRITTEN TWICE, AND BOTH TIMES MATTER. At entry, because tests observe a call while
     # it is deliberately still running (`hold_turns`) and a record that appeared only at
@@ -234,23 +293,11 @@ def _write_call_record(finished=None):
     # so a call record of argv alone cannot test the rate Jarvis pays. Only those two
     # keys: the whole environment would spill every secret the daemon holds into a
     # fixture on disk.
-    # THE SYSTEM PROMPT, RESOLVED. It arrives by argv or by file depending on its size
-    # (`claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`), and the file is a temporary one that is
-    # gone by the time a test reads this record — so an argv-only record would make
-    # every large prompt look like no prompt at all.
-    seen = ""
-    for flag in ("--append-system-prompt", "--system-prompt"):
-        if flag + "-file" in argv:
-            try:
-                with open(argv[argv.index(flag + "-file") + 1]) as f:
-                    seen = f.read()
-            except OSError:
-                seen = ""
-        elif flag in argv:
-            seen = argv[argv.index(flag) + 1]
+    seen = _system_prompt()  # all four doors — see `_system_prompt`
     tmp = _record_path + f".part{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump({"argv": argv, "cwd": os.getcwd(), "system_prompt_seen": seen,
+                   "prompt": resolved_prompt(),
                    "started_at": _started, "finished_at": finished,
                    "cache_env": {k: os.environ[k] for k in
                                  ("FORCE_PROMPT_CACHING_5M", "ENABLE_PROMPT_CACHING_1H")
@@ -361,7 +408,7 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
     # the id passed in is the id that comes back, on the opening turn AND on every
     # resume — a headless resume does not fork.
     sid = opt("--session-id") or opt("--resume")
-    prompt = argv[-1]
+    prompt = resolved_prompt()
     os.makedirs(turns_dir, exist_ok=True)
     log = os.path.join(turns_dir, sid + ".jsonl")
     if "--resume" in argv and not os.path.exists(log):
@@ -537,13 +584,10 @@ elif "-p" in argv and ("--session-id" in argv or "--resume" in argv):
 elif "-p" in argv and "--resume" not in argv:
     # headless one-shot (`claude -p ...`) — Neo's answering path. Deterministic
     # verdict driven by the prompt so tests control escalation.
-    prompt = argv[argv.index("-p") + 1]
-    # THE SYSTEM PROMPT ARRIVES BY ONE OF TWO DOORS and a fake that knew only the argv
-    # one would read every large call as having no system prompt at all — silently, and
-    # in the direction that makes a seat look like a Neo question. See
-    # `claude_cli.SYSTEM_PROMPT_ARGV_LIMIT`.
-    spfile = opt("--append-system-prompt-file")
-    system = open(spfile).read() if spfile else opt("--append-system-prompt", "")
+    prompt = resolved_prompt()
+    # Every door, concatenated — the reply chooser below branches on this text, so a
+    # half-read prompt answers a validation seat with a Neo verdict. See `_system_prompt`.
+    system = _system_prompt()
     # A VALIDATION SEAT, AND THIS BRANCH IS FIRST OF ALL. `chair` IS A LEGAL SEAT NAME IN
     # BOTH ROSTERS: a validator chair answered by the Neo seat branch below comes back a
     # perfectly well-formed Neo verdict carrying no pass and no reject at all, and a
@@ -1249,13 +1293,31 @@ elif argv[:2] == ["pr", "update-branch"]:
         json.dump(commits, f)
     print(f"Updated branch of pull request {url}")
 elif argv[:2] == ["api", "--method"]:
-    # The TWO API reads the OS makes — a commit's parents, and a branch's protection.
-    # Anything else is an unhandled argv, deliberately, so a third API call cannot appear
-    # here without the fixture noticing.
+    # The API reads the OS makes — a commit (its parents, or its subject), a branch's
+    # protection, and the repository's default branch name. Anything else is an unhandled
+    # argv, deliberately, so a FOURTH shape cannot appear here without the fixture
+    # noticing.
     path = argv[3] if len(argv) > 3 else ""
-    if argv[2] != "GET" or not ("/commits/" in path or path.endswith("/protection")):
+    jq = argv[argv.index("--jq") + 1] if "--jq" in argv else ""
+    repo_path = "/".join(path.split("/")[:3]) if path.startswith("repos/") else ""
+    if argv[2] != "GET" or not ("/commits/" in path or path.endswith("/protection")
+                                or (path == repo_path and jq == ".default_branch")):
         sys.stderr.write(f"fake gh: unhandled api call {argv}\n")
         sys.exit(2)
+    if jq == ".default_branch":
+        # The repository's own default branch. Unregistered answers GitHub's 404, which
+        # is what an origin pointing at a repository nobody created really does.
+        try:
+            with open(os.path.join(state_dir, "default-branch.json")) as f:
+                branches = json.load(f)
+        except (OSError, ValueError):
+            branches = {}
+        name = branches.get(path.removeprefix("repos/"))
+        if not name:
+            sys.stderr.write("gh: Not Found (HTTP 404)\n")
+            sys.exit(1)
+        print(name)
+        sys.exit(0)
     if path.endswith("/protection"):
         # An unregistered branch answers GitHub's own 404 body, which is the state this
         # repository is really in; `FAKE_GH_FAIL_PROTECTION` is every other failure.
@@ -1281,9 +1343,15 @@ elif argv[:2] == ["api", "--method"]:
     except (OSError, ValueError):
         commits = {}
     rec = commits.get(sha)
-    if rec is None:
+    # A commit registered for one field and asked about the other is a 404, not an empty
+    # answer: "unreadable" and "nothing there" are different facts on this path.
+    if rec is None or (jq == ".commit.message" and not rec.get("subject")) \
+            or (jq != ".commit.message" and rec.get("parents") is None):
         sys.stderr.write("gh: Not Found (HTTP 404)\n")
         sys.exit(1)
+    if jq == ".commit.message":
+        print(rec["subject"])
+        sys.exit(0)
     for parent in rec["parents"]:
         print(parent)
 elif argv[:2] == ["pr", "diff"]:
@@ -1380,6 +1448,7 @@ if fail:
     sys.exit(1)
 
 unit, workdir, stdout, stderr, setenv = None, None, None, None, {}
+stdin = None  # --property=StandardInput=file:<path>, a brief too big for argv
 rest = []
 i = 0
 while i < len(argv):
@@ -1398,6 +1467,9 @@ while i < len(argv):
         stdout = a.split("file:", 1)[1]
     elif a.startswith("--property=StandardError=file:"):
         stderr = a.split("file:", 1)[1]
+    elif a.startswith("--property=StandardInput=file:"):
+        # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md §6
+        stdin = a.split("file:", 1)[1]
     i += 1
 
 if not unit or not rest:
@@ -1409,7 +1481,8 @@ env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LANG")
 env.update(setenv)
 out = open(stdout, "w") if stdout else subprocess.DEVNULL
 err = open(stderr, "w") if stderr else subprocess.DEVNULL
-proc = subprocess.Popen(rest, cwd=workdir, env=env, stdin=subprocess.DEVNULL,
+inp = open(stdin, "rb") if stdin else subprocess.DEVNULL
+proc = subprocess.Popen(rest, cwd=workdir, env=env, stdin=inp,
                         stdout=out, stderr=err, start_new_session=True)
 with open(os.path.join(units_dir, unit + ".json"), "w") as f:
     json.dump({"unit": unit, "pid": proc.pid, "argv": rest, "cwd": workdir,
@@ -1688,7 +1761,8 @@ def fake_gh(tmp_path, monkeypatch):
         def set_pr(self, pr_url: str, state: str, merged_at: str | None = None,
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
-                   merge_state: str | None = None, head_oid: str = "") -> None:
+                   merge_state: str | None = None, head_oid: str = "",
+                   base_oid: str = "", merge_commit: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1708,10 +1782,16 @@ def fake_gh(tmp_path, monkeypatch):
             — is how a test says "somebody pushed", which is the case the whole SHA
             binding exists for.
 
-            It is OMITTED rather than sent empty when unset, because GitHub never answers
-            an empty sha: a test that wants the field absent must get it absent
-            (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
-            it present says so."""
+            `base_oid` is `baseRefOid`, the base branch's head as GitHub sees it, and it
+            is what says a branch is BEHIND on a repository whose strict status-check
+            policy is off — `mergeStateStatus` answers CLEAN there, so a fixture that
+            could not state this could only drive a catch-up that never fires in
+            production (spec 2026-09-27 §5.1).
+
+            `head_oid`, `base_oid` and `merge_commit` are all OMITTED rather than sent
+            empty when unset, because GitHub never answers an empty sha: a test that
+            wants the field absent must get it absent (`github.PR_FIELDS` asks for
+            `headRefOid` on every call), and one that wants it present says so."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
@@ -1723,6 +1803,13 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            if base_oid:
+                row["baseRefOid"] = base_oid
+            # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,
+            # which is the shape the extractor has to survive, and omitted rather than
+            # null when unset because GitHub answers null only on an unmerged PR.
+            if merge_commit:
+                row["mergeCommit"] = {"oid": merge_commit}
             self.prs[pr_url] = row
             monkeypatch.setenv("FAKE_GH_PRS", json.dumps(self.prs))
             # "Re-calling re-states it" includes un-doing a merge the fake performed:
@@ -1759,9 +1846,36 @@ def fake_gh(tmp_path, monkeypatch):
             Registered explicitly here, so it OVERRIDES what the fake would record for
             itself when the update runs.
             """
+            self._commit(sha, parents=list(parents))
+
+        def set_commit_subject(self, sha: str, subject: str) -> None:
+            """Say what `gh api …/commits/<sha> --jq .commit.message` answers.
+
+            The squash subject is the ONLY thing that attributes a red default branch to a
+            work order: `automerge_merged` records the pull request's head and the merge is
+            `--squash`, so the shas never compare equal (spec
+            docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2).
+            A commit with no subject registered answers GitHub's 404, which is the
+            "unreadable, so attribute nothing" case.
+            """
+            self._commit(sha, subject=subject)
+
+        def _commit(self, sha: str, **fields) -> None:
             path = gdir / "commits.json"
             rows = json.loads(path.read_text()) if path.exists() else {}
-            rows[sha] = {"parents": list(parents)}
+            rows[sha] = {**rows.get(sha, {}), **fields}
+            path.write_text(json.dumps(rows))
+
+        def set_default_branch(self, repo: str, branch: str) -> None:
+            """Say what `gh api repos/<owner>/<repo> --jq .default_branch` answers.
+
+            `repo` is `owner/name`, as `github.origin_repo` resolves it. Unregistered
+            answers the 404 a repository nobody created really answers — the reading the
+            OS must treat as NOT KNOWN rather than as green.
+            """
+            path = gdir / "default-branch.json"
+            rows = json.loads(path.read_text()) if path.exists() else {}
+            rows[repo] = branch
             path.write_text(json.dumps(rows))
 
         def set_protection(self, branch: str, checks: list[str]) -> None:
@@ -2190,6 +2304,20 @@ FIXTURE_DESIGN_DOC_BODY = "\n".join([
     "ask rather than pick.",
     "",
 ])
+
+
+def with_origin(path: Path, repo: str = "acme/proj") -> Path:
+    """Give this fixture project an `origin`, so `github.origin_repo` resolves.
+
+    OPT-IN, and it must stay that way: `make_git_project` leaves every fixture repository
+    remote-less, and adding one for the whole suite would arm the origin check — and
+    `Daemon.poll_default_branch`, which is gated on exactly this — in tests that never
+    asked for it. The default matches the harness's `PR = ".../acme/proj/pull/7"`, so
+    `github.checked_pr_url` still passes.
+    """
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin",
+                    f"https://github.com/{repo}.git"], check=True)
+    return path
 
 
 def make_git_project(root: Path, name: str, readme: str | None = "# proj\n",

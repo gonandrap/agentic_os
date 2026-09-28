@@ -40,6 +40,7 @@ from pathlib import Path
 
 import pytest
 
+from jarvis import claude_cli
 from jarvis.catalog import ProjectSpec
 from jarvis.dispatch import build_worker_prompt, serena_allow_rules
 
@@ -177,11 +178,15 @@ def run_and_record(repo: Path, prompt: str, agents: dict[str, Path] | None = Non
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(src.read_text())
 
-    argv = ["claude", "-p", prompt, "--output-format", "json", "--model", MODEL,
-            "--settings", str(settings), "--permission-mode", "acceptEdits"]
-    if system_prompt:
-        argv += ["--append-system-prompt", system_prompt]
-    subprocess.run(argv, cwd=repo, capture_output=True, text=True, timeout=timeout)
+    try:
+        # `keep_default_context`: this eval's SUBJECT is the default environment — it
+        # measures whether a worker carrying its CLAUDE.md and settings reaches for
+        # Serena — so the persona is APPENDED here and only here.
+        claude_cli.run_headless(prompt, system_prompt=system_prompt, settings=settings,
+                                permission_mode="acceptEdits", model=MODEL, cwd=repo,
+                                timeout=timeout, tools=None, keep_default_context=True)
+    except claude_cli.ClaudeCliError:
+        pass  # the tool log is the measurement; a failed turn still made its calls
 
     return [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
 

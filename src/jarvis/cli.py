@@ -18,6 +18,8 @@ Grouped commands:
                                           approvals (contest = the match was wrong)
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
+  jarvis rules list|show|retract|dry-run  the SELF-HEALING registry: the gaps the OS
+                                          recognises in itself (not the gate rules)
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|show|promote|done
   jarvis learn add|list|search|show|topics|stats|pin|unpin
@@ -132,6 +134,24 @@ def _readable_issues(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_spec(detail: dict[str, Any]) -> dict[str, Any]:
+    """The spec link as one line, for HUMAN output — §6 of
+    docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md.
+
+    Names the document, its revision and THE COMMAND that prints it — never a URL: the
+    CLI does not know the dashboard's host, and `jarvis search` already sets the
+    precedent of printing the command that shows a record. `--json` keeps the dict.
+    """
+    row = dict(detail)
+    link = row.pop("spec", None)
+    if not link:
+        return row
+    revision = link.get("source") or "the revision this text came from was not recorded"
+    row["spec"] = (f"{link['repo_path']} — {revision} · "
+                   f"jarvis fo spec {link['fo_id']}")
+    return row
+
+
 def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     """One seat's findings, classified, above its raw reply.
 
@@ -216,6 +236,27 @@ def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_review(detail: dict[str, Any]) -> dict[str, Any]:
+    """The decision this order owes, collapsed to its lines, for HUMAN output.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §4.
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the dict because
+    other tooling reads the counts, while a person gets the same sentences the dashboard's
+    buttons carry — written once, in `ops`, so the two surfaces cannot word one decision
+    differently.
+    """
+    row = dict(detail)
+    state = row.pop("review", None)
+    if state:
+        owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
+        where = (f"round {state['round']} gave up" if state["escalated"]
+                 else f"{state['pending']} {owed}")
+        row["review"] = [f"owed: {where} — {state['scope']}.",
+                         f"accept: {state['accept']}",
+                         f"reject: {state['reject']} {state['strands']}"]
+    return row
+
+
 def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
 
@@ -231,6 +272,51 @@ def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     line = ops.alarm_standing_line(row.pop("alarms", None) or [])
     if line:
         row["alarms"] = line
+    return row
+
+
+def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
+    """One line per status this order was in — the block `jarvis wo show` and `fo show`
+    both print (spec §6 of docs/superpowers/specs/2026-09-27-time-in-each-state.md).
+
+    THE RENDERER FORMATS NOTHING: every duration, every count and every share is read
+    off `ops.state_durations(...).as_dict()`, which is the same document `--json` prints
+    and the dashboard renders. A second derivation of one number is what `jarvis wo why`
+    exists to avoid.
+    """
+    from . import ops
+
+    lines: list[str] = []
+    # Said ONCE, before the rows, and in `ops`' words: a coarse span nothing labels is
+    # read as a measurement (spec §3, Neo's ruling).
+    if payload.get("approximate"):
+        lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    for total in payload.get("totals") or []:
+        entries = total["entries"]
+        word = "entry" if entries == 1 else "entries"
+        line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
+                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{total['share'] * 100:>3.0f}%")
+        if total["status"] and total["status"] == payload.get("current_status"):
+            idle = payload.get("last_activity_age_human")
+            since = (f"nothing since {idle} ago" if idle
+                     else "nothing on the record at all")
+            line += f"   ← now, {payload['current_status_age_human']}, {since}"
+        lines.append(line)
+    return lines
+
+
+def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
+    """The status-span payload collapsed to `time_in_state_lines`, for HUMAN output.
+
+    `_readable_rounds`' trick: `--json` keeps the whole document because the dashboard
+    and other tooling read it, while a person gets one line per status.
+    """
+    row = dict(detail)
+    payload = row.pop("time_in_state", None) or {}
+    lines = time_in_state_lines(payload)
+    if lines:
+        row["time in state"] = lines
     return row
 
 
@@ -409,6 +495,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list blocking joins at or above this long, for this run only "
                          "(default: the project's os.inspect.report_join_floor, "
                          f"{catalog.DEFAULT_INSPECT_REPORT_JOIN_FLOOR})")
+    # OFF BY DEFAULT: a tool input can be a whole file, so the default report must not
+    # grow with what the worker typed (spec §4c).
+    sp.add_argument("--params", action="store_true",
+                    help="also print each turn's tool calls with their parameters, "
+                         "and the caps those were truncated at")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
@@ -536,6 +627,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "feature's children, so the feature waits for it and shows it "
                         "in its tree (the feature must still be open)")
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
+
+    c.add_argument("--observability", choices=["off", "normal", "full"],
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -758,6 +852,15 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("fo_id")
     f.add_argument("--project")
 
+    f = fo.add_parser("spec", help="print the design document this feature holds — the "
+                                   "snapshot every reviewer and every child was given, "
+                                   "which exists before any pull request does")
+    f.add_argument("fo_id")
+    f.add_argument("--section", default="",
+                   help="one section only, by number or by heading substring — the same "
+                        "reference a child's brief names")
+    f.add_argument("--project")
+
     f = fo.add_parser("resume", help="put a FAILED feature order back to work — the way "
                                      "past a dead child, without touching the database")
     f.add_argument("fo_id")
@@ -932,6 +1035,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("command", metavar="request-number | command")
     g.add_argument("--project")
+
+    # rules (the self-healing detector/remedy registry) ----------------------------------
+    # docs/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
+    # a verb under `jarvis gate`: that family answers "what counts as privileged", this
+    # one answers "what does the OS recognise as its own recurring gap", and one verb
+    # meaning two registries is how `jarvis gate rules` stops being readable. The
+    # collision is close enough that the description has to open by saying which registry
+    # this is and name the other.
+    ru = sub.add_parser(
+        "rules",
+        help="the self-healing registry: the gaps the OS recognises in itself, and what "
+             "it proposes doing about each one",
+        description="the self-healing registry — the gaps the OS has learned to "
+                    "recognise in itself (a DETECTOR) and what it proposes doing about "
+                    "each one (a REMEDY RULE). This is NOT `jarvis gate rules`, which "
+                    "is the other registry: that one answers what counts as a "
+                    "privileged action, this one answers what counts as a gap.",
+    ).add_subparsers(dest="rules_cmd", required=True)
+
+    r = ru.add_parser("list", help="the registry, counts first")
+    r.add_argument("--project", default="",
+                   help="this project's rules AND the fleet-wide ones")
+    r.add_argument("--status", choices=("dry_run", "armed", "retracted"))
+    r.add_argument("--gap-class", dest="gap_class", default="")
+
+    r = ru.add_parser("show", help="one detector: its condition in prose, its remedy "
+                                   "rules, its provenance and its newest fires")
+    r.add_argument("detector_id", metavar="dt-id")
+
+    r = ru.add_parser("retract", help="retire a detector or one remedy rule: it stops "
+                                      "applying, the record keeps that it once did")
+    r.add_argument("rule_id", metavar="dt-id | rm-id")
+    r.add_argument("--reason", required=True,
+                   help="why — the only record of what changed the OS's mind")
+
+    r = ru.add_parser("dry-run", help="what this detector reads, and what it would "
+                                      "decide about one order. WRITES NOTHING")
+    r.add_argument("detector_id", metavar="dt-id")
+    r.add_argument("order_id", nargs="?", default="",
+                   help="an order to evaluate against. Omit to just see what the "
+                        "condition reads")
+
+    for r in ru.choices.values():
+        r.add_argument("--json", action="store_true", help="machine-readable output")
 
     # config (the versioned configuration console) ---------------------------------------
     # docs/superpowers/specs/2026-08-27-the-config-console.md §8. Every subcommand takes
@@ -1679,22 +1826,13 @@ def _print_bill(bill: dict) -> None:
         print(f"{total['cost']['by_class'][cls]:>9.3f} "
               f"{_tok(total['tokens'][cls]):>8}  {label:<12} {why}")
     print(f"\n'tokens' above is {bill_mod.TOKENS_MEAN}.")
-    # What is NOT here, named. An absent line reads as an omission, and "was nothing at
-    # all spent on the OS?" was one of the four questions this surface exists to answer.
-    # Said in the terminal exactly as the page says it: a caveat that appears in one
-    # renderer and not the other is one the reader learns to ignore.
-    absent = {
-        "worker": "the worker's own session — nothing measurable (never dispatched, or "
-                  "its transcript and every turn's result JSON are gone)",
-        "jarvis": "jarvis spent nothing of its own — no Neo question, no panel, no "
-                  "digest",
-        "subprocesses": "no claude processes the worker spawned itself were recorded",
-    }
-    present = {line["key"] for line in bill.get("actors") or []}
-    missing = [text for key, text in absent.items() if key not in present]
+    # What is NOT here, named — the sentences come from `bill.ABSENT_NOTES`, which the page
+    # reads too: a caveat worded differently in one renderer is one the reader learns to
+    # ignore, and it was duplicated in both until §10 needed a fourth.
+    missing = bill_mod.absent_notes(bill)
     if missing and bill["kind"] == "work_order":
         print("\nnot on this bill:")
-        for text in missing:
+        for _key, text in missing:
             print(f"  · {text}")
     rewrite = bill.get("rewrite") or {}
     if rewrite.get("tokens"):
@@ -1743,17 +1881,34 @@ def _mins(seconds: float) -> str:
 #: the percentages stop summing to 100, which is worse than the bug it would hide.
 PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
                "tools": "running tools", "idle": "between turns, nothing running",
-               "unaccounted": "unaccounted — no API call was ever made"}
+               "unaccounted": "unaccounted — no API response has completed"}
 
 #: The same buckets on the per-TURN line, where a full label does not fit. Same keys,
 #: same order, same pin.
 PART_SHORT = {"generating": "gen", "blocked": "blocked", "tools": "tools",
               "idle": "idle", "unaccounted": "unacc"}
 
+#: The glyph each bucket occupies in the per-turn bar (spec §4c). SAME KEYS, SAME ORDER,
+#: SAME PIN as the two tables above: the bar is built from the very `share` figures
+#: printed beside it, so the picture and the percentages cannot disagree.
+BAR_GLYPHS = {"generating": "█", "blocked": "▓", "tools": "▒", "idle": "░",
+              "unaccounted": "·"}
+
+#: Fixed, so every turn's bar is comparable at a glance and the columns after it line up.
+BAR_WIDTH = 20
+
 #: What a turn with no API call says, ahead of any duration breakdown. A fixed width so
 #: the split below it stays a column, and stated rather than left to be inferred from
 #: `0 calls`: the inference is what four layers got wrong (issue 227).
 NO_CALL_FLAG = "NO API CALL"
+
+#: The same column when a request is IN FLIGHT — spec of 2026-09-27 §1. Printed instead
+#: of `NO_CALL_FLAG`, never beside it: the absence of a completed block is not the
+#: absence of a call.
+AWAITING_FLAG = "AWAITING MODEL"
+
+#: One width for both, so the split after the flag stays a column either way.
+FLAG_WIDTH = max(len(NO_CALL_FLAG), len(AWAITING_FLAG))
 
 
 def _print_partition(unit: dict[str, Any]) -> None:
@@ -1787,13 +1942,77 @@ def _print_partition(unit: dict[str, Any]) -> None:
               f"of that idle, nothing on record was holding it")
 
 
-def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
+def _bar(share: dict[str, float]) -> str:
+    """The turn's partition as one fixed-width stacked bar, in `PARTS` order.
+
+    Cumulative edges rather than per-bucket rounding: five independently rounded
+    segments do not add up to the width, and a bar that is a character short reads as a
+    sixth bucket nobody named.
+    """
+    keys = list(BAR_GLYPHS)
+    out, done = [], 0
+    for index, name in enumerate(keys, start=1):
+        edge = min(BAR_WIDTH,
+                   round(sum(share.get(k, 0.0) for k in keys[:index]) * BAR_WIDTH))
+        out.append(BAR_GLYPHS[name] * max(0, edge - done))
+        done = max(done, edge)
+    return "".join(out).ljust(BAR_WIDTH, BAR_GLYPHS[keys[-1]])
+
+
+def _print_subagent(sub: dict[str, Any], indent: str) -> None:
+    """One subagent under the turn that named it. EVERY FIGURE COMES OUT OF THE PAYLOAD.
+
+    `writes_by_cause` is summed in `inspection` for the reason spec §4c gives: a number
+    the renderer computes is one the dashboard will eventually compute differently.
+    """
+    writes = ", ".join(f"{cause} {_tok(written)}"
+                       for cause, written in (sub["writes_by_cause"] or {}).items())
+    print(f"{indent}⤷ {sub['label'] or sub['task_id']}  {_mins(sub['wall']):>7}  "
+          f"{sub['api_calls']:>3} api calls  peak {_tok(sub['context_peak']):>5}  "
+          f"{'writes ' + writes if writes else 'no large writes'}")
+    if sub["deeper"]:
+        # Never imply completeness (spec §4b): one directory level is globbed, so a
+        # subagent's own subagents are counted and their transcripts are not read.
+        noun = "subagent" if sub["deeper"] == 1 else "subagents"
+        print(f"{indent}  {sub['deeper']} deeper {noun} NOT read — "
+              f"depth read {sub['depth_read']}")
+
+
+def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
+    """Every span of one turn with its reported parameters, behind `--params`.
+
+    The caps ride with the listing rather than sitting in a footnote: a report that
+    truncates without saying so is not reproducible (spec §4a), and this is the only
+    place a value is ever cut short.
+    """
+    if not turn["spans"]:
+        return
+    print(f"           parameters — capped at {caps['per_value']:,} chars per value, "
+          f"{caps['per_span']:,} per span, {caps['per_turn']:,} per turn")
+    for span in turn["spans"]:
+        print(f"           · {span['name']}  {_mins(span['seconds'])}")
+        for key, value in span["params"].items():
+            print(f"               {key} = {value}")
+        notes = []
+        if span["params_truncated"]:
+            notes.append("shortened: " + ", ".join(span["params_truncated"]))
+        if span["params_dropped"]:
+            notes.append("not printed, the cap was reached: "
+                         + ", ".join(span["params_dropped"]))
+        for note in notes:
+            print(f"               ({note})")
+
+
+def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
+                   params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
 
     The partition first because it is the headline, then the turns it is made of, then
     the three lists that explain the two expensive slices — what the blocked time was
     waiting for, what the tokens were re-sent for, and what the tool time was doing.
     """
+    from . import inspection
+
     head = f"{unit['wo_id']} — {unit['title']}"
     print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
     if not unit["found"]:
@@ -1813,14 +2032,26 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
 
     print()
+    # The legend for the bars below, keyed off the same dict they are drawn from — a
+    # glyph in one and not the other is `PART_LABELS`' failure in pictures (spec §4c).
+    print("  " + "  ".join(f"{g} {PART_SHORT[k]}" for k, g in BAR_GLYPHS.items()))
     causes = unit.get("hold_causes") or {}
     for turn in unit["turns"]:
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
         split = "  ".join(f"{PART_SHORT[k]} {s[k] * 100:>3.0f}%" for k in PART_SHORT)
-        flag = "" if turn["observed"] else NO_CALL_FLAG
-        print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
-              f"{flag:<{len(NO_CALL_FLAG)}}  {split}  "
+        flag = AWAITING_FLAG if turn.get("awaiting") else (
+            "" if turn["observed"] else NO_CALL_FLAG)
+        # The bar is drawn FROM `share` and the percentages are printed from the same
+        # dict, so the picture cannot disagree with the numbers. Both, not either: the
+        # bar is read at a glance and the numbers are what get quoted.
+        # Spec 2026-09-27 §3: the OS's own number, and part 2+ of one OS turn says so.
+        label = (f"turn {turn['seq']:>2}" if turn["seq"]
+                 else inspection.turn_name(turn["seq"]))
+        if turn.get("part", 1) > 1:
+            label += " (continued)"
+        print(f"  {label}  {_mins(turn['wall']):>7}  "
+              f"{flag:<{FLAG_WIDTH}}  {_bar(s)}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
         # The second clock only where the two differ, on its own line and naming the
@@ -1833,6 +2064,28 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int) -> None:
             print(f"           · {_mins(turn['active'])} active — held {named}")
         for trigger in turn["triggers"]:
             print(f"           ↳ {trigger['quote']}")
+        if turn["subagents"]:
+            # A PARTITION of the turn above, drawn out of it and never added to it
+            # (spec §4b, kn-7a2180ba) — said here because the seconds on these lines
+            # would otherwise read as extra time on top of the turn's own wall clock.
+            print("           subagents — a partition of this turn, not an addition:")
+            for sub in turn["subagents"]:
+                _print_subagent(sub, "           ")
+        if params:
+            _print_params(turn, unit["param_caps"])
+
+    for seq in unit.get("unmatched_os_turns") or []:
+        # Reported, never dropped (spec 2026-09-27 §3): the OS minted that turn.
+        print(f"\n  turn {seq} left no prompt row in the transcript (compaction "
+              f"rewrites it; its triggers are on turn {seq + 1})")
+
+    if unit["unattached_subagents"]:
+        # No timestamp fallback upstream, so these are reported rather than given a
+        # parent the record does not name (issue 227).
+        print(f"\n  subagents no span named — depth read "
+              f"{unit['subagent_depth_read']}:")
+        for sub in unit["unattached_subagents"]:
+            _print_subagent(sub, "    ")
 
     if unit["joins"]:
         print("\n  blocked on:")
@@ -1871,7 +2124,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     for index, unit in enumerate(res["units"]):
         if index:
             print()
-        _print_anatomy(unit, res["write_floor"])
+        _print_anatomy(unit, res["write_floor"], params=args.params)
     return 0
 
 
@@ -2303,6 +2556,10 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res.get("floor_reason"):
         print(f"\nEvery figure above is {res['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
+    # Money is all this command has ever shown, and the complaint behind spec §7 of
+    # docs/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
+    print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
+          "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
 
 
@@ -2410,7 +2667,7 @@ def _print_context(res: dict[str, Any]) -> None:
 
 
 def cmd_wo(args: argparse.Namespace) -> int:
-    from . import invariants, ops
+    from . import invariants, ops, specs
     from .project_store import OPEN_STATUSES, ProjectStore
     from .timeline import build_conversation, build_timeline
 
@@ -2422,6 +2679,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
             parent_id=parent or None, budget_usd=_budget_arg(args),
+            observability=getattr(args, "observability", None),
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
@@ -2555,10 +2813,25 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # a work order whose assumptions the OS never looked at has no line here.
                 **({"auto_review": review}
                    if (review := ops.autoreview_state(store, wo)) else {}),
+                # THE DECISION THIS ORDER OWES THE USER, worded exactly as the dashboard's
+                # buttons word it. Same never-always rule: absent when nothing is owed —
+                # spec 2026-09-27-a-review-control-for-an-escalated-round §4.
+                **({"review": owed}
+                   if (owed := ops.review_state(store, wo)) else {}),
+                # WHERE THE SPEC CAN BE READ — the feature's document, its revision and
+                # the anchor this order's section resolves to. Same never-always rule:
+                # absent for a standalone work order, which has no feature and no plan.
+                # This is what a planner gets INSTEAD of the bare `spec_section` column
+                # `**wo` smuggles in, which is NULL for it (spec §6).
+                **({"spec": link} if (link := specs.spec_link(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
                 "alarms": store.alarms_of(args.wo_id),
+                # HOW LONG IT HAS BEEN WHERE IT IS, and how long it spent in each status
+                # before that. Always present, on this dict's stated rule — spec §6.
+                "time_in_state": ops.state_durations(store,
+                                                     wo_id=args.wo_id).as_dict(),
                 # THE CEILING AND WHAT HAS GONE AGAINST IT. Always present, even as
                 # nulls: this is the record a user checks a number they typed against,
                 # and a key that comes and goes is one every consumer has to guard.
@@ -2569,9 +2842,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
         finally:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
-        _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_rounds(_readable_issues(
-                _readable_conversation(detail)))))))
+        _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
+            _readable_automerge(_readable_alarms(_readable_time_in_state(
+                _readable_rounds(_readable_issues(
+                    _readable_conversation(detail))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2795,6 +3069,12 @@ def cmd_fo(args: argparse.Namespace) -> int:
             # Silent when there is none, which is every feature until a sweep is armed.
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+            # The same block as `jarvis wo show`, from the same formatter — spec §6.
+            states = time_in_state_lines(detail["time_in_state"])
+            if states:
+                print("\ntime in state:")
+                for line in states:
+                    print(f"  {line}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:
@@ -2835,6 +3115,19 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     elif args.fo_cmd == "agent":
         _print(ops.rebuild_feature_agent(args.fo_id, args.project), args.json)
+
+    elif args.fo_cmd == "spec":
+        res = ops.feature_spec(args.fo_id, args.project,
+                               section=args.section or None)
+        if args.json:
+            _print(res, True)
+        else:
+            # One header line — the document and the revision it came from — then the
+            # markdown raw. The HTML renderer serves the page, never the terminal (§7).
+            head = res["repo_path"]
+            print(f"{head} — {res['source']}" if res["source"] else
+                  f"{head} — the revision this text came from was not recorded")
+            print(res["content"])
 
     elif args.fo_cmd == "resume":
         out = ops.resume_feature_order(args.fo_id, fix=args.fix,
@@ -3152,6 +3445,103 @@ def cmd_gate(args: argparse.Namespace) -> int:
                    "dismiss": "dismissed"}[args.ga_cmd]
         _print(ops.decide_gate(args.approval_id, verdict=verdict,
                                reason=args.reason, project_name=args.project), args.json)
+    return 0
+
+
+def _print_rules_list(data: dict) -> None:
+    """The registry, counts first.
+
+    The counts LEAD because that is the line a reader can act on — `12 rules: 3 armed, 8
+    in dry run, 1 retracted` — and every number in it came from `ops`. This function
+    derives none: two surfaces computing the same total is two surfaces that can
+    disagree about it.
+    """
+    c = data["counts"]
+    noun = "rule" if c["total"] == 1 else "rules"
+    print(f"{c['total']} {noun}: {c['armed']} armed, {c['dry_run']} in dry run, "
+          f"{c['retracted']} retracted")
+    for r in data["rules"]:
+        scope = r["project"] or "fleet-wide"
+        retired = " ⊘ retracted" if r["retired_at"] else ""
+        print(f"  {r['id']} [{r['gap_class']}] {scope} · {r['status']}{retired}")
+        if r["summary"]:
+            print(f"      {r['summary']}")
+        if not r["condition_prose"]:
+            print("      UNREADABLE: " + "; ".join(r["condition_problems"]))
+        for rem in r["remedies"]:
+            print(f"      → {rem['primitive']} {rem['params'] or ''}".rstrip())
+        if r["hit_rate"] is None:
+            print(f"      {r['hit_rate_note']}")
+        else:
+            hits, total = r["fires"]["hits"], r["fires"]["total"]
+            print(f"      {hits} {'hit' if hits == 1 else 'hits'} of "
+                  f"{total} {'fire' if total == 1 else 'fires'}")
+    print(f"\n{data['note']}")
+
+
+def _print_rules_show(data: dict) -> None:
+    d = data["detector"]
+    print(f"{d['id']} [{d['gap_class']}] {d['status']} · "
+          f"{d['project'] or 'fleet-wide'}")
+    if d["summary"]:
+        print(f"  {d['summary']}")
+    print(f"  condition: {data['condition_prose'] or 'UNREADABLE'}")
+    for p in data["condition_problems"]:
+        print(f"    ⚠ {p}")
+    for rem in data["remedies"] + data["retired_remedies"]:
+        retired = " ⊘ retracted" if rem["retired_at"] else ""
+        print(f"  remedy {rem['id']}: {rem['primitive']}{retired}")
+        if rem["params"]:
+            print(f"    parameters: {json.dumps(rem['params'], sort_keys=True)}")
+        if rem["argument"]:
+            print(f"    argument: {rem['argument']}")
+        if rem["retired_at"]:
+            print(f"    ↳ {rem['retired_reason']}")
+    prov = data["provenance"]
+    print("  provenance: " + ", ".join(f"{k}={v}" for k, v in prov.items() if v))
+    if data["hit_rate"] is None:
+        print(f"  {data['hit_rate_note']}")
+    for f in data["fires"]:
+        print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
+              # A fire is one line: the stored detail stays at rules.FACTS_CHARS.
+              + (f" · {_one_line(f['detail'], 110)}" if f["detail"] else ""))
+
+
+def _print_rules_dry_run(data: dict) -> None:
+    print(f"{data['detector']['id']} [{data['detector']['gap_class']}]")
+    if not data["readable"]:
+        print("  UNREADABLE — nothing was evaluated and nothing was decided")
+        for p in data["problems"]:
+            print(f"    ⚠ {p}")
+        print(f"\n{data['note']}")
+        return
+    print(f"  condition: {data['condition_prose']}")
+    print(f"  reads fields: {', '.join(data['fields'])}")
+    print(f"  from: {', '.join(data['sources'])}")
+    if data["evaluated"]:
+        print(f"  {data['explanation']}")
+    print(f"\n{data['note']}")
+
+
+def cmd_rules(args) -> int:
+    from . import ops
+
+    if args.rules_cmd == "list":
+        data = ops.rules_list(project=args.project, status=args.status or "",
+                              gap_class=args.gap_class)
+        _print(data, True) if args.json else _print_rules_list(data)
+    elif args.rules_cmd == "show":
+        data = ops.rules_show(args.detector_id)
+        _print(data, True) if args.json else _print_rules_show(data)
+    elif args.rules_cmd == "retract":
+        data = ops.rules_retract(args.rule_id, args.reason)
+        if args.json:
+            _print(data, True)
+        else:
+            print(f"✓ {data['rule']['id']} retracted — {data['note']}")
+    elif args.rules_cmd == "dry-run":
+        data = ops.rules_dry_run(args.detector_id, args.order_id)
+        _print(data, True) if args.json else _print_rules_dry_run(data)
     return 0
 
 
@@ -3977,6 +4367,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_io(args)
         if args.cmd == "gate":
             return cmd_gate(args)
+        if args.cmd == "rules":
+            return cmd_rules(args)
         if args.cmd == "config":
             return cmd_config(args)
         if args.cmd == "backlog":

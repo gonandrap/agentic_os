@@ -690,6 +690,16 @@ switch — the two are separate, as above.
 rows. The class renders as *not recorded*, never as `0.00` spent — §2's standing rule
 governs this section's own numbers exactly as it governs every other section's.
 
+**The absent list is read, not re-written.** Work order wo-92b0a58d's brief says "Change no
+bill arithmetic, no route, no template, no payload." Where that collides with this section,
+this section wins — Neo, question 766 on that order, 2026-09-26. The brief's "no template"
+does not bar the one read of `bill.py`'s absent list that this section's *not recorded* line
+needs. Today that list is hard-coded twice: `cli._print_bill`'s `absent` dict
+(`src/jarvis/cli.py`) and `src/jarvis/ui/templates/bill.html`. `bill.py` becomes the single
+source of it, the sentence text included, and both renderers only read it; the observability
+entry is added there. No other template change, and no arithmetic or payload change. Do not
+re-open this on a later child.
+
 ---
 
 ## 11. Clearing the blocker the diagnosis just named
@@ -716,6 +726,20 @@ alarm, and this lets the user reach the same three — `nudge`, `unblock`, `file
 — from the diagnosis they are already looking at. A section that needed a new remedy would
 be a different and much larger section, carrying a registry diff and its own approval
 story. This is not that section.
+
+> **Correction, 2026-09-27 — user ruling on the wo-dbea82cf review, applied by Neo (Neo
+> learning #39), recorded by wo-07ddf44b.** `jarvis wo fix` does NOT auto-match the blocker
+> against a closed table of shipped remedies. When no shipped remedy fits, `fix` files a
+> WORK ORDER to write a new reusable remedy in `src/jarvis/remedies.py` — with tests and a
+> `SHIPPED_REMEDIES` update, off `catalog.RemedyConfig`'s allow-list by default. The
+> registry stays closed at RUNTIME, so `fix` never writes acting code itself, but it GROWS
+> through reviewed code. The user's reason: matching only against what already ships means
+> the OS never learns about new bugs or gaps in itself. The paragraph above ("§11 adds NO
+> remedy to that registry") is superseded ON THIS POINT ONLY, as is the "no shipped remedy
+> covers it, so hand the user §6's command" fallback below, which now comes after filing the
+> new-remedy order. Every other exclusion in this section stands verbatim: no cancelling a
+> turn, no `set_status`, no `wo done`, no `fo resume`, no killing a process — and still no
+> remedy invented at runtime.
 
 **What it refuses.** `remedies.py` excludes cancelling a turn, `set_status`, `wo done`,
 `fo resume` and killing a process, on purpose, and its docstring calls that a boundary

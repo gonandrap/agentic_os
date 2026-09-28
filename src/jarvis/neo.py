@@ -426,6 +426,19 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             log.info("neo question %s held until the usage window reopens", q["id"])
             results.append({"question": q, "verdict": None, "outcome": "held"})
             continue
+        except claude_cli.InputTooLargeError as e:
+            # BEFORE the generic outage below, and the ordering is the mechanism: the
+            # same call will fail the same way for ever, so `max_attempts=0` gives up at
+            # the first attempt rather than parking a worker for three stale sweeps.
+            # Still no synthesised verdict. Spec §5:
+            # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+            outcome = store.release_claim(q["id"], f"input too large: {e}",
+                                          max_attempts=0)
+            log.error("neo question %s could not be sent: %s", q["id"], e)
+            if unreachable:
+                unreachable(q, f"input too large: {e}")
+            results.append({"question": q, "verdict": None, "outcome": outcome})
+            continue
         except claude_cli.ClaudeCliError as e:
             # A CALL THAT NEVER HAPPENED IS NOT A VERDICT. No `mark("failed")`, no
             # synthesised `{escalate: True}` and no `deliver` — question 388 reached the

@@ -86,6 +86,28 @@ COMPACTION = "compaction"
 #: a future descendant kind joins the class without the report having to learn about it.
 SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 
+#: What the user spent LOOKING at an order — the five observability paths, each metered at
+#: its own definition by `observability.metered` (§10 of
+#: docs/specs/2026-09-24-order-observability.md). A THIRD CLASS beside the worker's turns
+#: and Jarvis's overhead, for `WORKER_SUBPROCESS`'s reason exactly: money spent looking at
+#: an order is not money spent doing it, and a bill that mixes them answers neither
+#: question.
+#:
+#: THEIR DOLLARS ARE A MEASURED ZERO AND THAT IS THE WHOLE POINT. These paths are
+#: arithmetic over files Claude Code already wrote, so the claim "debugging is mechanical"
+#: arrives in the bill as a number instead of an assertion in a spec — and if any of them
+#: ever gains a model call, the row stops reading zero on its own and nobody has to
+#: remember to instrument it. A zero that was measured is not an absent figure; the bill
+#: keeps the two apart.
+OBSERVE_LIVE = "observe_live"
+OBSERVE_INSPECT = "observe_inspect"
+OBSERVE_CONTEXT = "observe_context"
+OBSERVE_WHY = "observe_why"
+OBSERVE_CONTEXT_WRITE = "observe_context_write"
+
+OBSERVABILITY_KINDS = frozenset({OBSERVE_LIVE, OBSERVE_INSPECT, OBSERVE_CONTEXT,
+                                 OBSERVE_WHY, OBSERVE_CONTEXT_WRITE})
+
 #: What kind of OS work a call was, as stored in `agent_calls.kind`. Open by design —
 #: an unknown kind records fine and shows up in the report under its own name — but the
 #: ones the OS emits today are named here so a reader of the schema knows what to expect,
@@ -110,6 +132,11 @@ KIND_LABELS = {
     "stakes_classifier": "classifying an assumption's stakes",
     COMPACTION: "compacting a cold conversation",
     WORKER_SUBPROCESS: "worker subprocess",
+    OBSERVE_LIVE: "watching the turn in flight",
+    OBSERVE_INSPECT: "inspecting where the time went",
+    OBSERVE_CONTEXT: "reading the context ledger",
+    OBSERVE_WHY: "diagnosing why the order is not moving",
+    OBSERVE_CONTEXT_WRITE: "recording the context ledger",
 }
 
 #: Where accounting rows go when that must differ from `$JARVIS_HOME`. Set at dispatch
@@ -147,6 +174,11 @@ def describe(kind: str) -> str:
 def is_subprocess(kind: str) -> bool:
     """Does this `agent_calls.kind` belong to the worker rather than to the OS?"""
     return kind in SUBPROCESS_KINDS
+
+
+def is_observability(kind: str) -> bool:
+    """Was this row the user LOOKING at the order rather than the OS working on it?"""
+    return kind in OBSERVABILITY_KINDS
 
 
 def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",

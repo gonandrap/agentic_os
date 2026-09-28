@@ -159,7 +159,8 @@ def setenv_args(env: dict[str, str]) -> list[str]:
 
 
 def run_prefix(unit: str, cwd: Path, outfile: Path, errfile: Path,
-               env: dict[str, str], description: str) -> list[str]:
+               env: dict[str, str], description: str,
+               stdin: Path | None = None) -> list[str]:
     """The `systemd-run` argv the turn's own command line is appended to.
 
     `--collect` so a finished unit unloads itself — which means a reap routinely finds
@@ -168,7 +169,9 @@ def run_prefix(unit: str, cwd: Path, outfile: Path, errfile: Path,
     so nothing has to relay them across a process that is about to exit; `file:` truncates
     on open, matching the `open("w")` the direct path uses. Standard input is `null` for
     the same reason it is `DEVNULL` there: `claude -p` otherwise waits three seconds for
-    input that is never coming.
+    input that is never coming. A turn whose prompt is too big for argv gets that file
+    as `StandardInput=file:` instead — spec §3,
+    docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
     """
     return [
         systemd_run_bin(), "--user", "--collect", "--quiet",
@@ -177,7 +180,8 @@ def run_prefix(unit: str, cwd: Path, outfile: Path, errfile: Path,
         f"--working-directory={cwd}",
         f"--property=StandardOutput=file:{outfile}",
         f"--property=StandardError=file:{errfile}",
-        "--property=StandardInput=null",
+        f"--property=StandardInput=file:{stdin}" if stdin
+        else "--property=StandardInput=null",
         *setenv_args(env),
         "--",
     ]

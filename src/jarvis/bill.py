@@ -92,16 +92,20 @@ TURN_CALL_LIMIT = 200
 #:     that a correction is not a loss.
 PAYLOAD_VERSION = 5
 
-#: The actor a line belongs to. Three, because they are three different KINDS of spend
+#: The actor a line belongs to. Four, because they are four different KINDS of spend
 #: and the user's first question about the old line was why the OS's half looked like
 #: one thing: the worker's own conversation, what Jarvis spent thinking about the order
-#: while the worker slept, and what the worker's own tool calls spawned beneath it.
+#: while the worker slept, what the worker's own tool calls spawned beneath it, and what
+#: the user spent LOOKING at the order rather than doing it (§10 of
+#: docs/specs/2026-09-24-order-observability.md).
 WORKER, JARVIS, SUBPROC = "worker", "jarvis", "subprocesses"
+OBSERVE = "observability"
 
 ACTOR_LABELS = {
     WORKER: "the worker's own session",
     JARVIS: "what Jarvis spent on this order",
     SUBPROC: "claude processes the worker spawned itself",
+    OBSERVE: "what looking at this order cost",
 }
 ACTOR_NOTES = {
     WORKER: "the agent's conversation — every turn it ran, subagents included",
@@ -110,7 +114,45 @@ ACTOR_NOTES = {
             "the dashboard",
     SUBPROC: "an eval suite, a script, a nested harness — its tokens are this order's, "
              "recorded as each call returned",
+    # Say the 0.00 out loud, because a reviewer will otherwise read it as a bug (§10).
+    OBSERVE: "money spent LOOKING at this order, not DOING it: every `jarvis watch`, "
+             "`jarvis inspect`, `jarvis wo why`, context ledger read and context ledger "
+             "write, one row each. Dollars of zero beside a count and a wall clock that "
+             "are not zero is the honest rendering of a mechanical path — the paths are "
+             "arithmetic over files that already exist, and a measured zero is the claim, "
+             "not a missing figure",
 }
+
+#: WHAT IS NOT ON THIS BILL, one sentence per actor class — and ONE SOURCE for both
+#: renderers (`cli._print_bill` and ui/templates/bill.html each carried its own copy, and
+#: wording that differs between two renderers is wording the reader stops trusting).
+#:
+#: ABSENT IS NOT ZERO (Neo's ruling on question 766): a class with no line did not spend
+#: 0.00, it was not recorded, and each sentence says which of the two it is.
+ABSENT_NOTES = {
+    WORKER: "The worker's own session — nothing measurable. Either it was never "
+            "dispatched, or Claude Code has pruned the transcript and the result JSON of "
+            "every turn is gone.",
+    JARVIS: "Jarvis's own calls — nothing. This order asked Neo no questions, no panel "
+            "deliberated on it, and nothing was digested for it. Every question a worker "
+            "asks costs one Neo call (five when the panel sits), and they would be "
+            "itemised here.",
+    SUBPROC: "Claude processes the worker spawned itself — nothing recorded. An eval "
+             "suite or a script run through Jarvis's transport would be itemised here.",
+    OBSERVE: "What looking at this order cost — not recorded. Either it ran before the "
+             "meter existed or nobody has opened a report on it, and neither of those is "
+             "a figure of zero spent.",
+}
+
+
+def absent_notes(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    """The classes with NO line on this payload, each with the sentence that says so.
+
+    An absence nobody names reads as an omission, and "was nothing at all spent on the
+    OS?" was one of the four questions this surface exists to answer.
+    """
+    present = {line.get("key") for line in payload.get("actors") or []}
+    return [(key, text) for key, text in ABSENT_NOTES.items() if key not in present]
 
 #: The line for spend that belongs to the order but to no turn of it. Its own line
 #: rather than folded into the nearest turn (Neo, question 121): the turns view claims
@@ -680,6 +722,10 @@ def _call_items(rows: Sequence[dict[str, Any]],
         envelope = db.from_json(row.get("usage_json"), {}) or {}
         if agent_usage.is_subprocess(kind):
             path: tuple[str, ...] = (SUBPROC, label or described)
+        elif agent_usage.is_observability(kind):
+            # Its own class, exactly as a subprocess row gets one: looking at the order is
+            # not Jarvis working on it (§10).
+            path = (OBSERVE, described)
         else:
             # A third level only when it SAYS something the kind did not. A panel's
             # rows are labelled with the seat, so each persona gets its own line (the
@@ -970,9 +1016,19 @@ def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
     applies: the stamp arrived WITH the modelUsage fix, so a row that predates it was
     read by the parser that missed subagents. A row with no envelope at all is skipped
     — no reading was taken, so there is none to be old.
+
+    AN OBSERVABILITY ROW IS SKIPPED FOR THAT SAME REASON, envelope or not (§10 of
+    docs/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
+    its `wall_ms`-and-zeros envelope carries no reading that could be old, and counting it
+    as version 1 would make every bill holding one disclose an under-reading that is not
+    there.
     """
+    from . import agent_usage
+
     versions: set[int] = set()
     for row in rows:
+        if agent_usage.is_observability(row.get("kind") or ""):
+            continue
         envelope = db.from_json(row.get("usage_json"), {}) or {}
         if envelope:
             versions.add(envelope.get("usage_v") or 1)

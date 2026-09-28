@@ -109,7 +109,8 @@ def test_a_seat_that_could_not_authenticate_abstains_and_carries_it(monkeypatch,
     down a panel the other three answered. That call belongs to `decide`."""
     monkeypatch.setattr(claude_cli, "run_headless_result",
                         lambda *a, **k: (_ for _ in ()).throw(auth_error()))
-    op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path)
+    op = seats._run_seat("tester", "p", "s", "sonnet", 10, tmp_path,
+                         kind="validation_seat")
 
     assert (op.status, op.replied) == ("abstained", False)
     assert op.auth is not None and AUTH in op.auth.message
