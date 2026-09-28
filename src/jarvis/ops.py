@@ -2732,9 +2732,14 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     if newest["kind"] == "automerge_held":
         latest = store.latest_validation_round(wo_id=wo["id"])
         if why := _automerge_hold_is_stale(wo, latest, newest):
-            newest = {**newest, "stale": True, "stale_because": why,
+            newest = {**newest, "stale_because": why,
                       "stale_status": str(wo.get("status") or ""),
                       "stale_round": int((latest or {}).get("round") or 0)}
+            # `rejudging` REWORDS ONLY and never sets `stale`: `force_validation_state`
+            # blanks its diagnosis on that key, and the `HELD_SHA_MOVED` population it
+            # exists for is the one sitting in `validating` (2026-09-27 spec §1, §3).
+            if why != "rejudging":
+                newest["stale"] = True
     return {**newest, "line": _automerge_line(newest)}
 
 
@@ -2881,6 +2886,11 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
                              payload: dict[str, Any]) -> str:
     """WHY this `automerge_held` event is no longer a claim about now — `""` when it is.
 
+    THREE ANSWERS: `"status"`, `"round"` and `"rejudging"` — the last for an order in
+    `validating`, where the user's follow-up to the spec forbids the present tense: the
+    panel is judging it again, so the hold it superseded is history, never the current
+    state (#786, #813). `"rejudging"` changes only the SENTENCE; see `automerge_state`.
+
     docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
     merging.md §1. Beside `_panel_hold_is_stale` so the two freshness rules sit in one
     place and one reader can see they agree: both are a present-tense claim derived from
@@ -2908,7 +2918,7 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
     if status not in _HOLD_REFRESHABLE_STATUSES:
         return "status"
     if status != "waiting_pr_merge":
-        return ""
+        return "rejudging"
     held_round = int(payload.get("round") or 0)
     if held_round and held_round < int((latest_round or {}).get("round") or 0):
         return "round"
@@ -3438,6 +3448,13 @@ def _automerge_line(state: dict[str, Any]) -> str:
     if state.get("stale_because") == "round":
         return (f"round {state.get('round')}'s hold is out of date — round "
                 f"{state.get('stale_round')} is the current round")
+    # THIS ONE DOES QUOTE THE REASON: past tense beside "was held" it is the history the
+    # user asked for, not a claim about now (2026-09-27 spec §5, third sentence).
+    if state.get("stale_because") == "rejudging":
+        reason = state.get("reason") or "no reason recorded"
+        if round_n := int(state.get("stale_round") or 0):
+            return f"re-judging in round {round_n} (was held: {reason})"
+        return f"re-judging (was held: {reason})"
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 

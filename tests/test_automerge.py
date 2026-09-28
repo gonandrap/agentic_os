@@ -1847,7 +1847,52 @@ def test_a_round_running_on_the_moved_head_is_not_a_stale_hold(started, project,
     row = store.get_work_order(wo["id"])
     state = ops.automerge_state(store, row)
 
-    assert "stale" not in state and state["line"].startswith("held — ")
+    # Not stale, so the payload still feeds the control — but not live either: the line is
+    # the history sentence, per the user's follow-up.
+    assert "stale" not in state and state["line"].startswith("re-judging in round ")
     diagnosis = ops.force_validation_state(store, row, project="proj_a",
                                            held=state)["diagnosis"]
     assert JUDGED[:10] in diagnosis and PUSHED[:10] in diagnosis
+
+
+def test_a_hold_on_an_order_being_re_judged_reads_as_history_not_as_now(started, project):
+    """The user's follow-up to this spec: while a round runs, the hold it superseded is
+    history. `held — <reason>` in the present tense says the order is stopped on that
+    reason when the answer is that the panel is judging it again (#786, #813)."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["line"] == f"re-judging in round {running} (was held: the head moved)"
+    assert "held — " not in state["line"]
+    assert state["stale_because"] == "rejudging"
+    assert "stale" not in state
+
+
+def test_a_re_judging_hold_still_feeds_the_re_judge_control(started, project, monkeypatch):
+    """The marking must stay OFF `stale`: `force_validation_state` blanks its diagnosis on
+    that key, and the `sha_moved` population it exists for is exactly the one sitting in
+    `validating`."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    def control():
+        row = store.get_work_order(wo["id"])
+        return ops.force_validation_state(store, row, project="proj_a",
+                                          held=ops.automerge_state(store, row))
+
+    parked = control()
+    open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    rejudging = control()
+
+    assert JUDGED[:10] in rejudging["diagnosis"] and PUSHED[:10] in rejudging["diagnosis"]
+    assert rejudging["diagnosis"] == parked["diagnosis"]
+    # `can_force` moves for the STATUS rule and not for the marking: `validating` is not
+    # forceable, and that is the same sentence any validating order gets.
+    assert rejudging["can_force"] is False and "is validating" in rejudging["refusal"]

@@ -53,8 +53,8 @@ key.
 
 New pure helper in src/jarvis/ops.py, directly beside `_panel_hold_is_stale`
 (src/jarvis/ops.py:2848) so the two freshness rules sit in one place and one reader can
-see they agree. Returns the reason it is stale (`"status"` / `"round"`) or `""`. Two
-checks, in this order:
+see they agree. Returns the reason it is stale (`"status"` / `"round"` / `"rejudging"`) or
+`""`. Two checks, in this order:
 
 **BOTH CHECKS ARE GATED ON THE STATUSES A FRESH HOLD CAN STILL ARRIVE IN**, and an order in
 one of them is never judged because the next tick judges it instead:
@@ -71,6 +71,14 @@ every such hold is stale at birth and §3 blanks the re-judge diagnosis for the 
 population it was written for. In `validating` the round machine owns the row and the poll
 rewrites the hold within a tick of it settling, so the round check is skipped there too: the
 running round IS the answer to "why has this not merged".
+
+**`validating` YIELDS `"rejudging"`, NOT SILENCE** — the user's follow-up to this spec:
+"While validating, don't show the old hold as live. Render it as history. A stale hold must
+never read as the current state (#786, #813)." Returning `""` there left `_automerge_line`
+falling through to `held — <reason>`, so an order being re-judged printed the superseded
+hold in the present tense — exactly what §5's other two sentences exist to stop. The third
+answer changes the SENTENCE only: §2 does not set `stale` for it, so §3's control keeps the
+diagnosis this gate was written to protect.
 
 (a) `wo["status"]` is outside `_HOLD_REFRESHABLE_STATUSES` — where `Daemon.auto_merge`
     returns before `decide`, so the check is the same condition that stopped a newer hold
@@ -98,8 +106,15 @@ only when `newest["kind"] == "automerge_held"`:
 
 ```python
 if (why := _automerge_hold_is_stale(wo, ..., newest)):
-    newest = {**newest, "stale": True, "stale_because": why}
+    newest = {**newest, "stale_because": why, "stale_status": ..., "stale_round": ...}
+    if why != "rejudging":
+        newest["stale"] = True
 ```
+
+**`"rejudging"` IS MARKED BUT NOT `stale`**, and that asymmetry is load-bearing: §3 blanks
+the re-judge diagnosis on `stale`, and the `HELD_SHA_MOVED` population that control exists
+for is precisely the one sitting in `validating`. It gets the same `stale_status` /
+`stale_round` fields, because §5's third sentence needs the round number.
 
 `kind`, `code`, `judged_sha`, `head_sha` and `round` all stay in the dict; only `line`
 changes (via `_automerge_line`, which reads the marker). Dropping the event or changing
@@ -145,7 +160,7 @@ above. `_hold_is_news` compares against the newest hold **for the same `key[0]`*
 changed state, not one per two-minute tick — is preserved: `decide` is deterministic given
 state, and the round only changes when a round opens.
 
-### 5. Wording of the two replacement lines
+### 5. Wording of the three replacement lines
 
 In `_automerge_line` (src/jarvis/ops.py:3322-3337), before the final `held — …` return.
 House voice there: lowercase fragment, no full stop, em dash separating the fact from its
@@ -163,8 +178,17 @@ detail, and the verb says who acted.
   claim about the *hold*, never about the merge. Nothing in it can be read as "held".
   Marker carries `"stale_round": <current>` so the line needs no store.
 
-Neither sentence reuses the stored `reason`. A stale reason quoted even in the past tense
-is what sent wo-659be188's reader to a passed CI run.
+* `stale_because == "rejudging"`:
+  `f"re-judging in round {stale_round} (was held: {reason})"`, and
+  `f"re-judging (was held: {reason})"` when the round is 0 or missing. The user's
+  follow-up: history, not a live claim. `no reason recorded` when the payload carries none,
+  reusing the fallthrough's wording.
+
+Neither of the FIRST TWO sentences reuses the stored `reason`. A stale reason quoted in the
+present tense is what sent wo-659be188's reader to a passed CI run. The third one does
+quote it, and that is the point of it: beside `was held`, in the past tense, with the
+current round named first, the reason is history the reader can place — not a claim about
+why the pull request has not merged.
 
 ### 6. Sibling in scope: autoreview's `HELD_STATUS`
 
