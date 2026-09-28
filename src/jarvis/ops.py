@@ -3043,6 +3043,55 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     return {**newest, "line": _autoreview_line(newest)}
 
 
+def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The decision this work order owes the user, and what each button would do — or None.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2.
+
+    None on every order that owes nothing, on `automerge_state`'s never-always rule: no key
+    in `jarvis wo show`, no control on the page.
+
+    `placement` IS THE MUTUAL EXCLUSION, computed here and once. An order can be escalated
+    AND hold a pending assumption (reachable since issue 212, `invariants.py:828-836`), and
+    POST `/wo/…/review` decides the WHOLE order either way, so two template conditions
+    would render two differently-labelled controls doing the same thing — Neo 838.
+
+    The sentences are here rather than in the template because both surfaces print them
+    (`cli._readable_autoreview`'s rule): a phrase in Jinja could not reach a terminal.
+
+    A PENDING ASSUMPTION IS OWED WHATEVER THE STATUS (§2): the early pass records them
+    while the worker still runs, and the page has carried the form there since before this
+    projection existed
+    (tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending). The
+    `needs_review` check gates the ESCALATED half only, because a later submission can move
+    the status on past an older escalated round.
+    """
+    from .invariants import validation_escalated
+
+    pending = len(store.pending_assumptions(wo["id"]))
+    escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
+    if not pending and not escalated:
+        return None
+    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
+    accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
+        " the work order" + (" over the panel's objection" if escalated else "")
+    reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
+        " the worker, with your reason as the guidance it is sent back with"
+    return {
+        "pending": pending,
+        "escalated": escalated,
+        "round": int(latest["round"]) if latest else None,
+        "placement": "assumptions" if pending else "validation",
+        "scope": "One decision, and it settles the whole order — every pending "
+                 "assumption and the order itself, in a single call",
+        "accept": accept + ".",
+        "reject": reject + ".",
+        "strands": "Rejecting with no reason leaves the work order flagged and the "
+                   "worker unguided.",
+    }
+
+
 def assumption_decider(a: dict[str, Any]) -> str:
     """WHO decided this assumption, in words, for whoever is about to read the verdict.
 
