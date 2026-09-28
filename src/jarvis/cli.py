@@ -1835,7 +1835,7 @@ def _mins(seconds: float) -> str:
 #: the percentages stop summing to 100, which is worse than the bug it would hide.
 PART_LABELS = {"generating": "generating", "blocked": "blocked on a subagent",
                "tools": "running tools", "idle": "between turns, nothing running",
-               "unaccounted": "unaccounted — no API call was ever made"}
+               "unaccounted": "unaccounted — no API response has completed"}
 
 #: The same buckets on the per-TURN line, where a full label does not fit. Same keys,
 #: same order, same pin.
@@ -1855,6 +1855,14 @@ BAR_WIDTH = 20
 #: the split below it stays a column, and stated rather than left to be inferred from
 #: `0 calls`: the inference is what four layers got wrong (issue 227).
 NO_CALL_FLAG = "NO API CALL"
+
+#: The same column when a request is IN FLIGHT — spec of 2026-09-27 §1. Printed instead
+#: of `NO_CALL_FLAG`, never beside it: the absence of a completed block is not the
+#: absence of a call.
+AWAITING_FLAG = "AWAITING MODEL"
+
+#: One width for both, so the split after the flag stays a column either way.
+FLAG_WIDTH = max(len(NO_CALL_FLAG), len(AWAITING_FLAG))
 
 
 def _print_partition(unit: dict[str, Any]) -> None:
@@ -1957,6 +1965,8 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
     the three lists that explain the two expensive slices — what the blocked time was
     waiting for, what the tokens were re-sent for, and what the tool time was doing.
     """
+    from . import inspection
+
     head = f"{unit['wo_id']} — {unit['title']}"
     print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
     if not unit["found"]:
@@ -1984,12 +1994,18 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
         reasons = ", ".join(t["kind"] for t in turn["triggers"]) or "no prompt recorded"
         s = turn["share"]
         split = "  ".join(f"{PART_SHORT[k]} {s[k] * 100:>3.0f}%" for k in PART_SHORT)
-        flag = "" if turn["observed"] else NO_CALL_FLAG
+        flag = AWAITING_FLAG if turn.get("awaiting") else (
+            "" if turn["observed"] else NO_CALL_FLAG)
         # The bar is drawn FROM `share` and the percentages are printed from the same
         # dict, so the picture cannot disagree with the numbers. Both, not either: the
         # bar is read at a glance and the numbers are what get quoted.
-        print(f"  turn {turn['seq']:>2}  {_mins(turn['wall']):>7}  "
-              f"{flag:<{len(NO_CALL_FLAG)}}  {_bar(s)}  {split}  "
+        # Spec 2026-09-27 §3: the OS's own number, and part 2+ of one OS turn says so.
+        label = (f"turn {turn['seq']:>2}" if turn["seq"]
+                 else inspection.turn_name(turn["seq"]))
+        if turn.get("part", 1) > 1:
+            label += " (continued)"
+        print(f"  {label}  {_mins(turn['wall']):>7}  "
+              f"{flag:<{FLAG_WIDTH}}  {_bar(s)}  {split}  "
               f"{turn['api_calls']:>3} calls  peak {_tok(turn['context_peak']):>5}  "
               f"{reasons}")
         # The second clock only where the two differ, on its own line and naming the
@@ -2011,6 +2027,11 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
                 _print_subagent(sub, "           ")
         if params:
             _print_params(turn, unit["param_caps"])
+
+    for seq in unit.get("unmatched_os_turns") or []:
+        # Reported, never dropped (spec 2026-09-27 §3): the OS minted that turn.
+        print(f"\n  turn {seq} left no prompt row in the transcript (compaction "
+              f"rewrites it; its triggers are on turn {seq + 1})")
 
     if unit["unattached_subagents"]:
         # No timestamp fallback upstream, so these are reported rather than given a
