@@ -331,9 +331,15 @@ because what the OS believed and when is evidence.
 Mirror `add_gate_rule` / `gate_rules` / `retract_gate_rule` / `record_gate_rule_hit`, retraction
 semantics included: `add_detector`, `get_detector`, `list_detectors(*, project="", gap_class="",
 status="", include_retired=False)`, `add_remedy_rule`, `remedy_rules_for(detector_id)`,
-`arm_detector(id, *, by, reason)`, `retract_detector(id, reason)`, `retract_remedy_rule(id,
-reason)`, `record_rule_fire(...)`, `close_rule_fire(...)`, `record_false_positive(fire_id,
-reason)`, `detectors_for_gap(gap_class, project="")`, `list_rule_fires(...)`.
+`retract_detector(id, reason)`, `retract_remedy_rule(id, reason)`, `record_rule_fire(...)`,
+`close_rule_fire(...)`, `detectors_for_gap(gap_class, project="")`, `list_rule_fires(...)`.
+
+**`arm_detector` and `record_false_positive` are NOT in that list, and their absence is
+deliberate.** They ship in §6 with the bridge, for the reason §6 gives: a verb that lets a person
+say "this rule may act" is half a review unless the reviewed path it acts through lands in the
+same diff. The `armed_at` / `armed_by` / `armed_reason` / `false_positives` COLUMNS ship here —
+§9 reads them and a later child must not buy a migration — but nothing here writes them.
+(Neo, question 882.)
 
 **One more public function, and it is a CONTRACT with a caller that does not exist yet.**
 `rules.resolve(detectors, remedy_rules, facts) -> tuple[Resolution, ...]` — given one order's
@@ -363,10 +369,14 @@ Its own top-level CLI family, **`jarvis rules`**:
 ```
 jarvis rules list [--project p] [--status dry_run|armed|retracted] [--gap-class c]
 jarvis rules show <dt-id>
-jarvis rules arm <dt-id> --reason "…"           # required
 jarvis rules retract <dt-id|rm-id> --reason "…" # required; never deletes
 jarvis rules dry-run <dt-id> [<order-id>]       # evaluate now, print, WRITE NOTHING
 ```
+
+Two more verbs belong to this family and are **not** built here — `jarvis rules arm <dt-id>
+--reason` and `jarvis rules false-positive <fire-id> --reason`, both in §6 with the bridge. So
+§3's `jarvis rules --help` lists four verbs, and a reader of this section should not expect to be
+able to arm anything with what it ships.
 
 Not folded into `jarvis gate rules`: that family answers "what counts as privileged", and one
 verb meaning two registries is how `jarvis gate rules` stops being readable. The collision is
@@ -494,6 +504,11 @@ does not run at all, not "runs in dry run", and `jarvis rules list` says so):
    increments `hits`. **In `dry_run` nothing else happens: no alarm, no message, no flag, no
    gate request, no event on the order's timeline.** A dry run is invisible to the work order on
    purpose and appears only on §9's view.
+
+   **AND THIS SECTION TREATS AN `armed` DETECTOR THE SAME WAY.** Nothing here branches on
+   `status`: an armed row reaching this pass before §6 lands is recorded and nothing more, so
+   the order in which the two merge cannot make anything act. §6 adds the branch; until it does,
+   `armed` is a label §9 can read and this pass ignores. (Neo, question 882.)
 5. A detector with an open fire whose condition no longer holds has that fire CLOSED, with
    `cleared_at`, `cleared_seconds` and `detectors.last_cleared`.
 6. A detector that raises, or whose snapshot cannot be built, is caught PER DETECTOR, recorded
