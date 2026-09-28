@@ -132,6 +132,24 @@ def _readable_issues(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_spec(detail: dict[str, Any]) -> dict[str, Any]:
+    """The spec link as one line, for HUMAN output — §6 of
+    docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md.
+
+    Names the document, its revision and THE COMMAND that prints it — never a URL: the
+    CLI does not know the dashboard's host, and `jarvis search` already sets the
+    precedent of printing the command that shows a record. `--json` keeps the dict.
+    """
+    row = dict(detail)
+    link = row.pop("spec", None)
+    if not link:
+        return row
+    revision = link.get("source") or "the revision this text came from was not recorded"
+    row["spec"] = (f"{link['repo_path']} — {revision} · "
+                   f"jarvis fo spec {link['fo_id']}")
+    return row
+
+
 def _finding_lines(opinion: dict[str, Any], filed: dict[str, Any]) -> list[str]:
     """One seat's findings, classified, above its raw reply.
 
@@ -213,6 +231,27 @@ def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
         row["assumptions"] = [
             ops.assumption_line(a) + (pointer if held_pending(a) else "")
             for a in rows]
+    return row
+
+
+def _readable_review(detail: dict[str, Any]) -> dict[str, Any]:
+    """The decision this order owes, collapsed to its lines, for HUMAN output.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §4.
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the dict because
+    other tooling reads the counts, while a person gets the same sentences the dashboard's
+    buttons carry — written once, in `ops`, so the two surfaces cannot word one decision
+    differently.
+    """
+    row = dict(detail)
+    state = row.pop("review", None)
+    if state:
+        owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
+        where = (f"round {state['round']} gave up" if state["escalated"]
+                 else f"{state['pending']} {owed}")
+        row["review"] = [f"owed: {where} — {state['scope']}.",
+                         f"accept: {state['accept']}",
+                         f"reject: {state['reject']} {state['strands']}"]
     return row
 
 
@@ -809,6 +848,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     f = fo.add_parser("agent", help="rebuild this feature's agent type from its spec")
     f.add_argument("fo_id")
+    f.add_argument("--project")
+
+    f = fo.add_parser("spec", help="print the design document this feature holds — the "
+                                   "snapshot every reviewer and every child was given, "
+                                   "which exists before any pull request does")
+    f.add_argument("fo_id")
+    f.add_argument("--section", default="",
+                   help="one section only, by number or by heading substring — the same "
+                        "reference a child's brief names")
     f.add_argument("--project")
 
     f = fo.add_parser("resume", help="put a FAILED feature order back to work — the way "
@@ -2552,7 +2600,7 @@ def _print_context(res: dict[str, Any]) -> None:
 
 
 def cmd_wo(args: argparse.Namespace) -> int:
-    from . import invariants, ops
+    from . import invariants, ops, specs
     from .project_store import OPEN_STATUSES, ProjectStore
     from .timeline import build_conversation, build_timeline
 
@@ -2698,6 +2746,17 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # a work order whose assumptions the OS never looked at has no line here.
                 **({"auto_review": review}
                    if (review := ops.autoreview_state(store, wo)) else {}),
+                # THE DECISION THIS ORDER OWES THE USER, worded exactly as the dashboard's
+                # buttons word it. Same never-always rule: absent when nothing is owed —
+                # spec 2026-09-27-a-review-control-for-an-escalated-round §4.
+                **({"review": owed}
+                   if (owed := ops.review_state(store, wo)) else {}),
+                # WHERE THE SPEC CAN BE READ — the feature's document, its revision and
+                # the anchor this order's section resolves to. Same never-always rule:
+                # absent for a standalone work order, which has no feature and no plan.
+                # This is what a planner gets INSTEAD of the bare `spec_section` column
+                # `**wo` smuggles in, which is NULL for it (spec §6).
+                **({"spec": link} if (link := specs.spec_link(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
@@ -2716,9 +2775,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
         finally:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
-        _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_time_in_state(_readable_rounds(_readable_issues(
-                _readable_conversation(detail))))))))
+        _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
+            _readable_automerge(_readable_alarms(_readable_time_in_state(
+                _readable_rounds(_readable_issues(
+                    _readable_conversation(detail))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2988,6 +3048,19 @@ def cmd_fo(args: argparse.Namespace) -> int:
 
     elif args.fo_cmd == "agent":
         _print(ops.rebuild_feature_agent(args.fo_id, args.project), args.json)
+
+    elif args.fo_cmd == "spec":
+        res = ops.feature_spec(args.fo_id, args.project,
+                               section=args.section or None)
+        if args.json:
+            _print(res, True)
+        else:
+            # One header line — the document and the revision it came from — then the
+            # markdown raw. The HTML renderer serves the page, never the terminal (§7).
+            head = res["repo_path"]
+            print(f"{head} — {res['source']}" if res["source"] else
+                  f"{head} — the revision this text came from was not recorded")
+            print(res["content"])
 
     elif args.fo_cmd == "resume":
         out = ops.resume_feature_order(args.fo_id, fix=args.fix,

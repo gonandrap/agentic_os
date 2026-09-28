@@ -3,6 +3,7 @@
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
 {% import "_states.html" as states_ui %}
+{% import "_review.html" as review_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -10,7 +11,9 @@
 {% set o = origin_meta.get(wo.origin, {'word': wo.origin, 'framework': false}) %}
 {# #pending is the deep-link target used by notifications: it lands on whatever
    is actually waiting on the user, falling back to the reply box. #}
-{% set pending = 'assumptions' if unreviewed else ('attention' if wo.needs_attention else 'reply') %}
+{# `review.placement`, never `unreviewed` — spec
+   docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §7. #}
+{% set pending = review.placement if review else ('attention' if wo.needs_attention else 'reply') %}
 
 <h2><a href="/project/{{ project }}">{{ project }}</a> / <span class="mono">{{ wo.id }}</span></h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -101,10 +104,18 @@
      it is NAMED here rather than inlined: repeating it under every order is exactly the
      duplication the spec-driven change removed. See
      docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md §4. #}
+  {% set spec_href = '/spec/' ~ project ~ '/' ~ spec_link.fo_id ~ ('#' ~ spec_link.anchor if spec_link and spec_link.anchor else '') if spec_link %}
   {% if spec and spec.section %}
   <p class="kv">📄 <strong>Spec section {{ spec.section }}</strong>
-    of <span class="mono">{{ spec.repo_path }}</span> — that section is what this order
-    builds; the brief above is the boundary around it.</p>
+    of <a class="mono" href="{{ spec_href }}">{{ spec.repo_path }}</a> — that section is
+    what this order builds; the brief above is the boundary around it.</p>
+  {% elif spec_link %}
+  {# The planner's case, which had nothing at all: `specs.spec_of` answers None for a
+     planner by design, so this is the second, narrow projection beside it — §5(a) of
+     docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. #}
+  <p class="kv">📄 <strong>The spec this feature is built from</strong>:
+    <a class="mono" href="{{ spec_href }}">{{ spec_link.repo_path }}</a>
+    {% if spec_link.source %}<span class="mono">— {{ spec_link.source }}</span>{% endif %}</p>
   {% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago
@@ -308,18 +319,10 @@
     {% endif %}
     <span class="sub mono">{{ fmt_age(a.ts) }} ago</span></div>
   {% endfor %}
-  {% if unreviewed %}
-  <div class="row">
-    <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
-          style="flex:1; display:flex; gap:8px; align-items:center">
-      <input type="text" name="feedback" style="flex:1"
-             placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
-      <button name="decision" value="accept" class="accept">Accept all</button>
-      <button name="decision" value="reject" class="danger">Reject all</button>
-    </form>
-  </div>
-  <div class="row"><span class="sub">Rejecting without a reason keeps the work order
-    flagged — send guidance below.</span></div>
+  {# ONE renderer, and `review.placement` alone decides which of its two call sites runs —
+     spec 2026-09-27-a-review-control-for-an-escalated-round §3. #}
+  {% if review and review.placement == 'assumptions' %}
+  {{ review_ui.review_form(project, wo, review) }}
   {% endif %}
 </div>
 {% endif %}
@@ -406,6 +409,17 @@
 {# Outside the tabs with the gates and the assumptions: a round that was rejected or
    escalated is the page asking something of the reader — §6. #}
 {{ validation_ui.section(validation) }}
+
+{# THE CALL IS HERE AND NOT INSIDE `section()`: that macro is shared with
+   `feature_order.html`, which has no `review_work_order` to post to — spec §5. Rendered
+   only when no assumption is pending, which is where the other call site puts it. #}
+{% if review and review.placement == 'validation' %}
+<h2{% if pending == 'validation' %} id="pending"{% endif %}>Round {{ review.round }} gave
+  up — your judgement <a href="#round-{{ review.round }}">round {{ review.round }} →</a></h2>
+<div class="panel">
+  {{ review_ui.review_form(project, wo, review) }}
+</div>
+{% endif %}
 
 {# Below the rounds, because it is what came OUT of them — and once for the whole order
    rather than once per round, which is the thing the per-round fragment could not be. #}

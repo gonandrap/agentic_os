@@ -6,6 +6,7 @@ notification inbox, the backlog (with dependencies), and the knowledge base.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +14,19 @@ from typing import Any, Sequence
 
 from . import db
 from .paths import central_db_path, ensure_home
+
+#: How old a base-health reading may be before the merge pause stops acting on it — ~7
+#: PR-poll intervals. A `gh` that stops answering must not pause the fleet's merges for
+#: ever on a fact nobody can confirm, and 900s is several polls, so one transient failure
+#: does not resume merging onto a red default branch either (spec
+#: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2).
+BASE_HEALTH_FRESH_SECONDS = 900
+
+
+def base_health_key(project: str) -> str:
+    """The `os_state` key holding one project's default-branch health."""
+    return f"base_health:{project}"
+
 
 # Tag marking knowledge mirrored out of a Claude Code memory file rather than typed
 # by a worker via `jarvis learn add`.
@@ -1356,3 +1370,27 @@ class CentralStore:
     def get_state(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM os_state WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+    def set_base_health(self, project: str, fact: dict[str, Any]) -> None:
+        """Record whether this project's default branch is red. One JSON row per project.
+
+        Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2:
+        the fact is fleet-shaped, so it belongs beside `daemon_pid` in `os_state` rather
+        than in a per-project table that cannot hold a fleet-shaped key.
+        """
+        self.set_state(base_health_key(project), json.dumps(fact))
+
+    def base_health(self, project: str) -> dict[str, Any]:
+        """The stored reading, or `{}` for "never read" — which is neither red nor green.
+
+        `{}` on unreadable JSON too: a fact that cannot be parsed is one the OS does not
+        hold, and rendering it as green is the one direction that must never happen.
+        """
+        raw = self.get_state(base_health_key(project))
+        if not raw:
+            return {}
+        try:
+            fact = json.loads(raw)
+        except ValueError:
+            return {}
+        return fact if isinstance(fact, dict) else {}

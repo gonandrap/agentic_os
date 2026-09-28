@@ -3043,6 +3043,55 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     return {**newest, "line": _autoreview_line(newest)}
 
 
+def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The decision this work order owes the user, and what each button would do — or None.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2.
+
+    None on every order that owes nothing, on `automerge_state`'s never-always rule: no key
+    in `jarvis wo show`, no control on the page.
+
+    `placement` IS THE MUTUAL EXCLUSION, computed here and once. An order can be escalated
+    AND hold a pending assumption (reachable since issue 212, `invariants.py:828-836`), and
+    POST `/wo/…/review` decides the WHOLE order either way, so two template conditions
+    would render two differently-labelled controls doing the same thing — Neo 838.
+
+    The sentences are here rather than in the template because both surfaces print them
+    (`cli._readable_autoreview`'s rule): a phrase in Jinja could not reach a terminal.
+
+    A PENDING ASSUMPTION IS OWED WHATEVER THE STATUS (§2): the early pass records them
+    while the worker still runs, and the page has carried the form there since before this
+    projection existed
+    (tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending). The
+    `needs_review` check gates the ESCALATED half only, because a later submission can move
+    the status on past an older escalated round.
+    """
+    from .invariants import validation_escalated
+
+    pending = len(store.pending_assumptions(wo["id"]))
+    escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
+    if not pending and not escalated:
+        return None
+    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
+    accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
+        " the work order" + (" over the panel's objection" if escalated else "")
+    reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
+        " the worker, with your reason as the guidance it is sent back with"
+    return {
+        "pending": pending,
+        "escalated": escalated,
+        "round": int(latest["round"]) if latest else None,
+        "placement": "assumptions" if pending else "validation",
+        "scope": "One decision, and it settles the whole order — every pending "
+                 "assumption and the order itself, in a single call",
+        "accept": accept + ".",
+        "reject": reject + ".",
+        "strands": "Rejecting with no reason leaves the work order flagged and the "
+                   "worker unguided.",
+    }
+
+
 def assumption_decider(a: dict[str, Any]) -> str:
     """WHO decided this assumption, in words, for whoever is about to read the verdict.
 
@@ -7235,7 +7284,12 @@ def submit_plan(fo_id: str, doc: Any,
             f"committed text, never your working tree. Commit it and resubmit:\n"
             f"  git add {plan['design_doc']} && git commit -m \"spec: …\""
         )
-    plan["design_doc_content"], source = found
+    # THE REVISION, PERSISTED IN THE SAME STATEMENT AS THE TEXT, so the two can never
+    # disagree — §4 of
+    # docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The spec page
+    # prints it verbatim and a plan that predates this key says so rather than guessing.
+    plan["design_doc_content"], plan["design_doc_source"] = found
+    source = plan["design_doc_source"]
     spec_problems = plans.spec_problems(plan, plan["design_doc_content"])
     if spec_problems:
         raise OpsError(
@@ -7385,7 +7439,7 @@ def refresh_plan_spec(fo_id: str,
                     project_name=name)
         return {**out, "reason": "rejected", "problems": problems}
 
-    plan["design_doc_content"] = text
+    plan["design_doc_content"], plan["design_doc_source"] = text, source
     planner_id = fo.get("plan_wo_id") or fo_id
     q2 = _ask_plan_review(name, fo, plan, planner_id, source,
                           why=f"the spec was revised on {source}")
@@ -7506,6 +7560,47 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
             )
         except OpsError as e:
             out["delivery_error"] = str(e)
+    return out
+
+
+def feature_spec(fo_id: str, project_name: str | None = None,
+                 section: str | None = None) -> dict[str, Any]:
+    """The document the OS HOLDS for this feature — `jarvis fo spec`.
+
+    §7 of docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The snapshot,
+    never the file on disk: the planner's branch is the only place the text exists before
+    a pull request, and the snapshot is what every reviewer and every child was given.
+
+    `content` is the whole document, or with `section` the extracted section alone. The
+    terminal gets MARKDOWN — `ui.markdown` serves the page and nothing else.
+    """
+    from . import sections
+    from .ui import markdown
+
+    name, _path, fo = find_feature_order(fo_id, project_name)
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    content = str(plan.get("design_doc_content") or "")
+    repo_path = str(plan.get("design_doc") or "")
+    if not (content and repo_path):
+        raise OpsError(
+            f"{fo_id} is {fo['status']} and holds no spec — a feature's document is "
+            f"snapshotted when its planner submits a plan"
+        )
+    out = {"project": name, "fo_id": fo_id, "repo_path": repo_path,
+           "source": str(plan.get("design_doc_source") or ""), "content": content}
+    if section:
+        text = sections.extract_section(content, section)
+        if text is None:
+            # The same courtesy `plans.spec_problems` gives a planner: name what exists
+            # rather than leaving the reader to guess at the heading.
+            names = [t for t, _s in markdown.anchors(content)]
+            headings = ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
+            raise OpsError(
+                f"{section!r} matches no section of {repo_path}. It carries: "
+                f"{headings or 'no headings at all'}"
+            )
+        out["section"] = section
+        out["content"] = text
     return out
 
 
