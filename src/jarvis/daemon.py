@@ -65,6 +65,7 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
@@ -1911,9 +1912,20 @@ class Daemon:
             # would send it to the user for being numbered 5 (spec
             # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
             # `rebinds` counts the round being settled, so `<` means "another one left".
+            #
+            # `pos` is the ORDINARY arm's budget position, and it is not `n` either: a
+            # rebind spends a row number without spending budget, so after one the rows
+            # run ahead of the budget and routing on `n` would escalate a submission
+            # with a round still in hand (and tell it "round 3 of 3"). Same counter
+            # `ops.rejudge_moved_head` budgets off — the round being settled is still
+            # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
+            # is this `+ 1`.
             uncounted = bool(round_row["uncounted"])
             rebinds = store.uncounted_validation_rounds(wo_id=wo_id) if uncounted else 0
-            goes_back = (rebinds < ops.REBIND_MAX) if uncounted else (n < max_rounds)
+            pos = store.counted_validation_rounds(wo_id=wo_id) + (
+                0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
+                else 1)
+            goes_back = (rebinds < ops.REBIND_MAX) if uncounted else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2094,10 +2106,10 @@ class Daemon:
                 # docstring or a missing test costs nothing in a session that is going
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
-                             note=ops.follow_up_feedback(follow_ups),
+                             note=ops.follow_up_feedback(follow_ups), budget_round=pos,
                              rebind=(rebinds, ops.REBIND_MAX) if uncounted else None)
                 log.info("[%s] %s rejected in round %d of %d",
-                         project.name, wo_id, n, max_rounds)
+                         project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
                 # ask for a resubmission there is no round left to judge — and the loop
@@ -2192,7 +2204,7 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str, *, note: str = "",
+                reason: str, *, note: str = "", budget_round: int | None = None,
                 rebind: tuple[int, int] | None = None) -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
@@ -2210,20 +2222,31 @@ class Daemon:
         `rebind` is `(used, ops.REBIND_MAX)` and swaps the wording for `REBIND_FEEDBACK`:
         the round was not charged to the submitter, so it may not be told it was (spec
         2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+
+        `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
+        its row number, and it is what the ordinary feedback names — a submitter told
+        "round 3 of 3" on its second charged round would ration itself out of a round it
+        still has (same spec §4.4).
+
+        `"round"` in the event stays the ROW NUMBER: `holds.py` correlates it with
+        `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
+        open for ever. The position rides beside it as `budget_round`.
         """
         wo_id = wo["id"]
         store.close_validation_round(round_id, "rejected", reason)
         used, of = rebind or (0, max_rounds)
+        pos = n if budget_round is None else budget_round
         # `of` is the bound this round was actually held by, so no surface prints
         # "round 5 of 3" (spec 2026-09-27 §4.4).
-        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of}
+        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
+                                 "budget_round": pos}
         if rebind is not None:
             event["uncounted"] = True
         store.add_event(wo_id, "validation_rejected", event)
         text = (REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
                                        reason=reason + note, wo_id=wo_id)
                 if rebind is not None
-                else REVIEW_FEEDBACK.format(n=n, max=max_rounds, reason=reason + note,
+                else REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
                                             wo_id=wo_id))
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
@@ -5966,7 +5989,7 @@ class Daemon:
         waiting for it would defer the carry into exactly the window where a round gets
         spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
         """
-        from . import branchproof, ci, github, ops
+        from . import branchproof, ops
 
         judged = str(getattr(decision, "judged_sha", "") or "")
         head = str(getattr(decision, "head_sha", "") or "")
@@ -6006,28 +6029,24 @@ class Daemon:
             if not ops.rebind_possible(store, wo, head=head, project=project.name,
                                        cfg=project.validation):
                 return CarryOutcome(False, False)
-            try:
-                chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                            cwd=project.path)
-            except github.GitHubError as exc:
+            def unreadable(exc: Exception) -> CarryOutcome:
                 log.info("[%s] %s: GitHub would not say what %s merged (%s)",
                          project.name, wo["id"], head[:10], exc)
                 return CarryOutcome(False, False)
-            except Exception:  # noqa: BLE001 — a parked pull request stays parked
-                log.exception("[%s] could not read the chain behind %s", project.name,
-                              wo["id"])
-                return CarryOutcome(False, False)
+
+            chain, failed = self._merge_chain(project, wo, pr_url=pr_url, judged=judged,
+                                              head=head, base=base,
+                                              github_error=unreadable)
+            if failed is not None:
+                return failed
             return CarryOutcome(False, bool(chain))
-        try:
-            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                        cwd=project.path)
-        except github.GitHubError as exc:
-            return refuse(ops.PROOF_READ,
-                          f"GitHub would not say what {head[:10]} merged ({exc})")
-        except Exception:  # noqa: BLE001 — a parked pull request stays parked
-            log.exception("[%s] could not read the chain behind %s", project.name,
-                          wo["id"])
-            return CarryOutcome(False, False)
+        chain, failed = self._merge_chain(
+            project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
+            github_error=lambda exc: refuse(
+                ops.PROOF_READ,
+                f"GitHub would not say what {head[:10]} merged ({exc})"))
+        if failed is not None:
+            return failed
         if not chain:
             return refuse(ops.PROOF_CHAIN,
                           f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
@@ -6046,6 +6065,33 @@ class Daemon:
                  "%s, no round spent", project.name, wo["id"], carried["round"],
                  judged[:10], head[:10], len(chain), len(bases), base)
         return CarryOutcome(True, False)
+
+    @staticmethod
+    def _merge_chain(project: ProjectSpec, wo: dict, *, pr_url: str, judged: str,
+                     head: str, base: str,
+                     github_error: Callable[[Exception], CarryOutcome],
+                     ) -> tuple[tuple[tuple[str, str, bool], ...] | None,
+                                CarryOutcome | None]:
+        """Walk `ci.base_merge_chain`, or say why it could not be walked.
+
+        `(chain, None)` on success and `(None, outcome)` on failure — ONE copy of the
+        walk for `_carry_catch_up`'s two branches, which asked GitHub the same question
+        and differed only in what a `GitHubError` means. That is `github_error`'s job:
+        the rebind branch has already written its refusal and only logs, the main path
+        refuses with `ops.PROOF_READ`. Anything else is a parked pull request staying
+        parked, which is the same answer on both.
+        """
+        from . import ci, github
+
+        try:
+            return ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                       cwd=project.path), None
+        except github.GitHubError as exc:
+            return None, github_error(exc)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return None, CarryOutcome(False, False)
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:

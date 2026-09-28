@@ -1136,3 +1136,59 @@ def test_rebind_max_exhausted_goes_to_the_user(tmp_path, project, jarvis_home,
                                   project="proj_a", cfg=_cfg(wider),
                                   decision=_moved(third), rebind=True) is None
     assert rounds_of(store, wo) == before
+
+
+def test_an_ordinary_round_after_a_rebind_is_budgeted_by_position(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """§4.4. A rebind spends a row number and no budget, so every ordinary round after
+    one is judged a position late if the routing reads the row: one counted round plus a
+    passing rebind puts the next submission on row 3 while its budget position is 2, and
+    it would be escalated — and told "round 3 of 3" — with a round still in hand."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=1)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=True)
+    judge(fleet, store, Panel("passed"))                 # the rebind, row 2
+
+    assert ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                     declared="re-ran the suite after the merge",
+                                     cfg=_cfg(fleet)) is not None
+    assert int(store.latest_validation_round(wo_id=wo["id"])["round"]) == 3
+    judge(fleet, store, Panel("rejected"))
+
+    assert store.get_work_order(wo["id"])["status"] != "needs_review"
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_rejected")[-1]["payload"], {})
+    assert payload["round"] == 3 and payload["budget_round"] == 2
+    fleet.deliver_envelopes(fleet.catalog.project("proj_a"), store)
+    text = store.queued_messages(wo["id"])[-1]["content"]
+    assert "round 2 of 3" in text and "round 3 of 3" not in text
+
+
+def test_a_fix_after_a_rejected_rebind_is_itself_a_rebind(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """§4.4. The worker was sent back by a round nobody charged it for, so the round
+    that reads its fix may not be charged either: rebind 1 is the OS's re-judge of the
+    merge, rebind 2 is the fix, and a second rejection has spent `REBIND_MAX` and goes
+    to the user."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=1)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=True)
+    judge(fleet, store, Panel("rejected"))               # rebind 1, row 2
+    counted = store.counted_validation_rounds(wo_id=wo["id"])
+
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="fixed it", cfg=_cfg(fleet))
+    assert row is not None and int(row["uncounted"]) == 1
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == counted
+
+    judge(fleet, store, Panel("rejected"))               # rebind 2 — the last one
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == ops.REBIND_MAX
+    assert store.get_work_order(wo["id"])["status"] == "needs_review"

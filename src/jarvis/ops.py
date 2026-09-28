@@ -4102,6 +4102,10 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     counted ones: a rebind (`uncounted=True`, `rejudge_moved_head`'s) spends a number and
     no budget, and numbering off the budget would hand the next submission its row.
 
+    `uncounted` is also DERIVED when the caller did not ask for it: a submission whose
+    last settled round was a REJECTED rebind is the fix that rebind asked for, and is a
+    rebind too (§4.4, and the block below).
+
     `forced_reason` is `force_validation`'s and nobody else's: it is stamped on the round
     and changes NOTHING about how the round is numbered, judged or settled. A forced
     round spends a number exactly like a submitted one, which is why the budget question
@@ -4134,6 +4138,16 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     from . import evidence as evidence_mod
     from . import specs
 
+    # A FIX ASKED FOR BY A REBIND IS ITSELF A REBIND (spec 2026-09-27-a-conflict-
+    # resolution-the-os-asked-for-costs-no-round §4.4). The worker was sent back by a
+    # round nobody charged it for, so charging it for the re-judge would take a round
+    # off a budget the rebind exists to protect. `REBIND_MAX` is what bounds the pair:
+    # rebind 1 is the OS's re-judge of its own merge, rebind 2 is the fix, and a second
+    # rejection has spent them both and routes to the user.
+    if not uncounted:
+        previous = store.last_judged_round(wo_id=str(wo["id"]))
+        uncounted = bool(previous is not None and int(previous["uncounted"] or 0)
+                         and str(previous["outcome"] or "") == "rejected")
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
         spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),

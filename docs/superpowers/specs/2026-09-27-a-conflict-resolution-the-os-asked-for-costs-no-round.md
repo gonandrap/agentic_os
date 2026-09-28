@@ -302,10 +302,20 @@ Replace the condition at daemon.py:2054 with a predicate that asks the right que
 ```
 uncounted = bool(round_row["uncounted"])
 rebinds = store.uncounted_validation_rounds(wo_id=wo_id) if uncounted else 0
-goes_back = (rebinds < ops.REBIND_MAX) if uncounted else (n < max_rounds)
+pos = store.counted_validation_rounds(wo_id=wo_id) + (
+    0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES else 1)
+goes_back = (rebinds < ops.REBIND_MAX) if uncounted else (pos < max_rounds)
 ...
 elif outcome == "rejected" and goes_back:
 ```
+
+**THE ORDINARY ARM ROUTES ON THE BUDGET POSITION, NOT ON THE ROW NUMBER.** Once a rebind
+has spent a number without spending budget, `n` runs ahead of the budget by one per
+rebind, and `n < max_rounds` would escalate a submission that still has a round — with
+`max_rounds` 3, one counted round and a passing rebind on row 2, the ordinary rejection on
+row 3 is budget position 2. `pos` is the same counter `ops.rejudge_moved_head` budgets off
+(`counted_validation_rounds`); the round being settled is still open, so it is not in
+`COUNTED_VALIDATION_OUTCOMES` yet and the `+ 1` adds it back.
 
 `rebinds` counts the round being settled, so `rebinds < REBIND_MAX` means "there is another
 rebind left after this one" — the loop is: rebind rejects, the worker fixes, the head moves
@@ -333,6 +343,22 @@ Shaped on `ops.BOUNCE_FEEDBACK` (ops.py:4001), which already has to say "no roun
 spent" and already explains why the submitter has not lost an attempt. The
 `validation_rejected` event gets `{"uncounted": True, "of": REBIND_MAX}` so the timeline
 does not print "round 5 of 3" either.
+
+`_reject` also takes `budget_round` — `pos` — and that is what `REVIEW_FEEDBACK` names, so
+an ordinary rejection after a rebind reads "round 2 of 3" rather than "round 3 of 3". The
+event's `"round"` STAYS THE ROW NUMBER and the position rides beside it as
+`"budget_round"`: `src/jarvis/holds.py` closes the VALIDATION hold by correlating that
+field with `validation_submitted`'s `round`, which is a row number, and rewriting it would
+leave every post-rebind hold open for ever.
+
+**A FIX ASKED FOR BY A REJECTED REBIND IS ITSELF A REBIND** (Neo: "Send a rebind rejection
+to the worker for a fix turn whatever the counted budget says... Its re-judge is another
+rebind. Once REBIND_MAX is used up, route to the user."). `ops.submit_for_validation`
+therefore DERIVES `uncounted` when the caller did not pass it: if the subject's most
+recent settled round (`last_judged_round`) was `uncounted=1` and `rejected`, the new round
+is uncounted too. The accounting reads: rebind 1 is the OS's re-judge of its own merge,
+rebind 2 is the worker's fix, and a second rejection has `rebinds == REBIND_MAX`, so
+`goes_back` is False and the user is asked.
 
 The feature loop (daemon.py:2511, 2639, 2661) is untouched: no feature round is ever a
 rebind.
@@ -461,6 +487,14 @@ fixture:
    writes it once across three ticks.
 9. `test_a_changed_diff_on_a_proved_chain_reports_a_rebind` — `_carry_catch_up` returns
    `CarryOutcome(carried=False, rebind=True)`, and still refuses the carry.
+
+12. `test_an_ordinary_round_after_a_rebind_is_budgeted_by_position` — one counted round,
+   a PASSING rebind on row 2, then an ordinary rejection on row 3 under `max_rounds` 3:
+   the work order is not `needs_review`, the feedback says "round 2 of 3", and the
+   `validation_rejected` event carries `round == 3` with `budget_round == 2`.
+13. `test_a_fix_after_a_rejected_rebind_is_itself_a_rebind` — a rejected rebind, then a
+   worker submission: the new round is `uncounted=1`, `counted_validation_rounds` is
+   unchanged, and its own rejection reaches `REBIND_MAX` and escalates to the user.
 
 **`tests/test_timeline.py`** — 10. both decline sentences render off `cause`, and a rebind's
 `validation_forced` reads "Validation forced by the OS" with the "does not count" clause.
