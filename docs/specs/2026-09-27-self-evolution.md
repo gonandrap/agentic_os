@@ -209,7 +209,8 @@ CREATE TABLE IF NOT EXISTS rule_fires (
     project TEXT NOT NULL, order_id TEXT NOT NULL, order_kind TEXT NOT NULL,
     fingerprint TEXT NOT NULL,            -- health.fingerprint, the dedupe memory
     mode TEXT NOT NULL,                   -- dry_run | armed
-    outcome TEXT NOT NULL,                -- recorded | proposed | refused | unreadable | cleared
+    outcome TEXT NOT NULL,                -- recorded | proposed | applied | refused
+                                          --   | unreadable | cleared
     alarm_id TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
     cleared_at REAL, cleared_seconds REAL,
@@ -220,12 +221,18 @@ CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
 ```
 
-`outcome` distinguishes five things that must not be collapsed. `recorded` is a dry run.
-`proposed` is an armed fire that raised an alarm. `refused` is an armed fire the remedy path
-declined — allow-list, missing grant, precondition — with the refusal's own words in `detail`; a
-refusal is not a hit and not a false positive, it is the gate working. `unreadable` is the pinned
-ruling's case: something could not be read, nothing was decided, and the row exists so the
-silence is visible. `cleared` closes a fire.
+`outcome` distinguishes six things that must not be collapsed. `recorded` is a dry run.
+`proposed` is an armed fire that raised an alarm; `applied` is one whose remedy the gate then let
+run, and the two are separate because §9's headline counts acts, not intentions — an alarm nobody
+approved changed nothing. `refused` is an armed fire the remedy path declined — allow-list,
+missing grant, precondition — with the refusal's own words in `detail`; a refusal is not a hit
+and not a false positive, it is the gate working. `unreadable` is the pinned ruling's case:
+something could not be read, nothing was decided, and the row exists so the silence is visible.
+`cleared` closes a fire.
+
+The enum ships complete from this section even though only §6 ever writes `proposed`, `applied`
+or `refused`: a value a later child adds to a column a shipped release already reads is a
+migration, and there is no reason to buy one.
 
 `detail` and any snapshot text stored on a fire is BOUNDED at `FACTS_CHARS` (4000) with the cap
 recorded, the way every other payload in this codebase is.
@@ -292,14 +299,22 @@ A condition that matches only because a field is missing is the commonest way a 
 and the dry-run output is where that gets caught.
 
 **Acceptance criterion for the grammar, and it is the one that matters:** all five conditions of
-§8's seed rules must be expressible in it without extending it. If one is not, the grammar is
-wrong — not the seed rule.
+§3.5's seed rules must be expressible in it without extending it. If one is not, the grammar is
+wrong — not the seed rule. That is why the seed DATA lives in §3.5 rather than beside the
+evaluation pass: a grammar whose stated acceptance criterion cannot be checked by the section that
+defines the grammar has no acceptance criterion.
 
 ### 3.3 Arming is explicit. The threshold is recorded and never acted on.
 
-`dry_run → armed → retracted`, and nothing else. A detector is CREATED in `dry_run`, always,
-whatever created it; there is no argument that writes an armed one. `retracted` is terminal and
-`retired_reason` is required.
+`dry_run → armed`, `armed → dry_run`, and either of them `→ retracted`. Nothing else. A detector
+is CREATED in `dry_run`, always, whatever created it; there is no argument that writes an armed
+one. `retracted` is terminal and `retired_reason` is required.
+
+**`armed → dry_run` exists for exactly one cause: the disarm interlock of §6**, when a person has
+marked `FALSE_POSITIVE_DISARM` of that detector's fires wrong. Retracting a misfiring detector
+instead would be the wrong verb twice over — it loses the calibration history the `arm_threshold`
+column exists to accumulate, and it says the rule was a mistake when what happened is that it is
+not ready. A demoted detector keeps firing in `dry_run`, where being wrong is free.
 
 **Only a person arms a rule, in v1.** `arm_threshold` is written and read back and displayed; no
 code acts on it. Arming a rule off a counter the OS itself increments is the OS granting itself
@@ -351,6 +366,30 @@ other. `list` leads with the counts — `12 rules: 3 armed, 8 in dry run, 1 retr
 line per detector. `show` renders the condition as prose, every remedy rule with its primitive
 and parameters, the whole provenance chain, and the newest fires with their outcomes. Every
 `ops` function returns a plain dict §9's dashboard consumes verbatim.
+
+### 3.5 The seed rows
+
+`rules.seed_rows()`, the direct analogue of `gate_rules.seed_rows()`, returns the five detectors
+of §1 with their remedy rows — **every one in `dry_run`**, `source="builtin"`, `project=""`,
+`gap_class` set, and provenance pointing at the issue that discovered the gap:
+`stale-panel-hold` (#786, #813), `unreachable-neo-question` (#788), `catch-up-round-burn` (#806),
+`red-base-inherited` (#793), `overtaken-release-order` (#784).
+
+**It is pure data in a leaf module and it lives HERE, beside the grammar, not beside the
+evaluation pass.** Two reasons. §3.2's acceptance criterion is that all five conditions are
+expressible without extending the grammar, and that is only checkable where the grammar is
+defined. And `rules.resolve` is meant to be tested against real rules rather than three
+hand-built rows, which is the difference between a lookup that works and a lookup that works on
+the example somebody wrote for it.
+
+**What this section asserts and what it does not.** `tests/test_rules.py` asserts every seed
+condition PARSES. It does NOT assert that each `primitive` exists in `remedies.REMEDIES`, nor that
+the parameters satisfy its schema: those primitives are §4's and do not exist yet, and a section
+cannot assert against code that has not landed. §5.3 owns both of those and the firing proof.
+Neither check is optional; they are simply not in the same place, and each section says so
+because neither worker can see the other.
+
+Seeding is invoked by §5.3. Nothing here calls it.
 
 ## 4. The primitives: the acts a rule may name
 
@@ -434,7 +473,12 @@ does not run at all, not "runs in dry run", and `jarvis rules list` says so):
    snapshot, not fifty.
 3. **Build the snapshot LAZILY.** `holds.held` walks up to `holds._EVENT_LIMIT` events per order;
    read holds only for detectors whose condition mentions a hold field, and the same for every
-   other non-trivial source. Measure the pass and record the measurement in the pull request.
+   other non-trivial source. Prove it with a CALL-COUNT test that names `holds.held` explicitly —
+   wrap it in a counter and assert ZERO calls when no live detector's condition names a hold
+   field. That is a white-box assertion this repo does not otherwise make, and it is worth it
+   here: naming the accessor is what makes a later refactor of it fail loudly instead of quietly
+   reintroducing the walk. Separately, the pull request BODY states the measured wall clock of one
+   `rules_tick` over N orders. That is a deliverable for a reviewer to read, not a test.
 4. A detector that matches, and whose `health.fingerprint` for that order differs from the newest
    OPEN fire's, writes a `rule_fires` row with `mode="dry_run"`, `outcome="recorded"` and
    increments `hits`. **In `dry_run` nothing else happens: no alarm, no message, no flag, no
@@ -453,27 +497,28 @@ makes the feature-to-carrier hop, so nothing is being painted into a corner.
 Cap the work explicitly: `EVAL_MAX_ORDERS` per project per tick, oldest first so nothing
 starves, and a wall-clock budget after which the pass stops and records that it did.
 
-### 5.3 The five seed rules
+### 5.3 Seeding the five rules, and proving each one fires
 
-`rules.seed_rows()`, the direct analogue of `gate_rules.seed_rows()`, returns the five detectors
-of §1 with their remedy rows — **every one in `dry_run`**, `source="builtin"`, `project=""`,
-`gap_class` set, provenance pointing at the issue that discovered the gap: `stale-panel-hold`
-(#786, #813), `unreachable-neo-question` (#788), `catch-up-round-burn` (#806),
-`red-base-inherited` (#793), `overtaken-release-order` (#784). Seeding runs where
-`gate_rules`' does and is idempotent by `seed_version`.
+The seed DATA is §3.5's. This section owns the CALL SITE — seeding runs where `gate_rules`' does
+and is idempotent by `seed_version` — and it owns the proof that the five conditions actually
+select the situations they were written for, which §3.5 cannot check because nothing evaluates
+there.
 
 **Each seed rule ships with a POSITIVE and a NEGATIVE test.** The positive: it fires on a
 reconstructed situation matching the issue it came from. The negative, and it is the one that
-carries the weight: a HEALTHY order of the same status on which it must not fire. A seed rule
-with no negative control is a detector that fires on everything and looks like it works.
+carries the weight: a HEALTHY order of the SAME status on which it must not fire, asserted by
+`detector_id` and not by a total fire count — another rule's silence otherwise hides this one's
+noise.
 
 **If the historical orders are not in the dev databases, the situations are SYNTHESISED from
 the store fixtures** — which is weaker evidence than a replay, and the pull request must say so
 rather than let a reader assume a replay happened.
 
-A seed row whose condition or primitive does not validate is a FAILING TEST, not a warning at
-startup: `tests/test_rules.py` asserts every seed condition parses, every primitive is in
-`remedies.REMEDIES`, and every parameter set satisfies that primitive's schema.
+This section also owns the assertion §3.5 cannot make: that every seed row's `primitive` is in
+`remedies.REMEDIES` and every parameter set satisfies that primitive's declared schema. §3.5
+checks only that the five CONDITIONS parse, because the primitives it names do not exist until §4
+lands and a section cannot assert against code that is not there yet. Neither check is optional
+and neither is the other's job.
 
 ## 6. Arming: a fire becomes an alarm and takes the gate that already exists
 
@@ -595,8 +640,9 @@ through to the panel. The pinned ruling applies here as much as to a model call.
 
 ### 7.3 The checklist, in the packet and never in the system prompt
 
-`evidence.EvidencePacket` gains `gap_class: str = ""` and `self_evolution: str = ""` (the
-rendered checklist), populated in `evidence.collect_work_order`, which already takes `wo`.
+`evidence.EvidencePacket` gains `gap_class: str = ""`, `detector_id: str = ""`,
+`remedy_rule_id: str = ""` and `self_evolution: str = ""` (the rendered checklist), all populated
+in `evidence.collect_work_order`, which already takes `wo`.
 `validation.build_packet_prompt` renders it under a heading, copying the `spec_ref` /
 `spec_section` pattern exactly.
 
@@ -604,11 +650,27 @@ rendered checklist), populated in `evidence.collect_work_order`, which already t
 `build_seat_prompt` are byte-stable per seat on purpose, for the prompt cache; a conditional
 section there costs a cache write on every ordinary round in the fleet.
 
-**The fingerprint.** `evidence.fingerprint` includes `gap_class`, `detector_id` and
-`remedy_rule_id` — those identify what was delivered, and a worker who changes the detector row
-without changing the diff must not look like a repeat submission. It EXCLUDES the rendered
-`self_evolution` text: that is OS-injected prose, not part of the delivery, and including it
-would make an unchanged resubmission look like new evidence.
+**The fingerprint, and read `evidence.fingerprint`'s docstring before you touch it.** That
+docstring declares its exclusion list UNCHANGED by name, and spends four paragraphs on one
+failure: anything mixed in unconditionally changes the hash of every round already stored and
+silently disables `Daemon._preceding_round`'s repeat guard, which is the only thing that catches a
+submitter who changed nothing. `head`, `summary` and `history` are each excluded for that reason.
+
+So follow the ASSUMPTIONS precedent, which is the one thing that ever widened the formula and the
+only shape that is safe: assumptions are mixed in ONLY when there are any, *"so every work order
+that files none hashes exactly as it did before that existed."* Identically here —
+`gap_class`, `detector_id` and `remedy_rule_id` join the hash ONLY when `gap_class` is non-empty.
+An ordinary order, which is almost every order, must hash byte-identically to what it hashes
+today, and a test must assert that against a pre-change value rather than merely against itself.
+
+Those three ids go in because a submitter who registers a different detector without touching the
+diff HAS produced new evidence, and the repeat guard would otherwise call round 2 identical to
+round 1. The rendered `self_evolution` text stays OUT: it is prose the OS injected, not something
+the submitter produced, and it is regenerated every round — the `history` row of that docstring's
+table, arriving through a new door.
+
+**`EvidencePacket` therefore carries all three ids**, not just `gap_class`, or the function cannot
+hash what this section says it hashes.
 
 The three questions, and they are about QUALITY:
 
