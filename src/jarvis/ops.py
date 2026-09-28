@@ -6837,19 +6837,30 @@ def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
     for its reason too: a closed duplicate that drops out of the answer is re-filed for
     ever.
 
-    Then live orders, searched BY THE SUBJECT ID and never by the proposed title.
-    `db.score_sql` is word-OR (kn-c6e8fbf0), so a title search would match half the
-    project on a shared word and downgrade nearly every GAP to ALREADY_TRACKED — a
-    duplicate check that never files is worse than none, because it reads as one that
-    works. The subject id is weighted and exact, and "an order is already open about this
-    subject" is the question worth asking anyway.
+    THE TWO HALVES KEY ON DIFFERENT THINGS, and that asymmetry is the point.
+
+    The tracker keys on THE CAUSE — the proposed fix's title — and never on the subject
+    id. Issues whose body names an order id are common and usually about some OTHER
+    cause: every validation follow-up the panel filed on that order, every earlier
+    investigation's filing. Keying the tracker on the id turned each of those into a
+    duplicate, downgraded a real GAP to ALREADY_TRACKED and filed nothing. The cost of
+    keying on the cause is the opposite error: `gh` search is token-AND, so an existing
+    issue about the same cause in different words is missed and a duplicate gets filed.
+    That is the right direction to fail in — a duplicate issue is visible and closable, a
+    GAP that was never filed is not.
+
+    Live orders key on THE SUBJECT ID and never on the proposed title. `db.score_sql` is
+    word-OR (kn-c6e8fbf0), so a title search would match half the project on a shared word
+    and downgrade nearly every GAP — a duplicate check that never files is worse than
+    none, because it reads as one that works. The subject id is weighted and exact, and
+    "an order is already open about this subject" is the question worth asking anyway.
     """
     from . import bugreport, issues, search as search_mod
 
     title = (verdict.get("proposed_fix") or {}).get("title") or ""
     repo = bugreport.bug_repo()
-    for term in [t for t in (subject, title) if t]:
-        for row in issues.issues_mentioning(repo, term):
+    if title:
+        for row in issues.issues_mentioning(repo, title):
             return str(row["url"])
     ours = {subject, fo["id"], fo.get("plan_wo_id") or ""}
     for hit in search_mod.search(subject, project=project,

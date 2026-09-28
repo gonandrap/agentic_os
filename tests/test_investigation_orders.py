@@ -211,6 +211,24 @@ QUOTED_SMUGGLED = (
     "git diff --outp=src/a.py",
 )
 
+#: READERS THAT WRITE. Each is in `gate_rules._READERS` or is an interpreter, so the
+#: `reads_only` fallback clears it — and each writes a file with no redirection at all.
+#: §2.6: the no-write guarantee is this kind's own, so the refusal is here, not there.
+WRITING_READERS = (
+    "sed -n 'w src/a.py' README.md",
+    "sed -n '1e touch x' README.md",
+    "sort -o src/a.py README.md",
+    "find . -delete",
+    "find . -fprint src/a.py",
+    'awk \'BEGIN{system("touch x")}\'',
+    # BUNDLED SHORT OPTIONS: the writing letter is in a cluster, so a test on the
+    # argument's PREFIX misses every one of these.
+    "sort -nro src/a.py README.md",
+    "sed -ni 'p' README.md",
+    "sed -nf script.sed README.md",
+    "sed -ne 'w src/a.py' README.md",
+)
+
 #: The pipelines an investigator actually needs, which the segment loop must keep.
 PIPED_READS = (
     "git log --oneline -5 | head -20",
@@ -260,6 +278,31 @@ def test_a_quoted_write_argument_is_refused_too():
 
 def test_a_quoted_read_still_runs():
     for command in QUOTED_READS:
+        assert _decision(
+            hooks.preflight_decision(_bash(command), _env())) == "allow", command
+
+
+def test_a_reader_that_writes_a_file_is_refused():
+    """§2.6: `gate_rules.reads_only` clears `sed`, `sort` and `awk` on their NAME, and
+    each of them writes a file from its own arguments. The no-write guarantee cannot
+    rest on a test of what a program usually does."""
+    for command in WRITING_READERS:
+        assert _decision(hooks.preflight_decision(_bash(command), _env())) == "deny", (
+            command)
+        assert _decision(
+            hooks.investigator_bash_decision(_bash(command), _env())) == "deny", command
+        # The negative control: no other kind's behaviour changes.
+        assert hooks.investigator_bash_decision(
+            _bash(command), _env("worker")) is None, command
+
+
+def test_the_ordinary_reads_still_run():
+    """The positive control for the rule above: refusing a whole program must not cost
+    the investigator the reads it lives in."""
+    for command in ("grep -rn foo src", "cat README.md", "sed -n '1,20p' README.md",
+                    # The same clusters, one letter different, still reading.
+                    "sed -ne '1,20p' README.md", "sed -nE '/err/p' README.md",
+                    "sort -u README.md"):
         assert _decision(
             hooks.preflight_decision(_bash(command), _env())) == "allow", command
 
@@ -409,9 +452,12 @@ def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
     """§2.5: the record must never read as though the investigator classified it that
     way, and never as though it was wrong — finding the duplicate was never its job."""
     subject = _subject(store)
+    # The body names THE CAUSE, which is what the tracker half keys on (§2.5) — the
+    # subject id in a body says nothing about whether this cause is already filed.
+    cause = a_verdict("GAP")["proposed_fix"]["title"]
     started.add_issue("https://github.com/x/y/issues/790",
                       title="stale panel hold", state="CLOSED",
-                      body=f"the panel hold on {subject} is never re-derived")
+                      body=f"{cause} — reported from a panel hold that never clears")
     inv = ops.create_investigation_order("proj_a", subject, WHY)
     _investigating(store, inv)
     out = ops.submit_verdict(inv["id"], a_verdict("GAP", subject=subject))
@@ -424,6 +470,28 @@ def test_a_gap_whose_duplicate_ops_finds_is_downgraded_honestly(started, store):
     assert stored["filed"] is None
     assert not any(c["argv"][:2] == ["issue", "create"] for c in started.calls), \
         "a duplicate must not be filed again — #792 duplicated #790"
+
+
+def test_an_issue_that_merely_names_the_subject_is_not_the_duplicate(started, store):
+    """§2.5: the tracker half keys on the CAUSE. Issues naming an order id are common —
+    every validation follow-up the panel filed on it — and are about other causes, so
+    keying on the id downgraded a real GAP and filed nothing."""
+    subject = _subject(store)
+    started.add_issue("https://github.com/x/y/issues/791",
+                      title="follow-up: docstring does not name the round number",
+                      body=f"raised by the validation panel on {subject}; the round "
+                           f"docstring omits the round number")
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+    out = ops.submit_verdict(inv["id"], a_verdict("GAP", subject=subject))
+
+    assert out["classification"] == "GAP"
+    assert out["filed"]["issue_url"]
+    assert out["filed"]["wo_id"]
+    assert out["classified_by"] != "ops"
+    stored = json.loads(store.get_feature_order(inv["id"])["plan"])
+    assert stored["classified_by"] != "ops"
+    assert stored["filed"]["issue_url"] == out["filed"]["issue_url"]
 
 
 def test_a_live_order_already_on_the_subject_counts_as_the_duplicate(started, store):

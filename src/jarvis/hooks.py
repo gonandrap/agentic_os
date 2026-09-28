@@ -562,6 +562,166 @@ INVESTIGATOR_JARVIS_ARG_VERBS = frozenset({
 #: work order on a tracker issue, which is §3.1's second refusal.
 INVESTIGATOR_JARVIS_DENIED = frozenset({("issues", "start")})
 
+#: Programs that run or write whatever they are told to, and that no evidence READ needs.
+#: `gate_rules.reads_only` clears a segment on the program's NAME, so `awk` — an
+#: interpreter with `system()` — reads there as a reader. Refused WHOLE rather than parsed
+#: (§2.6): deciding whether one `awk` program writes is not decidable, and this kind has
+#: `grep`, `cat`, `jq`, `git` and `gh` for everything it actually does.
+INVESTIGATOR_REFUSED_PROGRAMS = frozenset({
+    "awk", "gawk", "mawk", "perl", "python", "python3", "ruby", "node", "xargs",
+    "tee", "dd", "truncate", "install", "patch", "ed", "ex", "vi", "vim",
+})
+
+#: `find` actions that write, delete or execute. `-exec`/`-ok` run an arbitrary command;
+#: the `-fprint*`/`-fls` family writes a named file; `-delete` needs no explanation.
+INVESTIGATOR_FIND_WRITES = frozenset({
+    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+    "-fprint", "-fprint0", "-fprintf", "-fls",
+})
+
+
+def _sed_script_writes(script: str) -> bool:
+    """Whether one `sed` SCRIPT leaves the stream: `w`/`W` write a file, `e` executes.
+
+    Addresses and `s///` patterns are SKIPPED, so `sed -n '/error/p'` — an ordinary read
+    whose regex merely contains an `e` — is not refused. Everything this scanner cannot
+    place reads as a write: an unterminated regex is a script this parser does not model,
+    and §2.6's guarantee is not allowed to fail open.
+    """
+    i, n = 0, len(script)
+    while i < n:
+        c = script[i]
+        if c == "\\":
+            i += 2
+        elif c in "/":                      # an address regex: skip to its close
+            i = _sed_skip(script, i + 1, "/")
+            if i < 0:
+                return True
+        elif c in "sy":                     # s/re/rep/flags, y/from/to/ — flags can write
+            delim = script[i + 1] if i + 1 < n else ""
+            if not delim:
+                return True
+            i = _sed_skip(script, i + 2, delim)
+            if i < 0:
+                return True
+            i = _sed_skip(script, i, delim)
+            if i < 0:
+                return True
+            while i < n and script[i] not in ";}\n":
+                if script[i] in "wWe":
+                    return True
+                i += 1
+        elif c in "wWe":
+            return True
+        else:
+            i += 1
+    return False
+
+
+def _sed_skip(script: str, start: int, delim: str) -> int:
+    """Index just past the next unescaped `delim` from `start`, or -1 if there is none."""
+    i = start
+    while i < len(script):
+        if script[i] == "\\":
+            i += 2
+            continue
+        if script[i] == delim:
+            return i + 1
+        i += 1
+    return -1
+
+
+def _investigator_writer(segment: str) -> bool:
+    """Whether one SEGMENT is a reader that writes a file anyway — §2.6's own test.
+
+    `gate_rules.reads_only` clears a segment on the PROGRAM NAME, and `sed`, `sort` and
+    `find` each write from their own arguments with no redirection to give them away.
+    That test is structural and shared by every gate; this one is scoped to the
+    investigator, whose guarantee is "changes no file" rather than "runs nothing
+    privileged", so it belongs here and never in `gate_rules`.
+    """
+    # PARSED, for `_investigator_git_read`'s reason: the shell strips quotes before the
+    # program sees the argument. A parse this cannot do is a refusal, not a pass.
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return True
+    if not words:
+        return True
+    program = Path(words[0].lstrip("\\")).name
+    args = words[1:]
+    if program in INVESTIGATOR_REFUSED_PROGRAMS:
+        return True
+    if program == "find":
+        return any(a in INVESTIGATOR_FIND_WRITES for a in args)
+    if program == "sort":
+        # THE LETTERS IN THE CLUSTER, never the argument's prefix: `sort -nro f` writes
+        # and does not start with `-o`. `-n`, `-u`, `-r` carry no `o` and keep reading.
+        return any(a.startswith("--output")
+                   or ("o" in _short_cluster(a)) for a in args)
+    if program in ("sed", "gsed"):
+        return _sed_writes(args)
+    return False
+
+
+def _short_cluster(arg: str) -> str:
+    """The bundled short-option LETTERS of `arg`, or `""` when it is not a cluster.
+
+    `-nro` is three options, not a prefix — the bug this exists to close.
+    """
+    if not arg.startswith("-") or arg.startswith("--") or arg == "-":
+        return ""
+    return arg[1:]
+
+
+def _sed_writes(args: list[str]) -> bool:
+    """Whether a `sed` invocation leaves the stream: `-i`, `-f`, or a writing script.
+
+    The cluster is read LEFT TO RIGHT because sed's own parse does: `-i` takes an
+    optional suffix glued to it and `-e`/`-f` take the rest of the cluster as their
+    argument, so `-ni` is in-place, `-nf` reads its script from a file this hook cannot
+    see, and `-ne` is an ordinary read whose script is the next word.
+    """
+    scripts: list[str] = []
+    expect, seen_script = "", False
+    for arg in args:
+        if expect == "e":
+            scripts.append(arg)
+            expect, seen_script = "", True
+            continue
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name.startswith("--in-place") or name == "--file":
+                return True
+            if arg.startswith("--file="):
+                return True     # the script is in a file this hook cannot read
+            if arg.startswith("--expression="):
+                scripts.append(arg.split("=", 1)[1])
+                seen_script = True
+            elif name == "--expression":
+                expect = "e"
+            continue
+        cluster = _short_cluster(arg)
+        if cluster:
+            for index, letter in enumerate(cluster):
+                if letter in "if":
+                    return True     # in-place, or a script file
+                if letter == "e":
+                    rest = cluster[index + 1:]
+                    if rest:
+                        scripts.append(rest)
+                        seen_script = True
+                    else:
+                        expect = "e"
+                    break
+            continue
+        if not seen_script:
+            scripts.append(arg)
+            seen_script = True
+    if expect:
+        return True     # `-e` with nothing after it
+    return any(_sed_script_writes(s) for s in scripts)
+
 
 def investigator_write_decision(payload: dict[str, Any],
                                 env: dict[str, str]) -> dict[str, Any] | None:
@@ -621,9 +781,11 @@ def investigator_bash_decision(payload: dict[str, Any],
     `sed -i` on product code and `git commit` both go straight through.
 
     Allowed only for a `jarvis` chain whose every verb is permitted, or a chain whose
-    EVERY segment is an `INVESTIGATOR_READS` pair or passes `gate_rules.reads_only`
-    (structural, already refusing command substitution, shell invokers, unterminated
-    heredocs and `sed -i`).
+    EVERY segment clears `_investigator_writer` AND is either an `INVESTIGATOR_READS`
+    pair or passes `gate_rules.reads_only` (structural, already refusing command
+    substitution, shell invokers, unterminated heredocs and `sed -i`). `reads_only` keys
+    on the program name, so `_investigator_writer` is what stops `sed -n 'w f'`, `sort
+    -o f` and `awk` — readers that write from their own arguments.
     """
     if env.get(WO_KIND_ENV) != "investigator" or payload.get("tool_name") != "Bash":
         return None
@@ -710,6 +872,8 @@ def _investigator_may_run(command: str) -> bool:
     for start, end, _name in gate_rules.segments(command):
         segment = command[start:end].strip()
         if not segment:
+            return False
+        if _investigator_writer(segment):
             return False
         if not (_investigator_git_read(segment) or gate_rules.reads_only(segment)):
             return False

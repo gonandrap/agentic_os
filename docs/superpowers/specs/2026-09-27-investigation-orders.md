@@ -285,8 +285,16 @@ for that function's stated reason:
    * Tracker: `issues.follow_ups_filed`'s pattern (src/jarvis/issues.py:535-561) — a
      `gh issue list --state all --search "<terms> in:body"` read. `--state all` is
      load-bearing here for the same reason it is there: a closed duplicate that drops out
-     of the answer is re-filed for ever. Search terms come from the subject id and the
-     `proposed_fix.title`.
+     of the answer is re-filed for ever. The search term is the `proposed_fix.title` and
+     NOT the subject id: the tracker half keys on the CAUSE. Issues whose body names an
+     order id are common and usually about a different cause — every validation follow-up
+     the panel filed on that order, every earlier investigation's filing — so keying on
+     the id downgrades a real `GAP` to `ALREADY_TRACKED` and files nothing. The cost is
+     the opposite error: `gh` search is token-AND, so an existing issue about the same
+     cause in different words is missed and a duplicate gets filed. That is the right
+     direction to fail in — a duplicate issue is visible and closable, a `GAP` that was
+     never filed is not. (The live-order half below keys the other way, on the subject id;
+     the asymmetry is deliberate.)
    * Live orders: `search.search(query, kinds=…)` (src/jarvis/search.py:120) for work and
      feature orders, plus `issues.live_work_order` (src/jarvis/issues.py:1260) for "an
      order is already on this issue".
