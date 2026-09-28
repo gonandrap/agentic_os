@@ -154,12 +154,16 @@ def test_a_pull_request_with_no_head_oid_at_all_is_not_a_match():
     ({"merge_state": "BLOCKED"}, automerge.HELD_MERGE_STATE_UNCLEAN),   # a requirement out
     ({"merge_state": "UNSTABLE"}, automerge.HELD_MERGE_STATE_UNCLEAN),  # non-required red
     ({"merge_state": "BEHIND"}, automerge.HELD_MERGE_STATE_UNCLEAN),
-    ({"checks": ()}, automerge.HELD_CHECKS_NOT_GREEN),     # no checks is not green
-    ({"checks": (check("unit", "FAILURE"),)}, automerge.HELD_CHECKS_NOT_GREEN),
+    ({"checks": ()}, automerge.HELD_CHECKS_NONE),          # nothing has reported
+    ({"checks": (check("unit", "FAILURE"),)}, automerge.HELD_CHECKS_FAILED),
     ({"checks": (check("unit", "", "IN_PROGRESS"),)},      # queued is not passed
-     automerge.HELD_CHECKS_NOT_GREEN),
+     automerge.HELD_CHECKS_RUNNING),
     ({"checks": (check("unit"), check("evals", "", "QUEUED"))},
-     automerge.HELD_CHECKS_NOT_GREEN),
+     automerge.HELD_CHECKS_RUNNING),
+    # Failed beside running: one shard fails while its siblings queue, and the failure is
+    # the actionable fact (spec §5).
+    ({"checks": (check("unit (3.13)", "FAILURE"), check("evals", "", "QUEUED"))},
+     automerge.HELD_CHECKS_FAILED),
 ])
 def test_github_must_positively_say_open_mergeable_green_and_clean(kw, code):
     """Each condition holds, and each holds under ITS OWN code (issue #263).
@@ -170,6 +174,66 @@ def test_github_must_positively_say_open_mergeable_green_and_clean(kw, code):
     """
     decision = decide(rnd(), pull=pr(**kw))
     assert not decision.armed and decision.code == code
+
+
+def test_a_failed_check_is_named_in_the_reason_and_a_running_one_is_counted():
+    """Three worlds, three sentences: the split exists because one code over all three
+    was deduped into whichever held first (spec §5, issue #263)."""
+    failed = decide(rnd(), pull=pr(checks=(check("unit (3.13)", "FAILURE"),
+                                           check("evals", "", "QUEUED"))))
+    assert failed.code == automerge.HELD_CHECKS_FAILED
+    assert "unit (3.13)" in failed.reason
+    running = decide(rnd(), pull=pr(checks=(check("unit", "", "IN_PROGRESS"),)))
+    assert running.code == automerge.HELD_CHECKS_RUNNING and "1 check" in running.reason
+    none = decide(rnd(), pull=pr(checks=()))
+    assert none.code == automerge.HELD_CHECKS_NONE and "no check" in none.reason
+
+
+# -- a red default branch pauses every merge (spec §4) --------------------------------
+
+BASE_RED = automerge.BaseRed(base="main", workflow="ci",
+                             run_url="https://github.com/acme/proj/actions/runs/362732",
+                             head_sha="dead00beef0000000000000000000000000000cc",
+                             wo_id="wo-15f5d969")
+
+
+def test_no_base_red_fact_arms_it_and_a_red_base_holds_the_merge():
+    """`None` is "the OS holds no fresh fact" — no pause, no claim. The daemon judges
+    freshness; `decide` gets a fact or nothing."""
+    assert decide(rnd(), base_red=None).armed
+    held = decide(rnd(), base_red=BASE_RED)
+    assert not held.armed and held.code == automerge.HELD_BASE_RED
+    assert BASE_RED.run_url in held.reason
+    assert "ci" in held.reason and "wo-15f5d969" in held.reason
+
+
+def test_an_assumption_the_user_owes_outranks_a_red_default_branch():
+    """Conditions 1-3 are about permission and ownership and must dominate a fact about
+    the world."""
+    decision = decide(rnd(), base_red=BASE_RED, pending_assumptions=True)
+    assert decision.code == automerge.HELD_ASSUMPTIONS
+
+
+def test_a_red_base_holds_before_the_sha_checks_so_no_round_is_spent():
+    """THE COST THIS ORDERING SAVES. `Daemon._rejudge_moved_head` fires on
+    `HELD_SHA_MOVED` alone, so a moved head under a red `main` must not reach it: the
+    re-judge is deferred to the tick after `main` goes green, not lost."""
+    decision = decide(rnd(), pull=pr(head_oid=PUSHED), base_red=BASE_RED)
+    assert decision.code == automerge.HELD_BASE_RED
+    assert decision.round_id == 0 and decision.judged_sha == ""
+
+
+def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
+    """Matched on WORKFLOW and never on job name: fail-fast makes the base and the branch
+    different shards of one matrix (`ci.inherited`)."""
+    same = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
+        {**check("unit (3.13)", "FAILURE"), "workflow": "ci"},)))
+    assert "not its fault" in same.reason
+    other = decide(rnd(), base_red=BASE_RED, pull=pr(checks=(
+        {**check("lint", "FAILURE"), "workflow": "lint"},)))
+    assert "not its fault" not in other.reason
+    green = decide(rnd(), base_red=BASE_RED)
+    assert "not its fault" not in green.reason
 
 
 def test_no_two_conditions_share_a_hold_code():
@@ -843,7 +907,7 @@ def test_the_hold_the_user_reads_is_the_one_blocking_the_merge_now(started, proj
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
-        automerge.HELD_CHECKS_NOT_GREEN, automerge.HELD_NOT_MERGEABLE]
+        automerge.HELD_CHECKS_RUNNING, automerge.HELD_NOT_MERGEABLE]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
     assert "merges cleanly" in line and "CI" not in line
     # The repair still ran: the hold is a sentence about the pull request, not a claim
@@ -872,9 +936,9 @@ def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
-        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_NOT_GREEN]
+        automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_FAILED]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
-    assert "CI has not finished" in line and "BEHIND" not in line
+    assert "CI failed: unit (3.13)" in line and "BEHIND" not in line
     # The nudge went out and the merge did not: recording a hold claims nothing.
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
     assert store.list_approvals(wo["id"]) == []
@@ -1709,3 +1773,82 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
     assert list(invariants.check_attention_reason_is_true(store)) == []
     assert store.get_work_order(wo["id"])["attention_reason"] == \
         invariants.AUTOMERGE_DENIED_BLOCKER
+
+
+# -- a carried head relaxes the sha condition and nothing else -------------------------
+# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4 condition
+# (i), and Neo question 791 made it a requirement rather than a remark.
+
+CARRIED = "c0ffee11223300000000000000000000000ccccc"
+
+
+@pytest.mark.parametrize("over, armed, code", [
+    ({}, True, "armed"),
+    ({"checks": (check("unit (3.13)", "FAILURE"),)}, False,
+     automerge.HELD_CHECKS_FAILED),
+    ({"merge_state": "BEHIND"}, False, automerge.HELD_MERGE_STATE_UNCLEAN),
+    ({"mergeable": "CONFLICTING"}, False, automerge.HELD_NOT_MERGEABLE),
+    ({"state": "CLOSED"}, False, automerge.HELD_PR_CLOSED),
+])
+def test_a_carried_head_arms_only_when_every_other_condition_holds(over, armed, code):
+    """The carry moves ONE condition — the commit the verdict is bound to — and the other
+    five are asked of the carried commit exactly as before."""
+    decision = decide(rnd(carried_head_sha=CARRIED), pull=pr(head_oid=CARRIED, **over))
+
+    assert decision.armed is armed and decision.code == code
+    assert decision.judged_sha == CARRIED
+
+
+def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
+        started, project, fake_gh, monkeypatch):
+    """§7 TEST 13's OTHER HALF, and §5.2's rule: the catch-up runs BEFORE a grant exists
+    and never after one. The gate command string carries the judged sha, so moving the head
+    behind a live grant orphans a permission Neo already gave and silently asks for another.
+
+    The base moves out from under an approved-and-filed pull request here — the ordinary
+    case on a busy `main` — and the OS leaves it alone."""
+    from jarvis import branchproof
+
+    base1, base2 = "1" * 40, "2" * 40
+    contained = {base1}
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: ancestor in contained)
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base1)
+    fake_gh.updated_head(CARRIED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1 and fake_gh.updates == []
+
+    # `main` moved: the pull request is now behind, and a grant for the judged sha stands.
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base2)
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    assert store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert len(store.list_approvals(wo["id"])) == 1
+
+
+def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judged(
+        started, project, fake_gh):
+    """§3.5: the carry hangs off `HELD_SHA_MOVED` and nothing else. On the ordinary tick —
+    the head is the judged commit, an approval is already filed for it — it costs no
+    `git`, no extra API read, and writes nothing. A carry there would rebind a verdict
+    for no reason and orphan a grant Neo has already given on that sha."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
+                and "/commits/" in c["argv"][3]]
+    assert len(store.list_approvals(wo["id"])) == 1
