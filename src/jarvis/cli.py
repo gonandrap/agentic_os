@@ -18,6 +18,8 @@ Grouped commands:
                                           approvals (contest = the match was wrong)
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
+  jarvis rules list|show|retract|dry-run  the SELF-HEALING registry: the gaps the OS
+                                          recognises in itself (not the gate rules)
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|show|promote|done
   jarvis learn add|list|search|show|topics|stats|pin|unpin
@@ -1033,6 +1035,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument("command", metavar="request-number | command")
     g.add_argument("--project")
+
+    # rules (the self-healing detector/remedy registry) ----------------------------------
+    # docs/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
+    # a verb under `jarvis gate`: that family answers "what counts as privileged", this
+    # one answers "what does the OS recognise as its own recurring gap", and one verb
+    # meaning two registries is how `jarvis gate rules` stops being readable. The
+    # collision is close enough that the description has to open by saying which registry
+    # this is and name the other.
+    ru = sub.add_parser(
+        "rules",
+        help="the self-healing registry: the gaps the OS recognises in itself, and what "
+             "it proposes doing about each one",
+        description="the self-healing registry — the gaps the OS has learned to "
+                    "recognise in itself (a DETECTOR) and what it proposes doing about "
+                    "each one (a REMEDY RULE). This is NOT `jarvis gate rules`, which "
+                    "is the other registry: that one answers what counts as a "
+                    "privileged action, this one answers what counts as a gap.",
+    ).add_subparsers(dest="rules_cmd", required=True)
+
+    r = ru.add_parser("list", help="the registry, counts first")
+    r.add_argument("--project", default="",
+                   help="this project's rules AND the fleet-wide ones")
+    r.add_argument("--status", choices=("dry_run", "armed", "retracted"))
+    r.add_argument("--gap-class", dest="gap_class", default="")
+
+    r = ru.add_parser("show", help="one detector: its condition in prose, its remedy "
+                                   "rules, its provenance and its newest fires")
+    r.add_argument("detector_id", metavar="dt-id")
+
+    r = ru.add_parser("retract", help="retire a detector or one remedy rule: it stops "
+                                      "applying, the record keeps that it once did")
+    r.add_argument("rule_id", metavar="dt-id | rm-id")
+    r.add_argument("--reason", required=True,
+                   help="why — the only record of what changed the OS's mind")
+
+    r = ru.add_parser("dry-run", help="what this detector reads, and what it would "
+                                      "decide about one order. WRITES NOTHING")
+    r.add_argument("detector_id", metavar="dt-id")
+    r.add_argument("order_id", nargs="?", default="",
+                   help="an order to evaluate against. Omit to just see what the "
+                        "condition reads")
+
+    for r in ru.choices.values():
+        r.add_argument("--json", action="store_true", help="machine-readable output")
 
     # config (the versioned configuration console) ---------------------------------------
     # docs/superpowers/specs/2026-08-27-the-config-console.md §8. Every subcommand takes
@@ -3402,6 +3448,103 @@ def cmd_gate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_rules_list(data: dict) -> None:
+    """The registry, counts first.
+
+    The counts LEAD because that is the line a reader can act on — `12 rules: 3 armed, 8
+    in dry run, 1 retracted` — and every number in it came from `ops`. This function
+    derives none: two surfaces computing the same total is two surfaces that can
+    disagree about it.
+    """
+    c = data["counts"]
+    noun = "rule" if c["total"] == 1 else "rules"
+    print(f"{c['total']} {noun}: {c['armed']} armed, {c['dry_run']} in dry run, "
+          f"{c['retracted']} retracted")
+    for r in data["rules"]:
+        scope = r["project"] or "fleet-wide"
+        retired = " ⊘ retracted" if r["retired_at"] else ""
+        print(f"  {r['id']} [{r['gap_class']}] {scope} · {r['status']}{retired}")
+        if r["summary"]:
+            print(f"      {r['summary']}")
+        if not r["condition_prose"]:
+            print("      UNREADABLE: " + "; ".join(r["condition_problems"]))
+        for rem in r["remedies"]:
+            print(f"      → {rem['primitive']} {rem['params'] or ''}".rstrip())
+        if r["hit_rate"] is None:
+            print(f"      {r['hit_rate_note']}")
+        else:
+            hits, total = r["fires"]["hits"], r["fires"]["total"]
+            print(f"      {hits} {'hit' if hits == 1 else 'hits'} of "
+                  f"{total} {'fire' if total == 1 else 'fires'}")
+    print(f"\n{data['note']}")
+
+
+def _print_rules_show(data: dict) -> None:
+    d = data["detector"]
+    print(f"{d['id']} [{d['gap_class']}] {d['status']} · "
+          f"{d['project'] or 'fleet-wide'}")
+    if d["summary"]:
+        print(f"  {d['summary']}")
+    print(f"  condition: {data['condition_prose'] or 'UNREADABLE'}")
+    for p in data["condition_problems"]:
+        print(f"    ⚠ {p}")
+    for rem in data["remedies"] + data["retired_remedies"]:
+        retired = " ⊘ retracted" if rem["retired_at"] else ""
+        print(f"  remedy {rem['id']}: {rem['primitive']}{retired}")
+        if rem["params"]:
+            print(f"    parameters: {json.dumps(rem['params'], sort_keys=True)}")
+        if rem["argument"]:
+            print(f"    argument: {rem['argument']}")
+        if rem["retired_at"]:
+            print(f"    ↳ {rem['retired_reason']}")
+    prov = data["provenance"]
+    print("  provenance: " + ", ".join(f"{k}={v}" for k, v in prov.items() if v))
+    if data["hit_rate"] is None:
+        print(f"  {data['hit_rate_note']}")
+    for f in data["fires"]:
+        print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
+              # A fire is one line: the stored detail stays at rules.FACTS_CHARS.
+              + (f" · {_one_line(f['detail'], 110)}" if f["detail"] else ""))
+
+
+def _print_rules_dry_run(data: dict) -> None:
+    print(f"{data['detector']['id']} [{data['detector']['gap_class']}]")
+    if not data["readable"]:
+        print("  UNREADABLE — nothing was evaluated and nothing was decided")
+        for p in data["problems"]:
+            print(f"    ⚠ {p}")
+        print(f"\n{data['note']}")
+        return
+    print(f"  condition: {data['condition_prose']}")
+    print(f"  reads fields: {', '.join(data['fields'])}")
+    print(f"  from: {', '.join(data['sources'])}")
+    if data["evaluated"]:
+        print(f"  {data['explanation']}")
+    print(f"\n{data['note']}")
+
+
+def cmd_rules(args) -> int:
+    from . import ops
+
+    if args.rules_cmd == "list":
+        data = ops.rules_list(project=args.project, status=args.status or "",
+                              gap_class=args.gap_class)
+        _print(data, True) if args.json else _print_rules_list(data)
+    elif args.rules_cmd == "show":
+        data = ops.rules_show(args.detector_id)
+        _print(data, True) if args.json else _print_rules_show(data)
+    elif args.rules_cmd == "retract":
+        data = ops.rules_retract(args.rule_id, args.reason)
+        if args.json:
+            _print(data, True)
+        else:
+            print(f"✓ {data['rule']['id']} retracted — {data['note']}")
+    elif args.rules_cmd == "dry-run":
+        data = ops.rules_dry_run(args.detector_id, args.order_id)
+        _print(data, True) if args.json else _print_rules_dry_run(data)
+    return 0
+
+
 def _cfg_value(value: Any) -> str:
     """A setting as JSON, so `"true"` never reads as `true`."""
     return json.dumps(value, ensure_ascii=False)
@@ -4224,6 +4367,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_io(args)
         if args.cmd == "gate":
             return cmd_gate(args)
+        if args.cmd == "rules":
+            return cmd_rules(args)
         if args.cmd == "config":
             return cmd_config(args)
         if args.cmd == "backlog":

@@ -8627,6 +8627,251 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
                      "once did")}
 
 
+# -- the self-evolution registry (detectors and remedy rules; see rules.py) --------------
+#
+# docs/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
+# PLAIN DICT the CLI and the dashboard both consume verbatim; neither of them derives a
+# number, so the two surfaces cannot disagree about what the registry says.
+#
+# ABSENT IS NEVER ZERO, throughout. A detector that has never fired has NO hit rate — it
+# carries `None` and a sentence saying why, never `0.0`, because a fabricated zero reads
+# as a measurement and a rule nobody has evidence about is not a rule with bad evidence.
+
+#: What a fire counts as evidence FOR. The other three outcomes are not the detector
+#: being wrong: a `refused` is the gate working, an `unreadable` is not a decision at
+#: all, and a `cleared` closes a fire that was already counted when it opened.
+_HIT_OUTCOMES = ("recorded", "proposed", "applied")
+
+
+def _rule_entry(central: CentralStore, detector: dict[str, Any]) -> dict[str, Any]:
+    """One detector as every surface renders it: the row, its live remedies, its
+    condition IN PROSE, and its fire counts.
+
+    The condition is parsed again here rather than trusted: a row written by an older
+    release may name a field this one removed, and a listing that crashed on such a row
+    would take the whole registry down with it. An unreadable row is LISTED, with its
+    problems, and says so.
+    """
+    from . import rules as rules_mod
+
+    prose: str | None = None
+    problems: list[str] = []
+    try:
+        prose = rules_mod.render_condition(
+            rules_mod.parse_condition(detector["condition"]))
+    except rules_mod.RulesError as e:
+        problems = list(e.args[0]) if e.args and isinstance(e.args[0], list) else [str(e)]
+
+    fires = central.list_rule_fires(detector_id=detector["id"], limit=500)
+    by_outcome: dict[str, int] = {}
+    for f in fires:
+        by_outcome[f["outcome"]] = by_outcome.get(f["outcome"], 0) + 1
+    hits = sum(by_outcome.get(o, 0) for o in _HIT_OUTCOMES)
+    return {
+        **detector,
+        "condition_prose": prose,
+        "condition_problems": problems,
+        "readable": not problems,
+        "remedies": [_remedy_entry(r) for r in central.remedy_rules_for(detector["id"])],
+        "fires": {"total": len(fires), "by_outcome": by_outcome, "hits": hits},
+        "hit_rate": (hits / len(fires)) if fires else None,
+        "hit_rate_note": None if fires else (
+            "this detector has never fired, so it has no hit rate yet — which is not a "
+            "hit rate of zero"),
+    }
+
+
+def _remedy_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """A remedy row with its parameters DECODED, so no surface parses JSON itself."""
+    return {**row, "params": db.from_json(row.get("params"), {})}
+
+
+def rules_list(*, project: str = "", status: str = "",
+               gap_class: str = "") -> dict[str, Any]:
+    """The registry: what the OS has learned to recognise about itself.
+
+    The counts LEAD, because "twelve rules" is the number a reader can act on and the
+    list is the detail. `project` is a scope filter — it returns that project's rules and
+    the fleet-wide ones — for the reason `CentralStore.list_detectors` gives.
+
+    `enabled` is `None` in this release and that is deliberate: nothing evaluates these
+    rules yet, so there is no engine to be on or off, and `False` would state that one
+    exists and is switched off.
+    """
+    central = CentralStore()
+    try:
+        every = central.list_detectors(project=project, gap_class=gap_class,
+                                       include_retired=True)
+        counts = {
+            "total": len(every),
+            "armed": sum(1 for d in every if d["status"] == "armed"),
+            "dry_run": sum(1 for d in every if d["status"] == "dry_run"),
+            "retracted": sum(1 for d in every if d["status"] == "retracted"),
+        }
+        shown = [d for d in every if not status or d["status"] == status]
+        if not status:
+            shown = [d for d in shown if d["retired_at"] is None]
+        entries = [_rule_entry(central, d) for d in shown]
+    finally:
+        central.close()
+    if not counts["total"]:
+        note = ("no detectors are registered — the registry is empty, which is a "
+                "different thing from a registry whose rules have never matched")
+    else:
+        note = ("every rule is in dry run: it records what it would have proposed and "
+                "acts on nothing. Only a person arms one")
+        if counts["armed"]:
+            note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
+                    f"proposes; the gate still decides whether anything runs")
+    return {"counts": counts, "rules": entries, "enabled": None, "note": note}
+
+
+def rules_show(detector_id: str) -> dict[str, Any]:
+    """One detector in full: the condition as prose, every remedy rule with its
+    primitive and parameters, the whole provenance chain, and the newest fires.
+
+    The provenance chain is grouped rather than left scattered through the row because it
+    is the one thing a person arming a rule reads as a unit: which improvement order
+    found the gap, which work order fixed it, which issue and which pull request.
+    """
+    central = CentralStore()
+    try:
+        detector = central.get_detector(detector_id)
+        if detector is None:
+            raise OpsError(f"detector {detector_id!r} not found — "
+                           f"`jarvis rules list` shows the registered ones")
+        entry = _rule_entry(central, detector)
+        retired = [_remedy_entry(r) for r
+                   in central.remedy_rules_for(detector_id, include_retired=True)
+                   if r["retired_at"] is not None]
+        fires = central.list_rule_fires(detector_id=detector_id, limit=20)
+    finally:
+        central.close()
+    return {
+        "detector": detector,
+        "condition_prose": entry["condition_prose"],
+        "condition_problems": entry["condition_problems"],
+        "readable": entry["readable"],
+        "remedies": entry["remedies"],
+        "retired_remedies": retired,
+        "provenance": {
+            "source": detector["source"], "io_id": detector["io_id"],
+            "fix_wo_id": detector["fix_wo_id"], "issue_url": detector["issue_url"],
+            "pr_url": detector["pr_url"], "seed_version": detector["seed_version"],
+        },
+        "fires": fires,
+        "hit_rate": entry["hit_rate"],
+        "hit_rate_note": entry["hit_rate_note"],
+    }
+
+
+def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
+    """Retire a detector or one remedy rule. NEVER deletes.
+
+    Dispatches on the id prefix, because the two live in different tables and a user
+    holding an id from `jarvis rules show` should not have to know which. Retracting a
+    DETECTOR takes its live remedy rows with it — see `CentralStore.retract_detector`.
+    """
+    if not reason.strip():
+        raise OpsError("a retraction needs a reason — it is the only record of why the "
+                       "OS stopped believing something it acted on")
+    central = CentralStore()
+    try:
+        try:
+            if rule_id.startswith("dt-"):
+                rule = central.retract_detector(rule_id, reason.strip())
+                note = ("retracted, with its live remedy rules — they no longer apply, "
+                        "and the record keeps that they once did")
+            elif rule_id.startswith("rm-"):
+                rule = central.retract_remedy_rule(rule_id, reason.strip())
+                note = ("retracted — the detector still recognises the gap, it just no "
+                        "longer proposes this")
+            else:
+                raise OpsError(f"{rule_id!r} is neither a detector (`dt-…`) nor a "
+                               f"remedy rule (`rm-…`)")
+        except KeyError as e:
+            raise OpsError(str(e)) from e
+        except ValueError as e:
+            raise OpsError(str(e)) from e
+    finally:
+        central.close()
+    return {"rule": rule, "note": note}
+
+
+def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
+    """What this detector reads, and — given an order — what it would decide. WRITES
+    NOTHING.
+
+    The stored condition is RE-PARSED here, not trusted: a row written by an older
+    release may name a field a later one removed, and a row that fails on read is
+    reported UNREADABLE and never evaluated. The pinned ruling is that a thing which
+    could not be read decides nothing, so `matched` stays `None` — it is never reported
+    as "no match", which would be an answer nobody computed.
+    """
+    from . import rules as rules_mod
+
+    central = CentralStore()
+    try:
+        detector = central.get_detector(detector_id)
+        if detector is None:
+            raise OpsError(f"detector {detector_id!r} not found")
+        remedies_rows = [_remedy_entry(r)
+                         for r in central.remedy_rules_for(detector_id)]
+    finally:
+        central.close()
+
+    out: dict[str, Any] = {
+        "detector": detector, "remedies": remedies_rows, "order_id": order_id,
+        "readable": True, "evaluated": False, "matched": None, "problems": [],
+        "fields": [], "sources": [], "condition_prose": None, "explanation": None,
+        "absent": [], "note": "",
+    }
+    try:
+        cond = rules_mod.parse_condition(detector["condition"])
+    except rules_mod.RulesError as e:
+        problems = list(e.args[0]) if e.args and isinstance(e.args[0], list) else [str(e)]
+        out.update(readable=False, problems=problems, note=(
+            "this condition could not be read, so nothing was evaluated and nothing was "
+            "decided — a row written by an older release may name a field this one no "
+            "longer has"))
+        return out
+
+    out.update(condition_prose=rules_mod.render_condition(cond),
+               fields=sorted(rules_mod.fields_used(cond)),
+               sources=sorted(rules_mod.sources_used(cond)))
+    if not order_id:
+        out["note"] = ("no order given, so nothing was evaluated — this is what the "
+                       "condition reads")
+        return out
+
+    project, path, wo = find_work_order(order_id)
+    store = ProjectStore(path)
+    try:
+        try:
+            facts = rules_mod.facts(store, wo, now=db.now())
+        except NotImplementedError:
+            # `rules.facts` is DECLARED by the grammar section and implemented by the
+            # evaluation-and-firing section, which owns the readers behind every
+            # `FactField.source` slug. Until it lands there is no snapshot, and the
+            # honest answer is to say so: fabricating one, or returning "no match",
+            # would report a verdict nobody computed.
+            out["note"] = (
+                "the fact snapshot is not built in this release — `rules.facts` is "
+                "implemented by the evaluation-and-firing section, so this order was "
+                "not evaluated and nothing was decided")
+            return out
+    finally:
+        store.close()
+
+    evaluation = rules_mod.evaluate(cond, facts)
+    out.update(evaluated=True, matched=evaluation.matched,
+               absent=list(evaluation.absent),
+               explanation=rules_mod.explain(cond, evaluation),
+               project=project,
+               note="a dry run: this wrote nothing and acted on nothing")
+    return out
+
+
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
     """Why this command would, or would not, trip a gate.
 
