@@ -721,3 +721,24 @@ def test_an_auto_review_event_with_no_reason_still_says_something():
     ], [])
 
     assert all(e["detail"] == "no reason recorded" for e in entries), entries
+
+
+def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
+    """docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4, Neo's
+    second condition: a round the OS did NOT spend must be auditable from `jarvis wo show`
+    alone, and a refusal has to say which of the two proofs failed — "someone resolved a
+    conflict" and "the daemon could not reach GitHub" are different news."""
+    carried, refused = build_timeline({}, [
+        ev("validation_head_carried", 1.0, cause="base_merge_chain", round=1,
+           judged_sha="709582ae53000000", carried_head_sha="c2120424ba000000",
+           base="main", chain=["1a2b3c4d5e", "2b3c4d5e6f"], patch_id="b7f0deadbeef"),
+        ev("validation_carry_refused", 2.0, proof="patch_id", round=1,
+           judged_sha="709582ae53000000", head_sha="c2120424ba000000",
+           detail="the branch's own diff changed"),
+    ], [])
+
+    assert carried["label"] == "Verdict carried to the new head"
+    assert "709582ae53" in carried["detail"] and "c2120424ba" in carried["detail"]
+    assert "2 merge(s) of main" in carried["detail"]
+    assert refused["label"] == "Verdict not carried — re-judging"
+    assert "c2120424ba" in refused["detail"] and "resolved content" in refused["detail"]

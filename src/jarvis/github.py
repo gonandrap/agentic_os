@@ -198,7 +198,7 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
 #:   whose pull request merged and whose branch then carried MORE commits. It is recorded
 #:   on the `pr_merged` event so the landing sweep can ask months later without a second
 #:   round trip (`landing.assess`).
-PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,"
+PR_FIELDS = ("state,mergedAt,mergeable,mergeStateStatus,baseRefName,baseRefOid,"
              "statusCheckRollup,headRefOid,mergeCommit")
 
 #: A check conclusion that means THE CODE IS WRONG — as opposed to merely not green. The
@@ -296,6 +296,13 @@ class PullRequest:
     #: against a local checkout: this is a remote sha and the worktree it came from may
     #: be long gone.
     head_oid: str = ""
+    #: `baseRefOid`: the base branch's head commit as GitHub sees it, on the same read.
+    #: WHAT SAYS A BRANCH IS BEHIND on this repository, because `mergeStateStatus` does
+    #: not: with `strict_required_status_checks_policy` off a merely-behind branch reports
+    #: CLEAN, so `behind` below is a cheap positive and never a negative
+    #: (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5.1).
+    #: `ops.catch_up_needed` asks the ancestry question this is the input to.
+    base_oid: str = ""
     #: `mergeCommit.oid`: the commit THIS PULL REQUEST PUT ON ITS BASE, and `""` when
     #: GitHub did not answer it (an open pull request has none, which is not an error).
     #: NOT `head_oid` and never interchangeable with it: `automerge._merge_args` merges
@@ -350,7 +357,14 @@ class PullRequest:
 
     @property
     def behind(self) -> bool:
-        """The branch is behind its base. REPORTED, NEVER ACTED ON — spec §5."""
+        """The branch is behind its base, WHEN GITHUB SAYS SO — which it usually does not.
+
+        Acted on since spec 2026-09-27 §5: the OS catches the branch up itself, because
+        §3's verdict carry made the move free. This stays a POSITIVE SHORT-CIRCUIT only —
+        a repository with the strict status-check policy off answers CLEAN for a behind
+        branch, so `ops.catch_up_needed` decides on `base_oid` ancestry and reads this
+        first merely to skip the local git.
+        """
         return self.merge_state == "BEHIND"
 
 
@@ -413,6 +427,7 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
                      if payload.get("mergeStateStatus") else None),
         checks=read_checks(payload),
         head_oid=str(payload.get("headRefOid") or ""),
+        base_oid=str(payload.get("baseRefOid") or ""),
         # A nested object, so one `or {}` guard — spec §2.
         merge_commit_oid=str((payload.get("mergeCommit") or {}).get("oid") or ""),
     )

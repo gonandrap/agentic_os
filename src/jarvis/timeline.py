@@ -533,6 +533,40 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 else f"Validation forced {who}",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
+    if kind == "validation_head_carried":
+        # THE ROUND THAT WAS NOT SPENT, and Neo's second condition for allowing it (spec
+        # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4): a
+        # carry has to be auditable from `jarvis wo show` alone. Both causes render
+        # through one branch, for `ProjectStore.validated_head`'s one-home reason.
+        judged = str(p.get("judged_sha") or "")
+        now = str(p.get("carried_head_sha") or "")
+        n = len(p.get("chain") or ()) or 1
+        base = p.get("base") or "the base"
+        # Not every walked merge is a merge of the base since Neo question 806 widened
+        # proof (a): one the judged commit already contained counts too (§3.2 item 6).
+        bases = p.get("merged_base_shas")
+        n_base = n if bases is None else len(bases)
+        how = (f"{n} merge(s) of {base} and nothing else" if n_base == n else
+               f"{n} merge(s) — {n_base} of {base}, the rest bringing in only commits it "
+               f"already contained")
+        return ("Verdict carried to the new head",
+                f"round {p.get('round')} passed on {judged[:10]}; it now covers "
+                f"{now[:10]}, which is {judged[:10]} plus {how}")
+    if kind == "validation_carry_refused":
+        # The other half, and it must NAME THE PROOF: "someone resolved a conflict" and
+        # "the daemon could not reach GitHub" are different news, and the round about to
+        # be spent is only justified by the first.
+        head, proof = str(p.get("head_sha") or ""), str(p.get("proof") or "")
+        detail = {
+            "patch_id": (f"the diff on {head[:10]} is not the diff round "
+                         f"{p.get('round')} read, so the merge resolved content nobody "
+                         f"judged"),
+            "chain": (f"{head[:10]} is not the judged commit plus merges of the base "
+                      f"or of commits it already contained"),
+            "fetch": "no local answer about this branch's own diff",
+            "read": "GitHub would not say what this commit merged",
+        }.get(proof, str(p.get("detail") or "the proof could not be made"))
+        return "Verdict not carried — re-judging", detail
     if kind == "validation_rejudge_declined":
         # The one moved head the OS will NOT re-judge: the round it would open is the
         # last one, and that one is the user's (same spec, §4).
