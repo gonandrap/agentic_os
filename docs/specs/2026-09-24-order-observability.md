@@ -727,6 +727,20 @@ alarm, and this lets the user reach the same three — `nudge`, `unblock`, `file
 be a different and much larger section, carrying a registry diff and its own approval
 story. This is not that section.
 
+> **Correction, 2026-09-27 — user ruling on the wo-dbea82cf review, applied by Neo (Neo
+> learning #39), recorded by wo-07ddf44b.** `jarvis wo fix` does NOT auto-match the blocker
+> against a closed table of shipped remedies. When no shipped remedy fits, `fix` files a
+> WORK ORDER to write a new reusable remedy in `src/jarvis/remedies.py` — with tests and a
+> `SHIPPED_REMEDIES` update, off `catalog.RemedyConfig`'s allow-list by default. The
+> registry stays closed at RUNTIME, so `fix` never writes acting code itself, but it GROWS
+> through reviewed code. The user's reason: matching only against what already ships means
+> the OS never learns about new bugs or gaps in itself. The paragraph above ("§11 adds NO
+> remedy to that registry") is superseded ON THIS POINT ONLY, as is the "no shipped remedy
+> covers it, so hand the user §6's command" fallback below, which now comes after filing the
+> new-remedy order. Every other exclusion in this section stands verbatim: no cancelling a
+> turn, no `set_status`, no `wo done`, no `fo resume`, no killing a process — and still no
+> remedy invented at runtime.
+
 **What it refuses.** `remedies.py` excludes cancelling a turn, `set_status`, `wo done`,
 `fo resume` and killing a process, on purpose, and its docstring calls that a boundary
 rather than an oversight. **§11 inherits every one of those exclusions verbatim and must

@@ -1738,7 +1738,7 @@ def fake_gh(tmp_path, monkeypatch):
                    mergeable: str | None = None, base_ref: str = "main",
                    checks: list[dict] | None = None,
                    merge_state: str | None = None, head_oid: str = "",
-                   merge_commit: str = "") -> None:
+                   base_oid: str = "", merge_commit: str = "") -> None:
             """Register what `gh pr view <pr_url>` answers. Re-calling re-states it,
             which is how a test walks a pull request from OPEN to MERGED — or from
             MERGEABLE to CONFLICTING and back.
@@ -1758,10 +1758,16 @@ def fake_gh(tmp_path, monkeypatch):
             — is how a test says "somebody pushed", which is the case the whole SHA
             binding exists for.
 
-            It is OMITTED rather than sent empty when unset, because GitHub never answers
-            an empty sha: a test that wants the field absent must get it absent
-            (`github.PR_FIELDS` asks for `headRefOid` on every call), and one that wants
-            it present says so."""
+            `base_oid` is `baseRefOid`, the base branch's head as GitHub sees it, and it
+            is what says a branch is BEHIND on a repository whose strict status-check
+            policy is off — `mergeStateStatus` answers CLEAN there, so a fixture that
+            could not state this could only drive a catch-up that never fires in
+            production (spec 2026-09-27 §5.1).
+
+            `head_oid`, `base_oid` and `merge_commit` are all OMITTED rather than sent
+            empty when unset, because GitHub never answers an empty sha: a test that
+            wants the field absent must get it absent (`github.PR_FIELDS` asks for
+            `headRefOid` on every call), and one that wants it present says so."""
             if mergeable is None:
                 mergeable = "MERGEABLE" if state == "OPEN" else None
             row = {**self.prs.get(pr_url, {}),
@@ -1773,6 +1779,8 @@ def fake_gh(tmp_path, monkeypatch):
                 row["mergeStateStatus"] = merge_state
             if head_oid:
                 row["headRefOid"] = head_oid
+            if base_oid:
+                row["baseRefOid"] = base_oid
             # `mergeCommit.oid`, the commit the merge put on the base — a NESTED object,
             # which is the shape the extractor has to survive, and omitted rather than
             # null when unset because GitHub answers null only on an unmerged PR.
