@@ -216,6 +216,27 @@ def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_review(detail: dict[str, Any]) -> dict[str, Any]:
+    """The decision this order owes, collapsed to its lines, for HUMAN output.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §4.
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the dict because
+    other tooling reads the counts, while a person gets the same sentences the dashboard's
+    buttons carry — written once, in `ops`, so the two surfaces cannot word one decision
+    differently.
+    """
+    row = dict(detail)
+    state = row.pop("review", None)
+    if state:
+        owed = "pending assumption" + ("" if state["pending"] == 1 else "s")
+        where = (f"round {state['round']} gave up" if state["escalated"]
+                 else f"{state['pending']} {owed}")
+        row["review"] = [f"owed: {where} — {state['scope']}.",
+                         f"accept: {state['accept']}",
+                         f"reject: {state['reject']} {state['strands']}"]
+    return row
+
+
 def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     """The `wo_alarms` rows collapsed to `ops.alarm_standing_line`, for HUMAN output.
 
@@ -2698,6 +2719,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # a work order whose assumptions the OS never looked at has no line here.
                 **({"auto_review": review}
                    if (review := ops.autoreview_state(store, wo)) else {}),
+                # THE DECISION THIS ORDER OWES THE USER, worded exactly as the dashboard's
+                # buttons word it. Same never-always rule: absent when nothing is owed —
+                # spec 2026-09-27-a-review-control-for-an-escalated-round §4.
+                **({"review": owed}
+                   if (owed := ops.review_state(store, wo)) else {}),
                 # The rows themselves, on the same always-present rule: this order's own
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
@@ -2716,9 +2742,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
         finally:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
-        _print(_readable_config(_readable_autoreview(_readable_automerge(
+        _print(_readable_config(_readable_review(_readable_autoreview(_readable_automerge(
             _readable_alarms(_readable_time_in_state(_readable_rounds(_readable_issues(
-                _readable_conversation(detail))))))))
+                _readable_conversation(detail)))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":

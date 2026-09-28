@@ -1,0 +1,42 @@
+{# THE ONE REVIEW CONTROL of a work order: POST /wo/{name}/{wo_id}/review, and the two
+   things a reader has to know before pressing either button.
+
+   docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §3.
+
+   EXACTLY ONE FORM ON THE PAGE, NEVER TWO (Neo 838). One route decides the whole order, so
+   two forms with different labels would misrepresent scope and a validation-section one on
+   an order with a pending assumption would silently accept that assumption. Both call sites
+   are in `work_order.html` and both are guarded by `review.placement` — the single string
+   `ops.review_state` computes once — so "never two" is structural rather than asserted.
+
+   EVERY SENTENCE COMES FROM `ops.review_state`. `jarvis wo show` prints the same ones: a
+   phrase written here could not be printed in a terminal, and the two surfaces would be
+   free to disagree about what a button does. The labels are this surface's, because a
+   terminal has no buttons.
+
+   No JavaScript, per `_validation.html`: the warning about a bare rejection is rendered
+   text, not a `confirm()`. #}
+
+{% macro review_form(project, wo, review) %}
+<div class="row">
+  <form method="post" action="/wo/{{ project }}/{{ wo.id }}/review"
+        style="flex:1; display:flex; gap:8px; align-items:center">
+    <input type="text" name="feedback" style="flex:1"
+           placeholder="Why? (optional — teaches Neo, and on reject goes to the worker as guidance)">
+    <button name="decision" value="accept" class="accept"
+            title="{{ review.accept }}">{{ 'Accept all' if review.pending
+                                           else 'Accept as is' }}</button>
+    <button name="decision" value="reject" class="danger"
+            title="{{ review.reject }}">{{ 'Reject all' if review.pending
+                                           else 'Send it back' }}</button>
+  </form>
+</div>
+{# WHAT EACH BUTTON DOES, as text beside it — a `title=` is a thing nobody hovers, and the
+   scope of this decision is the fact the reader is most likely to get wrong. #}
+<div class="row"><span class="sub">{{ review.scope }}.{% if review.pending
+      and review.round %} It also settles round {{ review.round }}'s escalation —
+  <a href="#round-{{ review.round }}">round {{ review.round }} →</a>{% endif %}</span></div>
+<div class="row"><span class="sub">Accept: {{ review.accept }}</span></div>
+<div class="row"><span class="sub">Send back: {{ review.reject }}
+  {{ review.strands }}</span></div>
+{% endmacro %}

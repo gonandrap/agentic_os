@@ -2703,3 +2703,95 @@ def test_a_work_order_with_no_pull_request_says_nothing_about_merging(client, da
     daemon.tick()
 
     assert "MERGED" not in client.get(f"/wo/proj_a/{wo['id']}").text
+
+
+# -- the review control an escalated round owes ------------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §3, §5, §7.
+# THE FIXTURE GOES THROUGH `ops.escalate_validation_round` (ruling kn-303839ee): a
+# `set_status("needs_review")` plus a hand-written round leaves no attention flag and no
+# closed round, so the test would pass against a page rendering the form unconditionally.
+
+
+def _escalate(project, title="the panel gave up on it"):
+    """A work order in the live shape of wo-659be188: `needs_review`, latest round
+    `escalated`, no assumption rows at all."""
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order(title)
+        r = store.open_validation_round(wo_id=wo["id"], fingerprint="cccc3333",
+                                        summary="ship it", evidence="ran pytest")
+        ops.escalate_validation_round(store, wo, r["id"], r["round"],
+                                      "round 2 asked for the same test again")
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_an_escalated_round_with_no_assumptions_still_offers_the_review(client, project):
+    """The whole defect: the only review form was gated on a pending assumption, so an
+    order the panel gave up on named the ask and offered no way to answer it."""
+    wo = _escalate(project)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert f'action="/wo/proj_a/{wo["id"]}/review"' in page
+    assert 'name="decision" value="accept"' in page
+    assert 'name="decision" value="reject"' in page
+    assert "over the panel's objection" in html.unescape(" ".join(page.split()))
+    # ...and it is where the deep link lands — §7.
+    assert page.count('id="pending"') == 1
+
+
+def test_the_review_control_renders_once_and_in_the_assumptions_block(client, project):
+    """Neo 838: exactly one form, never two. Both conditions are true here."""
+    wo = _escalate(project)
+    ops.assume(wo["id"], "assumed the API is v2")
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+    action = f'action="/wo/proj_a/{wo["id"]}/review"'
+
+    assert page.count(action) == 1
+    # The one form is in the assumptions block, above the rounds — never beside them.
+    block = page.split("Assumptions pending your review", 1)[1].split(">Validation<", 1)[0]
+    assert action in block
+    # The line naming the round this one decision now ALSO settles.
+    assert "also settles round 1" in " ".join(block.split())
+    assert 'href="#round-1"' in block
+
+
+def test_rejecting_an_escalated_order_records_the_review_and_guides_the_worker(
+        client, project):
+    wo = _escalate(project)
+
+    res = client.post(f"/wo/proj_a/{wo['id']}/review",
+                      data={"decision": "reject", "feedback": "the panel is right"})
+
+    assert res.status_code == 303
+    store = ProjectStore(project)
+    try:
+        assert store.events_of_kind(wo["id"], "reviewed")
+        assert [m["content"] for m in store.list_messages(wo["id"])] \
+            == ["the panel is right"]
+    finally:
+        store.close()
+
+
+def test_the_feature_order_page_never_grows_a_work_order_review_form(client, project):
+    """§5: the shared `section()` macro must not carry it. A feature order has no
+    `review_work_order` equivalent, so a form posting to `/wo/.../review` there would
+    point at nothing."""
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order("CSV export", description="the whole ask")
+        r = store.open_validation_round(fo_id=fo["id"], fingerprint="dddd4444",
+                                        summary="the plan", evidence="read the tree")
+        store.close_validation_round(r["id"], "escalated", "the plan cannot be judged")
+    finally:
+        store.close()
+
+    page = client.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Validation" in page and "the plan cannot be judged" in page
+    assert "/wo/proj_a/" not in page.split(">Validation<")[1]
+    assert "over the panel's objection" not in html.unescape(" ".join(page.split()))
