@@ -2684,6 +2684,17 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     hold on a different head means the head moved, which is a new submission the denial
     does not describe. An APPROVAL gains no stickiness at all, which is the case the
     paragraph above exists for.
+
+    **A HOLD THAT IS NO LONGER ABOUT NOW IS MARKED, AND THE PAYLOAD SURVIVES** —
+    2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The line is
+    present tense and the event is immutable, so a hold written at round 3 on an order that
+    has since left `waiting_pr_merge` went on being rendered for ever — nothing can write a
+    newer one, because `Daemon.auto_merge` returns before `decide` for such an order. Only
+    `line` changes: `code`, `judged_sha`, `head_sha` and `round` all stay, because
+    `force_validation_state` builds the re-judge control's diagnosis out of them and a
+    dropped event or a mutated `kind` would erase it. That is the difference from
+    `autoreview_state`, which filters stale rows out: nothing downstream of it reads the
+    payload's fields.
     """
     from . import db
     from .automerge import decided_sha
@@ -2714,6 +2725,16 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     newest = terminal or newest
     if newest is None:
         return None
+    # A HOLD IS MARKED STALE, NEVER DROPPED (2026-09-27-a-stale-merge-hold-is-not-the-
+    # reason-a-pr-is-not-merging.md §2), and after the two rules above have chosen
+    # `newest`, so neither of them changes. The round is read only for a hold —
+    # `_stale_panel_hold`'s discipline.
+    if newest["kind"] == "automerge_held":
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        if why := _automerge_hold_is_stale(wo, latest, newest):
+            newest = {**newest, "stale": True, "stale_because": why,
+                      "stale_status": str(wo.get("status") or ""),
+                      "stale_round": int((latest or {}).get("round") or 0)}
     return {**newest, "line": _automerge_line(newest)}
 
 
@@ -2759,7 +2780,7 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     from . import db
 
     newest: dict[str, Any] | None = None
-    stale = _stale_panel_hold(store, wo["id"])
+    stale = _stale_panel_hold(store, wo["id"], status=str(wo.get("status") or ""))
     for kind in AUTOREVIEW_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
         # A `panel_gave_up` hold about an overtaken round cannot be this kind's candidate,
@@ -2845,8 +2866,57 @@ _RULING_RANK = {"autoreview_confirmed": 9, "autoreview_unconfirmed": 8,
                 "autoreview_asked": 1}
 
 
+#: THE STATUSES A FRESH HOLD CAN STILL ARRIVE IN, and freshness is judged ONLY outside
+#: them. `Daemon.auto_merge` returns at src/jarvis/daemon.py:4941 on any other status
+#: whatever `record_only` says, so `waiting_pr_merge` is the only status a hold is ever
+#: WRITTEN in — and one tick writes a `HELD_SHA_MOVED` hold and then `_rejudge_moved_head`
+#: (src/jarvis/daemon.py:4963-4968) moves the order to `validating`, where the hold would
+#: otherwise be stale at birth. In `validating` the round machine owns the row and the poll
+#: rewrites the hold within a tick of it settling, so the running round IS the answer to
+#: "why has this not merged".
+_HOLD_REFRESHABLE_STATUSES = ("waiting_pr_merge", "validating")
+
+
+def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | None,
+                             payload: dict[str, Any]) -> str:
+    """WHY this `automerge_held` event is no longer a claim about now — `""` when it is.
+
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §1. Beside `_panel_hold_is_stale` so the two freshness rules sit in one
+    place and one reader can see they agree: both are a present-tense claim derived from
+    an append-only timeline event and re-derived here against the current row (kn-a2ebbbdb,
+    kn-96f47efb).
+
+    Judged against LOCAL ROWS ONLY, which is `automerge_state`'s standing rule: no `gh`
+    call from a render path.
+
+    BOTH CHECKS ARE GATED ON `_HOLD_REFRESHABLE_STATUSES` — an order a fresh hold can still
+    arrive in is never judged, because the next tick judges it instead.
+
+    (a) `status` — outside those two statuses, which is where `Daemon.auto_merge` returns
+        before `decide` and so where no newer hold can ever be written. The same condition
+        that froze the sentence, not a second opinion about it.
+    (b) `round` — in `waiting_pr_merge` only, and strictly `<`, never `!=`: a payload round
+        ABOVE the latest row is not something the store can produce, and calling that stale
+        would hide a hold on an arithmetic surprise.
+
+    A PAYLOAD WITH ROUND 0 OR NO ROUND IS SKIPPED BY (b) ENTIRELY — `HELD_ASSUMPTIONS`,
+    `HELD_PLAN_ASSUMPTIONS` and every hold written before this shipped. No freshness key,
+    no round verdict: silence rather than a guess.
+    """
+    status = str(wo.get("status") or "")
+    if status not in _HOLD_REFRESHABLE_STATUSES:
+        return "status"
+    if status != "waiting_pr_merge":
+        return ""
+    held_round = int(payload.get("round") or 0)
+    if held_round and held_round < int((latest_round or {}).get("round") or 0):
+        return "round"
+    return ""
+
+
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any]) -> bool:
+                         payload: dict[str, Any], status: str = "") -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -2864,9 +2934,22 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     A PAYLOAD WITH NO ROUND — written before this shipped — is dropped only by clause (i).
     An order whose newest round is still escalated HAS had its panel give up, so
     suppressing the sentence there would replace a stale truth with a fresh silence.
+
+    `HELD_STATUS` IS THE SECOND CODE THIS ANSWERS FOR, and it needs no round and no payload
+    field (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6): the
+    claim is that the order is not in a state one of the two review passes acts in, so it
+    is stale exactly when the order now IS in one. The authority is
+    `autoreview.REVIEW_PASS_STATUSES`, which is the pair of literals `decide` and
+    `decide_early` test themselves — no second list of statuses exists to drift. The UNION
+    is deliberately imprecise: the payload does not say which pass wrote the hold, so a
+    hold from either is dropped once the order reaches either status. Both mis-drops lose a
+    stale sentence about a pass that no longer owns the row, while the pass that does own
+    it writes its own events on the next tick — never a lost live one.
     """
     from . import autoreview
 
+    if str(payload.get("code") or "") == autoreview.HELD_STATUS:
+        return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
         return False
     if not latest_round or str(latest_round.get("outcome") or "").lower() != "escalated":
@@ -2875,24 +2958,36 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     return bool(held_round) and held_round != int(latest_round.get("round") or 0)
 
 
-def _stale_panel_hold(store: ProjectStore, wo_id: str):
-    """`_panel_hold_is_stale` bound to this work order, reading the round LAZILY and ONCE.
+def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = None):
+    """`_panel_hold_is_stale` bound to this work order, reading its rows LAZILY and ONCE.
 
     An order with no panel hold pays nothing for the check — the discipline
     `assumptions_with_rulings` already applies to `_overtaken` and `objection_response`.
+
+    `status` is the work order's, for the `HELD_STATUS` clause: a caller that already holds
+    the row passes it rather than making this read the row again, and one that holds only
+    the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
+    of that code turns up.
     """
     from . import autoreview
 
-    cache: dict[str, dict[str, Any] | None] = {}
+    cache: dict[str, Any] = {}
+    codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
-        if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
+        code = str(payload.get("code") or "")
+        if code not in codes:
             return False
+        if "status" not in cache:
+            cache["status"] = (status if status is not None
+                              else str(store.get_work_order(wo_id)["status"] or ""))
+        if code == autoreview.HELD_STATUS:
+            return _panel_hold_is_stale(None, payload, cache["status"])
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload)
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
 
     return stale
 
@@ -3335,6 +3430,14 @@ def _automerge_line(state: dict[str, Any]) -> str:
                 f"{str(state.get('head_sha') or '')[:10]}")
     if kind == "automerge_failed":
         return f"the merge failed: {state.get('reason') or 'no reason recorded'}"
+    # A hold `automerge_state` marked stale. NEITHER SENTENCE REUSES THE STORED REASON —
+    # quoted even in the past tense it is what sent wo-659be188's reader to a CI run that
+    # had passed two rounds earlier (2026-09-27 spec §5).
+    if state.get("stale_because") == "status":
+        return f"not parked for merge: {state.get('stale_status') or 'in no status'}"
+    if state.get("stale_because") == "round":
+        return (f"round {state.get('round')}'s hold is out of date — round "
+                f"{state.get('stale_round')} is the current round")
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
@@ -4198,6 +4301,11 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
     and would answer about a different moment than the record is describing
     (`automerge_state`'s own note).
 
+    A hold `automerge_state` marked STALE is treated exactly as a non-hold kind — no
+    diagnosis, `refusal` and `can_force` untouched. The claim it would build is about a
+    commit a later round has since judged, which is the class of claim the 2026-09-27 spec
+    removes, and restating it inside a button is no better than printing it on a line.
+
     Only the two holds a fresh round CLEARS are diagnosed. A red build or a conflict is a
     hold this control cannot help with, and wording one of those as something to force a
     round over is how a user comes to spend round numbers on a failing CI run.
@@ -4209,7 +4317,9 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
         return None
     refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
     state: dict[str, Any] = dict(held or {})
-    if state.get("kind") != "automerge_held":
+    # A STALE HOLD IS TREATED AS NO HOLD (2026-09-27 spec §3): diagnosing from one would
+    # say the head moved away from a commit a later round has since judged.
+    if state.get("kind") != "automerge_held" or state.get("stale"):
         state = {}
     code = str(state.get("code") or "")
     judged = str(state.get("judged_sha") or "")

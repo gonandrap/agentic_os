@@ -5942,6 +5942,15 @@ class Daemon:
           from `PR_POLL_STATUSES` reaches the poll (issue #224), so this would otherwise
           fire on every `needs_review` order with a green pull request and tell the user
           the automatic merge declined something it was never asked about.
+
+        **THE ROUND IS PART OF THE KEY**, `_note_autoreview_held`'s medicine for
+        `panel_gave_up` (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+        merging.md §4). Six poll-reachable codes carry no round number in their reason, so
+        at an unmoved head round N+1's sentence is byte-identical to round N's: without the
+        round it writes nothing, the stored payload still says N, and
+        `ops._automerge_hold_is_stale` then declares a TRUE hold stale (kn-96f47efb). The
+        bound this dedupe exists for is kept — `decide` is deterministic given state, and
+        the round changes only when a round opens.
         """
         from . import automerge
 
@@ -5949,11 +5958,12 @@ class Daemon:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
         key = (str(decision.head_sha or ""), str(decision.code or ""),
-               str(decision.reason or ""))
+               str(decision.reason or ""), int(decision.round_n or 0))
         if not _hold_is_news(store, wo_id, "automerge_held", key,
                              lambda p: (str(p.get("head_sha") or ""),
                                         str(p.get("code") or ""),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        int(p.get("round") or 0))):
             return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,
