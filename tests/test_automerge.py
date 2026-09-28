@@ -1775,6 +1775,193 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
         invariants.AUTOMERGE_DENIED_BLOCKER
 
 
+# -- a hold is a claim about NOW, and the round it was written at decides ---------------
+#
+# docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+# merging.md. Measured on wo-659be188: `held — round 3 is waiting for CI` while the order
+# was at round 5, CI green, status `needs_review`. Both halves false, and nothing can ever
+# write a newer hold — `Daemon.auto_merge` returns before `decide` for an order that left
+# `waiting_pr_merge`, so the last hold written stays the rendered one for ever.
+
+
+def a_hold(store, wo_id: str, code: str, *, round_n: int, head_sha: str = JUDGED,
+           reason: str = "round 1 is waiting for CI") -> None:
+    """One `automerge_held` event, exactly as `Daemon._note_automerge_held` writes it."""
+    store.add_event(wo_id, "automerge_held", {
+        "code": code, "reason": reason, "judged_sha": JUDGED, "head_sha": head_sha,
+        "round": round_n})
+
+
+def open_round(store, wo_id: str, outcome: str = "") -> int:
+    """A fresh round, settled only when an outcome is named. Returns its number."""
+    row = store.open_validation_round(wo_id=wo_id, fingerprint="fp2")
+    store.set_validation_head(row["id"], JUDGED)
+    if outcome:
+        store.close_validation_round(row["id"], outcome, "")
+    return int(row["round"])
+
+
+def test_a_hold_from_a_round_a_later_one_overtook_is_not_read_as_live(started, project):
+    """A round number is the freshness key: round N's hold says nothing about round N+1."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
+    later = open_round(store, wo["id"])
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["stale"] is True
+    assert "held" not in state["line"]
+    assert "round 1" in state["line"] and f"round {later}" in state["line"]
+
+
+def test_an_order_awaiting_a_person_shows_no_live_merge_hold(started, project):
+    """wo-659be188's shape. The mechanism is not running over this order at all, so the
+    line makes no claim about the merge — and the payload SURVIVES the marking, because
+    `ops.force_validation_state` branches on its `code`."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
+    store.set_status(wo["id"], "needs_review")
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["line"] == "not parked for merge: needs_review"
+    assert state["code"] == automerge.HELD_CHECKS_RUNNING
+    assert state["judged_sha"] == JUDGED and state["round"] == 1
+
+
+def test_a_hold_at_the_current_round_on_a_parked_order_is_unchanged(started, project,
+                                                                   fake_gh):
+    """THE REGRESSION THE DEDUPE FIX PROTECTS. A true, current hold is still the line."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=[check("unit", "FAILURE")], merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(started, store)
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["code"] == automerge.HELD_CHECKS_FAILED
+    assert "stale" not in state
+    assert state["line"].startswith("held — ")
+
+
+def test_two_rounds_at_one_head_with_the_same_reason_both_record_a_hold(
+        started, project, fake_gh):
+    """WITHOUT THIS THE READ-SIDE FIX INVERTS ITSELF. Nine poll-reachable codes carry no
+    round number in their reason, so at an unmoved head the sentences are byte-identical
+    across rounds: round N+1's hold was deduped away, the stored payload still said N,
+    and the freshness check would then call a TRUE hold stale (kn-96f47efb)."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=[check("unit", "FAILURE")], merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(started, store)
+    current = open_round(store, wo["id"], "passed")
+    poll(started, store)
+
+    holds = [db.from_json(e["payload"], {})
+             for e in store.events_of_kind(wo["id"], "automerge_held")]
+
+    assert len(holds) == 2
+    assert holds[-1]["round"] == current
+    assert holds[0]["reason"] == holds[-1]["reason"]
+
+
+def test_force_validation_state_keeps_a_fresh_diagnosis_and_offers_none_when_stale(
+        started, project, monkeypatch):
+    """The diagnosis is a sentence about which commit the head moved AWAY from. Built
+    from a stale hold it names a commit a later round has since judged — the exact class
+    of claim this spec removes, restated inside a button."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    # The control is only rendered where the panel is on, and the catalog FILE stays off in
+    # these fixtures (`arm`'s note) — patched AFTER the order is built, so `ops.finish`
+    # still leaves it parked rather than `validating`.
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    def control():
+        row = store.get_work_order(wo["id"])
+        return ops.force_validation_state(store, row, project="proj_a",
+                                          held=ops.automerge_state(store, row))
+
+    fresh = control()
+    assert JUDGED[:10] in fresh["diagnosis"] and PUSHED[:10] in fresh["diagnosis"]
+
+    open_round(store, wo["id"], "passed")   # settled, so the refusal is the one it was
+    stale = control()
+
+    assert stale["diagnosis"] == ""
+    assert (stale["can_force"], stale["refusal"]) == (fresh["can_force"],
+                                                      fresh["refusal"])
+
+
+def test_a_round_running_on_the_moved_head_is_not_a_stale_hold(started, project,
+                                                               monkeypatch):
+    """FRESHNESS IS JUDGED ONLY OUTSIDE THE STATUSES A FRESH HOLD CAN STILL ARRIVE IN.
+
+    One poll tick writes the `sha_moved` hold and then `_rejudge_moved_head` moves the
+    order to `validating`, so judging that status would call every such hold stale at
+    birth — and blank the re-judge diagnosis for the one population it was written for.
+    The round the OS opened on the moved head IS the answer to "why has this not merged".
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    open_round(store, wo["id"])              # the re-judge, still running
+    store.set_status(wo["id"], "validating")
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    row = store.get_work_order(wo["id"])
+    state = ops.automerge_state(store, row)
+
+    # Not stale, so the payload still feeds the control — but not live either: the line is
+    # the history sentence, per the user's follow-up.
+    assert "stale" not in state and state["line"].startswith("re-judging in round ")
+    diagnosis = ops.force_validation_state(store, row, project="proj_a",
+                                           held=state)["diagnosis"]
+    assert JUDGED[:10] in diagnosis and PUSHED[:10] in diagnosis
+
+
+def test_a_hold_on_an_order_being_re_judged_reads_as_history_not_as_now(started, project):
+    """The user's follow-up to this spec: while a round runs, the hold it superseded is
+    history. `held — <reason>` in the present tense says the order is stopped on that
+    reason when the answer is that the panel is judging it again (#786, #813)."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["line"] == f"re-judging in round {running} (was held: the head moved)"
+    assert "held — " not in state["line"]
+    assert state["stale_because"] == "rejudging"
+    assert "stale" not in state
+
+
+def test_a_re_judging_hold_still_feeds_the_re_judge_control(started, project, monkeypatch):
+    """The marking must stay OFF `stale`: `force_validation_state` blanks its diagnosis on
+    that key, and the `sha_moved` population it exists for is exactly the one sitting in
+    `validating`."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    def control():
+        row = store.get_work_order(wo["id"])
+        return ops.force_validation_state(store, row, project="proj_a",
+                                          held=ops.automerge_state(store, row))
+
+    parked = control()
+    open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    rejudging = control()
+
+    assert JUDGED[:10] in rejudging["diagnosis"] and PUSHED[:10] in rejudging["diagnosis"]
+    assert rejudging["diagnosis"] == parked["diagnosis"]
+    # `can_force` moves for the STATUS rule and not for the marking: `validating` is not
+    # forceable, and that is the same sentence any validating order gets.
+    assert rejudging["can_force"] is False and "is validating" in rejudging["refusal"]
+
+
 # -- a carried head relaxes the sha condition and nothing else -------------------------
 # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4 condition
 # (i), and Neo question 791 made it a requirement rather than a remark.
@@ -1852,3 +2039,63 @@ def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judge
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
                 and "/commits/" in c["argv"][3]]
     assert len(store.list_approvals(wo["id"])) == 1
+
+
+def test_both_shapes_of_wo_show_say_a_superseded_hold_is_history_while_a_round_runs(
+        started, project, capsys):
+    """The CLI's two surfaces, from the one marked state — the user's follow-up to
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §5.
+
+    `--json` keeps the payload for tooling that reads the SHAs, so it has to carry the
+    MARKING (`stale_because`) beside them: without it a reader of the document has no way
+    to tell a live hold from a superseded one. The human row is `state["line"]` and
+    nothing else — collapsing to `state["reason"]` instead would print `held — <reason>`
+    in the present tense about a commit the running round has already moved past.
+    """
+    import json as _json
+
+    from jarvis import cli
+
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="round 1 passed on a1b2c3d4e5, the head is now e4f5a6b7c8")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    history = (f"re-judging in round {running} (was held: round 1 passed on a1b2c3d4e5, "
+               f"the head is now e4f5a6b7c8)")
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = _json.loads(capsys.readouterr().out)
+
+    assert document["auto_merge"]["stale_because"] == "rejudging"
+    assert document["auto_merge"]["line"] == history
+
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    human = capsys.readouterr().out
+
+    assert history in human
+    assert "held — " not in human
+
+
+def test_the_round_line_beside_a_re_judging_hold_describes_the_round_and_no_hold(
+        started, project):
+    """AN AUDIT OF THE SIBLING SUMMARY LINE, asked for alongside the same follow-up.
+
+    `ops.round_line` does not read the merge hold at all, and it must not start: the open
+    round's line is the running round's standing, so a hold's wording appearing here —
+    the word `held` or the stored reason quoted from the payload — would be a second
+    surface making the present-tense claim §5 removed, on a line that cannot even say
+    which commit the hold was about.
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved under the pass")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    line = ops.round_line(store.latest_validation_round(wo_id=wo["id"]))
+
+    assert line.startswith(f"round {running} · ")
+    assert "pending" in line
+    assert "held" not in line and "the head moved under the pass" not in line
