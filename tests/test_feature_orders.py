@@ -1115,3 +1115,120 @@ def test_a_refreshed_spec_reaches_the_children_and_the_feature_agent(planning, s
     out = ops.rebuild_feature_agent(fo["id"])
     definition = Path(out["dir"]) / ".claude" / "agents" / f"{out['agent']}.md"
     assert "frozen records" in definition.read_text()
+
+
+# -- the spec a person can open ---------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document the OS
+# HOLDS is the one every surface shows — it works before any pull request exists — and
+# which revision that is has to be RECORDED, never invented.
+
+
+def test_submitting_a_plan_records_which_revision_the_snapshot_came_from(planning,
+                                                                         store):
+    """§4. Set in the same statement as the content, so the two cannot disagree."""
+    _, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema")))
+
+    plan = db.from_json(store.get_feature_order(fo["id"])["plan"], {})
+    assert plan["design_doc_content"].startswith("# Exporter design")
+    # `landing.committed_text`'s own words, verbatim — re-wording them here would make
+    # the page and the Neo question describe one snapshot two ways.
+    assert re.match(r"(branch \S+|origin/\S+|\S+) @ [0-9a-f]{4,}",
+                    plan["design_doc_source"]), plan["design_doc_source"]
+
+
+def test_spec_link_points_a_planner_and_a_child_at_the_same_document(planning, store):
+    """§5(a). `spec_of` still answers None for a planner; this is the second, narrow
+    projection beside it."""
+    daemon, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE")))
+    released(daemon, store, fo["id"])
+
+    planner = planner_of(store, fo["id"])
+    kid = store.feature_children(fo["id"])[0]
+
+    assert specs.spec_of(store, planner) is None  # deliberately untouched
+    link = specs.spec_link(store, planner)
+    assert link is not None
+    assert link["fo_id"] == fo["id"] and link["repo_path"] == FIXTURE_DESIGN_DOC
+    assert link["anchor"] == ""  # a planner owns the whole feature, not a section
+
+    child_link = specs.spec_link(store, kid)
+    assert child_link is not None and child_link["anchor"]
+    # A standalone work order has no plan and therefore no spec to point at.
+    ordinary = ops.create_work_order("proj_a", "an ordinary job")
+    assert specs.spec_link(store, store.get_work_order(ordinary["id"])) is None
+
+
+def test_the_cli_prints_one_section_and_not_the_whole_document(planning, store,
+                                                              capsys):
+    """Spec test 6. The terminal gets MARKDOWN — the HTML renderer serves the page."""
+    from jarvis import cli
+
+    _, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema")))
+
+    assert cli.main(["fo", "spec", fo["id"], "--section", "3"]) == 0
+
+    out = capsys.readouterr().out
+    assert FIXTURE_DESIGN_DOC in out.splitlines()[0]  # the header line, with provenance
+    assert "Failure handling" in out
+    assert "union of keys" not in out  # §2 stays out
+
+
+def test_the_cli_names_the_headings_when_a_section_does_not_resolve(planning, capsys):
+    _, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema")))
+
+    from jarvis import cli
+    assert cli.main(["fo", "spec", fo["id"], "--section", "no such thing"]) == 1
+
+    assert "Data model" in capsys.readouterr().err
+
+
+def test_the_cli_refuses_a_feature_with_no_plan_and_names_its_state(planning, capsys):
+    from jarvis import cli
+
+    _, fo = planning
+    assert cli.main(["fo", "spec", fo["id"]]) == 1
+
+    assert "planning" in capsys.readouterr().err
+
+
+def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
+    """§6. A planner's `spec_section` column is NULL, so today it says nothing at all."""
+    from jarvis import cli
+
+    _, fo = planning
+    ops.submit_plan(fo["id"], a_plan(child("schema")))
+
+    assert cli.main(["wo", "show", fo["plan_wo_id"], "--json"]) == 0
+
+    detail = json.loads(capsys.readouterr().out)
+    assert detail["spec"]["repo_path"] == FIXTURE_DESIGN_DOC
+    assert detail["spec"]["fo_id"] == fo["id"]
+
+    # And for a person: the document, the revision, and THE COMMAND — never a URL, since
+    # the CLI does not know the dashboard's host.
+    assert cli.main(["wo", "show", fo["plan_wo_id"]]) == 0
+    human = capsys.readouterr().out
+    assert f"jarvis fo spec {fo['id']}" in human
+    assert "http" not in human.split("spec")[-1]
+
+
+def test_the_github_link_is_omitted_rather_than_guessed(project):
+    """§6. A 404 from a URL the OS assembled reads as the spec having been deleted."""
+    from jarvis import github
+    from jarvis.testing import with_origin
+
+    # No origin: nothing to build an owner/repo from.
+    assert github.blob_url(project, FIXTURE_DESIGN_DOC) is None
+
+    with_origin(project)
+    url = github.blob_url(project, FIXTURE_DESIGN_DOC)
+    assert url is not None
+    assert url.startswith("https://github.com/acme/proj/blob/")
+    # Built on the SHA, so it keeps showing what the page showed after main moves.
+    assert re.search(rf"/blob/[0-9a-f]{{40}}/{FIXTURE_DESIGN_DOC}$", url), url
+    assert github.blob_url(project, "") is None

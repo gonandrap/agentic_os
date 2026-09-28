@@ -283,9 +283,9 @@ def test_a_hold_a_fresh_round_cannot_clear_is_not_diagnosed_as_one_that_can(
     store, wo = parked(fleet, project, judged=JUDGED)
     artifact(fake_gh)
     monkeypatch.setattr(ops, "automerge_state", lambda store, wo: {
-        "kind": "automerge_held", "code": "checks_not_green", "round": 1,
+        "kind": "automerge_held", "code": "checks_failed", "round": 1,
         "judged_sha": JUDGED, "head_sha": JUDGED,
-        "line": "held — CI has not finished a unanimous pass on this commit"})
+        "line": "held — CI failed: unit (3.13)"})
 
     page = page_of(wo["id"])
 

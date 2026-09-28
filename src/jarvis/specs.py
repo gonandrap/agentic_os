@@ -180,6 +180,35 @@ def spec_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
             "section": which, "section_text": (text or "").strip()}
 
 
+def spec_link(store: ProjectStore, wo: dict[str, Any]) -> dict[str, str] | None:
+    """Where this order's spec can be READ. None for a standalone work order.
+
+    Any order with a parent — planner, manager or child — §5(a) of
+    docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. Deliberately NOT
+    `spec_of`, which answers None for a planner by design and must keep doing so: three
+    readers depend on "a planner has no section of its own".
+
+    Returns `fo_id`, `repo_path`, `source` (the revision, "" when the plan predates it
+    being recorded) and `anchor` — "" unless a child's `spec_section` resolves. It
+    carries NO content: the page is the pointer, not a second copy.
+    """
+    from .ui import markdown  # stdlib-only module; no FastAPI, no Jinja
+
+    fo_id = str(wo.get("parent_id") or "")
+    if not fo_id:
+        return None
+    plan = plan_of(store, fo_id)
+    content = str(plan.get("design_doc_content") or "")
+    repo_path = str(plan.get("design_doc") or "")
+    if not (content and repo_path):
+        return None
+    which = str(wo.get("spec_section") or "").strip()
+    anchor = markdown.anchor_for(content, which) if which else None
+    return {"fo_id": fo_id, "repo_path": repo_path,
+            "source": str(plan.get("design_doc_source") or ""),
+            "anchor": anchor or ""}
+
+
 def materialize(project_path: Path, fo_id: str, wo_id: str,
                 spec: dict[str, str]) -> dict[str, str]:
     """Write the spec and this child's section under `.jarvis/`; return the paths.
