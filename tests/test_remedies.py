@@ -165,21 +165,38 @@ def test_every_covers_slug_is_a_real_blocker_and_no_two_remedies_claim_one():
     assert remedies.REMEDIES["file_work_order"].covers == ()
 
 
-def test_covering_answers_the_one_owner_and_none_for_an_unclaimed_slug():
-    assert remedies.covering("prompt") == "nudge"
-    assert remedies.covering("pending") == "unblock"
-    assert remedies.covering("gate_held") is None
-    assert remedies.covering("a-slug-shipped-next-year") is None
+def test_resolve_answers_a_code_match_and_none_for_an_unclaimed_slug():
+    """`resolve` is `covering`'s replacement (the user's design addition, superseding Neo
+    q839's table-free lookup with the same one-lookup-function seam fo-69ba1cc4's data
+    rows will back): a `RemedyMatch` naming the primitive, empty `params`, `source=="code"`
+    — and still None for anything unclaimed."""
+    nudge = remedies.resolve("prompt")
+    assert nudge == remedies.RemedyMatch(remedy="nudge", params={}, source="code")
+    unblock = remedies.resolve("pending")
+    assert unblock == remedies.RemedyMatch(remedy="unblock", params={}, source="code")
+    assert remedies.resolve("gate_held") is None
+    assert remedies.resolve("a-slug-shipped-next-year") is None
 
 
-def test_covering_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
+def test_resolve_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
     """Paired with the green registry above: the guard is asserted to BITE, or the test
     that says the registry is clean is grading nothing."""
     clash = remedies.Remedy(**{**vars(remedies.REMEDIES["file_work_order"]),
                                "covers": ("prompt",)})
     monkeypatch.setitem(remedies.REMEDIES, "file_work_order", clash)
     with pytest.raises(ValueError, match="prompt"):
-        remedies.covering("prompt")
+        remedies.resolve("prompt")
+
+
+def test_resolve_raises_when_a_row_names_a_primitive_absent_from_remedies(monkeypatch):
+    """The row/primitive split, ahead of fo-69ba1cc4's data rows actually arriving: a slug
+    that resolves to an id `REMEDIES` does not have is a malformed rule and must not come
+    back as a usable `RemedyMatch` — that would fail later, further from the cause."""
+    ghost = remedies.Remedy(**{**vars(remedies.REMEDIES["unblock"]),
+                               "id": "no-such-primitive", "covers": ("pending",)})
+    monkeypatch.setitem(remedies.REMEDIES, "unblock", ghost)
+    with pytest.raises(ValueError, match="no-such-primitive"):
+        remedies.resolve("pending")
 
 
 def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):

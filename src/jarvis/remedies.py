@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 log = logging.getLogger("remedies")
 
@@ -209,6 +209,11 @@ class Remedy:
     #: (kn-4ea33fe6), so a remedy added later is reachable from `ops.fix` with no edit to
     #: `ops` at all — and a slug no remedy claims falls to `fix`'s default arm, which asks
     #: for the remedy rather than shrugging.
+    #:
+    #: THIS IS THE CODE-DECLARED BACKING for `resolve` — today's only source. fo-69ba1cc4
+    #: adds DATA rows beside it in the central store, a remedy = primitive + parameters
+    #: keyed by `gap_class`, and a data row carries exactly the same fact this tuple does:
+    #: which slug it clears.
     covers: tuple[str, ...]
     apply: Callable[..., str]
 
@@ -510,22 +515,67 @@ def get(remedy_id: str) -> Remedy:
     return REMEDIES[remedy_id]
 
 
-def covering(slug: str) -> str | None:
-    """The one remedy whose `covers` holds this `ops.waiting_on` slug, or None.
+@dataclass(frozen=True)
+class RemedyMatch:
+    """What `resolve` answers for a claimed slug: a primitive, and its parameters."""
 
-    THE REGISTRY ANSWERS THIS AND NOT A TABLE IN `ops` (Neo q839): the user's ruling is
-    that auto-matching a blocker against a closed table there means the OS never learns
-    which blockers it has no remedy for. None is therefore a USEFUL answer and `ops.fix`
-    acts on it — it asks for a remedy to be written — so this function must never guess.
+    #: The primitive's id — always a key of `REMEDIES` (`resolve` raises otherwise).
+    remedy: str
+    #: The primitive's parameters. Empty for every row today, because today's rows are all
+    #: `Remedy.covers` entries and carry no parameters of their own; fo-69ba1cc4's data rows
+    #: are where this stops being empty.
+    params: Mapping[str, str]
+    #: Where the row came from. `"code"` for everything `resolve` answers today.
+    source: str
 
-    RAISES on two owners. A slug with two remedies is a registry defect, and picking one
-    of them is a choice `ops` is in no position to make on a caller's behalf.
+
+def resolve(slug: str) -> RemedyMatch | None:
+    """THE SINGLE RESOLUTION POINT for an `ops.waiting_on` slug — the seam the user's later
+    design addition asked for, in these words: "resolve a diagnosis slug to a remedy
+    through one lookup function, and when nothing resolves, open or point to an
+    investigation. Do not build a separate store."
+
+    THIS SIGNATURE AND EVERY CALLER STAY PUT WHEN fo-69ba1cc4 LANDS. That feature replaces
+    this function's SOURCE — today `Remedy.covers` on the code-declared registry below,
+    tomorrow rule rows in the central store (remedy = primitive + parameters, `gap_class`
+    as the slug fo-69ba1cc4's ask names) — but never this signature. `params` and `source`
+    exist on `RemedyMatch` now, ahead of any row that fills them, precisely so that arrival
+    is not a signature change: every caller written against `RemedyMatch` today already
+    reads the shape a data row will answer with tomorrow.
+
+    A NEW PRIMITIVE IS A CODE CHANGE HERE, in `REMEDIES` below. A NEW RULE NEVER IS — it is
+    a row fo-69ba1cc4's registry adds, resolved through this same function with no edit to
+    this module. That split is the whole point of the registry being data: the OS heals a
+    new gap class by adding a row, not by shipping code for each one.
+
+    THERE IS EXACTLY ONE LOOKUP FUNCTION, and that is deliberate rather than an economy:
+    two would let `ops.fix` and the registry disagree about what clears a slug, which is
+    the general defect `Remedy.covers`'s own comment on one-home-per-rule warns against
+    (kn-4ea33fe6) — here doubled, because the two homes would be reachable from different
+    callers and could drift with nobody comparing them.
+
+    `None` IS A MEANINGFUL ANSWER, not a gap this function hides: a slug nothing resolves
+    is a GAP CLASS, and `ops.fix` acts on the `None` by opening or pointing to an
+    investigation of it (wo-4beada49's order kind) rather than guessing at a fix.
+
+    RAISES on two owners: a slug claimed by more than one remedy is a registry defect, and
+    picking one of them on a caller's behalf is not this function's to decide. RAISES when
+    a resolved row names a primitive that is not a key of `REMEDIES`: a rule may point at a
+    primitive that used to exist, or a data row may be malformed, and returning a
+    `RemedyMatch` for a primitive `ops.fix` cannot even look up would fail later and
+    further from the cause.
     """
     found = [r.id for r in REMEDIES.values() if slug in r.covers]
     if len(found) > 1:
         raise ValueError(f"{slug} is covered by more than one remedy: "
                          f"{', '.join(sorted(found))}")
-    return found[0] if found else None
+    if not found:
+        return None
+    remedy_id = found[0]
+    if remedy_id not in REMEDIES:
+        raise ValueError(f"{slug} resolves to {remedy_id!r}, which is not a primitive "
+                         f"this OS has ({', '.join(sorted(REMEDIES))})")
+    return RemedyMatch(remedy=remedy_id, params={}, source="code")
 
 
 def render_catalogue(allowed: tuple[str, ...]) -> str:

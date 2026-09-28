@@ -551,6 +551,26 @@ def test_a_stalled_prompt_is_matched_to_nudge_and_nothing_is_written(started,
     _nothing_was_written(wo["id"])
 
 
+def test_a_rows_own_argument_beats_the_shipped_default_and_loses_to_the_callers(
+        started, catalog_file, monkeypatch):
+    """Precedence, `fix`'s own comment: the caller's `--argument` wins, then the matched
+    row's `params["argument"]` (what a data row's parameters will supply, fo-69ba1cc4),
+    then the shipped `FIX_ARGUMENTS` default. Monkeypatches `resolve` rather than inventing
+    a row store — none exists yet, and none should."""
+    _arm(catalog_file, "nudge")
+    wo = _stalled()
+    monkeypatch.setattr(
+        remedies, "resolve",
+        lambda slug: remedies.RemedyMatch(remedy="nudge", params={"argument": "ROW SAYS"},
+                                          source="code"))
+
+    row_default = ops.fix(wo["id"])
+    assert row_default["proposal"]["argument"] == "ROW SAYS"
+
+    caller_wins = ops.fix(wo["id"], argument="CALLER SAYS")
+    assert caller_wins["proposal"]["argument"] == "CALLER SAYS"
+
+
 def test_dead_edges_are_matched_to_unblock(started, catalog_file):
     _arm(catalog_file, "unblock")
     wo = _stranded(dead=True)
@@ -891,12 +911,14 @@ def test_a_signin_park_is_the_users_own_move(started, catalog_file):
     _nothing_was_written(wo["id"])
 
 
-# -- 6. the slug NOBODY classified: a gap in the OS, not a shrug ------------------------
+# -- 6. the slug NOBODY resolves: a gap CLASS, ending in an investigation ---------------
 #
-# Neo q839, reversing §11's "add NO remedy": auto-matching a blocker against a closed
-# table in `ops` means the OS never learns which blockers it has no remedy FOR. Every
-# slug `waiting_on` answers today is classified by one of the four sets, so the only way
-# to reach the new default arm is a slug from the future — stated directly, the way
+# The user's later design addition, superseding Neo q839's own default arm (which used to
+# offer `file_work_order` briefed to WRITE a remedy). A slug `remedies.resolve` claims for
+# nobody is a gap class, and `ops.fix` neither guesses a fix nor files anything for it — it
+# points at a LIVE improvement order already evidencing this one, or offers to open one.
+# Every slug `waiting_on` answers today is classified by one of the four sets, so the only
+# way to reach this arm is a slug from the future — stated directly, the way
 # `test_a_nudge_the_mapping_calls_wrong_is_refused_in_its_own_words` states its mapping.
 
 UNKNOWN = {"what": "quota_ledger_drift", "stalled": False,
@@ -907,41 +929,99 @@ def _unclassified(monkeypatch) -> None:
     monkeypatch.setattr(ops, "waiting_on", lambda store, wo: dict(UNKNOWN))
 
 
-def test_an_unclassified_blocker_is_offered_a_new_remedy_order_and_writes_nothing(
+def _improvement_order_count(project: str = "proj_a") -> int:
+    return len(ops.list_improvement_orders(project, include_settled=True))
+
+
+def test_an_unresolved_slug_with_no_investigation_offers_nothing_and_writes_nothing(
         started, catalog_file, monkeypatch):
-    """The new default. `file_work_order` with an OS-authored brief that names the slug and
-    asks for a REUSABLE remedy — and with `confirm=False` still nothing written at all."""
+    """No registered remedy AND no live investigation naming this order: the payload says
+    so in words, names the slug, offers no remedy and no move — and `confirm=True` still
+    writes NOTHING AT ALL, not even an improvement order (issue #227: a gap reads as a gap,
+    never as an empty list)."""
     _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
     wo = _stalled()
     _unclassified(monkeypatch)
+    before = _improvement_order_count()
 
-    out = ops.fix(wo["id"])
+    out = ops.fix(wo["id"], confirm=True)
 
     assert out["blocker"]["what"] == UNKNOWN["what"]
-    assert out["remedy"] == "file_work_order"
-    assert out["proposal"]["blast"] == remedies.REMEDIES["file_work_order"].blast
-    brief = out["proposal"]["argument"]
-    assert brief == ops.FIX_NEW_REMEDY_BRIEF.format(
-        what=UNKNOWN["what"], detail=UNKNOWN["detail"], wo_id=wo["id"])
-    # The four things the order is for, each asserted rather than assumed from the brief
-    # being long: the slug, the module, the registry's own closing act, and the arming it
-    # must NOT do.
-    assert UNKNOWN["what"] in brief and UNKNOWN["detail"] in brief
-    assert "src/jarvis/remedies.py" in brief
-    assert "covers" in brief and "SHIPPED_REMEDIES" in brief
-    assert "tests/test_remedies.py" in brief
-    assert "allow-list" in brief
-    assert wo["id"] in brief
+    assert out["remedy"] is None
+    assert out["proposal"] is None
     assert out["your_move"] is None
     assert out["filed"] is None
+    assert UNKNOWN["what"] in out["note"]
+    assert "no registered remedy" in out["note"]
+    _nothing_was_written(wo["id"])
+    assert _improvement_order_count() == before
+    # THE REGISTRY IS STILL CLOSED: this arm files nothing, ever, so a `fix` run over a
+    # slug nobody resolves cannot be how a new remedy sneaks in.
+    assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
+
+
+def test_an_unresolved_slug_with_a_live_investigation_is_pointed_at_it(
+        started, catalog_file, monkeypatch):
+    """A LIVE improvement order already naming this work order as evidence: the payload
+    names that io's id rather than offering to open a second one. Read-only regardless of
+    `confirm`."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    io = ops.create_improvement_order("proj_a", "quota ledger keeps drifting",
+                                      description="seen on several orders",
+                                      refs=[wo["id"]])
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    assert out["remedy"] is None
+    assert out["filed"] is None
+    assert io["id"] in out["note"]
     _nothing_was_written(wo["id"])
 
 
-def test_the_new_remedy_brief_carries_no_text_the_os_did_not_write(started, catalog_file,
-                                                                  monkeypatch):
-    """`diagnose`'s boundary, kn-1791a5e6: the slug and §6's `detail` are the ONLY
-    interpolations, and both are OS-authored. No exception tail, no gate command, no
-    transcript line."""
+def test_a_settled_investigation_does_not_count_as_live(started, catalog_file, monkeypatch):
+    """A SETTLED io is not a reason to withhold the offer — `include_settled=False` is the
+    rule, not a courtesy."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    io = ops.create_improvement_order("proj_a", "quota ledger keeps drifting",
+                                      description="seen on several orders",
+                                      refs=[wo["id"]])
+    store = ProjectStore(ops.find_feature_order(io["id"])[1])
+    try:
+        store.set_feature_status(io["id"], "cancelled")
+    finally:
+        store.close()
+
+    out = ops.fix(wo["id"])
+
+    assert io["id"] not in out["note"]
+    assert "no registered remedy" in out["note"]
+
+
+def test_a_live_investigation_on_another_order_does_not_count(started, catalog_file,
+                                                              monkeypatch):
+    """An io referencing a DIFFERENT work order is not evidence for this one."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    other = _stalled("a different order entirely")
+    _unclassified(monkeypatch)
+    ops.create_improvement_order("proj_a", "quota ledger keeps drifting",
+                                 description="seen on several orders", refs=[other["id"]])
+
+    out = ops.fix(wo["id"])
+
+    assert "no registered remedy" in out["note"]
+    assert out["note"] == ops.FIX_GAP_NO_INVESTIGATION.format(what=UNKNOWN["what"])
+
+
+def test_the_gap_note_carries_no_text_the_os_did_not_write(started, catalog_file,
+                                                           monkeypatch):
+    """`diagnose`'s boundary, kn-1791a5e6: the slug is the ONLY interpolation in the
+    no-investigation sentence, and it is OS-authored. No exception tail, no gate command,
+    no transcript line."""
     _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
     wo = ops.create_work_order("proj_a", "ship it")
     store = _store(wo["id"])
@@ -956,41 +1036,12 @@ def test_the_new_remedy_brief_carries_no_text_the_os_did_not_write(started, cata
         store.close()
     _unclassified(monkeypatch)
 
-    brief = ops.fix(wo["id"])["proposal"]["argument"]
+    note = ops.fix(wo["id"])["note"]
 
     for leaked in ("scripts/shipit.sh", "a worker's own words here", "SECRET PROMPT TEXT",
                    "Traceback", "/home/someone"):
-        assert leaked not in brief
-    # Paired with the negatives: the brief is not empty, so the assertions above are not
-    # green on a blank string.
-    assert UNKNOWN["what"] in brief
-
-
-def test_confirming_it_files_one_grant_and_adds_no_remedy(started, catalog_file,
-                                                         monkeypatch):
-    """The act rides the same `self_heal` grant as every other remedy: one request, a
-    reviewer decides, nothing applied. AND THE REGISTRY IS STILL CLOSED afterwards — the
-    order writes the new remedy as a reviewed diff, `ops.fix` never authors one."""
-    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
-    wo = _stalled()
-    _unclassified(monkeypatch)
-
-    out = ops.fix(wo["id"], confirm=True)
-
-    assert out["remedy"] == "file_work_order"
-    assert out["filed"]["proposed"] is True
-    assert str(out["filed"]["approval"]) in out["filed"]["note"]
-    store = _store(wo["id"])
-    try:
-        (approval,) = store.list_approvals(wo["id"])
-        assert approval["kind"] == remedies.GATE_KIND
-        assert approval["status"] == "pending"
-        # Filed, not applied: no work order exists yet and none may until the gate opens.
-        assert store.queued_messages(wo["id"]) == []
-        assert [w["id"] for w in store.list_work_orders()] == [wo["id"]]
-    finally:
-        store.close()
-    assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
+        assert leaked not in note
+    assert UNKNOWN["what"] in note
 
 
 def test_the_cli_renders_the_payload_and_derives_nothing(started, catalog_file, capsys):
