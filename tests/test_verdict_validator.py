@@ -12,7 +12,7 @@ import json
 
 import pytest
 
-from jarvis import findings, verdicts
+from jarvis import findings, gaps, verdicts
 from jarvis.testing import a_verdict
 
 
@@ -124,3 +124,58 @@ def test_the_settle_headline_names_what_the_user_owes():
     headline = verdicts.settle_headline("inv-1234abcd", doc)
     assert "inv-1234abcd" in headline
     assert doc["user_owes"][:20] in headline
+
+
+def test_the_gap_class_is_required_on_all_four_classifications():
+    """Appendix A.3: item 4 asks for the class on EVERY investigation, so excluding
+    WAITING_ON_USER and TRANSIENT would delete the "four of these ended with the user
+    owing something" signal."""
+    for classification in verdicts.CLASSIFICATIONS:
+        doc = a_verdict(classification)
+        assert verdicts.parse_verdict(doc)["gap_class"] == doc["gap_class"]
+        doc.pop("gap_class")
+        with pytest.raises(verdicts.VerdictError) as e:
+            verdicts.parse_verdict(doc)
+        assert any("gap_class" in p for p in e.value.problems), classification
+
+
+def test_an_unregistered_but_well_formed_gap_class_is_accepted():
+    """A.2's two tiers: the verdict checks SHAPE, never membership in `GAP_CLASSES` —
+    the first occurrence of a mechanism nobody has named is the normal case."""
+    doc = verdicts.parse_verdict(a_verdict("GAP", gap_class="awaiting-signin"))
+    assert doc["gap_class"] == "awaiting-signin"
+    assert not gaps.registered("awaiting-signin")
+
+
+def test_a_gap_class_that_is_a_sentence_is_refused():
+    with pytest.raises(verdicts.VerdictError) as e:
+        verdicts.parse_verdict(
+            a_verdict("GAP", gap_class="the panel gave up and never re-derived it"))
+    assert any("gap_class" in p for p in e.value.problems)
+    # The control: the same document with a slug.
+    assert verdicts.parse_verdict(a_verdict("GAP", gap_class="stale-hold"))
+
+
+def test_a_proposed_fix_without_a_detector_or_a_remedy_is_refused():
+    """A.3: they are the investigator's diagnostic contribution and the fix order's
+    acceptance criteria, so they are required exactly as every other field there is."""
+    assert verdicts.PROPOSED_FIX_FIELDS[-2:] == ("detector", "remedy")
+    for name in ("detector", "remedy"):
+        fix = dict(a_verdict("GAP")["proposed_fix"])
+        fix.pop(name)
+        with pytest.raises(verdicts.VerdictError) as e:
+            verdicts.parse_verdict(a_verdict("GAP", proposed_fix=fix))
+        assert any(f"proposed_fix.{name}" in p for p in e.value.problems)
+    # The control: untouched, both fields present.
+    doc = verdicts.parse_verdict(a_verdict("GAP"))
+    assert doc["proposed_fix"]["detector"] and doc["proposed_fix"]["remedy"]
+
+
+def test_the_rendered_verdict_leads_with_the_class_and_shows_the_deliverables():
+    text = "\n".join(verdicts.render_verdict(verdicts.parse_verdict(a_verdict("GAP"))))
+    assert "stale-hold" in text.splitlines()[0]
+    assert "detector:" in text
+    assert "remedy:" in text
+    owed = "\n".join(verdicts.render_verdict(
+        verdicts.parse_verdict(a_verdict("WAITING_ON_USER"))))
+    assert "stale-hold" in owed.splitlines()[0]

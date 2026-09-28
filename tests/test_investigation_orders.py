@@ -682,7 +682,15 @@ _NEGATIONS = ("not", "never", " no ", "cannot", "refus", "nothing")
 
 
 def _without_prohibitions(prompt: str) -> str:
-    return "\n".join(line for line in prompt.splitlines()
+    """The prompt with its prohibitions and its GAP-CLASS REGISTRY removed.
+
+    The registry too (A.2): its entries DESCRIBE what a stuck order looks like, so
+    `red-main`'s symptom says "a pull request whose checks fail" — vocabulary the
+    investigator reads about, never an instruction to it."""
+    from jarvis import gaps
+
+    body = prompt.replace(gaps.render_registry(), "")
+    return "\n".join(line for line in body.splitlines()
                      if not any(w in line.lower() for w in _NEGATIONS))
 
 
@@ -773,3 +781,20 @@ def test_the_investigation_kind_is_not_in_the_feature_listings(store):
             store.list_feature_orders(kind="investigation")] == [inv["id"]]
     assert project_store.feature_status_label("investigation", "planning") == \
         "investigating"
+
+
+def test_the_investigator_prompt_demands_a_gap_class_and_shows_the_registry(
+        store, project_spec):
+    """Appendix A.3: one renderer for the prompt and the fix order's brief, for
+    `remedies.render_catalogue`'s reason — a model shown a different list from the one the
+    code enforces asks for things that are refused."""
+    from jarvis import gaps
+
+    prompt = _prompt(store, "investigator", project_spec)
+    assert gaps.render_registry() in prompt
+    assert '"gap_class"' in prompt
+    assert '"detector"' in prompt and '"remedy"' in prompt
+    lowered = prompt.lower()
+    assert "mechanical" in lowered and "self-heal" in lowered
+    # The control: the worker's prompt carries none of it.
+    assert "gap_class" not in _prompt(store, "worker", project_spec)

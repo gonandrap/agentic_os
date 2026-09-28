@@ -2414,6 +2414,7 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
     doc: dict[str, Any] = {
         "subject": subject,
         "classification": classification,
+        "gap_class": "stale-hold",
         "root_cause": (f"The panel's give-up hold on {subject} is written once and never "
                        f"re-derived, so the order stays parked after the cause clears."),
         "evidence": [
@@ -2431,6 +2432,10 @@ def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
             "expected": "the hold clears on the next tick once the pull request moves",
             "actual": "the order stays parked until a human runs `jarvis wo done`",
             "priority": "high",
+            "detector": ("a reconciler invariant over state: an order in `validating` "
+                         "whose hold names a commit that is no longer the pull request's "
+                         "head"),
+            "remedy": "unblock",
         }
     elif classification == "WAITING_ON_USER":
         doc["user_owes"] = f"assumption as-4 on {subject} is still pending review"

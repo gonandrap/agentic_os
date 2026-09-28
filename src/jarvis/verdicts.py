@@ -39,7 +39,7 @@ import json
 import re
 from typing import Any
 
-from . import findings
+from . import findings, gaps
 
 #: The four decisions an investigation can reach about its subject. A classification is a
 #: decision about THE SUBJECT, not about the codebase in general.
@@ -79,7 +79,13 @@ FORBIDDEN_FIELDS: dict[str, tuple[str, ...]] = {
 #: Every field of a `proposed_fix`, and nothing is optional: `report_bug` refuses without
 #: `expected`/`actual`, `priority` is never inferred (its own ruling), and a description
 #: that does not brief a stranger briefs nobody.
-PROPOSED_FIX_FIELDS = ("title", "description", "expected", "actual", "priority")
+#: `detector` and `remedy` are Appendix A.3's addition, appended with no per-field
+#: exception: `detector` is the predicate over STATE that would have recognised this, and
+#: `remedy` the `remedies.REMEDIES` id that clears it (or `none`, with the reason it is
+#: unsafe to automate). They are the fix order's acceptance criteria — a fix that turns
+#: the symptom green and leaves the OS just as blind is what they refuse.
+PROPOSED_FIX_FIELDS = ("title", "description", "expected", "actual", "priority",
+                       "detector", "remedy")
 
 #: What `duplicate_of` may name: a tracker issue (`#n` or a URL) or an order id. Anything
 #: else is a sentence, and a sentence is not a link the user can follow.
@@ -149,11 +155,14 @@ def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
             f"it takes to state a mechanism rather than restate the symptom"
         )
 
+    gap_class = _gap_class(raw, problems)
+
     evidence = findings.parse_evidence(got_subject or "?", raw.get("evidence"), problems)
 
     out: dict[str, Any] = {
         "subject": got_subject,
         "classification": classification,
+        "gap_class": gap_class,
         "root_cause": root_cause,
         "evidence": evidence,
     }
@@ -163,6 +172,35 @@ def parse_verdict(raw: Any, subject: str = "") -> dict[str, Any]:
     if problems:
         raise VerdictError(problems)
     return out
+
+
+def _gap_class(raw: dict[str, Any], problems: list[str]) -> str:
+    """The class slug, required on ALL FOUR classifications — Appendix A.3.
+
+    SHAPE ONLY, via `gaps.checked_slug`: a well-formed slug nobody has registered is
+    accepted, because the first occurrence of a mechanism nobody has named is exactly the
+    case an investigation exists for (A.2's two tiers). Checking membership in
+    `gaps.GAP_CLASSES` here would force the investigator to pick the nearest existing slug
+    and record a lie.
+
+    Required on `WAITING_ON_USER` and `TRANSIENT` too: "four investigations on
+    `awaiting-signin` and every one ended WAITING_ON_USER" is a finding about the OS, and
+    excluding the non-GAP classifications would delete exactly that signal.
+    """
+    raw_value = raw.get("gap_class")
+    if not str(raw_value or "").strip():
+        problems.append(
+            "`gap_class` is required on every classification — the slug naming the "
+            "MECHANISM, so two investigations of one mechanism on different subjects are "
+            "comparable. Reuse one of "
+            f"{', '.join(gaps.SHIPPED_GAP_CLASSES)} when the mechanism matches, or coin "
+            f"a new one of two to five lowercase hyphenated words")
+        return ""
+    try:
+        return gaps.checked_slug(str(raw_value))
+    except gaps.GapClassError as exc:
+        problems.append(f"`gap_class`: {exc}")
+        return ""
 
 
 def _payload(classification: str, raw: dict[str, Any],
@@ -291,6 +329,10 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
     """
     lines = [
         f"  classification: {verdict.get('classification', '')}"
+        + (f" [{verdict['gap_class']}"
+           + ("" if gaps.registered(str(verdict['gap_class']))
+              else ", not registered — the fix order owes a detector and a remedy")
+           + "]" if verdict.get("gap_class") else "")
         + (f" (ops: submitted as {verdict['submitted_classification']})"
            if verdict.get("classified_by") == "ops"
            and verdict.get("submitted_classification") else ""),
@@ -310,7 +352,9 @@ def render_verdict(verdict: dict[str, Any]) -> list[str]:
         lines += [f"  proposed fix: {fix.get('title', '')}",
                   f"    expected: {fix.get('expected', '')}",
                   f"    actual: {fix.get('actual', '')}",
-                  f"    priority: {fix.get('priority', '')}"]
+                  f"    priority: {fix.get('priority', '')}",
+                  f"    detector: {fix.get('detector', '')}",
+                  f"    remedy: {fix.get('remedy', '')}"]
     evidence = verdict.get("evidence") or []
     if evidence:
         lines.append("  evidence:")

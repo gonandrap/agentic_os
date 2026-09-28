@@ -631,3 +631,663 @@ UI smoke test that every route renders.
    STAYS** (the user confirmed). `ops.submit_verdict` deliberately writes no knowledge —
    there is no knowledge-write path on the verdict — so the investigator's own
    `jarvis learn add` is the single channel, not a second one.
+
+---
+---
+
+# Appendix A — the self-evolution loop (the user's design addition, 2026-09-27)
+
+**Added after §1–§7 were written and reviewed. Nothing above is rewritten.** The five
+edits this appendix makes to shipped §2 behaviour are listed in A.10 and nowhere else, so
+a reader of §2 alone is never silently wrong about more than those five.
+
+The requirement is the user's, in five items: a stable GAP CLASS on the verdict; two
+outputs per GAP (unblock now, and a fix order owing three deliverables); enforcement of
+those deliverables rather than instruction; a recurrence ledger that treats a repeat as an
+INCOMPLETE FIX; and a metric that shows the mechanical share rising.
+
+**Two knowledge entries this appendix was told to honour could not be read from this
+seat** — it has `Write` and Serena only, no `Bash`, so `jarvis learn show kn-85265170` and
+`kn-a2b5efe0` were unavailable, and neither id appears anywhere in the tree. A.1 and A.9
+use the lead's summary of them. **Verify both before implementing**; if kn-85265170 says
+more about the remedy registry's extension mechanism than "fix orders add to it", A.1's
+seam split is the paragraph to re-read.
+
+## The problem — an investigation's output dies with the investigation, so the same gap class is diagnosed by a model for ever
+
+§2 ships a diagnostician. It does not ship a system that gets stuck less often, and the
+gap between those two is measurable in the code as it stands.
+
+**1. A GAP verdict's only durable output is prose a human reads.**
+`ops.submit_verdict` (src/jarvis/ops.py:6702-6827) ends in exactly two writes: the verdict
+document into `feature_orders.plan`, and an expedited bug through
+`bugreport.report_bug(..., expedite=True)`. `verdicts.parse_verdict`
+(src/jarvis/verdicts.py:102) requires `root_cause` to be a PARAGRAPH — `MIN_FIELD_CHARS`
+of free text. Nothing on the record is comparable between two investigations, so "this is
+the fourth one of these this month" is not a query anyone can run; it is an operator
+remembering. The `_verdict_duplicate` check (src/jarvis/ops.py:6830) searches on the
+SUBJECT ID, deliberately and correctly (`db.score_sql` is word-OR, kn-c6e8fbf0) — which
+means two investigations of the same MECHANISM on two different subjects are, by
+construction, not duplicates of each other and both file.
+
+**2. The mechanical actuator exists and nothing connects it to a diagnosis.**
+`remedies.REMEDIES` (src/jarvis/remedies.py:273) holds three entries — `nudge`, `unblock`,
+`file_work_order` — and `remedies.apply` (src/jarvis/remedies.py:552) is the only code in
+the OS that acts on an order nobody asked it to touch. Its selector today is a supervisor
+model call judging an alarm. There is no mapping from "what is wrong" to "which remedy
+clears it", so a diagnosis that KNOWS the answer cannot say it in a form the daemon can
+execute.
+
+**3. The mechanical detector surface exists and is hand-written, one incident at a time.**
+`invariants.INVARIANTS` (src/jarvis/invariants.py:3783) is ~30 checks, each added by a
+human after something broke. #793 in §1.1 — "nothing in the OS noticed that `main` was
+red" — is the standing measurement of what that costs: the detector for a class arrives
+only if somebody writes it, and until then every occurrence is found by a person or, after
+this WO ships, by a model session at `investigation_budget_usd` a go (§2.8, `2.00`).
+
+**4. So the loop as specified converges on the wrong fixed point.** Five of §1.1's six
+causes would now be found by an investigator instead of by the operator — an improvement
+in attention and a permanent cost in tokens. Occurrence *n* costs the same as occurrence
+1, and the record cannot tell you it is occurrence *n*.
+
+**5. And a fix order filed from a GAP is held to nothing.** The brief
+`issues.WORK_ORDER_BRIEF` (src/jarvis/issues.py:815) says "Fix {url}" and reproduces the
+issue body. The validation panel then judges the PR against `assets/validator-seats/*.md`
+mandates, whose vocabulary has no notion of a detector or a remedy. A fix that turns the
+symptom green and leaves the OS just as blind passes every check there is — which is
+`dispatch._analyst_prompt`'s own founding argument (src/jarvis/dispatch.py:714-717),
+arriving through a door that argument never had.
+
+**Root cause, stated once:** the OS's diagnosis vocabulary (prose) and its self-healing
+vocabulary (`remedies` ids, `INVARIANTS` callables) are disjoint, and nothing in the path
+from verdict to merged fix requires them to meet.
+
+**What this appendix does NOT fix, deliberately.** It builds the loop; it does not write
+the detectors and remedies for §1.1's six historical classes. Each of those is its own fix
+order — that is the loop working, not a gap in it (A.13).
+
+## The fix — the verdict carries a class slug, and the expedited fix order it files cannot merge without a detector and a remedy registered for that slug
+
+Six moving parts. Read A.1 first: it says which of them this order does not build.
+
+### A.1 The `jarvis wo fix` seam — what wo-dbea82cf owns, what this order owns
+
+`jarvis wo fix` **does not exist in this checkout**: no `wo fix` verb in `cli.py`, and
+`remedies.apply` has exactly one caller shape (the supervisor's `remedy_tick`). It is
+being built by wo-dbea82cf, under the user ruling kn-85265170 that its remedy table must
+be an extensible registry that fix orders add to.
+
+**wo-dbea82cf owns:** the `wo fix` CLI verb and its `ops` entry point; the remedy-selection
+table and its extension mechanism; and honouring the four refusals `remedies.py`'s
+docstring lists (closed registry, `catalog.RemedyConfig` off by default with an empty
+allow-list, an approved-unexpired-unspent `self_heal` grant through `gates.open_gate`, the
+AST pin).
+
+**This order owns:** one call site, one indirection, and the ledger row that call writes.
+Specifically `ops._try_unblock(project, subject_id, gap_class)`, a private helper beside
+`submit_verdict`, which
+
+* imports the `wo fix` entry point LAZILY inside the function body, and treats
+  `ImportError` / `AttributeError` as the outcome `"unavailable"` — not as an error. This
+  is what makes this order landable and mergeable before wo-dbea82cf, and it is the same
+  lazy-import-inside-the-body discipline `cli.py` and `daemon.py:134` already use for a
+  different reason;
+* passes the remedy id that `gaps.get(gap_class).remedy` names, and never a remedy the
+  investigator chose in prose. The investigator's `proposed_fix.remedy` field (A.3) is a
+  RECOMMENDATION to the fix order's author; the registry is what a running daemon obeys.
+  A model naming a remedy that then executes would put a free-text action into the one
+  module that has none (`remedies.py`'s "no free-text action and no 'other'");
+* records the outcome on the verdict document under `unblock` and in the ledger row (A.7).
+
+**Load-bearing assumption about the seam, state it and test it:** `wo fix` applies through
+`remedies.apply`, so `remedies.apply` stays the single choke point every mechanical action
+passes. A.7's mechanical ledger write lives THERE for that reason. If wo-dbea82cf ends up
+with a second acting path that bypasses `remedies.apply`, the metric in A.8 silently
+under-counts the mechanical share — i.e. it reports the loop failing while it works, which
+is the worst direction for a number whose whole job is to be believed.
+
+**What happens when a remedy fits but is not armed.** All four refusals stand; none is
+worked around. `_try_unblock` returns one of five outcomes, each stored verbatim on the
+verdict under `unblock.outcome` and rendered by `verdicts.render_verdict`:
+
+| outcome | cause | what the record says |
+|---|---|---|
+| `applied` | the remedy ran | what it did, from `remedies.apply`'s return string |
+| `not-armed` | `RemedyConfig.enabled` false, or the id not in `allowed` | names the project's config path and the exact `jarvis wo fix <subject> <remedy>` the user can run |
+| `awaiting-grant` | the `self_heal` approval is pending or absent | names the gate request; a grant is a review, not a delay to route around |
+| `no-remedy` | the class's registry entry has `remedy=gaps.REMEDY_NONE` | says the class is deliberately not automated, and names what the detector will raise instead |
+| `unavailable` | the seam is not merged yet | names wo-dbea82cf |
+
+**None of the five raises attention**, and that is a decision rather than an omission.
+§2.5 ruling 6 spends the user's attention on `WAITING_ON_USER` only, and a refused unblock
+is not a new thing the user owes: the subject is still stuck, its own
+`invariants.true_blockers` line already says so on its own record, and the expedited fix
+order is already filed. Raising a second flag here would re-spend exactly the attention an
+investigation exists to save. It is visible without a flag — on the investigation page, in
+the ledger, and as an `attention`-resolved episode in the A.8 metric, which is the number
+the user checks when they want to know whether arming remedies is worth it.
+
+### A.2 `src/jarvis/gaps.py` — the class registry, closed by test and grown by a fix order
+
+New leaf module, stdlib-only at module level, modelled line for line on `remedies.py`:
+
+```python
+@dataclass(frozen=True)
+class GapClass:
+    id: str            # the slug: stale-hold, round-burn, red-main, oversized-input
+    headline: str      # the mechanism, in the terms a reviewer needs
+    symptom: str       # what a stuck order looks like from outside
+    detector: str      # the invariant id or doctor check that recognises it, from state
+    remedy: str        # a `remedies.REMEDIES` id, or REMEDY_NONE
+    issue_url: str     # the tracker issue whose fix registered this class
+    since: str         # the jarvis version the detector shipped in
+
+GAP_CLASSES: dict[str, GapClass] = {...}
+SHIPPED_GAP_CLASSES: tuple[str, ...] = (...)   # asserted == tuple(GAP_CLASSES)
+REMEDY_NONE = "none"                            # unsafe to automate; detector only
+SLUG_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+){1,4}$")
+```
+
+plus `get`, `registered(slug) -> bool`, `by_invariant() -> dict[str, str]` (the detector id
+to class id inverse, for the daemon in A.7), `checked_slug(raw) -> str` (shape only), and
+`render_registry()` — one renderer for the investigator prompt and the fix order's brief,
+for `remedies.render_catalogue`'s stated reason: a model shown a different list from the
+one the code enforces asks for things that are refused.
+
+**Ships with the four slugs the user named**, each pointing at its §1.1 issue and each
+with `detector=""` and `remedy=REMEDY_NONE` — i.e. registered as KNOWN and NOT YET
+MECHANICAL. A registry entry with an empty `detector` is the honest state of `stale-hold`
+on the day this lands, and the metric in A.8 reads it as "0% mechanical", which is the
+true number.
+
+**The tension the lead named, resolved: TWO TIERS, and only one of them is closed.**
+
+* **The ledger and the verdict accept any WELL-FORMED SLUG** — `SLUG_RE`, nothing else.
+  They must: the first occurrence of a class nobody has seen is exactly the case the
+  investigation exists for, and a closed vocabulary at the verdict would either refuse
+  that verdict or force the investigator to lie by picking the nearest existing slug. The
+  second is worse than the first, and it is what a model does under a closed enum.
+* **`GAP_CLASSES` is closed by `SHIPPED_GAP_CLASSES`, asserted by a test**, on
+  `remedies.SHIPPED_REMEDIES`' precedent (src/jarvis/remedies.py:311-313). Membership does
+  not mean "a name the OS has heard"; it means **"this class has a detector and a remedy,
+  and a human reviewed both"**.
+* **The fix order grows it, and the PR *is* the reviewed diff.** Registering the class is
+  one of the three deliverables A.6 enforces, so the only route into `GAP_CLASSES` is a
+  merged pull request that also carries the detector, the remedy and the test. The
+  investigation cannot grow it — an investigator's writes are refused by
+  `hooks.investigator_write_decision` (§2.6), which is the one property that makes this
+  split safe rather than notional.
+* **The loop closes with one check**: `invariants.check_gap_classes_are_registered`, in
+  `OS_INVARIANTS` (they take nothing, are never repairable — the right list, and it is
+  where `INV-UI-HEALTHY` lives). `INV-GAP-REGISTERED` is false when the ledger holds a
+  class whose fix work order has LANDED and which is not in `GAP_CLASSES`. That is
+  precisely "somebody shipped a symptom fix and called it done", reported by `jarvis
+  doctor` every tick, with no model call.
+
+### A.3 The verdict gains a class and two requirement fields
+
+`src/jarvis/verdicts.py`:
+
+* **`gap_class`, required on ALL FOUR classifications**, validated by `gaps.checked_slug`
+  shape only (A.2). Required on `WAITING_ON_USER` and `TRANSIENT` too, which is the
+  non-obvious half: item 4 asks for the class on EVERY investigation, and "we opened four
+  investigations on `awaiting-signin` and every one ended WAITING_ON_USER" is a finding
+  about the OS — the user is being made to do something a state check could do. Excluding
+  the non-GAP classifications would delete exactly that signal. The ledger stores the
+  classification beside the class, so any consumer that wants GAP-only has it.
+* **`proposed_fix` gains `detector` and `remedy`**, appended to `PROPOSED_FIX_FIELDS`
+  (src/jarvis/verdicts.py:82) and therefore required with no per-field exception, as every
+  field there already is. `detector`: what predicate over STATE would have recognised this
+  — named in mechanism terms, not "add a check". `remedy`: which existing
+  `remedies.REMEDIES` id clears it, or the word `none` with the reason it is unsafe to
+  automate. These are the investigator's diagnostic contribution and the fix order's
+  acceptance criteria; the panel in A.6 checks the code against them.
+* `settle_headline` and `render_verdict` (src/jarvis/verdicts.py:275, 285) render the
+  class, the `unblock` outcome and the regression link. `render_verdict` leads with the
+  classification today; the class goes on that same first line, because "which kind of
+  broken" is the first thing a reader of a settled investigation wants.
+* `MAX_VERDICT_CHARS` is unchanged: two short prose fields do not move a 20 000-char cap.
+
+`dispatch._investigator_prompt` (§2.3) gains one section, `gaps.render_registry()`, and one
+rule: **reuse an existing slug when the mechanism matches, and coin a new one only when it
+does not** — with the consequence stated, that a new slug commits a fix order to
+registering it. Item 6 of §2.3 (bounded inputs) is unchanged.
+
+### A.4 Item 2(a) — unblock the subject now
+
+Inside `ops.submit_verdict`, after the filing in step 4 and before the settle in step 5:
+`_try_unblock` (A.1), for a `GAP` only, and ONLY when `gaps.registered(gap_class)` and the
+entry's `remedy` is not `REMEDY_NONE`. An unregistered class has no vetted remedy by
+definition, and guessing one from prose is the free-text action `remedies.py` refuses.
+
+Order matters and is the same argument §2.5 makes for its own step order: the bug is filed
+FIRST, so a remedy that unsticks the subject can never cause the cause to go unfiled. The
+inverse order would mean a successful unblock followed by a `gh` outage leaves a subject
+that looks healthy and a defect nobody recorded — the §1.1 failure mode exactly.
+
+### A.5 Item 3, part one — the structured fields survive verdict -> issue -> work order -> PR
+
+Four hops, and the last one is the one that matters: the panel judges a WORK ORDER, so the
+class has to be on the work order's row before the panel ever runs.
+
+1. **verdict -> `report_bug`.** `bugreport.report_bug` (src/jarvis/bugreport.py:394) gains
+   keyword-only `gap_class`, `detector`, `remedy`, threaded into `render_body`
+   (src/jarvis/bugreport.py:240), which gains one section after Actual:
+
+   ```
+   ### Required deliverables (filed by an investigation — jarvis:gap-class=stale-hold)
+   ```
+
+   with the three named deliverables, the detector and remedy the verdict proposed, and a
+   machine marker `bugreport.GAP_MARKER = "<!-- jarvis:gap-class={slug} -->"` beside the
+   existing `<!-- Filed automatically by … -->` comment. The marker is for
+   `issues.issues_mentioning`-style reads and for a human pasting the issue into a session;
+   **it is not the panel's source** (see 3).
+2. **`report_bug` -> `route_filing`.** `issues.route_filing`
+   (src/jarvis/issues.py:863) gains `gap_class=""` and puts it in the metadata it already
+   writes: `metadata={EXPEDITED_KEY: True, GAP_CLASS_KEY: gap_class}` at
+   src/jarvis/issues.py:939, with `GAP_CLASS_KEY = "gap_class"` declared beside
+   `EXPEDITED_KEY` (src/jarvis/issues.py:847). Nothing else about that call changes.
+3. **`promote_confirmed` -> the work order row.** `promote_confirmed`
+   (src/jarvis/issues.py:1319) already passes `metadata` to `ops.create_work_order` **at
+   creation** — its docstring says why, and the reason is exactly ours: "the daemon can
+   claim and dispatch the row before a second write lands". So the gap class is on
+   `work_orders.metadata` from the instant the row exists, and `issues.was_expedited`'s
+   pattern is the precedent for reading it back (`issues.gap_class_of(wo)`).
+4. **The work order -> the panel.** `ops.submit_for_validation`
+   (src/jarvis/ops.py:3820) holds `wo` in hand. No network read, no issue fetch, no PR
+   body parse. **This is why the metadata hop is the seam and the issue marker is not:** a
+   panel that had to read the tracker to learn whether to enforce would fail open on a `gh`
+   outage, i.e. would stop enforcing precisely when the fleet is degraded.
+
+`issues.start_work` — the other route from an issue to a work order — reads the issue body
+and so must lift the class off `GAP_MARKER` and write the same metadata key. Otherwise a
+class filed by an investigation, left on the tracker and picked up later by hand loses its
+deliverables silently, which is the one hole a reader will look for.
+
+### A.6 Item 3, part two — the enforcement, mechanically first and the tester seat second
+
+Two layers, and the split is by what each can actually decide.
+
+**Layer 1: a mechanical bounce, no model call, no round spent.** The precedent is exact
+and already shipped: `ops.unanswered_paths` (src/jarvis/ops.py:3783) reads the store,
+`validation.unanswered_submission` (src/jarvis/validation.py:847) is the pure rule, and
+`ops.submit_for_validation` (src/jarvis/ops.py:3872-3900) bounces without opening a round.
+Mirror all three:
+
+* `validation.missing_gap_deliverables(gap_class, packet) -> tuple[str, ...] | None` —
+  pure, `(class, EvidencePacket)` in, the names of the missing deliverables out, `None`
+  when nothing is missing or when it cannot tell. It asks three path-and-content questions
+  over `packet.file_shas` and the diff, which is all a string comparison can honestly
+  answer:
+  1. `src/jarvis/gaps.py` is touched AND the diff adds the slug to both `GAP_CLASSES` and
+     `SHIPPED_GAP_CLASSES` — the registry deliverable, which subsumes "a detector is
+     named" and "a remedy is named" because the dataclass has no optional fields;
+  2. the file the new entry's `detector` names is touched (`invariants.py`, or wherever a
+     doctor check lives) — a registry entry pointing at a detector that was not written is
+     the exact lie this layer exists to catch;
+  3. a file under `tests/` is touched whose diff mentions the slug — the test deliverable,
+     at the only granularity a sha map can see.
+* `ops.unmet_gap_deliverables(store, wo, packet)` — the store half: reads the gap class off
+  `wo["metadata"]`, returns `None` for every work order that has none, which is the fleet.
+* In `submit_for_validation`, beside the `unanswered` branch and **before** it (a
+  submission can be both, and the missing-deliverable message is the more specific), with
+  its own event kind `gap_bounced`, its own `GAP_BOUNCE_FEEDBACK` naming the three
+  deliverables and the registry file, and its own `GAP_BOUNCE_LIMIT = 2` counted off that
+  event.
+* **On exhaustion, copy the trick at src/jarvis/ops.py:3880-3894 exactly**: open the round
+  and immediately `escalate_validation_round` it. The comment there is the reason and it
+  is not optional — `invariants.true_blockers` (src/jarvis/invariants.py:657) re-derives
+  `VALIDATION_STUCK_BLOCKER` from a round whose outcome is `escalated`, and
+  INV-ATTENTION-REASON rewrites any attention reason it cannot re-derive. A give-up written
+  bare loses its flag on the next tick and the user is never asked. **Do not invent a new
+  blocker constant here**: a new attention reason needs a new derivation inside
+  `true_blockers`, and reusing the existing escalation costs nothing and is already tested.
+* **A FORCED round is never bounced**, for `submit_for_validation`'s stated reason: there
+  is no submitter to send anything back to.
+* **Every uncertainty returns `None`** — no gap class on the work order, an empty file map,
+  a packet that predates the metadata key. `unanswered_submission`'s docstring makes this
+  argument and it holds here: the cost of failing open is one panel round, the cost of
+  guessing wrong is bouncing work that was really done.
+
+**Layer 2: the `tester` seat, for the question a string comparison cannot ask.** Layer 1
+proves a test file mentions the slug. Whether the test actually makes the detector FIRE and
+the remedy CLEAR it is a reading of code, and that is a seat's job. `tester` already holds
+a veto (`validation.VETO_SEATS`, src/jarvis/validation.py:129), so the enforcement needs no
+new seat and no change to `arbitrate`: one paragraph in
+`assets/validator-seats/tester.md` — on a submission that registers a gap class, a test
+that does not both fire the detector from constructed state and show the remedy clearing it
+is a BLOCKING finding. Note the constraint in `tests/test_validation_seats.py`: it asserts
+the mandate prose against the veto table, so the paragraph has to say "blocking" and the
+table has to already agree. It does.
+
+**Why not a sixth seat.** A seat is a model call per round, on every work order in the
+fleet, to answer a question that is `None` for all but a handful of them — and the veto
+table's own docstring names the failure mode of a seat with a narrow mandate and a veto: an
+annoying rejection loop that spends the attention this whole lineage exists to save.
+
+### A.7 Item 4 — the recurrence ledger
+
+**Where: a new `gap_events` table in the CENTRAL store** (`$JARVIS_HOME/os.db`,
+src/jarvis/central_store.py:89-285), not in the per-project DB. Three reasons, in order:
+
+1. **A gap class is a property of the OS, not of a project.** `stale-hold` recurring in
+   `jarvis_os` and in `shared_schedule` is one incomplete fix, and a per-project table
+   makes that the one join nobody can do.
+2. **The metric is fleet-wide** (A.8). A per-project ledger would make the dashboard page
+   open every project DB to draw one number — and a project whose path has moved would
+   silently drop out of the denominator.
+3. **The regression decision needs the issue and the fix order together**, and those cross
+   projects: the issue is on the OS tracker, the fix order is in whichever project filed
+   it.
+
+Columns — append-only, `inbox`'s shape (src/jarvis/central_store.py:98):
+
+```
+id INTEGER PK, ts REAL, gap_class TEXT, project TEXT, subject_id TEXT,
+subject_kind TEXT, episode TEXT,          -- health.fingerprint at the moment it was seen
+inv_id TEXT, classification TEXT,          -- '' when no investigation was involved
+resolved_by TEXT,                          -- investigation | mechanical | attention
+detector TEXT,                             -- the invariant id, when a detector saw it
+issue_url TEXT, fix_wo_id TEXT, landed_at REAL,
+regression_of INTEGER                      -- the earlier row whose fix was incomplete
+UNIQUE(gap_class, subject_id, episode)
+```
+
+**`episode` is `health.fingerprint(pstore, subject)`** (src/jarvis/health.py:51) — the
+codebase's own "two units with the same fingerprint are the same situation" primitive,
+reused rather than reinvented, and the UNIQUE constraint on it is what stops a detector
+firing every tick from inflating the denominator. Note the correctness rule in
+`health.observer_kinds()`: a fingerprint must not move because it was looked at. A
+`gap_events` row is written to the CENTRAL store and writes no `wo_events` row, so the
+ledger cannot perturb the value it is keyed on. A remedy application does move it — and
+that is right: the episode is over.
+
+Store methods on `CentralStore`, beside the knowledge ones: `record_gap_event(...)`
+(idempotent on the unique key, returns the row), `gap_events(gap_class=None, since=None)`,
+`mark_gap_fix_landed(fix_wo_id, ts)`, `landed_fix_for(gap_class)`, `gap_rollup(days)`.
+
+**Three writers, one per resolution path:**
+
+| writer | where | `resolved_by` |
+|---|---|---|
+| `ops.submit_verdict`, at the settle | src/jarvis/ops.py:6702, step 5 | `investigation` |
+| `remedies.apply`, after the handler returns | src/jarvis/remedies.py:552 | `mechanical` |
+| `Daemon.reconcile_project`, per `Violation` whose invariant is in `gaps.by_invariant()` | daemon | `mechanical` if `v.repaired` else `attention` |
+
+The third is the neatest consequence of the existing design: `invariants.INVARIANTS`
+checkers already "repair what is unambiguous", so `Violation.repaired`
+(src/jarvis/invariants.py:443) IS the detector-plus-remedy-in-one case, and the flag is
+already there to read.
+
+**"The fix already landed", decided from state with no model call.** `landed_fix_for(class)`
+returns the earliest row for that class with a non-empty `fix_wo_id` and a non-NULL
+`landed_at`. `landed_at` is stamped by the daemon where it already watches that
+transition — the issue sync / PR poll path that completes a `waiting_pr_merge` order — so
+the question is one indexed read at verdict time and never a crawl. Two facts, both
+already in the store: the fix work order reached a terminal landed status, and its issue
+closed.
+
+**The regression path, in `ops.submit_verdict` step 4, BEFORE `_verdict_duplicate`:** if
+`landed_fix_for(gap_class)` returns a row, this is not a duplicate and not a new bug — the
+earlier fix was INCOMPLETE. So:
+
+* `issues.reopen(url)` — **a new function**, beside `issues.close`
+  (src/jarvis/issues.py:~445), one `gh issue reopen`. It does not exist today, and this is
+  the only new GitHub verb the appendix needs;
+* `issues.comment(url, …)` (src/jarvis/issues.py:430) with the new investigation's id, the
+  new subject and the root cause — the evidence that the class recurred;
+* a `regression` label, on `FOLLOW_UP_LABEL`/`ensure_follow_up_label`'s pattern
+  (src/jarvis/issues.py), so the recurrence is visible to somebody scanning the tracker
+  and never only inside the OS;
+* a new `gap_events` row with `regression_of` pointing at the earlier one, and
+  `issue_url` the ORIGINAL issue's;
+* the verdict stored with `classification` unchanged at `GAP`, `classified_by: "ops"`, and
+  a new `regression_of` field naming the original issue and fix order. **Not
+  `ALREADY_TRACKED`**: that classification means "somebody is on this", and the truth here
+  is the opposite — somebody was on it, shipped, and it came back.
+* **No second expedited bug.** The fix order: hand back `issues.live_work_order(spec, url)`
+  when one is live, exactly as `promote_confirmed` already does; otherwise
+  `promote_confirmed` files a fresh one against the REOPENED issue, which is what that
+  function's docstring already calls the reopened-issue case.
+
+### A.8 Item 5 — the metric
+
+**The rollup: `ops.gap_report(days=90, project=None)`**, computed in `ops` over one
+`CentralStore.gap_rollup` read. `ops` and not the route, on
+`ops.knowledge_usage_report`'s precedent (rendered at src/jarvis/ui/app.py:1312): the page
+and the CLI must not be two answers to one question.
+
+Shape, per gap class, newest activity first:
+
+```
+{"gap_class", "occurrences", "weeks": [(iso_week, n), ...],
+ "mechanical", "attention", "investigation",
+ "mechanical_share", "registered", "detector", "remedy",
+ "issue_url", "regressions", "first_seen", "last_seen"}
+```
+
+plus a fleet total row with the same keys.
+
+**The denominator, defined precisely enough to implement.** One `gap_events` row is one
+EPISODE — one occurrence of one class on one subject in one situation, deduped by
+`UNIQUE(gap_class, subject_id, episode)`. For a window W:
+
+* `occurrences = count(rows in W)`
+* `investigation = count(resolved_by = 'investigation')` — a model session diagnosed it
+* `attention = count(resolved_by = 'attention')` — a detector saw it and a human acted
+* `mechanical = count(resolved_by = 'mechanical')` — a registered remedy ran, or a
+  repairing invariant fixed it; **no agent turn and no user attention**
+* `mechanical_share = mechanical / occurrences`, and `occurrences` is exactly
+  `investigation + attention + mechanical` because `resolved_by` is written once per row
+  and is never empty.
+
+`attention` counts as NOT mechanical, and it is reported as its own number rather than
+folded into either side: it is the state "the detector exists, the remedy is not armed or
+is unsafe" — which is A.1's `not-armed` / `no-remedy` outcomes seen from the metric end,
+and it is the number that tells the user whether arming a remedy would pay.
+
+**Where it goes: a new `/evolution` page**, `@app.get("/evolution")` in
+src/jarvis/ui/app.py beside `/alarms` (src/jarvis/ui/app.py:1455), template
+`src/jarvis/ui/templates/evolution.html`, one nav entry. Not a section on `/`: that page is
+the pulse and holds what needs the user, and this metric needs nobody — it is read when the
+user asks whether the OS is getting better. The per-class rows lead with
+`mechanical_share`, then the weekly sparkline counts, then the registry state
+(`registered` / `detector` / `remedy`), so an unregistered class with four occurrences and
+0% mechanical reads as the backlog item it is. Each project's page gets the same table
+scoped to its own rows, on the `jarvis issues` per-project precedent.
+
+**CLI: `jarvis gaps [--days n] [--project p]`**, a thin wrapper on `ops.gap_report`, on
+`jarvis learn stats`' precedent (CLI and page, one computation). One crib-sheet entry
+under §2.10's rules: it goes in the existing fenced block, and it is capped the same way.
+
+### A.9 The detector in item 2(ii) vs the fleet-health mechanical trigger (kn-a2b5efe0, wo-9f00e3b5)
+
+Related, different, and the difference is worth one paragraph in the code as well as here,
+because the names will be confused.
+
+**The fleet-health trigger (wo-9f00e3b5) answers "is this order not progressing?"** — one
+symptom-level, kind-agnostic question about any open unit, whose output is a MODEL SESSION:
+it opens an investigation. Its nearest shipped relative is `health.due`
+(src/jarvis/health.py:89), whose whole job is deciding when a model call is worth its
+money, and `health.fingerprint`, which is the cheap deterministic summary that decision
+reads. A trigger like that is necessarily vague: it fires on "something is wrong here, and
+what is wrong is not known".
+
+**The detector in item 2(ii) answers "is THIS gap class present?"** — one named class, a
+predicate over state, whose output is a remedy or a precise attention line naming a
+command. Its home is `invariants.INVARIANTS` / the doctor checks, whose contract
+(src/jarvis/invariants.py) is "no LLM, ever".
+
+**The relationship: the detector is what the trigger's output should turn into.** Every
+class that gains a detector is a class the fleet-health trigger no longer has to spend a
+session on — which is exactly the number A.8 reports. The two must not be merged: a
+detector that fired an investigation would be a mechanical check paying for a model to
+re-derive what it already knew, and a trigger keyed on gap classes would only ever notice
+the ones already fixed. **The one edit where they meet:** when the fleet-health trigger
+opens an investigation, `Daemon.reconcile_project` should skip the classes whose detector
+already fired on that subject this episode — same episode key, so the ledger answers it
+with no extra state. That edit belongs to wo-9f00e3b5, not here; this appendix owes it the
+ledger read, which A.7 provides.
+
+### A.10 Every file this appendix changes, with its precedent
+
+New:
+
+| file | what | precedent |
+|---|---|---|
+| `src/jarvis/gaps.py` | `GapClass`, `GAP_CLASSES`, `SHIPPED_GAP_CLASSES`, `SLUG_RE`, `checked_slug`, `get`, `registered`, `by_invariant`, `render_registry`, `REMEDY_NONE` | `remedies.py` in full: closed registry, dataclass carrying the words a reviewer reads, one renderer for every reader |
+| `src/jarvis/ui/templates/evolution.html` | the metric page | `alarms.html` |
+| `tests/test_gap_ledger.py`, `tests/test_gap_deliverables.py` | A.11 | `tests/test_validation_bounce.py`, `tests/test_remedies.py` |
+
+Changed, each edit sited:
+
+1. `src/jarvis/verdicts.py` — `gap_class` required on all four (`parse_verdict`:102, via a
+   new common-field check beside `root_cause`); `PROPOSED_FIX_FIELDS`:82 gains `detector`
+   and `remedy`; `render_verdict`:285 and `settle_headline`:275 render class, `unblock` and
+   `regression_of`.
+2. `src/jarvis/ops.py` — `submit_verdict`:6702 gains the regression branch (before
+   `_verdict_duplicate`), the `_try_unblock` call and the ledger write; new
+   `_verdict_regression`, `_try_unblock`; `GAP_CLASS_METADATA` read helper;
+   `unmet_gap_deliverables` and the `gap_bounced` branch in `submit_for_validation`:3872
+   with `GAP_BOUNCE_FEEDBACK` / `GAP_BOUNCE_LIMIT` / `_gap_bounce` beside
+   `BOUNCE_FEEDBACK`:3741 / `BOUNCE_LIMIT`:3736 / `_bounce`:3917; new `gap_report`.
+3. `src/jarvis/central_store.py` — the `gap_events` DDL plus its index, beside
+   `knowledge_reads`:159; the five methods.
+4. `src/jarvis/bugreport.py` — `report_bug`:394 and `render_body`:240 gain
+   `gap_class`/`detector`/`remedy`; new `GAP_MARKER`, `DELIVERABLES_SECTION`.
+5. `src/jarvis/issues.py` — `GAP_CLASS_KEY` beside `EXPEDITED_KEY`:847;
+   `route_filing`:863 threads it into the metadata at :939; `start_work` lifts it off
+   `GAP_MARKER`; new `reopen`, `gap_class_of`, `REGRESSION_LABEL` +
+   `ensure_regression_label` on `FOLLOW_UP_LABEL`'s pattern.
+6. `src/jarvis/validation.py` — `missing_gap_deliverables`, pure, beside
+   `unanswered_submission`:847.
+7. `assets/validator-seats/tester.md` — one blocking paragraph (A.6 layer 2).
+8. `src/jarvis/invariants.py` — `check_gap_classes_are_registered` in `OS_INVARIANTS`;
+   `INV-GAP-REGISTERED`.
+9. `src/jarvis/remedies.py` — one `central.record_gap_event` call at the end of
+   `apply`:552, when the alarm or the `wo fix` request carries a class. Not a name the AST
+   pin in `tests/test_remedies.py` walks for, and it acts on nothing.
+10. `src/jarvis/daemon.py` — the per-`Violation` ledger write in `reconcile_project`; the
+    `landed_at` stamp where a fix order's PR merge is already observed.
+11. `src/jarvis/dispatch.py` — `_investigator_prompt` (§2.3) gains
+    `gaps.render_registry()` and the coin-a-slug rule.
+12. `src/jarvis/cli.py` — `jarvis gaps`, one handler, lazy imports as every handler does.
+13. `src/jarvis/ui/app.py` — `/evolution` beside `/alarms`:1455; the per-project table.
+14. `CLAUDE.md` — one crib entry for `jarvis gaps`, under §2.10's rules.
+
+### A.11 Tests
+
+1. **The registry is closed and the slug is not.** `tuple(gaps.GAP_CLASSES) ==
+   gaps.SHIPPED_GAP_CLASSES` (the `tests/test_remedies.py` assertion, copied); `SLUG_RE`
+   accepts `stale-hold` / `oversized-input` and refuses `Stale_Hold`, `x`, a sentence and a
+   40-char run; `parse_verdict` ACCEPTS an unregistered well-formed slug on all four
+   classifications and REFUSES a missing one — the two halves of A.2's two tiers, and the
+   negative control is the one that will be deleted by accident.
+2. **`INV-GAP-REGISTERED` fires on exactly the incomplete fix.** A ledger row with a
+   landed `fix_wo_id` and a class absent from `GAP_CLASSES` yields the violation; the same
+   row with the class registered yields nothing; a row with no `landed_at` yields nothing.
+3. **The deliverables bounce.** Through `ops.submit_for_validation` and not the pure rule
+   alone — a bounce placed after the round is opened passes a direct unit test and spends a
+   round in production, which is the §5 item 1 reachability argument applied here. Four
+   cases: a packet touching all three deliverables opens a round; one missing the registry
+   entry bounces with the three named; the second bounce bounces; the third opens a round
+   and escalates it, and `invariants.true_blockers` re-derives
+   `VALIDATION_STUCK_BLOCKER` on the next call (the assertion that the give-up survives a
+   tick). **Negative control: a work order with no gap class in its metadata is never
+   bounced** — that is the fleet, and getting it wrong stops every project.
+4. **The class survives all four hops.** `ops.submit_verdict` with a fake `gh` -> the
+   issue body contains `GAP_MARKER` -> the dispatched work order's `metadata` carries
+   `GAP_CLASS_KEY` -> `ops.unmet_gap_deliverables` reads it back with no network. One test,
+   asserted at every hop, because each hop is a different author's edit.
+5. **The ledger's episode key deduplicates.** Two `record_gap_event` calls with one
+   fingerprint make one row; a moved fingerprint makes two; and a `health.fingerprint`
+   computed before and after a `gap_events` write is byte-identical — the
+   `observer_kinds()` rule, asserted rather than trusted.
+6. **The regression path.** A landed fix for `stale-hold`, then a second investigation on
+   a different subject with the same class: no new issue is created, the original is
+   reopened and commented, the new row's `regression_of` points at the first, the verdict
+   stays `GAP` with `classified_by="ops"`, and a live fix order is handed back rather than
+   duplicated.
+7. **Item 2(a) against all four refusals.** `_try_unblock` returns `not-armed` with
+   `RemedyConfig` off, `awaiting-grant` with a pending approval, `no-remedy` for
+   `REMEDY_NONE`, `unavailable` when the seam is absent (monkeypatch the import to raise
+   `ImportError`), `applied` on the happy path — and **in every one of the five, no
+   attention flag is raised on the investigation** (A.1's ruling), while the outcome is on
+   the stored document.
+8. **The metric adds up.** `ops.gap_report` over a seeded ledger: `mechanical + attention
+   + investigation == occurrences` per class and for the fleet total; `mechanical_share`
+   of a class with no mechanical rows is `0.0` and not a `ZeroDivisionError`; the window
+   excludes older rows; and the `/evolution` route renders (the existing every-route smoke
+   test).
+
+### A.12 Rejected alternatives
+
+* **A closed enum of gap classes at the verdict** (the obvious fix, and what a reviewer
+  will propose). Loses on the first occurrence of anything new: the verdict would be
+  refused, or — worse and likelier — the investigator picks the nearest existing slug and
+  the ledger records a lie. A.2's two tiers get the reviewed diff without that cost.
+* **The ledger in the per-project store.** Cheaper (no new central table, no cross-DB
+  read) and it destroys the metric: the same class in two projects would never be one
+  recurrence, which is the entire signal item 4 asks for.
+* **A sixth validation seat that owns the deliverables.** A model call per round on every
+  work order in the fleet to answer a question that is `None` for nearly all of them, plus
+  the narrow-mandate-with-a-veto failure `validation.VETO_SEATS`' own comment names.
+* **Enforce the deliverables in the fix order's BRIEF only** (i.e. instruct, do not
+  enforce). This is precisely what the user ruled against, and the codebase agrees twice:
+  `dispatch._analyst_prompt`:687-691 ("this is PROSE, not enforcement") and
+  `validation.arbitrate`'s "a safety rule that lives in prose is a rule that holds by
+  prompt luck". The brief still says it — a worker that learns the rule from a bounce paid
+  a round to read it.
+* **Let the investigator register the gap class itself.** One `Write` to `gaps.py` and the
+  loop closes with no fix order. It would require a second exempt path in
+  `hooks.investigator_write_decision`, and §4 has already settled this: a kind that may
+  sometimes ship is a kind whose no-write hook is conditional, and a conditional wall is a
+  speed bump.
+* **Derive the mechanical share from `wo_events` instead of a ledger table.** No new
+  table, and it cannot answer the question: an episode nobody investigated leaves no work
+  order event, so the denominator would count only the cases the loop is trying to
+  eliminate — a metric that improves by definition.
+* **Put the metric on `/` (the pulse).** The pulse holds what needs the user. This needs
+  nobody, and a number on that page competes with an attention item.
+
+### A.13 Out of scope for this session, and what each would cost
+
+* **Detectors and remedies for §1.1's six classes.** Each is a fix order of its own, and
+  filing them is the loop working. Rough cost per class: one invariant plus its test, half
+  a session, plus a remedy only where one of the three existing ones fits — and for
+  `red-main` and `round-burn` none does, so those want a new `REMEDIES` entry, which is a
+  reviewed diff and a gate conversation of its own.
+* **Extending `remedies.REMEDIES`.** The closed registry stays closed in this order. The
+  extension mechanism is kn-85265170's subject and wo-dbea82cf's work.
+* **Backfilling the ledger from the six historical issues.** A one-off script, ~1h,
+  and it writes rows nobody measured; the metric's first useful window starts when the
+  table does. Say so on the page rather than faking history.
+* **A time series longer than weekly counts** — no charting dependency exists and none
+  should be added for this.
+* **Auto-arming a remedy once its class has recurred N times.** The natural next ask, and
+  it is a permission decision: it would let the OS widen `RemedyConfig` on its own, which
+  is the one thing `remedies.py`'s four refusals are for. Bring it as a user ruling, not as
+  a follow-up commit.
+* **Investigations of a class with no subject** (a fleet-wide gap, e.g. `red-main`). §6
+  already excludes investigating the fleet as a whole, and the ledger's
+  `UNIQUE(gap_class, subject_id, episode)` assumes a subject. A fleet-level gap currently
+  arrives attached to whichever order tripped over it, which is good enough and worth
+  naming as a known imprecision in the ledger.
+
+### A.14 Questions for the lead
+
+1. **Is `gap_class` really required on `WAITING_ON_USER` and `TRANSIENT`?** A.3 rules yes
+   and argues it. It is the one place this appendix makes an investigator do work for a
+   metric rather than for its subject. Cheap to reverse: one entry in a required-fields
+   table.
+2. **Does a regression re-expedite?** A.7 files against the reopened issue and lets
+   `promote_confirmed` dispatch, which means a second expedited work order and therefore a
+   second release commitment for one class. That follows §2.5's cascade ruling — the
+   original was expedited and the bug is still live — but it is the highest-consequence
+   line in this appendix and the user may want a regression to be LOUDER and slower
+   instead: reopen, label, notify, and let them press go.
+3. **The `/evolution` window default.** A.8 says 90 days with no measurement behind it, on
+   §7 item 1's precedent (one constant, one line).
+4. **Confirm kn-85265170 and kn-a2b5efe0** against A.1 and A.9. This seat could not read
+   them.

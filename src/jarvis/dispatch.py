@@ -855,7 +855,7 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
     `verdict.json` with that exact spelling (the one path the write hook exempts) and names
     the four permitted `jarvis` mutations exactly.
     """
-    from . import db, verdicts
+    from . import db, gaps, verdicts
     from .ops import SUBJECT_KEY  # lazy: ops imports dispatch
 
     inv_id = wo.get("parent_id") or "?"
@@ -920,6 +920,18 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
         "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
         "",
+        "# Name the gap class — required on all four",
+        gaps.render_registry(),
+        "",
+        "",
+        "# A GAP also owes a detector and a remedy",
+        "`proposed_fix.detector`: the predicate over STATE that would have recognised "
+        "this — a reconciler invariant or a `jarvis doctor` check, MECHANICAL, no model "
+        "call. `proposed_fix.remedy`: which existing remedy id makes the next occurrence "
+        "self-heal, or the word `none` with the reason it is unsafe to automate. Both are "
+        "the fix order's acceptance criteria: a fix that turns the symptom green and "
+        "leaves the OS blind is refused.",
+        "",
         "# The verdict",
         f"Write it to `verdict.json` in your worktree root — that filename exactly, it is "
         f"the one path you are permitted to write — and submit it with the command below, "
@@ -934,16 +946,19 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "{",
         f'  "subject": "{subject or "wo-…"}",',
         '  "classification": "GAP",',
+        '  "gap_class": "stale-hold",   // a registry slug, or a new well-formed one',
         '  "root_cause": "one paragraph, in mechanism terms",',
         '  "evidence": [',
         f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
         "  ],",
-        '  "proposed_fix": {          // GAP only, and all five fields',
+        '  "proposed_fix": {          // GAP only, and all seven fields',
         '    "title": "what the bug report is titled",',
         '    "description": "the brief, standing alone",',
         '    "expected": "what should happen",',
         '    "actual": "what happens",',
-        '    "priority": "high"',
+        '    "priority": "high",',
+        '    "detector": "the state predicate that recognises it, in mechanism terms",',
+        '    "remedy": "an existing remedy id, or none with the reason"',
         "  },",
         '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
         '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
@@ -951,7 +966,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "}",
         "```",
         "",
-        "`subject`, `classification`, `root_cause` and at least one `evidence` entry are "
+        "`subject`, `classification`, `gap_class`, `root_cause` and at least one "
+        "`evidence` entry are "
         "required for all four. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
         "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
         "owes something. It names every problem at once, so one revision fixes all of "
