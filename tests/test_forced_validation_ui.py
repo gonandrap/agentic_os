@@ -325,3 +325,30 @@ def test_forcing_the_round_from_the_page_is_what_lets_the_merge_arm(
 
     fleet.poll_pull_requests(spec, store)
     assert [a["kind"] for a in store.list_approvals(wo["id"])] == ["auto_merge"]
+
+
+# -- a hold the panel has superseded reads as history on this page too -----------------
+
+
+def test_the_page_says_a_superseded_hold_is_history_and_never_why_it_is_parked_now(
+        fleet, project, fake_gh):
+    """The page must print `auto_merge.line` and never the stored `reason`.
+
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §5 and the user's follow-up: while a round runs, the hold it superseded is
+    history. `ops.automerge_state` marks it `rejudging` and words it, but a template
+    rendering the payload's own `reason` would put `held — <reason>` back on the page
+    without failing one `ops` test — the reader sent to a CI run two rounds out of date
+    (wo-659be188), from the surface most people read.
+    """
+    store, wo = parked_on_a_moved_head(fleet, project, fake_gh)
+    press(wo["id"], "origin/main was merged in to clear a conflict")
+    assert store.get_work_order(wo["id"])["status"] == "validating"
+    held = json.loads(store.events_of_kind(wo["id"], "automerge_held")[-1]["payload"])
+
+    page = page_of(wo["id"])
+
+    assert f"auto-merge: re-judging in round 2 (was held: {held['reason']})" in page
+    # Anchored to the auto-merge line itself: this page also renders the timeline and the
+    # re-judge section, and both talk about holds (kn-d51713af).
+    assert "auto-merge: held — " not in page

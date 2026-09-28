@@ -1975,3 +1975,63 @@ def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judge
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
                 and "/commits/" in c["argv"][3]]
     assert len(store.list_approvals(wo["id"])) == 1
+
+
+def test_both_shapes_of_wo_show_say_a_superseded_hold_is_history_while_a_round_runs(
+        started, project, capsys):
+    """The CLI's two surfaces, from the one marked state — the user's follow-up to
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §5.
+
+    `--json` keeps the payload for tooling that reads the SHAs, so it has to carry the
+    MARKING (`stale_because`) beside them: without it a reader of the document has no way
+    to tell a live hold from a superseded one. The human row is `state["line"]` and
+    nothing else — collapsing to `state["reason"]` instead would print `held — <reason>`
+    in the present tense about a commit the running round has already moved past.
+    """
+    import json as _json
+
+    from jarvis import cli
+
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="round 1 passed on a1b2c3d4e5, the head is now e4f5a6b7c8")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    history = (f"re-judging in round {running} (was held: round 1 passed on a1b2c3d4e5, "
+               f"the head is now e4f5a6b7c8)")
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = _json.loads(capsys.readouterr().out)
+
+    assert document["auto_merge"]["stale_because"] == "rejudging"
+    assert document["auto_merge"]["line"] == history
+
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    human = capsys.readouterr().out
+
+    assert history in human
+    assert "held — " not in human
+
+
+def test_the_round_line_beside_a_re_judging_hold_describes_the_round_and_no_hold(
+        started, project):
+    """AN AUDIT OF THE SIBLING SUMMARY LINE, asked for alongside the same follow-up.
+
+    `ops.round_line` does not read the merge hold at all, and it must not start: the open
+    round's line is the running round's standing, so a hold's wording appearing here —
+    the word `held` or the stored reason quoted from the payload — would be a second
+    surface making the present-tense claim §5 removed, on a line that cannot even say
+    which commit the hold was about.
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved under the pass")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    line = ops.round_line(store.latest_validation_round(wo_id=wo["id"]))
+
+    assert line.startswith(f"round {running} · ")
+    assert "pending" in line
+    assert "held" not in line and "the head moved under the pass" not in line
