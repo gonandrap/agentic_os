@@ -530,3 +530,95 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
     assert [t["seq"] for t in out["turns"]] == [1]
     assert out["turns"][0]["recorded"] is False and out["turns"][0]["ingredients"] == []
     assert "not recorded" in out["turns"][0]["note"]
+
+
+#: An arbitrary epoch the backfill fixtures hang off.
+SPAN_T0 = 1_700_000_000.0
+
+
+def legacy_with_history(tmp_path) -> Path:
+    """A database from the live release holding one work order's status events and one
+    feature order, and no `wo_state_spans` at all."""
+    import json
+
+    proj = tmp_path / "legacy-spans"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute(
+        "INSERT INTO work_orders (id, title, description, status, origin, created_at, "
+        "updated_at) VALUES ('wo-old', 't', '', 'completed', 'jarvis', ?, ?)",
+        (SPAN_T0, SPAN_T0 + 400))
+    for ts, status in ((100, "running"), (200, "needs_review"),
+                       (250, "needs_review"), (300, "completed")):
+        old.execute(
+            "INSERT INTO wo_events (wo_id, ts, kind, payload) VALUES ('wo-old',?,?,?)",
+            (SPAN_T0 + ts, "status", json.dumps({"status": status})))
+    old.commit()
+    old.close()
+    return proj
+
+
+def spans_of(store: ProjectStore, order_id: str) -> list[tuple]:
+    return [(r["from_status"], r["to_status"], r["ts"], r["approximate"])
+            for r in store.state_spans(order_id)]
+
+
+def test_status_events_are_backfilled_as_spans_exactly(tmp_path):
+    """The historical status trail, reproduced — spec §3 of
+    docs/superpowers/specs/2026-09-27-time-in-each-state.md.
+
+    The duplicate consecutive event is the one the store now prevents at the source; a
+    zero-length span for it in the history would inflate the entry count.
+    """
+    store = ProjectStore(legacy_with_history(tmp_path))       # the upgrade
+    try:
+        assert spans_of(store, "wo-old") == [
+            ("", "pending", SPAN_T0, 0),
+            ("pending", "running", SPAN_T0 + 100, 0),
+            ("running", "needs_review", SPAN_T0 + 200, 0),
+            ("needs_review", "completed", SPAN_T0 + 300, 0),
+        ]
+    finally:
+        store.close()
+
+
+def test_a_historical_feature_order_gets_one_approximate_span(tmp_path):
+    """A feature order has no event trail, so its history is one coarse span and says so.
+
+    The row is written straight into `feature_orders` rather than through
+    `create_feature_order`, because what is under test is a feature order that predates
+    the spans table — the shipped asset has no `feature_orders` at all.
+    """
+    proj = legacy_with_history(tmp_path)
+    first = ProjectStore(proj)
+    try:
+        first.conn.execute(
+            "INSERT INTO feature_orders (id, title, description, status, origin, "
+            "created_at, updated_at) VALUES ('fo-old','f','','executing','jarvis',?,?)",
+            (SPAN_T0, SPAN_T0 + 500))
+        first.conn.commit()
+        assert spans_of(first, "fo-old") == []
+    finally:
+        first.close()
+
+    second = ProjectStore(proj)
+    try:
+        assert spans_of(second, "fo-old") == [("", "executing", SPAN_T0, 1)]
+    finally:
+        second.close()
+
+
+def test_the_backfill_is_idempotent_across_opens(tmp_path):
+    """`_migrate` runs in `__init__` — every CLI invocation and every reconcile."""
+    proj = legacy_with_history(tmp_path)
+    first = ProjectStore(proj)
+    try:
+        before = spans_of(first, "wo-old")
+    finally:
+        first.close()
+    second = ProjectStore(proj)
+    try:
+        assert spans_of(second, "wo-old") == before
+    finally:
+        second.close()

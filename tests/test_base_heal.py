@@ -34,6 +34,8 @@ success from the outside:
 from __future__ import annotations
 
 import ast
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,7 @@ from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import BASE_RED_NOTE, status_label
 from jarvis.project_store import ProjectStore
+from jarvis.testing import make_git_project
 
 PR = "https://github.com/acme/proj/pull/7"
 PR2 = "https://github.com/acme/proj/pull/8"
@@ -674,3 +677,548 @@ def test_a_branch_name_github_answered_is_still_checked_before_it_is_an_argument
     for bad in ("--repo=someone/else", "-x", "main;rm -rf /", ""):
         with pytest.raises(GitHubError):
             ci.base_runs(bad)
+
+
+# -- a catch-up with `main` costs no round ---------------------------------------------
+# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md, issue #806:
+# the carry above, generalised from ONE merge the OS made to a CHAIN of base merges
+# anyone made — and proved twice, because parentage alone would carry an evil merge.
+
+#: The chain: JUDGED, then `main` merged in twice. Production lengths, as above.
+MID = "1a2b3c4d5e00000000000000000000000000f001"
+CAUGHT_UP = "2b3c4d5e6f00000000000000000000000000f002"
+BASE1 = "3c4d5e6f7a00000000000000000000000000f003"
+BASE2 = "4d5e6f7a8b00000000000000000000000000f004"
+WORKER_PUSH = "5e6f7a8b9c00000000000000000000000000f005"
+#: The divergent pull-merge shape of wo-00bd1096 / PR #779: a merge of two lineages of the
+#: BRANCH itself, its second parent already contained in JUDGED (§3.2 item 6, Neo 806).
+PULL_MERGE = "6f7a8b9c0d00000000000000000000000000f006"
+BRANCH_SIDE = "7a8b9c0d1e00000000000000000000000000f007"
+
+
+@pytest.fixture()
+def local_proof(monkeypatch):
+    """Proof (b) and the ancestry half of proof (a), answered without a checkout. §3.3.
+
+    The `project` fixture is a repository with no `origin`, so a real fetch resolves
+    nothing here. The git itself is proved against a real clone below, and the refusal a
+    failed fetch produces is driven through the real code in
+    `test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing`.
+    """
+    from jarvis import branchproof
+
+    # THE REAL ONES, kept reachable: the two whitespace tests below drive the daemon with
+    # ids a real repository produced, so they need the git behind the fake (review round 1).
+    state = {"id": "b7f0deadbeef", "ids": {}, "ancestors": None, "contained": set(),
+             "git_fetch": branchproof.fetch, "git_fingerprint": branchproof.diff_fingerprint}
+
+    def fetch(repo, *refs):
+        return True
+
+    def diff_fingerprint(repo, base_ref, sha):
+        return state["ids"].get(sha, state["id"])
+
+    def is_ancestor(repo, ancestor, descendant):
+        # TWO DESCENDANTS, and telling them apart is the whole of Neo question 806's
+        # widening: `origin/<base>` (a base merge) and the JUDGED commit (a pull merge of
+        # the branch's own lineage). `contained` is the second set.
+        if descendant.startswith("origin/"):
+            return state["ancestors"] is None or ancestor in state["ancestors"]
+        return ancestor in state["contained"]
+
+    monkeypatch.setattr(branchproof, "fetch", fetch)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", diff_fingerprint)
+    monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
+    return state
+
+
+def api_reads(fake_gh) -> list[str]:
+    """Every commit the walk asked GitHub about — the bound is a length of this list."""
+    return [c["argv"][3].rsplit("/", 1)[-1] for c in fake_gh.calls
+            if c["argv"][:2] == ["api", "--method"] and "/commits/" in c["argv"][3]]
+
+
+def refusals(store, wo) -> list[str]:
+    return [db.from_json(e["payload"], {}).get("proof")
+            for e in store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT)]
+
+
+def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
+        started, project, fake_gh, local_proof):
+    """THE WHOLE FEATURE. `main` was merged in twice — by a worker clearing a conflict, by
+    the user pressing "Update branch", it does not matter — so the head is two commits
+    past the one round 1 read. Today that costs a round, and on the last one it strands
+    the order in front of the user (wo-00bd1096, wo-8736a5c5).
+
+    The acceptance is that it MERGES on no new round: the carry, the same-tick re-decide
+    (§3.5 step 3), the gate, the merge."""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [MID, BASE2])
+    fake_gh.set_parents(MID, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    carried = store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)
+    assert len(carried) == 1
+    payload = db.from_json(carried[0]["payload"], {})
+    assert payload["cause"] == "base_merge_chain"
+    assert payload["chain"] == [MID, CAUGHT_UP]
+    assert payload["merged_base_shas"] == [BASE1, BASE2]
+    assert payload["patch_id"] == local_proof["id"]
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert row["head_sha"] == JUDGED and row["carried_head_sha"] == CAUGHT_UP
+    assert ProjectStore.validated_head(row) == CAUGHT_UP
+    # NO ROUND, which is the point: one settled round before and after.
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+    # ...and the merge is proposed on the SAME tick, not two minutes later.
+    approvals = store.list_approvals(wo["id"])
+    assert [a["kind"] for a in approvals] == ["auto_merge"]
+    assert CAUGHT_UP in approvals[0]["command"]
+
+    gates.apply_decision(store, approvals[0]["id"], "approved", "ok", "neo",
+                         project="proj_a")
+    poll(started, store)
+
+    assert [c["argv"][2] for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]] \
+        == [PR]
+    assert store.get_work_order(wo["id"])["status"] == "completed"
+
+
+def test_a_chain_whose_first_parent_is_a_worker_push_is_refused(started, project,
+                                                               fake_gh, local_proof):
+    """PROOF (a), §3.2. First parents only: a commit on the way back to the judged one
+    that is not a two-parent merge is authored content, and the verdict may not cross it.
+    Said once per (head, proof) however long the pull request stays parked."""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [WORKER_PUSH, BASE2])
+    fake_gh.set_parents(WORKER_PUSH, [JUDGED])
+
+    poll(started, store)
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["chain"]
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_merge_of_something_other_than_the_base_is_refused(started, project, fake_gh,
+                                                            local_proof):
+    """§3.2 item 6, and it is what makes the chain a chain of BASE merges: a two-parent
+    merge whose second parent is not an ancestor of `origin/main` merged somebody else's
+    branch in — authored content arriving in a shape that looks identical."""
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ancestors"] = {BASE1}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [MID, BASE2])
+    fake_gh.set_parents(MID, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["chain"]
+
+
+def test_a_pull_merge_of_the_branchs_own_lineage_carries_the_verdict(
+        started, project, fake_gh, local_proof):
+    """§3.2 item 6 as Neo question 806 widened it — the shape of wo-00bd1096 / PR #779.
+
+    A worker ran `git pull --no-rebase` before pushing, so the head is a merge of two
+    lineages of the BRANCH: its second parent is already contained in the judged commit,
+    so it brings in no commit that was not judged. Proof (b) is still required and still
+    equal, so the verdict carries and no round is spent.
+    """
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ancestors"] = {BASE1}
+    local_proof["contained"] = {BRANCH_SIDE}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=PULL_MERGE)
+    fake_gh.set_parents(PULL_MERGE, [MID, BRANCH_SIDE])
+    fake_gh.set_parents(MID, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    carried = store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)
+    assert len(carried) == 1
+    payload = db.from_json(carried[0]["payload"], {})
+    assert payload["chain"] == [MID, PULL_MERGE]
+    # `merged_base_shas` MUST NOT LIE: the pull merge's second parent is no base commit.
+    assert payload["merged_base_shas"] == [BASE1]
+    assert payload["merged_branch_shas"] == [BRANCH_SIDE]
+    assert payload["base_sha"] == BASE1
+    assert ProjectStore.validated_head(store.latest_validation_round(wo_id=wo["id"])) \
+        == PULL_MERGE
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+def test_a_merge_bringing_in_an_unjudged_commit_is_still_refused(
+        started, project, fake_gh, local_proof):
+    """Neo question 806's condition 3: the same shape with one fact moved. The second
+    parent is an ancestor of NEITHER `origin/main` NOR the judged commit, so it brings in
+    authored content no seat read — refused as `chain`, and the round machine gets its
+    turn on that head."""
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ancestors"] = {BASE1}
+    local_proof["contained"] = set()
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=PULL_MERGE)
+    fake_gh.set_parents(PULL_MERGE, [MID, BRANCH_SIDE])
+    fake_gh.set_parents(MID, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["chain"]
+    assert store.list_approvals(wo["id"]) == []
+    assert ops.rejudged_heads(store, wo["id"]) == {PULL_MERGE}
+
+
+def test_the_walk_is_bounded_and_spends_no_more_api_calls_than_the_limit(
+        started, project, fake_gh, local_proof):
+    """THE BOUND, §3.2 item 5. Ten catch-ups on one parked pull request is not a case
+    worth an unbounded walk, and the cost of the bound is the assertion: one `gh api` per
+    commit, at most `ci.CHAIN_LIMIT` of them, then fall through."""
+    opt_in(started)
+    store, wo = parked(project)
+    chain = [f"{i:02d}" + "0" * 34 + "aa11" for i in range(ci.CHAIN_LIMIT + 2)]
+    for i, sha in enumerate(chain):
+        fake_gh.set_parents(sha, [chain[i + 1] if i + 1 < len(chain) else JUDGED, BASE1])
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=chain[0])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["chain"]
+    assert len(api_reads(fake_gh)) == ci.CHAIN_LIMIT
+
+
+def test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing(started, project,
+                                                                fake_gh):
+    """§3.4, and the open question the spec logs: the `project` fixture has no `origin`,
+    so proof (b) cannot be computed at all — the shape of a checkout whose origin refuses
+    `refs/pull/N/head`. Refused, named `fetch` so a reader can tell it from a conflict
+    resolution, and the pull request falls through untouched."""
+    opt_in(started)
+    store, wo = parked(project)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["fetch"]
+    assert api_reads(fake_gh) == []            # refused before a single API call
+    assert store.list_approvals(wo["id"]) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+# -- proof (b), against a real repository ---------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = {"HOME": str(cwd), "PATH": os.environ.get("PATH", ""),
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _a_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
+    """A real clone whose feature branch merged a moved `main`, cleanly and evilly.
+
+    Returns (repo, judged, caught_up, evil). `caught_up` is an ordinary merge of
+    `origin/main`; `evil` merges the same commit and edits the branch's own file while
+    resolving — the case GitHub reports with the parentage of a clean one.
+    """
+    up = make_git_project(tmp_path, "upstream")
+    repo = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "a.txt").write_text("the branch's own line\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "the branch's contribution")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "b.txt").write_text("a line main added\n")
+    _git(up, "add", "b.txt")
+    _git(up, "commit", "-qm", "main moves")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-edit", "origin/main")
+    caught_up = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", judged)
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "a.txt").write_text("the branch's own line\nresolved differently\n")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "a merge that resolved content")
+    return repo, judged, caught_up, _git(repo, "rev-parse", "HEAD")
+
+
+def test_identical_patch_ids_carry_and_an_edited_branch_file_does_not(tmp_path):
+    """PROOF (b), §3.3, and the whole reason it exists. An evil merge has the parentage of
+    a clean one, so proof (a) alone would carry it and bind the panel's verdict to code no
+    seat read. What the branch adds ON TOP OF ITS MERGE BASE catches it."""
+    from jarvis import branchproof
+
+    repo, judged, caught_up, evil = _a_branch_that_merged_main(tmp_path)
+
+    assert branchproof.fetch(repo, "main")
+    clean = branchproof.diff_fingerprint(repo, "main", caught_up)
+    assert clean and clean == branchproof.diff_fingerprint(repo, "main", judged)
+    assert branchproof.diff_fingerprint(repo, "main", evil) != clean
+
+
+def _a_branch_that_added_a_binary_file(tmp_path) -> tuple[Path, str, str]:
+    """A real clone whose feature branch ADDED a binary file, then a merge swapped it.
+
+    Returns (repo, judged, swapped). `bin.dat` holds a NUL byte, so `git diff` prints only
+    `Binary files ... differ` for it and the `index` line's new-side blob id is the only
+    fingerprint of its content. `swapped` merges `origin/main` cleanly and rewrites those
+    bytes while resolving.
+    """
+    up = make_git_project(tmp_path, "upstream")
+    repo = tmp_path / "binwork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "bin.dat").write_bytes(b"\x00\x01judged payload\x00\xff")
+    _git(repo, "add", "bin.dat")
+    _git(repo, "commit", "-qm", "the branch adds a binary file")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "b.txt").write_text("a line main added\n")
+    _git(up, "add", "b.txt")
+    _git(up, "commit", "-qm", "main moves")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "bin.dat").write_bytes(b"\x00\x01swapped payload\x00\xff")
+    _git(repo, "add", "bin.dat")
+    _git(repo, "commit", "-qm", "a merge that swapped the binary file's bytes")
+    return repo, judged, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_merge_that_swaps_a_binary_files_bytes_is_not_the_judged_diff(tmp_path):
+    """REVIEW ROUND 3's BLOCKER. `git diff` prints no content for a binary file, only
+    `Binary files ... differ`, so dropping the `index` blob ids dropped the ONLY
+    fingerprint of it: a resolution that swapped the bytes of a file the branch added took
+    the judged commit's id and carried the verdict onto content no seat read."""
+    from jarvis import branchproof
+
+    repo, judged, swapped = _a_branch_that_added_a_binary_file(tmp_path)
+
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before != branchproof.diff_fingerprint(repo, "main", swapped)
+
+
+def _a_branch_that_added_a_latin1_text_file(tmp_path) -> tuple[Path, str, str]:
+    r"""A real clone whose branch added a TEXT file that is not valid UTF-8.
+
+    Returns (repo, judged, rewritten). `accents.txt` holds b"caf\xe9\n" — Latin-1, and no
+    NUL byte, so `git diff` prints it as content rather than as `Binary files ... differ`.
+    `rewritten` merges `origin/main` and changes that byte to `\xe8` while resolving.
+    """
+    up = make_git_project(tmp_path, "upstream")
+    repo = tmp_path / "latin1work"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "accents.txt").write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "accents.txt")
+    _git(repo, "commit", "-qm", "the branch adds a latin-1 text file")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "b.txt").write_text("a line main added\n")
+    _git(up, "add", "b.txt")
+    _git(up, "commit", "-qm", "main moves")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "accents.txt").write_bytes(b"caf\xe8\n")
+    _git(repo, "add", "accents.txt")
+    _git(repo, "commit", "-qm", "a merge that rewrote an undecodable byte")
+    return repo, judged, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_merge_that_rewrites_an_undecodable_byte_is_not_the_judged_diff(tmp_path):
+    r"""REVIEW ROUND 5's BLOCKER. The fingerprint is over the diff's BYTES. A text file's
+    diff carries its content, so the binary rule does not cover it, and hashing that text
+    as UTF-8 with `errors="replace"` mapped every undecodable byte to one U+FFFD:
+    b"caf\xe9\n" and b"caf\xe8\n" hashed alike and a resolution that swapped them carried
+    the verdict onto bytes no seat read."""
+    from jarvis import branchproof
+
+    repo, judged, rewritten = _a_branch_that_added_a_latin1_text_file(tmp_path)
+
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before != branchproof.diff_fingerprint(repo, "main", rewritten)
+
+
+def test_a_base_merge_that_moves_the_hunks_section_heading_still_matches(tmp_path):
+    """The `@@`'s trailing SECTION HEADING is in the hash, unlike the ranges beside it, so
+    the tolerance of §3.3 only holds while a base merge MOVES that line without changing
+    which heading the branch's hunk sits under. `main` adds a function above `alpha`, so
+    the heading `def alpha():` slides down four lines and the id must not move. A base
+    change that lands BETWEEN the heading and the hunk renames it and does move the id:
+    that is the conservative false refusal `diff_fingerprint` documents and accepts."""
+    from jarvis import branchproof
+
+    up = make_git_project(tmp_path, "upstream")
+    (up / "mod.py").write_text(
+        "def alpha():\n    return 1\n\n\ndef omega():\n    return 9\n")
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "the module")
+    repo = tmp_path / "headwork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "mod.py").write_text(
+        (repo / "mod.py").read_text().replace("return 9", "return 99"))
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "the branch's contribution")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "mod.py").write_text("def first():\n    return 0\n\n\n"
+                               + (up / "mod.py").read_text())
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "main inserts a function above the whole module")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-edit", "origin/main")
+    caught_up = _git(repo, "rev-parse", "HEAD")
+
+    merge_base = _git(repo, "merge-base", "origin/main", caught_up)
+    assert "@@ def alpha():" in _git(repo, "diff", f"{merge_base}..{caught_up}")
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before == branchproof.diff_fingerprint(repo, "main", caught_up)
+
+
+def _a_python_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
+    """A real clone where `main` moved INSIDE the file the branch also changed.
+
+    Returns (repo, judged, caught_up, dedented). `caught_up` merges the moved `main`
+    cleanly — the branch's own hunk is untouched and only its LINE NUMBERS shift, the
+    tolerance §3.3 has to keep. `dedented` merges the same commit and pulls a `return` out
+    of its `if` while resolving: whitespace only, a different program, and `git patch-id
+    --stable` cannot see it (review round 1 of wo-659be188).
+    """
+    up = make_git_project(tmp_path, "upstream")
+    (up / "mod.py").write_text("def f(x):\n    if x:\n        return 1\n    return 0\n")
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "the module")
+    repo = tmp_path / "pywork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    with open(repo / "mod.py", "a") as fh:
+        fh.write("\n\ndef g(y):\n    if y:\n        return 2\n    return 0\n")
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "the branch's contribution")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "mod.py").write_text("HEADER = 1\nHEADER2 = 2\n\n"
+                               + (up / "mod.py").read_text())
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "main moves, above the branch's own lines")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-edit", "origin/main")
+    caught_up = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", judged)
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "mod.py").write_text(
+        (repo / "mod.py").read_text().replace("        return 2", "    return 2"))
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "a resolution that only re-indented")
+    return repo, judged, caught_up, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_resolution_that_only_re_indents_python_is_not_the_diff_that_was_judged(
+        started, project, fake_gh, local_proof, tmp_path):
+    """REVIEW ROUND 1's BLOCKER. `git patch-id --stable` strips whitespace before hashing,
+    so a resolution that dedents a `return` out of its `if` — a different program, on the
+    branch's own line — produced the SAME id and the verdict was carried onto it, with the
+    record saying the diff was byte-identical.
+
+    Both halves in one test: the ids from a real repository must differ, and the daemon
+    driven with those ids must refuse the carry as `patch_id`."""
+    git_fingerprint = local_proof["git_fingerprint"]
+    repo, judged, _caught_up, dedented = _a_python_branch_that_merged_main(tmp_path)
+    assert local_proof["git_fetch"](repo, "main")
+    before = git_fingerprint(repo, "main", judged)
+    after = git_fingerprint(repo, "main", dedented)
+    assert before and after and before != after
+
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ids"] = {JUDGED: before, CAUGHT_UP: after}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert refusals(store, wo) == ["patch_id"]
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_base_merge_that_only_shifts_the_branchs_line_numbers_still_carries(
+        started, project, fake_gh, local_proof, tmp_path):
+    """THE TOLERANCE, and the reason the `@@` ranges are normalised rather than hashed.
+
+    `main` added lines ABOVE the branch's own hunk in the same file, so the branch's
+    contribution is unchanged and only the hunk header's numbers moved. A whitespace-exact
+    hash that kept them would refuse this — the commonest catch-up on the fleet — so the
+    ids must still be equal and the verdict must still carry with no round spent."""
+    git_fingerprint = local_proof["git_fingerprint"]
+    repo, judged, caught_up, _dedented = _a_python_branch_that_merged_main(tmp_path)
+    assert local_proof["git_fetch"](repo, "main")
+    before = git_fingerprint(repo, "main", judged)
+    assert before and before == git_fingerprint(repo, "main", caught_up)
+
+    opt_in(started)
+    store, wo = parked(project)
+    local_proof["ids"] = {JUDGED: before, CAUGHT_UP: before}
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=CAUGHT_UP)
+    fake_gh.set_parents(CAUGHT_UP, [JUDGED, BASE1])
+
+    poll(started, store)
+
+    assert refusals(store, wo) == []
+    assert len(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)) == 1
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+def test_the_ancestry_question_is_asked_of_the_local_origin_ref(tmp_path):
+    """§3.2 item 6 asked locally rather than with a `compare` call per commit: the fetch
+    is already paid for, and the API cost of the walk would otherwise double."""
+    from jarvis import branchproof
+
+    repo, judged, caught_up, _evil = _a_branch_that_merged_main(tmp_path)
+    merged_base = _git(repo, "rev-parse", caught_up + "^2")
+
+    assert branchproof.is_ancestor(repo, merged_base, "origin/main")
+    assert not branchproof.is_ancestor(repo, judged, "origin/main")
+    assert not branchproof.is_ancestor(repo, "not-a-ref", "origin/main")
+
+
+def test_a_fetch_of_a_ref_nobody_publishes_fails_rather_than_guessing(tmp_path):
+    """The other open question: a `refs/pull/N/head` some origin refuses makes the feature
+    inert there, so the failure is a False the caller has to handle — logged with the ref
+    it asked for. And a ref is an argument, so a flag-shaped one never becomes one."""
+    from jarvis import branchproof
+
+    repo, _judged, _caught_up, _evil = _a_branch_that_merged_main(tmp_path)
+
+    assert not branchproof.fetch(repo, "main", "refs/pull/7/head")
+    assert not branchproof.fetch(repo, "--upload-pack=false")
+
+
+def test_the_local_proof_module_runs_git_and_talks_to_nothing_else():
+    """`test_this_module_writes_only_the_branch_update`'s guard, for the new module. `ci`
+    is held against a `gh` allowlist and `github` against a read-only one; this module is
+    the local-`git` home, so what it is held against is that it shells out to `git` alone
+    and imports neither of them (§3.1)."""
+    from jarvis import branchproof
+
+    tree = ast.parse(Path(branchproof.__file__).read_text())
+    argv0 = {node.elts[0].value for node in ast.walk(tree)
+             if isinstance(node, ast.List) and node.elts
+             and isinstance(node.elts[0], ast.Constant)
+             and isinstance(node.elts[0].value, str)}
+    assert argv0 == {"git"}, f"this module runs more than git: {sorted(argv0)}"
+    imported = {(n.module or "") for n in ast.walk(tree)
+                if isinstance(n, ast.ImportFrom)}
+    assert not imported & {"ci", "github", "bugreport", "project_store", "ops"}
+    assert set(ci.WRITE_VERBS) == {("pr", "update-branch")}

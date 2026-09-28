@@ -38,7 +38,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, invariants, observability
+from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
@@ -52,12 +52,14 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
+    WO_STATUSES,
     ProjectStore,
     feature_status_label,
     is_feature_order_id,
@@ -1450,6 +1452,249 @@ UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a res
                     "large one is a different defect from anything this report can name")
 NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
                       "by Claude Code), so the residual is unmeasurable rather than zero")
+
+# -- time in each state -------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md §4. The ONE computation
+# over `wo_state_spans`; every surface renders this payload and derives no duration of its
+# own.
+
+#: How near a timeline event has to sit to a transition to be read as its cause. Spec §4
+#: rule 6: the trigger is derived at READ time, identically for live and backfilled rows,
+#: which is why no `set_status` call site has to be annotated.
+TRIGGER_WINDOW = 120.0
+
+#: `None` and a sentence, never `0` — issue #227's rule, as `NO_TURN_NOTE` above.
+NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
+                    "last activity to date — absent, not zero")
+SETTLED_NOTE = "this order has settled, so it has no current status age"
+FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
+                       "coarse span from its creation")
+#: What a renderer prints for a transition nothing was written about. Never a guess and
+#: never blank (spec §4 rule 6).
+NO_TRIGGER_PHRASE = "cause not recorded"
+
+#: What is NOT activity. `health.observer_kinds()` is imported rather than re-listed for
+#: the reason it exists: an order the supervisor swept would otherwise read as progressing
+#: BECAUSE it was examined. `status` is the thing being measured, so counting it would make
+#: every transition reset the idle clock, and `created` is when the record BEGAN rather than
+#: something that happened to the order.
+def _quiet_kinds() -> tuple[str, ...]:
+    return tuple(sorted({*health.observer_kinds(), "status", "created"}))
+
+
+@dataclass(frozen=True)
+class Span:
+    """One status the order was in, and when. `left is None` means it is in it now."""
+
+    status: str
+    entered: float
+    left: float | None
+    trigger: str                # '' when the record names no cause
+    approximate: bool
+
+    def seconds(self, now: float) -> float:
+        """A backwards clock must not produce a negative span (`holds.Hold.overlap`)."""
+        return max(0.0, (now if self.left is None else self.left) - self.entered)
+
+
+@dataclass(frozen=True)
+class StateDurations:
+    """One order's whole status history. `now` is never baked in; `as_dict` applies it."""
+
+    order_id: str
+    order_kind: str             # 'wo' | 'fo'
+    spans: tuple[Span, ...]     # oldest first
+    current_status: str         # '' for a settled order
+    current_status_since: float | None
+    last_activity_ts: float | None
+    last_activity_kind: str     # the wo_events kind / table that supplied it, '' if none
+    approximate: bool           # any span is
+    notes: tuple[str, ...]
+    #: FO_KINDS, so an improvement order's rows read `analysing` and not `planning`. '' for
+    #: a work order.
+    row_kind: str = ""
+    #: The read moment `state_durations` was given, and the default `as_dict` applies when
+    #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
+    #: are the same document.
+    asof: float = 0.0
+
+    def label(self, status: str) -> str:
+        if self.order_kind == "fo":
+            return feature_status_label(self.row_kind, status)
+        return timeline.STATUS_LABEL.get(status, status)
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = self.asof if now is None else now
+        order = FO_STATUSES if self.order_kind == "fo" else WO_STATUSES
+        end = now
+        if self.spans and self.spans[-1].left is not None:
+            end = self.spans[-1].left
+        lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
+
+        def share(seconds: float) -> float:
+            return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
+                  "left": s.left, "open": s.left is None,
+                  "seconds": round(s.seconds(now), 2),
+                  "seconds_human": ago_phrase(s.seconds(now)),
+                  "share": share(s.seconds(now)), "trigger": s.trigger,
+                  "approximate": s.approximate}
+                 for s in self.spans]
+        totals = []
+        for status in order:
+            mine = [s for s in self.spans if s.status == status]
+            if not mine:
+                continue
+            seconds = round(sum(s.seconds(now) for s in mine), 2)
+            totals.append({"status": status, "label": self.label(status),
+                           "seconds": seconds, "seconds_human": ago_phrase(seconds),
+                           "entries": len(mine), "share": share(seconds)})
+        age = (round(now - self.current_status_since, 2)
+               if self.current_status_since is not None else None)
+        idle = (round(max(0.0, now - self.last_activity_ts), 2)
+                if self.last_activity_ts is not None else None)
+        return {
+            "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
+            "approximate": self.approximate,
+            "lifetime_seconds": round(lifetime, 2),
+            "lifetime_human": ago_phrase(lifetime),
+            "spans": spans, "totals": totals,
+            "current_status": self.current_status,
+            "current_status_since": self.current_status_since,
+            "current_status_age": age,
+            "current_status_age_human": None if age is None else ago_phrase(age),
+            "last_activity_ts": self.last_activity_ts,
+            "last_activity_kind": self.last_activity_kind,
+            "last_activity_age": idle,
+            "last_activity_age_human": None if idle is None else ago_phrase(idle),
+            "notes": list(self.notes),
+        }
+
+
+def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
+    """The kind of the newest quiet-excluded event at `ts <= entered` within the window."""
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    row = store.conn.execute(
+        f"SELECT kind FROM wo_events WHERE wo_id=? AND ts<=? AND ts>=? "
+        f"AND kind NOT IN ({marks}) ORDER BY ts DESC, id DESC LIMIT 1",
+        (wo_id, entered, entered - TRIGGER_WINDOW, *quiet),
+    ).fetchone()
+    return str(row["kind"]) if row else ""
+
+
+def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """Every moment the record says something happened TO one work order. Spec §4.
+
+    All five tables, though every activity class in today's code also writes a `wo_events`
+    row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
+    events-only read is one future writer away from calling a busy order idle.
+    """
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    found: list[tuple[float, str]] = []
+    row = store.conn.execute(
+        f"SELECT kind, ts FROM wo_events WHERE wo_id=? AND kind NOT IN ({marks}) "
+        f"ORDER BY ts DESC, id DESC LIMIT 1", (wo_id, *quiet)).fetchone()
+    if row is not None:
+        found.append((float(row["ts"]), str(row["kind"])))
+    for sql, source in (
+        ("SELECT MAX(started_at), MAX(ended_at) FROM wo_turns WHERE wo_id=?", "wo_turns"),
+        ("SELECT MAX(ts), MAX(delivered_at) FROM wo_messages WHERE wo_id=?",
+         "wo_messages"),
+        ("SELECT MAX(ts) FROM validation_rounds WHERE wo_id=?", "validation_rounds"),
+        ("SELECT MAX(ts), MAX(decided_at) FROM approvals WHERE wo_id=?", "approvals"),
+    ):
+        got = store.conn.execute(sql, (wo_id,)).fetchone()
+        stamps = [float(v) for v in tuple(got or ()) if v is not None]
+        if stamps:
+            found.append((max(stamps), source))
+    return found
+
+
+def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
+    """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
+
+    A FEATURE ORDER'S ACTIVITY IS ITS FAMILY'S — every child, the planner and the manager,
+    not `carrier_for_feature`: picking one carrier would call a feature idle while three of
+    its other children were running. A feature progresses when anything in it does.
+    """
+    if kind == "wo":
+        found = _activity_of(store, order_id)
+    else:
+        family = [c["id"] for c in store.feature_children(order_id)]
+        fo = store.get_feature_order(order_id)
+        if fo.get("plan_wo_id"):
+            family.append(str(fo["plan_wo_id"]))
+        manager = store.manager_work_order(order_id)
+        if manager:
+            family.append(str(manager["id"]))
+        found = [seen for child in family for seen in _activity_of(store, child)]
+        row = store.conn.execute(
+            "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
+        if row and row[0] is not None:
+            found.append((float(row[0]), "validation_rounds"))
+    if not found:
+        return (0.0, "")
+    return max(found, key=lambda seen: seen[0])
+
+
+def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
+                    now: float | None = None) -> StateDurations:
+    """How long this order has been in its status, and how long it spent in each before.
+
+    Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
+    on both or neither. `now` is a parameter because every figure here is a present-tense
+    claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
+    injectable by a test. One indexed read per table, no model, nothing written.
+    """
+    if bool(wo_id) == bool(fo_id):
+        raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    now = time.time() if now is None else now
+    kind = "wo" if wo_id else "fo"
+    order_id = wo_id or fo_id
+    terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
+    row_kind = ""
+    if kind == "fo":
+        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+
+    rows = store.state_spans(order_id)
+    spans: list[Span] = []
+    for i, row in enumerate(rows):
+        entered = float(row["ts"])
+        status = str(row["to_status"])
+        if i + 1 < len(rows):
+            left: float | None = float(rows[i + 1]["ts"])
+        else:
+            # The last span is OPEN unless the order settled there, in which case it
+            # closed at its own moment and there is no open span at all (spec §4 rule 2).
+            left = entered if status in terminal else None
+        trigger = str(row["trigger"] or "")
+        if not trigger and kind == "wo":
+            trigger = _derived_trigger(store, order_id, entered)
+        spans.append(Span(status=status, entered=entered, left=left, trigger=trigger,
+                          approximate=bool(row["approximate"])))
+
+    open_span = spans[-1] if spans and spans[-1].left is None else None
+    activity_ts, activity_kind = _last_activity(store, kind, order_id)
+    approximate = any(s.approximate for s in spans)
+    notes: list[str] = []
+    if approximate:
+        notes.append(FO_APPROXIMATE_NOTE)
+    if not activity_kind:
+        notes.append(NO_ACTIVITY_NOTE)
+    if spans and open_span is None:
+        notes.append(SETTLED_NOTE)
+    return StateDurations(
+        order_id=order_id, order_kind=kind, spans=tuple(spans),
+        current_status=open_span.status if open_span else "",
+        current_status_since=open_span.entered if open_span else None,
+        last_activity_ts=activity_ts if activity_kind else None,
+        last_activity_kind=activity_kind, approximate=approximate,
+        notes=tuple(notes), row_kind=row_kind, asof=now,
+    )
 
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
 #: retried and gave up is today visible only as a cost row, and the whole point of
@@ -3772,9 +4017,14 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
     ran `jarvis wo ack` over a parked order must not have the flag raised again by the
     next tick; that is the same renotify defect wearing the column instead of the event.
+
+    THE STORE ENFORCES THE NO-DUPLICATE RULE NOW, not this function: `set_status` writes
+    neither a `status` event nor a span row for a move to the status the order is already
+    in (spec 2026-09-27-time-in-each-state §2), so the quiet path asserts the status
+    through the chokepoint like every other caller instead of dodging it.
     """
     if store.work_unlanded_open(wo["id"]):
-        store.update_work_order(wo["id"], status="needs_review")
+        store.set_status(wo["id"], "needs_review", trigger="unlanded_repark")
         return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
@@ -5333,7 +5583,41 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
 
 #: The event `carry_validated_head` writes. Not a `PrRepair` and not an automerge event:
 #: it is a fact about a VERDICT, and it belongs beside the round it moved.
+#:
+#: ONE KIND FOR BOTH CARRIES, with a `cause` — `"base_heal"` here, `"base_merge_chain"` in
+#: `carry_merge_chain` — for `ProjectStore.validated_head`'s one-home reason (spec
+#: 2026-09-27 §4, Neo question 791 rejected a second kind).
 HEAD_CARRIED_EVENT = "validation_head_carried"
+
+#: A carry the OS could NOT justify, and the reason the round machine is about to spend a
+#: round. Its own kind because it is the opposite fact, and `proof` says which of the two
+#: independent proofs failed.
+CARRY_REFUSED_EVENT = "validation_carry_refused"
+
+#: `cause` on `HEAD_CARRIED_EVENT`: the OS's own merge-ref rebuild, or a chain of base
+#: merges anybody made.
+CARRY_BASE_HEAL = "base_heal"
+CARRY_BASE_MERGE_CHAIN = "base_merge_chain"
+
+#: `cause` on `PR_BASE_UPDATED_EVENT` / `PR_BASE_UPDATE_FAILED_EVENT`: which of the two
+#: reasons asked the OS to rebuild this merge ref. THE KEY IS SHARED (`base_heal_spent`)
+#: and the reason is not — the bound is about how often one merge ref may be rebuilt, and
+#: the record still has to say why (spec 2026-09-27 §5.3 guard 4).
+BASE_UPDATE_BEHIND = "behind"
+BASE_UPDATE_BASE_RED = "base_red"
+
+#: How many times the OS may catch one pull request up with a MOVING base. The per-base-sha
+#: key cannot bound this on its own: every new commit on `main` is a new key and would earn
+#: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
+CATCH_UP_MAX = 3
+
+#: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
+#: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
+#: not reach GitHub" (spec §4).
+PROOF_CHAIN = "chain"
+PROOF_PATCH_ID = "patch_id"
+PROOF_FETCH = "fetch"
+PROOF_READ = "read"
 
 
 def record_base_health(store: ProjectStore, wo: dict[str, Any], *, red: bool,
@@ -5388,24 +5672,28 @@ def base_heal_spent(store: ProjectStore, wo_id: str, base_sha: str) -> bool:
 
 def record_base_update(store: ProjectStore, wo: dict[str, Any], *, base: str,
                        base_sha: str, head_before: str, head_after: str,
-                       checks: tuple[str, ...]) -> None:
+                       checks: tuple[str, ...], cause: str) -> None:
     """The OS healed this pull request itself. Spec §4: say so, on the record.
 
     `head_before`/`head_after` are not decoration — they are what `carry_validated_head`
     is allowed to rely on afterwards, and what tells a reader six weeks later that the
     commit an automatic merge landed differed from the judged one by a base merge and
     nothing else.
+
+    `cause` is `BASE_UPDATE_BASE_RED` or `BASE_UPDATE_BEHIND` — the two reasons the OS
+    updates a branch, sharing one key and one event kind, distinguishable on the record
+    and countable apart (`catch_up_attempts`).
     """
     from . import invariants as invariants_mod
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
                      "head_before": head_before, "head_after": head_after,
-                     "checks": list(checks)})
+                     "checks": list(checks), "cause": cause})
 
 
 def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: str,
-                              base_sha: str, reason: str) -> None:
+                              base_sha: str, reason: str, cause: str) -> None:
     """GitHub refused the update. Spends the attempt — see `base_heal_spent`.
 
     `reason` is `GitHubError.reason`, this OS's own short phrase, never `str(e)`: that
@@ -5416,7 +5704,99 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATE_FAILED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
-                     "reason": reason})
+                     "reason": reason, "cause": cause})
+
+
+def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
+    """How often the OS has already caught this pull request up with a moving base.
+
+    `CATCH_UP_MAX`'s counter (spec 2026-09-27 §5.3 guard 5), and it counts
+    `cause="behind"` rows only: a red base rebuilt the same merge ref for a different
+    reason, on its own key, and the two bounds must not eat each other's budget.
+    """
+    from . import invariants as invariants_mod
+
+    n = 0
+    for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if payload.get("cause") == BASE_UPDATE_BEHIND:
+            n += 1
+    return n
+
+
+def catch_up_needed(pr: Any, *, repo: Path) -> bool:
+    """Is this pull request behind its base? `.behind` ALONE IS NOT THE QUESTION.
+
+    Spec 2026-09-27 §5.1. `PullRequest.behind` is `mergeStateStatus == "BEHIND"`, and on a
+    repository whose `strict_required_status_checks_policy` is off — this one — a merely
+    behind branch reports CLEAN. Keying the catch-up on it would make the feature a no-op
+    on the fleet's busiest project, silently. So it is a cheap positive short-circuit, and
+    the authoritative test is ancestry: the base's head commit, read from the same
+    `gh pr view` the poll already makes, must be reachable from the pull request's head.
+
+    Asked of the LOCAL checkout (`branchproof.is_ancestor`) after the fetch proof (b)
+    needs anyway. A checkout that cannot answer reads as BEHIND — the caller's seven
+    guards then decide whether to spend an update, and every one of them is bounded.
+    """
+    from . import branchproof
+
+    if getattr(pr, "behind", False):
+        return True
+    base_oid = str(getattr(pr, "base_oid", "") or "")
+    head = str(getattr(pr, "head_oid", "") or "")
+    if not base_oid or not head:
+        return False        # GitHub answered no base commit: nothing to be behind of
+    return not branchproof.is_ancestor(repo, base_oid, head)
+
+
+def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      facts: Callable[[dict], tuple[str, dict] | None]) -> dict | None:
+    """The guard both carries owe and the one write both make. Spec 2026-09-27 §3.1.
+
+    TWO ENTRY POINTS, ONE RULE (review round 1): `carry_validated_head` and
+    `carry_merge_chain` differ only in what they prove, and a second copy of the write is a
+    second place for `validated_head`'s one-home invariant to drift out of. What is shared
+    is exactly this — there must be a latest round, its verdict must be the one on `judged`,
+    the head must have actually moved, and the binding is `carry_round_head` plus ONE
+    `HEAD_CARRIED_EVENT` carrying the round it moved.
+
+    `facts` is the caller's own proof, given the round row so it can name the round in its
+    refusal log; it returns `(reason, payload extras)` or None to refuse. Nothing is written
+    until it holds, so a refusal at either level leaves the record exactly as it was.
+
+    **AND IT PUTS THE FLAG DOWN ITSELF when nothing else is blocking** (spec §6 item 4):
+    the carry made `sha_moved` untrue, and nothing else lowers a stored flag before the
+    order completes on the merge, so without this the user keeps an attention item about a
+    stall that is over. Only when `true_blockers` is EMPTY — another blocker is somebody
+    else's reason and is left exactly as it was — and only while the flag is actually up,
+    which is what makes it idempotent across reconcile ticks and keeps it off the user's
+    acks (kn-089de524).
+    """
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or not judged or not head or head == judged:
+        return None
+    if ProjectStore.validated_head(row) != judged:
+        return None
+    built = facts(row)
+    if built is None:
+        return None
+    reason, extra = built
+    store.carry_round_head(int(row["id"]), head, reason)
+    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
+               "judged_sha": judged, "carried_head_sha": head, "reason": reason, **extra}
+    # AFTER the binding, so `rejudge_exhausted`'s last clause reads the carried head, and
+    # from the live row rather than the caller's snapshot (spec §6 item 4).
+    from . import invariants as invariants_mod
+
+    fresh = store.get_work_order(wo["id"])
+    lowered = bool(fresh["needs_attention"]) and not invariants_mod.true_blockers(
+        store, fresh)
+    if lowered:
+        carried["attention_cleared"] = True
+    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    if lowered:
+        store.clear_attention(wo["id"])
+    return carried
 
 
 def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
@@ -5470,29 +5850,127 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
     merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
     never whether one happens.
     """
-    row = store.latest_validation_round(wo_id=wo["id"])
-    if row is None or not judged or not head_after or head_after == judged:
-        return None
-    if ProjectStore.validated_head(row) != judged:
-        return None
-    if len(parents) != 2 or parents[0] != judged:
-        log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
-                 "of %s with the base", wo["id"], row["round"], head_after[:10],
-                 [p[:10] for p in parents] or "unreadable", judged[:10])
-        return None
-    reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
-              f"failure inherited from a red base — no authored content changed")
-    store.carry_round_head(int(row["id"]), head_after, reason)
-    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
-               "judged_sha": judged, "carried_head_sha": head_after,
-               "base": base, "base_sha": base_sha, "reason": reason,
-               # THE PROOF, not a restatement of the claim: the commit's own parents as
-               # GitHub answered them. `merged_base_sha` is the base commit that
-               # actually went in, which is not necessarily `base_sha` — the base can
-               # move between the CI read and the update.
-               "parents": list(parents), "merged_base_sha": parents[1]}
-    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
-    return carried
+    def facts(row: dict) -> tuple[str, dict] | None:
+        if len(parents) != 2 or parents[0] != judged:
+            log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
+                     "of %s with the base", wo["id"], row["round"], head_after[:10],
+                     [p[:10] for p in parents] or "unreadable", judged[:10])
+            return None
+        return ((f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
+                 f"failure inherited from a red base — no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commit's own parents as
+                # GitHub answered them. `merged_base_sha` is the base commit that
+                # actually went in, which is not necessarily `base_sha` — the base can
+                # move between the CI read and the update.
+                {"cause": CARRY_BASE_HEAL, "base": base, "base_sha": base_sha,
+                 "parents": list(parents), "merged_base_sha": parents[1]})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head_after, facts=facts)
+
+
+def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      chain: tuple[tuple[str, str, bool], ...], base: str, base_sha: str,
+                      fingerprints: tuple[str, str]) -> dict | None:
+    """Bind the panel's verdict to a head that is `judged` plus merges that added nothing.
+
+    docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3. The
+    generalisation of `carry_validated_head` above: the same weakening of "nothing merges a
+    commit no round judged", licensed by the same fact, for a CHAIN of base merges made by
+    anyone rather than one merge the OS made. Every catch-up with `main` is one — and the
+    OS's own gate reviewer demands the catch-up, so charging a round for it is the OS
+    charging for what it asked for.
+
+    **THE FACTS ARRIVE AS ARGUMENTS AND THE POLICY IS HERE.** `chain` is
+    `ci.base_merge_chain`'s proof (a), oldest first, each element `(merge, commit merged
+    in, whether that is a base commit)` — the second kind is a `git pull --no-rebase` merge
+    of the branch's own lineage, which Neo question 806 widened proof (a) to accept because
+    the judged commit already contained it; `fingerprints` is proof (b) —
+    `branchproof.diff_fingerprint` for `judged` and for `head` — and they must be
+    non-empty and EQUAL, which is what excludes an evil merge
+    whose conflict resolution edited the branch's own files. `Daemon._carry_catch_up` does
+    the `gh`/`git` and names the proof that failed; nothing here touches a network, so the
+    rule stays unit-testable exactly as `carry_validated_head` is.
+
+    **IT READS NEITHER `cfg`, `counted_validation_rounds` NOR `rejudged_heads`, and that is
+    a requirement rather than an omission (§6 item 2).** Part 3 of the spec is two live
+    orders stranded with their round budget spent and a decline already written for the
+    very head this would carry; both recover with nothing typed only because no round
+    accounting can reach this function. Enforced structurally — there is no `cfg`
+    parameter — and not by a comment.
+
+    Returns the payload written, or None when the facts do not hold.
+    """
+    before, after = fingerprints
+
+    def facts(_row: dict) -> tuple[str, dict] | None:
+        if not chain or chain[-1][0] != head:
+            return None         # oldest-first: the newest commit walked IS the head
+        if not before or not after or before != after:
+            # Belt to the daemon's braces: a differing diff is authored content, and the
+            # one thing this function may never do is carry a verdict onto it.
+            return None
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        branch = [merged for _sha, merged, is_base in chain if not is_base]
+        # Two sentences and not one, because `merged_base_shas` must not lie: past Neo
+        # question 806 a walked merge may have brought in the branch's own lineage.
+        said = ([f"`{base}` was merged into this branch {len(bases)} time(s)"]
+                if bases else [])
+        if branch:
+            said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
+                        f"already contained")
+        # SAY WHAT IS TRUE, and it is a HASH comparison and not a comparison of the diff
+        # text (review round 1): `branchproof.diff_fingerprint` hashes the diff whitespace
+        # and all, dropping only the line numbers and text blob ids a base merge moves —
+        # a binary file's new-side id stays in (round 3). So "unchanged
+        # down to its whitespace", never "byte-identical" — the bytes of the two diffs do
+        # differ, in exactly the bookkeeping this is licensed to ignore.
+        return ((" and ".join(said) + f", and the pull request's own diff is unchanged "
+                 f"down to its whitespace (diff hash {after[:12]}, line numbers aside) "
+                 f"— no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commits walked and what
+                # each of them merged in, as GitHub answered, plus the id both diffs
+                # produced. A reader six weeks later can re-run either proof from this.
+                {"cause": CARRY_BASE_MERGE_CHAIN,
+                 "chain": [sha for sha, _merged, _base in chain],
+                 "merged_base_shas": bases, "merged_branch_shas": branch,
+                 "base": base, "base_sha": base_sha, "patch_id": after})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head, facts=facts)
+
+
+def carry_refusal_told(store: ProjectStore, wo_id: str, head_sha: str,
+                       proof: str) -> bool:
+    """Has this refusal already been written for this commit? §4's dedupe.
+
+    Keyed on (head, proof) rather than saturating — `rejudged_heads` and `base_heal_spent`'
+    shape and kn-089de524's rule. A parked pull request reaches the carry every two
+    minutes, so an event per tick would bury the record; a key that saturated would hide
+    the refusal on the commit that arrives next.
+    """
+    for row in store.events_of_kind(wo_id, CARRY_REFUSED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if (str(payload.get("head_sha") or "") == head_sha
+                and str(payload.get("proof") or "") == proof):
+            return True
+    return False
+
+
+def record_carry_refusal(store: ProjectStore, wo: dict[str, Any], *, judged: str,
+                         head_sha: str, proof: str, detail: str,
+                         chain: tuple[str, ...] = ()) -> bool:
+    """Say on the record that the verdict was NOT carried, and which proof said so.
+
+    Neo's second condition (§4): a round the OS skipped and a round it spent must both be
+    auditable from `jarvis wo show` alone. Written once per (head, proof), and never for an
+    empty head — an unreadable head is `gh` failing to answer, and keying the dedupe on
+    `""` would swallow the real commit when it arrives (`rejudged_heads`' trap).
+    """
+    if not head_sha or carry_refusal_told(store, wo["id"], head_sha, proof):
+        return False
+    store.add_event(wo["id"], CARRY_REFUSED_EVENT,
+                    {"judged_sha": judged, "head_sha": head_sha, "proof": proof,
+                     "detail": detail, "chain": list(chain)})
+    return True
 
 
 def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
@@ -6702,6 +7180,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
             # carrier: a child's own alarm belongs on the child.
             "alarms": store.alarms_for_feature(fo_id),
+            # How long it has been where it is, on the same always-present rule — the
+            # identical document `jarvis wo show` carries for a work order (spec §6).
+            "time_in_state": state_durations(store, fo_id=fo_id).as_dict(),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a

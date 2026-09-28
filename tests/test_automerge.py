@@ -1896,3 +1896,82 @@ def test_a_re_judging_hold_still_feeds_the_re_judge_control(started, project, mo
     # `can_force` moves for the STATUS rule and not for the marking: `validating` is not
     # forceable, and that is the same sentence any validating order gets.
     assert rejudging["can_force"] is False and "is validating" in rejudging["refusal"]
+
+
+# -- a carried head relaxes the sha condition and nothing else -------------------------
+# docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4 condition
+# (i), and Neo question 791 made it a requirement rather than a remark.
+
+CARRIED = "c0ffee11223300000000000000000000000ccccc"
+
+
+@pytest.mark.parametrize("over, armed, code", [
+    ({}, True, "armed"),
+    ({"checks": (check("unit (3.13)", "FAILURE"),)}, False,
+     automerge.HELD_CHECKS_NOT_GREEN),
+    ({"merge_state": "BEHIND"}, False, automerge.HELD_MERGE_STATE_UNCLEAN),
+    ({"mergeable": "CONFLICTING"}, False, automerge.HELD_NOT_MERGEABLE),
+    ({"state": "CLOSED"}, False, automerge.HELD_PR_CLOSED),
+])
+def test_a_carried_head_arms_only_when_every_other_condition_holds(over, armed, code):
+    """The carry moves ONE condition — the commit the verdict is bound to — and the other
+    five are asked of the carried commit exactly as before."""
+    decision = decide(rnd(carried_head_sha=CARRIED), pull=pr(head_oid=CARRIED, **over))
+
+    assert decision.armed is armed and decision.code == code
+    assert decision.judged_sha == CARRIED
+
+
+def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
+        started, project, fake_gh, monkeypatch):
+    """§7 TEST 13's OTHER HALF, and §5.2's rule: the catch-up runs BEFORE a grant exists
+    and never after one. The gate command string carries the judged sha, so moving the head
+    behind a live grant orphans a permission Neo already gave and silently asks for another.
+
+    The base moves out from under an approved-and-filed pull request here — the ordinary
+    case on a busy `main` — and the OS leaves it alone."""
+    from jarvis import branchproof
+
+    base1, base2 = "1" * 40, "2" * 40
+    contained = {base1}
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: ancestor in contained)
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base1)
+    fake_gh.updated_head(CARRIED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1 and fake_gh.updates == []
+
+    # `main` moved: the pull request is now behind, and a grant for the judged sha stands.
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=base2)
+
+    poll(started, store)
+
+    assert fake_gh.updates == []
+    assert store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert len(store.list_approvals(wo["id"])) == 1
+
+
+def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judged(
+        started, project, fake_gh):
+    """§3.5: the carry hangs off `HELD_SHA_MOVED` and nothing else. On the ordinary tick —
+    the head is the judged commit, an approval is already filed for it — it costs no
+    `git`, no extra API read, and writes nothing. A carry there would rebind a verdict
+    for no reason and orphan a grant Neo has already given on that sha."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    poll(started, store)
+    assert len(store.list_approvals(wo["id"])) == 1
+
+    poll(started, store)
+
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
+                and "/commits/" in c["argv"][3]]
+    assert len(store.list_approvals(wo["id"])) == 1

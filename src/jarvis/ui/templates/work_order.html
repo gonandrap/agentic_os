@@ -2,6 +2,7 @@
 {% import "_bill.html" as bill_ui %}
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
+{% import "_states.html" as states_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -426,6 +427,12 @@
     <button role="tab" data-panel="tab-timeline" aria-selected="false"
             aria-controls="tab-timeline">Timeline
       {%- if timeline %}<span class="n">{{ timeline|length }}</span>{% endif %}</button>
+    {# A tab and not a header block: the ask is diagnostic, and only what asks something
+       of the reader lives above the tabs (spec §7). #}
+    <button role="tab" data-panel="tab-states" aria-selected="false"
+            aria-controls="tab-states">Time in state
+      {%- if states.current_status_age_human %}
+      <span class="n">{{ states.current_status_age_human }}</span>{% endif %}</button>
   </div>
 
 <section class="tabpanel on" id="tab-conversation" role="tabpanel">
@@ -525,6 +532,10 @@
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+</section>
+
+<section class="tabpanel" id="tab-states" role="tabpanel">
+{{ states_ui.view(states) }}
 </section>
 </div>
 

@@ -401,6 +401,85 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     assert not [s for s in sql if "approvals" in s]
 
 
+def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
+        started, project, fake_gh, parked, monkeypatch):
+    """SPEC 2026-09-27 §7 TEST 19: the carry's extra reads happen on a `sha_moved` tick and
+    on no other. A green, up-to-date pull request whose verdict covers its head pays the
+    base budget, no `gh api` commit walk and no local diff — so the price of the feature is
+    paid by the pull requests it rescues.
+
+    The walk is the expensive half (one `gh api` per commit, `ci.CHAIN_LIMIT` of them), and
+    this is what stops it drifting onto the path every open pull request pays every two
+    minutes. Counted on the poll AFTER the proposal, the steady state an opted-in project
+    spends almost all of its time in.
+    """
+    from jarvis import branchproof
+
+    git: list[str] = []
+    real_git = branchproof._git
+    monkeypatch.setattr(branchproof, "_git",
+                        lambda repo, *a, **kw: (git.append(a[0]), real_git(repo, *a,
+                                                                          **kw))[1])
+    spec = started.catalog.project("proj_a")
+    spec.validation.enabled = True
+    spec.validation.auto_merge = True
+    store = ProjectStore(project)
+    judged = "709582ae53000000000000000000000000000aaa"
+    row = store.open_validation_round(wo_id=parked["id"], fingerprint="fp1")
+    store.set_validation_head(row["id"], judged)
+    store.close_validation_round(row["id"], "passed", "")
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   merge_state="CLEAN", head_oid=judged, base_oid=judged)
+    poll(started, store)                 # the merge is proposed on this one
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+
+    poll(started, store)                 # ...and this is the steady state being priced
+
+    store.conn.set_trace_callback(None)
+    # The verdict already covers the head, so nothing is carried and nothing is refused.
+    assert store.events_of_kind(parked["id"], ops.HEAD_CARRIED_EVENT) == []
+    assert store.events_of_kind(parked["id"], ops.CARRY_REFUSED_EVENT) == []
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]]
+    # No local proof either: the diff the branch adds is computed for a MOVED head only.
+    assert "diff" not in git
+    assert len([s for s in sql if "validation_rounds" in s]) == 1
+    assert len([s for s in sql if "assumptions" in s]) == 1
+
+
+def test_a_sha_moved_tick_is_the_one_that_pays_for_the_walk(
+        started, project, fake_gh, parked, monkeypatch):
+    """The other side of test 19, so "only on a `sha_moved` tick" is an assertion about
+    both ticks. The head moved, so the carry runs: the fetch, the two local diffs and one
+    `gh api` per commit walked — and it is bounded by the chain, not by the poll."""
+    from jarvis import branchproof
+
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: True)
+    spec = started.catalog.project("proj_a")
+    spec.validation.enabled = True
+    spec.validation.auto_merge = True
+    store = ProjectStore(project)
+    judged = "709582ae53000000000000000000000000000aaa"
+    head = "c2120424ba000000000000000000000000000bbb"
+    base = "3c4d5e6f7a00000000000000000000000000f003"
+    row = store.open_validation_round(wo_id=parked["id"], fingerprint="fp1")
+    store.set_validation_head(row["id"], judged)
+    store.close_validation_round(row["id"], "passed", "")
+    fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
+                   merge_state="CLEAN", head_oid=head, base_oid=base)
+    fake_gh.set_parents(head, [judged, base])
+
+    poll(started, store)
+
+    assert len(store.events_of_kind(parked["id"], ops.HEAD_CARRIED_EVENT)) == 1
+    # ONE commit walked, one API read for it — the walk is the length of the chain.
+    assert len([c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
+                and "/commits/" in c["argv"][3]]) == 1
+
+
 def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
         started, project, fake_gh, reviewing):
     """The status guard is a cost guard too, and on the commonest non-parked status.
