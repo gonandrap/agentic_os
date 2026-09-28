@@ -1011,6 +1011,46 @@ def test_a_merge_that_swaps_a_binary_files_bytes_is_not_the_judged_diff(tmp_path
     assert before and before != branchproof.diff_fingerprint(repo, "main", swapped)
 
 
+def _a_branch_that_added_a_latin1_text_file(tmp_path) -> tuple[Path, str, str]:
+    r"""A real clone whose branch added a TEXT file that is not valid UTF-8.
+
+    Returns (repo, judged, rewritten). `accents.txt` holds b"caf\xe9\n" — Latin-1, and no
+    NUL byte, so `git diff` prints it as content rather than as `Binary files ... differ`.
+    `rewritten` merges `origin/main` and changes that byte to `\xe8` while resolving.
+    """
+    up = make_git_project(tmp_path, "upstream")
+    repo = tmp_path / "latin1work"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "accents.txt").write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "accents.txt")
+    _git(repo, "commit", "-qm", "the branch adds a latin-1 text file")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "b.txt").write_text("a line main added\n")
+    _git(up, "add", "b.txt")
+    _git(up, "commit", "-qm", "main moves")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "accents.txt").write_bytes(b"caf\xe8\n")
+    _git(repo, "add", "accents.txt")
+    _git(repo, "commit", "-qm", "a merge that rewrote an undecodable byte")
+    return repo, judged, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_merge_that_rewrites_an_undecodable_byte_is_not_the_judged_diff(tmp_path):
+    r"""REVIEW ROUND 5's BLOCKER. The fingerprint is over the diff's BYTES. A text file's
+    diff carries its content, so the binary rule does not cover it, and hashing that text
+    as UTF-8 with `errors="replace"` mapped every undecodable byte to one U+FFFD:
+    b"caf\xe9\n" and b"caf\xe8\n" hashed alike and a resolution that swapped them carried
+    the verdict onto bytes no seat read."""
+    from jarvis import branchproof
+
+    repo, judged, rewritten = _a_branch_that_added_a_latin1_text_file(tmp_path)
+
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before != branchproof.diff_fingerprint(repo, "main", rewritten)
+
+
 def test_a_base_merge_that_moves_the_hunks_section_heading_still_matches(tmp_path):
     """The `@@`'s trailing SECTION HEADING is in the hash, unlike the ranges beside it, so
     the tolerance of §3.3 only holds while a base merge MOVES that line without changing

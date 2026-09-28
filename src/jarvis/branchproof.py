@@ -70,6 +70,28 @@ def _git(repo: Path, *args: str, stdin: str | None = None) -> str | None:
     return proc.stdout
 
 
+def _git_bytes(repo: Path, *args: str) -> bytes | None:
+    """`_git`'s contract — None on any failure, never raises — with the OUTPUT AS BYTES.
+
+    A diff is not text: a repository's files are whatever bytes they hold, and `git diff`
+    copies them through. `errors="replace"` maps every undecodable byte to the same U+FFFD,
+    so a fingerprint taken after that decode cannot tell b"caf\\xe9" from b"caf\\xe8" and a
+    resolution that swapped them carried the verdict (review round 5). Only `stderr`, which
+    is LOGGED and never hashed, is decoded with `errors="replace"` here.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              timeout=GIT_TIMEOUT, check=False, env=_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("git %s in %s could not run: %s", args[0], repo, exc)
+        return None
+    if proc.returncode != 0:
+        log.debug("git %s in %s exited %d: %s", " ".join(args), repo, proc.returncode,
+                  proc.stderr.decode("utf-8", "replace").strip()[:200])
+        return None
+    return proc.stdout
+
+
 def fetch(repo: Path, *refs: str) -> bool:
     """Bring `refs` down from `origin`, once per carry attempt. False when it failed.
 
@@ -96,27 +118,28 @@ def fetch(repo: Path, *refs: str) -> bool:
 #: them and nothing else — and the `index` line's blob ids, which name whole-file contents
 #: of the merge base and of the merged head, both of which move for the same reason. The
 #: `@@`'s trailing section heading and the mode on the `index` line stay in.
-_HUNK_RANGE_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M)
-_INDEX_IDS_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+", re.M)
+#: BYTES patterns, because the diff is hashed as bytes (review round 5).
+_HUNK_RANGE_RE = re.compile(rb"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M)
+_INDEX_IDS_RE = re.compile(rb"^index [0-9a-f]+\.\.[0-9a-f]+", re.M)
 
 #: A BINARY file's diff is exempt from the `index` rule, and has to be (§3.3, review round
 #: 3): `git diff` prints `Binary files … differ` and no content, so the new-side blob id is
 #: the ONLY fingerprint of what the branch put there. The OLD side is still dropped — it
 #: names the merge base's version and moves when the base does.
-_INDEX_NEW_ID_RE = re.compile(r"^index [0-9a-f]+\.\.([0-9a-f]+)", re.M)
-_BINARY_RE = re.compile(r"^(?:Binary files .* differ|GIT binary patch)$", re.M)
-_PER_FILE_RE = re.compile(r"^(?=diff --git )", re.M)
+_INDEX_NEW_ID_RE = re.compile(rb"^index [0-9a-f]+\.\.([0-9a-f]+)", re.M)
+_BINARY_RE = re.compile(rb"^(?:Binary files .* differ|GIT binary patch)$", re.M)
+_PER_FILE_RE = re.compile(rb"^(?=diff --git )", re.M)
 
 
-def _normalise(diff: str) -> str:
+def _normalise(diff: bytes) -> bytes:
     """Drop what a base merge moves, per file, keeping binary content in the hash."""
     out = []
     for section in _PER_FILE_RE.split(diff):
         if _BINARY_RE.search(section):
-            out.append(_INDEX_NEW_ID_RE.sub(r"index \1", section))
+            out.append(_INDEX_NEW_ID_RE.sub(rb"index \1", section))
         else:
-            out.append(_INDEX_IDS_RE.sub("index", _HUNK_RANGE_RE.sub("@@ @@", section)))
-    return "".join(out)
+            out.append(_INDEX_IDS_RE.sub(b"index", _HUNK_RANGE_RE.sub(b"@@ @@", section)))
+    return b"".join(out)
 
 
 def diff_fingerprint(repo: Path, base_ref: str, sha: str) -> str | None:
@@ -135,6 +158,14 @@ def diff_fingerprint(repo: Path, base_ref: str, sha: str) -> str | None:
     heading are all part of the id. `--full-index`, so nothing depends on how short git
     chose to abbreviate; `--no-ext-diff --no-textconv`, so no repository's configuration can
     choose what this hashes.
+
+    **THE HASH IS OVER THE DIFF'S BYTES, never over decoded text** (review round 5). A
+    repository holds whatever bytes it holds, and a text file's content is inside its diff,
+    so decoding with `errors="replace"` before hashing mapped every undecodable byte to one
+    U+FFFD: b"caf\\xe9\\n" and b"caf\\xe8\\n" produced the same id, and a resolution that
+    rewrote such a file kept the judged commit's fingerprint. `_git_bytes` captures the diff
+    raw and `_normalise` works in bytes; `errors="replace"` survives only where output is
+    LOGGED.
 
     **A BINARY file keeps its new-side blob id** (review round 3). `git diff` prints
     `Binary files … differ` and no content for any path a `-diff`/`binary` attribute marks
@@ -166,11 +197,11 @@ def diff_fingerprint(repo: Path, base_ref: str, sha: str) -> str | None:
     merge_base = _git(repo, "merge-base", f"origin/{branch}", sha)
     if not merge_base or not merge_base.strip():
         return None
-    diff = _git(repo, "diff", "--full-index", "--no-ext-diff", "--no-textconv",
-                f"{merge_base.strip()}..{sha}")
+    diff = _git_bytes(repo, "diff", "--full-index", "--no-ext-diff", "--no-textconv",
+                      f"{merge_base.strip()}..{sha}")
     if not diff:
         return None
-    return hashlib.sha256(_normalise(diff).encode("utf-8", "replace")).hexdigest()
+    return hashlib.sha256(_normalise(diff)).hexdigest()
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:

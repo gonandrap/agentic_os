@@ -142,7 +142,7 @@ git -C <repo> diff --full-index --no-ext-diff --no-textconv
        <merge-base(base_ref, sha)>..<sha>
     -> per file: TEXT diff  -> drop the `@@ -a,b +c,d @@` ranges and both `index` blob ids
                   BINARY    -> keep the NEW-side `index` blob id, drop the old side
-    -> sha256 of what is left
+    -> sha256 of what is left, AS BYTES
 ```
 
 `--no-ext-diff --no-textconv` so no repository's configuration decides what is hashed.
@@ -173,6 +173,14 @@ file type. The old side is still dropped, because it names the merge base's vers
 moves when the base does, and text hunks are untouched so the catch-up above still carries.
 The alternative, `git diff --binary`, was rejected: for a MODIFIED binary file it can emit
 a delta against the preimage, so the base moving would move the id.
+
+**THE DIFF IS HASHED AS BYTES, and the normalisation above runs in bytes** (review round 5
+of wo-659be188). A TEXT file's content rides inside its diff, and a file is whatever bytes it
+holds — decoding to `str` with `errors="replace"` before hashing collapsed every undecodable
+byte to one U+FFFD, so a branch file of b"caf\xe9\n" and the same file rewritten to
+b"caf\xe8\n" by a conflict resolution hashed identically and the verdict carried onto bytes
+no seat read. `branchproof._git_bytes` captures the diff raw; `errors="replace"` remains only
+where git's output is LOGGED, never where it is hashed.
 
 This is the proof (a) cannot give. GitHub reports an **evil merge** — a merge whose
 conflict resolution edited the pull request's own files — with exactly the parentage of a
