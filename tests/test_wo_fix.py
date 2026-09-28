@@ -863,6 +863,136 @@ def test_an_idle_manager_is_not_a_blocker_and_is_handed_no_command(started, cata
     _nothing_was_written(wo["id"])
 
 
+def test_a_signin_park_is_the_users_own_move(started, catalog_file):
+    """`FIX_USERS_MOVE`'s reason, on the member whose command is not a `jarvis` one at all:
+    `signin`'s detail names `/login`, which only the user can type. Unchanged behaviour —
+    the diagnosis handed back, labelled theirs — and asserted HERE rather than left to the
+    new default arm, which would otherwise swallow every unclassified slug silently."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = ops.create_work_order("proj_a", "parked on a sign-in")
+    store = _store(wo["id"])
+    try:
+        store.set_status(wo["id"], "waiting_input")
+        turn = store.create_turn(wo["id"], kind="message", prompt="do the thing")
+        store.finish_turn(turn["id"], "failed",
+                          error="Failed to authenticate: OAuth session expired and "
+                                "could not be refreshed")
+    finally:
+        store.close()
+
+    out = ops.fix(wo["id"])
+
+    assert out["blocker"]["what"] == "signin"
+    assert out["remedy"] is None and out["proposal"] is None
+    assert out["your_move"]["detail"] == out["blocker"]["detail"]
+    assert out["your_move"]["note"] == ops.FIX_YOURS_TO_RUN
+    assert out["note"] == ops.FIX_UNCOVERED.format(what="signin")
+    assert "signin" in ops.FIX_USERS_MOVE
+    _nothing_was_written(wo["id"])
+
+
+# -- 6. the slug NOBODY classified: a gap in the OS, not a shrug ------------------------
+#
+# Neo q839, reversing §11's "add NO remedy": auto-matching a blocker against a closed
+# table in `ops` means the OS never learns which blockers it has no remedy FOR. Every
+# slug `waiting_on` answers today is classified by one of the four sets, so the only way
+# to reach the new default arm is a slug from the future — stated directly, the way
+# `test_a_nudge_the_mapping_calls_wrong_is_refused_in_its_own_words` states its mapping.
+
+UNKNOWN = {"what": "quota_ledger_drift", "stalled": False,
+           "detail": "the OS has no idea, and that is the point of this test"}
+
+
+def _unclassified(monkeypatch) -> None:
+    monkeypatch.setattr(ops, "waiting_on", lambda store, wo: dict(UNKNOWN))
+
+
+def test_an_unclassified_blocker_is_offered_a_new_remedy_order_and_writes_nothing(
+        started, catalog_file, monkeypatch):
+    """The new default. `file_work_order` with an OS-authored brief that names the slug and
+    asks for a REUSABLE remedy — and with `confirm=False` still nothing written at all."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+
+    out = ops.fix(wo["id"])
+
+    assert out["blocker"]["what"] == UNKNOWN["what"]
+    assert out["remedy"] == "file_work_order"
+    assert out["proposal"]["blast"] == remedies.REMEDIES["file_work_order"].blast
+    brief = out["proposal"]["argument"]
+    assert brief == ops.FIX_NEW_REMEDY_BRIEF.format(
+        what=UNKNOWN["what"], detail=UNKNOWN["detail"], wo_id=wo["id"])
+    # The four things the order is for, each asserted rather than assumed from the brief
+    # being long: the slug, the module, the registry's own closing act, and the arming it
+    # must NOT do.
+    assert UNKNOWN["what"] in brief and UNKNOWN["detail"] in brief
+    assert "src/jarvis/remedies.py" in brief
+    assert "covers" in brief and "SHIPPED_REMEDIES" in brief
+    assert "tests/test_remedies.py" in brief
+    assert "allow-list" in brief
+    assert wo["id"] in brief
+    assert out["your_move"] is None
+    assert out["filed"] is None
+    _nothing_was_written(wo["id"])
+
+
+def test_the_new_remedy_brief_carries_no_text_the_os_did_not_write(started, catalog_file,
+                                                                  monkeypatch):
+    """`diagnose`'s boundary, kn-1791a5e6: the slug and §6's `detail` are the ONLY
+    interpolations, and both are OS-authored. No exception tail, no gate command, no
+    transcript line."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = ops.create_work_order("proj_a", "ship it")
+    store = _store(wo["id"])
+    try:
+        store.set_status(wo["id"], "waiting_input")
+        store.add_approval(wo["id"], kind="release", command="./scripts/shipit.sh",
+                           matched="shipit", justification="a worker's own words here",
+                           status=gates.AWAITING_CASE)
+        turn = store.create_turn(wo["id"], kind="message", prompt="SECRET PROMPT TEXT")
+        store.finish_turn(turn["id"], "failed", error="Traceback: /home/someone/x.py")
+    finally:
+        store.close()
+    _unclassified(monkeypatch)
+
+    brief = ops.fix(wo["id"])["proposal"]["argument"]
+
+    for leaked in ("scripts/shipit.sh", "a worker's own words here", "SECRET PROMPT TEXT",
+                   "Traceback", "/home/someone"):
+        assert leaked not in brief
+    # Paired with the negatives: the brief is not empty, so the assertions above are not
+    # green on a blank string.
+    assert UNKNOWN["what"] in brief
+
+
+def test_confirming_it_files_one_grant_and_adds_no_remedy(started, catalog_file,
+                                                         monkeypatch):
+    """The act rides the same `self_heal` grant as every other remedy: one request, a
+    reviewer decides, nothing applied. AND THE REGISTRY IS STILL CLOSED afterwards — the
+    order writes the new remedy as a reviewed diff, `ops.fix` never authors one."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    assert out["remedy"] == "file_work_order"
+    assert out["filed"]["proposed"] is True
+    assert str(out["filed"]["approval"]) in out["filed"]["note"]
+    store = _store(wo["id"])
+    try:
+        (approval,) = store.list_approvals(wo["id"])
+        assert approval["kind"] == remedies.GATE_KIND
+        assert approval["status"] == "pending"
+        # Filed, not applied: no work order exists yet and none may until the gate opens.
+        assert store.queued_messages(wo["id"]) == []
+        assert [w["id"] for w in store.list_work_orders()] == [wo["id"]]
+    finally:
+        store.close()
+    assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
+
+
 def test_the_cli_renders_the_payload_and_derives_nothing(started, catalog_file, capsys):
     """Both surfaces read one dict. The JSON arm is asserted equal to `ops.fix`, and the
     human arm against the payload's OWN sentences — a figure or a sentence in the terminal

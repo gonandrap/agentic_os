@@ -120,6 +120,68 @@ def test_the_registry_is_closed_and_shipped_with_exactly_three():
                                                                  "feature_order"}
 
 
+def _waiting_on_slugs() -> set[str]:
+    """Every `what` slug `ops.waiting_on` can answer, read off its AST.
+
+    OFF THE SOURCE AND NOT OFF A LIST HERE, `test_the_acting_calls_stay_inside_the_handlers`'
+    reason one function along: a copy of the vocabulary in the test file is green the day
+    the function's answers and the copy diverge, which is exactly the day a `covers` entry
+    starts pointing at a slug nobody answers. The `{"what": wo["status"]}` arm is not a
+    literal and its statuses are added by hand — the only dynamic arm, checked by the
+    assertion below that every literal arm is still found.
+    """
+    import ast
+    from pathlib import Path
+
+    from jarvis import ops as ops_mod
+
+    tree = ast.parse(Path(ops_mod.__file__).read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "waiting_on")
+    slugs = {v.value for node in ast.walk(fn) if isinstance(node, ast.Dict)
+             for k, v in zip(node.keys, node.values)
+             if isinstance(k, ast.Constant) and k.value == "what"
+             and isinstance(v, ast.Constant) and isinstance(v.value, str)}
+    assert {"prompt", "pending", "gate_held", "signin"} <= slugs, slugs
+    return slugs | {"completed", "cancelled", "failed", "waiting_pr_merge",
+                    "needs_review"}
+
+
+def test_every_covers_slug_is_a_real_blocker_and_no_two_remedies_claim_one():
+    """`covers` is the mapping `ops.FIX_MATCHES` used to be, moved ON to the remedy (Neo
+    q839). A slug nothing answers means a remedy nothing can reach, and a slug with two
+    owners is a registry defect rather than a choice `ops.fix` may make."""
+    real = _waiting_on_slugs()
+    claimed: dict[str, str] = {}
+    for remedy in remedies.REMEDIES.values():
+        assert isinstance(remedy.covers, tuple)
+        for slug in remedy.covers:
+            assert slug in real, f"{remedy.id} covers {slug}, which nothing answers"
+            assert slug not in claimed, f"{slug} claimed by {claimed[slug]} and {remedy.id}"
+            claimed[slug] = remedy.id
+    assert claimed == {"prompt": "nudge", "pending": "unblock"}
+    # The empty tuple is a decision and not an omission: it writes code, clears no blocker
+    # mechanically, and stays reachable only by being named.
+    assert remedies.REMEDIES["file_work_order"].covers == ()
+
+
+def test_covering_answers_the_one_owner_and_none_for_an_unclaimed_slug():
+    assert remedies.covering("prompt") == "nudge"
+    assert remedies.covering("pending") == "unblock"
+    assert remedies.covering("gate_held") is None
+    assert remedies.covering("a-slug-shipped-next-year") is None
+
+
+def test_covering_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
+    """Paired with the green registry above: the guard is asserted to BITE, or the test
+    that says the registry is clean is grading nothing."""
+    clash = remedies.Remedy(**{**vars(remedies.REMEDIES["file_work_order"]),
+                               "covers": ("prompt",)})
+    monkeypatch.setitem(remedies.REMEDIES, "file_work_order", clash)
+    with pytest.raises(ValueError, match="prompt"):
+        remedies.covering("prompt")
+
+
 def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):
     """An unknown id is a `CatalogError` naming the known ones, `GateConfig.parse`'s rule
     — a typo must not silently leave a permission unset. Paired with the id that IS

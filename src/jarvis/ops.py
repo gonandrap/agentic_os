@@ -1739,27 +1739,6 @@ def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
     return out
 
 
-#: Which SHIPPED remedy clears which `waiting_on` answer — §11 of
-#: docs/specs/2026-09-24-order-observability.md. CLOSED and keyed on the slug, for
-#: `remedies.REMEDIES`' own reason: widening what the OS offers to do is then a reviewed
-#: diff rather than a sentence somewhere in a function.
-#:
-#: `prompt`: the ONE answer `waiting_on` reports as `stalled` — nothing is coming for it by
-#: itself, and a message is the only thing that can move it. It is the same case
-#: `_diagnose_commands` offers `jarvis wo resume-auto` for.
-#:
-#: `pending`: an order held behind dependency edges. Matched HERE and qualified in
-#: `_fix_match`, because `unblock`'s handler is the DEFAULT mode and cuts only edges that
-#: can never clear — an order whose every edge is live is not this case.
-#:
-#: `file_work_order` HAS NO SLUG AND MUST NOT GET ONE: no `waiting_on` answer means "a
-#: defect needs code written", and matching a blocker to a whole worker session is a
-#: judgement this table is in no position to make. It is reachable only by being named.
-FIX_MATCHES: dict[str, str] = {
-    "prompt": "nudge",
-    "pending": "unblock",
-}
-
 #: The `waiting_on` answers that are NOT A BLOCKER: something is coming by itself, or the
 #: order has settled. They are answered in words and offered nothing — handing back
 #: `detail` as the user's command would invent a move out of a sentence that describes a
@@ -1771,19 +1750,24 @@ FIX_MATCHES: dict[str, str] = {
 #: with whose move it is (`FIX_YOURS_TO_RUN`, or `FIX_WORKERS_TO_RUN` for the closed set
 #: `FIX_WORKER_MOVE` names) — so a description of a wait reaching it is
 #: the OS inventing a move the user cannot make, on top of calling a healthy order blocked.
-#: Every uncovered slug names a real command in its own detail (`signin` `/login`,
-#: `assumptions` and `plan_assumptions` `jarvis wo review`, `gate_held` `jarvis gate
-#: request`, `gate_escalated` `jarvis gate approve`, `neo_escalated` `jarvis neo answer`,
-#: `message_stuck` `jarvis wo show`). Adding a `waiting_on` answer means checking it here.
+#: The slugs that DO name a command in their own detail are enumerated in `FIX_USERS_MOVE`
+#: and `FIX_WORKER_MOVE`, one per whose move it is. Adding a `waiting_on` answer means
+#: deciding it into one of those three sets — and a slug in none of them now reaches
+#: `_fix_match`'s default arm, which files for a remedy to be WRITTEN (Neo q839).
 FIX_NOTHING_TO_CLEAR: tuple[str, ...] = (
     "turn_running", "validating", "retry_pending", "neo_question", "gate_with_neo",
     "queued_message", "pending", "manager_idle", "completed", "cancelled", "failed",
     "waiting_pr_merge", "needs_review",
 )
 
-#: Said of a blocker no shipped remedy covers. §11 adds no remedy, so this is the honest
-#: answer rather than a gap: the way through is §6's own pre-validated sentence, and it is
-#: labelled as the USER's to run.
+#: Said of a blocker no shipped remedy covers AND whose way through somebody can type —
+#: `FIX_USERS_MOVE` and `FIX_WORKER_MOVE`, and only those. The way through is §6's own
+#: pre-validated sentence, labelled with whose it is to run.
+#:
+#: IT IS NO LONGER THE ANSWER FOR AN UNCLASSIFIED SLUG. It used to be, and the user rejected
+#: that (Neo q839): "it should not auto-match with known blockers, because doing that it
+#: will never learn about new bugs or gaps in the OS." A slug none of the four sets names is
+#: a gap, and `_fix_match`'s default arm asks for a remedy to be written for it.
 FIX_UNCOVERED = ("no shipped remedy covers this blocker ({what}) — the OS is not offering "
                  "to act on it")
 FIX_YOURS_TO_RUN = ("this is yours to run: the OS is not offering to take it, and nothing "
@@ -1802,6 +1786,27 @@ FIX_WORKERS_TO_RUN = ("this is the WORKER's to run in its own worktree, not your
 #: Adding a `waiting_on` answer means deciding it here, exactly as `FIX_NOTHING_TO_CLEAR`
 #: above must be decided.
 FIX_WORKER_MOVE: frozenset[str] = frozenset({"gate_held"})
+
+#: CLOSED SET: the slugs whose own `detail` names a command THE USER MAY RUN. This was the
+#: DEFAULT arm until Neo q839; it is a membership list now, because "everything else is
+#: yours to type" hid the case the user actually cares about — a blocker the OS has no
+#: remedy for and never learns it needs one. Each member is decided against the command its
+#: own `waiting_on` detail names, never inferred from the wording:
+#:
+#: * `signin` — `/login`, which only the user can type;
+#: * `assumptions` and `plan_assumptions` — `jarvis wo review`, the user's ruling and
+#:   nobody else's (the second one on its feature's PLANNER);
+#: * `gate_escalated` — `jarvis gate approve` / `deny`, escalated to the user BY NAME;
+#: * `neo_escalated` — `jarvis neo answer`, a question Neo could not settle;
+#: * `message_stuck` — `jarvis wo show`, then `jarvis wo done` if the order is finished
+#:   with it.
+#:
+#: `gate_held` is deliberately NOT here: its two exits are refused from anyone but the
+#: worker, which is what `FIX_WORKER_MOVE` exists to say.
+FIX_USERS_MOVE: frozenset[str] = frozenset({
+    "signin", "assumptions", "plan_assumptions", "gate_escalated", "neo_escalated",
+    "message_stuck",
+})
 FIX_NOTHING = "nothing here for a remedy to clear — {detail}"
 FIX_LIVE_EDGES = ("every dependency edge it waits on is still LIVE, so the `unblock` "
                   "remedy would cut nothing and is not offered — only `--all` cuts a live "
@@ -1829,6 +1834,38 @@ FIX_ARGUMENTS = {
     "unblock": ("Cut the dependency edges that can never clear, so this order can be "
                 "dispatched."),
 }
+
+#: THE DEFAULT ARM's argument: the brief for the order that writes the remedy this blocker
+#: needed and the OS did not have. Neo q839, and the user's reason for it — "in order to fix
+#: the issue at hand, it may need to create a new remedy that will be used for that fix, and
+#: can be used for other fixes in the future" — so the order is asked for a REUSABLE remedy
+#: and not a one-off repair of this order.
+#:
+#: OS-AUTHORED, and the only three interpolations are the `waiting_on` slug, §6's own
+#: `detail` and the order's id: all three are text the OS wrote (`diagnose`'s boundary,
+#: kn-1791a5e6), so no exception tail, gate command, prompt or transcript line can ride in.
+#: The first line is the title `remedies._title_from` takes, so it reads as one.
+FIX_NEW_REMEDY_BRIEF = (
+    "Write a reusable `{what}` remedy in src/jarvis/remedies.py\n"
+    "\n"
+    "{wo_id} is blocked on a `waiting_on` answer no shipped remedy covers: `{what}`. The "
+    "OS's own diagnosis of it reads: {detail}\n"
+    "\n"
+    "That gap is the work, not just this one order. Add a remedy that clears `{what}` "
+    "WHEREVER it appears:\n"
+    "\n"
+    "1. a handler function in src/jarvis/remedies.py holding every acting call — the "
+    "enclosure the AST pin in tests/test_remedies.py requires;\n"
+    "2. a `REMEDIES` entry with `headline`, `blast`, `subjects` and `covers` containing "
+    "`{what}`, so `ops.fix` reaches it with no edit to ops.py;\n"
+    "3. `SHIPPED_REMEDIES` updated to match, which is what makes the addition a reviewed "
+    "diff rather than a prompt edit;\n"
+    "4. tests in tests/test_remedies.py covering the handler and the new `covers` entry;\n"
+    "5. left OFF every project's allow-list, so it ships DISARMED and a user arms it "
+    "deliberately.\n"
+    "\n"
+    "Then clear the blocker on {wo_id} with it — that order is waiting on this one."
+)
 
 #: A proposal the reviewer has been asked about, and one nobody could be asked about.
 #: UNREACHABLE IS NOT A VERDICT (kn-40db1828): the grant stays pending and is answerable by
@@ -1867,41 +1904,59 @@ def remedy_config(project: str | None = None) -> Any:
 
 def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
                asked: str | None) -> tuple[str | None, str | None,
-                                           dict[str, str] | None]:
-    """`(remedy, note, your_move)` for one blocker — §11's matching rule and nothing else.
+                                           dict[str, str] | None, str | None]:
+    """`(remedy, note, your_move, argument)` for one blocker — the matching rule, and it is
+    the REGISTRY's rather than this module's (Neo q839).
+
+    `argument` is the OS's own brief for the arms that have one and None everywhere else, so
+    a caller's `--argument` still wins in `fix`.
 
     Reads only. The predicates are the ones `_diagnose_commands` calls, not copies of them
     (kn-4ea33fe6), and the `NUDGE_IS_WRONG` arm mirrors `resume_in_auto`'s refusal in that
     mapping's own words rather than restating why.
     """
+    from . import remedies as remedies_mod
+
     wo_id = str(wo["id"])
     what = str(blocker["what"])
-    matched = asked if asked is not None else FIX_MATCHES.get(what)
+    # ASKED THE REGISTRY, not a table here: one home per rule, so a remedy shipped later is
+    # reachable without an edit to this function (`Remedy.covers`).
+    matched = asked if asked is not None else remedies_mod.covering(what)
     # THE MAPPING OWNS THE RULE, on the asked path too: there is no `--force` here, and an
     # OS proposing a nudge its own mapping calls wrong is asking a reviewer to approve a
     # known no-op.
     if matched == "nudge" and what in NUDGE_IS_WRONG:
-        return None, f"{NUDGE_IS_WRONG[what]} {blocker['detail']}", None
+        return None, f"{NUDGE_IS_WRONG[what]} {blocker['detail']}", None, None
     if asked is not None:
-        return asked, None, None
+        return asked, None, None, None
     if matched == "unblock":
         edges = store.unfinished_dependencies(wo_id)
         if not edges:
-            return None, FIX_NOTHING.format(detail=blocker["detail"]), None
+            return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
         if not invariants.dead_dependencies(store, wo):
             return None, FIX_LIVE_EDGES, {
                 "detail": f"jarvis wo unblock {wo_id} --all",
-                "note": FIX_YOURS_TO_RUN}
+                "note": FIX_YOURS_TO_RUN}, None
     if matched is not None:
-        return matched, None, None
+        return matched, None, None, None
     if what in FIX_NOTHING_TO_CLEAR:
-        return None, FIX_NOTHING.format(detail=blocker["detail"]), None
-    return None, FIX_UNCOVERED.format(what=what), {
-        # §6's sentence, which the function that diagnosed the blocker wrote and which is
-        # already pre-validated against what the OS would accept right now.
-        "detail": blocker["detail"],
-        # WHOSE move it is — `FIX_WORKER_MOVE`'s reason.
-        "note": FIX_WORKERS_TO_RUN if what in FIX_WORKER_MOVE else FIX_YOURS_TO_RUN}
+        return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
+    if what in FIX_USERS_MOVE or what in FIX_WORKER_MOVE:
+        return None, FIX_UNCOVERED.format(what=what), {
+            # §6's sentence, which the function that diagnosed the blocker wrote and which
+            # is already pre-validated against what the OS would accept right now.
+            "detail": blocker["detail"],
+            # WHOSE move it is — `FIX_WORKER_MOVE`'s reason.
+            "note": (FIX_WORKERS_TO_RUN if what in FIX_WORKER_MOVE
+                     else FIX_YOURS_TO_RUN)}, None
+    # A SLUG NOBODY CLASSIFIED IS A GAP IN THE OS, and this arm is the whole point of the
+    # change (Neo q839, overriding §11's "add no remedy"): handing it back as the user's to
+    # type was the OS declining to learn that it has no remedy for a blocker it keeps
+    # hitting. So it offers the remedy that WRITES one, briefed by `FIX_NEW_REMEDY_BRIEF`.
+    # No new authority: `fix` still checks the catalog, still files nothing without
+    # `confirm=True`, and the act still rides an approved `self_heal` grant.
+    return "file_work_order", None, None, FIX_NEW_REMEDY_BRIEF.format(
+        what=what, detail=blocker["detail"], wo_id=wo_id)
 
 
 def _file_fix(store: ProjectStore, project: str, wo: dict[str, Any], remedy_id: str,
@@ -1968,9 +2023,13 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
 
     IT ADDS NO AUTHORITY AND THAT IS THE WHOLE DESIGN. The registry in `remedies.py` is
     closed, the allow-list ships off, and every act rides an approved `self_heal` grant a
-    reviewer opened. The only new thing here is the ENTRY POINT: the three shipped remedies
-    — `nudge`, `unblock`, `file_work_order` — reachable from the diagnosis the user is
-    already looking at. Every exclusion `remedies.py` names is inherited verbatim: no
+    reviewer opened. There is no runtime authoring of a remedy: a blocker no remedy covers
+    is offered `file_work_order` with `FIX_NEW_REMEDY_BRIEF`, so the new remedy arrives as a
+    reviewed diff written by a worker (Neo q839, overriding §11's "add no remedy" — the user
+    ruled that auto-matching against a closed table means the OS never learns which blockers
+    it has no remedy for). The only new thing here is the ENTRY POINT: the three shipped
+    remedies — `nudge`, `unblock`, `file_work_order` — reachable from the diagnosis the
+    user is already looking at. Every exclusion `remedies.py` names is inherited verbatim: no
     cancelling a turn, no `set_status`, no `wo done`, no `fo resume`, no killing a process,
     and nothing here does one of those under another name.
 
@@ -1984,8 +2043,8 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
     error tail — `diagnose`'s boundary, for its security reason.
 
     ABSENT IS NEVER ZERO (issue #227). No blocker, remedies off for the project, a remedy
-    not in the allow-list, a blocker nothing covers: each says so in words and offers
-    nothing. There is no list of proposals to come back empty.
+    not in the allow-list, a blocker whose way through is somebody's to type: each says so
+    in words and offers nothing. There is no list of proposals to come back empty.
     """
     from . import remedies as remedies_mod
 
@@ -1994,15 +2053,18 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
     store = ProjectStore(path)
     try:
         blocker = waiting_on(store, wo)
-        matched, note, your_move = _fix_match(store, wo, blocker, remedy)
+        matched, note, your_move, offered = _fix_match(store, wo, blocker, remedy)
+        # THE CALLER'S ARGUMENT WINS, then the OS's own brief for this arm, then the
+        # per-remedy default. Resolved before the refusals below because `file_work_order`'s
+        # own refusal is about whether there IS an argument.
+        arg = (argument or "").strip() or offered or FIX_ARGUMENTS.get(matched or "", "")
         if matched is not None:
             # THE CATALOG FIRST, `_config_refusal`'s own ordering: the user must never be
             # shown something their own catalog forbids, let alone asked to approve it.
             # Called rather than restated — one home for the rule, whoever asked.
             note = remedies_mod._config_refusal(
                 matched, remedies_mod.subject_kind_of(wo), cfg)
-            if note is None and matched == "file_work_order" \
-                    and not (argument or "").strip():
+            if note is None and matched == "file_work_order" and not arg:
                 # `_apply_file_work_order`'s refusal, stated before a grant is filed
                 # instead of after one was spent.
                 note = remedies_mod.NO_ARGUMENT.format(origin=str(wo["id"]))
@@ -2017,7 +2079,6 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
         if matched is None:
             return payload
         remedy_row = remedies_mod.REMEDIES[matched]
-        arg = (argument or "").strip() or FIX_ARGUMENTS.get(matched, "")
         payload["proposal"] = {
             "remedy": matched,
             # VERBATIM OFF THE REGISTRY. The words the user weighs and the words the

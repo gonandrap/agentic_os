@@ -204,6 +204,12 @@ class Remedy:
     headline: str          # what it does, in the terms a reviewer needs
     blast: str             # what it touches, and what it cannot undo
     subjects: tuple[str, ...]
+    #: The `ops.waiting_on` slugs this remedy clears. THE MAPPING LIVES ON THE REMEDY, and
+    #: that is the point of deleting `ops.FIX_MATCHES` (Neo q839): one home per rule
+    #: (kn-4ea33fe6), so a remedy added later is reachable from `ops.fix` with no edit to
+    #: `ops` at all — and a slug no remedy claims falls to `fix`'s default arm, which asks
+    #: for the remedy rather than shrugging.
+    covers: tuple[str, ...]
     apply: Callable[..., str]
 
 
@@ -453,6 +459,9 @@ REMEDIES: dict[str, Remedy] = {
               "gives no instruction, but a message cannot be unsent and the spend "
               "cannot be undone.",
         subjects=("work_order", "feature_order"),
+        # `prompt` is the ONE answer `waiting_on` reports as `stalled` — nothing is coming
+        # for it by itself, and a message is the only thing that can move it.
+        covers=("prompt",),
         apply=_apply_nudge,
     ),
     "unblock": Remedy(
@@ -464,6 +473,10 @@ REMEDIES: dict[str, Remedy] = {
               "dispatched without the work it was told to build on, which is the point "
               "and is also what cannot be taken back once it runs.",
         subjects=("work_order",),
+        # `pending` is an order held behind dependency edges. Claimed here and QUALIFIED in
+        # `ops._fix_match`: this handler is the default mode and cuts only edges that can
+        # never clear, so an order whose every edge is live is not this case.
+        covers=("pending",),
         apply=_apply_unblock,
     ),
     "file_work_order": Remedy(
@@ -478,6 +491,11 @@ REMEDIES: dict[str, Remedy] = {
               "approve. An order can be cancelled, but the tokens the first one spends "
               "before anyone looks cannot be taken back.",
         subjects=("work_order", "feature_order"),
+        # EMPTY ON PURPOSE, and it is a decision rather than an omission: this writes code
+        # and clears no blocker mechanically, so it stays reachable only by being NAMED —
+        # by the user with `--remedy`, or by `ops.fix`'s default arm asking for the remedy
+        # an unclassified blocker has no.
+        covers=(),
         apply=_apply_file_work_order,
     ),
 }
@@ -490,6 +508,24 @@ SHIPPED_REMEDIES: tuple[str, ...] = ("nudge", "unblock", "file_work_order")
 def get(remedy_id: str) -> Remedy:
     """The remedy, or `KeyError`. There is no free-text action and no "other"."""
     return REMEDIES[remedy_id]
+
+
+def covering(slug: str) -> str | None:
+    """The one remedy whose `covers` holds this `ops.waiting_on` slug, or None.
+
+    THE REGISTRY ANSWERS THIS AND NOT A TABLE IN `ops` (Neo q839): the user's ruling is
+    that auto-matching a blocker against a closed table there means the OS never learns
+    which blockers it has no remedy for. None is therefore a USEFUL answer and `ops.fix`
+    acts on it — it asks for a remedy to be written — so this function must never guess.
+
+    RAISES on two owners. A slug with two remedies is a registry defect, and picking one
+    of them is a choice `ops` is in no position to make on a caller's behalf.
+    """
+    found = [r.id for r in REMEDIES.values() if slug in r.covers]
+    if len(found) > 1:
+        raise ValueError(f"{slug} is covered by more than one remedy: "
+                         f"{', '.join(sorted(found))}")
+    return found[0] if found else None
 
 
 def render_catalogue(allowed: tuple[str, ...]) -> str:
