@@ -1,0 +1,81 @@
+{% import "_debug.html" as ui %}
+{# HOW LONG THIS ORDER HAS BEEN WHERE IT IS — `ops.state_durations(...).as_dict()`, the
+   same document `jarvis wo show --json` prints (spec §7 of
+   docs/superpowers/specs/2026-09-27-time-in-each-state.md).
+
+   NOTHING IS COMPUTED HERE. Every duration, count and share is read off the payload; the
+   template's only arithmetic is the CSS percentage, `_debug.html:28-40`'s trick, so the
+   terminal and the page can never disagree about one number. No charting dependency and
+   no JavaScript: a diagnostic view that needs a bundle is one that breaks when the bundle
+   does.
+
+   `.get(s, …)` and never `[s]` on both status tables: a twelfth status must render grey,
+   not a 500 on the page someone opened to find out why nothing moved. #}
+{% macro view(states, heading='h2') %}
+{% set meta = fo_status_meta if states.order_kind == 'fo' else status_meta %}
+{% set tone_colour = {'ok': 'var(--green)', 'warn': 'var(--amber)', 'bad': 'var(--red)',
+                      'active': 'var(--cyan)', 'muted': 'var(--ink-3)'} %}
+<{{ heading }}>Time in state</{{ heading }}>
+{# The flag, said once and before any figure: a coarse span nothing labels reads as a
+   measurement. `ops.FO_APPROXIMATE_NOTE`'s words, the CLI's words. #}
+{% if states.approximate %}{{ ui.note(approximate_note) }}{% endif %}
+{% if not states.totals %}
+<div class="panel"><div class="row"><span class="sub">no status transition is on the
+  record for this order yet</span></div></div>
+{% else %}
+<div class="panel">
+  {% for t in states.totals %}
+  {% set colour = tone_colour.get(meta.get(t.status, {}).get('tone', 'muted'), 'var(--ink-3)') %}
+  <div class="row">
+    <span class="mono" style="width: 16px; color: {{ colour }};">{{ meta.get(t.status, {}).get('icon', '•') }}</span>
+    <span class="grow">{{ t.label }}
+      {%- if t.status == states.current_status %}
+      {# TWO FIGURES, LABELLED DIFFERENTLY. Equal numbers are the common case, and one
+         number shown twice reads as a bug (spec §7). #}
+      <span class="sub">in this status {{ fmt_dur(states.current_status_age) }} ·
+        {% if states.last_activity_age is none %}nothing on the record at all
+        {%- else %}nothing on the record for {{ fmt_dur(states.last_activity_age) }}
+        {%- endif %}</span>{% endif %}</span>
+    <span class="mono" style="width: 70px; text-align: right;">{{ fmt_dur(t.seconds) }}</span>
+    <span class="mono" style="width: 80px; text-align: right;">{{ t.entries }}
+      {{- ' entry' if t.entries == 1 else ' entries' }}</span>
+    <div style="display: flex; height: 9px; width: 160px; margin-left: 12px;
+                border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
+                background: var(--raised);">
+      <div title="{{ t.label }}" style="width: {{ t.share * 100 }}%; background: {{ colour }};"></div>
+    </div>
+  </div>
+  {% endfor %}
+  <div class="row">
+    <span class="grow sub">whole lifetime</span>
+    <span class="mono">{{ fmt_dur(states.lifetime_seconds) }}</span>
+  </div>
+</div>
+
+{# The Gantt: one row per span, oldest first, each bar offset by when it started. The
+   cause is the neighbouring event's kind, derived at read time — and "cause not
+   recorded" where the record names none, never a guess and never blank (spec §4). #}
+<div class="panel">
+  <div class="row"><span class="sub">every transition, oldest first</span></div>
+  {% for s in states.spans %}
+  {% set colour = tone_colour.get(meta.get(s.status, {}).get('tone', 'muted'), 'var(--ink-3)') %}
+  {% set offset = (((s.entered - states.spans[0].entered) / states.lifetime_seconds * 100)
+                   if states.lifetime_seconds else 0)|round(2) %}
+  <div class="row">
+    <span class="mono" style="width: 150px; color: {{ colour }};">{{ meta.get(s.status, {}).get('icon', '•') }}
+      {{ s.status }}</span>
+    <div style="display: flex; height: 9px; width: 220px; border: 1px solid var(--line);
+                border-radius: 3px; overflow: hidden; background: var(--raised);">
+      <div style="width: {{ offset }}%;"></div>
+      <div style="width: {{ s.share * 100 }}%; background: {{ colour }};"></div>
+    </div>
+    <span class="grow sub" style="margin-left: 12px;">{{ fmt_ts(s.entered) }} ·
+      {{ s.trigger or no_trigger_phrase }}{% if s.open %} · still in it{% endif %}</span>
+    <span class="mono">{{ fmt_dur(s.seconds) }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{# The absences, in `ops`' own sentences: a missing figure is never a zero (issue #227). #}
+{% for note in states.notes if note != approximate_note %}{{ ui.note(note) }}{% endfor %}
+{% endmacro %}

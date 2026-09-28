@@ -88,6 +88,10 @@ STATUS_LABEL = {
     "waiting_input": "Waiting on you",
     "validating": "Under review by the validation panel",
     "needs_review": "Needs your review",
+    # The two `ops.state_durations` was built for, and both printed as raw tokens until
+    # it named them (spec 2026-09-27-time-in-each-state §4 rule 5).
+    "waiting_pr_merge": "Waiting for its pull request to merge",
+    "budget_exhausted": "Budget spent",
     "completed": "Completed",
     "failed": "Failed",
     "cancelled": "Cancelled",

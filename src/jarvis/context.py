@@ -29,6 +29,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
+# The ONE module-level jarvis import, and it is here because a DECORATOR cannot be lazy:
+# §10's meter wraps `record` at its definition. `observability` is a leaf and imports
+# nothing that reaches back here, so this is not the cycle the docstring warns about.
+from . import observability
+from .agent_usage import OBSERVE_CONTEXT_WRITE
+
 log = logging.getLogger("jarvis.context")
 
 #: Bytes per token, the estimator's whole model. Four is the usual English-prose figure;
@@ -284,6 +290,11 @@ def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
             "ingredients": measure(project, wo, turn, briefing, knowledge)}
 
 
+# The meter wraps the WHOLE function, gate guard included: an order running at `off` still
+# records a near-zero row, so the meter has no hole. A meter with a hole reports a number
+# lower than the truth, which is worse than no number (§10 of
+# docs/specs/2026-09-24-order-observability.md). The gate below is never its switch.
+@observability.metered(OBSERVE_CONTEXT_WRITE, target="wo", project="project")
 def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
            briefing: dict[str, Any], knowledge: Any = None) -> None:
     """The ONE writer of `wo_turns.context_json`. Never raises into the dispatch path.
@@ -298,6 +309,11 @@ def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
     the read path already renders as a sentence. A measurement that could stop a turn
     from running would be worth strictly less than the turn.
     """
+    # §10's gate has exactly ONE consumer and this is it. Before measuring anything: at
+    # `off` the column stays NULL, which `ops.context_report` already renders as "not
+    # recorded" — its existing forward-only wording, now for a second reason.
+    if not observability.records_context(wo, getattr(project, "observability", None)):
+        return
     try:
         import json as _json
 

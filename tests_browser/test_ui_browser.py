@@ -897,3 +897,189 @@ def test_the_project_page_box_searches_only_that_project(page, server, project):
     assert "project=proj_a" in page.url
     assert page.locator("select[name='project']").input_value() == "proj_a"
     assert "grafana rotation, proj_a" in page.locator(".search-hit").first.inner_text()
+
+
+# -- time in each state (spec docs/superpowers/specs/2026-09-27-time-in-each-state.md §7)
+# The view is a LAYOUT question — a row per status, two figures on one of them, a bar per
+# span — so a browser is the only place it can be checked, and the same run regenerates
+# the PR's evidence.
+
+_HOUR = 3600.0
+
+
+#: One heading and everything under it, as a rectangle and its text. The work-order view
+#: sits inside `#tab-states` and can be shot as an element; the feature page's is a bare
+#: sequence of siblings after an `h3`, with no wrapper to select — so the run measures the
+#: block instead of the page being changed to give it a box.
+_SECTION_JS = """
+(heading) => {
+  const start = [...document.querySelectorAll('h2, h3')]
+      .find(h => h.textContent.trim().startsWith(heading));
+  if (!start) return null;
+  const block = [start];
+  for (let el = start.nextElementSibling; el; el = el.nextElementSibling) {
+    if (el.tagName === 'H2' || el.tagName === 'H3') break;
+    block.push(el);
+  }
+  // A hidden sibling measures (0,0,0,0), and a zero box in the union drags the clip to
+  // the top-left of the document — a shot of the whole page instead of the block.
+  const boxes = block.map(el => el.getBoundingClientRect())
+      .filter(b => b.width > 0 && b.height > 0);
+  const left = Math.min(...boxes.map(b => b.left));
+  const top = Math.min(...boxes.map(b => b.top));
+  return {clip: {x: left + window.scrollX - 14, y: top + window.scrollY - 14,
+                 width: Math.max(...boxes.map(b => b.right)) - left + 28,
+                 height: Math.max(...boxes.map(b => b.bottom)) - top + 28},
+          text: block.map(el => el.innerText).join('\\n')};
+}
+"""
+
+
+def _section(page, heading):
+    got = page.evaluate(_SECTION_JS, heading)
+    assert got, f"no section headed {heading!r}"
+    return got
+
+
+def _union_clip(page, selectors):
+    """A rectangle around several elements. The work-order view's own `h2` is hidden —
+    the TAB is its title — so the tab strip has to be in the shot or the panel is a table
+    of figures with nothing naming it."""
+    return page.evaluate("""
+      (selectors) => {
+        const boxes = selectors.map(s => document.querySelector(s).getBoundingClientRect());
+        const left = Math.min(...boxes.map(b => b.left));
+        const top = Math.min(...boxes.map(b => b.top));
+        return {x: left + window.scrollX - 14, y: top + window.scrollY - 14,
+                width: Math.max(...boxes.map(b => b.right)) - left + 28,
+                height: Math.max(...boxes.map(b => b.bottom)) - top + 28};
+      }
+    """, selectors)
+
+
+def _shot_clip(page, clip, name):
+    import os
+    import pathlib
+
+    where = os.environ.get("JARVIS_UI_SHOTS")
+    if not where:
+        return
+    out = pathlib.Path(where)
+    out.mkdir(parents=True, exist_ok=True)
+    page.screenshot(path=str(out / f"{name}.png"), clip=clip, full_page=True)
+
+
+def _backdate_spans(store, order_id, stamps):
+    """Put an order's spans and its creation on the clock — oldest first.
+
+    The store stamps `db.now()` and there is no back-dating API, so a history that
+    happened forty hours ago says so afterwards with SQL: nothing sleeps
+    (tests/test_time_in_state.py's `backdate`).
+    """
+    ids = [r["id"] for r in store.conn.execute(
+        "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
+    assert len(ids) == len(stamps), (ids, stamps)
+    for span_id, ts in zip(ids, stamps):
+        store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
+    store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                       (stamps[0], order_id))
+    store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
+                       (stamps[0], order_id))
+    store.conn.commit()
+
+
+def _event_at(store, wo_id, kind, ts):
+    store.add_event(wo_id, kind)
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events WHERE wo_id=?)",
+        (ts, wo_id))
+    store.conn.commit()
+
+
+def test_the_time_in_state_tab_reads_like_the_order_it_was_filed_on(
+        page, server, project):
+    """wo-8736a5c5's shape: thirteen hours parked behind a pull request, after a review
+    asked for TWICE — so the entry count is a figure with something to say."""
+    import time as _time
+
+    now = _time.time()
+    # pending 12m, running 9h48m, needs_review 1h, running 14h, needs_review 2h,
+    # waiting_pr_merge 13h and counting.
+    stamps = [now - 40 * _HOUR, now - 39.8 * _HOUR, now - 30 * _HOUR,
+              now - 29 * _HOUR, now - 15 * _HOUR, now - 13 * _HOUR]
+    wo = ops.create_work_order(
+        "proj_a", "Take the repository name from the catalog, not the remote")
+    store = ProjectStore(project)
+    try:
+        for status in ("running", "needs_review", "running", "needs_review",
+                       "waiting_pr_merge"):
+            store.set_status(wo["id"], status)
+        _backdate_spans(store, wo["id"], stamps)
+        # The causes, as events a second ahead of each transition: the trigger is derived
+        # from the neighbouring event, so a history with no events reads "cause not
+        # recorded" on every row.
+        for kind, ts in (("dispatched", stamps[1]), ("finished", stamps[2]),
+                         ("turn_resumed", stamps[3]), ("finished", stamps[4]),
+                         ("pr_url_recorded", stamps[5])):
+            _event_at(store, wo["id"], kind, ts - 1)
+    finally:
+        store.close()
+
+    page.set_viewport_size({"width": 1280, "height": 1000})
+    page.goto(f"{server}/wo/proj_a/{wo['id']}")
+    page.click("button[role=tab][data-panel='tab-states']")
+    panel = page.locator("#tab-states")
+    assert panel.is_visible()
+    body = panel.inner_text()
+
+    assert "Needs your review" in body and "Waiting for its pull" in body
+    assert "2 entries" in body, "needs_review was entered twice"
+    assert "1 entry" in body
+    # The two figures, labelled differently, on the current status only.
+    assert "in this status 13.0h" in body
+    assert "nothing on the record for 13.0h" in body
+    assert body.count("in this status") == 1
+    assert "pr_url_recorded" in body and "still in it" in body
+    assert "whole lifetime" in body
+    _shot_clip(page, _union_clip(page, ["[role=tablist]", "#tab-states"]),
+               "wo-time-in-state")
+
+
+def test_the_feature_page_labels_its_coarse_span_as_approximate(page, server, project):
+    """The flag Neo's ruling insisted be visible. A feature that predates the spans table
+    is reproduced by dropping its rows: the next open of the store backfills the one
+    approximate span (tests/test_ui_observability.py's fixture)."""
+    import time as _time
+
+    now = _time.time()
+    fo = ops.create_feature_order(
+        "proj_a", "Export every project's cost history as CSV",
+        description="One file per project, and a column for the re-write tax.")
+    store = ProjectStore(project)
+    try:
+        store.conn.execute("DELETE FROM wo_state_spans WHERE order_id=?", (fo["id"],))
+        store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",
+                           (now - 58 * _HOUR, fo["id"]))
+        store.conn.commit()
+    finally:
+        store.close()
+    store = ProjectStore(project)           # re-open: the backfill runs in __init__
+    try:
+        store.set_feature_status(fo["id"], "executing")
+        _backdate_spans(store, fo["id"], [now - 58 * _HOUR, now - 31 * _HOUR])
+        # A feature's activity is its FAMILY's, so the figure needs a child that did
+        # something: without one the page says "nothing on the record at all", which is
+        # true of an empty fixture and not of the order this shot is evidence for.
+        child = store.create_work_order("Write the exporter", parent_id=fo["id"])
+        _event_at(store, child["id"], "turn_ended", now - 4 * _HOUR)
+    finally:
+        store.close()
+
+    page.set_viewport_size({"width": 1280, "height": 1000})
+    page.goto(f"{server}/fo/proj_a/{fo['id']}")
+    section = _section(page, "Time in state")
+    assert "a feature order keeps no event trail" in section["text"]
+    assert "in this status 31.0h" in section["text"]
+    assert "nothing on the record for 4.0h" in section["text"]
+    assert "executing" in section["text"]
+    _shot_clip(page, section["clip"], "fo-time-in-state")

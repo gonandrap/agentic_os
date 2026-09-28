@@ -38,7 +38,10 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, invariants
+from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
+from .agent_usage import (
+    OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
+)
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -49,12 +52,14 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
+    WO_STATUSES,
     ProjectStore,
     feature_status_label,
     is_feature_order_id,
@@ -772,6 +777,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       issue_url: str | None = None,
                       issue_priority: str | None = None,
                       budget_usd: float | None = None,
+                      observability: str | None = None,
                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
@@ -820,6 +826,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             metadata=metadata,
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
+            # Stamped, never resolved against the catalog here: NULL means "this order
+            # has no answer" and the project config is read at write time
+            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
@@ -1443,6 +1453,249 @@ UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a res
 NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
                       "by Claude Code), so the residual is unmeasurable rather than zero")
 
+# -- time in each state -------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md §4. The ONE computation
+# over `wo_state_spans`; every surface renders this payload and derives no duration of its
+# own.
+
+#: How near a timeline event has to sit to a transition to be read as its cause. Spec §4
+#: rule 6: the trigger is derived at READ time, identically for live and backfilled rows,
+#: which is why no `set_status` call site has to be annotated.
+TRIGGER_WINDOW = 120.0
+
+#: `None` and a sentence, never `0` — issue #227's rule, as `NO_TURN_NOTE` above.
+NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
+                    "last activity to date — absent, not zero")
+SETTLED_NOTE = "this order has settled, so it has no current status age"
+FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
+                       "coarse span from its creation")
+#: What a renderer prints for a transition nothing was written about. Never a guess and
+#: never blank (spec §4 rule 6).
+NO_TRIGGER_PHRASE = "cause not recorded"
+
+#: What is NOT activity. `health.observer_kinds()` is imported rather than re-listed for
+#: the reason it exists: an order the supervisor swept would otherwise read as progressing
+#: BECAUSE it was examined. `status` is the thing being measured, so counting it would make
+#: every transition reset the idle clock, and `created` is when the record BEGAN rather than
+#: something that happened to the order.
+def _quiet_kinds() -> tuple[str, ...]:
+    return tuple(sorted({*health.observer_kinds(), "status", "created"}))
+
+
+@dataclass(frozen=True)
+class Span:
+    """One status the order was in, and when. `left is None` means it is in it now."""
+
+    status: str
+    entered: float
+    left: float | None
+    trigger: str                # '' when the record names no cause
+    approximate: bool
+
+    def seconds(self, now: float) -> float:
+        """A backwards clock must not produce a negative span (`holds.Hold.overlap`)."""
+        return max(0.0, (now if self.left is None else self.left) - self.entered)
+
+
+@dataclass(frozen=True)
+class StateDurations:
+    """One order's whole status history. `now` is never baked in; `as_dict` applies it."""
+
+    order_id: str
+    order_kind: str             # 'wo' | 'fo'
+    spans: tuple[Span, ...]     # oldest first
+    current_status: str         # '' for a settled order
+    current_status_since: float | None
+    last_activity_ts: float | None
+    last_activity_kind: str     # the wo_events kind / table that supplied it, '' if none
+    approximate: bool           # any span is
+    notes: tuple[str, ...]
+    #: FO_KINDS, so an improvement order's rows read `analysing` and not `planning`. '' for
+    #: a work order.
+    row_kind: str = ""
+    #: The read moment `state_durations` was given, and the default `as_dict` applies when
+    #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
+    #: are the same document.
+    asof: float = 0.0
+
+    def label(self, status: str) -> str:
+        if self.order_kind == "fo":
+            return feature_status_label(self.row_kind, status)
+        return timeline.STATUS_LABEL.get(status, status)
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = self.asof if now is None else now
+        order = FO_STATUSES if self.order_kind == "fo" else WO_STATUSES
+        end = now
+        if self.spans and self.spans[-1].left is not None:
+            end = self.spans[-1].left
+        lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
+
+        def share(seconds: float) -> float:
+            return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
+                  "left": s.left, "open": s.left is None,
+                  "seconds": round(s.seconds(now), 2),
+                  "seconds_human": ago_phrase(s.seconds(now)),
+                  "share": share(s.seconds(now)), "trigger": s.trigger,
+                  "approximate": s.approximate}
+                 for s in self.spans]
+        totals = []
+        for status in order:
+            mine = [s for s in self.spans if s.status == status]
+            if not mine:
+                continue
+            seconds = round(sum(s.seconds(now) for s in mine), 2)
+            totals.append({"status": status, "label": self.label(status),
+                           "seconds": seconds, "seconds_human": ago_phrase(seconds),
+                           "entries": len(mine), "share": share(seconds)})
+        age = (round(now - self.current_status_since, 2)
+               if self.current_status_since is not None else None)
+        idle = (round(max(0.0, now - self.last_activity_ts), 2)
+                if self.last_activity_ts is not None else None)
+        return {
+            "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
+            "approximate": self.approximate,
+            "lifetime_seconds": round(lifetime, 2),
+            "lifetime_human": ago_phrase(lifetime),
+            "spans": spans, "totals": totals,
+            "current_status": self.current_status,
+            "current_status_since": self.current_status_since,
+            "current_status_age": age,
+            "current_status_age_human": None if age is None else ago_phrase(age),
+            "last_activity_ts": self.last_activity_ts,
+            "last_activity_kind": self.last_activity_kind,
+            "last_activity_age": idle,
+            "last_activity_age_human": None if idle is None else ago_phrase(idle),
+            "notes": list(self.notes),
+        }
+
+
+def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
+    """The kind of the newest quiet-excluded event at `ts <= entered` within the window."""
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    row = store.conn.execute(
+        f"SELECT kind FROM wo_events WHERE wo_id=? AND ts<=? AND ts>=? "
+        f"AND kind NOT IN ({marks}) ORDER BY ts DESC, id DESC LIMIT 1",
+        (wo_id, entered, entered - TRIGGER_WINDOW, *quiet),
+    ).fetchone()
+    return str(row["kind"]) if row else ""
+
+
+def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """Every moment the record says something happened TO one work order. Spec §4.
+
+    All five tables, though every activity class in today's code also writes a `wo_events`
+    row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
+    events-only read is one future writer away from calling a busy order idle.
+    """
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    found: list[tuple[float, str]] = []
+    row = store.conn.execute(
+        f"SELECT kind, ts FROM wo_events WHERE wo_id=? AND kind NOT IN ({marks}) "
+        f"ORDER BY ts DESC, id DESC LIMIT 1", (wo_id, *quiet)).fetchone()
+    if row is not None:
+        found.append((float(row["ts"]), str(row["kind"])))
+    for sql, source in (
+        ("SELECT MAX(started_at), MAX(ended_at) FROM wo_turns WHERE wo_id=?", "wo_turns"),
+        ("SELECT MAX(ts), MAX(delivered_at) FROM wo_messages WHERE wo_id=?",
+         "wo_messages"),
+        ("SELECT MAX(ts) FROM validation_rounds WHERE wo_id=?", "validation_rounds"),
+        ("SELECT MAX(ts), MAX(decided_at) FROM approvals WHERE wo_id=?", "approvals"),
+    ):
+        got = store.conn.execute(sql, (wo_id,)).fetchone()
+        stamps = [float(v) for v in tuple(got or ()) if v is not None]
+        if stamps:
+            found.append((max(stamps), source))
+    return found
+
+
+def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
+    """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
+
+    A FEATURE ORDER'S ACTIVITY IS ITS FAMILY'S — every child, the planner and the manager,
+    not `carrier_for_feature`: picking one carrier would call a feature idle while three of
+    its other children were running. A feature progresses when anything in it does.
+    """
+    if kind == "wo":
+        found = _activity_of(store, order_id)
+    else:
+        family = [c["id"] for c in store.feature_children(order_id)]
+        fo = store.get_feature_order(order_id)
+        if fo.get("plan_wo_id"):
+            family.append(str(fo["plan_wo_id"]))
+        manager = store.manager_work_order(order_id)
+        if manager:
+            family.append(str(manager["id"]))
+        found = [seen for child in family for seen in _activity_of(store, child)]
+        row = store.conn.execute(
+            "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
+        if row and row[0] is not None:
+            found.append((float(row[0]), "validation_rounds"))
+    if not found:
+        return (0.0, "")
+    return max(found, key=lambda seen: seen[0])
+
+
+def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
+                    now: float | None = None) -> StateDurations:
+    """How long this order has been in its status, and how long it spent in each before.
+
+    Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
+    on both or neither. `now` is a parameter because every figure here is a present-tense
+    claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
+    injectable by a test. One indexed read per table, no model, nothing written.
+    """
+    if bool(wo_id) == bool(fo_id):
+        raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    now = time.time() if now is None else now
+    kind = "wo" if wo_id else "fo"
+    order_id = wo_id or fo_id
+    terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
+    row_kind = ""
+    if kind == "fo":
+        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+
+    rows = store.state_spans(order_id)
+    spans: list[Span] = []
+    for i, row in enumerate(rows):
+        entered = float(row["ts"])
+        status = str(row["to_status"])
+        if i + 1 < len(rows):
+            left: float | None = float(rows[i + 1]["ts"])
+        else:
+            # The last span is OPEN unless the order settled there, in which case it
+            # closed at its own moment and there is no open span at all (spec §4 rule 2).
+            left = entered if status in terminal else None
+        trigger = str(row["trigger"] or "")
+        if not trigger and kind == "wo":
+            trigger = _derived_trigger(store, order_id, entered)
+        spans.append(Span(status=status, entered=entered, left=left, trigger=trigger,
+                          approximate=bool(row["approximate"])))
+
+    open_span = spans[-1] if spans and spans[-1].left is None else None
+    activity_ts, activity_kind = _last_activity(store, kind, order_id)
+    approximate = any(s.approximate for s in spans)
+    notes: list[str] = []
+    if approximate:
+        notes.append(FO_APPROXIMATE_NOTE)
+    if not activity_kind:
+        notes.append(NO_ACTIVITY_NOTE)
+    if spans and open_span is None:
+        notes.append(SETTLED_NOTE)
+    return StateDurations(
+        order_id=order_id, order_kind=kind, spans=tuple(spans),
+        current_status=open_span.status if open_span else "",
+        current_status_since=open_span.entered if open_span else None,
+        last_activity_ts=activity_ts if activity_kind else None,
+        last_activity_kind=activity_kind, approximate=approximate,
+        notes=tuple(notes), row_kind=row_kind, asof=now,
+    )
+
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
 #: retried and gave up is today visible only as a cost row, and the whole point of
 #: surfacing it here is that the reader can see it was NEVER REACHED. The wording avoids
@@ -1642,6 +1895,9 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     return out, refusals
 
 
+# Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
+# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+@observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
@@ -3641,9 +3897,14 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
     ran `jarvis wo ack` over a parked order must not have the flag raised again by the
     next tick; that is the same renotify defect wearing the column instead of the event.
+
+    THE STORE ENFORCES THE NO-DUPLICATE RULE NOW, not this function: `set_status` writes
+    neither a `status` event nor a span row for a move to the status the order is already
+    in (spec 2026-09-27-time-in-each-state §2), so the quiet path asserts the status
+    through the chokepoint like every other caller instead of dodging it.
     """
     if store.work_unlanded_open(wo["id"]):
-        store.update_work_order(wo["id"], status="needs_review")
+        store.set_status(wo["id"], "needs_review", trigger="unlanded_repark")
         return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
@@ -6792,6 +7053,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
             # carrier: a child's own alarm belongs on the child.
             "alarms": store.alarms_for_feature(fo_id),
+            # How long it has been where it is, on the same always-present rule — the
+            # identical document `jarvis wo show` carries for a work order (spec §6).
+            "time_in_state": state_durations(store, fo_id=fo_id).as_dict(),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -9129,7 +9393,15 @@ def _partition_calls(
 
     os_side, worker_side = [], []
     for g in groups:
-        target = worker_side if agent_usage.is_subprocess(g.get("kind") or "") else os_side
+        kind = g.get("kind") or ""
+        # A METERED LOOK IS NEITHER, and is dropped from both: §10's rows are not `claude`
+        # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
+        # one as an OS call would report two calls where Jarvis made one. Money spent
+        # LOOKING at an order is reported by `bill.py`, in its own class
+        # (docs/specs/2026-09-24-order-observability.md §10).
+        if agent_usage.is_observability(kind):
+            continue
+        target = worker_side if agent_usage.is_subprocess(kind) else os_side
         target.append(g)
     return os_side, worker_side
 
@@ -9661,6 +9933,7 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+@observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
                    join_floor: int | None = None) -> dict[str, Any]:
@@ -9747,6 +10020,7 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+@observability.metered(OBSERVE_LIVE, target="target", project="project")
 def live_report(target: str, project: str | None = None, *,
                 reader: Any = None, now: float | None = None) -> dict[str, Any]:
     """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point.
@@ -9808,6 +10082,7 @@ TURN_NOT_RECORDED = ("not recorded for this turn — it ran before the context l
                      "landed, or its measurement failed")
 
 
+@observability.metered(OBSERVE_CONTEXT, target="wo_id", project="project")
 def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
@@ -10412,7 +10687,11 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         central.close()
     out = []
     for row in rows:
-        if agent_usage.is_subprocess(row["kind"]):
+        # Subprocesses go to `_subproc_detail`; §10's metered looks at the order go to the
+        # bill's own class and nowhere else — this table is Jarvis's `claude -p` calls, and
+        # a zero-token row that bought no model call is not one of them.
+        if agent_usage.is_subprocess(row["kind"]) or agent_usage.is_observability(
+                row["kind"]):
             continue
         u = usage_mod.priced(row["model"] or "unknown", input=row["input"],
                              cache_write=row["cache_write"],

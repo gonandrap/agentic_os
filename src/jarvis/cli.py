@@ -234,6 +234,51 @@ def _readable_alarms(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
+    """One line per status this order was in — the block `jarvis wo show` and `fo show`
+    both print (spec §6 of docs/superpowers/specs/2026-09-27-time-in-each-state.md).
+
+    THE RENDERER FORMATS NOTHING: every duration, every count and every share is read
+    off `ops.state_durations(...).as_dict()`, which is the same document `--json` prints
+    and the dashboard renders. A second derivation of one number is what `jarvis wo why`
+    exists to avoid.
+    """
+    from . import ops
+
+    lines: list[str] = []
+    # Said ONCE, before the rows, and in `ops`' words: a coarse span nothing labels is
+    # read as a measurement (spec §3, Neo's ruling).
+    if payload.get("approximate"):
+        lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    for total in payload.get("totals") or []:
+        entries = total["entries"]
+        word = "entry" if entries == 1 else "entries"
+        line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
+                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{total['share'] * 100:>3.0f}%")
+        if total["status"] and total["status"] == payload.get("current_status"):
+            idle = payload.get("last_activity_age_human")
+            since = (f"nothing since {idle} ago" if idle
+                     else "nothing on the record at all")
+            line += f"   ← now, {payload['current_status_age_human']}, {since}"
+        lines.append(line)
+    return lines
+
+
+def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
+    """The status-span payload collapsed to `time_in_state_lines`, for HUMAN output.
+
+    `_readable_rounds`' trick: `--json` keeps the whole document because the dashboard
+    and other tooling read it, while a person gets one line per status.
+    """
+    row = dict(detail)
+    payload = row.pop("time_in_state", None) or {}
+    lines = time_in_state_lines(payload)
+    if lines:
+        row["time in state"] = lines
+    return row
+
+
 def _readable_config(detail: dict[str, Any]) -> dict[str, Any]:
     """`config_version: cfg-a1b2…` replaced by `config: cfg-a1b2… (3 versions since)`.
 
@@ -541,6 +586,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "feature's children, so the feature waits for it and shows it "
                         "in its tree (the feature must still be open)")
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
+
+    c.add_argument("--observability", choices=["off", "normal", "full"],
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -1684,22 +1732,13 @@ def _print_bill(bill: dict) -> None:
         print(f"{total['cost']['by_class'][cls]:>9.3f} "
               f"{_tok(total['tokens'][cls]):>8}  {label:<12} {why}")
     print(f"\n'tokens' above is {bill_mod.TOKENS_MEAN}.")
-    # What is NOT here, named. An absent line reads as an omission, and "was nothing at
-    # all spent on the OS?" was one of the four questions this surface exists to answer.
-    # Said in the terminal exactly as the page says it: a caveat that appears in one
-    # renderer and not the other is one the reader learns to ignore.
-    absent = {
-        "worker": "the worker's own session — nothing measurable (never dispatched, or "
-                  "its transcript and every turn's result JSON are gone)",
-        "jarvis": "jarvis spent nothing of its own — no Neo question, no panel, no "
-                  "digest",
-        "subprocesses": "no claude processes the worker spawned itself were recorded",
-    }
-    present = {line["key"] for line in bill.get("actors") or []}
-    missing = [text for key, text in absent.items() if key not in present]
+    # What is NOT here, named — the sentences come from `bill.ABSENT_NOTES`, which the page
+    # reads too: a caveat worded differently in one renderer is one the reader learns to
+    # ignore, and it was duplicated in both until §10 needed a fourth.
+    missing = bill_mod.absent_notes(bill)
     if missing and bill["kind"] == "work_order":
         print("\nnot on this bill:")
-        for text in missing:
+        for _key, text in missing:
             print(f"  · {text}")
     rewrite = bill.get("rewrite") or {}
     if rewrite.get("tokens"):
@@ -2525,6 +2564,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
             model=args.model, effort=args.effort, permission_mode=args.permission_mode,
             append_system_prompt=args.append_system_prompt, depends_on=deps,
             parent_id=parent or None, budget_usd=_budget_arg(args),
+            observability=getattr(args, "observability", None),
         )
         _print({"created": wo["id"], "project": args.project, "status": wo["status"],
                 "depends_on": deps,
@@ -2662,6 +2702,10 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # alarms, not `ops.list_cost_alarms`' fleet-wide dict, whose join columns
                 # (title, status, hidden) are already above — §4.
                 "alarms": store.alarms_of(args.wo_id),
+                # HOW LONG IT HAS BEEN WHERE IT IS, and how long it spent in each status
+                # before that. Always present, on this dict's stated rule — spec §6.
+                "time_in_state": ops.state_durations(store,
+                                                     wo_id=args.wo_id).as_dict(),
                 # THE CEILING AND WHAT HAS GONE AGAINST IT. Always present, even as
                 # nulls: this is the record a user checks a number they typed against,
                 # and a key that comes and goes is one every consumer has to guard.
@@ -2673,8 +2717,8 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_config(_readable_autoreview(_readable_automerge(
-            _readable_alarms(_readable_rounds(_readable_issues(
-                _readable_conversation(detail)))))))
+            _readable_alarms(_readable_time_in_state(_readable_rounds(_readable_issues(
+                _readable_conversation(detail))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -2898,6 +2942,12 @@ def cmd_fo(args: argparse.Namespace) -> int:
             # Silent when there is none, which is every feature until a sweep is armed.
             if detail["alarms"]:
                 print(f"\nalarms: {ops.alarm_standing_line(detail['alarms'])}")
+            # The same block as `jarvis wo show`, from the same formatter — spec §6.
+            states = time_in_state_lines(detail["time_in_state"])
+            if states:
+                print("\ntime in state:")
+                for line in states:
+                    print(f"  {line}")
             if detail["plan_text"]:
                 print(f"\nplan:\n{detail['plan_text']}")
             if detail["max_parallel"]:
