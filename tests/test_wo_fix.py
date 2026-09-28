@@ -933,18 +933,19 @@ def _improvement_order_count(project: str = "proj_a") -> int:
     return len(ops.list_improvement_orders(project, include_settled=True))
 
 
-def test_an_unresolved_slug_with_no_investigation_offers_nothing_and_writes_nothing(
+def test_an_unresolved_slug_with_no_investigation_and_confirm_false_writes_nothing(
         started, catalog_file, monkeypatch):
-    """No registered remedy AND no live investigation naming this order: the payload says
-    so in words, names the slug, offers no remedy and no move — and `confirm=True` still
+    """No registered remedy AND no live investigation naming this order: on `confirm=False`
+    the payload says so in words, names the slug, offers no remedy and no move — and
     writes NOTHING AT ALL, not even an improvement order (issue #227: a gap reads as a gap,
-    never as an empty list)."""
+    never as an empty list). Neo q863(a) only ungates `confirm=True`; this path is
+    unchanged."""
     _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
     wo = _stalled()
     _unclassified(monkeypatch)
     before = _improvement_order_count()
 
-    out = ops.fix(wo["id"], confirm=True)
+    out = ops.fix(wo["id"], confirm=False)
 
     assert out["blocker"]["what"] == UNKNOWN["what"]
     assert out["remedy"] is None
@@ -955,9 +956,133 @@ def test_an_unresolved_slug_with_no_investigation_offers_nothing_and_writes_noth
     assert "no registered remedy" in out["note"]
     _nothing_was_written(wo["id"])
     assert _improvement_order_count() == before
-    # THE REGISTRY IS STILL CLOSED: this arm files nothing, ever, so a `fix` run over a
+    # THE REGISTRY IS STILL CLOSED: this arm never guesses a remedy, so a `fix` run over a
     # slug nobody resolves cannot be how a new remedy sneaks in.
     assert tuple(remedies.REMEDIES) == remedies.SHIPPED_REMEDIES
+
+
+def test_confirm_true_with_no_live_investigation_opens_exactly_one(
+        started, catalog_file, monkeypatch):
+    """Neo q863(a): `confirm=True` with no live investigation opens exactly ONE improvement
+    order, ungated — no approval row is filed for it. Its refs are `[wo_id, slug]`, in that
+    order (Neo's own condition, so a later investigation can dedupe by class); its brief
+    carries the reusable-remedy requirement verbatim; its title names the slug; `filed`
+    stays None because there is no gate request; the note names the new io."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    before = _improvement_order_count()
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    ios = ops.list_improvement_orders("proj_a", include_settled=True)
+    assert len(ios) == before + 1
+    io = ios[0]
+    assert ops.evidence_refs(io) == [wo["id"], UNKNOWN["what"]]
+    assert "src/jarvis/remedies.py" in io["description"]
+    assert "SHIPPED_REMEDIES" in io["description"]
+    assert "tests" in io["description"]
+    assert "allow-list" in io["description"]
+    assert UNKNOWN["what"] in io["title"]
+    store = _store(wo["id"])
+    try:
+        assert store.list_approvals(wo["id"]) == []
+    finally:
+        store.close()
+    assert out["filed"] is None
+    assert io["id"] in out["note"]
+
+
+def test_confirm_true_twice_creates_one_investigation_the_second_points_at_it(
+        started, catalog_file, monkeypatch):
+    """Running `fix(..., confirm=True)` twice must not open two investigations of the same
+    gap class: the second run finds the first one live and points at it instead."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    before = _improvement_order_count()
+
+    first = ops.fix(wo["id"], confirm=True)
+    second = ops.fix(wo["id"], confirm=True)
+
+    assert _improvement_order_count() == before + 1
+    ios = ops.list_improvement_orders("proj_a", include_settled=True)
+    io_id = ios[0]["id"]
+    assert io_id in first["note"]
+    assert io_id in second["note"]
+    assert second["note"] == ops.FIX_GAP_INVESTIGATING.format(what=UNKNOWN["what"],
+                                                              io_id=io_id)
+
+
+def test_confirm_true_dedupes_by_gap_class_on_a_different_order(
+        started, catalog_file, monkeypatch):
+    """A live io whose refs name the SLUG but a DIFFERENT work order is pointed at —
+    Neo q863's whole reason for the second evidence ref: the class is the unit of work, and
+    `confirm=True` creates nothing new for it."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    other = _stalled("a different order entirely")
+    _unclassified(monkeypatch)
+    io = ops.create_improvement_order("proj_a", "quota ledger keeps drifting",
+                                      description="seen on several orders",
+                                      refs=[other["id"], UNKNOWN["what"]])
+    before = _improvement_order_count()
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    assert _improvement_order_count() == before
+    assert io["id"] in out["note"]
+    assert out["filed"] is None
+    _nothing_was_written(wo["id"])
+
+
+def test_a_settled_investigation_naming_the_slug_does_not_count(
+        started, catalog_file, monkeypatch):
+    """A SETTLED io referencing this order or the slug is not a reason to withhold the
+    offer: `confirm=True` opens a new one."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    io = ops.create_improvement_order("proj_a", "quota ledger keeps drifting",
+                                      description="seen on several orders",
+                                      refs=[wo["id"], UNKNOWN["what"]])
+    store = ProjectStore(ops.find_feature_order(io["id"])[1])
+    try:
+        store.set_feature_status(io["id"], "cancelled")
+    finally:
+        store.close()
+    before = _improvement_order_count()
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    assert _improvement_order_count() == before + 1
+    assert io["id"] not in out["note"]
+
+
+def test_the_filing_failure_says_nothing_was_filed_and_leaks_no_exception_text(
+        started, catalog_file, monkeypatch):
+    """A FAILURE IS NEVER A VERDICT (kn-40db1828): `create_improvement_order` raising
+    `OpsError` must not read as an investigation opened, must not leak the exception
+    string, and must leave no improvement order behind."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = _stalled()
+    _unclassified(monkeypatch)
+    secret = "project 'proj_a' not registered, some internal detail nobody should read"
+
+    def boom(*a, **kw):
+        raise ops.OpsError(secret)
+
+    monkeypatch.setattr(ops, "create_improvement_order", boom)
+    before = _improvement_order_count()
+
+    out = ops.fix(wo["id"], confirm=True)
+
+    assert secret not in out["note"]
+    assert "not registered" not in out["note"]
+    assert "is now open" not in out["note"]  # FIX_GAP_OPENED's own claim, never made here
+    assert "nothing was filed" in out["note"]
+    assert out["filed"] is None
+    assert _improvement_order_count() == before
 
 
 def test_an_unresolved_slug_with_a_live_investigation_is_pointed_at_it(
@@ -1038,10 +1163,21 @@ def test_the_gap_note_carries_no_text_the_os_did_not_write(started, catalog_file
 
     note = ops.fix(wo["id"])["note"]
 
-    for leaked in ("scripts/shipit.sh", "a worker's own words here", "SECRET PROMPT TEXT",
-                   "Traceback", "/home/someone"):
+    leaks = ("scripts/shipit.sh", "a worker's own words here", "SECRET PROMPT TEXT",
+             "Traceback", "/home/someone")
+    for leaked in leaks:
         assert leaked not in note
     assert UNKNOWN["what"] in note
+
+    # RETARGETED for Neo q863(a): `confirm=True` interpolates the same `detail` into the
+    # investigation's BRIEF (`FIX_GAP_INVESTIGATION_BRIEF`), so the boundary must hold there
+    # too — checked on both the returned note and the io's own stored description.
+    out = ops.fix(wo["id"], confirm=True)
+    ios = ops.list_improvement_orders("proj_a", include_settled=True)
+    io = ios[0]
+    for leaked in leaks:
+        assert leaked not in out["note"]
+        assert leaked not in io["description"]
 
 
 def test_the_cli_renders_the_payload_and_derives_nothing(started, catalog_file, capsys):

@@ -1853,12 +1853,51 @@ FIX_GAP_NO_INVESTIGATION = (
     "analyst reads the gap and registers a remedy that clears `{what}` wherever it "
     "appears next, rather than a one-off fix for this order alone"
 )
-#: The same gap, but a LIVE improvement order already names this work order as evidence —
-#: the POINT half of the fallback. The two interpolations are the slug and the `io-` id,
-#: both OS-computed.
+#: The same gap, but a LIVE improvement order already names this work order OR THIS GAP
+#: CLASS as evidence — the POINT half of the fallback, widened by Neo q863: the class is
+#: the unit of work an investigation ends, so a second investigation of the same class is
+#: duplicated effort even when it names a different order. The two interpolations are the
+#: slug and the `io-` id, both OS-computed.
 FIX_GAP_INVESTIGATING = (
     "no registered remedy covers this blocker ({what}) — {io_id} is already investigating "
     "this gap class. Read it with `jarvis io show {io_id}`"
+)
+
+#: Neo q863(a): TITLE and BRIEF for the investigation `_fix_gap_note` opens on `confirm=True`
+#: with no live one covering the class. OS-authored — the only interpolations are the slug,
+#: this order's id, and §6's own `detail` (the evidence the analyst starts from), never an
+#: exception tail, a gate command, a prompt or a transcript line (`diagnose`'s boundary,
+#: kn-1791a5e6).
+FIX_GAP_INVESTIGATION_TITLE = (
+    "Investigate the `{what}` gap class: no registered remedy clears it"
+)
+#: Neo's ruling condition on q863: the brief MUST end by filing a work order for a new
+#: REUSABLE remedy in src/jarvis/remedies.py — tests, a `SHIPPED_REMEDIES` update, and the
+#: remedy left OFF `RemedyConfig`'s allow-list by default, so it ships disarmed. Stating
+#: that requirement here is what makes q863's condition binding on the analyst rather than
+#: a preference this module remembered and nobody else can see.
+FIX_GAP_INVESTIGATION_BRIEF = (
+    "`jarvis wo fix` found blocker `{what}` on {wo_id} with no registered remedy to clear "
+    "it. `jarvis wo why {wo_id}` reported: {detail}\n\n"
+    "End this investigation by filing a work order for a new REUSABLE remedy in "
+    "src/jarvis/remedies.py: it needs tests, a `SHIPPED_REMEDIES` entry, and it must ship "
+    "OFF `RemedyConfig`'s allow-list by default so the remedy arrives disarmed."
+)
+#: The just-opened case's own note — distinct from `FIX_GAP_INVESTIGATING`'s "already
+#: investigating" because nobody has read this one yet; naming the io id and the gap class
+#: so the user's next move is `jarvis io show {io_id}`, same as the point half.
+FIX_GAP_OPENED = (
+    "no registered remedy covers this blocker ({what}) — {io_id} is now open to "
+    "investigate this gap class. Read it with `jarvis io show {io_id}`"
+)
+#: A FAILURE IS NEVER A VERDICT (kn-40db1828): `create_improvement_order` can raise
+#: `OpsError` (unregistered project, or its own no-description/no-refs refusals, neither
+#: reachable here since this call always supplies both). NO `{error}` SLOT — the exception
+#: string stays in the `log.warning` and never reaches the payload (`FIX_UNREACHABLE`'s
+#: precedent, same file).
+FIX_GAP_FILING_FAILED = (
+    "no registered remedy covers this blocker ({what}) — an investigation could not be "
+    "opened, and nothing was filed. Nothing was decided either: run this again"
 )
 
 #: A proposal the reviewer has been asked about, and one nobody could be asked about.
@@ -1896,29 +1935,57 @@ def remedy_config(project: str | None = None) -> Any:
         return RemedyConfig()
 
 
-def _fix_gap_note(project: str, wo_id: str, what: str) -> str:
+def _fix_gap_note(project: str, wo_id: str, what: str, detail: str, confirm: bool) -> str:
     """§11's fallback for a slug `remedies.resolve` claims for nobody — the user's design
     addition superseding Neo q839's own default arm. POINTS at a LIVE improvement order
-    that already names this work order as evidence, or OFFERS to open one. Read-only
-    either way, and unconditional on `confirm`: opening the investigation is not this
-    function's to do (issue #227 still applies — the gap reads as a gap, in words, never
-    as an empty list).
+    that already evidences this gap class, or on `confirm=True` OPENS one (Neo q863(a)).
+    `confirm=False` stays read-only (issue #227 still applies — the gap reads as a gap, in
+    words, never as an empty list).
 
     Reads the evidence through `evidence_refs`, the one home for that read — see its own
-    docstring for why this function does not know the metadata shape itself.
+    docstring for why this function does not know the metadata shape itself. Matches on
+    EITHER this work order's id OR the slug itself (Neo q863's whole reason for the second
+    evidence ref): the class is the unit of work an investigation ends, so a second
+    investigation of the same class is duplicated effort even filed against a different
+    order — `FIX_GAP_INVESTIGATING`'s "already investigating this gap class" is equally
+    true either way.
     """
     for io in list_improvement_orders(project, include_settled=False):
-        if wo_id in evidence_refs(io):
+        refs = evidence_refs(io)
+        if wo_id in refs or what in refs:
             return FIX_GAP_INVESTIGATING.format(what=what, io_id=io["id"])
-    # PENDING NEO 863: opening an investigation of {wo_id} — `create_improvement_order` —
-    # goes here, once Neo rules whether the filing rides the `self_heal` grant or is
-    # ungated.
-    return FIX_GAP_NO_INVESTIGATION.format(what=what)
+    if not confirm:
+        return FIX_GAP_NO_INVESTIGATION.format(what=what)
+    # NO GATE (Neo q863(a), in Neo's own terms): the user pressing `--confirm` IS the
+    # authorisation, and an investigation only OBSERVES — it reaches no session, changes no
+    # status, alters nothing — unlike `file_work_order`, which is gated because it FILES
+    # WORK. REFS ARE THE WO ID *AND* THE GAP-CLASS SLUG, in that order, so a later
+    # investigation can dedupe by CLASS and not only by order — the loop above, widened.
+    try:
+        io = create_improvement_order(
+            project,
+            FIX_GAP_INVESTIGATION_TITLE.format(what=what),
+            FIX_GAP_INVESTIGATION_BRIEF.format(what=what, wo_id=wo_id, detail=detail),
+            refs=[wo_id, what],
+            # `WO_ORIGINS` (project_store.py) is a CLOSED set and this is the right
+            # member of it, not the default nobody chose: a `jarvis` command the user ran
+            # filed this, the same bucket `jarvis bug report` uses — as against a direct DB
+            # insert (`manual`), a clock (`schedule`) or Neo's own writes (`neo`). `fix()`
+            # is one function behind both the CLI and the debug-page button, so there is no
+            # narrower bucket to hand it and inventing one would widen a closed set.
+            origin="jarvis")
+    except OpsError as exc:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828): the exception text stays here, never
+        # in the payload — `FIX_UNREACHABLE`'s precedent, same file.
+        log.warning("could not open an investigation of the %s gap class on %s: %s",
+                    what, wo_id, exc)
+        return FIX_GAP_FILING_FAILED.format(what=what)
+    return FIX_GAP_OPENED.format(what=what, io_id=io["id"])
 
 
 def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
-               asked: str | None, project: str) -> tuple[str | None, str | None,
-                                           dict[str, str] | None, str | None]:
+               asked: str | None, project: str, confirm: bool
+               ) -> tuple[str | None, str | None, dict[str, str] | None, str | None]:
     """`(remedy, note, your_move, argument)` for one blocker — the matching rule, and it is
     the REGISTRY's rather than this module's (Neo q839, and the user's later design
     addition that the registry is DATA rows fo-69ba1cc4 builds, resolved through
@@ -1928,9 +1995,11 @@ def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
     everywhere else, so a caller's `--argument` still wins and the shipped `FIX_ARGUMENTS`
     default still applies when neither is given (`fix`'s own precedence comment).
 
-    Reads only. The predicates are the ones `_diagnose_commands` calls, not copies of them
-    (kn-4ea33fe6), and the `NUDGE_IS_WRONG` arm mirrors `resume_in_auto`'s refusal in that
-    mapping's own words rather than restating why.
+    Reads only, EXCEPT the gap arm on `confirm=True`, which may open an investigation
+    (`_fix_gap_note`, Neo q863(a)) — every other arm here still writes nothing. The
+    predicates are the ones `_diagnose_commands` calls, not copies of them (kn-4ea33fe6),
+    and the `NUDGE_IS_WRONG` arm mirrors `resume_in_auto`'s refusal in that mapping's own
+    words rather than restating why.
     """
     from . import remedies as remedies_mod
 
@@ -1972,9 +2041,12 @@ def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
     # change (Neo q839, overriding §11's "add no remedy" — and now the user's design
     # addition, overriding Neo q839's own answer in turn): it ends in a registered remedy
     # through an INVESTIGATION (`wo-4beada49`'s order kind), never a work order guessing
-    # at a fix. No new authority either way: `fix` still checks the catalog, still files
-    # nothing without `confirm=True`, and this arm files nothing at all, ever.
-    return None, _fix_gap_note(project, wo_id, what), None, None
+    # at a fix. No new authority: this arm never guesses a remedy, and on `confirm=False`
+    # it still files nothing. On `confirm=True` with no live investigation, it opens ONE —
+    # Neo q863(a): the user's own press is the authorisation, so this is not the exception
+    # to "`fix` files nothing without `confirm=True`" above, it is that rule applied.
+    gap = _fix_gap_note(project, wo_id, what, blocker["detail"], confirm)
+    return None, gap, None, None
 
 
 def _file_fix(store: ProjectStore, project: str, wo: dict[str, Any], remedy_id: str,
@@ -2056,7 +2128,11 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
 
     `confirm=False` WRITES NOTHING AT ALL — it returns the proposal and the user reads it.
     `confirm=True` files it through `remedies.propose_fix` and stops there; `Daemon.
-    remedy_tick` applies an approved grant, so filing and acting stay two facts.
+    remedy_tick` applies an approved grant, so filing and acting stay two facts. THE ONE
+    EXCEPTION is the gap arm (Neo q863(a)): with no registered remedy and no live
+    investigation, `confirm=True` opens an improvement order directly, UNGATED — the
+    user's own press is the authorisation, and an investigation only OBSERVES, unlike
+    `file_work_order` which files WORK and so is gated.
 
     THE BLOCKER IS `waiting_on`'S, called and never re-derived (kn-4ea33fe6), and it
     travels verbatim so this payload and `jarvis wo why`'s cannot disagree. Every sentence
@@ -2074,7 +2150,8 @@ def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = Non
     store = ProjectStore(path)
     try:
         blocker = waiting_on(store, wo)
-        matched, note, your_move, offered = _fix_match(store, wo, blocker, remedy, name)
+        matched, note, your_move, offered = _fix_match(store, wo, blocker, remedy, name,
+                                                       confirm)
         # PRECEDENCE: the CALLER'S `--argument` wins, then the matched row's own
         # `params["argument"]` (what a data row's parameters will supply, fo-69ba1cc4),
         # then the shipped `FIX_ARGUMENTS` default. Resolved before the refusals below
