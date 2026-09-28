@@ -911,3 +911,113 @@ def test_the_lowered_flag_is_not_re_raised_on_the_next_tick(tmp_path, project,
     assert not row["attention_reason"]
     assert row["acknowledged_blockers"] is None
     assert len(store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT)) == 1
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md
+
+
+def _cfg(fleet):
+    return fleet.catalog.project("proj_a").validation
+
+
+def _moved(head: str = PUSHED, *, round_n: int = 3):
+    return automerge._held(automerge.HELD_SHA_MOVED, "the head moved",
+                           judged_sha=JUDGED, head_sha=head, round_n=round_n)
+
+
+def test_a_conflict_resolving_merge_past_the_cap_is_re_judged_without_spending_a_round(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """wo-8736a5c5 / PR #794. The OS's own conflict poll made the worker merge `main`;
+    the resolution is content no seat read, so the carry correctly refuses — and the
+    re-judge that follows must not be charged to the worker's rework budget."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    out = ops.rejudge_moved_head(store, project, wo, project="proj_a",
+                                 cfg=_cfg(fleet), decision=_moved(), rebind=True)
+
+    assert out is not None and not out["declined"]
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_forced")[-1]["payload"], {})
+    assert payload["by"] == ops.REJUDGE_BY_OS and payload["rebind"] is True
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert int(row["round"]) == 4 and int(row["uncounted"]) == 1
+    assert "does not count against validation.max_rounds" in row["forced_reason"]
+
+    store.set_validation_head(row["id"], PUSHED)
+    store.close_validation_round(row["id"], "passed", "")
+
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 3
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == 1
+    assert store.numbered_validation_rounds(wo_id=wo["id"]) == 4
+
+
+def test_the_rebind_arm_never_reads_the_round_budget(tmp_path, project, jarvis_home,
+                                                     fake_claude, fake_gh):
+    """§4.3: `cfg.max_rounds` is not consulted at all on the rebind arm — the live
+    order's recovery must not depend on any round accounting reaching this path."""
+    fleet = boot(tmp_path, project, max_rounds=1)
+    store, wo = parked(project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    out = ops.rejudge_moved_head(store, project, wo, project="proj_a",
+                                 cfg=_cfg(fleet), decision=_moved(), rebind=True)
+
+    assert out is not None and not out["declined"]
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT) == []
+
+
+def test_rebind_max_bounds_the_self_repair(tmp_path, project, jarvis_home, fake_claude,
+                                           fake_gh):
+    """§4.3, the cap branch. Past `REBIND_MAX` the decline names its own cause, so a
+    reader can tell it from a spent round budget — and it is said once per commit."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+    for head in (PUSHED, AGAIN):
+        artifact(fake_gh, head_oid=head)
+        ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                               decision=_moved(head), rebind=True)
+        row = store.latest_validation_round(wo_id=wo["id"])
+        store.close_validation_round(row["id"], "rejected", "no")
+        store.set_status(wo["id"], "waiting_pr_merge")
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == ops.REBIND_MAX
+
+    third = "dddd1111dddd2222dddd3333dddd4444dddd5555"
+    artifact(fake_gh, head_oid=third)
+    out = ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                                 decision=_moved(third), rebind=True)
+
+    assert out == {"wo_id": wo["id"], "declined": True,
+                   "cause": ops.REBIND_EXHAUSTED, "head_sha": third,
+                   "judged_sha": JUDGED, "rebinds": ops.REBIND_MAX,
+                   "rebind_max": ops.REBIND_MAX}
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert len(declined) == 1
+    assert db.from_json(declined[0]["payload"], {})["cause"] == ops.REBIND_EXHAUSTED
+    # said once per commit, not once per tick
+    assert ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                                  decision=_moved(third), rebind=True) is None
+    assert len(store.events_of_kind(
+        wo["id"], invariants.REJUDGE_DECLINED_EVENT)) == 1
+
+
+def test_a_non_merge_head_change_past_the_cap_still_goes_to_the_user(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """A worker PUSH past the cap is what `max_rounds` is FOR: no rebind, today's
+    decline — now naming its cause — and today's blocker, byte for byte."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=2)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    poll(fleet, store)
+
+    assert rounds_of(store, wo) == [1, 2]
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    payload = db.from_json(declined[-1]["payload"], {})
+    assert payload["cause"] == ops.REJUDGE_BUDGET_SPENT
+    assert payload["next_round"] == 3 and payload["max_rounds"] == 3
+    assert invariants.true_blockers(
+        store, store.get_work_order(wo["id"]))[0] == invariants.SHA_MOVED_BLOCKER
