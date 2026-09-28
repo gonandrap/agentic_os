@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
@@ -90,6 +91,23 @@ log = logging.getLogger(__name__)
 #: `answer_form` in `ui/templates/_question.html`, and `ops.neo_review`'s `--correct`
 #: tail. All seven are done for this kind; see the comment at `Q_KINDS`.
 QUESTION_KIND = "assumption"
+
+#: Characters of decision record one packet may carry. A constant and not a config key:
+#: `evidence.DEFAULT_DIFF_CHARS` and `neo.LEARNINGS_CHAR_BUDGET` are the precedent for a
+#: prompt-size bound here, and a per-project knob is a setting nobody sets and every test
+#: has to pin. docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own
+#: -rulings.md §3.
+DECISION_RECORD_CHARS = 6000
+
+#: A question id the assumption's own text names — `Neo question 887`, `question 887`,
+#: `Q887`, `Neo 887`, every form seen in the field. Bounded to six digits so a commit-hash
+#: fragment or a line count cannot become an id.
+_CITED_QUESTION_RE = re.compile(
+    r"\b(?:neo\s+question|question|neo|q)\s*#?\s*(\d{1,6})\b", re.IGNORECASE)
+
+#: How many cited ids one packet quotes. A reviewer packet is not a bibliography, and
+#: `content` naming six question ids is a different problem.
+_CITED_LIMIT = 5
 
 #: `assumptions.decided_by` for a verdict this module reached. Spelled through
 #: `project_store.ASSUMPTION_DECIDER_OS` at its call sites; named here for
@@ -1139,6 +1157,14 @@ deletes or publishes anything, carries legal or personal-data weight, or would b
 to undo — even if you are also accepting it. High stakes goes to the user whatever you
 ruled, and marking one honestly is how you stay trusted on the rest.
 
+THE DECISION RECORD IS AUTHORITY AND YOU MAY CITE IT. What it lists has already been
+decided on this work order — a question the user or Neo answered, a message the user sent,
+an assumption they already ruled on. When it settles the assumption in front of you,
+ACCEPT and name the id in your `reason`; escalating to ask for a decision that is quoted
+in your own prompt spends a review action the user has already spent. An item marked
+`(withheld …)`, `(not answered)` or `(not shown)` is NOT a ruling, and neither is an
+omission line: those are cases to escalate, not blanks to fill in.
+
 A SIBLING MARKED `(withheld — high-stakes …)` IS NOT A BLANK TO FILL IN. The OS holds
 those assumptions for the user and does not show you their text, deliberately. Do not
 guess at what one says, and do not treat its absence as permission: if your ruling would
@@ -1183,8 +1209,208 @@ def sibling_line(s: dict[str, Any]) -> str:
     return f"  #{s['n']} [{s['status']}] {content[:200]}"
 
 
+def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, Any]],
+                    assumption: dict[str, Any] | None = None) -> str:
+    """What has ALREADY been decided on this work order, newest first. `''` when nothing.
+
+    `sibling_line`'s neighbour because it is the same kind of thing — context rows
+    rendered into one packet section with a redaction net over them — and the reason it
+    lives here rather than in `daemon.py` is that the daemon half of this module runs git
+    and calls models, so a string assembled there would be out of reach of the pure tests
+    that cover every other line of packet text (GitHub issue #832, §7).
+
+    Three groups, each newest-first: the order's answered Neo Q&A, the user's own
+    messages, then the user's rulings on sibling assumptions. Grouped rather than merged
+    because provenance differs per group and a merged stream would need a per-item source
+    label to stay readable.
+
+    **THE SECRET NET ONLY, NOT THE HIGH-STAKES NET** (§5, on the user's ruling on Neo
+    question 943). `sibling_line`'s argument does not transfer: every item here is SETTLED
+    BY CONSTRUCTION — an answered question, a message the user sent, an assumption already
+    decided — so there is no decision left to withhold, and withholding one reproduces
+    #832 one table along. The secret net stays because a credential reaching a model at
+    all is true whoever decided what.
+
+    `assumption` is the row being ruled on, and it is a parameter rather than a lookup in
+    `siblings` because the citation budget is spent in ITS favour first
+    (`_cited_question_ids`). `None` scans the siblings alone.
+    """
+    answered = list(neo.answered_questions(wo_id) or [])
+    n_by_question = {}
+    for s in siblings:
+        for column in ("neo_question_id", "confirm_question_id"):
+            if s.get(column):
+                n_by_question[int(s[column])] = s.get("n")
+
+    cited_ids = _cited_question_ids(siblings, assumption)
+    by_id = {int(q["id"]): q for q in answered}
+    # Cited FIRST and exempt from the cap: it is the single item most likely to be why
+    # this packet exists — Q900 escalated naming a question id it could not see (§4).
+    head = [_cited_item(neo, wo_id, qid, by_id.get(qid), n_by_question)
+            for qid in cited_ids]
+
+    items = [_question_item(q, n_by_question) for q in answered
+             if int(q["id"]) not in cited_ids]
+    items += [_message_item(m) for m in (store.user_messages(wo_id) or [])]
+    items += [line for s in siblings if (line := _user_ruling_item(s))]
+
+    kept, dropped, spent = [], 0, 0
+    for item in items:
+        if spent + len(item) + 1 > DECISION_RECORD_CHARS:
+            dropped = len(items) - len(kept)
+            break
+        kept.append(item)
+        spent += len(item) + 1
+    lines = [*head, *kept]
+    if not lines:
+        return ""
+    if dropped:
+        # An omission stated, and LAST (kn-1485b845). Going silent is the failure this
+        # whole spec is about: a reviewer that cannot tell "no prior decisions" from
+        # "decisions I was not shown" must escalate, and would be right to.
+        lines.append(f"  (… {dropped} older items omitted — the record is capped at "
+                     f"{DECISION_RECORD_CHARS} characters)")
+    return "\n".join(lines)
+
+
+def _cited_question_ids(siblings: list[dict[str, Any]],
+                        assumption: dict[str, Any] | None = None) -> list[int]:
+    """Question ids the assumptions' own text names, deduplicated, capped.
+
+    **THE ROW BEING RULED ON IS SCANNED FIRST**, and the order is the whole point: the cap
+    is five citations, and five siblings citing five ids between them would otherwise spend
+    it before the assumption under review names anything — which is precisely the case #832
+    is about, since Q900 cited an id in its OWN text.
+
+    `_CITED_QUESTION_RE` OVER-MATCHES ON PURPOSE. Prose like "question 3" becomes a
+    citation, and that costs a line saying `(no such question)` — stated rather than
+    silent, which is this spec's rule everywhere. The priority order above is what stops
+    such a false positive displacing a real citation.
+    """
+    found: list[int] = []
+    for s in ([assumption] if assumption else []) + list(siblings):
+        for match in _CITED_QUESTION_RE.finditer(str(s.get("content") or "")):
+            qid = int(match.group(1))
+            if qid not in found:
+                found.append(qid)
+    return found[:_CITED_LIMIT]
+
+
+def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,
+                n_by_question: dict[int, Any]) -> str:
+    """One cited id, resolved. Answered here it goes in whole; otherwise it is NAMED.
+
+    The three unresolved cases are distinct facts and each is stated rather than swallowed
+    (§4). A pending question is not authority, and saying it is pending is what stops the
+    reviewer reading silence as a ruling. A question on ANOTHER work order is not quoted at
+    all: its text has not been through this order's evidence gates, and a worker citing it
+    does not make it this order's record. One that never existed is a fact about the
+    assumption being ruled on.
+    """
+    cited = "(cited by the assumption"
+    if answered is not None:
+        return _question_item(answered, n_by_question, cited=True, truncate=False)
+    row = neo.get(qid)
+    if row is None:
+        return f"  Q{qid} {cited}; no such question)"
+    if str(row.get("wo_id") or "") != wo_id:
+        return f"  Q{qid} {cited}; belongs to another work order — not shown)"
+    return f"  Q{qid} {cited}; asked on this order, not answered)"
+
+
+def _question_item(q: dict[str, Any], n_by_question: dict[int, Any], *,
+                   cited: bool = False, truncate: bool = True) -> str:
+    """One answered question. `answered_by` is verbatim: "the user said" and "Neo said"
+    are different authority, and the Q879 escalation turned on not knowing which.
+
+    **AN `assumption`-KIND ROW'S QUESTION TEXT IS NEVER QUOTED.** That row IS a review
+    packet — several thousand characters carrying the work order description, the diff and
+    the sibling list — so quoting it is recursive and would spend the whole cap on one
+    item. It is rendered rather than EXCLUDED because the ruling itself is the payload:
+    Q879's missing fact was Neo's verdict on a sibling assumption.
+    """
+    qid = int(q["id"])
+    if str(q.get("kind") or "") == QUESTION_KIND:
+        n = n_by_question.get(qid)
+        headline = f"assumption #{n}" if n is not None else "assumption (row not found)"
+    else:
+        first_line = str(q.get("question") or "").strip().splitlines()
+        headline = (first_line[0] if first_line else "(no question text)")[:160]
+    answer = " ".join(str(q.get("answer") or "(no answer recorded)").split())
+    if truncate:
+        answer = answer[:800]
+    tail = ""
+    if str(q.get("review_status") or "") == "corrected":
+        # `neo_store.review` leaves the user's correction as the only ruling that survived.
+        tail = (f" (the user corrected this: "
+                f"{' '.join(str(q.get('review_feedback') or '').split())[:200]})")
+    marker = " (cited by the assumption)" if cited else ""
+    return _netted(
+        f"Q{qid}{marker}",
+        f"  Q{qid}{marker} [answered by {q.get('answered_by') or 'unknown'}] "
+        f"{headline} -> {answer}{tail}",
+        (headline, answer, tail))
+
+
+def _message_item(m: dict[str, Any]) -> str:
+    body = " ".join(str(m.get("body") or "").split())[:400]
+    stamp = _stamp(m.get("ts"))
+    return _netted(f"[user message {stamp}]",
+                   f"  [user message {stamp}] {body}", (body,))
+
+
+def _user_ruling_item(s: dict[str, Any]) -> str:
+    """A sibling assumption the USER settled, with the reasoning they gave, or `''`.
+
+    `jarvis wo review --feedback` writes that reasoning to `decided_reason` — the
+    `assumptions` table has no `review_feedback` column — with `decided_by` naming who
+    decided; `ops.assumption_ruling_line` reads the same pair. A row `DECIDER` settled is
+    Neo's and reaches the packet through its answered question row instead, never as a
+    ruling of the user's.
+    """
+    status = str(s.get("status") or "")
+    if status in ("", "pending") or str(s.get("decided_by") or "") == DECIDER:
+        return ""
+    reason = " ".join(str(s.get("decided_reason") or "").split())[:400]
+    return _netted(f"#{s.get('n')} {status}",
+                   f"  #{s.get('n')} {status} by the user"
+                   f"{' — ' + reason if reason else ''}", (reason,))
+
+
+def _netted(label: str, rendered: str, payload: tuple[str, ...]) -> str:
+    """The secret net over ONE item. Named, never quoted, never dropped.
+
+    The net runs over the PAYLOAD fields rather than the rendered line, because
+    `_ASSIGNMENT_RE` anchors at the start of a line and every rendered item begins with
+    its own label. The classification is the shape and not the value, which is the
+    contract `secret_marker_text`'s docstring states; dropping instead would be the
+    silence #832 is about.
+    """
+    marker = secret_marker_text("\n".join(payload))
+    return rendered if not marker else f"  {label} (withheld — carries {marker})"
+
+
+def _stamp(ts: Any) -> str:
+    """A record timestamp as a date, for ordering the reviewer can read."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except (TypeError, ValueError):
+        return "unknown time"
+
+
+#: The decision record's heading, and its empty case. Last of the context blocks on
+#: purpose: it is what the reviewer reads just before it answers.
+RECORD_HEADING = "# What has already been decided on this work order — authority you may CITE"
+NO_RECORD = "  (no prior decisions recorded)"
+
+
+def _record_block(record: str) -> str:
+    return f"{RECORD_HEADING}\n{record or NO_RECORD}"
+
+
 def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                     siblings: list[dict[str, Any]], *, early: bool = False) -> str:
+                     siblings: list[dict[str, Any]], *, early: bool = False,
+                     record: str = "") -> str:
     """What the reviewer reads. One assumption, quoted; the rest listed, not ruled on.
 
     The siblings are here because an assumption is sometimes only defensible given
@@ -1192,6 +1418,10 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     code applies the ruling to exactly one row whatever comes back. Each one goes through
     `sibling_line`, which applies the same high-stakes rule that decided whether it could
     be ruled on at all.
+
+    `record` is what has already been decided on this order (`decision_record`), last of
+    the context blocks and the one whose absence produced the escalations in #832. It
+    defaults to `""` so a caller not yet teaching one is merely unaware, never wrong.
     """
     n = assumption.get("n")
     others = "\n".join(sibling_line(s) for s in siblings
@@ -1215,6 +1445,8 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         if early else
         "Answer with `escalate`, `verdict` (`approve` to accept it, `deny` to send it to "
         "the user), `stakes` (`routine` or `high`) and a one-line `reason`.")
+    answers += (" When the decision record above settles it, say which id in `reason` "
+                "instead of escalating to ask for it again.")
     return "\n\n".join([
         f"ASSUMPTION REVIEW — rule on assumption #{n} of {wo['id']} in {project}, and on "
         f"nothing else.",
@@ -1224,12 +1456,14 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
         delivered,
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
+        _record_block(record),
         answers,
     ])
 
 
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                      siblings: list[dict[str, Any]], stat: str, diff: str) -> str:
+                      siblings: list[dict[str, Any]], stat: str, diff: str,
+                      record: str = "") -> str:
     """What the reviewer reads at DELIVERY. Everything the early pass could not have.
 
     Each block earns its place, and the two new ones are the whole point of the second
@@ -1274,11 +1508,14 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"# What changed\n{stat or '(no files reported)'}\n\n{diff or '(no diff)'}",
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
+        _record_block(record),
         "You are CONFIRMING that earlier reading against the delivered result. "
         "Confirming settles this assumption in the user's name; anything else leaves it "
         "with them, carrying both readings.",
         "Answer with `escalate`, `verdict` (`approve` to confirm it, `deny` to send it "
-        "to the user), `stakes` (`routine` or `high`) and a one-line `reason`.",
+        "to the user), `stakes` (`routine` or `high`) and a one-line `reason`. When the "
+        "decision record above settles it, say which id in `reason` instead of "
+        "escalating to ask for it again.",
     ])
 
 
@@ -1302,7 +1539,9 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     (kn-4edb0eb7).
     """
     question = neo.ask(project, wo["id"],
-                       _confirm_question(project, wo, assumption, siblings, stat, diff),
+                       _confirm_question(project, wo, assumption, siblings, stat, diff,
+                                         decision_record(store, neo, wo["id"], siblings,
+                                                         assumption)),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)
@@ -1335,7 +1574,10 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     it is known for certain: here. `Daemon._asked_early` reads it back.
     """
     question = neo.ask(project, wo["id"],
-                       _ruling_question(project, wo, assumption, siblings, early=early),
+                       _ruling_question(
+                           project, wo, assumption, siblings, early=early,
+                           record=decision_record(store, neo, wo["id"], siblings,
+                                                  assumption)),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)

@@ -760,6 +760,34 @@ def test_decide_evidence_arms_on_an_ordinary_summary():
     assert d.armed
 
 
+def test_the_confirmation_packet_carries_the_decision_record_too():
+    """Test 7's mirror. Both passes rule on the same assumption, so a record present on
+    one and absent on the other is #832 on every confirmation.
+
+    docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md.
+    """
+    from tests.test_autoreview import RECORD_HEADER, FakeNeo, FakeStore, qrow
+
+    neo_ = FakeNeo(qrow(answered_by="user", answer="build NO kill remedy"))
+
+    autoreview.propose_confirmation(FakeStore(), neo_, "p", WO, judged(), [judged()],
+                                    stat=" render.py | 2 +-", diff="+    return 1\n")
+
+    (packet,) = neo_.asked
+    assert RECORD_HEADER in packet
+    assert "Q887" in packet and "answered by user" in packet
+    assert packet.index("do not rule on these") < packet.index(RECORD_HEADER)
+    assert packet.index(RECORD_HEADER) < packet.index("You are CONFIRMING")
+
+
+def test_the_confirmation_packet_says_when_there_is_no_record():
+    """The empty case on this pass too: `record=""` renders the section, never omits it."""
+    packet = autoreview._confirm_question(   # noqa: SLF001
+        "p", WO, judged(), [], " render.py | 2 +-", "+    return 1\n")
+
+    assert "(no prior decisions recorded)" in packet
+
+
 def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     """`assumption_id` and `n` so `_note_autoreview_held` dedupes per assumption, as
     every other hold does — otherwise one work order records this every tick."""

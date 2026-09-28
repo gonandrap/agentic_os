@@ -507,6 +507,23 @@ class NeoStore:
             (wo_id, *OPEN_Q_STATUSES),
         ).fetchall())
 
+    def answered_questions(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Decisions already taken on this work order, NEWEST FIRST.
+
+        `open_questions`' other half, and the two differences are both deliberate. The
+        order is reversed because the caller caps the text it can carry
+        (`autoreview.DECISION_RECORD_CHARS`) and the newest ruling is the one that
+        supersedes. And there is NO `kind` filter: that exclusion is load-bearing above
+        because an open `approval` is a gate reported elsewhere, while here every row is a
+        ruling on this order — an `approval` the user answered is exactly the authority a
+        reviewer escalated for want of (GitHub issue #832).
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            """SELECT * FROM questions WHERE wo_id=? AND status='answered'
+               ORDER BY ts DESC, id DESC LIMIT ?""",
+            (wo_id, limit),
+        ).fetchall())
+
     def list_questions(self, statuses: tuple[str, ...] | None = None,
                        review_status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         q = "SELECT * FROM questions"

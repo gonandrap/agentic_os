@@ -1652,3 +1652,280 @@ def test_a_second_outage_on_the_re_asked_question_re_arms_it_again(started):
     assert len(events(store, wo["id"], "autoreview_asked")) == 3
     # `HELD_ASKED` is suppressed (`_holds_not_recorded`): the question IS filed.
     assert events(store, wo["id"], "autoreview_held") == []
+
+
+# -- the decision record: the order's own rulings reach the packet ----------------------
+#
+# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md.
+#
+# THE DEFECT: the reviewer escalated asking the user to re-decide something already
+# decided on the same work order, because no answered question, no user message and no
+# user ruling on a sibling was ever in the packet.
+
+
+def qrow(**over) -> dict:
+    return {"id": 887, "wo_id": "wo-1", "kind": "question", "status": "answered",
+            "question": "should the kill remedy exist?", "answer": "neither A nor B",
+            "answered_by": "neo", "ts": 100.0, "review_status": "unreviewed",
+            "review_feedback": None, **over}
+
+
+class FakeNeo:
+    """`answered_questions` and `get`, the two reads the record makes. Rows are given
+    newest-first, as the query returns them; `others` exist but are not answered here."""
+
+    def __init__(self, *rows: dict, others: tuple[dict, ...] = ()):
+        self.rows = list(rows)
+        self.all = {r["id"]: r for r in (*rows, *others)}
+        self.asked: list[str] = []
+
+    def answered_questions(self, wo_id: str, limit: int = 20) -> list[dict]:
+        return [r for r in self.rows
+                if r["wo_id"] == wo_id and r["status"] == "answered"][:limit]
+
+    def get(self, question_id: int) -> dict | None:
+        return self.all.get(int(question_id))
+
+    def ask(self, project, wo_id, question, context="", kind="") -> dict:
+        self.asked.append(question)
+        return {"id": 1, "question": question}
+
+
+class FakeStore:
+    def __init__(self, *messages: dict):
+        self.messages = list(messages)
+
+    def user_messages(self, wo_id: str, limit: int = 100) -> list[dict]:
+        return self.messages
+
+    def link_assumption_question(self, *a) -> None:
+        pass
+
+    link_assumption_confirmation = link_assumption_question
+
+    def add_event(self, *a) -> None:
+        pass
+
+
+def record(*rows: dict, messages: tuple[dict, ...] = (), siblings=None,
+           others: tuple[dict, ...] = (), ruling_on=None) -> str:
+    return autoreview.decision_record(
+        FakeStore(*messages), FakeNeo(*rows, others=others), "wo-1",
+        [assumption()] if siblings is None else siblings, assumption=ruling_on)
+
+
+def test_an_answered_question_reaches_the_packet_with_its_id_and_who_answered():
+    """Test 1. Q900 escalated citing "a user correction I can't see" — the user's own
+    answer to a question on the SAME work order. Both facts have to be there: the id, so
+    the reviewer can cite it, and WHO answered, because the user and Neo are different
+    authority and Q879 turned on not knowing which."""
+    out = record(qrow(answered_by="user", answer="build NO kill remedy"))
+
+    assert "Q887" in out
+    assert "answered by user" in out
+    assert "build NO kill remedy" in out
+
+
+def test_a_corrected_neo_answer_carries_the_correction_that_overrode_it():
+    """A corrected Neo answer is not authority on its own: `neo_store.review` leaves the
+    user's feedback as the only ruling that survived."""
+    out = record(qrow(review_status="corrected",
+                      review_feedback="no — always ask first"))
+
+    assert "the user corrected this: no — always ask first" in out
+
+
+def test_an_empty_record_says_so_rather_than_going_silent():
+    """"No prior decisions" and "prior decisions I was not shown" must not read alike: a
+    reviewer that cannot tell them apart is right to escalate."""
+    assert autoreview.decision_record(FakeStore(), FakeNeo(), "wo-1", []) == ""
+    assert "(no prior decisions recorded)" in autoreview._ruling_question(   # noqa: SLF001
+        "p", WO, assumption(), [])
+
+
+def test_the_record_is_capped_newest_first_and_says_what_it_dropped():
+    """Test 2. The omission is stated, and LAST (kn-1485b845). Going silent is the
+    failure this whole spec is about."""
+    rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i} " + "x" * 800)
+            for i in range(12)]
+    out = record(*rows)
+
+    assert "ruling 0" in out, "the newest ruling was evicted"
+    assert "ruling 11" not in out
+    last = out.strip().splitlines()[-1]
+    assert "older items omitted" in last and "6000 characters" in last
+
+
+def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
+    """Test 3. Q900 escalated naming a question id it could not see. That row is the one
+    item most likely to be why the packet exists, so the cap does not reach it."""
+    long_answer = "the user said: " + "y" * 3000
+    cited = qrow(id=887, ts=1.0, answer=long_answer)
+    fillers = [qrow(id=900 - i, ts=500.0 - i, answer="z" * 900) for i in range(10)]
+    out = record(*fillers, cited,
+                 siblings=[assumption(content="per Neo question 887, kept the shim")])
+
+    assert long_answer in out, "the cited answer was truncated or evicted"
+    assert out.index("Q887") < out.index("Q900")
+
+
+@pytest.mark.parametrize("cite", ["Neo question 887", "question 887", "Q887", "Neo 887"])
+def test_every_field_spelling_of_a_question_id_is_recognised(cite):
+    out = record(siblings=[assumption(content=f"decided this because {cite} said so")],
+                 others=(qrow(id=887, status="queued", answer=None),))
+
+    assert "Q887 (cited by the assumption; asked on this order, not answered)" in out
+
+
+def test_the_citation_budget_is_spent_on_the_assumption_being_ruled_on_first():
+    """THE BUDGET ORDER, and the case the feature exists for: Q900 cited an id in its OWN
+    text. Five siblings citing five ids between them must not spend the five-citation
+    budget before the row under review gets to name one."""
+    ruling_on = assumption(id=20, n=6, content="per Q906, kept the shim")
+    siblings = [assumption(id=i, n=i, content=f"decided per Q{900 + i}")
+                for i in range(1, 6)] + [ruling_on]
+    out = record(qrow(id=906, answer="the user said: keep the shim"),
+                 siblings=siblings, ruling_on=ruling_on,
+                 others=tuple(qrow(id=900 + i, status="queued", answer=None)
+                              for i in range(1, 6)))
+
+    cited = [line for line in out.splitlines() if "cited by the assumption" in line]
+    assert cited[0].startswith("  Q906 (cited by the assumption)")
+    assert "the user said: keep the shim" in cited[0]
+    # The cut fell on a SIBLING's citation, not on the row being ruled on.
+    assert len(cited) == autoreview._CITED_LIMIT   # noqa: SLF001
+    assert "Q905" not in out
+
+
+def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
+    """Content from a different order has not been through this order's evidence gates,
+    and a worker citing it does not make it this order's record."""
+    out = record(siblings=[assumption(content="as Q887 decided")],
+                 others=(qrow(id=887, wo_id="wo-9", answer="quoted elsewhere"),))
+
+    assert ("Q887 (cited by the assumption; belongs to another work order — not shown)"
+            in out)
+    assert "quoted elsewhere" not in out
+
+
+def test_a_cited_question_that_never_existed_is_stated_not_swallowed():
+    """A worker citing a question id that was never asked is a fact about the assumption
+    the reviewer is ruling on."""
+    out = record(siblings=[assumption(content="as Q887 decided")])
+
+    assert "Q887 (cited by the assumption; no such question)" in out
+
+
+def test_an_assumption_kind_row_is_a_one_liner_and_its_packet_is_never_requoted():
+    """Test 4. An `assumption` question row IS a review packet — description, diff and
+    sibling list. Quoting it is recursive and would spend the whole cap on one item. The
+    RULING is the payload (Q879's missing fact), so it is rendered, naming the sibling."""
+    packet = "ASSUMPTION REVIEW — rule on assumption #4 " + "p" * 5000
+    out = record(qrow(id=879, kind=autoreview.QUESTION_KIND, question=packet,
+                      answer="approve — routine naming"),
+                 siblings=[assumption(), assumption(id=8, n=4, neo_question_id=879)])
+
+    assert "p" * 200 not in out and packet not in out
+    assert "Q879" in out and "assumption #4" in out
+    assert "approve — routine naming" in out
+
+
+def test_an_assumption_kind_row_whose_sibling_is_gone_still_reads_as_a_ruling():
+    """A ruling whose subject cannot be located is still a ruling."""
+    out = record(qrow(id=879, kind=autoreview.QUESTION_KIND, question="x" * 4000,
+                      answer="approve"))
+
+    assert "Q879" in out and "assumption (row not found)" in out
+
+
+def test_a_record_item_carrying_a_credential_is_withheld_not_dropped():
+    """Test 5. The secret net is the ONE net that runs here (§5). It names the SHAPE and
+    never the value, and withholds rather than dropping: silence is the bug."""
+    out = record(qrow(answer='API_KEY = "sk-live-4a9f8c2b7d1e"'))
+
+    assert "sk-live-4a9f8c2b7d1e" not in out
+    assert "Q887 (withheld — carries a line assigning API_KEY)" in out
+
+
+def test_a_high_stakes_wording_in_a_settled_ruling_is_shown_in_full():
+    """§5, on the user's own ruling on Neo question 943: the high-stakes net is NOT
+    applied here. Every item is settled by construction, so there is no decision left to
+    withhold — and hiding a ruling the user already gave is exactly the #832 bug."""
+    out = record(qrow(answered_by="user", answer="yes, delete the production rows"))
+
+    assert "delete the production rows" in out
+    assert "withheld" not in out
+
+
+def test_a_user_message_on_the_order_reaches_the_record():
+    out = record(messages=({"ts": 1727500000.0, "body": "no kill remedy, ever"},))
+
+    assert "user message" in out and "no kill remedy, ever" in out
+
+
+def test_a_sibling_the_user_settled_carries_their_reason():
+    """Test 6. `jarvis wo review --feedback` writes the user's reasoning to
+    `decided_reason` — the `assumptions` table has no `review_feedback` column — with
+    `decided_by` naming who decided."""
+    out = record(siblings=[
+        assumption(),
+        assumption(id=8, n=4, status="rejected", decided_by="",
+                   decided_reason="I want the flag spelled out"),
+    ])
+
+    assert "#4 rejected by the user — I want the flag spelled out" in out
+
+
+def test_a_sibling_neo_settled_is_rendered_as_neos_not_the_users():
+    """Test 6's other half, and Q879's own case: Neo's verdict on a sibling reaches the
+    packet through its ANSWERED QUESTION row, never as a ruling of the user's."""
+    out = record(qrow(id=877, kind=autoreview.QUESTION_KIND, question="packet",
+                      answer="approve — mechanical"),
+                 siblings=[
+                     assumption(),
+                     assumption(id=8, n=4, status="accepted",
+                                decided_by=autoreview.DECIDER,
+                                decided_reason="mechanical naming",
+                                neo_question_id=877),
+                 ])
+
+    assert "by the user" not in out
+    assert "Q877" in out and "answered by neo" in out and "assumption #4" in out
+
+
+RECORD_HEADER = "# What has already been decided on this work order"
+
+
+def test_propose_builds_the_section_with_no_daemon_and_no_model_call():
+    """Test 7. The record is built in `autoreview`, so the daemon changes not at all."""
+    neo_ = FakeNeo(qrow(answered_by="user"))
+
+    autoreview.propose(FakeStore(), neo_, "p", WO, assumption(), [assumption()])
+
+    (packet,) = neo_.asked
+    assert RECORD_HEADER in packet and "Q887" in packet
+    # After the sibling list, before the closing answer instructions.
+    assert packet.index("do not rule on these") < packet.index(RECORD_HEADER)
+    assert packet.index(RECORD_HEADER) < packet.index("Answer with `escalate`")
+
+
+def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
+    """The query, §1. Newest first — unlike `open_questions` — because the caller caps and
+    the newest ruling is the one that supersedes. NO `kind` filter: an `approval` the user
+    answered is exactly the kind of ruling #832 is about."""
+    neo_store = NeoStore()
+    try:
+        first = neo_store.ask("proj_a", "wo-rec", "one")
+        second = neo_store.ask("proj_a", "wo-rec", "two", kind="approval")
+        still_open = neo_store.ask("proj_a", "wo-rec", "three")
+        other = neo_store.ask("proj_a", "wo-elsewhere", "four")
+        for q in (first, second, other):
+            neo_store.record_answer(q["id"], "yes", answered_by="user")
+
+        got = neo_store.answered_questions("wo-rec")
+
+        assert [r["id"] for r in got] == [second["id"], first["id"]]
+        assert still_open["id"] not in [r["id"] for r in got]
+        assert neo_store.answered_questions("wo-rec", limit=1) == got[:1]
+    finally:
+        neo_store.close()
