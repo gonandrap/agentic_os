@@ -3059,12 +3059,12 @@ def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | No
     The sentences are here rather than in the template because both surfaces print them
     (`cli._readable_autoreview`'s rule): a phrase in Jinja could not reach a terminal.
 
-    ONE DEVIATION FROM §2, which says None whenever the status is not `needs_review`: a
-    pending assumption is owed whatever the status — the early pass records them while the
-    worker still runs, and the page has carried the form there since before this projection
-    existed (tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending).
-    The `needs_review` condition is kept for the ESCALATED half, where a later submission
-    can move the status on past an older escalated round.
+    A PENDING ASSUMPTION IS OWED WHATEVER THE STATUS (§2): the early pass records them
+    while the worker still runs, and the page has carried the form there since before this
+    projection existed
+    (tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending). The
+    `needs_review` check gates the ESCALATED half only, because a later submission can move
+    the status on past an older escalated round.
     """
     from .invariants import validation_escalated
 

@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
 PORT = 8809
 
-PR = "https://github.com/gonandrap/agentic_os/pull/817"
+PR = "https://github.com/gonandrap/agentic_os/pull/820"
 REASON = ("the panel asked for a regression test the worker had already argued is "
           "covered by tests/test_daemon.py, and neither moved — the panel and the "
           "worker cannot settle this between them")

@@ -2757,12 +2757,12 @@ def test_the_review_control_renders_once_and_in_the_assumptions_block(client, pr
     assert action in block
     # The line naming the round this one decision now ALSO settles.
     assert "also settles round 1" in " ".join(block.split())
-    assert 'href="#round-1"' in block
 
 
 def test_rejecting_an_escalated_order_records_the_review_and_guides_the_worker(
         client, project):
     wo = _escalate(project)
+    assert wo["needs_attention"]   # the escalation raised it; the review must put it down
 
     res = client.post(f"/wo/proj_a/{wo['id']}/review",
                       data={"decision": "reject", "feedback": "the panel is right"})
@@ -2773,6 +2773,14 @@ def test_rejecting_an_escalated_order_records_the_review_and_guides_the_worker(
         assert store.events_of_kind(wo["id"], "reviewed")
         assert [m["content"] for m in store.list_messages(wo["id"])] \
             == ["the panel is right"]
+        # THE REVIEW TOOK EFFECT, not just the delivery. `ops.review_work_order` leaves a
+        # rejection WITH feedback un-flagged (the guidance is the answer to what flagged
+        # the user), so the escalation's attention flag must be down.
+        after = store.get_work_order(wo["id"])
+        assert not after["needs_attention"]
+        # ...and the status is unchanged by design: `needs_review` is an OPEN status and
+        # the worker resumes when jarvisd delivers the queued message, not in this process.
+        assert after["status"] == "needs_review"
     finally:
         store.close()
 

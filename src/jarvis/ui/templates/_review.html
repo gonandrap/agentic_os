@@ -33,9 +33,12 @@
 </div>
 {# WHAT EACH BUTTON DOES, as text beside it — a `title=` is a thing nobody hovers, and the
    scope of this decision is the fact the reader is most likely to get wrong. #}
+{# NO ANCHOR HERE. The validation section directly below carries `id="round-N"`, and an
+   `href` in this block would resolve to nothing on an order whose hold payload recorded no
+   round — tests/test_assumption_objection_view.py's guard. #}
 <div class="row"><span class="sub">{{ review.scope }}.{% if review.pending
-      and review.round %} It also settles round {{ review.round }}'s escalation —
-  <a href="#round-{{ review.round }}">round {{ review.round }} →</a>{% endif %}</span></div>
+      and review.round %} It also settles round {{ review.round }}'s
+  escalation.{% endif %}</span></div>
 <div class="row"><span class="sub">Accept: {{ review.accept }}</span></div>
 <div class="row"><span class="sub">Send back: {{ review.reject }}
   {{ review.strands }}</span></div>

@@ -70,8 +70,15 @@ pending, and the sentence each button's effect is described by.
 def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
 ```
 
-Returns `None` when no decision is owed — `wo["status"] != "needs_review"`, or neither a
-pending assumption nor an escalated latest round. Otherwise:
+Returns `None` when no decision is owed: neither a pending assumption nor an escalated
+latest round.
+
+**The `needs_review` status check gates the ESCALATED half only.** A pending assumption is
+owed whatever the status — the early pass records assumptions while the worker still runs,
+and the form has rendered on a `pending` order since before this projection existed
+(`tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending`). So
+`escalated = wo["status"] == "needs_review" and validation_escalated(...)`, and `pending`
+stands on its own. Otherwise:
 
 ```python
 {
