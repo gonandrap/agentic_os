@@ -1307,8 +1307,159 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     ])
 
 
+#: How many dropped paths the truncation marker NAMES. The COUNT is always exact — spec
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+CONFIRM_DROPPED_FILES_SHOWN = 10
+
+#: The per-field cuts this question makes, named instead of spelled inline — the limit
+#: discipline of `gates.build_request_question` (spec § 2).
+CONFIRM_DESCRIPTION_CHARS = 2000
+CONFIRM_SUMMARY_CHARS = 1500
+
+#: `supervisor.build_evidence`'s closing sentence, reused verbatim for the same purpose.
+CANNOT_SEE = "Escalate rather than judge on what you cannot see."
+
+#: The two `EvidencePacket.source` values, whose `head` means different things.
+SOURCE_WORKTREE = "worktree"
+SOURCE_PULL_REQUEST = "pull_request"
+
+
+@dataclass(frozen=True)
+class ConfirmEvidence:
+    """The delivered change as ONE confirmation question carries it.
+
+    The packet trimmed to `validation.confirm_diff_chars`, plus what the trim removed:
+    a diff the reviewer is not told was cut is how it confirms a change it never saw.
+
+    `full_chars` is the length of the diff the COLLECTION handed over, and
+    `collect_truncated` says that collection was itself bounded — so the total is not
+    knowable and the marker must not state one (Neo, question 945).
+    """
+
+    stat: str = ""
+    diff: str = ""
+    files: tuple[str, ...] = ()
+    diff_truncated: bool = False
+    dropped_files: tuple[str, ...] = ()
+    pr_url: str = ""
+    source: str = ""
+    head: str = ""
+    full_chars: int = 0
+    collect_truncated: bool = False
+    #: The collection bound, carried so the marker can name it without this module
+    #: holding a number the daemon owns.
+    collect_limit: int = 0
+
+    def what_changed(self) -> str:
+        """The EXACT `# What changed` block `_confirm_question` interpolates.
+
+        ONE renderer, called twice — by the question and by the daemon's
+        `decide_evidence` call — so the text scanned and the text sent cannot drift:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2, every byte that is
+        persisted or sent has been through the net.
+        """
+        return _what_changed(self)
+
+
+def confirm_evidence(packet: Any, assumption: dict[str, Any], limit: int, *,
+                     collect_limit: int = 0) -> ConfirmEvidence:
+    """Trim one collected packet for one assumption. PURE — no git, no store, no model.
+
+    **THE HUNKS THE ASSUMPTION NAMES GO FIRST.** An assumption that mentions a path is
+    confirmed against that path, and spending the budget in diff order drops exactly the
+    file the question is about. Where it names none the collection's order stands.
+
+    `None` is the collector having failed or there being nothing, and it answers an empty
+    instance: AN EMPTY DIFF STILL ASKS (`Daemon._confirmation_evidence`).
+    """
+    from . import evidence
+
+    if packet is None:
+        return ConfirmEvidence(collect_limit=collect_limit)
+    files = tuple(packet.files or ())
+    full = str(packet.diff or "")
+    content = str(assumption.get("content") or "").lower()
+    named: list[str] = []
+    rest: list[str] = []
+    for new, old, text in evidence._sections(full):
+        path = new or old
+        (named if path in files and _names_path(content, path) else rest).append(text)
+    kept, cut, dropped = evidence._truncate(
+        "".join(named + rest) if named else full, limit, files)
+    return ConfirmEvidence(
+        stat=str(packet.stat or ""), diff=kept, files=files,
+        diff_truncated=bool(cut or packet.diff_truncated),
+        dropped_files=tuple(dict.fromkeys(tuple(packet.dropped_files or ())
+                                          + tuple(dropped))),
+        pr_url=str(packet.pr_url or ""), source=str(packet.source or ""),
+        head=str(packet.head or ""), full_chars=len(full),
+        collect_truncated=bool(packet.diff_truncated), collect_limit=collect_limit)
+
+
+def _names_path(content: str, path: str) -> bool:
+    """Does this text name that file — by its full path or by its basename?"""
+    lower = path.lower()
+    return lower in content or lower.rsplit("/", 1)[-1] in content
+
+
+def _truncation_marker(ev: ConfirmEvidence) -> str:
+    """What was cut, in one line: the kept size, the TOTAL, the count and the names."""
+    total = (f"more than {ev.collect_limit:,}" if ev.collect_truncated
+             else f"{ev.full_chars:,}")
+    shown = ev.dropped_files[:CONFIRM_DROPPED_FILES_SHOWN]
+    more = len(ev.dropped_files) - len(shown)
+    named = ", ".join(shown) + (f", and {more} more" if more else "")
+    which = (f"{len(ev.dropped_files)} file(s) not shown: {named}" if shown
+             else "no whole file dropped")
+    return (f"[diff truncated — {len(ev.diff):,} of {total} chars; {which}; "
+            f"full diff: {ev.pr_url or '(no pull request)'}]")
+
+
+def _reference(ev: ConfirmEvidence) -> str:
+    """The reference, which rides truncated or not (Neo, question 753).
+
+    A sha as a sha and a branch as a branch: `head` is a HEAD sha on the worktree path
+    and GitHub's `headRefName` on the pull-request path (evidence.py's field comment).
+    """
+    if ev.head and ev.source == SOURCE_WORKTREE:
+        head = f"head sha: {ev.head}"
+    elif ev.head and ev.source == SOURCE_PULL_REQUEST:
+        head = f"head branch: {ev.head}"
+    else:
+        head = "head: (unknown)"
+    return f"pull request: {ev.pr_url or '(none)'}\n{head}"
+
+
+def _what_changed(ev: ConfirmEvidence) -> str:
+    """The full stat, the full file list, the kept hunks, what was cut, the reference."""
+    from . import provenance
+
+    stat = (provenance.borrowed_block(provenance.Borrowed(
+        label="the `git diff --stat` of the delivered change", whose="git",
+        # FULL: the stat is what a reviewer reads when no hunk survived the budget.
+        text=ev.stat, limit=len(ev.stat))) if ev.stat else "(no files reported)")
+    paths = "\n".join(f"  {f}" for f in ev.files)
+    listing = ("changed files, all of them — this list is never truncated:\n"
+               + provenance.borrowed_block(provenance.Borrowed(
+                   label="the changed-file list of the delivered change", whose="git",
+                   # FULL: evidence.py's rule 3 — `files` is truncated at no limit.
+                   text=paths, limit=len(paths))) if ev.files
+               else "changed files: (none reported)")
+    diff = (provenance.borrowed_block(provenance.Borrowed(
+        label="the delivered diff", whose="the worker of this work order",
+        # Bounded upstream by `confirm_diff_chars` at a FILE BOUNDARY: a blind character
+        # limit here would re-cut it mid-hunk.
+        text=ev.diff, limit=len(ev.diff))) if ev.diff else "(no diff)")
+    parts = ["# What changed", stat, listing, diff]
+    if ev.diff_truncated:
+        parts += [f"{_truncation_marker(ev)}\n{CANNOT_SEE}"]
+    parts.append(_reference(ev))
+    return "\n\n".join(parts)
+
+
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                      siblings: list[dict[str, Any]], stat: str, diff: str) -> str:
+                      siblings: list[dict[str, Any]],
+                      ev: ConfirmEvidence) -> str:
     """What the reviewer reads at DELIVERY. Everything the early pass could not have.
 
     Each block earns its place, and the two new ones are the whole point of the second
@@ -1318,7 +1469,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
       reviewer is being asked to confirm a READING, not to rule from scratch, and one
       formed with no diff in front of it is evidence rather than authority — saying so is
       what stops the earlier line being read as a decision already taken.
-    * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
+    * **the diff stat and the diff** (trimmed by `confirm_evidence` to
+      `validation.confirm_diff_chars`, with a marker naming what was cut),
       and the result summary. This is the fact that did not exist when the assumption was
       an intention, and confirming without it would be the cheap design Neo refused.
       **`decide_evidence` HAS ALREADY PASSED BOTH**, because `neo.ask` persists
@@ -1347,10 +1499,10 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"{assumption.get('provisional_reason') or '(no reason recorded)'}\n"
         f"That reading had NO diff and NO result summary in front of it. You do.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
-        f"{(wo.get('description') or '')[:2000]}",
+        f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         f"# What the worker says it delivered\n"
-        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}",
-        f"# What changed\n{stat or '(no files reported)'}\n\n{diff or '(no diff)'}",
+        f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
+        _what_changed(ev),
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         "You are CONFIRMING that earlier reading against the delivered result. "
@@ -1363,7 +1515,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
 
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
-                         *, stat: str = "", diff: str = "") -> dict[str, Any]:
+                         *,
+                         evidence: ConfirmEvidence | None = None) -> dict[str, Any]:
     """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
 
     `propose`'s mirror, and the differences are the two that matter: the link is
@@ -1381,7 +1534,8 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     (kn-4edb0eb7).
     """
     question = neo.ask(project, wo["id"],
-                       _confirm_question(project, wo, assumption, siblings, stat, diff),
+                       _confirm_question(project, wo, assumption, siblings,
+                                         evidence or ConfirmEvidence()),
                        context=f"{wo.get('title') or ''}\n"
                                f"{(wo.get('description') or '')[:800]}",
                        kind=QUESTION_KIND)

@@ -209,6 +209,14 @@ CACHE_TTL_TICK_OFFSET = 60
 #: rate of a few a day.
 DIGEST_BATCH = 5
 
+#: What `_confirmation_evidence` collects, and it is a MEMORY bound rather than a prompt
+#: budget: this text never reaches a model — `autoreview.confirm_evidence` trims it to
+#: `validation.confirm_diff_chars` per assumption — and it exists only so that trimmer can
+#: state an honest total in its truncation marker, which `EvidencePacket` cannot supply
+#: (it carries `diff_sha`, not a pre-truncation length). Ruled by Neo, question 945 on
+#: wo-604b5b99; spec docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+CONFIRM_COLLECT_CHARS = 1_000_000
+
 #: THE VALIDATION SEAM. A validator is any callable of
 #:
 #:     (ProjectStore, the round row, the evidence packet) -> {
@@ -6009,18 +6017,26 @@ class Daemon:
                 # LAZILY, and once per work order: collecting evidence runs git and may
                 # reach GitHub, and an order whose every row holds must not pay for it.
                 if packet is None:
-                    packet = self._confirmation_evidence(project, wo, cfg)
+                    packet = self._confirmation_evidence(project, wo)
+                # Trimmed PER ASSUMPTION, and the collection above stays one `git diff`:
+                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+                ce = autoreview.confirm_evidence(
+                    packet, a, cfg.confirm_diff_chars,
+                    collect_limit=CONFIRM_COLLECT_CHARS)
                 # THE SECOND GATE, over the EVIDENCE rather than the row, and it runs
-                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea).
+                # before `neo.ask` PERSISTS the diff as a question row (kn-deef42ea). It
+                # reads the TRIMMED text because that is what is persisted and sent, and
+                # the WHOLE rendered block of it: docs/superpowers/specs/
+                # 2026-09-26-bounded-model-inputs.md § 2.
                 evidence_ok = autoreview.decide_evidence(
-                    a, packet[0], packet[1], summary=str(wo.get("result_summary") or ""))
+                    a, ce.stat, ce.what_changed(),
+                    summary=str(wo.get("result_summary") or ""))
                 if not evidence_ok.armed:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
                 autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
-                                                assumptions, stat=packet[0],
-                                                diff=packet[1])
+                                                assumptions, evidence=ce)
                 continue
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
@@ -6177,9 +6193,9 @@ class Daemon:
             "classifier_high": high, "category": verdict.category,
             "reason": verdict.reason, "model": verdict.model, "parsed": verdict.parsed})
 
-    def _confirmation_evidence(self, project: ProjectSpec, wo: dict,
-                               cfg: Any) -> tuple[str, str]:
-        """The diff the confirmation question carries. `(stat, diff)`, never raising.
+    def _confirmation_evidence(self, project: ProjectSpec,
+                               wo: dict) -> "evidence.EvidencePacket | None":
+        """The evidence the confirmation question is built from. The packet, or `None`.
 
         `evidence.collect_work_order` does not raise by contract, and this wraps it
         anyway: one unreadable repository must not cost the work order its pass, and the
@@ -6189,19 +6205,19 @@ class Daemon:
         pass had, and refusing to confirm because git said nothing would leave a settled
         verdict unusable on exactly the orders that are hardest to read.
 
-        `cfg.diff_chars` is the project's resolved validation config — the same value and
-        the same spelling `ops.submit_for_validation` passes.
+        Collected at `CONFIRM_COLLECT_CHARS`, NOT at the panel's `validation.diff_chars`:
+        `autoreview.confirm_evidence` trims this per assumption to
+        `validation.confirm_diff_chars`, and no caller here reads the panel's number.
         """
         from . import evidence
 
         try:
-            packet = evidence.collect_work_order(
-                project.path, wo, declared="", diff_chars=cfg.diff_chars)
-            return str(packet.stat or ""), str(packet.diff or "")
+            return evidence.collect_work_order(
+                project.path, wo, declared="", diff_chars=CONFIRM_COLLECT_CHARS)
         except Exception:  # noqa: BLE001 — an unreadable repo is not a reason to park
             log.exception("[%s] evidence for confirming %s's assumptions failed",
                           project.name, wo["id"])
-            return "", ""
+            return None
 
     def _note_autoreview_held(self, store: ProjectStore, wo_id: str,
                               decision: Any, *, settling: bool = False,
