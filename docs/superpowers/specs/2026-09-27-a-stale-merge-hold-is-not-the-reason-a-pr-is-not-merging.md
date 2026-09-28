@@ -33,10 +33,11 @@ spec closes the automerge hold and one sibling.
 
 Second, load-bearing defect, without which the fix inverts itself: the dedupe key in
 `_note_automerge_held` is `(head_sha, code, reason)` (src/jarvis/daemon.py:5950-5955) with
-no round. Six poll-reachable codes carry reason text with **no round number in it** —
-`HELD_PR_CLOSED` (src/jarvis/automerge.py:289-291), `HELD_NOT_MERGEABLE` (292-294),
-`HELD_CHECKS_NOT_GREEN` (295-297), `HELD_MERGE_STATE_UNCLEAN` (298-302),
-`HELD_ASSUMPTIONS` (237-240), `HELD_PLAN_ASSUMPTIONS` (244-248). At an unmoved head those
+no round. Nine poll-reachable codes carry reason text with **no round number in it** —
+`HELD_PR_CLOSED` (src/jarvis/automerge.py:337-339), `HELD_NOT_MERGEABLE` (341-343),
+`HELD_CHECKS_FAILED` (345-346), `HELD_CHECKS_RUNNING` (348-350), `HELD_CHECKS_NONE`
+(351), `HELD_MERGE_STATE_UNCLEAN` (353-356), `HELD_ASSUMPTIONS` (272-274),
+`HELD_PLAN_ASSUMPTIONS` (279-282), `HELD_BASE_RED` (292-302). At an unmoved head those
 sentences are byte-identical across rounds, so round N+1's hold is deduped away, the
 stored payload still says round N, and a round-based freshness check would declare a
 **true, current** hold stale. This is kn-96f47efb's trap verbatim; `_note_autoreview_held`
@@ -257,10 +258,10 @@ TDD order; all in tests/test_automerge.py unless noted. `uv run pytest tests/ ev
    stored, status `needs_review`; assert `line == "not parked for merge: needs_review"` and
    `state["code"]` is still the stored code (the payload survived the marking).
 3. `test_a_hold_at_the_current_round_on_a_parked_order_is_unchanged` — regression the
-   dedupe fix protects: `HELD_CHECKS_NOT_GREEN` at the latest round, status
+   dedupe fix protects: `HELD_CHECKS_FAILED` at the latest round, status
    `waiting_pr_merge`; assert `"stale" not in state` and `line.startswith("held — ")`.
 4. `test_two_rounds_at_one_head_with_the_same_reason_both_record_a_hold` — poll twice with
-   identical `HELD_CHECKS_NOT_GREEN` reason and head, a new round between; assert
+   identical `HELD_CHECKS_FAILED` reason and head, a new round between; assert
    `len(events_of_kind(wo_id, "automerge_held")) == 2` and the newest payload's `round` is
    the current one.
 5. `test_force_validation_state_keeps_a_fresh_diagnosis_and_offers_none_when_stale` — a

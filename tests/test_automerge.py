@@ -1804,7 +1804,7 @@ def open_round(store, wo_id: str, outcome: str = "") -> int:
 def test_a_hold_from_a_round_a_later_one_overtook_is_not_read_as_live(started, project):
     """A round number is the freshness key: round N's hold says nothing about round N+1."""
     store, wo = arm(started, project, auto_merge=True)
-    a_hold(store, wo["id"], automerge.HELD_CHECKS_NOT_GREEN, round_n=1)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
     later = open_round(store, wo["id"])
 
     state = ops.automerge_state(store, store.get_work_order(wo["id"]))
@@ -1819,13 +1819,13 @@ def test_an_order_awaiting_a_person_shows_no_live_merge_hold(started, project):
     line makes no claim about the merge — and the payload SURVIVES the marking, because
     `ops.force_validation_state` branches on its `code`."""
     store, wo = arm(started, project, auto_merge=True)
-    a_hold(store, wo["id"], automerge.HELD_CHECKS_NOT_GREEN, round_n=1)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
     store.set_status(wo["id"], "needs_review")
 
     state = ops.automerge_state(store, store.get_work_order(wo["id"]))
 
     assert state["line"] == "not parked for merge: needs_review"
-    assert state["code"] == automerge.HELD_CHECKS_NOT_GREEN
+    assert state["code"] == automerge.HELD_CHECKS_RUNNING
     assert state["judged_sha"] == JUDGED and state["round"] == 1
 
 
@@ -1839,14 +1839,14 @@ def test_a_hold_at_the_current_round_on_a_parked_order_is_unchanged(started, pro
 
     state = ops.automerge_state(store, store.get_work_order(wo["id"]))
 
-    assert state["code"] == automerge.HELD_CHECKS_NOT_GREEN
+    assert state["code"] == automerge.HELD_CHECKS_FAILED
     assert "stale" not in state
     assert state["line"].startswith("held — ")
 
 
 def test_two_rounds_at_one_head_with_the_same_reason_both_record_a_hold(
         started, project, fake_gh):
-    """WITHOUT THIS THE READ-SIDE FIX INVERTS ITSELF. Six poll-reachable codes carry no
+    """WITHOUT THIS THE READ-SIDE FIX INVERTS ITSELF. Nine poll-reachable codes carry no
     round number in their reason, so at an unmoved head the sentences are byte-identical
     across rounds: round N+1's hold was deduped away, the stored payload still said N,
     and the freshness check would then call a TRUE hold stale (kn-96f47efb)."""

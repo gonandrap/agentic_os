@@ -6333,7 +6333,7 @@ class Daemon:
 
         **THE ROUND IS PART OF THE KEY**, `_note_autoreview_held`'s medicine for
         `panel_gave_up` (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
-        merging.md §4). Six poll-reachable codes carry no round number in their reason, so
+        merging.md §4). Nine poll-reachable codes carry no round number in their reason, so
         at an unmoved head round N+1's sentence is byte-identical to round N's: without the
         round it writes nothing, the stored payload still says N, and
         `ops._automerge_hold_is_stale` then declares a TRUE hold stale (kn-96f47efb). The
