@@ -1129,9 +1129,10 @@ REMEDIES: dict[str, Remedy] = {
 #: Asserted equal to `tuple(REMEDIES)`. The registry is closed BY A TEST rather than by
 #: a convention, so widening what the OS may do fails a suite and is read by a human.
 #:
-#: NINE, and the spec's §4 table lists TEN: `retry_neo_question` is DROPPED on Neo 908 and
-#: filed as a backlog item instead — a primitive a rule can name must have an act behind
-#: it, and requeuing a failed question has none that does not double-spend an attempt.
+#: NINE, and the spec's §4 table lists TEN: `retry_neo_question` is DROPPED on Neo 908.
+#: `NeoStore` has no `requeue_failed` and adding one is outside this section's two-file
+#: scope, so the primitive is filed on the backlog with `requeue_failed` named as its
+#: prerequisite rather than built here without it.
 SHIPPED_REMEDIES: tuple[str, ...] = ("nudge", "unblock", "file_work_order",
                                      "update_branch", "carry_verdict", "force_rejudge",
                                      "lower_attention", "drop_hold", "raise_attention")

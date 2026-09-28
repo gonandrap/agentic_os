@@ -807,9 +807,12 @@ def test_the_invariant_closes_an_abandoned_proposal_and_leaves_a_live_one_alone(
 # docs/specs/2026-09-27-self-evolution.md §4. The six new primitives each WRAP an
 # existing call rather than reimplementing one, so what is graded here is the seam the
 # rest of the feature stands on — `params` (Neo 904), `can_apply`, and the closed tables
-# that keep both honest — rather than the acts themselves, which are already covered
-# where the calls they wrap are tested (`tests/test_rejudge_moved_head.py` and the
-# catch-up suite).
+# that keep both honest. THE FIVE ACTING HANDLERS ARE TESTED BELOW TOO
+# (`_apply_carry_verdict`, `_apply_update_branch`, `_apply_drop_hold`,
+# `_apply_lower_attention`, `_apply_force_rejudge`): each is a fresh copy of the daemon's
+# own orchestration (review round 1, assumption [4]) and not a thin pass-through to code
+# already covered by `tests/test_rejudge_moved_head.py` or the catch-up suite, so a test
+# that stopped at the seam would leave every one of them unexercised.
 
 PR_URL = "https://github.com/acme/proj/pull/7"
 JUDGED_SHA = "aaaa1111aaaa2222aaaa3333aaaa4444aaaa5555"
@@ -1159,3 +1162,368 @@ def test_importing_remedies_does_not_import_invariants():
     done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
 
     assert done.returncode == 0, done.stderr
+
+
+# -- 7. the five acting handlers themselves ---------------------------------------------
+#
+# Review round 1, assumption [4]: each of these is a fresh copy of the daemon's own
+# orchestration and not a pass-through to code the seam tests above already exercise, so
+# every one is driven through `REMEDIES[id].apply` — never the private `_apply_*` name —
+# so the test goes through the same door a verdict does.
+
+
+def test_carry_verdict_apply_happy_binds_the_round_to_the_moved_head(project,
+                                                                       monkeypatch):
+    """Proofs (a) and (b) both hold: the diff is unchanged and the walked chain's newest
+    commit IS the live head, so `ops.carry_merge_chain` finds facts and writes them."""
+    from jarvis import branchproof, ci, github
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=MOVED_SHA, base_oid=JUDGED_SHA))
+        monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+        monkeypatch.setattr(branchproof, "diff_fingerprint",
+                            lambda repo, base, sha: "same-diff-fingerprint")
+        monkeypatch.setattr(
+            ci, "base_merge_chain",
+            lambda pr_url, judged, head, *, base_ref, cwd=None:
+            ((MOVED_SHA, "cccc1111cccc2222cccc3333cccc4444cccc5555", True),))
+
+        sentence = remedies.REMEDIES["carry_verdict"].apply(
+            store, None, "proj_a", wo, {}, params={})
+
+        row = store.latest_validation_round(wo_id=wo["id"])
+        assert f"round {row['round']}" in sentence
+        assert row["carried_head_sha"] == MOVED_SHA
+    finally:
+        store.close()
+
+
+def test_carry_verdict_apply_refuses_when_the_diffs_differ(project, monkeypatch):
+    """THE CASE THE PANEL CALLED OUT: proof (b) is what decides whether an unjudged
+    commit may reach `main`, and a merge whose resolution touched authored content must
+    refuse even though proof (a)'s chain would otherwise hold."""
+    from jarvis import branchproof, ci, github, ops
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=MOVED_SHA, base_oid=JUDGED_SHA))
+        monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+        fingerprints = iter(["fp-judged", "fp-head"])
+        monkeypatch.setattr(branchproof, "diff_fingerprint",
+                            lambda repo, base, sha: next(fingerprints))
+        monkeypatch.setattr(
+            ci, "base_merge_chain",
+            lambda pr_url, judged, head, *, base_ref, cwd=None:
+            ((MOVED_SHA, "cccc1111cccc2222cccc3333cccc4444cccc5555", True),))
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["carry_verdict"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        events = store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT)
+        assert len(events) == 1
+        assert db.from_json(events[0]["payload"], {})["proof"] == ops.PROOF_PATCH_ID
+        row = store.latest_validation_round(wo_id=wo["id"])
+        assert row["carried_head_sha"] == ""
+    finally:
+        store.close()
+
+
+def test_carry_verdict_apply_refuses_on_an_empty_chain(project, monkeypatch):
+    """`base_merge_chain` found no run of merges connecting `judged` to `head` — proof (a)
+    fails even though the diffs (proof (b)) agree."""
+    from jarvis import branchproof, ci, github, ops
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=MOVED_SHA, base_oid=JUDGED_SHA))
+        monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
+        monkeypatch.setattr(branchproof, "diff_fingerprint",
+                            lambda repo, base, sha: "same-diff-fingerprint")
+        monkeypatch.setattr(
+            ci, "base_merge_chain",
+            lambda pr_url, judged, head, *, base_ref, cwd=None: ())
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["carry_verdict"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        events = store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT)
+        assert len(events) == 1
+        assert db.from_json(events[0]["payload"], {})["proof"] == ops.PROOF_CHAIN
+    finally:
+        store.close()
+
+
+def test_carry_verdict_apply_refuses_when_the_fetch_fails(project, monkeypatch):
+    """A fetch that failed means nothing local is comparable — refused before either
+    proof is even attempted, so neither `diff_fingerprint` nor `base_merge_chain` runs."""
+    from jarvis import branchproof, ci, github, ops
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=MOVED_SHA, base_oid=JUDGED_SHA))
+        monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
+        fingerprint_calls: list[Any] = []
+        chain_calls: list[Any] = []
+        monkeypatch.setattr(branchproof, "diff_fingerprint",
+                            lambda repo, base, sha: fingerprint_calls.append(sha) or "x")
+        monkeypatch.setattr(
+            ci, "base_merge_chain",
+            lambda pr_url, judged, head, *, base_ref, cwd=None:
+            chain_calls.append(1) or ())
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["carry_verdict"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        assert fingerprint_calls == []
+        assert chain_calls == []
+        events = store.events_of_kind(wo["id"], ops.CARRY_REFUSED_EVENT)
+        assert len(events) == 1
+        assert db.from_json(events[0]["payload"], {})["proof"] == ops.PROOF_FETCH
+    finally:
+        store.close()
+
+
+def test_update_branch_apply_refuses_when_the_head_moved_past_the_verdict(project,
+                                                                            monkeypatch):
+    """THE NARROWED WINDOW the handler's docstring names: the head is re-read
+    immediately before the update, and a head the panel never read must not be merged
+    into — so `ci.update_branch` is never reached."""
+    from jarvis import ci, github
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=MOVED_SHA, base_oid="c0c0c0c0"))
+        calls: list[Any] = []
+        monkeypatch.setattr(ci, "update_branch",
+                            lambda pr_url, cwd=None: calls.append(pr_url))
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["update_branch"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        assert calls == []
+    finally:
+        store.close()
+
+
+def test_update_branch_apply_records_the_failure_and_spends_the_attempt(project,
+                                                                           monkeypatch):
+    """GitHub refused the update: the branch is exactly where it was, so this is a
+    refusal rather than a failure — and `record_base_update_failed` marks the attempt
+    spent for THIS base sha (`ops.base_heal_spent`), so it is not retried for ever."""
+    from jarvis import ci, github, invariants, ops
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: github.PullRequest(
+            state="OPEN", base_ref="main", head_oid=JUDGED_SHA, base_oid="c0c0c0c0"))
+
+        def _raise(pr_url, cwd=None):
+            raise github.GitHubError("gh said no", github.GitHubError.REFUSED)
+
+        monkeypatch.setattr(ci, "update_branch", _raise)
+        assert ops.base_heal_spent(store, wo["id"], "c0c0c0c0") is False
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["update_branch"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        events = store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATE_FAILED_EVENT)
+        assert len(events) == 1
+        assert db.from_json(events[0]["payload"], {})["reason"] == \
+            github.GitHubError.REFUSED
+        # `ops.catch_up_attempts` counts only a SUCCESSFUL update (`PR_BASE_UPDATED_EVENT`
+        # with `cause="behind"`), so a refused one does not move it — the bound a refused
+        # attempt actually spends is `base_heal_spent`, keyed on the base sha, which is
+        # what stops the same refusal being retried against the same base for ever.
+        assert ops.base_heal_spent(store, wo["id"], "c0c0c0c0") is True
+    finally:
+        store.close()
+
+
+def test_update_branch_apply_happy_merges_the_base_and_records_the_new_head(project,
+                                                                              monkeypatch):
+    """`gh pr update-branch` succeeded: the record names both the commit that was judged
+    and the one the merge produced."""
+    from jarvis import ci, github, invariants
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        answers = iter([
+            github.PullRequest(state="OPEN", base_ref="main", head_oid=JUDGED_SHA,
+                               base_oid="c0c0c0c0"),
+            github.PullRequest(state="OPEN", base_ref="main", head_oid=MOVED_SHA,
+                               base_oid="c0c0c0c0"),
+        ])
+        monkeypatch.setattr(github, "pr_view", lambda url, cwd=None: next(answers))
+        monkeypatch.setattr(ci, "update_branch", lambda pr_url, cwd=None: None)
+
+        sentence = remedies.REMEDIES["update_branch"].apply(
+            store, None, "proj_a", wo, {}, params={})
+
+        assert JUDGED_SHA[:10] in sentence and MOVED_SHA[:10] in sentence
+        (event,) = store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATED_EVENT)
+        payload = db.from_json(event["payload"], {})
+        assert payload["head_before"] == JUDGED_SHA
+        assert payload["head_after"] == MOVED_SHA
+    finally:
+        store.close()
+
+
+def test_force_rejudge_apply_refuses_with_no_reason_and_calls_nothing(project,
+                                                                        monkeypatch):
+    """The reason is stored ON THE ROUND, so an unreasoned rule row is refused before
+    `ops.force_validation` is ever asked to open one."""
+    from jarvis import ops
+
+    store, wo = _wo(project)
+    calls: list[Any] = []
+    monkeypatch.setattr(ops, "force_validation",
+                        lambda wo_id, *, reason, project_name=None: calls.append(1))
+    try:
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["force_rejudge"].apply(
+                store, None, "proj_a", wo, {}, params={})
+        assert calls == []
+    finally:
+        store.close()
+
+
+def test_force_rejudge_apply_surfaces_ops_error_and_names_the_round_on_success(
+        project, monkeypatch):
+    """`ops.OpsError` becomes `RemedyRefused` carrying its own sentence; a success names
+    the round `ops.force_validation` opened and the reason verbatim."""
+    from jarvis import ops
+
+    store, wo = _wo(project)
+    try:
+        monkeypatch.setattr(
+            ops, "force_validation",
+            lambda wo_id, *, reason, project_name=None:
+            (_ for _ in ()).throw(ops.OpsError("no round budget left")))
+        with pytest.raises(remedies.RemedyRefused) as excinfo:
+            remedies.REMEDIES["force_rejudge"].apply(
+                store, None, "proj_a", wo, {}, params={"reason": "the round recorded no "
+                                                                   "commit"})
+        assert "no round budget left" in str(excinfo.value)
+
+        monkeypatch.setattr(
+            ops, "force_validation",
+            lambda wo_id, *, reason, project_name=None: {"round": 3, "reason": reason})
+        sentence = remedies.REMEDIES["force_rejudge"].apply(
+            store, None, "proj_a", wo, {},
+            params={"reason": "the round recorded no commit"})
+        assert "3" in sentence and "the round recorded no commit" in sentence
+    finally:
+        store.close()
+
+
+def test_lower_attention_apply_happy_clears_a_flag_true_blockers_no_longer_derives(
+        project):
+    """`invariants.true_blockers` re-derives nothing from a bare `pending` work order, so
+    the flag `apply` clears is one the next reconcile tick would have cleared anyway."""
+    from jarvis import invariants
+
+    store, wo = _wo(project)
+    try:
+        store.flag_attention(wo["id"], invariants.AUTH_BLOCKER)
+        remedies.REMEDIES["lower_attention"].apply(
+            store, None, "proj_a", wo, {}, params={})
+        assert not store.get_work_order(wo["id"])["needs_attention"]
+    finally:
+        store.close()
+
+
+def test_lower_attention_apply_re_reads_the_row_and_refuses_on_a_fresh_blocker(project):
+    """THE RE-READ THE DOCSTRING PROMISES: `subject` is captured stale, on purpose,
+    before a pending assumption lands — so a caller passing the row it read at the top of
+    the tick must not have the flag taken down from under a blocker nothing else asks
+    about again."""
+    from jarvis import invariants
+
+    store, wo = _wo(project)
+    try:
+        store.flag_attention(wo["id"], invariants.AUTH_BLOCKER)
+        stale = store.get_work_order(wo["id"])
+        store.add_assumption(wo["id"], "I assumed the base branch is main")
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["lower_attention"].apply(
+                store, None, "proj_a", stale, {}, params={})
+
+        assert store.get_work_order(wo["id"])["needs_attention"]
+    finally:
+        store.close()
+
+
+def test_drop_hold_apply_happy_abandons_the_open_gate_request(project):
+    """Closes the request `expired`/`abandoned` — never a verdict — and the command it
+    named stays blocked, which is the whole point of ending a hold nobody argued."""
+    store, wo = _wo(project)
+    try:
+        approval = store.add_approval(
+            wo["id"], "deploy", "a privileged command a worker proposed",
+            status="awaiting_case")
+        # `add_approval` already writes the paired `gate_requested` event carrying this
+        # approval's id — `_open_gate_episode` reads exactly that event, so nothing
+        # further needs writing here.
+
+        sentence = remedies.REMEDIES["drop_hold"].apply(
+            store, None, "proj_a", wo, {},
+            params={"cause": "gate", "reason": "the recogniser mismatched"})
+
+        closed = store.get_approval(approval["id"])
+        assert closed["status"] == "expired"
+        assert closed["closed_as"] == "abandoned"
+        assert "blocked" in sentence
+    finally:
+        store.close()
+
+
+def test_drop_hold_apply_refuses_a_non_gate_cause_and_writes_nothing(project):
+    """NEO 908: every cause but the gate has no end-it-now call behind it, so the refusal
+    names the cause asked for and touches no row."""
+    store, wo = _wo(project)
+    try:
+        events = len(store.list_events(wo["id"]))
+        with pytest.raises(remedies.RemedyRefused) as excinfo:
+            remedies.REMEDIES["drop_hold"].apply(
+                store, None, "proj_a", wo, {}, params={"cause": "neo", "reason": "x"})
+        assert "neo" in str(excinfo.value)
+        assert len(store.list_events(wo["id"])) == events
+    finally:
+        store.close()
+
+
+def test_drop_hold_apply_refuses_with_no_reason_and_leaves_the_approval_open(project):
+    """The reason is the whole record of why a request nobody decided was closed, so an
+    unreasoned call must not touch the approval at all."""
+    store, wo = _wo(project)
+    try:
+        approval = store.add_approval(
+            wo["id"], "deploy", "a privileged command a worker proposed",
+            status="awaiting_case")
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["drop_hold"].apply(
+                store, None, "proj_a", wo, {}, params={"cause": "gate", "reason": ""})
+
+        assert store.get_approval(approval["id"])["status"] == "awaiting_case"
+    finally:
+        store.close()
