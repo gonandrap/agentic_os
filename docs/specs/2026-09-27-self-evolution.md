@@ -346,8 +346,17 @@ This is the function `jarvis wo fix` will call to resolve a named blocker throug
 instead of through a closed match table (kn-6c252734, kn-85265170). That command's own remedy
 seam is on an unmerged branch (wo-dbea82cf), so the wiring is deliberately NOT in this feature —
 but the function it will call is, built in the shape it needs, with `remedies.REMEDIES` as its
-only source of primitives, and tested here against every seed rule. A lookup API that arrives
-after its caller is a lookup API its caller worked around.
+only source of primitives. A lookup API that arrives after its caller is a lookup API its caller
+worked around, which is why the SHAPE, the return type and the insert-time parameter validation
+are fixed here rather than deferred with the wiring.
+
+**Tested here against the three primitives that already ship** — `nudge`, `unblock`,
+`file_work_order` — or against stubs. NOT against all five seed rules: six of the primitives
+those rules name (`update_branch`, `carry_verdict`, `lower_attention`, `drop_hold`,
+`retry_neo_question`, `raise_attention`) do not exist until §4 lands, and this section has no
+dependency on §4 — the two are built in parallel on purpose, and adding the edge would serialise
+the root of the whole feature. §5.3 owns the resolve proof over all five seed rules, because it
+is the one section that depends on both. (Neo, question 878.)
 
 Its own top-level CLI family, **`jarvis rules`**:
 
@@ -378,14 +387,15 @@ of §1 with their remedy rows — **every one in `dry_run`**, `source="builtin"`
 **It is pure data in a leaf module and it lives HERE, beside the grammar, not beside the
 evaluation pass.** Two reasons. §3.2's acceptance criterion is that all five conditions are
 expressible without extending the grammar, and that is only checkable where the grammar is
-defined. And `rules.resolve` is meant to be tested against real rules rather than three
-hand-built rows, which is the difference between a lookup that works and a lookup that works on
-the example somebody wrote for it.
+defined. And the rows are the CONTRACT every later section reads — §5.3 fires them, §8 joins on
+their `gap_class`, §9 counts them — so they must land before any of those, and this is the only
+section with no dependency on §4.
 
 **What this section asserts and what it does not.** `tests/test_rules.py` asserts every seed
 condition PARSES. It does NOT assert that each `primitive` exists in `remedies.REMEDIES`, nor that
-the parameters satisfy its schema: those primitives are §4's and do not exist yet, and a section
-cannot assert against code that has not landed. §5.3 owns both of those and the firing proof.
+the parameters satisfy its schema, nor that `rules.resolve` returns a `Resolution` for them:
+those primitives are §4's and do not exist yet, and a section cannot assert against code that has
+not landed. §5.3 owns all three of those and the firing proof.
 Neither check is optional; they are simply not in the same place, and each section says so
 because neither worker can see the other.
 
@@ -514,11 +524,14 @@ noise.
 the store fixtures** — which is weaker evidence than a replay, and the pull request must say so
 rather than let a reader assume a replay happened.
 
-This section also owns the assertion §3.5 cannot make: that every seed row's `primitive` is in
-`remedies.REMEDIES` and every parameter set satisfies that primitive's declared schema. §3.5
-checks only that the five CONDITIONS parse, because the primitives it names do not exist until §4
-lands and a section cannot assert against code that is not there yet. Neither check is optional
-and neither is the other's job.
+This section also owns the three assertions §3.5 cannot make: that every seed row's `primitive`
+is in `remedies.REMEDIES`, that every parameter set satisfies that primitive's declared
+`Remedy.params` schema, and that `rules.resolve` returns a `Resolution` for every one of the five
+seed rules. §3.5 checks only that the five CONDITIONS parse, and §3.4 tests `resolve` against the
+primitives that already ship, because the six primitives the seed rules name do not exist until
+§4 lands and a section cannot assert against code that is not there yet. This is the only section
+that depends on both §3 and §4, so it is the only one that can carry these. None of the three is
+optional and none is §3's job. (Neo, question 878.)
 
 ## 6. Arming: a fire becomes an alarm and takes the gate that already exists
 
@@ -795,9 +808,11 @@ the dashboard's existing idiom, and the numbers come from the report.
 - **Rewiring `jarvis wo fix` to resolve through this registry.** Its remedy seam is on an
   unmerged branch (wo-dbea82cf), so the WIRING is a backlog item gated on that merge — not a
   child that waits on a branch, which is how orders get stranded. What is NOT deferred is the
-  handle: §3.4's `rules.resolve` ships here, in the shape that command calls, tested against
-  every seed rule. Both briefs must say the same thing — `remedies.REMEDIES` is the ONE registry
-  and `wo fix` SELECTS from it rather than extending it. (Neo, question 860.)
+  handle: §3.4's `rules.resolve` ships here, in the shape that command calls, with
+  `remedies.REMEDIES` as its source, tested in §3.4 against the primitives that already ship and
+  in §5.3 against all five seed rules. Both briefs must say the same thing — `remedies.REMEDIES`
+  is the ONE registry and `wo fix` SELECTS from it rather than extending it. (Neo, questions 860
+  and 878.)
 - **wo-9f00e3b5's fleet-health trigger.** Its mechanical "not progressing" condition IS a
   detector and should become a seed rule rather than being built twice. Nothing named that exists
   in the tree yet. Note the id collision waiting: `probes.DEFAULT_PROBES` already has
