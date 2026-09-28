@@ -94,6 +94,11 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 #: about a pull request a worker named, and it reaches an API path below.
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
+#: One segment of `owner/repo`, for the two reads that take them apart rather than
+#: through a pull request URL. `github.PR_URL_RE`'s own character class: the source is
+#: `github.origin_repo`, which reads the checkout's remote, and it reaches an API path.
+REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 @dataclass(frozen=True)
 class Run:
@@ -263,6 +268,56 @@ def commit_parents(pr_url: str, sha: str, cwd: Path | None = None) -> tuple[str,
                    "--jq", ".parents[].sha"], cwd=cwd,
                   missing_hint="so Jarvis cannot prove what a branch update merged")
     return tuple(line.strip() for line in stdout.splitlines() if line.strip())
+
+
+def _checked_repo(owner: str, repo: str) -> tuple[str, str]:
+    if not (REPO_SEGMENT_RE.match(owner or "") and REPO_SEGMENT_RE.match(repo or "")):
+        raise GitHubError(f"{owner!r}/{repo!r} is not a repository this may ask about",
+                          GitHubError.URL_REFUSED)
+    return owner, repo
+
+
+def default_branch(owner: str, repo: str, cwd: Path | None = None) -> str:
+    """This repository's default branch name. Raises `GitHubError` on any doubt.
+
+    A PINNED GET rather than a local git read: `origin/HEAD` is written by `git clone` and
+    is absent in worktrees and in repositories initialised in place, so the commonest
+    answer would be "unknown" — the answer that does nothing (spec
+    docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md, §default
+    branch name). The method is the second argument, so `VERBS` needs no new entry.
+    """
+    _checked_repo(owner, repo)
+    stdout = _run(["api", "--method", "GET", f"repos/{owner}/{repo}",
+                   "--jq", ".default_branch"], cwd=cwd,
+                  missing_hint="so Jarvis cannot tell which branch is this project's base")
+    name = (stdout or "").strip()
+    if not BRANCH_RE.match(name):
+        raise GitHubError(f"{name!r} is not a branch name this may ask about",
+                          GitHubError.URL_REFUSED)
+    return name
+
+
+def commit_subject(owner: str, repo: str, sha: str, cwd: Path | None = None) -> str:
+    """The first line of `sha`'s commit message. Raises `GitHubError` on any doubt.
+
+    What attributes a red default branch to a work order: the squash subject carries the
+    pull request's `(#N)`, and the shas cannot be compared — `automerge_merged` records
+    the PULL REQUEST's head while the merge is `--squash` (spec §2).
+    """
+    _checked_repo(owner, repo)
+    if not SHA_RE.match(sha or ""):
+        raise GitHubError(f"{sha!r} is not a commit this may ask about",
+                          GitHubError.URL_REFUSED)
+    stdout = _run(["api", "--method", "GET", f"repos/{owner}/{repo}/commits/{sha}",
+                   "--jq", ".commit.message"], cwd=cwd,
+                  missing_hint="so Jarvis cannot say which work order broke the base")
+    return (stdout or "").strip().splitlines()[0].strip() if (stdout or "").strip() else ""
+
+
+def run_url(owner: str, repo: str, run_id: int) -> str:
+    """Where a person looks at a workflow run. PURE — `gh run list` answers
+    `databaseId` and no URL."""
+    return f"https://github.com/{owner}/{repo}/actions/runs/{int(run_id)}"
 
 
 #: How far back the carry's parentage walk reads, in commits and therefore in API calls.

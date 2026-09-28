@@ -1132,6 +1132,10 @@ def create_app() -> FastAPI:
             # same reason one authority along: None keeps the line off the page for
             # every order the mechanism never looked at.
             auto_review = ops.autoreview_state(store, wo)
+            # WHETHER THIS ORDER OWES THE USER A DECISION, and where the one form goes —
+            # spec 2026-09-27-a-review-control-for-an-escalated-round §2. None keeps every
+            # control off the page, as it keeps the line out of `jarvis wo show`.
+            review = ops.review_state(store, wo)
             # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
             # around a section of the feature's spec now, so a page that showed the brief
             # alone would be a page missing most of the work. `section_text` is NOT passed
@@ -1168,7 +1172,7 @@ def create_app() -> FastAPI:
                       # What was said, and what happened — two readings of one record,
                       # neither derivable from the other. See `timeline`'s docstring.
                       conversation=build_conversation(events, messages),
-                      assumptions=assumptions, unreviewed=unreviewed,
+                      assumptions=assumptions, unreviewed=unreviewed, review=review,
                       approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
 

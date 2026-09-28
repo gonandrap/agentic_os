@@ -340,6 +340,17 @@ class PullRequest:
         return red_checks(self.checks)
 
     @property
+    def unfinished(self) -> tuple[str, ...]:
+        """The checks that have not finished yet, by name. `checks_green`'s third world.
+
+        Here rather than at a caller for `red_checks`' reason: whoever needs to say "2
+        check(s) still running" must not re-derive it over `UNFINISHED_STATUSES` (issue
+        #224 — `automerge.HELD_CHECKS_RUNNING` is the caller).
+        """
+        return tuple(c["name"] or "(unnamed check)" for c in self.checks
+                     if c["status"].upper() in UNFINISHED_STATUSES)
+
+    @property
     def checks_green(self) -> bool:
         """CI positively passed — as opposed to "nothing is currently failing".
 
@@ -352,8 +363,7 @@ class PullRequest:
         A pull request with no checks at all is not green either. It cannot have had a
         red episode to close, so this never has to answer for one.
         """
-        return bool(self.checks) and not self.failing and not any(
-            c["status"].upper() in UNFINISHED_STATUSES for c in self.checks)
+        return bool(self.checks) and not self.failing and not self.unfinished
 
     @property
     def behind(self) -> bool:
