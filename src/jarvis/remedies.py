@@ -625,6 +625,22 @@ def _apply_update_branch(pstore: Any, central: Any, project: str,
     pr_url = str(subject.get("pr_url") or "")
     if not pr_url:
         raise RemedyRefused(f"{wo_id} carries no pull request — nothing was done")
+    # `can_apply` is a PREDICATE and authorises nothing: a grant is REVIEWED and then
+    # APPLIED later, so the state it was reviewed against can have moved on in between —
+    # a worker can have started a turn, a message can have queued, a round can have
+    # opened. Review round 2: the guard that matters is the one taken at the moment of
+    # the act, so `_in_flight` and the `ops.CATCH_UP_MAX` bound are repeated here, not
+    # merely trusted from `_can_update_branch`'s pass before the gate was opened.
+    flight = _in_flight(pstore, wo_id)
+    if flight:
+        raise RemedyRefused(flight)
+    attempts = ops.catch_up_attempts(pstore, wo_id)
+    if attempts >= ops.CATCH_UP_MAX:
+        raise RemedyRefused(
+            f"the OS has already caught {wo_id} up with its base "
+            f"{ops.CATCH_UP_MAX} times, which is the bound `ops.CATCH_UP_MAX` sets — "
+            f"a base moving faster than this one is caught up is a person's problem, "
+            f"not another merge")
     path = Path(str(pstore.project_path))
     try:
         fresh = github.pr_view(pr_url, cwd=path)
@@ -704,6 +720,10 @@ def _apply_carry_verdict(pstore: Any, central: Any, project: str,
     EVERY REFUSAL IS RECORDED WITH THE PROOF THAT FAILED. A bare "not carried" cannot tell
     "someone resolved a conflict" from "GitHub would not answer", and those want opposite
     responses from the reader.
+
+    Review round 2 asked whether this needs `_in_flight`/`ops.CATCH_UP_MAX` repeated at
+    the act too, the way `_apply_update_branch` now does: it does not, because this
+    writes only a validation-round row and never moves a branch's head.
     """
     from . import branchproof, ci, github, ops
     from .project_store import ProjectStore

@@ -98,7 +98,7 @@ def _proposed(started, catalog_file, monkeypatch, tmp_path, token, *allowed):
 # -- 1. the registry is closed ---------------------------------------------------------
 
 
-def test_the_registry_is_closed_and_shipped_with_exactly_three():
+def test_the_first_three_shipped_remedies_are_pinned_by_name_and_order():
     """Adding a remedy must be a test-breaking, reviewed act rather than a prompt edit.
 
     Both directions in one test: an id that is not there raises, an id that is returns
@@ -1386,6 +1386,99 @@ def test_update_branch_apply_happy_merges_the_base_and_records_the_new_head(proj
         store.close()
 
 
+def test_update_branch_apply_refuses_a_queued_message_before_touching_github(project,
+                                                                                monkeypatch):
+    """Review round 2's blocking defect: `apply` only checked the re-read head against
+    the verdict, and never repeated `_in_flight`'s message guard — so a grant approved
+    after a message queued could still move the branch a worker has not seen the message
+    about yet. The guard now runs BEFORE `github.pr_view`, so neither call is reached."""
+    from jarvis import ci, github
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        store.queue_message(wo["id"], "are you there", source="jarvis")
+        pr_view_calls: list[Any] = []
+        update_calls: list[Any] = []
+        monkeypatch.setattr(
+            github, "pr_view",
+            lambda url, cwd=None: pr_view_calls.append(url) or github.PullRequest(
+                state="OPEN", base_ref="main", head_oid=JUDGED_SHA, base_oid="c0c0c0c0"))
+        monkeypatch.setattr(ci, "update_branch",
+                            lambda pr_url, cwd=None: update_calls.append(pr_url))
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["update_branch"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        assert update_calls == []
+        assert pr_view_calls == []
+    finally:
+        store.close()
+
+
+def test_update_branch_apply_refuses_an_open_validation_round_before_touching_github(
+        project, monkeypatch):
+    """The same defect, the round guard: a grant approved before a round opened must not
+    move the head the seats reading it are judging (Neo question 283, review round 2)."""
+    from jarvis import ci, github
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        store.open_validation_round(wo_id=wo["id"], fingerprint="fp-open", round=2)
+        pr_view_calls: list[Any] = []
+        update_calls: list[Any] = []
+        monkeypatch.setattr(
+            github, "pr_view",
+            lambda url, cwd=None: pr_view_calls.append(url) or github.PullRequest(
+                state="OPEN", base_ref="main", head_oid=JUDGED_SHA, base_oid="c0c0c0c0"))
+        monkeypatch.setattr(ci, "update_branch",
+                            lambda pr_url, cwd=None: update_calls.append(pr_url))
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["update_branch"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        assert update_calls == []
+        assert pr_view_calls == []
+    finally:
+        store.close()
+
+
+def test_update_branch_apply_refuses_past_the_catch_up_bound_before_touching_github(
+        project, monkeypatch):
+    """The third guard `_can_update_branch` carries and `apply` did not (review round 2):
+    `ops.CATCH_UP_MAX` recorded catch-ups mean a base moving faster than the OS can keep
+    this branch caught up with is a person's problem, not another merge — checked, again,
+    before any GitHub call."""
+    from jarvis import ci, github, invariants, ops
+
+    store, wo = _wo(project, pr_url=PR_URL, status="waiting_pr_merge")
+    try:
+        _judged(store, wo["id"])
+        for _ in range(ops.CATCH_UP_MAX):
+            store.add_event(wo["id"], invariants.PR_BASE_UPDATED_EVENT,
+                            {"cause": "behind"})
+        pr_view_calls: list[Any] = []
+        update_calls: list[Any] = []
+        monkeypatch.setattr(
+            github, "pr_view",
+            lambda url, cwd=None: pr_view_calls.append(url) or github.PullRequest(
+                state="OPEN", base_ref="main", head_oid=JUDGED_SHA, base_oid="c0c0c0c0"))
+        monkeypatch.setattr(ci, "update_branch",
+                            lambda pr_url, cwd=None: update_calls.append(pr_url))
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["update_branch"].apply(
+                store, None, "proj_a", wo, {}, params={})
+
+        assert update_calls == []
+        assert pr_view_calls == []
+    finally:
+        store.close()
+
+
 def test_force_rejudge_apply_refuses_with_no_reason_and_calls_nothing(project,
                                                                         monkeypatch):
     """The reason is stored ON THE ROUND, so an unreasoned rule row is refused before
@@ -1525,5 +1618,62 @@ def test_drop_hold_apply_refuses_with_no_reason_and_leaves_the_approval_open(pro
                 store, None, "proj_a", wo, {}, params={"cause": "gate", "reason": ""})
 
         assert store.get_approval(approval["id"])["status"] == "awaiting_case"
+    finally:
+        store.close()
+
+
+def test_drop_hold_apply_refuses_with_no_gate_request_open_at_all(project):
+    """The one `drop_hold` apply case not yet covered: `_open_gate_episode` finds nothing
+    because none was ever filed, so this is refused the same as any other unsatisfied
+    precondition — nothing written, no event, no approval touched (there is none)."""
+    store, wo = _wo(project)
+    try:
+        events = len(store.list_events(wo["id"]))
+
+        with pytest.raises(remedies.RemedyRefused) as excinfo:
+            remedies.REMEDIES["drop_hold"].apply(
+                store, None, "proj_a", wo, {},
+                params={"cause": "gate", "reason": "the recogniser mismatched"})
+
+        assert "no gate request" in str(excinfo.value) or "still open" in str(
+            excinfo.value)
+        assert len(store.list_events(wo["id"])) == events
+    finally:
+        store.close()
+
+
+def test_raise_attention_apply_happy_flags_the_invariants_constant_verbatim(project):
+    """`apply` renders through the closed table and writes exactly the `invariants`
+    constant the template names — never a re-spelled copy — so `true_blockers` and this
+    remedy can never read the same blocker as two different sentences."""
+    from jarvis import invariants
+
+    store, wo = _wo(project)
+    try:
+        sentence = remedies.REMEDIES["raise_attention"].apply(
+            store, None, "proj_a", wo, {}, params={"template": "pr_closed"})
+
+        flagged = store.get_work_order(wo["id"])
+        assert flagged["needs_attention"]
+        assert flagged["attention_reason"] == invariants.PR_CLOSED_BLOCKER
+        assert invariants.PR_CLOSED_BLOCKER in sentence
+    finally:
+        store.close()
+
+
+def test_raise_attention_apply_refuses_an_unknown_template_and_writes_nothing(project):
+    """The third of the three doors `test_raise_attention_takes_a_template_key_...`
+    already names: `apply` itself refuses a key outside the closed table, and a refusal
+    at this door must leave the flag exactly where it was."""
+    store, wo = _wo(project)
+    try:
+        before = store.get_work_order(wo["id"])
+
+        with pytest.raises(remedies.RemedyRefused):
+            remedies.REMEDIES["raise_attention"].apply(
+                store, None, "proj_a", wo, {},
+                params={"template": "looks_stuck_to_me"})
+
+        assert store.get_work_order(wo["id"]) == before
     finally:
         store.close()
