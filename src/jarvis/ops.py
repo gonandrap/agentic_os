@@ -38,7 +38,10 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, invariants
+from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
+from .agent_usage import (
+    OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
+)
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import CentralStore
 from .daemon import daemon_running
@@ -49,12 +52,14 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
+    WO_STATUSES,
     ProjectStore,
     feature_status_label,
     is_feature_order_id,
@@ -772,6 +777,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                       issue_url: str | None = None,
                       issue_priority: str | None = None,
                       budget_usd: float | None = None,
+                      observability: str | None = None,
                       metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     """File a work order. `parent_id` files it UNDER a feature order.
 
@@ -820,6 +826,10 @@ def create_work_order(project_name: str, title: str, description: str = "",
             metadata=metadata,
             budget_usd=(budget_usd if budget_usd is not None
                         else budget.default_for(_spec_or_none(project_name))),
+            # Stamped, never resolved against the catalog here: NULL means "this order
+            # has no answer" and the project config is read at write time
+            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
         # which "this order points at that issue" is a fact rather than an inference.
@@ -1443,6 +1453,249 @@ UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a res
 NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
                       "by Claude Code), so the residual is unmeasurable rather than zero")
 
+# -- time in each state -------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md §4. The ONE computation
+# over `wo_state_spans`; every surface renders this payload and derives no duration of its
+# own.
+
+#: How near a timeline event has to sit to a transition to be read as its cause. Spec §4
+#: rule 6: the trigger is derived at READ time, identically for live and backfilled rows,
+#: which is why no `set_status` call site has to be annotated.
+TRIGGER_WINDOW = 120.0
+
+#: `None` and a sentence, never `0` — issue #227's rule, as `NO_TURN_NOTE` above.
+NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
+                    "last activity to date — absent, not zero")
+SETTLED_NOTE = "this order has settled, so it has no current status age"
+FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
+                       "coarse span from its creation")
+#: What a renderer prints for a transition nothing was written about. Never a guess and
+#: never blank (spec §4 rule 6).
+NO_TRIGGER_PHRASE = "cause not recorded"
+
+#: What is NOT activity. `health.observer_kinds()` is imported rather than re-listed for
+#: the reason it exists: an order the supervisor swept would otherwise read as progressing
+#: BECAUSE it was examined. `status` is the thing being measured, so counting it would make
+#: every transition reset the idle clock, and `created` is when the record BEGAN rather than
+#: something that happened to the order.
+def _quiet_kinds() -> tuple[str, ...]:
+    return tuple(sorted({*health.observer_kinds(), "status", "created"}))
+
+
+@dataclass(frozen=True)
+class Span:
+    """One status the order was in, and when. `left is None` means it is in it now."""
+
+    status: str
+    entered: float
+    left: float | None
+    trigger: str                # '' when the record names no cause
+    approximate: bool
+
+    def seconds(self, now: float) -> float:
+        """A backwards clock must not produce a negative span (`holds.Hold.overlap`)."""
+        return max(0.0, (now if self.left is None else self.left) - self.entered)
+
+
+@dataclass(frozen=True)
+class StateDurations:
+    """One order's whole status history. `now` is never baked in; `as_dict` applies it."""
+
+    order_id: str
+    order_kind: str             # 'wo' | 'fo'
+    spans: tuple[Span, ...]     # oldest first
+    current_status: str         # '' for a settled order
+    current_status_since: float | None
+    last_activity_ts: float | None
+    last_activity_kind: str     # the wo_events kind / table that supplied it, '' if none
+    approximate: bool           # any span is
+    notes: tuple[str, ...]
+    #: FO_KINDS, so an improvement order's rows read `analysing` and not `planning`. '' for
+    #: a work order.
+    row_kind: str = ""
+    #: The read moment `state_durations` was given, and the default `as_dict` applies when
+    #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
+    #: are the same document.
+    asof: float = 0.0
+
+    def label(self, status: str) -> str:
+        if self.order_kind == "fo":
+            return feature_status_label(self.row_kind, status)
+        return timeline.STATUS_LABEL.get(status, status)
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = self.asof if now is None else now
+        order = FO_STATUSES if self.order_kind == "fo" else WO_STATUSES
+        end = now
+        if self.spans and self.spans[-1].left is not None:
+            end = self.spans[-1].left
+        lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
+
+        def share(seconds: float) -> float:
+            return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
+                  "left": s.left, "open": s.left is None,
+                  "seconds": round(s.seconds(now), 2),
+                  "seconds_human": ago_phrase(s.seconds(now)),
+                  "share": share(s.seconds(now)), "trigger": s.trigger,
+                  "approximate": s.approximate}
+                 for s in self.spans]
+        totals = []
+        for status in order:
+            mine = [s for s in self.spans if s.status == status]
+            if not mine:
+                continue
+            seconds = round(sum(s.seconds(now) for s in mine), 2)
+            totals.append({"status": status, "label": self.label(status),
+                           "seconds": seconds, "seconds_human": ago_phrase(seconds),
+                           "entries": len(mine), "share": share(seconds)})
+        age = (round(now - self.current_status_since, 2)
+               if self.current_status_since is not None else None)
+        idle = (round(max(0.0, now - self.last_activity_ts), 2)
+                if self.last_activity_ts is not None else None)
+        return {
+            "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
+            "approximate": self.approximate,
+            "lifetime_seconds": round(lifetime, 2),
+            "lifetime_human": ago_phrase(lifetime),
+            "spans": spans, "totals": totals,
+            "current_status": self.current_status,
+            "current_status_since": self.current_status_since,
+            "current_status_age": age,
+            "current_status_age_human": None if age is None else ago_phrase(age),
+            "last_activity_ts": self.last_activity_ts,
+            "last_activity_kind": self.last_activity_kind,
+            "last_activity_age": idle,
+            "last_activity_age_human": None if idle is None else ago_phrase(idle),
+            "notes": list(self.notes),
+        }
+
+
+def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
+    """The kind of the newest quiet-excluded event at `ts <= entered` within the window."""
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    row = store.conn.execute(
+        f"SELECT kind FROM wo_events WHERE wo_id=? AND ts<=? AND ts>=? "
+        f"AND kind NOT IN ({marks}) ORDER BY ts DESC, id DESC LIMIT 1",
+        (wo_id, entered, entered - TRIGGER_WINDOW, *quiet),
+    ).fetchone()
+    return str(row["kind"]) if row else ""
+
+
+def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """Every moment the record says something happened TO one work order. Spec §4.
+
+    All five tables, though every activity class in today's code also writes a `wo_events`
+    row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
+    events-only read is one future writer away from calling a busy order idle.
+    """
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    found: list[tuple[float, str]] = []
+    row = store.conn.execute(
+        f"SELECT kind, ts FROM wo_events WHERE wo_id=? AND kind NOT IN ({marks}) "
+        f"ORDER BY ts DESC, id DESC LIMIT 1", (wo_id, *quiet)).fetchone()
+    if row is not None:
+        found.append((float(row["ts"]), str(row["kind"])))
+    for sql, source in (
+        ("SELECT MAX(started_at), MAX(ended_at) FROM wo_turns WHERE wo_id=?", "wo_turns"),
+        ("SELECT MAX(ts), MAX(delivered_at) FROM wo_messages WHERE wo_id=?",
+         "wo_messages"),
+        ("SELECT MAX(ts) FROM validation_rounds WHERE wo_id=?", "validation_rounds"),
+        ("SELECT MAX(ts), MAX(decided_at) FROM approvals WHERE wo_id=?", "approvals"),
+    ):
+        got = store.conn.execute(sql, (wo_id,)).fetchone()
+        stamps = [float(v) for v in tuple(got or ()) if v is not None]
+        if stamps:
+            found.append((max(stamps), source))
+    return found
+
+
+def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
+    """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
+
+    A FEATURE ORDER'S ACTIVITY IS ITS FAMILY'S — every child, the planner and the manager,
+    not `carrier_for_feature`: picking one carrier would call a feature idle while three of
+    its other children were running. A feature progresses when anything in it does.
+    """
+    if kind == "wo":
+        found = _activity_of(store, order_id)
+    else:
+        family = [c["id"] for c in store.feature_children(order_id)]
+        fo = store.get_feature_order(order_id)
+        if fo.get("plan_wo_id"):
+            family.append(str(fo["plan_wo_id"]))
+        manager = store.manager_work_order(order_id)
+        if manager:
+            family.append(str(manager["id"]))
+        found = [seen for child in family for seen in _activity_of(store, child)]
+        row = store.conn.execute(
+            "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
+        if row and row[0] is not None:
+            found.append((float(row[0]), "validation_rounds"))
+    if not found:
+        return (0.0, "")
+    return max(found, key=lambda seen: seen[0])
+
+
+def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
+                    now: float | None = None) -> StateDurations:
+    """How long this order has been in its status, and how long it spent in each before.
+
+    Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
+    on both or neither. `now` is a parameter because every figure here is a present-tense
+    claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
+    injectable by a test. One indexed read per table, no model, nothing written.
+    """
+    if bool(wo_id) == bool(fo_id):
+        raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    now = time.time() if now is None else now
+    kind = "wo" if wo_id else "fo"
+    order_id = wo_id or fo_id
+    terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
+    row_kind = ""
+    if kind == "fo":
+        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+
+    rows = store.state_spans(order_id)
+    spans: list[Span] = []
+    for i, row in enumerate(rows):
+        entered = float(row["ts"])
+        status = str(row["to_status"])
+        if i + 1 < len(rows):
+            left: float | None = float(rows[i + 1]["ts"])
+        else:
+            # The last span is OPEN unless the order settled there, in which case it
+            # closed at its own moment and there is no open span at all (spec §4 rule 2).
+            left = entered if status in terminal else None
+        trigger = str(row["trigger"] or "")
+        if not trigger and kind == "wo":
+            trigger = _derived_trigger(store, order_id, entered)
+        spans.append(Span(status=status, entered=entered, left=left, trigger=trigger,
+                          approximate=bool(row["approximate"])))
+
+    open_span = spans[-1] if spans and spans[-1].left is None else None
+    activity_ts, activity_kind = _last_activity(store, kind, order_id)
+    approximate = any(s.approximate for s in spans)
+    notes: list[str] = []
+    if approximate:
+        notes.append(FO_APPROXIMATE_NOTE)
+    if not activity_kind:
+        notes.append(NO_ACTIVITY_NOTE)
+    if spans and open_span is None:
+        notes.append(SETTLED_NOTE)
+    return StateDurations(
+        order_id=order_id, order_kind=kind, spans=tuple(spans),
+        current_status=open_span.status if open_span else "",
+        current_status_since=open_span.entered if open_span else None,
+        last_activity_ts=activity_ts if activity_kind else None,
+        last_activity_kind=activity_kind, approximate=approximate,
+        notes=tuple(notes), row_kind=row_kind, asof=now,
+    )
+
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
 #: retried and gave up is today visible only as a cost row, and the whole point of
 #: surfacing it here is that the reader can see it was NEVER REACHED. The wording avoids
@@ -1642,6 +1895,9 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     return out, refusals
 
 
+# Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
+# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+@observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
@@ -2602,6 +2858,42 @@ AUTOMERGE_EVENTS = ("automerge_merged", "automerge_decided", "automerge_proposed
 AUTOMERGE_TERMINAL = "automerge_merged"
 
 
+def merge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the surfaces say about this order's pull request landing, or None.
+
+    `automerge_state`'s shape and its reasons: None — and therefore no line at all — for
+    an order with no pull request and no `pr_merged` event, so an order the mechanism
+    never touched gains nothing. ONE derivation for `jarvis wo show` (`cli.py`) and the
+    dashboard work-order page (`ui/app.py`), because a derivation duplicated across those
+    two files is how they drift (2026-09-25 spec §7).
+
+    **NEVER FROM `pr_state`** (kn-dbc4971d): that column is stale by construction, has one
+    permitted reader, and gains no writer in this change. MERGED comes from the
+    `pr_merged` event — written by `ops.complete_merged` when the merge ended the order and
+    by `Daemon.refresh_landings` when it was observed afterwards — and any other state from
+    the newest `landing_seen`, which is dated and audited.
+
+    An empty `state` means NOTHING HAS LOOKED YET, which `landing` is careful never to read
+    as "did not merge".
+    """
+    from . import db
+
+    pr_url = str(wo.get("pr_url") or "")
+    merged = store.events_of_kind(wo["id"], "pr_merged")
+    if not pr_url and not merged:
+        return None
+    if merged:
+        payload = db.from_json(merged[-1]["payload"], {})
+        return {"pr_url": str(payload.get("pr_url") or pr_url), "state": "MERGED",
+                "head_oid": str(payload.get("head_oid") or ""),
+                "merged_at": payload.get("merged_at"),
+                "source": str(payload.get("source") or "")}
+    seen = store.events_of_kind(wo["id"], "landing_seen")
+    payload = db.from_json(seen[-1]["payload"], {}) if seen else {}
+    return {"pr_url": pr_url, "state": str(payload.get("pr_state") or ""),
+            "head_oid": "", "merged_at": None, "source": ""}
+
+
 def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
     """What `jarvis wo show` and the dashboard say about the automatic merge, or None.
 
@@ -2733,6 +3025,12 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = candidate
     if newest is None:
         return None
+    # An ask is a claim about a question, resolved against `questions.status` for the same
+    # reason (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    if newest["kind"] == "autoreview_asked":
+        gone = _unreachable_asks()(newest.get("neo_question_id"))
+        if gone:
+            newest = {**newest, "unreachable": gone}
     # "left with you" is a claim about the PRESENT: resolve it against the row, once
     # (2026-09-25-a-decided-assumption-is-not-left-with-you.md §1).
     if newest["kind"] in _AUTOREVIEW_OWED_BY_USER:
@@ -2844,6 +3142,58 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str):
     return stale
 
 
+def _unreachable_asks():
+    """`question_id -> {"question_id", "hint"} | None` — the asks whose question is DEAD.
+
+    kn-96f47efb at the read side, and the third instance of it after
+    `_AUTOREVIEW_OWED_BY_USER` and `_stale_panel_hold`: `autoreview_asked` is append-only
+    and immortal, so "awaiting ruling" is a present-tense claim about a row in `neo.db`
+    that has since changed status, and it has to be re-derived rather than believed.
+
+    LAZY, `_stale_panel_hold`'s discipline — an order with no ask pays nothing — and
+    cached per question, so `neo.db` is opened and closed once per link actually asked
+    about (`invariants.awaiting_neo`'s shape, and `ops.delete_work_order`'s precedent for
+    ops reaching into it at all). Best-effort in the same direction: any failure opening or
+    reading it yields None, so the line reads as it does today rather than taking
+    `jarvis wo show` down.
+
+    UNREACHABLE IS `status == 'failed'` AND NOTHING ELSE. `escalated` is Neo handing the
+    question back WITH a decision, and reaches the assumption as an `autoreview_escalated`
+    event; `queued`, `answering` and `answered` are genuinely in flight or already
+    delivered. `failed` on an assumption question has exactly two writers —
+    `neo_store.release_claim` and `neo_store.reclaim_stale` — and both stamp
+    `UNREACHABLE_PREFIX`, which is where the hint comes from. The prefix is stripped: the
+    sentence around it already says Neo could not be reached, and printing it twice reads
+    as a quoted status code.
+    """
+    from .neo_store import UNREACHABLE_PREFIX, NeoStore
+
+    cache: dict[int, dict[str, Any] | None] = {}
+
+    def dead(question_id: Any) -> dict[str, Any] | None:
+        qid = int(question_id or 0)
+        if not qid:
+            return None
+        if qid not in cache:
+            cache[qid] = None
+            try:
+                neo = NeoStore()
+                try:
+                    q = neo.get(qid)
+                finally:
+                    neo.close()
+            except Exception:  # noqa: BLE001 — see docstring: never take a surface down
+                q = None
+            if q and str(q["status"] or "") == "failed":
+                hint = str(q["answer_reason"] or "")
+                if hint.startswith(UNREACHABLE_PREFIX):
+                    hint = hint[len(UNREACHABLE_PREFIX):]
+                cache[qid] = {"question_id": qid, "hint": " ".join(hint.split())[:160]}
+        return cache[qid]
+
+    return dead
+
+
 def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, Any]]:
     """`all_assumptions`, each row carrying what the OS DID with it under `os_ruling`.
 
@@ -2887,6 +3237,17 @@ def assumptions_with_rulings(store: ProjectStore, wo_id: str) -> list[dict[str, 
             if prev is None or ((candidate["ts"], _RULING_RANK[kind])
                                 > (prev["ts"], _RULING_RANK[prev["kind"]])):
                 newest[aid] = candidate
+    # Only the rows whose surviving ruling IS an ask can carry the fact, so only those are
+    # asked about — `_overtaken`'s and `objection_response`'s discipline. One branch covers
+    # both links: `propose_confirmation` writes `autoreview_asked` too, with `confirm`
+    # (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §2).
+    gone = _unreachable_asks()
+    for ruling in newest.values():
+        if ruling["kind"] != "autoreview_asked":
+            continue
+        unreachable = gone(ruling.get("neo_question_id"))
+        if unreachable:
+            ruling["unreachable"] = unreachable
     base = store.all_assumptions(wo_id)
     rows = [{**a, "os_ruling": newest.get(int(a.get("id") or 0)),
              # Both derivations read the carrier and the timeline, so they are asked only
@@ -2914,8 +3275,12 @@ def _overtaken(store: ProjectStore, wo_id: str) -> dict[str, int] | None:
     already landed, else None.
 
     From the TIMELINE, never from `work_orders.pr_state` — kn-dbc4971d, that column is
-    stale by construction. `pr_merged` is written by `complete_merged`, the single
-    close-out for a hand-merge and an auto-merge alike, so one read covers both routes.
+    stale by construction. `pr_merged` has TWO writers since the 2026-09-25 spec §5:
+    `complete_merged`, the close-out for a hand-merge and an auto-merge alike, and
+    `Daemon.refresh_landings`, which records a merge it observed after the order had
+    already settled. Both mean the child's code is on the default branch, which is the
+    only thing counted here, so one read still covers every route — and the second writer
+    ADDS the children that reached `completed` without the merge ending them.
     """
     fo = store.feature_order_for_planner(wo_id)
     if fo is None or fo.get("plan_wo_id") != wo_id:
@@ -3031,6 +3396,17 @@ def assumption_ruling_line(a: dict[str, Any]) -> str:
         held = re.sub(r"^assumption #\d+ ", "", reason)
         return f"Held by the OS — {held}" if held else "Held by the OS"
     if kind == "autoreview_asked":
+        # A dead question is not a ruling on its way — §3 of
+        # 2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md. Neither
+        # "escalated" nor "Neo decided" is sayable here: a crash is not a decision.
+        gone = ruling.get("unreachable") or {}
+        if gone:
+            what = " to confirm its early reading" if ruling.get("confirm") else ""
+            tail = f" — last error: {gone['hint']}" if gone.get("hint") else ""
+            return (f"Neo could not be reached (question {gone['question_id']}) — nobody "
+                    f"judged this{what}; you decide it: `jarvis neo answer "
+                    f"{gone['question_id']} \"…\"` then `jarvis wo review "
+                    f"{a.get('wo_id')}`{tail}")
         return f"Asked Neo (question {question}), awaiting ruling"
     if kind == "autoreview_unconfirmed":
         # The early reading did not survive the diff, so the assumption is the user's and
@@ -3158,6 +3534,14 @@ def _autoreview_line(state: dict[str, Any]) -> str:
         return (f"assumption #{n} left with you — "
                 f"{state.get('reason') or 'no reason recorded'}{since}")
     if kind == "autoreview_asked":
+        # `left with you` deliberately: the same claim as the two `_AUTOREVIEW_OWED_BY_USER`
+        # branches, so it sorts into the same reading (§3). No `resolved_status` suffix —
+        # that resolves an event against a SETTLED row and this branch is only reachable
+        # while the row is pending.
+        gone = state.get("unreachable") or {}
+        if gone:
+            return (f"assumption #{n} left with you — Neo could not be reached "
+                    f"(question {gone['question_id']}); nobody judged it")
         return f"assumption #{n} is with Neo (question {state.get('neo_question_id')})"
     # The early pass's five. Each gets a branch rather than falling through, because the
     # fallthrough below says "held" — a kind with no branch would claim the OS refused to
@@ -3336,7 +3720,8 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
     off the same predicate: see `unlanded_work`.
     """
     wo_id = wo["id"]
-    pr_url = pr_url or wo.get("pr_url") or None
+    pr_url = pr_url or (str(wo.get("pr_url") or "")
+                        if routes_on_pull_request(store, wo) else "") or None
     if not pr_url and not store.work_abandoned(wo_id):
         stranding = unlanded_work(store, wo)
         if stranding.produced:
@@ -3351,6 +3736,55 @@ def land_finished(store: ProjectStore, wo: dict[str, Any],
         finally:
             central.close()
     return status
+
+
+def declared_pull_request(store: ProjectStore, wo: dict[str, Any]) -> str:
+    """The pull request the SUBMITTER declared — the only one that routes the merge queue.
+
+    `work_orders.pr_url` has two sources since issue #742. `ops.finish` writes it from
+    `jarvis wo finish --pr` and records `finished {pr_url}`; `gates._record_pull_request`
+    writes it from an approved merge gate and records `pr_url_recorded {source: "gate"}`,
+    which is the only record a planner's pull request leaves. A gate-derived URL is
+    DELIBERATELY NOT A DECLARATION: it is recorded for every reader (INV-PR-RECORDED, the
+    landing sweep, the CLI and the dashboard) and inert for routing, so a planner whose
+    gate was decided before `ops.submit_plan` settles `completed` rather than parking in
+    `waiting_pr_merge` and opening a validation round over a pull request that has already
+    merged (2026-09-25 spec §3).
+
+    **THIS PREDICATE IS THE ONE LINE TO REVISIT** if another route is ever to reach the
+    merge queue. Nothing else branches on where the column came from, and every router
+    asks `routes_on_pull_request`, which is this read plus the gate-only test.
+
+    It says WHETHER a declaration exists, and the routers still route on the caller's own
+    `pr_url`: `review_work_order` hands its landing a copy with the column deliberately
+    BLANKED once the poll has settled that pull request, and returning a URL out of the
+    timeline there would put a closed pull request back in the merge queue.
+    """
+    for event in reversed(store.events_of_kind(wo["id"], "finished")):
+        declared = str(db.from_json(event["payload"], {}).get("pr_url") or "")
+        if declared:
+            return declared
+    return ""
+
+
+def routes_on_pull_request(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Whether `wo['pr_url']` may move this work order — the merge queue's one test.
+
+    ONE rule, read by `land_finished`, by the reconciler's park and by
+    `Daemon.poll_pull_requests`, because three copies of it is how a gate-recorded URL
+    stayed inert at one site and settled a planner at the others (2026-09-25 spec §4).
+
+    A NEGATIVE test, deliberately: the column routes unless it is GATE-ONLY — a
+    `pr_url_recorded` event with no declaration behind it (`declared_pull_request`). A row
+    carrying a `pr_url` and no event about it at all is a legacy row, and it keeps routing
+    exactly as it did. Requiring a declaration instead would take every record written
+    before issue #742 out of the merge queue.
+    """
+    if not wo.get("pr_url"):
+        return False
+    if not store.events_of_kind(wo["id"], "pr_url_recorded"):
+        return True
+    return bool(declared_pull_request(store, wo))
 
 
 def unlanded_work(store: ProjectStore, wo: dict[str, Any],
@@ -3463,9 +3897,14 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
     ran `jarvis wo ack` over a parked order must not have the flag raised again by the
     next tick; that is the same renotify defect wearing the column instead of the event.
+
+    THE STORE ENFORCES THE NO-DUPLICATE RULE NOW, not this function: `set_status` writes
+    neither a `status` event nor a span row for a move to the status the order is already
+    in (spec 2026-09-27-time-in-each-state §2), so the quiet path asserts the status
+    through the chokepoint like every other caller instead of dodging it.
     """
     if store.work_unlanded_open(wo["id"]):
-        store.update_work_order(wo["id"], status="needs_review")
+        store.set_status(wo["id"], "needs_review", trigger="unlanded_repark")
         return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
@@ -4611,6 +5050,7 @@ def void_round_for_settled_pr(store: ProjectStore, wo: dict[str, Any],
 def complete_merged(store: ProjectStore, wo: dict[str, Any],
                     merged_at: str | None = None,
                     head_oid: str = "",
+                    merge_commit: str = "",
                     automerge: dict[str, Any] | None = None) -> dict[str, Any]:
     """The pull request landed: end the work order, exactly as the user closing it does.
 
@@ -4634,6 +5074,12 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     because a merge whose commit is not written down anywhere is a hole in the record,
     and this is the one path that knows it.
 
+    `merge_commit` is `mergeCommit.oid` — THE COMMIT THIS PULL REQUEST PUT ON `main`,
+    which `head_oid` (the branch tip) is not and cannot be under `--squash`. Recorded
+    here for the same reason and on the same round trip, and read by the release
+    settlement to ask whether a tag contains it
+    (docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md §2).
+
     `automerge` says WHO merged it, which `head_oid` cannot: it is the `pr_merged` rule
     above cutting the other way. A merge the OS performed itself is indistinguishable
     here from one the user performed — the same `gh pr view` reports both — so the ONE
@@ -4651,7 +5097,9 @@ def complete_merged(store: ProjectStore, wo: dict[str, Any],
     store.update_work_order(wo["id"], pr_state="MERGED")
     stopped = close_out(store, wo, "pr_merged", why="pull request merged",
                         payload={"pr_url": wo.get("pr_url"), "merged_at": merged_at,
-                                 **({"head_oid": head_oid} if head_oid else {})})
+                                 **({"head_oid": head_oid} if head_oid else {}),
+                                 **({"merge_commit": merge_commit}
+                                    if merge_commit else {})})
     mark_backlog_done(wo)
     return {"wo_id": wo["id"], "status": "completed", "was": wo["status"],
             "pr_url": wo.get("pr_url"), "merged_at": merged_at,
@@ -5008,7 +5456,41 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
 
 #: The event `carry_validated_head` writes. Not a `PrRepair` and not an automerge event:
 #: it is a fact about a VERDICT, and it belongs beside the round it moved.
+#:
+#: ONE KIND FOR BOTH CARRIES, with a `cause` — `"base_heal"` here, `"base_merge_chain"` in
+#: `carry_merge_chain` — for `ProjectStore.validated_head`'s one-home reason (spec
+#: 2026-09-27 §4, Neo question 791 rejected a second kind).
 HEAD_CARRIED_EVENT = "validation_head_carried"
+
+#: A carry the OS could NOT justify, and the reason the round machine is about to spend a
+#: round. Its own kind because it is the opposite fact, and `proof` says which of the two
+#: independent proofs failed.
+CARRY_REFUSED_EVENT = "validation_carry_refused"
+
+#: `cause` on `HEAD_CARRIED_EVENT`: the OS's own merge-ref rebuild, or a chain of base
+#: merges anybody made.
+CARRY_BASE_HEAL = "base_heal"
+CARRY_BASE_MERGE_CHAIN = "base_merge_chain"
+
+#: `cause` on `PR_BASE_UPDATED_EVENT` / `PR_BASE_UPDATE_FAILED_EVENT`: which of the two
+#: reasons asked the OS to rebuild this merge ref. THE KEY IS SHARED (`base_heal_spent`)
+#: and the reason is not — the bound is about how often one merge ref may be rebuilt, and
+#: the record still has to say why (spec 2026-09-27 §5.3 guard 4).
+BASE_UPDATE_BEHIND = "behind"
+BASE_UPDATE_BASE_RED = "base_red"
+
+#: How many times the OS may catch one pull request up with a MOVING base. The per-base-sha
+#: key cannot bound this on its own: every new commit on `main` is a new key and would earn
+#: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
+CATCH_UP_MAX = 3
+
+#: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
+#: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
+#: not reach GitHub" (spec §4).
+PROOF_CHAIN = "chain"
+PROOF_PATCH_ID = "patch_id"
+PROOF_FETCH = "fetch"
+PROOF_READ = "read"
 
 
 def record_base_health(store: ProjectStore, wo: dict[str, Any], *, red: bool,
@@ -5063,24 +5545,28 @@ def base_heal_spent(store: ProjectStore, wo_id: str, base_sha: str) -> bool:
 
 def record_base_update(store: ProjectStore, wo: dict[str, Any], *, base: str,
                        base_sha: str, head_before: str, head_after: str,
-                       checks: tuple[str, ...]) -> None:
+                       checks: tuple[str, ...], cause: str) -> None:
     """The OS healed this pull request itself. Spec §4: say so, on the record.
 
     `head_before`/`head_after` are not decoration — they are what `carry_validated_head`
     is allowed to rely on afterwards, and what tells a reader six weeks later that the
     commit an automatic merge landed differed from the judged one by a base merge and
     nothing else.
+
+    `cause` is `BASE_UPDATE_BASE_RED` or `BASE_UPDATE_BEHIND` — the two reasons the OS
+    updates a branch, sharing one key and one event kind, distinguishable on the record
+    and countable apart (`catch_up_attempts`).
     """
     from . import invariants as invariants_mod
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
                      "head_before": head_before, "head_after": head_after,
-                     "checks": list(checks)})
+                     "checks": list(checks), "cause": cause})
 
 
 def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: str,
-                              base_sha: str, reason: str) -> None:
+                              base_sha: str, reason: str, cause: str) -> None:
     """GitHub refused the update. Spends the attempt — see `base_heal_spent`.
 
     `reason` is `GitHubError.reason`, this OS's own short phrase, never `str(e)`: that
@@ -5091,7 +5577,99 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATE_FAILED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
-                     "reason": reason})
+                     "reason": reason, "cause": cause})
+
+
+def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
+    """How often the OS has already caught this pull request up with a moving base.
+
+    `CATCH_UP_MAX`'s counter (spec 2026-09-27 §5.3 guard 5), and it counts
+    `cause="behind"` rows only: a red base rebuilt the same merge ref for a different
+    reason, on its own key, and the two bounds must not eat each other's budget.
+    """
+    from . import invariants as invariants_mod
+
+    n = 0
+    for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if payload.get("cause") == BASE_UPDATE_BEHIND:
+            n += 1
+    return n
+
+
+def catch_up_needed(pr: Any, *, repo: Path) -> bool:
+    """Is this pull request behind its base? `.behind` ALONE IS NOT THE QUESTION.
+
+    Spec 2026-09-27 §5.1. `PullRequest.behind` is `mergeStateStatus == "BEHIND"`, and on a
+    repository whose `strict_required_status_checks_policy` is off — this one — a merely
+    behind branch reports CLEAN. Keying the catch-up on it would make the feature a no-op
+    on the fleet's busiest project, silently. So it is a cheap positive short-circuit, and
+    the authoritative test is ancestry: the base's head commit, read from the same
+    `gh pr view` the poll already makes, must be reachable from the pull request's head.
+
+    Asked of the LOCAL checkout (`branchproof.is_ancestor`) after the fetch proof (b)
+    needs anyway. A checkout that cannot answer reads as BEHIND — the caller's seven
+    guards then decide whether to spend an update, and every one of them is bounded.
+    """
+    from . import branchproof
+
+    if getattr(pr, "behind", False):
+        return True
+    base_oid = str(getattr(pr, "base_oid", "") or "")
+    head = str(getattr(pr, "head_oid", "") or "")
+    if not base_oid or not head:
+        return False        # GitHub answered no base commit: nothing to be behind of
+    return not branchproof.is_ancestor(repo, base_oid, head)
+
+
+def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      facts: Callable[[dict], tuple[str, dict] | None]) -> dict | None:
+    """The guard both carries owe and the one write both make. Spec 2026-09-27 §3.1.
+
+    TWO ENTRY POINTS, ONE RULE (review round 1): `carry_validated_head` and
+    `carry_merge_chain` differ only in what they prove, and a second copy of the write is a
+    second place for `validated_head`'s one-home invariant to drift out of. What is shared
+    is exactly this — there must be a latest round, its verdict must be the one on `judged`,
+    the head must have actually moved, and the binding is `carry_round_head` plus ONE
+    `HEAD_CARRIED_EVENT` carrying the round it moved.
+
+    `facts` is the caller's own proof, given the round row so it can name the round in its
+    refusal log; it returns `(reason, payload extras)` or None to refuse. Nothing is written
+    until it holds, so a refusal at either level leaves the record exactly as it was.
+
+    **AND IT PUTS THE FLAG DOWN ITSELF when nothing else is blocking** (spec §6 item 4):
+    the carry made `sha_moved` untrue, and nothing else lowers a stored flag before the
+    order completes on the merge, so without this the user keeps an attention item about a
+    stall that is over. Only when `true_blockers` is EMPTY — another blocker is somebody
+    else's reason and is left exactly as it was — and only while the flag is actually up,
+    which is what makes it idempotent across reconcile ticks and keeps it off the user's
+    acks (kn-089de524).
+    """
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or not judged or not head or head == judged:
+        return None
+    if ProjectStore.validated_head(row) != judged:
+        return None
+    built = facts(row)
+    if built is None:
+        return None
+    reason, extra = built
+    store.carry_round_head(int(row["id"]), head, reason)
+    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
+               "judged_sha": judged, "carried_head_sha": head, "reason": reason, **extra}
+    # AFTER the binding, so `rejudge_exhausted`'s last clause reads the carried head, and
+    # from the live row rather than the caller's snapshot (spec §6 item 4).
+    from . import invariants as invariants_mod
+
+    fresh = store.get_work_order(wo["id"])
+    lowered = bool(fresh["needs_attention"]) and not invariants_mod.true_blockers(
+        store, fresh)
+    if lowered:
+        carried["attention_cleared"] = True
+    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    if lowered:
+        store.clear_attention(wo["id"])
+    return carried
 
 
 def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
@@ -5145,29 +5723,127 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
     merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
     never whether one happens.
     """
-    row = store.latest_validation_round(wo_id=wo["id"])
-    if row is None or not judged or not head_after or head_after == judged:
-        return None
-    if ProjectStore.validated_head(row) != judged:
-        return None
-    if len(parents) != 2 or parents[0] != judged:
-        log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
-                 "of %s with the base", wo["id"], row["round"], head_after[:10],
-                 [p[:10] for p in parents] or "unreadable", judged[:10])
-        return None
-    reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
-              f"failure inherited from a red base — no authored content changed")
-    store.carry_round_head(int(row["id"]), head_after, reason)
-    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
-               "judged_sha": judged, "carried_head_sha": head_after,
-               "base": base, "base_sha": base_sha, "reason": reason,
-               # THE PROOF, not a restatement of the claim: the commit's own parents as
-               # GitHub answered them. `merged_base_sha` is the base commit that
-               # actually went in, which is not necessarily `base_sha` — the base can
-               # move between the CI read and the update.
-               "parents": list(parents), "merged_base_sha": parents[1]}
-    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
-    return carried
+    def facts(row: dict) -> tuple[str, dict] | None:
+        if len(parents) != 2 or parents[0] != judged:
+            log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
+                     "of %s with the base", wo["id"], row["round"], head_after[:10],
+                     [p[:10] for p in parents] or "unreadable", judged[:10])
+            return None
+        return ((f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
+                 f"failure inherited from a red base — no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commit's own parents as
+                # GitHub answered them. `merged_base_sha` is the base commit that
+                # actually went in, which is not necessarily `base_sha` — the base can
+                # move between the CI read and the update.
+                {"cause": CARRY_BASE_HEAL, "base": base, "base_sha": base_sha,
+                 "parents": list(parents), "merged_base_sha": parents[1]})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head_after, facts=facts)
+
+
+def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      chain: tuple[tuple[str, str, bool], ...], base: str, base_sha: str,
+                      fingerprints: tuple[str, str]) -> dict | None:
+    """Bind the panel's verdict to a head that is `judged` plus merges that added nothing.
+
+    docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3. The
+    generalisation of `carry_validated_head` above: the same weakening of "nothing merges a
+    commit no round judged", licensed by the same fact, for a CHAIN of base merges made by
+    anyone rather than one merge the OS made. Every catch-up with `main` is one — and the
+    OS's own gate reviewer demands the catch-up, so charging a round for it is the OS
+    charging for what it asked for.
+
+    **THE FACTS ARRIVE AS ARGUMENTS AND THE POLICY IS HERE.** `chain` is
+    `ci.base_merge_chain`'s proof (a), oldest first, each element `(merge, commit merged
+    in, whether that is a base commit)` — the second kind is a `git pull --no-rebase` merge
+    of the branch's own lineage, which Neo question 806 widened proof (a) to accept because
+    the judged commit already contained it; `fingerprints` is proof (b) —
+    `branchproof.diff_fingerprint` for `judged` and for `head` — and they must be
+    non-empty and EQUAL, which is what excludes an evil merge
+    whose conflict resolution edited the branch's own files. `Daemon._carry_catch_up` does
+    the `gh`/`git` and names the proof that failed; nothing here touches a network, so the
+    rule stays unit-testable exactly as `carry_validated_head` is.
+
+    **IT READS NEITHER `cfg`, `counted_validation_rounds` NOR `rejudged_heads`, and that is
+    a requirement rather than an omission (§6 item 2).** Part 3 of the spec is two live
+    orders stranded with their round budget spent and a decline already written for the
+    very head this would carry; both recover with nothing typed only because no round
+    accounting can reach this function. Enforced structurally — there is no `cfg`
+    parameter — and not by a comment.
+
+    Returns the payload written, or None when the facts do not hold.
+    """
+    before, after = fingerprints
+
+    def facts(_row: dict) -> tuple[str, dict] | None:
+        if not chain or chain[-1][0] != head:
+            return None         # oldest-first: the newest commit walked IS the head
+        if not before or not after or before != after:
+            # Belt to the daemon's braces: a differing diff is authored content, and the
+            # one thing this function may never do is carry a verdict onto it.
+            return None
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        branch = [merged for _sha, merged, is_base in chain if not is_base]
+        # Two sentences and not one, because `merged_base_shas` must not lie: past Neo
+        # question 806 a walked merge may have brought in the branch's own lineage.
+        said = ([f"`{base}` was merged into this branch {len(bases)} time(s)"]
+                if bases else [])
+        if branch:
+            said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
+                        f"already contained")
+        # SAY WHAT IS TRUE, and it is a HASH comparison and not a comparison of the diff
+        # text (review round 1): `branchproof.diff_fingerprint` hashes the diff whitespace
+        # and all, dropping only the line numbers and text blob ids a base merge moves —
+        # a binary file's new-side id stays in (round 3). So "unchanged
+        # down to its whitespace", never "byte-identical" — the bytes of the two diffs do
+        # differ, in exactly the bookkeeping this is licensed to ignore.
+        return ((" and ".join(said) + f", and the pull request's own diff is unchanged "
+                 f"down to its whitespace (diff hash {after[:12]}, line numbers aside) "
+                 f"— no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commits walked and what
+                # each of them merged in, as GitHub answered, plus the id both diffs
+                # produced. A reader six weeks later can re-run either proof from this.
+                {"cause": CARRY_BASE_MERGE_CHAIN,
+                 "chain": [sha for sha, _merged, _base in chain],
+                 "merged_base_shas": bases, "merged_branch_shas": branch,
+                 "base": base, "base_sha": base_sha, "patch_id": after})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head, facts=facts)
+
+
+def carry_refusal_told(store: ProjectStore, wo_id: str, head_sha: str,
+                       proof: str) -> bool:
+    """Has this refusal already been written for this commit? §4's dedupe.
+
+    Keyed on (head, proof) rather than saturating — `rejudged_heads` and `base_heal_spent`'
+    shape and kn-089de524's rule. A parked pull request reaches the carry every two
+    minutes, so an event per tick would bury the record; a key that saturated would hide
+    the refusal on the commit that arrives next.
+    """
+    for row in store.events_of_kind(wo_id, CARRY_REFUSED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if (str(payload.get("head_sha") or "") == head_sha
+                and str(payload.get("proof") or "") == proof):
+            return True
+    return False
+
+
+def record_carry_refusal(store: ProjectStore, wo: dict[str, Any], *, judged: str,
+                         head_sha: str, proof: str, detail: str,
+                         chain: tuple[str, ...] = ()) -> bool:
+    """Say on the record that the verdict was NOT carried, and which proof said so.
+
+    Neo's second condition (§4): a round the OS skipped and a round it spent must both be
+    auditable from `jarvis wo show` alone. Written once per (head, proof), and never for an
+    empty head — an unreadable head is `gh` failing to answer, and keying the dedupe on
+    `""` would swallow the real commit when it arrives (`rejudged_heads`' trap).
+    """
+    if not head_sha or carry_refusal_told(store, wo["id"], head_sha, proof):
+        return False
+    store.add_event(wo["id"], CARRY_REFUSED_EVENT,
+                    {"judged_sha": judged, "head_sha": head_sha, "proof": proof,
+                     "detail": detail, "chain": list(chain)})
+    return True
 
 
 def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
@@ -6377,6 +7053,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
             # carrier: a child's own alarm belongs on the child.
             "alarms": store.alarms_for_feature(fo_id),
+            # How long it has been where it is, on the same always-present rule — the
+            # identical document `jarvis wo show` carries for a work order (spec §6).
+            "time_in_state": state_durations(store, fo_id=fo_id).as_dict(),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -8714,7 +9393,15 @@ def _partition_calls(
 
     os_side, worker_side = [], []
     for g in groups:
-        target = worker_side if agent_usage.is_subprocess(g.get("kind") or "") else os_side
+        kind = g.get("kind") or ""
+        # A METERED LOOK IS NEITHER, and is dropped from both: §10's rows are not `claude`
+        # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
+        # one as an OS call would report two calls where Jarvis made one. Money spent
+        # LOOKING at an order is reported by `bill.py`, in its own class
+        # (docs/specs/2026-09-24-order-observability.md §10).
+        if agent_usage.is_observability(kind):
+            continue
+        target = worker_side if agent_usage.is_subprocess(kind) else os_side
         target.append(g)
     return os_side, worker_side
 
@@ -9246,6 +9933,7 @@ def messaging_config_at(project_path: Path) -> Any:
         return MessagingConfig()
 
 
+@observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
                    join_floor: int | None = None) -> dict[str, Any]:
@@ -9332,6 +10020,46 @@ def inspect_report(target: str, project: str | None = None, *,
             "join_floor": cfg.report_join_floor, "units": units}
 
 
+@observability.metered(OBSERVE_LIVE, target="target", project="project")
+def live_report(target: str, project: str | None = None, *,
+                reader: Any = None, now: float | None = None) -> dict[str, Any]:
+    """What this work order's turn is doing RIGHT NOW — `jarvis watch`'s one entry point.
+
+    THE SINGLE SHIPPED ENTRY POINT, and both renderers consume the payload without
+    reshaping it: a renderer that derives a number is one the other surface will disagree
+    with (PR 65). Returns `live.Live.as_dict()` verbatim.
+
+    A WORK ORDER ONLY. A feature order is not a live turn — it has no session and no
+    clock of its own — so `find_work_order`'s OpsError is the right answer for one, and
+    `inspect_report`'s feature-order-first resolution deliberately is not copied.
+
+    `reader` is the caller's `live.Reader`, reused across frames (Neo q678 (1)): it holds
+    the resolved transcript path and the rows already parsed, which is what makes a
+    two-second refresh cheap. None builds one for this call. Nothing is cached at module
+    level and nothing is persisted.
+    """
+    from . import holds, live
+    from . import worker_session as ws
+
+    name, path, wo = find_work_order(target, project)
+    reader = live.Reader() if reader is None else reader
+    reader.bind(wo.get("session_id") or "")
+    store = ProjectStore(path)
+    try:
+        # The two facts only the record knows, plus the holds — `live` opens no database,
+        # so they are read here and passed in (`inspection.read_session`'s `spans` rule).
+        return reader.snapshot(
+            wo_id=wo["id"], project=name,
+            turn_in_flight=ws.busy(store, wo["id"]) is not None,
+            settled=wo["status"] not in OPEN_STATUSES,
+            now=time.time() if now is None else now,
+            holds=holds.held(store, wo["id"]),
+            write_floor=inspect_config(name).report_write_floor,
+        ).as_dict()
+    finally:
+        store.close()
+
+
 #: The precedence, carried in the PAYLOAD and not only in this file's prose, because the
 #: CLI and the dashboard must both be able to print it: a `prefix-miss` classification is
 #: an observation of what the API was charged for, and a context delta is an explanation
@@ -9354,6 +10082,7 @@ TURN_NOT_RECORDED = ("not recorded for this turn — it ran before the context l
                      "landed, or its measurement failed")
 
 
+@observability.metered(OBSERVE_CONTEXT, target="wo_id", project="project")
 def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
@@ -9958,7 +10687,11 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         central.close()
     out = []
     for row in rows:
-        if agent_usage.is_subprocess(row["kind"]):
+        # Subprocesses go to `_subproc_detail`; §10's metered looks at the order go to the
+        # bill's own class and nowhere else — this table is Jarvis's `claude -p` calls, and
+        # a zero-token row that bought no model call is not one of them.
+        if agent_usage.is_subprocess(row["kind"]) or agent_usage.is_observability(
+                row["kind"]):
             continue
         u = usage_mod.priced(row["model"] or "unknown", input=row["input"],
                              cache_write=row["cache_write"],

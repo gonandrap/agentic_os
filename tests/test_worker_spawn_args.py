@@ -259,3 +259,21 @@ def test_the_prompt_survives_the_bound(tmp_path) -> None:
     argv = turn_argv(prompt=prompt, autocompact_window=150_000,
                      add_dirs=[tmp_path])
     assert commander_positionals(argv) == [prompt], f"argv={argv}"
+
+
+def test_a_stdin_prompt_leaves_neither_the_fence_nor_the_prompt_in_argv() -> None:
+    """With no prompt in argv there is nothing to fence, and a trailing bare `--` is a
+    token every parser of this argv would have to special-case. Spec §3:
+    docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    """
+    args = claude_cli.turn_args("the whole brief", "s-1", resume=False,
+                                prompt_via_stdin=True)
+
+    assert "--" not in args
+    assert "the whole brief" not in args
+    assert commander_positionals(args) == []
+
+
+def test_the_default_still_ends_with_the_fenced_prompt() -> None:
+    args = claude_cli.turn_args("the whole brief", "s-1", resume=False)
+    assert args[-2:] == ["--", "the whole brief"]

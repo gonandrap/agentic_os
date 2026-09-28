@@ -74,6 +74,7 @@ from .project_store import (
     RUNNABLE_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
     UNGOVERNED_ORIGINS,
+    VALIDATION_AUTH_CAUSE,
     VALIDATION_CI_CAUSE,
     VALIDATION_HELD_CAUSE,
     ProjectStore,
@@ -298,6 +299,13 @@ CI_HOLD_RECHECK_SECONDS = 60.0
 #: watching, which is the silent stall `VALIDATION_OUTAGE_LIMIT` exists to prevent one
 #: authority along. Forty-five minutes is CI's ~20-minute suite with room for a queue.
 CI_HOLD_DEADLINE_SECONDS = 45.0 * 60.0
+
+#: How long a round whose seats could not authenticate waits before going again: 1m, 5m,
+#: 15m, then 60m FOR EVER — the last entry is a cap and not a final attempt. What clears
+#: an auth failure is a human running `/login`, which may be thirty seconds or next week
+#: away, so nothing here gives up on a count (spec
+#: docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §4).
+AUTH_HOLD_BACKOFF = (60.0, 300.0, 900.0, 3600.0)
 
 #: Why a round closed with no verdict at all. Deliberately NOT phrased as a rejection:
 #: nothing judged this work, so there is nothing for its author to fix, and the reason
@@ -806,6 +814,10 @@ class Daemon:
                 # Only the OS-owning project does any work here — see `check_cache_ttl`.
                 if scan_cache_ttl:
                     self.check_cache_ttl(project, store)
+                # IMMEDIATELY BEFORE dispatch, not after: `sync_issues` files a release
+                # order late in one tick and this claim takes it early in the next, so a
+                # hold running after dispatch holds nothing on the first opportunity.
+                self.hold_red_release(project, store)
                 self.dispatch_pending(project, store, state)
                 if poll_prs:
                     # BEFORE the pull-request poll, so the same tick's `auto_merge`
@@ -822,6 +834,11 @@ class Daemon:
                     # tracker is the surface a person scans when choosing what to pick
                     # up, and a reference count that lags is one they act on wrongly.
                     self.sync_issue_references(project, store)
+                    # After `sync_issues`, which is what files release orders, and on
+                    # this beat because the merge commit recorded by the poll above is
+                    # the only other thing that changes the answer — the reconcile beat
+                    # would be too slow to save the worker turn this exists to save.
+                    self.settle_shipped_releases(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -1990,6 +2007,13 @@ class Daemon:
                 log.info("[%s] %s: round %d held until the usage window reopens",
                          project.name, wo_id, n)
                 return
+            if isinstance(failure, claude_cli.AuthFailureError):
+                # BEFORE the generic outage below, and Neo's hard condition on question
+                # 723: an auth failure must never consume one of its three attempts.
+                self._validation_auth_held(store, wo, round_id, n, failure.auth)
+                log.info("[%s] %s: round %d held until Claude Code can authenticate",
+                         project.name, wo_id, n)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -2291,6 +2315,46 @@ class Daemon:
                         {"round": n, "cause": VALIDATION_CI_CAUSE,
                          "reopens_at": reopens, "pending": list(pending)})
 
+    @staticmethod
+    def _validation_auth_held(store: ProjectStore, wo: dict, round_id: int, n: int,
+                              auth: claude_cli.AuthFailure) -> None:
+        """Claude Code could not authenticate. WAIT — this costs no outage attempt.
+
+        `_validation_ci_held`'s twin in every mechanical respect, and read that one first:
+        the round is closed `failed` because `failed` is `RUNNABLE` and
+        `counted_validation_rounds` ignores it, so the submitter spends no round number and
+        the next tick owns the same round again. GitHub issue #778: four work orders on
+        2026-09-25/26 were closed `escalated` on the FIRST auth failure of an OAuth refresh
+        race that fixed itself, each spending a round number and a user's attention.
+
+        IT NEVER ESCALATES ON A COUNT. `attempt` is recorded so a reader can see the streak
+        and so the backoff is derivable, and it is compared against nothing —
+        `worker_session.TurnPause.exhausted`'s reasoning one authority along: what clears
+        an auth failure is a human, and a count that gives up turns something a sign-in
+        fixes into a spent round. The 60m cap is what bounds the cost of waiting for ever:
+        one round, four seats, ~1.5s and zero tokens each, once an hour.
+
+        Counted FROM THE EVENTS, like `_validation_outage`, so a daemon restart does not
+        hand the round a fresh schedule. No `not recorded` backstop, for
+        `_validation_ci_held`'s reason: this holds on a moment, so an unwritten event costs
+        one unnecessary retry on the next tick rather than a silent stall.
+        """
+        from .invariants import AUTH_HOLD_NOTE
+
+        wo_id = wo["id"]
+        attempt = 1 + sum(
+            1 for e in store.events_of_kind(wo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        store.add_event(wo_id, "validation_failed",
+                        {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                         "reopens_at": reopens, "attempt": attempt,
+                         "error": auth.message[:500]})
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -2542,6 +2606,13 @@ class Daemon:
                 log.info("[%s] feature %s: round %d held until the window reopens",
                          project.name, fo_id, n)
                 return
+            except claude_cli.AuthFailureError as e:
+                # BEFORE the generic clause — a `ClaudeCliError` subclass, so Python would
+                # never reach it after — and held rather than spent, GitHub issue #778.
+                self._feature_auth_held(store, fo, round_id, n, e.auth)
+                log.info("[%s] feature %s: round %d held until Claude Code can "
+                         "authenticate", project.name, fo_id, n)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -2714,6 +2785,32 @@ class Daemon:
                            "reopens_at": reopens, "error": limit.message[:500],
                            "feature_order": fo_id})
 
+    def _feature_auth_held(self, store: ProjectStore, fo: dict, round_id: int, n: int,
+                           auth: claude_cli.AuthFailure) -> None:
+        """`_validation_auth_held` for a feature round — read that one; this is its twin.
+
+        The only difference is the carrier, the same one `_feature_held` has: these events
+        live on the MANAGER's timeline (`ops.feature_event`), because `wo_events.wo_id` is
+        a foreign key into `work_orders`, and the streak is counted back through
+        `ops.feature_events_of_kind`.
+        """
+        from . import ops
+        from .invariants import AUTH_HOLD_NOTE
+
+        fo_id = fo["id"]
+        attempt = 1 + sum(
+            1 for e in ops.feature_events_of_kind(store, fo_id, "validation_failed")
+            if db.from_json(e["payload"], {}).get("round") == n
+            and db.from_json(e["payload"], {}).get("cause") == VALIDATION_AUTH_CAUSE)
+        reopens = time.time() + AUTH_HOLD_BACKOFF[min(attempt - 1,
+                                                      len(AUTH_HOLD_BACKOFF) - 1)]
+        store.close_validation_round(round_id, "failed", AUTH_HOLD_NOTE,
+                                     hold_cause=VALIDATION_AUTH_CAUSE)
+        ops.feature_event(store, fo_id, "validation_failed",
+                          {"round": n, "cause": VALIDATION_AUTH_CAUSE,
+                           "reopens_at": reopens, "attempt": attempt,
+                           "error": auth.message[:500], "feature_order": fo_id})
+
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
         """The validator could not be reached. A transport failure, NOT a verdict.
@@ -2870,6 +2967,8 @@ class Daemon:
             if stale["requeued"] or stale["failed"]:
                 log.warning("neo reclaimed stranded questions: requeued=%s failed=%s",
                             stale["requeued"], stale["failed"])
+            if stale["failed"]:
+                self._note_stranded_unreachable(store, stale["failed"])
             queued = store.counts().get("queued", 0)
         finally:
             store.close()
@@ -2878,6 +2977,74 @@ class Daemon:
         self.neo_draining = True
         future = self.neo_pool.submit(self._neo_drain)
         future.add_done_callback(lambda f: setattr(self, "neo_draining", False))
+
+    def _note_stranded_unreachable(self, store: Any, failed: list[int]) -> None:
+        """Tell the user about the questions `reclaim_stale` just gave up on (§5).
+
+        One `CentralStore` for the batch, closed in a `finally`, and the guard is PER
+        QUESTION for `auto_review`'s reason — one bad row must never stop the rest, nor
+        cost the tick its drain. No duplicate rows — `reclaim_stale`'s UPDATE matches `status='answering'`,
+        so an id is returned in `failed` exactly once in its life, and the drain path is
+        mutually exclusive with this one by status.
+        """
+        from .neo_store import UNREACHABLE_PREFIX
+
+        central = CentralStore()
+        try:
+            for qid in failed:
+                try:
+                    q = store.get(qid)
+                    if not q:
+                        continue
+                    detail = str(q["answer_reason"] or "")
+                    if detail.startswith(UNREACHABLE_PREFIX):
+                        detail = detail[len(UNREACHABLE_PREFIX):]
+                    self._note_question_unreachable(central, q, detail)
+                except Exception:  # noqa: BLE001
+                    log.exception("could not surface stranded neo question %s", qid)
+        finally:
+            central.close()
+
+    def _note_question_unreachable(self, central: CentralStore, q: dict,
+                                   detail: str) -> None:
+        """Neo's retries are spent. SAY SO — do not dress it as an escalation.
+
+        No per-kind branch, and that is the difference from `_neo_drain`'s `deliver`: there
+        is no verdict to apply, so the gate stays shut, the plan stays unreviewed and the
+        worker is told nothing. The only thing that happens is the user finding out that
+        nobody judged their question.
+
+        ONE METHOD BECAUSE THERE ARE TWO PATHS INTO IT (2026-09-26-an-unreachable-neo-
+        question-is-not-a-question-in-flight.md §5): the drain, where `release_claim`
+        returns `"unreachable"`, and `neo_tick`, where `reclaim_stale` fails a question
+        stranded in `answering` with a bare UPDATE. The second used to be logged and
+        nothing else, so half the unreachable rows reached neither the inbox nor the
+        attention flag. `invariants.neo_question_blocker` writes the reason so
+        `true_blockers` can re-derive it on every tick afterwards (kn-78346a2d).
+        """
+        from . import invariants
+
+        head = q["question"].strip().splitlines()[0][:200]
+        central.add_inbox(
+            project=q["project"], level="warning",
+            title=f"Neo could not be reached for a question from {q['wo_id']}",
+            body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
+                 f"every time it was tried. This is not an escalation: Neo made no "
+                 f"decision.\nLast error: {detail[:200]}\n"
+                 f"Read it and answer it: "
+                 f"{notify.neo_question_url(self.catalog, q['id'])}\n"
+                 f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
+            wo_id=q["wo_id"],
+        )
+        ppath = {p.name: p.path for p in self.catalog.projects}.get(q["project"])
+        if ppath and ppath.is_dir():
+            pstore = ProjectStore(ppath)
+            try:
+                pstore.flag_attention(
+                    q["wo_id"],
+                    invariants.neo_question_blocker({**q, "status": "failed"}))
+            finally:
+                pstore.close()
 
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
@@ -2966,41 +3133,12 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
-        def unreachable(q: dict, detail: str) -> None:
-            """Neo's retries are spent. SAY SO — do not dress it as an escalation.
-
-            No per-kind branch, and that is the difference from `deliver`: there is no
-            verdict to apply, so the gate stays shut, the plan stays unreviewed and the
-            worker is told nothing. The only thing that happens is the user finding out
-            that nobody judged their question.
-            """
-            head = q["question"].strip().splitlines()[0][:200]
-            central.add_inbox(
-                project=q["project"], level="warning",
-                title=f"Neo could not be reached for a question from {q['wo_id']}",
-                body=f"Q: {head}\nNOBODY HAS JUDGED THIS — Neo's model call failed "
-                     f"every time it was tried. This is not an escalation: Neo made no "
-                     f"decision.\nLast error: {detail[:200]}\n"
-                     f"Read it and answer it: "
-                     f"{notify.neo_question_url(self.catalog, q['id'])}\n"
-                     f"Or from a terminal: jarvis neo answer {q['id']} \"...\"",
-                wo_id=q["wo_id"],
-            )
-            ppath = paths.get(q["project"])
-            if ppath and ppath.is_dir():
-                pstore = ProjectStore(ppath)
-                try:
-                    pstore.flag_attention(
-                        q["wo_id"],
-                        invariants.neo_question_blocker({**q, "status": "failed"}))
-                finally:
-                    pstore.close()
-
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
-                unreachable=unreachable,
+                unreachable=lambda q, detail: self._note_question_unreachable(
+                    central, q, detail),
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -4216,6 +4354,8 @@ class Daemon:
         if store.queued_messages(wo["id"]):
             return  # the next turn goes out this tick; nothing has settled yet
         fresh = store.get_work_order(wo["id"])
+        from . import ops as ops_mod
+
         # THE LANDING THE ROUND MACHINE DEFERRED, taken explicitly rather than left to
         # the coincidence that the branches below usually reach the same status: they
         # re-derive the join from the TURN, skipping the two rules only
@@ -4224,8 +4364,6 @@ class Daemon:
         # of docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
         deferred = _landing_deferred(store, wo["id"]) if round_open == "passed" else None
         if deferred is not None:
-            from . import ops as ops_mod
-
             ops_mod.land_when_cleared(store, fresh)
             store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
@@ -4234,7 +4372,7 @@ class Daemon:
                 if fresh["status"] != "needs_review":
                     store.set_status(wo["id"], "needs_review")
                     store.flag_attention(wo["id"], "assumptions pending review")
-            elif fresh.get("pr_url"):
+            elif ops_mod.routes_on_pull_request(store, fresh):
                 # Finished behind a pull request: it is the user's merge that ends this
                 # work order, not the worker's last turn. Settling it to `completed`
                 # here would take it off the open list before anyone had merged it.
@@ -4248,7 +4386,9 @@ class Daemon:
                 # question 275). The flag comes back on its own once the status does —
                 # INV-ATTENTION-MISSING re-derives it — so nothing has to be remembered
                 # beyond the status itself.
-                from . import ops as ops_mod
+                #
+                # A GATE-RECORDED URL IS NOT ONE OF THESE, and that exclusion is the
+                # predicate's, not this branch's: 2026-09-25 spec §4.
 
                 # `resumed_from` is the same rule as `pr_repair_origin` for the other
                 # way the OS takes a work order out of its status (issue #259): a
@@ -4278,8 +4418,7 @@ class Daemon:
                 # and no `pr_url` — used to be the one route to `completed` that walked
                 # past it. It also unparks: `park_unlanded` leaves `needs_review` behind,
                 # and this ran a tick later and completed the order it had just held.
-                from . import ops as ops_mod
-
+                # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
         elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
@@ -4645,14 +4784,28 @@ class Daemon:
         attention list; it does not mean the record may go on saying something untrue.
 
         The step is skipped whole when nothing is parked — one indexed query — so a
-        fleet with no open pull requests never spawns a subprocess for this.
+        fleet with no open pull requests never spawns a subprocess for this. One further
+        statement per STEP excludes the gate-only columns (2026-09-25 spec §4), and it is
+        per step and not per pull request on purpose: see below.
         """
-        parked = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
-                                                      include_hidden=True)
-                  if wo.get("pr_url")]
-        if not parked:
+        candidates = [wo for wo in store.list_work_orders(statuses=PR_POLL_STATUSES,
+                                                          include_hidden=True)
+                      if wo.get("pr_url")]
+        if not candidates:
             return
         from . import github, ops
+
+        # GATE-ONLY COLUMNS OUT, AND FOR ONE STATEMENT PER STEP. A URL a merge gate
+        # recorded routes nothing (2026-09-25 spec §4): polling one would see MERGED and
+        # `complete_merged` would close out a planner that never submitted its plan. The
+        # bulk read is what keeps the budget above per-pull-request — `pr_url_recorded` is
+        # rare, so `routes_on_pull_request` is asked only about the ids it names.
+        recorded = store.work_orders_with_event("pr_url_recorded",
+                                                [wo["id"] for wo in candidates])
+        parked = [wo for wo in candidates
+                  if wo["id"] not in recorded or ops.routes_on_pull_request(store, wo)]
+        if not parked:
+            return
 
         # THE BASE'S CI, READ ONCE PER PROJECT PER TICK AND LAZILY — `heal_inherited_
         # failure` fills this only when some pull request is actually failing, so a
@@ -4697,7 +4850,8 @@ class Daemon:
                     log.info("[%s] %s merged — completing %s", project.name,
                              wo["pr_url"], wo["id"])
                     ops.complete_merged(store, wo, merged_at=pr.merged_at,
-                                        head_oid=pr.head_oid)
+                                        head_oid=pr.head_oid,
+                                        merge_commit=pr.merge_commit_oid)
                 elif pr.closed_unmerged:
                     # ONCE PER CLOSURE. Before the poll widened, `record_pr_closed` moved
                     # the work order to `needs_review` and out of the polled set, so
@@ -4873,6 +5027,14 @@ class Daemon:
                 continue
             found = landing.judge(wo_id, str(wo["pr_url"]), pr.state)
             store.add_event(wo_id, "landing_seen", found.record())
+            # THE MERGE ITSELF, as an event and never as `pr_state` — kn-dbc4971d keeps
+            # that column's two writers, and `ops.complete_merged` would `close_out` an
+            # order that is already `completed`. Once only: two events are two merge lines
+            # on every surface. 2026-09-25-a-gate-records-the-pull-request.md §5.
+            if pr.state == "MERGED" and not store.events_of_kind(wo_id, "pr_merged"):
+                store.add_event(wo_id, "pr_merged", {
+                    "pr_url": str(wo["pr_url"]), "head_oid": pr.head_oid,
+                    "merged_at": pr.merged_at, "source": "landing_sweep"})
             log.debug("[%s] %s: %s", project.name, wo_id, found.detail)
 
     def _needs_landing_refresh(self, store: ProjectStore, wo_id: str) -> bool:
@@ -4973,19 +5135,50 @@ class Daemon:
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
             base_red=base_red)
         if not decision.armed:
-            self._note_automerge_held(store, wo_id, decision)
+            # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec
+            # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md
+            # §3.5). BEFORE the hold, so a carry that succeeds leaves no `automerge_held`
+            # event describing a stall that lasted microseconds, and before the re-judge,
+            # so the round machine never sees a head that moved for a reason no seat needs
+            # to read. A refused carry falls through to both, untouched.
             if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and automerge.only_the_head_moved(
-                        round_row, wo, pr, cfg, pending_assumptions=pending,
-                        plan_assumptions=plan_assumptions)):
-                self._rejudge_moved_head(project, store, wo, decision)
-            return
+                    and self._carry_catch_up(project, store, wo, pr, decision)):
+                round_row = store.latest_validation_round(wo_id=wo_id)
+                decision = automerge.decide(
+                    round_row, wo, pr, cfg,
+                    validated_head=store.validated_head(round_row),
+                    pending_assumptions=pending, plan_assumptions=plan_assumptions)
+            if not decision.armed:
+                self._note_automerge_held(store, wo_id, decision)
+                if (not record_only
+                        and decision.code == automerge.HELD_MERGE_STATE_UNCLEAN
+                        and str(getattr(pr, "merge_state", "") or "").upper() == "BEHIND"):
+                    # GitHub said BEHIND outright — the rarer half of §5.1, and the only
+                    # one `decide` can see. The commoner one reports CLEAN and is caught
+                    # on the armed path below, by ancestry.
+                    self._catch_up_with_base(project, store, wo, pr)
+                    return
+                if (not record_only and decision.code == automerge.HELD_SHA_MOVED
+                        and automerge.only_the_head_moved(
+                            round_row, wo, pr, cfg, pending_assumptions=pending,
+                            plan_assumptions=plan_assumptions)):
+                    self._rejudge_moved_head(project, store, wo, decision)
+                return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
 
         approval = store.latest_approval_for(
             wo_id, automerge.GATE_KIND,
             automerge.merge_command(str(wo.get("pr_url") or ""), decision.judged_sha))
+        if approval is None:
+            # BEFORE A GRANT EXISTS AND NEVER AFTER ONE (spec 2026-09-27 §5.2). The gate
+            # command string carries the judged sha, so catching the branch up behind a
+            # live grant would orphan a permission Neo already gave and silently ask for
+            # another. A head the OS moved is not decided on this tick: the next one
+            # re-reads it, waits out its CI and carries the verdict across (§3).
+            caught_up = self._catch_up_with_base(project, store, wo, pr)
+            if caught_up.head_oid != pr.head_oid:
+                return
         if approval is not None and approval["status"] != "approved":
             # Filed and not granted: pending with Neo, escalated to the user, denied,
             # expired. Every one of those is somebody's business and none of them is
@@ -5268,6 +5461,32 @@ class Daemon:
             "reason": OBJECTION_WITHDRAWN_REASON,
             "envelope_id": assumption.get("objection_envelope_id")})
 
+    def _unreachable_question_ids(self, neo_store: Any,
+                                  assumptions: list[dict]) -> set[int]:
+        """The links among these rows that point at a question NOBODY WILL EVER ANSWER.
+
+        `status == 'failed'` and nothing else: the ladder is spent, so the hold the pointer
+        buys in `autoreview.decide` condition 6 — and in `decide_confirm`'s own column —
+        would otherwise last the life of the work order
+        (2026-09-26-an-unreachable-neo-question-is-not-a-question-in-flight.md §4).
+
+        ONE READ PER LINK PER TICK, beside the other facts about the ORDER above, and on
+        the handle `auto_review` already opened on this thread — so it costs no connection
+        and nothing at all on an order nobody has asked about. Derived here rather than in
+        `autoreview`, which is pure by contract; `ops._unreachable_asks` is the read-side
+        twin for the surfaces.
+        """
+        dead: set[int] = set()
+        for a in assumptions:
+            for column in ("neo_question_id", "confirm_question_id"):
+                qid = int(a.get(column) or 0)
+                if not qid or qid in dead:
+                    continue
+                q = neo_store.get(qid)
+                if q and str(q["status"] or "") == "failed":
+                    dead.add(qid)
+        return dead
+
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
                                assumptions: list[dict], *, early: bool = False) -> None:
@@ -5300,6 +5519,7 @@ class Daemon:
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
         objecting = bool(store.outstanding_objections(wo["id"]))
+        dead_questions = self._unreachable_question_ids(neo_store, assumptions)
         packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
@@ -5311,7 +5531,8 @@ class Daemon:
                     return autoreview.decide_confirm(
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
                         round_reason=round_reason, refusal_answered=answered,
-                        objections_outstanding=objecting, stakes=stakes_verdict)
+                        objections_outstanding=objecting,
+                        unreachable_question_ids=dead_questions, stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -5338,7 +5559,9 @@ class Daemon:
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
-                            refusal_answered=answered, stakes=stakes_verdict)
+                            refusal_answered=answered,
+                            unreachable_question_ids=dead_questions,
+                            stakes=stakes_verdict)
 
             decision = self._stakes_reviewed(project, store, wo, cfg, a, judge(), judge)
             if not decision.armed:
@@ -5412,9 +5635,9 @@ class Daemon:
 
         SS3.3 and SS3.8. The transport is `neo.answer_question`'s, verbatim in its two
         non-obvious arguments: the neutral cwd, so the project's `CLAUDE.md` is not pulled
-        into a prompt that is supposed to carry one sentence, and `attribute=False`
-        because this call records itself and leaving the transport's attribution on would
-        double-count it.
+        into a prompt that is supposed to carry one sentence, and
+        `records_itself="stakes_classifier"` because this call records itself and the
+        transport's attribution would double-count it.
 
         ONE `agent_calls` ROW PER CALL, and a FAILED call still writes one with `ok=False`
         — `add_agent_call`'s own rule: a None-usage row says a call was made and cost
@@ -5436,7 +5659,7 @@ class Daemon:
             result = call(stakes.question(str(a.get("content") or "")),
                           system_prompt=stakes.PERSONA, model=stakes.MODEL,
                           timeout=stakes.TIMEOUT, cwd=ensure_home(), tools="",
-                          attribute=False)
+                          records_itself="stakes_classifier")
         except Exception:  # noqa: BLE001 — an unreachable classifier holds, never raises
             log.exception("[%s] stakes classifier for %s failed", project.name,
                           wo.get("id"))
@@ -5829,6 +6052,188 @@ class Daemon:
                  assumption.get("n"), wo["id"],
                  "accept" if ruling.accept else "object", ruling.reason)
 
+    def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                        pr: Any, decision: Any) -> bool:
+        """Prove this head added no unjudged commit, and carry the verdict onto it.
+
+        docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
+        True when the verdict now covers the live head, so the caller may re-decide on the
+        same tick. False is the ordinary answer and writes nothing but the refusal.
+
+        `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
+        rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
+        own job — `proof` is the difference between "someone resolved a conflict" and "the
+        daemon could not reach GitHub", and no reader can recover it from a bare None.
+
+        **The fetch comes first because both proofs need it**, and a failed one refuses:
+        proof (a)'s ancestry test reads `origin/{base}` out of this checkout. §3.4 on why
+        every failure here deserves the round that follows — a differing diff means the
+        bytes this pull request contributes are not the bytes the panel read, and on the
+        commonest cause (a worker resolving a conflict) that difference is authored content
+        nobody has judged.
+
+        **Deliberately NOT guarded by `automerge.only_the_head_moved`**, which the re-judge
+        below does require: CI on a freshly caught-up head is usually still running, and
+        waiting for it would defer the carry into exactly the window where a round gets
+        spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
+        """
+        from . import branchproof, ci, github, ops
+
+        judged = str(getattr(decision, "judged_sha", "") or "")
+        head = str(getattr(decision, "head_sha", "") or "")
+        base = str(getattr(pr, "base_ref", "") or "")
+        pr_url = str(wo.get("pr_url") or "")
+        if not judged or not head or head == judged or not base or not pr_url:
+            return False
+
+        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+            if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
+                                        proof=proof, detail=detail, chain=chain):
+                log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
+                         wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
+            return False
+
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            return refuse(ops.PROOF_FETCH,
+                          f"`git fetch origin {base} {pull_ref}` failed, so the pull "
+                          f"request's own diff cannot be compared locally")
+        before = branchproof.diff_fingerprint(project.path, base, judged)
+        after = branchproof.diff_fingerprint(project.path, base, head)
+        if not before or not after:
+            return refuse(ops.PROOF_FETCH,
+                          "the diff this branch adds on top of its merge base could not "
+                          "be computed locally")
+        if before != after:
+            return refuse(ops.PROOF_PATCH_ID,
+                          f"the diff on {head[:10]} is not the diff round "
+                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                          f"content nobody judged")
+        try:
+            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                        cwd=project.path)
+        except github.GitHubError as exc:
+            return refuse(ops.PROOF_READ,
+                          f"GitHub would not say what {head[:10]} merged ({exc})")
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return False
+        if not chain:
+            return refuse(ops.PROOF_CHAIN,
+                          f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
+                          f"of commits {judged[:10]} already contained")
+        # The NEWEST BASE commit walked, and `""` when none was: past Neo question 806 a
+        # walked merge may have brought in the branch's own lineage (§3.2 item 6).
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        carried = ops.carry_merge_chain(
+            store, wo, judged=judged, head=head, chain=chain, base=base,
+            base_sha=bases[-1] if bases else "", fingerprints=(before, after))
+        if carried is None:
+            return refuse(ops.PROOF_CHAIN,
+                          "the round this would have been carried from is no longer the "
+                          "verdict on the judged commit")
+        log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
+                 "%s, no round spent", project.name, wo["id"], carried["round"],
+                 judged[:10], head[:10], len(chain), len(bases), base)
+        return True
+
+    def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
+                            pr: Any) -> Any:
+        """Merge the base into this branch, when it is behind. Returns the head to decide on.
+
+        docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5. The
+        OS's own gate reviewer refuses a merge whose CI ran against a base behind `main`,
+        and `ops.PR_BEHIND_NOTE` has been telling workers to merge `origin/{base}` in for
+        exactly that reason — so the move is compulsory and the OS may as well make it,
+        now that §3's carry means it costs no round.
+
+        **RETURNS THE RE-READ `PullRequest`**, `heal_inherited_failure`'s contract and for
+        its reason: the caller must decide against the head the update produced, not the
+        one it replaced. The pull request it was given comes back unchanged whenever
+        nothing happened, which is the ordinary answer.
+
+        **THE SEVEN GUARDS ARE §5.3 AND EVERY ONE OF THEM DEFERS RATHER THAN DROPS.** In
+        order, cheapest first: a turn in flight or an undelivered message (never move the
+        head under a worker), an open round (never move it beneath the seats — Neo question
+        283), one update per base commit (`ops.base_heal_spent`, the red-base heal's key,
+        shared because the bound is about rebuilding one merge ref and not about why),
+        `ops.CATCH_UP_MAX` (the per-base-sha key cannot bound a fast-moving base: every
+        commit on it is a fresh key), and a re-read of the head immediately before the
+        update — `gh pr update-branch` has no `--match-head-commit`, so the window is
+        narrowed here and closed by §3's proof (a).
+
+        A refused update spends the attempt and leaves the pull request exactly where it
+        was. Nothing here is gated: `ci.update_branch` is `ci.WRITE_VERBS`' one entry and
+        ungated for the reasons in its own docstring, and the MERGE this leads to still
+        files its `automerge.GATE_KIND` request.
+        """
+        from . import branchproof, ci, github, ops
+
+        wo_id = wo["id"]
+        base = str(getattr(pr, "base_ref", "") or "")
+        pr_url = str(wo.get("pr_url") or "")
+        base_oid = str(getattr(pr, "base_oid", "") or "")
+        if not base or not pr_url:
+            return pr
+        if (worker_session.busy(store, wo_id) or store.queued_messages(wo_id)
+                or store.validation_round_open(wo_id)):
+            log.debug("[%s] %s is in flight — catching up with %s deferred",
+                      project.name, wo_id, base)
+            return pr
+        if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
+            return pr
+        if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
+            log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
+                      project.name, wo_id, base, ops.CATCH_UP_MAX)
+            return pr
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            return pr           # logged there, with the refs it asked for
+        if not ops.catch_up_needed(pr, repo=project.path):
+            return pr
+
+        # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
+        # at the top of the poll, and a worker turn can end and push in the meantime. The
+        # update may only run on the commit a round judged, so that the carry afterwards
+        # has something true to rest on.
+        try:
+            fresh = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] could not re-read %s before catching it up: %s",
+                      project.name, pr_url, e)
+            return pr
+        judged = ProjectStore.validated_head(
+            store.latest_validation_round(wo_id=wo_id)) or ""
+        head_before = fresh.head_oid
+        if not head_before or head_before != judged:
+            return fresh
+        base_oid = fresh.base_oid or base_oid
+        try:
+            ci.update_branch(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.info("[%s] could not catch %s up with %s: %s", project.name, pr_url,
+                     base, e)
+            ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
+                                          reason=e.reason,
+                                          cause=ops.BASE_UPDATE_BEHIND)
+            return fresh
+        try:
+            fresh = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            # The update LANDED; only the read back failed. Recorded with the head
+            # unmoved, and the next tick reads the real one — `heal_inherited_failure`'s
+            # direction, for its reason.
+            log.info("[%s] caught %s up but could not re-read it: %s", project.name,
+                     pr_url, e)
+        ops.record_base_update(store, wo, base=base, base_sha=base_oid,
+                               head_before=head_before, head_after=fresh.head_oid,
+                               checks=fresh.failing, cause=ops.BASE_UPDATE_BEHIND)
+        log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
+                 project.name, pr_url, base, base_oid[:10], head_before[:10],
+                 fresh.head_oid[:10])
+        return fresh
+
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
                             wo: dict, decision: Any) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
@@ -6117,7 +6522,8 @@ class Daemon:
             log.info("[%s] could not rebuild %s against %s: %s", project.name,
                      wo["pr_url"], base_ref, e)
             ops.record_base_update_failed(store, wo, base=base_ref, base_sha=base_sha,
-                                          reason=e.reason)
+                                          reason=e.reason,
+                                          cause=ops.BASE_UPDATE_BASE_RED)
             return False, pr
         try:
             pr = github.pr_view(wo["pr_url"], cwd=project.path)
@@ -6130,7 +6536,7 @@ class Daemon:
                      wo["pr_url"], e)
         ops.record_base_update(store, wo, base=base_ref, base_sha=base_sha,
                                head_before=head_before, head_after=pr.head_oid,
-                               checks=pr.failing)
+                               checks=pr.failing, cause=ops.BASE_UPDATE_BASE_RED)
         log.info("[%s] %s was red only because %s was — rebuilt it against %s",
                  project.name, wo["pr_url"], base_ref, base_sha[:10])
         if judged and judged == head_before and pr.head_oid != head_before:
@@ -6316,9 +6722,21 @@ class Daemon:
             # merged pull request or an order that produced nothing to land, so this
             # inherits issue #232's distinction rather than restating it — a fix sitting
             # on an unmerged branch never gets here. `pr_url` separates those two routes:
-            # an order with no code to land has nothing to put in a release.
-            if (applied == issues.CLOSED and wo.get("pr_url")
-                    and issues.dispatches(wo.get("issue_priority") or "")):
+            # an order with no code to land has nothing to put in a release — and it is
+            # read through the routing predicate, because cutting a RELEASE is the largest
+            # move the column makes and a gate-recorded one makes none (2026-09-25 spec
+            # §4). The closing COMMENT still names the raw column, which is the whole
+            # point of recording it.
+            from . import ops as ops_mod
+
+            # TWO ROUTES TO A RELEASE, and expediting is the user's own: an expedited
+            # order carries an honest low/medium rating or none at all, so the rating
+            # column alone could never see that they asked for this in production now
+            # (2026-09-27 spec §2).
+            if (applied == issues.CLOSED
+                    and ops_mod.routes_on_pull_request(store, wo)
+                    and (issues.dispatches(wo.get("issue_priority") or "")
+                         or issues.was_expedited(wo))):
                 self.ensure_release(project, store, wo)
 
     #: How long a cached issue state is good for. An hour, because nothing the OS does
@@ -6399,9 +6817,12 @@ class Daemon:
     #: would (the user's instruction). `--stage` rather than an inline restart because
     #: restarting inline kills the worker's own session: 0.5.1 landed as `failed` after a
     #: perfect deploy, which is the whole reason staged mode exists.
+    #: WHY each fix earned this release is on the per-fix LINE, not here: a batch can
+    #: mix a confirmed blocker with an expedited `low`, and one sentence about both
+    #: would be false about one of them (2026-09-27 spec §4).
     RELEASE_BRIEF = """\
-Ship a release. These fixes have LANDED on `main` and the bugs they close were confirmed \
-`critical` or `blocker` by Neo, so the OS owes the fleet a release carrying them:
+Ship a release. These fixes have LANDED on `main` and the OS owes the fleet a release \
+carrying them:
 
 {fixes}
 
@@ -6430,12 +6851,17 @@ the place to fix a red build."""
         Idempotent for the same reason the rest of the lifecycle is — a fix already in
         the batch is not added twice, so a sweep that runs again changes nothing.
         """
-        from . import db
+        from . import db, issues
         from .project_store import OPEN_STATUSES
 
         url = wo.get("issue_url") or ""
+        # Expedited first: an order can be both, and the user's scheduling act is the
+        # one that is never contingent on a verdict (spec §4).
+        reason = ("expedited by the filer" if issues.was_expedited(wo)
+                  else f"confirmed `{wo.get('issue_priority')}` by Neo")
         line = (f"- {url} — fixed by `{wo['id']}`"
-                + (f" ({wo['pr_url']})" if wo.get("pr_url") else ""))
+                + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
+                + f" — {reason}")
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
@@ -6467,6 +6893,277 @@ the place to fix a red build."""
                         {"issue_url": url, "wo_id": wo["id"]})
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
         return str(fresh["id"])
+
+    #: How long a red base defers a release order's dispatch. Only a RE-CHECK INTERVAL:
+    #: a fixed `main` ships within five minutes, so being wrong about the number is
+    #: cheap, and it is deliberately not a config key until someone wants a different one.
+    RED_HOLD_SECONDS = 300
+
+    #: Said once per BROKEN COMMIT on a release order held back by a red base
+    #: (2026-09-27 spec §5.2).
+    RED_HOLD_EVENT = "release_held_red_base"
+
+    def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Keep a pending release order out of dispatch while the base branch is red.
+
+        **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
+        fires only on the issue-state TRANSITION, so a release skipped because `main`
+        was red would never be filed again and the fix would drop out of every future
+        batch. The order is always created; this defers it until the base is buildable.
+
+        Now that an expedited `low` ships on landing, releases go out unattended and
+        routinely, and the only thing standing between a red `main` and a release was a
+        sentence in `RELEASE_BRIEF` asking the worker to check — a worker's judgement in
+        place of a post-condition.
+
+        **AN UNREADABLE CI DOES NOT HOLD.** `ci.base_runs` raises on any doubt; a `gh`
+        outage must not strand the user's release for ever, and the brief plus the
+        release gate are the fallback. `_heal_inherited_red`'s direction for the same call.
+
+        Cost, in guard order: nothing at all for a project that does not own the OS, one
+        indexed listing when it owns no pending release, and a `gh` call only once a
+        hold has lapsed — an in-force hold IS the rate limit.
+
+        docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
+        """
+        from . import ci, evidence, github
+
+        # Same scope as `settle_shipped_releases`: the release path is the OS's own
+        # release script and the production checkout, both facts about this repository.
+        if project.name != self._os_owner():
+            return
+        due: list[dict[str, Any]] = []
+        for candidate in store.list_work_orders(statuses=("pending",),
+                                                include_hidden=True):
+            meta = db.from_json(candidate.get("metadata"), {}) or {}
+            # A hold already in force is the throttle: no `gh` call until it lapses,
+            # and that is the whole rate limit (§5.3).
+            if (isinstance(meta.get(self.RELEASE_BATCH_KEY), list)
+                    and float(candidate.get("retry_after") or 0) <= db.now()):
+                due.append(candidate)
+        if not due:
+            return
+
+        base = evidence.base_ref(project.path) or "main"
+        # `base_runs` asks `gh run list --branch`, which wants the BRANCH — and
+        # `BRANCH_RE` admits a slash, so `origin/main` would pass the check and select
+        # nothing. `landing._fetch_ref`'s strip.
+        branch = base.split("/", 1)[1] if base.startswith("origin/") else base
+        try:
+            # One call for the whole step, `_heal_inherited_red`'s caching by base ref.
+            runs = ci.base_runs(branch, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] could not read %s's CI, so no release is held: %s",
+                      project.name, branch, e)
+            return
+        red = self._red_base_run(runs)
+        for wo in due:
+            wo_id = str(wo["id"])
+            if red is None:
+                # Green with no hold in force writes nothing, and a non-zero ladder
+                # belongs to `release_dispatch_claim` — not this step's to erase (§5.7).
+                if wo.get("retry_after") is not None and not int(
+                        wo.get("dispatch_attempts") or 0):
+                    store.hold_dispatch(wo_id, until=None)
+                continue
+            until = max(float(wo.get("retry_after") or 0),
+                        db.now() + self.RED_HOLD_SECONDS)
+            store.hold_dispatch(wo_id, until=until)
+            self._say_base_is_red(store, wo_id, base, red, until)
+
+    def _red_base_run(self, runs: tuple[Any, ...]) -> Any | None:
+        """The run that says the base is broken right now, or None.
+
+        Scoped to the workflows that reported on the base's NEWEST head (§5.1): asking
+        about every workflow in the window would let one that ran once, failed and was
+        then deleted latch the base red for ever, because `ci.latest` keeps returning it.
+        """
+        from . import ci
+
+        head = runs[0].head_sha if runs else ""
+        workflows = tuple(dict.fromkeys(
+            r.workflow for r in runs if r.head_sha == head and r.workflow))
+        for workflow in workflows:
+            latest = ci.latest(runs, workflow)
+            if latest is not None and latest.red:
+                return latest
+        return None
+
+    def _say_base_is_red(self, store: ProjectStore, wo_id: str, base: str,
+                         red: Any, until: float) -> None:
+        """One line per BROKEN COMMIT on the release order's timeline.
+
+        Deduped on the head sha and not on the kind: kn-7b122cd9 — a code per condition
+        is also a code per world, and `main` breaking again on a different commit is
+        news. No attention flag; a red base for a few minutes is ordinary.
+        """
+        head = red.head_sha
+        if any(db.from_json(e["payload"], {}).get("head_sha") == head
+               for e in store.events_of_kind(wo_id, self.RED_HOLD_EVENT)):
+            return
+        store.add_event(wo_id, self.RED_HOLD_EVENT, {
+            "base": base, "head_sha": head, "run_id": red.run_id,
+            "workflow": red.workflow, "until": until,
+            "detail": (f"{base} is red at {head[:10]} ({red.workflow}) — holding the "
+                       f"release until it is green")})
+        log.info("%s is red at %s — holding the release %s", base, head[:10], wo_id)
+
+    #: Said once per TAG on a release order another release overtook (spec §6).
+    OVERTAKEN_EVENT = "release_overtaken"
+
+    #: The back-fill of spec §2, on the FIXING order: the commit a merge put on `main`,
+    #: read from GitHub once for a pull request that merged before the poller recorded it.
+    MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
+
+    def settle_shipped_releases(self, project: ProjectSpec,
+                                store: ProjectStore) -> None:
+        """End a release order whose fixes another release already shipped — issue #784.
+
+        `ensure_release`'s missing ending. A release order's only settlement path was the
+        marker handshake, whose marker names the SHIPPING work order, so a release cut by
+        another path while this order waited ~9 minutes for CI settled nothing and a
+        worker turn was spent closing it by hand (wo-e5816dd7, wo-4301a7a6).
+
+        Done means **a `jarvis-*` tag contains every payload commit of the batch AND
+        production runs that tag** — Neo question 751, option B: the order was filed
+        because the fleet owed the user a running fix, and a tag nobody deployed does not
+        pay that debt. Tag but no deploy leaves it open with one note on the timeline (§6).
+
+        Cost, in the order of the guards: zero queries for every project but the OS
+        owner; one indexed query and a metadata parse when it owns none; git and the
+        production checkout only with an open release order in hand. `include_hidden`
+        matches `ensure_release` — hiding drops a record from listings, not from the
+        arithmetic that decides whether it is over.
+
+        docs/superpowers/specs/2026-09-26-a-release-order-overtaken-mid-ci-wait-settles-itself.md
+        """
+        from . import release
+        from .project_store import OPEN_STATUSES
+
+        # §8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both
+        # facts about the OS's own release path. Another project keeps today's behaviour.
+        if project.name != self._os_owner():
+            return
+        orders: list[tuple[dict[str, Any], list[str]]] = []
+        for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
+                                                include_hidden=True):
+            meta = db.from_json(candidate.get("metadata"), {}) or {}
+            batch = meta.get(self.RELEASE_BATCH_KEY)
+            if isinstance(batch, list) and batch:
+                orders.append((candidate, [str(u) for u in batch]))
+        if not orders:
+            return
+        marker = release.read_marker() or {}
+        for wo, batch in orders:
+            try:
+                self._settle_shipped_release(project, store, wo, batch, marker)
+            except Exception:  # noqa: BLE001 — one release order must not stall the tick
+                log.exception("[%s] settling the release %s failed", project.name,
+                              wo["id"])
+                continue
+
+    def _settle_shipped_release(self, project: ProjectSpec, store: ProjectStore,
+                                wo: dict[str, Any], batch: list[str],
+                                marker: dict[str, Any]) -> None:
+        """One release order. Every refusal in spec §7 leaves the row untouched."""
+        from . import release
+
+        wo_id = str(wo["id"])
+        # §7.5: a marker naming this order, in ANY state including failed_verification —
+        # it staged its own release and the handshake owns it. Only `verify_on_boot` may
+        # settle a release the OS performed, because only it checks the unit timestamps.
+        if str(marker.get("wo_id") or "") == wo_id:
+            return
+        shas = self._release_payload(project, store, wo_id, batch)
+        if shas is None:
+            return
+        found = release.overtaken_by(project.path, shas)
+        if found.error:
+            log.debug("[%s] %s: cannot tell whether its batch shipped: %s",
+                      project.name, wo_id, found.error)
+            return
+        if not found.tag:
+            return  # §7.3: the ordinary case, and what the order was filed for
+        if not found.live:
+            # Deduped on the TAG, not the kind: by kind alone this would go silent if the
+            # first tag never deploys and a later one does, and that second tag is news.
+            # No attention flag — a normal few minutes must not read as a fault (§6).
+            if any(db.from_json(e["payload"], {}).get("tag") == found.tag
+                   for e in store.events_of_kind(wo_id, self.OVERTAKEN_EVENT)):
+                return
+            store.add_event(wo_id, self.OVERTAKEN_EVENT, {
+                "tag": found.tag, "shas": list(shas), "deployed": found.deployed,
+                "detail": (f"{found.tag} already carries these fixes; production is on "
+                           f"{found.deployed}")})
+            log.info("[%s] %s already carries %s's fixes; production is on %s",
+                     project.name, found.tag, wo_id, found.deployed)
+            return
+        settled = release.settle(
+            store, wo_id, found.tag,
+            why=(f"{found.tag} already carries this release's fixes and production "
+                 f"runs it"))
+        log.info("[%s] %s shipped %s's batch and is live — %s", project.name,
+                 found.tag, wo_id, settled)
+
+    def _release_payload(self, project: ProjectSpec, store: ProjectStore, wo_id: str,
+                         batch: list[str]) -> list[str] | None:
+        """Every payload commit of this batch, or None if ONE of them cannot be resolved.
+
+        A partial payload must never be tested (§7.1): a tag containing the known half
+        would complete an order whose other fix never shipped.
+
+        The batch is a list of issue urls; `release_batched` is the event that names the
+        order which fixed each, so the mapping is read back from what wrote the batch.
+        """
+        fixers = {}
+        for event in store.events_of_kind(wo_id, "release_batched"):
+            said = db.from_json(event["payload"], {})
+            fixers[said.get("issue_url")] = said.get("wo_id")
+        shas: list[str] = []
+        for url in batch:
+            fix_id = fixers.get(url)
+            if not fix_id:
+                return None
+            try:
+                fix = store.get_work_order(str(fix_id))
+            except KeyError:
+                return None
+            sha = self._merge_commit_of(project, store, fix)
+            if not sha:
+                return None
+            shas.append(sha)
+        return shas
+
+    def _merge_commit_of(self, project: ProjectSpec, store: ProjectStore,
+                         fix: dict[str, Any]) -> str:
+        """The commit this fix put on `main`, or `""` when it cannot be resolved.
+
+        Recorded on `pr_merged` by the merge poller (§2). A fix that merged BEFORE that
+        shipped has none, so ONE `github.pr_view` back-fills it and the answer is written
+        to `pr_merge_commit_recorded` — one `gh` call per fix, once ever, not once a tick.
+        """
+        from . import github
+
+        for kind in ("pr_merged", self.MERGE_COMMIT_EVENT):
+            rows = store.events_of_kind(fix["id"], kind)
+            if rows:
+                sha = db.from_json(rows[-1]["payload"], {}).get("merge_commit") or ""
+                if sha:
+                    return str(sha)
+        pr_url = fix.get("pr_url") or ""
+        if not pr_url:
+            return ""
+        try:
+            pr = github.pr_view(pr_url, cwd=project.path)
+        except github.GitHubError as e:
+            log.debug("[%s] %s: could not read %s for its merge commit: %s",
+                      project.name, fix["id"], pr_url, e)
+            return ""
+        if not (pr.merged and pr.merge_commit_oid):
+            return ""
+        store.add_event(fix["id"], self.MERGE_COMMIT_EVENT,
+                        {"pr_url": pr_url, "merge_commit": pr.merge_commit_oid})
+        return pr.merge_commit_oid
 
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:

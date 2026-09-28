@@ -56,6 +56,7 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -305,7 +306,7 @@ def verify_on_boot(store_for: StoreLookup, runner: SystemdRunner | None = None,
             "version": version, "tag": tag,
             "detail": f"release {tag} verified live",
         })
-        settled = _settle(store, wo_id, tag)
+        settled = settle(store, wo_id, tag)
         store.add_notification(
             title=f"Shipped {tag} to production",
             body=(f"{tag} verified live: production is on version {version} and both "
@@ -339,10 +340,15 @@ def _report_failure(store: ProjectStore, wo_id: str, tag: str, reason: str) -> N
     )
 
 
-def _settle(store: ProjectStore, wo_id: str, tag: str) -> str:
+def settle(store: ProjectStore, wo_id: str, tag: str, why: str | None = None) -> str:
     """Move the shipping work order to `completed`, respecting kn-99d3f1d4's traps.
 
     Returns a phrase for the notification body describing what was done.
+
+    `why` is which ENDING this was, and there is one function rather than two because
+    every trap below exists because it was a bug once; the first divergence a sibling
+    would grow is a release order completed over an assumption nobody answered (spec §5).
+    It defaults to the verify-on-boot wording, which is that path's, unchanged.
 
     * `completed` — nothing to do beyond clearing any stale flag.
     * `waiting_pr_merge` — left parked: it finished behind a pull request and the
@@ -359,6 +365,7 @@ def _settle(store: ProjectStore, wo_id: str, tag: str) -> str:
     """
     from . import ops
 
+    why = why or f"release {tag} verified live"
     try:
         wo = store.get_work_order(wo_id)
     except KeyError:
@@ -372,9 +379,8 @@ def _settle(store: ProjectStore, wo_id: str, tag: str) -> str:
         return "stays parked on its pull request"
     if store.pending_assumptions(wo_id):
         return "still has assumptions pending your review"
-    ops.close_out(store, wo, "release_completed",
-                  why=f"release {tag} verified live",
-                  payload={"tag": tag})
+    ops.close_out(store, wo, "release_completed", why=why,
+                  payload={"tag": tag, "why": why})
     ops.mark_backlog_done(wo)
     return f"completed (was {wo['status']})"
 
@@ -405,6 +411,135 @@ def _tag_created_at(root: Path, tag: str) -> float | None:
         return float(stamp)
     except ValueError:
         return None
+
+
+#: Every tag a release of this repository cuts. HARDCODED, not a setting (spec §3): the
+#: whole release path — `scripts/shipit.sh`, `_production_ref`'s `jarvis-X.Y.Z` rule,
+#: `DAEMON_UNIT` — is already this repository's, and a knob would imply the rest
+#: generalises.
+RELEASE_TAG_GLOB = "jarvis-*"
+
+
+def _tag_version(tag: str) -> tuple[int, Any]:
+    """Sort key for a release tag: `(major, minor, patch)`, lexical for anything else."""
+    parts = tag.removeprefix("jarvis-").split(".")
+    try:
+        return (0, tuple(int(p) for p in parts))
+    except ValueError:
+        return (1, tag)
+
+
+def tags_containing(root: Path, shas: Sequence[str]) -> tuple[list[str], str]:
+    """The `jarvis-*` tags that carry EVERY one of `shas`, lowest version first.
+
+    `git tag --contains X` is ancestry — it lists the tags whose commit is a descendant
+    of X — and it is the only correct reading: release tags are descendants of `main`,
+    never ancestors (kn-179cd767), so "main is ahead of the tag" decides nothing
+    (kn-4f5aaa2b measured main 5 commits ahead while the fix was unshipped) and "the tag
+    list has not changed" answers a different question.
+
+    ONE INVOCATION PER SHA, intersected here: `git tag --contains A --contains B` is a
+    UNION, so a single call would report a tag carrying half a batch as carrying all of
+    it. A batch is one or two commits.
+
+    Returns `(tags, error)`. A non-empty error is "cannot tell" and every caller reads it
+    as a refusal, never as "no tags" — `_tag_created_at`'s direction. Lowest version
+    first because the first release that carried the whole batch is the honest answer,
+    and it is deterministic across ticks.
+    """
+    if not shas:
+        return [], "no payload commits to look for"
+    # FIRST, and best-effort: a tag another release path cut is not in this checkout
+    # until it is fetched, and the defect's window is minutes long — so a stale tag list
+    # is the normal state. A failed fetch can only make a tag unseen, which leaves the
+    # work order open (spec §3A).
+    try:
+        fetched = subprocess.run(
+            ["git", "-C", str(root), "fetch", "--tags", "--quiet", "--force", "origin"],
+            capture_output=True, text=True, timeout=60, check=False)
+        if fetched.returncode != 0:
+            log.debug("could not fetch tags in %s: %s", root,
+                      (fetched.stderr or "").strip()[:200])
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("could not fetch tags in %s: %s", root, e)
+
+    common: set[str] | None = None
+    for sha in shas:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(root), "tag", "--list", RELEASE_TAG_GLOB,
+                 "--contains", sha],
+                capture_output=True, text=True, timeout=20, check=False)
+        except (OSError, subprocess.SubprocessError) as e:
+            return [], f"git could not be run in {root}: {type(e).__name__}: {e}"
+        names = set(out.stdout.split())
+        if out.returncode != 0 or (not names and out.stderr.strip()):
+            detail = (out.stderr or out.stdout).strip().replace("\n", " ")[:200]
+            return [], f"`git tag --contains {sha}` failed: {detail}"
+        common = names if common is None else common & names
+    return sorted(common or set(), key=_tag_version), ""
+
+
+@dataclass(frozen=True)
+class Overtaken:
+    """Has another release already carried a batch, and does the fleet RUN it.
+
+    Built by `overtaken_by`. `error` is a refusal — "cannot tell" — and is never the same
+    claim as `tag == ""`, which is the ordinary "no release carries this yet".
+    """
+
+    #: The lowest `jarvis-*` tag containing the whole batch; `""` when none does.
+    tag: str = ""
+    #: Every containing tag, lowest version first.
+    tags: tuple[str, ...] = ()
+    #: `_production_ref`'s answer, when it could be read.
+    deployed: str = ""
+    #: Production is at one of `tags`, with the file and git agreeing.
+    live: bool = False
+    #: Why nothing can be concluded; empty when something can.
+    error: str = ""
+
+
+def overtaken_by(project_root: Path, shas: Sequence[str]) -> Overtaken:
+    """Did another release already ship this payload, and is production running it.
+
+    The two halves run in different checkouts (spec §3): ancestry in the PROJECT's own
+    clone, where the tags and the objects are, and the deploy question in the PRODUCTION
+    checkout, read-only.
+
+    The production test is MEMBERSHIP in `tags`, deliberately not ancestry re-run there:
+    `git merge-base --is-ancestor` needs the payload object present, which a deploy clone
+    does not guarantee, and making it reliable would need a fetch into a checkout that is
+    a release tag and must never be written. Note what membership correctly refuses — a
+    later tag cut from an older base does not contain the fix, so production running it
+    leaves the order open.
+
+    BOTH READINGS of what production is, the file and git, on kn-58429229's rule and for
+    its reason: during the 0.5.0 half-apply the tag was checked out and the running code
+    was not it, so a check that reads one of the two is the check that was already fooled
+    once.
+    """
+    tags, error = tags_containing(project_root, shas)
+    if error:
+        return Overtaken(error=error)
+    if not tags:
+        return Overtaken()
+    found = {"tag": tags[0], "tags": tuple(tags)}
+    root = production_code_dir()
+    if not root.is_dir():
+        return Overtaken(**found, error=f"no production checkout at {root}")
+    ref = _production_ref(root)
+    if ref == "HEAD":
+        return Overtaken(**found,
+                         error="the production checkout is not at a release tag")
+    version = _production_version()
+    if version is None:
+        return Overtaken(**found, deployed=ref,
+                         error="the production checkout's version could not be read")
+    if ref.removeprefix("jarvis-") != version:
+        return Overtaken(**found, deployed=ref,
+                         error=f"production is at {ref} and says version {version}")
+    return Overtaken(**found, deployed=ref, live=ref in tags)
 
 
 def verify_release_claim(store: ProjectStore, wo_id: str, version: str, tag: str) -> str:

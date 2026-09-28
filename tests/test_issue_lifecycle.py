@@ -1097,6 +1097,34 @@ def test_a_blocker_that_produced_no_code_closes_its_issue_and_ships_nothing(flee
     assert not fleet.releases()
 
 
+def test_a_gate_recorded_pull_request_closes_the_issue_and_ships_nothing(fleet):
+    """The third reader of the column, audited: a RELEASE is the largest move `pr_url`
+    makes, and a gate-recorded one makes none (2026-09-25 spec §4).
+
+    The pairing is in the same assertion: the issue still CLOSES with the link on it, which
+    is what recording the gate's URL was for — only the ship is withheld, because nobody
+    declared that this order's code is what landed.
+    """
+    from jarvis import gates, ops
+
+    wo_id = fleet.blocker_wo()
+    store = fleet.store()
+    try:
+        approval = store.add_approval(wo_id, gates.PR_MERGE, f"gh pr merge {PR} --squash")
+        gates.apply_decision(store, approval["id"], verdict="approved",
+                             reason="checks green", decided_by="neo")
+        assert store.get_work_order(wo_id)["pr_url"] == PR
+        ops.complete_merged(store, store.get_work_order(wo_id))
+    finally:
+        store.close()
+
+    fleet.sweep()
+    issue = fleet.gh.issue()
+    assert issue["state"] == "CLOSED"
+    assert PR in "\n".join(issue["comments"])
+    assert not fleet.releases()
+
+
 def test_a_landed_fix_for_a_backlog_priority_ships_nothing(fleet):
     """Only `critical` and `blocker` commit the fleet to a release. A `high` the user
     promoted themselves closes its issue and stops there."""
@@ -1147,6 +1175,9 @@ def _escalate(fleet, reason="not enough evidence"):
     ("issue_released", "handed back"),
     ("issue_closed", "closed"),
     ("release_batched", "release"),
+    # The two the overtaken-release settlement adds (issue #784, its spec §6).
+    ("release_overtaken", "already carries"),
+    ("pr_merge_commit_recorded", "merge"),
 ])
 def test_every_event_this_feature_writes_has_a_label_a_reader_can_read(kind, label):
     """kn-3f133363: falling through to the generic renderer is NOT the same claim as a
@@ -1372,38 +1403,46 @@ def test_expediting_a_claim_dispatches_without_waiting_for_neo(fleet, level):
 
 
 @pytest.mark.parametrize("level", ["critical", "blocker"])
-def test_an_expedited_claim_that_lands_first_ships_no_release(fleet, level):
-    """The race the flag creates: a one-line fix can land before Neo answers. Nothing
-    but a verdict may cut a release, so landing first ships none."""
+def test_an_expedited_claim_that_lands_first_still_ships_a_release(fleet, level):
+    """The race the flag creates: a one-line fix can land before Neo answers. The
+    release comes from the EXPEDITING, never from a rating — which is still empty."""
+    from jarvis import ops
     pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
     fleet.land(pickup["wo_id"])
-    assert fleet.releases() == [], "an unconfirmed claim may not ship a release"
+
+    assert len(fleet.releases()) == 1, "the user asked for this in production now"
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert not (wo["issue_priority"] or ""), "and not because it acquired a rating"
 
 
-def test_a_claim_neo_could_not_be_asked_about_ships_no_release(monkeypatch, fleet):
-    """Neo unreachable is the case the whole route fails closed on, and expediting only
-    moves WHEN the work happens — never whether the claim was checked."""
+def test_an_expedited_claim_neo_could_not_be_asked_about_still_ships(monkeypatch, fleet):
+    """Neo unreachable fails closed on the RATING — the label and the order's copy of it
+    are untouched — and not on the user's scheduling act."""
+    from jarvis import ops
     monkeypatch.setattr(issues, "ask_triage",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("neo is off")))
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     assert pickup["wo_id"] and "NOT re-assessed" in pickup["reason"]
 
     fleet.land(pickup["wo_id"])
-    assert fleet.releases() == [], "nothing is shipped off a claim nobody could check"
+
+    assert len(fleet.releases()) == 1
+    assert "priority: blocker" in fleet.gh.issue()["labels"], \
+        "the claim is still only the filing agent's own"
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert not (wo["issue_priority"] or ""), "no verdict, no rating"
 
 
 @pytest.mark.parametrize("approve", [False, True])
-def test_a_verdict_that_arrives_after_the_fix_landed_ships_nothing(fleet, approve):
-    """A verdict can only decide what has not happened yet. The work landed unrated, so
-    no release was cut, and neither ruling reaches back for one — INCLUDING the confirm.
-    Failing closed in both directions is the choice: a release the fleet restarts for is
-    the user's to ask for (`scripts/shipit.sh`) once the moment to cut it automatically
-    has gone. The label is still corrected, which is what the tracker is for."""
+def test_a_verdict_after_the_landing_adds_no_second_release(fleet, approve):
+    """A verdict can only decide what has not happened yet. The expedited landing cut
+    the release; neither ruling reaches back to cut a second one. The label is still
+    corrected, which is what the tracker is for."""
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.land(pickup["wo_id"])
     fleet.triage(approve=approve, answer="" if approve else "medium", reason="r")
 
-    assert fleet.releases() == []
+    assert len(fleet.releases()) == 1
     want = "blocker" if approve else "medium"
     assert f"priority: {want}" in fleet.gh.issue()["labels"]
 
@@ -1427,12 +1466,13 @@ def test_a_downgrade_cannot_undo_an_expedited_work_order(fleet):
     _name, _path, wo = ops.find_work_order(pickup["wo_id"])
     assert wo["issue_priority"] == "medium", "the claim may not outlive the verdict"
     assert not issues.dispatches(wo["issue_priority"]), \
-        "a downgraded claim must not ship a release when the fix lands"
+        "a downgraded claim is not a dispatching rating"
+    assert issues.was_expedited(wo), "but the user's scheduling act survives the verdict"
 
 
-def test_a_downgraded_expedited_fix_lands_without_a_release(fleet):
-    """The same fact through the daemon rather than through the column: the landing
-    sweep is what would have cut the release."""
+def test_a_downgraded_expedited_fix_still_ships(fleet):
+    """The same fact through the daemon: the downgrade moves the label and the rating,
+    and the flag the landing sweep now also reads is not Neo's to move."""
     from jarvis import ops
     pickup = fleet.file_bug(priority="blocker", expedite=True)["pickup"]
     fleet.triage(approve=False, answer="medium", reason="bounded to one command")
@@ -1440,7 +1480,8 @@ def test_a_downgraded_expedited_fix_lands_without_a_release(fleet):
 
     _name, _path, wo = ops.find_work_order(pickup["wo_id"])
     assert wo["issue_state"] == issues.CLOSED, "the fix still lands and still closes it"
-    assert fleet.releases() == [], "a `medium` bug does not ship a release"
+    assert wo["issue_priority"] == "medium", "the rating is Neo's and Neo moved it"
+    assert len(fleet.releases()) == 1, "the scheduling act is the user's and survives"
 
 
 def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
@@ -1457,6 +1498,78 @@ def test_neo_confirming_an_expedited_claim_grants_it_the_release(fleet):
 
     fleet.land(pickup["wo_id"])
     assert len(fleet.releases()) == 1, "a confirmed blocker still ships on landing"
+
+
+# -- an expedited fix that LANDS ships a release --------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md.
+# The release used to be cut from the RATING alone, so the one route that deliberately
+# carries no rating shipped nothing and a human had to watch for the merge.
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_an_expedited_low_bug_that_lands_ships_a_release(fleet, level):
+    """§2: a level `dispatches()` rejects, expedited, landed — one release carrying it."""
+    from jarvis import db
+    from jarvis.daemon import Daemon
+    pickup = fleet.file_bug(priority=level, expedite=True)["pickup"]
+    fleet.land(pickup["wo_id"])
+
+    rel = fleet.releases()
+    assert len(rel) == 1
+    assert db.from_json(rel[0]["metadata"], {})[Daemon.RELEASE_BATCH_KEY] == \
+        [fleet.issue_url]
+
+
+@pytest.mark.parametrize("level", ["low", "medium", "high"])
+def test_a_non_expedited_low_bug_that_lands_ships_nothing(fleet, level):
+    """The control: the same levels picked up with `jarvis issues start`. The FLAG is
+    what changed, not the landing."""
+    fleet.file_bug(priority=level)
+    started = issues.start_work(fleet.issue_url)
+    fleet.land(started["wo_id"])
+
+    assert fleet.releases() == [], "nobody asked for this in production now"
+
+
+def test_two_expedited_fixes_landing_make_one_release(fleet):
+    """§3: the batching is inherited whole — two landings, one release order."""
+    from jarvis import db
+    from jarvis.daemon import Daemon
+    second_url = f"https://github.com/{FIXTURE_BUG_REPO}/issues/2"
+    first = fleet.file_bug(title="one", priority="low", expedite=True)["pickup"]
+    fleet.gh.next_issue(second_url)
+    second = fleet.file_bug(title="two", priority="high", expedite=True)["pickup"]
+    fleet.land(first["wo_id"], pr_url=PR)
+    fleet.land(second["wo_id"], pr_url=PR_2)
+
+    rel = fleet.releases()
+    assert len(rel) == 1, "two fixes landing close together are one release"
+    meta = db.from_json(rel[0]["metadata"], {})
+    assert sorted(meta[Daemon.RELEASE_BATCH_KEY]) == sorted([fleet.issue_url,
+                                                             second_url])
+    store = fleet.store()
+    try:
+        assert len(store.events_of_kind(rel[0]["id"], "release_batched")) == 2
+    finally:
+        store.close()
+
+
+def test_an_expedited_order_records_that_it_was_expedited(fleet):
+    """§1: the flag is on the ROW at creation, and a filing nobody expedited reads
+    False rather than raising."""
+    from jarvis import db, ops
+    third_url = f"https://github.com/{FIXTURE_BUG_REPO}/issues/3"
+    pickup = fleet.file_bug(priority="low", expedite=True)["pickup"]
+    _name, _path, wo = ops.find_work_order(pickup["wo_id"])
+    assert db.from_json(wo["metadata"], {})[issues.EXPEDITED_KEY] is True
+    assert issues.was_expedited(wo)
+
+    fleet.gh.next_issue(third_url)
+    fleet.file_bug(title="plain", priority="low")
+    plain = issues.start_work(third_url)
+    _name, _path, other = ops.find_work_order(plain["wo_id"])
+    assert not issues.was_expedited(other)
 
 
 def test_the_issue_survives_a_work_order_that_could_not_be_created(monkeypatch, fleet):

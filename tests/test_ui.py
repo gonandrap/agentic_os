@@ -2286,6 +2286,27 @@ def test_a_round_waiting_for_ci_is_not_painted_as_a_failure(client, project):
     assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
 
 
+def test_a_round_held_for_authentication_is_not_painted_as_a_failure(client, project):
+    """GitHub issue #778. No template edit ships with that fix — the badge is keyed on
+    `project_store.validation_standing` — so the thing that can regress is the table row,
+    and this is what pins it rendered."""
+    from jarvis.project_store import VALIDATION_AUTH_CAUSE
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("add the export")
+    rnd = store.open_validation_round(wo_id=wo["id"], fingerprint="ffff6666")
+    store.close_validation_round(rnd["id"], "failed",
+                                 "waiting for Claude Code authentication",
+                                 hold_cause=VALIDATION_AUTH_CAUSE)
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert ('class="st tone-active"><span class="i">◑</span>held for authentication'
+            '</span>') in page
+    assert ">failed</span>" not in page
+    assert 'class="st tone-bad"' not in page, "a wait was toned as a failure"
+
+
 def test_a_round_that_really_failed_keeps_the_red_badge(client, project):
     """The other half, and the one a rendering fix breaks by accident: an outage and an
     unconfigured panel have no `hold_cause`, nothing is coming back on its own, and they
@@ -2652,3 +2673,33 @@ def test_the_browser_side_pattern_never_rejects_what_the_server_accepts(client):
         assert re.fullmatch(pattern, good), f"{pattern!r} rejects {good!r}"
     for bad in ("lots", "nan", "inf", "five dollars", "$"):
         assert not re.fullmatch(pattern, bad), f"{pattern!r} accepts {bad!r}"
+
+
+def test_the_work_order_page_says_the_pull_request_merged(client, daemon, project):
+    """The dashboard half of the 2026-09-25 spec §7 — off `ops.merge_state`, the same
+    derivation `jarvis wo show` reads, and off the event rather than `pr_state`."""
+    pr = "https://github.com/acme/proj/pull/735"
+    wo = ops.create_work_order("proj_a", "the cap")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        store.update_work_order(wo["id"], pr_url=pr)
+        store.set_status(wo["id"], "completed")
+        store.add_event(wo["id"], "pr_merged", {"pr_url": pr, "head_oid": "abc1234",
+                                                "merged_at": "2026-09-20T10:00:00Z",
+                                                "source": "landing_sweep"})
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert pr in page
+    assert "MERGED" in page
+
+
+def test_a_work_order_with_no_pull_request_says_nothing_about_merging(client, daemon,
+                                                                     project):
+    wo = ops.create_work_order("proj_a", "a planner")
+    daemon.tick()
+
+    assert "MERGED" not in client.get(f"/wo/proj_a/{wo['id']}").text

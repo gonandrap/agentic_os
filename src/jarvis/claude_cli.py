@@ -7,6 +7,7 @@ All interaction with Claude Code goes through here so tests can substitute a fak
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -73,9 +74,25 @@ def cache_env(explicit: dict[str, str] | None = None) -> dict[str, str]:
 #: docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
 
+#: Above this many BYTES the USER prompt goes to the CLI on STDIN rather than in argv.
+#: Same number and same reasoning as `SYSTEM_PROMPT_ARGV_LIMIT`, and a SEPARATE constant
+#: because the two doors are different mechanisms (`--append-system-prompt-file` vs
+#: stdin). Spec: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+PROMPT_ARGV_LIMIT = 64 * 1024
+
 
 class ClaudeCliError(RuntimeError):
     pass
+
+
+class InputTooLargeError(ClaudeCliError):
+    """`execve` refused the argv: one argument was past `MAX_ARG_STRLEN`.
+
+    A ClaudeCliError subclass so existing handlers still catch it, but a SEPARATE class
+    because it is deterministic: the same call will fail the same way for ever, so a
+    retry is only a delay. Distinguished from every transient outage by that fact.
+    Spec §4: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    """
 
 
 class AttributionRefused(RuntimeError):
@@ -89,19 +106,56 @@ class AttributionRefused(RuntimeError):
 
 
 @contextlib.contextmanager
-def _system_prompt_arg(system_prompt: str | None) -> Iterator[list[str]]:
-    """The flags that carry a system prompt, and the temporary file when it needs one."""
+def _prompt_file(text: str) -> Iterator[str]:
+    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="jarvis-system-",
+                                     encoding="utf-8", delete=True) as fh:
+        fh.write(text)
+        fh.flush()
+        yield fh.name
+
+
+@contextlib.contextmanager
+def _system_prompt_arg(system_prompt: str | None, *,
+                       keep_default_context: bool = False) -> Iterator[list[str]]:
+    """The flags that carry a system prompt, and the temporary file when it needs one.
+
+    REPLACES the CLI's default prompt unless `keep_default_context`. Spec:
+    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+    """
     if not system_prompt:
         yield []
         return
-    if len(system_prompt.encode()) <= SYSTEM_PROMPT_ARGV_LIMIT:
-        yield ["--append-system-prompt", system_prompt]
+    raw = system_prompt.encode()
+    if keep_default_context:
+        if len(raw) <= SYSTEM_PROMPT_ARGV_LIMIT:
+            yield ["--append-system-prompt", system_prompt]
+            return
+        with _prompt_file(system_prompt) as name:
+            yield ["--append-system-prompt-file", name]
         return
-    with tempfile.NamedTemporaryFile("w", suffix=".md", prefix="jarvis-system-",
+    if len(raw) <= SYSTEM_PROMPT_ARGV_LIMIT:
+        yield ["--system-prompt", system_prompt]
+        return
+    # No `--system-prompt-file` exists on CLI 2.1.282, so past the argv ceiling the
+    # CALLER'S OWN bytes split across both doors — a stub that talks about the prompt
+    # measured as an injection attempt and the model refused it.
+    cut = SYSTEM_PROMPT_ARGV_LIMIT
+    while cut > 0 and raw[cut] & 0xC0 == 0x80:  # never cut a UTF-8 sequence in half
+        cut -= 1
+    with _prompt_file(raw[cut:].decode()) as name:
+        yield ["--system-prompt", raw[:cut].decode(),
+               "--append-system-prompt-file", name]
+
+
+@contextlib.contextmanager
+def _empty_mcp_config() -> Iterator[list[str]]:
+    """`--mcp-config` naming a server-free file: `--strict-mcp-config` alone still
+    leaves the user's configured servers' schemas in the request."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="jarvis-mcp-",
                                      encoding="utf-8", delete=True) as fh:
-        fh.write(system_prompt)
+        json.dump({"mcpServers": {}}, fh)
         fh.flush()
-        yield ["--append-system-prompt-file", fh.name]
+        yield ["--mcp-config", fh.name]
 
 
 def claude_bin() -> str:
@@ -118,7 +172,15 @@ def version() -> str:
 
 
 def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
-         env_extra: dict[str, str] | None = None) -> str:
+         env_extra: dict[str, str] | None = None,
+         stdin_text: str | None = None) -> str:
+    """One `claude` call, waited for. `stdin_text` is the prompt's second door.
+
+    `input=None` leaves stdin inherited exactly as before, so no existing caller
+    changes. `encoding="utf-8"` rather than bare `text=True`: the locale encoding would
+    raise `UnicodeEncodeError` on a non-ASCII prompt under `LANG=C`. Spec §2:
+    docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    """
     env = os.environ.copy()
     # `env_extra` is caller intent and must win over the cache default; ambient env loses.
     env.update(cache_env(env_extra))
@@ -129,12 +191,22 @@ def _run(args: list[str], cwd: Path | None = None, timeout: int = 120,
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            input=stdin_text,
             timeout=timeout,
         )
     except FileNotFoundError as e:
         raise ClaudeCliError(f"`{claude_bin()}` not found on PATH") from e
     except subprocess.TimeoutExpired as e:
         raise ClaudeCliError(f"`claude {' '.join(args[:3])}...` timed out after {timeout}s") from e
+    except OSError as e:
+        # AFTER `FileNotFoundError`, which is an `OSError` and keeps its own message.
+        if e.errno == errno.E2BIG:
+            raise InputTooLargeError(
+                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
+            ) from e
+        raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
     if proc.returncode != 0:
         raise _cli_failure(args, proc.returncode, proc.stdout, proc.stderr)
     return proc.stdout
@@ -157,6 +229,11 @@ def _cli_failure(args: list[str], rc: int, stdout: str, stderr: str) -> ClaudeCl
     limit = usage_limit(detail)
     if limit is not None:
         return UsageLimitError(limit)
+    # AFTER the window and against the UNPREFIXED text: spec
+    # docs/superpowers/specs/2026-09-26-the-panel-must-not-mistake-an-auth-failure-for-a-verdict.md §2.
+    auth = auth_failure(detail)
+    if auth is not None:
+        return AuthFailureError(auth)
     return ClaudeCliError(
         f"claude {' '.join(args[:4])}... failed (rc={rc}): {detail[:500]}")
 
@@ -732,6 +809,7 @@ def turn_args(
     autocompact_window: int | None = None,
     agent: str | None = None,
     max_budget_usd: float | None = None,
+    prompt_via_stdin: bool = False,
 ) -> list[str]:
     """argv for one worker turn. Split out from `spawn_turn` so tests can assert on it.
 
@@ -765,6 +843,10 @@ def turn_args(
         # Formatted rather than str()'d so a computed remainder never reaches argv in
         # scientific notation, which the CLI's parser does not accept.
         args += ["--max-budget-usd", f"{max_budget_usd:.6f}"]
+    if prompt_via_stdin:
+        # Neither the fence nor the prompt: with no prompt in argv there is nothing to
+        # fence. Spec §3: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+        return args
     # Same fence, same reason as `spawn_background`: `--add-dir` and `--tools` are both
     # variadic and will eat the prompt as an option value if it arrives bare. Nothing
     # may be appended after this.
@@ -812,12 +894,21 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
     that same environment, which is the whole reason they share this one function.
     """
     outfile.parent.mkdir(parents=True, exist_ok=True)
-    args = turn_args(prompt, session_id, resume, **kwargs)
+    # THE PROMPT FILE BELONGS TO THE TURN, like `<seq>.json` and `<seq>.err`, and
+    # `worker_session._reap` deletes it: this function returns before the detached
+    # `claude` has read its stdin. Spec §3:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    big = len(prompt.encode()) > PROMPT_ARGV_LIMIT
+    promptfile = outfile.with_suffix(".prompt") if big else None
+    if promptfile is not None:
+        promptfile.write_text(prompt, encoding="utf-8")
+    args = turn_args(prompt, session_id, resume, prompt_via_stdin=big, **kwargs)
     env = {**os.environ, **cache_env()}
     if unit and systemd_units.use_transient_units():
         prefix = systemd_units.run_prefix(
             unit, cwd=cwd, outfile=outfile, errfile=errfile, env=env,
             description=f"jarvis worker turn ({session_id})",
+            stdin=promptfile,
         )
         try:
             # No redirection here: the unit's own StandardOutput= writes the result file,
@@ -840,17 +931,30 @@ def spawn_turn(prompt: str, cwd: Path, session_id: str, outfile: Path,
             log.warning("systemd-run failed for %s (%s): %s — spawning directly",
                         unit, done.returncode, (done.stderr or "").strip()[:300])
     try:
-        with outfile.open("w") as out, errfile.open("w") as err:
+        with contextlib.ExitStack() as stack:
+            out = stack.enter_context(outfile.open("w"))
+            err = stack.enter_context(errfile.open("w"))
+            # The child inherits a dup of the fd, so the parent's handle closing here is
+            # harmless. DEVNULL for the small case, unchanged: that is what stops the
+            # three-second wait.
+            stdin: Any = subprocess.DEVNULL
+            if promptfile is not None:
+                stdin = stack.enter_context(promptfile.open("rb"))
             proc = subprocess.Popen(
                 [claude_bin(), *args],
                 cwd=cwd,
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin,
                 stdout=out,
                 stderr=err,
                 start_new_session=True,
             )
-    except (FileNotFoundError, OSError) as e:
+    except OSError as e:
+        if e.errno == errno.E2BIG:
+            raise InputTooLargeError(
+                f"`{claude_bin()}` could not be started: the input was too large for the "
+                f"command line ({sum(len(a.encode()) for a in args)} bytes of arguments)"
+            ) from e
         raise ClaudeCliError(f"could not start `{claude_bin()}`: {e}") from e
     return SpawnedTurn(pid=proc.pid)
 
@@ -992,6 +1096,21 @@ class UsageLimitError(ClaudeCliError):
     def __init__(self, limit: UsageLimit) -> None:
         super().__init__(limit.message)
         self.limit = limit
+
+
+class AuthFailureError(ClaudeCliError):
+    """`claude` could not authenticate: the OAuth session expired, the login lapsed.
+
+    `UsageLimitError`'s shape, and a `ClaudeCliError` subclass for its reason: every
+    existing `except claude_cli.ClaudeCliError` keeps working unchanged and what this adds
+    is `auth`. The difference from the window is that NO deadline exists — what clears it
+    is a human — so the caller holds on a schedule rather than on a stated moment
+    (`Daemon._validation_auth_held`, GitHub issue #778).
+    """
+
+    def __init__(self, auth: AuthFailure) -> None:
+        super().__init__(auth.message)
+        self.auth = auth
 
 
 #: The legacy shape, and the only one that states the moment unambiguously:
@@ -1596,7 +1715,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                         timeout: int = 300, tools: str | None = None, *,
                         records_itself: str | Authorisation = "", record: Any = None,
                         permission_mode: str | None = None,
-                        env_extra: dict[str, str] | None = None) -> HeadlessResult:
+                        env_extra: dict[str, str] | None = None,
+                        settings: Path | str | None = None,
+                        keep_default_context: bool = False) -> HeadlessResult:
     """One-shot headless call (`claude -p`), with its accounting kept.
 
     The transport every OS-side agent runs on — Neo, the panel's seats, the dashboard
@@ -1642,6 +1763,15 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     workers; `env_extra` is how the sandbox gets on its PATH. Note it does NOT
     suppress attribution: a measured subject still spends the work order's tokens,
     and `env_extra` overriding `PATH` leaves `JARVIS_WO_ID` untouched.
+
+    THE CALL STARTS FROM NOTHING: `system_prompt` REPLACES the CLI's default prompt, and
+    a prompt-only call (`tools=""`) also loses the user's setting sources, MCP servers
+    and skills. A tooled callee keeps them, because they carry its permissions — Neo's
+    carve-out, question 670. `keep_default_context` appends instead, and is for an eval
+    whose SUBJECT is that default environment (only
+    `evals/llm/test_navigation_judgment.py`, which measures whether a worker reaches for
+    Serena); `settings` passes `--settings` for the same one. Spec:
+    docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
     """
     # FIRST, before any argument is built or any subprocess runs: a refused call spends
     # nothing (spec §2).
@@ -1651,21 +1781,32 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         _check_kind(records_itself.kind)
     elif records_itself:
         _check_records_itself(records_itself)
-    args: list[str] = ["-p", prompt, "--output-format", "json"]
+    # THE PROMPT'S SECOND DOOR, spec §2:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
+    args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
+                       "--no-session-persistence"]
     if model:
         args += ["--model", model]
+    if settings:
+        args += ["--settings", str(settings)]
     if tools is not None:  # "" is meaningful: it disables every tool
         args += ["--tools", tools]
-    if tools == "":
-        # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's schemas
-        # in the request, reachable. See spec §4: a seat asked to name its tools listed
-        # eleven Google Drive verbs. "Judges the prompt and only the prompt" is what
-        # `tools=""` means, so the two ship together.
-        args += ["--strict-mcp-config"]
     if permission_mode:
         args += ["--permission-mode", permission_mode]
-    with _system_prompt_arg(system_prompt) as extra:
-        out = _run(args + extra, cwd=cwd, timeout=timeout, env_extra=env_extra)
+    with contextlib.ExitStack() as stack:
+        if tools == "":
+            # `--tools ""` strips the BUILT-IN tools and leaves every MCP server's
+            # schemas in the request, reachable. See spec §4: a seat asked to name its
+            # tools listed eleven Google Drive verbs. "Judges the prompt and only the
+            # prompt" is what `tools=""` means, so these ship together — no servers, no
+            # setting sources (hence no hooks, no plugins) and no skills.
+            args += ["--strict-mcp-config", *stack.enter_context(_empty_mcp_config()),
+                     "--setting-sources", "", "--disable-slash-commands"]
+        args += stack.enter_context(
+            _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
+        out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
+                   stdin_text=prompt if over else None)
     data: Any = None
     try:
         data = json.loads(out)
@@ -1695,7 +1836,9 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                  timeout: int = 300, tools: str | None = None, *,
                  records_itself: str | Authorisation = "", record: Any = None,
                  permission_mode: str | None = None,
-                 env_extra: dict[str, str] | None = None) -> str:
+                 env_extra: dict[str, str] | None = None,
+                 settings: Path | str | None = None,
+                 keep_default_context: bool = False) -> str:
     """`run_headless_result`, keeping only the text.
 
     Kept for callers that have nothing to account against — and for the `call=` seams,
@@ -1712,7 +1855,8 @@ def run_headless(prompt: str, system_prompt: str | None = None,
                                cwd=cwd, timeout=timeout, tools=tools,
                                records_itself=records_itself, record=record,
                                permission_mode=permission_mode,
-                               env_extra=env_extra).text
+                               env_extra=env_extra, settings=settings,
+                               keep_default_context=keep_default_context).text
 
 
 def unpack_headless(value: HeadlessResult | str) -> tuple[str, dict[str, Any] | None]:

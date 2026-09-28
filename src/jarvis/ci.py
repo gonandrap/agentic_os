@@ -320,6 +320,71 @@ def run_url(owner: str, repo: str, run_id: int) -> str:
     return f"https://github.com/{owner}/{repo}/actions/runs/{int(run_id)}"
 
 
+#: How far back the carry's parentage walk reads, in commits and therefore in API calls.
+#: Spec 2026-09-27 §3.2 item 5: ten catch-ups on one parked pull request is not a case
+#: worth an unbounded walk, and past the bound the pull request falls through to the
+#: re-judge — today's behaviour, at a cost that is stated rather than discovered.
+CHAIN_LIMIT = 10
+
+
+def base_merge_chain(pr_url: str, judged: str, head: str, *, base_ref: str,
+                     cwd: Path | None = None) -> tuple[tuple[str, str, bool], ...]:
+    """`judged..head` as a chain of MERGES THAT ADDED NOTHING UNJUDGED, oldest first, or `()`.
+
+    PROOF (a) of the verdict carry
+    (docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.2), and
+    `commit_parents` N times: `carry_validated_head`'s one-merge shape generalised to the
+    chain that actually occurs, because base merges arrive in runs — a worker merges
+    `main`, CI is slow, `main` moves, the OS merges `main` again.
+
+    Each element is `(merge commit, the commit it merged in, whether that is a base
+    commit)`, so the caller can record the two lists the event carries — base commits and
+    the branch's own — without re-deriving either.
+
+    Walking FIRST PARENTS BACKWARDS FROM `head`, every commit must have exactly two
+    parents: one parent is authored content, and three is an octopus merge nothing here
+    reasons about. The second parent must be an ancestor of `origin/{base_ref}` **or an
+    ancestor of `judged`** — asked LOCALLY through `branchproof.is_ancestor`, for the
+    reason in its docstring. Neo question 806 widened it to the second case: a worker's
+    `git pull --no-rebase` before pushing leaves a merge of two lineages of the BRANCH,
+    and a second parent the judged commit already contains adds no commit that was not
+    judged. Anything else is somebody's authored content arriving in the same shape. A
+    fetch failure therefore reads as "not an ancestor" and refuses, which is the direction
+    this has to fall.
+
+    Proof (b) is REQUIRED alongside and this is never sufficient alone (§3.3).
+
+    `GitHubError` propagates: the caller leaves the pull request exactly where it was,
+    `carry_validated_head`'s failure direction.
+    """
+    from . import branchproof
+
+    if not SHA_RE.match(judged or "") or not SHA_RE.match(head or "") or cwd is None:
+        return ()
+    chain: list[tuple[str, str, bool]] = []
+    cursor = head
+    for _ in range(CHAIN_LIMIT):
+        parents = commit_parents(pr_url, cursor, cwd=cwd)
+        if len(parents) != 2:
+            log.info("%s is not a base merge — its parents are %s", cursor[:10],
+                     [p[:10] for p in parents] or "unreadable")
+            return ()
+        is_base = branchproof.is_ancestor(cwd, parents[1], f"origin/{base_ref}")
+        # §3.2 item 6, widened by Neo question 806: a base commit, OR one the judged
+        # commit already contains (a `git pull --no-rebase` merge of the branch itself).
+        if not is_base and not branchproof.is_ancestor(cwd, parents[1], judged):
+            log.info("%s merged %s, which is an ancestor of neither origin/%s nor %s",
+                     cursor[:10], parents[1][:10], base_ref, judged[:10])
+            return ()
+        chain.append((cursor, parents[1], is_base))
+        cursor = parents[0]
+        if cursor == judged:
+            return tuple(reversed(chain))
+    log.info("more than %d commits between %s and %s — not walking further", CHAIN_LIMIT,
+             judged[:10], head[:10])
+    return ()
+
+
 # -- the decision, pure ---------------------------------------------------------------
 
 

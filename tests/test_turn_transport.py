@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -526,3 +527,82 @@ def test_env_extra_reaches_the_subprocess_environment(monkeypatch, tmp_path) -> 
     assert seen["env"][claude_cli.TURN_TRANSPORT_ENV] == claude_cli.TRANSPORT_BACKGROUND
     # and the ambient environment still rides along, or the turn loses PATH
     assert "PATH" in seen["env"]
+
+
+# -- a brief too big for argv ----------------------------------------------------------
+# docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+
+
+#: Past `MAX_ARG_STRLEN`, not merely past the door's own threshold.
+OVER_EXECVE = 131_072 + 1
+
+
+def test_a_big_brief_reaches_a_transient_unit_on_stdin(
+        fake_claude, fake_systemd, tmp_path) -> None:
+    """`StandardInput=file:` is the transient unit's counterpart of the `stdin=` the
+    direct path passes; without it the turn launches with an EMPTY brief."""
+    prompt = "z" * OVER_EXECVE + "\nTHE_UNIT_BRIEF_MARKER"
+
+    claude_cli.spawn_turn(prompt, cwd=tmp_path, session_id="s-unit",
+                          outfile=tmp_path / "1.json", errfile=tmp_path / "1.err",
+                          unit="jarvis-turn-wo-9-1.service")
+
+    promptfile = tmp_path / "1.prompt"
+    run = fake_systemd.runs[-1]["argv"]
+    assert f"--property=StandardInput=file:{promptfile}" in run
+    assert "--property=StandardInput=null" not in run
+    unit = fake_systemd.units["jarvis-turn-wo-9-1.service"]
+    assert "--" not in unit["argv"], f"the prompt is still in argv; argv={unit['argv']}"
+    record = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])[-1]
+    assert record["prompt"] == prompt
+
+
+def test_the_prompt_file_outlives_the_spawn_and_dies_with_the_reap(fleet) -> None:
+    """A context manager here would unlink the file before the detached `claude` read
+    it — a turn dispatched with an empty brief, which fails silently."""
+    store = fleet["store"]
+    prompt = "w" * OVER_EXECVE
+    wo = ops.create_work_order("proj_a", "task")
+    turn, _ = worker_session.start(store, fleet["project"],
+                                   store.get_work_order(wo["id"]), prompt)
+
+    promptfile = Path(turn["outfile"]).with_suffix(".prompt")
+    assert promptfile.exists(), "unlinked before the turn could read it"
+    _wait_for_result(Path(turn["outfile"]))
+
+    assert _poll_until_settled(store), "the turn never settled"
+    assert not promptfile.exists(), "the reap left the prompt file behind"
+
+
+def test_reaping_a_turn_that_never_spawned_does_not_raise(fleet) -> None:
+    """A turn row exists before the process does, so `outfile` can still be empty.
+
+    `Path("")` is `PosixPath('.')` and `.with_suffix()` raises `ValueError` on it — the
+    prompt-file unlink has to be as guarded as the `errfile` beside it.
+    """
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "never spawned")
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="work")
+    assert turn["outfile"] == ""
+
+    settled = worker_session._reap(store, turn, "proj_a")
+
+    assert settled["state"] == "failed"
+
+
+def test_a_fake_claude_with_no_argv_prompt_never_blocks_on_a_terminal(
+        fake_claude, tmp_path) -> None:
+    """`resolved_prompt` reads stdin for any `-p` call carrying no prompt in argv — a
+    headless `--resume` among them. With an inherited terminal that read never returns,
+    so the fake hangs and takes the test session with it.
+    """
+    leader, follower = os.openpty()
+    try:
+        subprocess.run(  # the pin is that it RETURNS at all
+            [os.environ["JARVIS_CLAUDE_BIN"], "-p", "--output-format", "json"],
+            stdin=follower, capture_output=True, text=True, timeout=20, cwd=tmp_path)
+    finally:
+        os.close(follower)
+        os.close(leader)
+
+    assert fake_claude.calls[-1]["prompt"] == ""

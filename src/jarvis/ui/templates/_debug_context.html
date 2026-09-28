@@ -1,0 +1,93 @@
+{% import "_debug.html" as ui %}
+{# 4. THE CONTEXT LEDGER — `ops.context_report`: what Jarvis put in each window, and the
+   delta between turns. FORWARD-ONLY, and the surface says so: an order whose turns ran
+   before the ledger landed renders the payload's own note and NOT an empty table, which
+   is what a reader reports as a bug (spec §5, issue #227).
+
+   All the arithmetic is the payload's — the residual subtraction, the per-turn delta and
+   the sentence naming a prefix break are its keys, not this block's. #}
+<section id="block-context">
+<h2>What was in the context window</h2>
+{{ ui.failed(context) }}
+{% if context.payload %}
+{% set c = context.payload %}
+{% if not c.recorded %}{{ ui.note(c.note) }}{% endif %}
+{% for turn in c.turns %}
+<div class="panel" style="margin-bottom: 10px;">
+  <div class="row">
+    <span class="mono" style="width: 70px;">{{ turn_label(turn.seq) }}</span>
+    <span class="grow mono">{{ turn.kind }}</span>
+    <span class="kv">{{ fmt_ts(turn.started_at) }}</span>
+  </div>
+  {% if not turn.recorded %}
+  {{ ui.note(turn.note) }}
+  {% else %}
+  {# Fixed columns: `table-layout: auto` sized turn 1's table off its empty note column and
+     turn 2's off a full one, so two readings of the same ledger did not line up. #}
+  <table style="table-layout: fixed;">
+    <tr><th style="width: 200px;">ingredient</th><th style="width: 120px;">bytes</th>
+        <th style="width: 120px;">tokens</th><th>what it is</th></tr>
+    {% for row in turn.ingredients %}
+    <tr>
+      <td class="mono">{{ row.name }}</td>
+      {# An ingredient that cannot be read is None with a sentence, never 0 bytes. #}
+      <td class="mono">{{ '{:,}'.format(row.bytes) if row.bytes is not none else '–' }}</td>
+      {# Commas and not `fmt_tok`: `jarvis wo context` prints this column as `{:,}` and an
+         abbreviated 47k beside its 47,104 is the same figure in two shapes. #}
+      <td class="mono">{{ '{:,}'.format(row.tokens) if row.tokens is not none else '–' }}</td>
+      <td class="sub">{{ row.note }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <div class="row">
+    <span class="kv" style="width: 120px;">residual</span>
+    {% if turn.residual %}
+    {# LABELLED AS THE RESIDUAL IT IS: Claude Code's own share is INFERRED by subtraction
+       from the cold-start write, never measured (kn-0cb81cec) — `measured: false`. #}
+    <span class="grow sub">{{ turn.residual.note }}</span>
+    {# `tokens: None` is the unknown residual and prints as absent, never as 0 — the
+       payload's `absent` flag decides, not this template. #}
+    <span class="kv mono">{{ '{:,}'.format(turn.residual.tokens) if not turn.residual.absent else 'unknown' }}{{ ' (INFERRED, not measured)' if not turn.residual.measured }}</span>
+    {% else %}
+    <span class="grow sub">{{ turn.residual_note }}</span>
+    {% endif %}
+  </div>
+  {% if turn.delta %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">delta</span>
+    <span class="grow sub">against {{ turn_label(turn.delta.against_seq) }}{% if turn.delta.biggest_growth %} — biggest growth
+      <span class="mono">{{ turn.delta.biggest_growth }}</span>{% endif %}</span>
+  </div>
+  {# The same rows `cli._print_context` keeps, on the same two conditions: an ingredient
+     absent on both turns is not an event, and neither is a measured change of zero. An
+     ingredient that appeared or disappeared HAS no delta and is still shown. #}
+  {% for row in turn.delta.rows
+     if row.kind != 'absent' and not (row.kind == 'change' and not row.bytes_delta) %}
+  <div class="row">
+    <span class="mono" style="width: 120px;">{{ row.name }}</span>
+    <span class="grow sub">{{ row.note }}</span>
+    <span class="kv mono">{{ '{:+,}'.format(row.bytes_delta) ~ ' bytes' if row.bytes_delta is not none else row.kind }}</span>
+  </div>
+  {% endfor %}
+  {% endif %}
+  {% if turn.prefix_break %}
+  <div class="row">
+    <span class="st tone-warn wrap"><span class="i">⚠</span>{{ turn.prefix_break.cause }} —
+      {{ fmt_tok(turn.prefix_break.tokens_rewritten) }} tokens re-written.</span>
+  </div>
+  {# THE PRECEDENCE, beside the hypothesis and never without it: the write classification
+     is the authority and this report raises no alarm of its own (kn-fafe92b7,
+     kn-2c41d4cc). `authority` is the payload's copy of `ops.PREFIX_AUTHORITY`. #}
+  {{ ui.note(turn.prefix_break.authority or prefix_authority) }}
+  {{ ui.note(turn.prefix_break.note) }}
+  {% endif %}
+  {% if turn.caps %}
+  <div class="sub" style="padding: 8px 16px;">Measured at
+    {% for key, value in turn.caps.items() %}<span class="mono">{{ key }} {{ value }}</span>{{ " · " if not loop.last }}{% endfor %}{% if turn.token_bytes %};
+    tokens estimated at {{ turn.token_bytes }} bytes each{% endif %}.</div>
+  {% endif %}
+  {% endif %}
+</div>
+{% endfor %}
+{% endif %}
+</section>

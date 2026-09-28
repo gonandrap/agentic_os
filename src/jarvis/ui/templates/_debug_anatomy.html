@@ -1,0 +1,162 @@
+{% import "_debug.html" as ui %}
+{# 3. THE FULL ANATOMY — `ops.inspect_report`, which has had NO dashboard surface at all
+   until this page (spec §7). Per-turn partition bars off each turn's `share`, the tool
+   profile, every tool call with its parameters, the subagents nested under the turn they
+   ran in, and the cache writes with the prose cause `inspection` attributed them to.
+   Nothing here is computed: the floors, the caps and the depth read are STATED, because a
+   truncation the reader cannot size is not reproducible (spec §4a). #}
+<section id="block-anatomy">
+<h2>Where the time went</h2>
+{{ ui.failed(anatomy) }}
+{% if anatomy.payload %}
+{% set a = anatomy.payload %}
+<div class="panel">
+  <div class="row">
+    <span class="sub">Read at a write floor of {{ fmt_tok(a.write_floor) }} tokens and a
+      join floor of {{ a.join_floor }}s — both per-project settings
+      (<code>jarvis config set {{ project }} inspect.report_write_floor</code>).</span>
+  </div>
+</div>
+
+{% for u in a.units %}
+{% if not u.found %}
+{# The same answer `jarvis cost` and `cli._print_anatomy` give, in their words: Claude
+   Code prunes transcripts on its own schedule, and an unmeasurable clock is not a zero
+   one (issue #227). #}
+{{ ui.note("no transcript — nothing to measure. Session: " ~ (u.session_id or "none recorded")) }}
+{% else %}
+<div class="panel">
+  <div class="row">
+    <span class="kv" style="width: 120px;">session</span>
+    <span class="grow mono sid">{{ u.session_id }}</span>
+    <span class="kv mono">wall {{ fmt_dur(u.partition.wall) }} ·
+      active {{ fmt_dur(u.partition.active) }} · held {{ fmt_dur(u.partition.held) }}</span>
+  </div>
+  {% for k in parts %}
+  <div class="row">
+    {# `%.0f`, EXACTLY as `cli._print_partition` formats the same share: half-up there and
+       floor here would make 0.335 read 34% in the terminal and 33% on the page — two
+       surfaces disagreeing about one number, which is what §7 forbids. #}
+    <span class="mono" style="width: 64px; text-align: right;">{{ "%.0f"|format(u.share[k] * 100) }}%</span>
+    <span class="mono" style="width: 70px; text-align: right;">{{ fmt_dur(u.partition[k]) }}</span>
+    <span class="grow sub">{{ part_labels[k] }}</span>
+  </div>
+  {% endfor %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">unexplained</span>
+    {# The sentence is `ops.UNEXPLAINED_NOTE`, the one `jarvis wo why` prints: a residual
+       described in two wordings is one the reader learns to ignore. #}
+    <span class="grow sub">{{ unexplained_note }}</span>
+    <span class="kv mono">{{ fmt_dur(u.partition.unexplained) }}</span>
+  </div>
+  <div class="row">
+    <span class="kv" style="width: 120px;">cache</span>
+    <span class="grow mono">re-written {{ fmt_tok(u.rewrite_excess) }} · peak
+      {{ fmt_tok(u.context_peak) }} · bought at 5m {{ fmt_tok(u.cache_ttl.cache_5m) }},
+      1h {{ fmt_tok(u.cache_ttl.cache_1h) }}{% if u.cache_ttl.unknown %}, unknown
+      {{ fmt_tok(u.cache_ttl.unknown) }}{% endif %}</span>
+  </div>
+  {% for cause, seconds in u.held_by.items() %}
+  <div class="row"><span class="kv" style="width: 120px;">held by</span>
+    {# The legend travels WITH the reading (`hold_causes`), so no surface keeps its own
+       copy of the wording. #}
+    <span class="grow">{{ u.hold_causes.get(cause, cause) }}</span>
+    <span class="kv mono">{{ fmt_dur(seconds) }}</span></div>
+  {% endfor %}
+</div>
+
+<h2>Turn by turn</h2>
+{{ ui.bar_legend() }}
+<div class="panel">
+  {% for turn in u.turns %}
+  <div class="row">
+    <span class="mono" style="width: 70px;">{{ turn_label(turn.seq) }}</span>
+    {{ ui.bar(turn.share) }}
+    <span class="grow sub">{% for t in turn.triggers %}{{ t.kind }}{{ ", " if not loop.last }}{% else %}no prompt recorded{% endfor %}</span>
+    <span class="kv mono">{{ fmt_dur(turn.wall) }}{% if turn.held %} · held {{ fmt_dur(turn.held) }}{% endif %}</span>
+  </div>
+  {# `observed` is the headline fact about a turn and is carried rather than inferred
+     from `api_calls == 0` — the inference is what four layers got wrong (issue #227). #}
+  {% if not turn.observed %}
+  <div class="row"><span class="st tone-warn wrap"><span class="i">⚠</span>nothing in this
+    turn ever reached the API, so its remainder is unaccounted rather than generating.</span></div>
+  {% endif %}
+  {% for t in turn.triggers %}
+  <div class="sub" style="padding: 0 16px 6px;"><span class="mono">{{ t.kind }}</span>
+    ({{ t.source }}) {{ t.quote }}</div>
+  {% endfor %}
+  {% for span in turn.spans %}
+  <div class="row">
+    <span class="mono" style="width: 110px;">{{ span.name }}</span>
+    <span class="grow">{{ span.detail }}{{ ui.params(span) }}</span>
+    <span class="kv mono">{{ fmt_dur(span.seconds) if span.finished else 'never returned' }}</span>
+  </div>
+  {% endfor %}
+  {% for s in turn.subagents %}{{ ui.subagent(s) }}{% endfor %}
+  {% endfor %}
+</div>
+
+{% if u.unattached_subagents %}
+<h2>Subagents that could not be attached</h2>
+<div class="panel">
+  {# Reported HERE rather than under a turn: a timestamp fallback invents a parent the
+     record does not name (issue #227, spec §4b). #}
+  {{ ui.note("no tool span of this session names these transcripts, so this report cannot
+              say which turn they ran in.") }}
+  {% for s in u.unattached_subagents %}{{ ui.subagent(s) }}{% endfor %}
+</div>
+{% endif %}
+
+{% if u.tools %}
+<h2>Tool profile</h2>
+<div class="panel"><table>
+  <tr><th>tool</th><th>calls</th><th>total</th><th>mean</th><th>never returned</th></tr>
+  {% for row in u.tools %}
+  <tr><td class="mono">{{ row.name }}</td><td>{{ row.calls }}</td>
+      <td>{{ fmt_dur(row.seconds) }}</td><td>{{ fmt_dur(row.mean) }}</td>
+      <td>{{ row.unfinished or '–' }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+
+{% if u.joins %}
+<h2>Blocking joins at or over {{ u.join_floor }}s</h2>
+<div class="panel">
+  {% for span in u.joins %}
+  <div class="row"><span class="mono" style="width: 110px;">{{ span.name }}</span>
+    <span class="grow">{{ span.detail }}</span>
+    <span class="kv mono">{{ fmt_dur(span.seconds) }}</span></div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<h2>Cache writes, classified</h2>
+<div class="panel">
+  {% if u.writes %}
+  {% for w in u.writes %}
+  <div class="row">
+    <span class="mono" style="width: 110px;">{{ w.cause }}</span>
+    <span class="grow sub">{{ w.note }}</span>
+    <span class="kv mono">{{ fmt_tok(w.written) }} · {{ fmt_ts(w.ts) }}</span>
+  </div>
+  {% endfor %}
+  {% else %}
+  {{ ui.note("no cache write in this session reached the write floor above — a
+              `ttl-expiry` and a `prefix-miss` look identical on a bill and have
+              completely different fixes, so only writes big enough to classify are
+              reported.") }}
+  {% endif %}
+</div>
+
+<div class="panel" style="margin-top: 10px;">
+  {# The caps, stated for the same reason the floors are (spec §4a). #}
+  <div class="sub" style="padding: 10px 16px;">Tool parameters above are cut at
+    {{ u.param_caps.per_value }} characters per value, {{ u.param_caps.per_span }} per
+    call and {{ u.param_caps.per_turn }} per turn; every key is accounted for as kept,
+    shortened or dropped. Subagents are read {{ u.subagent_depth_read }} level deep —
+    deeper ones are counted, not read.</div>
+</div>
+{% endif %}
+{% endfor %}
+{% endif %}
+</section>

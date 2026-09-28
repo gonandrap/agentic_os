@@ -2,6 +2,7 @@
 {% import "_bill.html" as bill_ui %}
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
+{% import "_states.html" as states_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -64,6 +65,13 @@
     <p class="kv">⑃ pull request:
       <a href="{{ wo.pr_url }}" rel="noopener">{{ wo.pr_url }}</a>
       {%- if wo.status == 'waiting_pr_merge' %} — merge it, then "Mark done".{% endif %}</p>
+    {# Whether it landed, derived by `ops.merge_state` from the timeline and never from
+       `pr_state` — the same helper `jarvis wo show` renders. Absent while nothing has
+       looked yet: "nothing has looked" is not "did not merge". #}
+    {% if merge_state and merge_state.state %}
+      <p class="sub">⑃ state: {{ merge_state.state }}
+        {%- if merge_state.head_oid %} at {{ merge_state.head_oid[:10] }}{% endif %}</p>
+    {% endif %}
     {# What the OS did, or declined to do, about merging it. Absent entirely unless the
        mechanism has touched this order — which is every order on a project that has not
        opted in — and NEVER a warning tone: a held auto-merge means the user merges this
@@ -192,6 +200,14 @@
     · <a href="/cost/{{ project }}/{{ wo.id }}">details →</a>
   </p>
   {% endif %}
+  {# The four readings this page does not carry: why it is not moving, what its turn is
+     doing right now, where the time went and what was in the window (spec §7 of
+     docs/specs/2026-09-24-order-observability.md). Linked from here as well as from the
+     bill, because a page reachable only from the bill is unreachable in practice. #}
+  <p class="kv mono" style="margin-bottom:0;">
+    <a href="/wo/{{ project }}/{{ wo.id }}/debug">why it is not moving, and where the
+      time went →</a>
+  </p>
   {# THE CEILING AND THE CONTROL THAT CHANGES IT, together. The box is always offered,
      because setting a budget on an order that has none is as much a thing the reader
      came here to do as raising one that ran out. The numbers beside it are
@@ -411,6 +427,12 @@
     <button role="tab" data-panel="tab-timeline" aria-selected="false"
             aria-controls="tab-timeline">Timeline
       {%- if timeline %}<span class="n">{{ timeline|length }}</span>{% endif %}</button>
+    {# A tab and not a header block: the ask is diagnostic, and only what asks something
+       of the reader lives above the tabs (spec §7). #}
+    <button role="tab" data-panel="tab-states" aria-selected="false"
+            aria-controls="tab-states">Time in state
+      {%- if states.current_status_age_human %}
+      <span class="n">{{ states.current_status_age_human }}</span>{% endif %}</button>
   </div>
 
 <section class="tabpanel on" id="tab-conversation" role="tabpanel">
@@ -510,6 +532,10 @@
       ({{ debug_count }})</a>
   {% endif %}
 </div>
+</section>
+
+<section class="tabpanel" id="tab-states" role="tabpanel">
+{{ states_ui.view(states) }}
 </section>
 </div>
 

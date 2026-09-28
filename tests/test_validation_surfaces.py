@@ -138,7 +138,9 @@ def test_wo_show_json_adds_the_rounds_and_changes_nothing_else(
 
     assert set(after) == set(before)
     for key in before:
-        if key == "validation_rounds":
+        # `time_in_state` is a present-tense reading (`ops.state_durations`), so it moves
+        # between two calls by design — spec 2026-09-27-time-in-each-state §4.
+        if key in ("validation_rounds", "time_in_state"):
             continue
         assert type(after[key]) is type(before[key]), key
         assert after[key] == before[key], key
