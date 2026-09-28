@@ -759,6 +759,27 @@ def _retired(row: Mapping[str, Any]) -> bool:
     return bool(row.get("retired_at")) or row.get("status") == RETRACTED
 
 
+#: Weakest first. A pair is only as live as its weaker half.
+_STRENGTH = {RETRACTED: 0, DRY_RUN: 1, ARMED: 2}
+
+
+def effective_status(detector: Mapping[str, Any],
+                     remedy_rule: Mapping[str, Any]) -> str:
+    """The status of a rule as a PAIR: the weaker of detector and remedy row.
+
+    `retracted` < `dry_run` < `armed`, so a retracted half makes the pair dead and a
+    `dry_run` half can never be acted on armed. Every caller downstream reads the pair
+    through this and never the remedy row alone — the precedence is stated once, here,
+    so nothing re-derives it and gets it backwards (spec §3.3).
+
+    Pure: it takes row mappings and touches no store.
+    """
+    det = RETRACTED if _retired(detector) else str(detector.get("status") or DRY_RUN)
+    rem = RETRACTED if _retired(remedy_rule) else str(
+        remedy_rule.get("status") or DRY_RUN)
+    return det if _STRENGTH.get(det, 0) <= _STRENGTH.get(rem, 0) else rem
+
+
 def readable_detectors(
     detectors: Iterable[Mapping[str, Any]],
 ) -> tuple[list[tuple[Mapping[str, Any], dict[str, Any]]],
@@ -1100,10 +1121,16 @@ _SEEDS: tuple[dict[str, Any], ...] = (
             # writer knows about is an account nobody can check. So this reason has to
             # become one of `true_blockers`' own. Flagged here rather than fixed here:
             # the primitives section owns `raise_attention` and owns making that true.
+            # §4: `raise_attention` RENDERS its reason from a TEMPLATE KEY and never
+            # relays one. The closed tuple of keys lives in `remedies.py` and is that
+            # section's to define; this is the key this seed row claims, and §5.3
+            # reconciles it against the real tuple. The words a reviewer reads are the
+            # `argument` below — the field for words — not a parameter.
             {"primitive": "raise_attention",
-             "params": {"reason": ("the release this order would ship has already "
-                                   "landed — close it with `jarvis wo done`")},
-             "argument": ("INV-WORK-LANDED has already recorded that the work this order "
+             "params": {"reason_key": "overtaken-release-order"},
+             "argument": ("The release this order would ship has already landed: close "
+                          "it with `jarvis wo done`. "
+                          "INV-WORK-LANDED has already recorded that the work this order "
                           "would ship is on the default branch: it was overtaken, and it "
                           "has done nothing for an hour. Nothing is wrong and nothing "
                           "needs fixing — it needs CLOSING, by the user, with `jarvis wo "

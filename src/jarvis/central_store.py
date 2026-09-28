@@ -312,6 +312,16 @@ CREATE TABLE IF NOT EXISTS detectors (
     seed_version INTEGER NOT NULL DEFAULT 0
 );
 
+-- `status` here uses the SAME three values as `detectors.status` and is never set on its
+-- own: A REMEDY ROW FOLLOWS ITS DETECTOR. The alarm bridge's `arm_detector` flips the
+-- detector and every non-retracted remedy row under it in ONE transaction; the disarm
+-- interlock flips the same set back to `dry_run`; `retract_detector` retracts its remedy
+-- rows with the detector's own reason. The ONE independent verb is `retract_remedy_rule`,
+-- which retracts one remedy under a LIVE detector — that is how a remedy is replaced
+-- without losing the condition's hit history, which is the whole reason the rule is two
+-- rows. So a remedy row is never `armed` under a `dry_run` detector, and the EFFECTIVE
+-- status of a rule is the WEAKER of the two: read the pair through
+-- `rules.effective_status`, never the remedy row alone.
 CREATE TABLE IF NOT EXISTS remedy_rules (
     id TEXT PRIMARY KEY,                  -- 'rm-' + db.new_id
     detector_id TEXT NOT NULL REFERENCES detectors(id),
@@ -1274,6 +1284,10 @@ class CentralStore:
         `detector_id` is a parameter for the reason `add_gate_rule`'s is: the seeder
         passes a CONTENT-DERIVED id (`rules.seed_id`) so re-seeding is idempotent and
         cannot resurrect a rule the user retracted.
+
+        An `io` detector may not be fleet-wide. Widening one afterwards is a person
+        RETRACTING the scoped row and registering a fleet-wide one — which leaves both on
+        the record with their reasons — and never an `UPDATE` nobody reviews.
         """
         from . import probes, rules
 
@@ -1281,6 +1295,21 @@ class CentralStore:
             raise ValueError(
                 f"gap_class {gap_class!r} is not a slug — it is the key later sections "
                 f"join on, so it must match {probes.ID_PATTERN.pattern}")
+        # A rule learned on one project may not silently police the others. Fleet-wide is
+        # the POWERFUL case, so it is the REVIEWED one: only `builtin` (seed rows, which
+        # are reviewed code in a diff) and `user` (a person typing) may take it. An
+        # investigation's rule is scoped to the project that produced it, always.
+        # Widening one afterwards is a person retracting the scoped row and registering a
+        # fleet-wide one, leaving both on the record with their reasons — never an
+        # `UPDATE` nobody reviews (spec §3).
+        if source == "io" and not project:
+            raise ValueError(
+                "an io-learned detector may not be fleet-wide: pass the project that "
+                "produced it. A rule learned on one project may not silently police the "
+                "others, and only `builtin` and `user` detectors — reviewed code, or a "
+                "person typing — may leave `project` empty. To widen this one later, "
+                "retract it and register a fleet-wide rule, so both stay on the record "
+                "with their reasons.")
         parsed = rules.parse_condition(condition)
         did = detector_id or db.new_id("dt")
         self.conn.execute(
@@ -1345,6 +1374,17 @@ class CentralStore:
 
         A retracted detector is refused because a live remedy row under a dead detector
         is a row `rules.resolve` would still pair if anything looked it up by primitive.
+
+        THE STATE MACHINE: a remedy row follows its detector. Same three values as
+        `detectors.status`, and nothing here sets `armed` — the alarm bridge's
+        `arm_detector` flips the detector and every non-retracted remedy row under it in
+        one transaction, the disarm interlock flips the same set back, and
+        `retract_detector` retracts them with the detector's reason. The one independent
+        verb is `retract_remedy_rule`, which retracts one remedy under a LIVE detector:
+        that is how a remedy is replaced without losing the condition's history, which is
+        why the rule is two rows. A remedy row is therefore never `armed` under a
+        `dry_run` detector, and a rule's EFFECTIVE status is the weaker of the pair —
+        read it through `rules.effective_status`, never off this row alone.
         """
         from . import rules
 

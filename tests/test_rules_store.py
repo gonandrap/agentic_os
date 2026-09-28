@@ -19,8 +19,10 @@ Spec: docs/specs/2026-09-27-self-evolution.md §3.1, §3.3, §3.4.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import subprocess
+import textwrap
 
 import pytest
 
@@ -290,3 +292,71 @@ def test_a_database_written_before_these_tables_existed_opens_and_works(jarvis_h
         assert store.open_rule_fire(det["id"], "wo-1")["id"] == fire["id"]
     finally:
         store.close()
+
+
+# -- scope: an io-learned rule may not police the fleet ----------------------------------
+
+
+def test_an_io_learned_detector_may_not_be_fleet_wide(store):
+    """§3: fleet-wide is the POWERFUL case, so it is the reviewed one."""
+    with pytest.raises(ValueError) as e:
+        _detector(store, source="io", project="")
+    assert "io" in str(e.value) and "project" in str(e.value)
+    assert store.list_detectors(include_retired=True) == []
+
+    scoped = _detector(store, source="io", project="jarvis_os")
+    assert scoped["project"] == "jarvis_os"
+
+
+@pytest.mark.parametrize("source", ["builtin", "user"])
+def test_builtin_and_user_detectors_may_be_fleet_wide(store, source):
+    det = _detector(store, source=source, project="")
+    assert det["project"] == "" and det["source"] == source
+
+
+# -- a remedy row follows its detector ---------------------------------------------------
+
+
+def test_add_remedy_rule_always_writes_dry_run(store):
+    det = _detector(store)
+    assert store.add_remedy_rule(det["id"], "nudge")["status"] == rules.DRY_RUN
+
+
+def test_this_section_exposes_no_verb_that_arms_a_remedy_row(store):
+    """Arming lands with the alarm bridge, in one transaction over the pair. Nothing
+    here may set a remedy row to `armed` — that would make the pair a combination §3.3
+    says cannot exist."""
+    assert [n for n in dir(CentralStore) if "arm" in n.lower()] == []
+    for verb in (CentralStore.add_remedy_rule, CentralStore.retract_remedy_rule,
+                 CentralStore.retract_detector):
+        body = ast.parse(textwrap.dedent(inspect.getsource(verb))).body[0]
+        if ast.get_docstring(body) is not None:
+            body.body = body.body[1:]       # the prose EXPLAINS arming; the code may not
+        assert rules.ARMED not in ast.unparse(body)
+        assert "ARMED" not in ast.unparse(body)
+
+
+def test_retracting_a_detector_leaves_the_pair_effectively_retracted(store):
+    det = _detector(store)
+    rule = store.add_remedy_rule(det["id"], "nudge")
+    store.retract_detector(det["id"], "the gap was fixed in code")
+
+    dead_det = store.get_detector(det["id"])
+    dead_rule = store.get_remedy_rule(rule["id"])
+    assert dead_rule["status"] == rules.RETRACTED
+    assert "the gap was fixed in code" in dead_rule["retired_reason"]
+    assert "followed" in dead_rule["retired_reason"]
+    assert rules.effective_status(dead_det, dead_rule) == rules.RETRACTED
+
+
+def test_retract_remedy_rule_works_under_a_live_detector(store):
+    det = _detector(store)
+    rule = store.add_remedy_rule(det["id"], "nudge")
+    store.retract_remedy_rule(rule["id"], "the remedy is replaced")
+
+    live = store.get_detector(det["id"])
+    assert live["status"] == rules.DRY_RUN and live["retired_at"] is None
+    dead = store.get_remedy_rule(rule["id"])
+    assert rules.effective_status(live, dead) == rules.RETRACTED
+    assert rules.effective_status(live, store.add_remedy_rule(
+        det["id"], "unblock")) == rules.DRY_RUN

@@ -353,6 +353,48 @@ def test_the_quoted_automerge_codes_are_the_real_ones():
     assert quoted == {automerge.HELD_SHA_MOVED, automerge.HELD_BASE_RED}
 
 
+def test_effective_status_is_the_weaker_of_the_pair():
+    """§3.3: the pair can hold no other combination, and every caller reads it here."""
+    weakest = {
+        (rules.RETRACTED, rules.RETRACTED): rules.RETRACTED,
+        (rules.RETRACTED, rules.DRY_RUN): rules.RETRACTED,
+        (rules.RETRACTED, rules.ARMED): rules.RETRACTED,
+        (rules.DRY_RUN, rules.RETRACTED): rules.RETRACTED,
+        (rules.DRY_RUN, rules.DRY_RUN): rules.DRY_RUN,
+        (rules.DRY_RUN, rules.ARMED): rules.DRY_RUN,
+        (rules.ARMED, rules.RETRACTED): rules.RETRACTED,
+        (rules.ARMED, rules.DRY_RUN): rules.DRY_RUN,
+        (rules.ARMED, rules.ARMED): rules.ARMED,
+    }
+    assert set(weakest) == {(d, r) for d in rules.STATUSES for r in rules.STATUSES}
+    for (det_status, rem_status), expected in weakest.items():
+        got = rules.effective_status({"status": det_status}, {"status": rem_status})
+        assert got == expected, (det_status, rem_status, got)
+
+
+def test_effective_status_reads_retired_at_as_retracted():
+    """`_retired`'s two spellings: a row retired by timestamp alone is still dead."""
+    assert rules.effective_status(
+        {"status": rules.ARMED}, {"status": rules.ARMED, "retired_at": 1.0}
+    ) == rules.RETRACTED
+    assert rules.effective_status(
+        {"status": rules.ARMED, "retired_at": 1.0}, {"status": rules.ARMED}
+    ) == rules.RETRACTED
+
+
+def test_seed_rule_five_raise_attention_carries_a_template_key_not_free_text():
+    """§4: `raise_attention` RENDERS its reason and never relays one, so the row carries
+    a template key and no prose parameter."""
+    entry = rules.seed_rows()[4]
+    assert entry["detector"]["gap_class"] == "overtaken-release-order"
+    rem = [r for r in entry["remedies"] if r["primitive"] == "raise_attention"]
+    assert len(rem) == 1
+    params = json.loads(rem[0]["params"])
+    assert params == {"reason_key": "overtaken-release-order"}
+    assert "reason" not in params
+    assert "jarvis wo done" in rem[0]["argument"]
+
+
 def test_bound_records_the_cap_it_applied():
     assert rules.bound("short") == "short"
     long = "x" * (rules.FACTS_CHARS + 50)
