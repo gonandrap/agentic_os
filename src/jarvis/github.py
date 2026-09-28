@@ -192,7 +192,7 @@ def blob_url(cwd: Path | None, repo_path: str) -> str | None:
     None at every unreadable step, and the caller OMITS the link rather than guessing: a
     404 on GitHub from a URL the OS assembled reads as the spec having been deleted.
     """
-    from .evidence import base_ref, default_branch_head
+    from .landing import base_ref, default_branch_head  # §6: landing's, not evidence's
 
     if cwd is None or not repo_path:
         return None
