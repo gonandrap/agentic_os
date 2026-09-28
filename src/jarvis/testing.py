@@ -1235,6 +1235,13 @@ elif argv[:2] == ["pr", "view"]:
         sys.exit(1)
     fields = argv[argv.index("--json") + 1].split(",") if "--json" in argv else []
     print(json.dumps({k: v for k, v in pr.items() if not fields or k in fields}))
+elif argv[:2] == ["pr", "list"]:
+    # `gh pr list --head <branch> --state open --json url`, keyed by BRANCH: an
+    # unregistered branch answers an EMPTY ARRAY, which is gh's own answer and the fact
+    # `ops.submit_plan`'s refusal is built on. Registered by `set_open_pr`.
+    branch = argv[argv.index("--head") + 1] if "--head" in argv else ""
+    rows = json.loads(os.environ.get("FAKE_GH_OPEN_PRS", "{}")).get(branch, [])
+    print(json.dumps([{"url": u} for u in rows]))
 elif argv[:2] == ["run", "list"]:
     # The BASE branch's CI history. Keyed by branch, because the whole recogniser turns
     # on "was main red when this check ran", and a fake that answered one list for every
@@ -1826,6 +1833,18 @@ def fake_gh(tmp_path, monkeypatch):
             rows = json.loads(path.read_text()) if path.exists() else {}
             rows[sha] = {"parents": list(parents)}
             path.write_text(json.dumps(rows))
+
+        open_prs: dict[str, list[str]] = {}
+
+        def set_open_pr(self, branch: str, *urls: str) -> None:
+            """What `gh pr list --head <branch> --state open` answers.
+
+            Keyed by branch and NOT taken from the `pr view` roster: that one carries no
+            `headRefName` for `set_pr`, so a fixture derived from it could not say "this
+            branch has an open pull request" without also registering a whole artifact.
+            """
+            self.open_prs[branch] = list(urls)
+            monkeypatch.setenv("FAKE_GH_OPEN_PRS", json.dumps(self.open_prs))
 
         def set_protection(self, branch: str, checks: list[str]) -> None:
             """Protect `branch`, requiring `checks`. Unregistered branches answer the
