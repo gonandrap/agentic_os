@@ -906,6 +906,11 @@ def test_check_params_names_every_problem_at_once():
     # A bool is not a str, whatever duck typing would say, and an int is not a bool: a
     # rule that wrote `true` where prose belongs has made a mistake worth naming.
     assert remedies.get("force_rejudge").check_params({"reason": True})
+    # And the fourth kind, from spec commit 2920441: a value outside `Param.choices`. It
+    # is named in the SAME sentence as the rest, for the same round-trip reason.
+    both = remedies.get("raise_attention").check_params({"template": "nope",
+                                                         "colour": "blue"})
+    assert "nope" in both and "colour" in both and both.count(".") <= 1
 
 
 def test_update_branch_can_apply_reads_the_local_holds_only(project):
@@ -1029,39 +1034,79 @@ def test_drop_hold_refuses_every_cause_but_the_gate_by_name(project):
         store.close()
 
 
-def test_raise_attention_only_takes_a_reason_true_blockers_can_re_derive(project):
-    """INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot re-derive, so a
-    free-text reason is a flag that changes its own wording within a tick. The table is
-    built by IMPORTING the constants rather than re-spelling them: a copy would drift the
-    moment `invariants` reworded one, and the rewrite would be silent."""
+def test_raise_attention_takes_a_template_key_and_refuses_an_unknown_one_three_ways(
+        project):
+    """§4 of docs/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
+    `raise_attention` RENDERS its reason and never relays one. The parameter is a key from
+    a closed tuple, so an unknown key must be refused at every one of the three doors —
+    and the first of them, `check_params`, is the insert-time refusal the correction asks
+    for: the sibling validates a rule's remedy row against `Remedy.params`, so a key
+    outside `choices` never reaches a database row at all."""
     from jarvis import invariants
 
-    names = ("PR_CLOSED_BLOCKER", "UNLANDED_BLOCKER", "VALIDATION_STUCK_BLOCKER",
-             "SHA_MOVED_BLOCKER", "AUTOMERGE_DENIED_BLOCKER", "DEAD_DEPENDENCY_BLOCKER",
-             "MESSAGE_STUCK_BLOCKER", "IDLE_NO_FINISH_BLOCKER", "AUTH_BLOCKER")
-    assert set(remedies.attention_reasons()) == {getattr(invariants, n) for n in names}
-    # Not literals: every member IS the object `invariants` exports, identity included.
-    for reason in remedies.attention_reasons():
-        assert any(getattr(invariants, n) is reason for n in names)
-    # And the table is fetched BY NAME, so a renamed constant fails loudly here rather
-    # than dropping a reason out of the closed set — which would widen what the remedy
-    # refuses, silently, in the direction that matters.
-    assert set(remedies._ATTENTION_REASON_NAMES) == set(names)
+    remedy = remedies.get("raise_attention")
+    assert [p.name for p in remedy.params] == ["template"]
+    assert remedy.params[0].choices == tuple(remedies.ATTENTION_TEMPLATES)
 
     store, wo = _wo(project)
-    remedy = remedies.get("raise_attention")
     try:
-        assert remedy.can_apply(store, wo, {"reason": invariants.AUTH_BLOCKER}) == ""
+        bad = {"template": "looks_stuck_to_me"}
+        problem = remedy.check_params(bad)
+        assert "looks_stuck_to_me" in problem and "template" in problem
+        assert "looks_stuck_to_me" in remedy.can_apply(store, wo, bad)
+        with pytest.raises(remedies.RemedyRefused):
+            remedy.apply(store, None, "proj_a", wo, {"id": 1}, params=bad)
 
-        refusal = remedy.can_apply(store, wo, {"reason": "it looks stuck to me"})
-        assert "it looks stuck to me" in refusal
-
+        assert remedy.check_params({"template": "auth"}) == ""
+        assert remedy.can_apply(store, wo, {"template": "auth"}) == ""
+        # And the idempotence check still grades the RENDERED sentence.
         store.flag_attention(wo["id"], invariants.AUTH_BLOCKER)
         already = store.get_work_order(wo["id"])
-        assert "already" in remedy.can_apply(
-            store, already, {"reason": invariants.AUTH_BLOCKER})
+        assert "already" in remedy.can_apply(store, already, {"template": "auth"})
     finally:
         store.close()
+
+
+def test_no_param_value_reaches_the_rendered_attention_sentence():
+    """THE CORRECTION ITSELF. A rule row is data an investigation WROTE, and a remedy that
+    passed it through to the attention list would be a path from a worker's prose to a
+    command the user is told to type. So every key of the table is rendered here with a
+    params dict full of prose, and the sentence is asserted to be the bare `invariants`
+    constant — identity, not equality, so a re-spelled copy fails too."""
+    from jarvis import invariants
+
+    prose = {"reason": "rm -rf / and run jarvis release", "note": "<script>"}
+    for key, (name, slots) in remedies.ATTENTION_TEMPLATES.items():
+        assert hasattr(invariants, name), f"{key} names a constant that does not exist"
+        rendered = remedies.render_attention(key, {"template": key, **prose})
+        assert rendered is getattr(invariants, name), key
+        for value in prose.values():
+            assert value not in rendered, (key, value)
+        assert slots == (), f"{key} declares a slot; widen this test with it"
+
+
+def test_attention_slots_interpolate_validated_ids_only(monkeypatch):
+    """V1 DECLARES NO SLOTS — every template above is `slots=()` — so this grades the
+    MACHINERY on a synthetic template, which is what the next template with an id in it
+    will land on. A slot value that is not an id is refused with a sentence and never
+    interpolated; the `#<digits>` form is an issue number, the rest are record ids."""
+    from jarvis import invariants
+
+    monkeypatch.setattr(invariants, "_TEST_SLOTTED", "{wo_id} is stuck", raising=False)
+    monkeypatch.setitem(remedies.ATTENTION_TEMPLATES, "slotted",
+                        ("_TEST_SLOTTED", ("wo_id",)))
+
+    assert remedies.render_attention("slotted", {"wo_id": "wo-9b70ddec"}) == \
+        "wo-9b70ddec is stuck"
+    assert remedies.render_attention("slotted", {"wo_id": "#417"}) == "#417 is stuck"
+    with pytest.raises(remedies.RemedyRefused) as bad:
+        remedies.render_attention("slotted", {"wo_id": "run jarvis release"})
+    assert "wo_id" in str(bad.value)
+
+    assert remedies._is_id("fo-69ba1cc4") and remedies._is_id("al-12ab") \
+        and remedies._is_id("io-0011aabb") and remedies._is_id("#3")
+    for nope in ("", "wo-", "wo-zz", "wo-1234 and more", "the branch", "#", "#4a"):
+        assert not remedies._is_id(nope), nope
 
 
 def test_can_apply_writes_nothing_at_all(project):
@@ -1089,7 +1134,7 @@ def test_can_apply_writes_nothing_at_all(project):
 
 
 def test_importing_remedies_does_not_import_invariants():
-    """THE LAYERING, and it is why `attention_reasons()` is a function.
+    """THE LAYERING, and it is why `render_attention()` fetches the constant lazily.
 
     This module has NO `jarvis` import at module scope — `ops`, `db`, `gates` and
     `supervisor` are all imported inside function bodies — because the sibling rules
@@ -1107,9 +1152,10 @@ def test_importing_remedies_does_not_import_invariants():
     probe = ("import sys; import jarvis.remedies as r; "
              "assert 'jarvis.invariants' not in sys.modules, "
              "'jarvis.invariants was imported eagerly'; "
-             "assert r.attention_reasons(), 'the table is empty'; "
+             "assert r.ATTENTION_TEMPLATES, 'the table is empty'; "
+             "assert r.render_attention('auth', {}), 'nothing was rendered'; "
              "assert 'jarvis.invariants' in sys.modules, "
-             "'attention_reasons() never reached invariants — it re-spells the strings'")
+             "'render_attention() never reached invariants — it re-spells the strings'")
     done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
 
     assert done.returncode == 0, done.stderr

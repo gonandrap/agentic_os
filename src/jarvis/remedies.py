@@ -22,6 +22,7 @@ has no other record, and each needs the proposal loop to have earned trust first
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from functools import lru_cache
@@ -117,41 +118,106 @@ REFUSED_INBOX_TITLE = "A remedy was refused, and {alarm_id} still needs you"
 #: schema is a validation that silently passes.
 PARAM_TYPES: dict[str, type] = {"str": str, "int": int, "bool": bool}
 
-#: The NAMES of the only reasons `raise_attention` may flag. Names, and never the
-#: sentences: `attention_reasons()` fetches the objects `invariants` exports, so the
-#: prose is still never re-spelled here, and a constant somebody renames fails loudly
-#: with `AttributeError` instead of quietly dropping a reason out of the table.
-_ATTENTION_REASON_NAMES: tuple[str, ...] = (
-    "PR_CLOSED_BLOCKER", "UNLANDED_BLOCKER", "VALIDATION_STUCK_BLOCKER",
-    "SHA_MOVED_BLOCKER", "AUTOMERGE_DENIED_BLOCKER", "DEAD_DEPENDENCY_BLOCKER",
-    "MESSAGE_STUCK_BLOCKER", "IDLE_NO_FINISH_BLOCKER", "AUTH_BLOCKER",
-)
+#: The closed TEMPLATE table `raise_attention` renders from: our own short key -> the
+#: `invariants` constant that spells the sentence, and the id slots that sentence takes.
+#:
+#: §4 of docs/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
+#: **`raise_attention` renders its reason; it never relays one.** The parameter a rule
+#: writes is a KEY, and the sentence the user reads is built in code from that key — no
+#: free-text parameter, and no parameter interpolated into the command the reason tells
+#: them to type. The distinction is not pedantry about a table that was already closed:
+#: a rule row is data an INVESTIGATION wrote, an investigation reads a worker's prose,
+#: and a remedy that passed a row's string through to the attention list would be an
+#: unbroken path from that prose to a command the user is being told to run. Passing a
+#: key breaks the path at the type level, because a key is compared and never printed.
+#:
+#: THE KEYS ARE OUR OWN LITERALS AND THAT IS THE LAYERING. This module has no `jarvis`
+#: import at module scope — `ops`, `db`, `gates`, `invariants` and `supervisor` are all
+#: imported inside function bodies — because the sibling rules section is specified as a
+#: leaf that may import it beside stdlib, `db` and `catalog`. A table keyed on the
+#: constants themselves would drag `project_store`, `neo_store`, `budget`,
+#: `worker_session`, `catalog` and `automerge` into every importer, measured at 0.127s of
+#: eager import. So the table holds the constant's NAME and `render_attention` fetches
+#: the object lazily by `getattr`: the prose is never re-spelled here, and a constant
+#: somebody renames fails loudly with `AttributeError` rather than quietly dropping a
+#: reason out of the closed set — a silent widening in the direction that matters.
+#:
+#: The sentences belong to `invariants.true_blockers`, which owns
+#: `work_orders.attention_reason`: INV-ATTENTION-REASON re-derives that column every
+#: reconcile tick and REWRITES any reason it cannot derive. A flag outside this table is
+#: therefore not a flag that says the wrong thing — it is a flag that says something
+#: DIFFERENT two minutes later, with no record of what it first said.
+ATTENTION_TEMPLATES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "pr_closed": ("PR_CLOSED_BLOCKER", ()),
+    "unlanded": ("UNLANDED_BLOCKER", ()),
+    "validation_stuck": ("VALIDATION_STUCK_BLOCKER", ()),
+    "sha_moved": ("SHA_MOVED_BLOCKER", ()),
+    "automerge_denied": ("AUTOMERGE_DENIED_BLOCKER", ()),
+    "dead_dependency": ("DEAD_DEPENDENCY_BLOCKER", ()),
+    "message_stuck": ("MESSAGE_STUCK_BLOCKER", ()),
+    "idle_no_finish": ("IDLE_NO_FINISH_BLOCKER", ()),
+    "auth": ("AUTH_BLOCKER", ()),
+}
+
+#: The ONLY shape a value may have to reach a rendered sentence: a record id, or an issue
+#: number. Deliberately narrower than "a short string with no spaces" — the point of the
+#: correction is that the user's attention list can never carry a span an investigation
+#: chose, and a permissive validator is a free-text parameter with extra steps.
+_ID_PATTERN = re.compile(r"\A(?:(?:wo|fo|io|al)-[0-9a-f]{4,}|#[0-9]+)\Z")
 
 
-@lru_cache(maxsize=1)
-def attention_reasons() -> tuple[str, ...]:
-    """The ONLY reasons `raise_attention` may flag, fetched from `invariants` rather than
-    re-spelled here.
+def _is_id(value: Any) -> bool:
+    """True for `wo-`/`fo-`/`io-`/`al-` plus hex, or `#<digits>`. Nothing else."""
+    return isinstance(value, str) and bool(_ID_PATTERN.match(value))
 
-    `invariants.true_blockers` owns `work_orders.attention_reason`: INV-ATTENTION-REASON
-    re-derives it every reconcile tick and REWRITES any reason it cannot derive, so a
-    remedy that flagged free text would produce a flag whose wording changed within two
-    minutes and a record that never said what it first said. A second copy of these
-    sentences here would drift the moment `invariants` reworded one — and the drift would
-    be invisible, because the rewrite is silent. So the table is the objects themselves.
 
-    **A FUNCTION AND NOT A MODULE-LEVEL TUPLE, AND THAT IS THE LAYERING.** This module has
-    no `jarvis` import at module scope — `ops`, `db`, `gates` and `supervisor` are all
-    imported inside function bodies — because the sibling rules section is specified as a
-    leaf that may import it beside stdlib, `db` and `catalog`. Importing `invariants` at
-    module scope would drag `project_store`, `neo_store`, `budget`, `worker_session`,
-    `catalog` and `automerge` into every importer of this module, measured at 0.127s of
-    eager import. Cached because the constants are immutable and this is read per
-    candidate per tick.
-    """
+@lru_cache(maxsize=None)
+def _attention_sentence(name: str) -> str:
+    """The `invariants` constant, fetched lazily and cached. See `ATTENTION_TEMPLATES`
+    for why this is a function call rather than a module-level reference."""
     from . import invariants
 
-    return tuple(getattr(invariants, name) for name in _ATTENTION_REASON_NAMES)
+    return getattr(invariants, name)
+
+
+def render_attention(key: str, params: dict[str, Any] | None = None) -> str:
+    """The sentence a `raise_attention` flag carries, BUILT IN CODE from a template key.
+
+    Refuses an unknown key, and interpolates ONLY the slots the template declares, only
+    after each value passes `_is_id`. **EVERY OTHER PARAM IS IGNORED** — that is the
+    whole of the correction in spec commit 2920441, and it is asserted as such: there
+    must be no route by which a value reaches this sentence except a declared, validated
+    slot, so the params mapping is read by slot name and never iterated.
+
+    In v1 every template declares `slots=()` and nothing is interpolated at all; the
+    validator and the slot machinery exist because the next template will name an id, and
+    `tests/test_remedies.py` grades them on a synthetic template today so that the day it
+    lands is not the day the rule is written.
+    """
+    template = ATTENTION_TEMPLATES.get(key)
+    if template is None:
+        raise RemedyRefused(
+            f"{key!r} is not an attention template — `raise_attention` RENDERS its reason "
+            f"from a closed table and never relays one, so a reason that is not a key of "
+            f"that table cannot be flagged. Use one of: "
+            f"{', '.join(ATTENTION_TEMPLATES)}")
+    name, slots = template
+    sentence = _attention_sentence(name)
+    if not slots:
+        # The constant ITSELF, untouched: no `.format` call, so a brace that turns up in
+        # one of these sentences can never become an interpolation site by accident.
+        return sentence
+    given = params or {}
+    values: dict[str, str] = {}
+    for slot in slots:
+        value = given.get(slot)
+        if not _is_id(value):
+            raise RemedyRefused(
+                f"{slot} was given as {value!r}, which is not a record id — an attention "
+                f"reason interpolates ids and nothing else, so this was refused rather "
+                f"than rendered")
+        values[slot] = str(value)
+    return sentence.format(**values)
 
 
 class RemedyRefused(Exception):
@@ -172,6 +238,16 @@ class Param:
     type: str              # a key of PARAM_TYPES, never a Python type — see that table
     required: bool = True
     help: str = ""
+
+    #: The closed set of values this parameter may take; empty means unconstrained.
+    #:
+    #: Spec commit 2920441, §4: it is what makes "an unknown key is refused ON INSERT"
+    #: true without this module knowing the rule registry exists. The sibling validates a
+    #: remedy row against `Remedy.params` before it is stored, so a `raise_attention`
+    #: template key outside this tuple never reaches a database row — the refusal is one
+    #: `check_params` call the sibling already makes, rather than a second validator that
+    #: would have to be kept in step with this one.
+    choices: tuple[str, ...] = ()
 
 
 def _always_possible(pstore: Any, subject: dict[str, Any],
@@ -228,9 +304,13 @@ class Remedy:
 
         Every problem, following `plans.parse_plan` and `findings.parse_report`: the
         author of a rule is a model, and a parser that reports the first fault makes it
-        fix one thing per round trip — each of which is a whole session. The three kinds
+        fix one thing per round trip — each of which is a whole session. The four kinds
         are reported together because they are usually one mistake (a renamed parameter
         is a missing name AND an unknown one).
+
+        The fourth kind is a value outside `Param.choices`, added by spec commit 2920441:
+        it is the insert-time half of "`raise_attention` renders its reason and never
+        relays one", since the sibling grades a remedy row here before storing it.
 
         A BOOL IS NOT AN INT HERE, whatever `isinstance` says. `True` where a count
         belongs is a mistake worth naming, and Python's own subclassing is the reason it
@@ -257,6 +337,9 @@ class Remedy:
             if not ok:
                 wrong.append(f"{name} was given as {type(value).__name__} where "
                              f"{param.type} is wanted")
+            elif param.choices and value not in param.choices:
+                wrong.append(f"{name} was given as {value!r}, which is not one of "
+                             f"{', '.join(param.choices)}")
         problems += wrong
         if not problems:
             return ""
@@ -871,13 +954,13 @@ def _apply_drop_hold(pstore: Any, central: Any, project: str, subject: dict[str,
 
 def _can_raise_attention(pstore: Any, subject: dict[str, Any],
                          params: dict[str, Any]) -> str:
-    reason = str((params or {}).get("reason") or "")
-    allowed = attention_reasons()
-    if reason not in allowed:
-        return (f"{reason!r} is not a reason `invariants.true_blockers` can re-derive, "
-                f"and INV-ATTENTION-REASON rewrites every reason it cannot — so this flag "
-                f"would change its own wording within a tick. Use one of: "
-                f"{'; '.join(allowed)}")
+    try:
+        reason = render_attention(str((params or {}).get("template") or ""), params)
+    except RemedyRefused as refused:
+        # The same refusal `apply` would raise, as a sentence: `can_apply` answers with
+        # prose and never raises, and re-deriving the wording here would let the two
+        # doors drift.
+        return str(refused)
     wo_id = str(subject.get("id") or "")
     if subject.get("needs_attention") and str(subject.get("attention_reason") or "") == reason:
         return (f"{wo_id} is already flagged with that exact reason — the user has it in "
@@ -888,18 +971,17 @@ def _can_raise_attention(pstore: Any, subject: dict[str, Any],
 def _apply_raise_attention(pstore: Any, central: Any, project: str,
                            subject: dict[str, Any], alarm: dict[str, Any], *,
                            params: dict[str, Any] | None = None) -> str:
-    """Flag attention with a reason `true_blockers` can re-derive, and only such a reason.
+    """Flag attention with a reason RENDERED from the closed template table, and only so.
 
-    The closed table is the whole of the safety here (see `attention_reasons`): the
-    reconciler owns this column, so a reason outside it is not a flag that says the wrong
-    thing, it is a flag that says something DIFFERENT two minutes later with no record of
-    what it first said.
+    The rule names a key; the sentence is built here by `render_attention` and is one of
+    the sentences `invariants.true_blockers` itself re-derives (see `ATTENTION_TEMPLATES`
+    for why both halves matter). The reconciler owns this column, so a reason outside the
+    table is not a flag that says the wrong thing — it is a flag that says something
+    DIFFERENT two minutes later with no record of what it first said. And per spec commit
+    2920441 nothing the rule wrote reaches the sentence: an unknown key is refused here,
+    and was already refused on insert by `check_params` against `Param.choices`.
     """
-    reason = str((params or {}).get("reason") or "")
-    if reason not in attention_reasons():
-        raise RemedyRefused(
-            f"{reason!r} is not a reason `invariants.true_blockers` re-derives, so the "
-            f"reconciler would rewrite it within a tick — nothing was done")
+    reason = render_attention(str((params or {}).get("template") or ""), params)
     wo_id = str(subject["id"])
     pstore.flag_attention(wo_id, reason)
     return f"flagged {wo_id} for the user: {reason}"
@@ -1027,14 +1109,18 @@ REMEDIES: dict[str, Remedy] = {
                  "reconciler itself derives",
         blast="SPENDS THE USER'S ATTENTION, the scarcest thing the OS allocates, and a "
               "flag raised wrongly is read before it can be taken back. It writes no "
-              "other state, reaches no session and costs no tokens. The reason must come "
-              "from the closed table `invariants.true_blockers` re-derives, so the flag "
-              "still says the same thing after the next tick.",
+              "other state, reaches no session and costs no tokens. The rule names a KEY "
+              "and the sentence is built in code from the closed table "
+              "`invariants.true_blockers` re-derives: nothing the rule wrote reaches the "
+              "user's list, and the flag still says the same thing after the next tick.",
         subjects=("work_order",),
-        params=(Param("reason", "str", True,
-                      "the attention reason, which must be one of `remedies."
-                      "attention_reasons()` — the sentences `invariants.true_blockers` "
-                      "re-derives; anything else is rewritten within a tick"),),
+        params=(Param("template", "str", True,
+                      "WHICH attention sentence to render, as a key of `remedies."
+                      "ATTENTION_TEMPLATES` — not the sentence itself. The wording is "
+                      "built in code from the key, so a reason cannot be written here; "
+                      "every key renders one of the sentences `invariants.true_blockers` "
+                      "re-derives, and anything else is rewritten within a tick",
+                      choices=tuple(ATTENTION_TEMPLATES)),),
         can_apply=_can_raise_attention,
         apply=_apply_raise_attention,
     ),
