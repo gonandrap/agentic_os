@@ -135,7 +135,9 @@ bash-token and credential-named-key cases must be absent from `json.dumps(to_sea
 level="normal"))`. A `normal` seal leaking a secret would be the same permanent store with none
 of the gate.
 
-**The payload records `autopsy_level` from day one, even though this child has no gate.**
+**The payload records `autopsy_level` from day one, even though this child has no gate.** The
+level is the CALLER'S argument: with no gate this child's `seal_autopsies` can only pass
+`normal`, and section 5 is what makes `full` reachable by passing `level_for`'s answer through.
 Without it, "no params" is ambiguous between "sealed at `normal`" and "this order ran no
 tools", and that ambiguity is rule (b) reappearing one level down. A seal written before the
 field existed reads as UNKNOWN, a third state distinct from `"normal"` and `"full"`.
@@ -324,7 +326,16 @@ before its orders are sealed.
 `autopsy.records_autopsy(wo, cfg)` with `observability.level_for(wo, cfg) != observability.OFF`.
 It does NOT add a second `records_autopsy` to `src/jarvis/observability.py`: two functions with
 one name across two modules is the `read_session` trap of section 4, invited deliberately.
-Nothing else about the writer changes.
+
+**This child ALSO wires the level through, and without it `full` ships dark.** `seal_autopsies`
+calls `observability.level_for(wo, cfg)` ONCE per order and uses the result TWICE: as the gate
+(`!= OFF`) and as the argument to `to_seal(anatomy, level=...)`, which records it as
+`autopsy_level`. Nothing else owns this. Section 3's writer has no gate, so on its own it can
+only ever pass `normal`; section 6 teaches `to_seal` to emit `params` when the level is `full`
+but may NOT import `observability.py`, because this section is the only one that does. Leave the
+pass-through out and no order in production is ever sealed with `params` or with `autopsy_level`
+`"full"` — the user's ask, giving `full` a meaning, would ship dark while every test passed.
+Beyond the predicate body and this one argument, nothing about the writer changes.
 
 The parent spec's section 10 said the gate governs exactly ONE write and no read. It now
 governs TWO, so its wording, the `ObservabilityConfig` docstring, the `jarvis config` CLI help
@@ -347,7 +358,8 @@ idiom of `tests/test_supervisor.py::test_every_supervisor_setting_reaches_the_co
 every `ObservabilityConfig` field reaches `jarvis config set` help, and `full`'s help line
 DIFFERS from `normal`'s. And the behaviour: level `off` seals nothing, level `normal` seals
 tier-1, and the test that previously pinned `full` and `normal` as identical is REPLACED and not
-deleted.
+deleted. And the pass-through, end to end through the daemon: a project at level `full` seals
+with `autopsy_level` `"full"`, a project at `normal` seals with `autopsy_level` `"normal"`.
 
 This child must NOT touch `CLAUDE.md`: `evals/llm/test_jarvis_judgment.py:24` loads it as a bare
 system prompt and LLM-grades 14 scenarios against it.
@@ -391,6 +403,11 @@ already built; the committed fixture is used ONLY for the "changes nothing" asse
 of the existing `test_a_meta_only_directory_adds_nothing_to_the_real_session` and
 `test_redacting_detail_changes_nothing_in_the_committed_session` — sealing it at `full` changes
 none of the eleven pinned numbers.
+
+And the reason this child has an edge on `gate` rather than on `seal` alone: a DAEMON TICK over a
+project configured at level `full` writes `params` into `autopsy_json`, and the same tick over a
+project at `normal` writes none. Section 3's writer plus section 6's `to_seal` cannot produce
+that on their own — only section 5's pass-through can.
 
 ## 7. Out of scope, and why
 
