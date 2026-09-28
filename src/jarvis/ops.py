@@ -5482,7 +5482,7 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
 
 def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
                       chain: tuple[tuple[str, str, bool], ...], base: str, base_sha: str,
-                      patch_ids: tuple[str, str]) -> dict | None:
+                      fingerprints: tuple[str, str]) -> dict | None:
     """Bind the panel's verdict to a head that is `judged` plus merges that added nothing.
 
     docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3. The
@@ -5496,8 +5496,9 @@ def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
     `ci.base_merge_chain`'s proof (a), oldest first, each element `(merge, commit merged
     in, whether that is a base commit)` — the second kind is a `git pull --no-rebase` merge
     of the branch's own lineage, which Neo question 806 widened proof (a) to accept because
-    the judged commit already contained it; `patch_ids` is proof (b) — `branchproof.patch_id` for `judged` and for
-    `head` — and they must be non-empty and EQUAL, which is what excludes an evil merge
+    the judged commit already contained it; `fingerprints` is proof (b) —
+    `branchproof.diff_fingerprint` for `judged` and for `head` — and they must be
+    non-empty and EQUAL, which is what excludes an evil merge
     whose conflict resolution edited the branch's own files. `Daemon._carry_catch_up` does
     the `gh`/`git` and names the proof that failed; nothing here touches a network, so the
     rule stays unit-testable exactly as `carry_validated_head` is.
@@ -5511,7 +5512,7 @@ def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
 
     Returns the payload written, or None when the facts do not hold.
     """
-    before, after = patch_ids
+    before, after = fingerprints
 
     def facts(_row: dict) -> tuple[str, dict] | None:
         if not chain or chain[-1][0] != head:
@@ -5530,8 +5531,9 @@ def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, h
             said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
                         f"already contained")
         # SAY WHAT IS TRUE, and it is a HASH comparison and not a comparison of the diff
-        # text (review round 1): `branchproof.patch_id` hashes the diff whitespace and all,
-        # dropping only the line numbers and blob ids a base merge moves. So "unchanged
+        # text (review round 1): `branchproof.diff_fingerprint` hashes the diff whitespace
+        # and all, dropping only the line numbers and text blob ids a base merge moves —
+        # a binary file's new-side id stays in (round 3). So "unchanged
         # down to its whitespace", never "byte-identical" — the bytes of the two diffs do
         # differ, in exactly the bookkeeping this is licensed to ignore.
         return ((" and ".join(said) + f", and the pull request's own diff is unchanged "

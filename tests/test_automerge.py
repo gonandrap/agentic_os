@@ -1748,7 +1748,7 @@ def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
     base1, base2 = "1" * 40, "2" * 40
     contained = {base1}
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
-    monkeypatch.setattr(branchproof, "patch_id", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
     monkeypatch.setattr(branchproof, "is_ancestor",
                         lambda repo, ancestor, descendant: ancestor in contained)
     store, wo = arm(started, project, auto_merge=True)

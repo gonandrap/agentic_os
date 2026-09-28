@@ -68,7 +68,7 @@ def local_proof(monkeypatch):
     def fetch(repo, *refs):
         return state["fetch"]
 
-    def patch_id(repo, base_ref, sha):
+    def diff_fingerprint(repo, base_ref, sha):
         return state["id"]
 
     def is_ancestor(repo, ancestor, descendant):
@@ -77,7 +77,7 @@ def local_proof(monkeypatch):
         return ancestor in state["contains"]
 
     monkeypatch.setattr(branchproof, "fetch", fetch)
-    monkeypatch.setattr(branchproof, "patch_id", patch_id)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", diff_fingerprint)
     monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
     return state
 

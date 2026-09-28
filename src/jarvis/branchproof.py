@@ -91,7 +91,7 @@ def fetch(repo: Path, *refs: str) -> bool:
 
 
 #: The two pieces of a diff that a BASE MERGE legitimately moves without the branch's
-#: contribution changing, and the only two dropped before the hash (§3.3, review round 1):
+#: contribution changing, and the only two dropped from a TEXT diff (§3.3, review round 1):
 #: the hunk header's line ranges — `main` adding lines above the branch's own hunk shifts
 #: them and nothing else — and the `index` line's blob ids, which name whole-file contents
 #: of the merge base and of the merged head, both of which move for the same reason. The
@@ -99,8 +99,27 @@ def fetch(repo: Path, *refs: str) -> bool:
 _HUNK_RANGE_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.M)
 _INDEX_IDS_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+", re.M)
 
+#: A BINARY file's diff is exempt from the `index` rule, and has to be (§3.3, review round
+#: 3): `git diff` prints `Binary files … differ` and no content, so the new-side blob id is
+#: the ONLY fingerprint of what the branch put there. The OLD side is still dropped — it
+#: names the merge base's version and moves when the base does.
+_INDEX_NEW_ID_RE = re.compile(r"^index [0-9a-f]+\.\.([0-9a-f]+)", re.M)
+_BINARY_RE = re.compile(r"^(?:Binary files .* differ|GIT binary patch)$", re.M)
+_PER_FILE_RE = re.compile(r"^(?=diff --git )", re.M)
 
-def patch_id(repo: Path, base_ref: str, sha: str) -> str | None:
+
+def _normalise(diff: str) -> str:
+    """Drop what a base merge moves, per file, keeping binary content in the hash."""
+    out = []
+    for section in _PER_FILE_RE.split(diff):
+        if _BINARY_RE.search(section):
+            out.append(_INDEX_NEW_ID_RE.sub(r"index \1", section))
+        else:
+            out.append(_INDEX_IDS_RE.sub("index", _HUNK_RANGE_RE.sub("@@ @@", section)))
+    return "".join(out)
+
+
+def diff_fingerprint(repo: Path, base_ref: str, sha: str) -> str | None:
     """What `sha`'s branch ADDS on top of its merge base with `origin/<base_ref>`, as an id.
 
     PROOF (b) of the carry, §3.3: computed for the judged commit and for the live head, and
@@ -114,9 +133,17 @@ def patch_id(repo: Path, base_ref: str, sha: str) -> str | None:
     the record saying the diff was byte-identical. So the diff is hashed HERE, verbatim:
     every space, every tab, the `---`/`+++` paths, the mode lines and the `@@`'s section
     heading are all part of the id. `--full-index`, so nothing depends on how short git
-    chose to abbreviate.
+    chose to abbreviate; `--no-ext-diff --no-textconv`, so no repository's configuration can
+    choose what this hashes.
 
-    **The `@@` line ranges and the `index` blob ids are the ONLY things dropped**, because
+    **A BINARY file keeps its new-side blob id** (review round 3). `git diff` prints
+    `Binary files … differ` and no content for any path a `-diff`/`binary` attribute marks
+    or that holds a NUL byte, so for those the new-side id is the only fingerprint of the
+    bytes; dropping it let a resolution swap them and keep the judged commit's id. The old
+    side is still dropped, and text hunks are unchanged — see below for why they must be.
+
+    **The `@@` line ranges and the `index` blob ids are the ONLY things dropped** from a
+    text diff, because
     they are bookkeeping about the base rather than about the branch's contribution: `main`
     adding lines above the branch's own hunk shifts the ranges and changes both blob ids
     while the branch adds exactly what it added before. Keeping them would refuse the
@@ -139,11 +166,11 @@ def patch_id(repo: Path, base_ref: str, sha: str) -> str | None:
     merge_base = _git(repo, "merge-base", f"origin/{branch}", sha)
     if not merge_base or not merge_base.strip():
         return None
-    diff = _git(repo, "diff", "--full-index", f"{merge_base.strip()}..{sha}")
+    diff = _git(repo, "diff", "--full-index", "--no-ext-diff", "--no-textconv",
+                f"{merge_base.strip()}..{sha}")
     if not diff:
         return None
-    normalised = _INDEX_IDS_RE.sub("index", _HUNK_RANGE_RE.sub("@@ @@", diff))
-    return hashlib.sha256(normalised.encode("utf-8", "replace")).hexdigest()
+    return hashlib.sha256(_normalise(diff).encode("utf-8", "replace")).hexdigest()
 
 
 def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:

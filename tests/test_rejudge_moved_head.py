@@ -700,7 +700,7 @@ def local_proof(monkeypatch):
 
     state = {"id": "cafe12345678", "ids": {}}
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
-    monkeypatch.setattr(branchproof, "patch_id",
+    monkeypatch.setattr(branchproof, "diff_fingerprint",
                         lambda repo, base_ref, sha: state["ids"].get(sha, state["id"]))
     monkeypatch.setattr(branchproof, "is_ancestor",
                         lambda repo, ancestor, descendant: True)
@@ -881,7 +881,7 @@ def test_another_true_blocker_keeps_the_flag_up(fleet, project):
     carried = ops.carry_merge_chain(
         store, wo, judged=JUDGED, head=CAUGHT_UP,
         chain=((CAUGHT_UP, BASE, True),), base="main", base_sha=BASE,
-        patch_ids=("cafe12345678", "cafe12345678"))
+        fingerprints=("cafe12345678", "cafe12345678"))
 
     assert carried is not None
     assert "attention_cleared" not in carried

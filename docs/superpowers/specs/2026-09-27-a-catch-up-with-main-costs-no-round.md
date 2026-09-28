@@ -87,6 +87,12 @@ gets the chance.
 | The IO and the logging | `Daemon._carry_catch_up`, new, beside `Daemon._rejudge_moved_head` (daemon.py:5839) | `_rejudge_moved_head`'s division of labour: daemon does `gh`/`git` and logging, `ops` holds the rule. |
 | The write itself | `ProjectStore.carry_round_head` (project_store.py:4375), unchanged | It is already dumb on purpose. |
 
+**One accepted dependency inversion:** `ci.base_merge_chain` imports `branchproof` for
+item 6's ancestry question, so the `gh` module depends on the local-git module. The
+alternative is a `compare` API call per walked commit, which doubles the walk's API cost for
+a fetch already paid for by proof (b). `branchproof` imports nothing that can reach GitHub,
+so the arrow only ever points this way and `ci.py`'s allowlist test is unaffected.
+
 `ProjectStore.validated_head` already prefers `carried_head_sha` (project_store.py:4287),
 so **no reader changes**. The invariant "nothing merges a commit no round has bound" is
 preserved rather than weakened: the carry binds the existing round to the new head, and it
@@ -127,14 +133,19 @@ propagates to the daemon, which logs and leaves the pull request exactly where i
 
 ### 3.3 Proof (b) — locally: the pull request's own content is unchanged
 
-`branchproof.patch_id(repo, base_ref, sha)`:
+`branchproof.diff_fingerprint(repo, base_ref, sha)` — **not** `patch_id`: it is not a
+`git patch-id` and kn-3536d21b requires that it never becomes one.
 
 ```
 git -C <repo> fetch --quiet origin <base_ref> <pull/N/head>     # once per attempt
-git -C <repo> diff --full-index <merge-base(base_ref, sha)>..<sha>
-    -> drop the `@@ -a,b +c,d @@` ranges and the `index <old>..<new>` blob ids
+git -C <repo> diff --full-index --no-ext-diff --no-textconv
+       <merge-base(base_ref, sha)>..<sha>
+    -> per file: TEXT diff  -> drop the `@@ -a,b +c,d @@` ranges and both `index` blob ids
+                  BINARY    -> keep the NEW-side `index` blob id, drop the old side
     -> sha256 of what is left
 ```
+
+`--no-ext-diff --no-textconv` so no repository's configuration decides what is hashed.
 
 computed for `judged` and for `head`. **The carry needs the two ids to be identical.**
 
@@ -152,6 +163,16 @@ reason: they are bookkeeping about the BASE rather than about the branch's contr
 `main` adding lines above the branch's own hunk shifts the ranges and changes both blob ids
 while the branch adds exactly what it added before — the commonest catch-up on the fleet,
 and the case this feature exists for.
+
+**A BINARY file's new-side blob id is the exception, and must be** (review round 3 of
+wo-659be188). `git diff` prints `Binary files … differ` and no content for any path a
+`-diff`/`binary` attribute marks or that holds a NUL byte, so for such a file the new-side
+id is the ONLY fingerprint of the bytes the branch put there: dropping it let a resolution
+that swapped those bytes keep the judged commit's id — the round-1 hole again, in another
+file type. The old side is still dropped, because it names the merge base's version and
+moves when the base does, and text hunks are untouched so the catch-up above still carries.
+The alternative, `git diff --binary`, was rejected: for a MODIFIED binary file it can emit
+a delta against the preimage, so the base moving would move the id.
 
 This is the proof (a) cannot give. GitHub reports an **evil merge** — a merge whose
 conflict resolution edited the pull request's own files — with exactly the parentage of a
@@ -237,7 +258,9 @@ round, round_id, judged_sha, carried_head_sha
 chain: [sha, …]              # oldest-first, the commits walked
 merged_base_shas: [sha, …]    # second parents that are ancestors of origin/<base>
 merged_branch_shas: [sha, …]  # second parents the JUDGED commit already held (Neo 806)
-base, base_sha                # base_ref and origin/<base_ref> at proof time
+base                          # the base_ref proved against
+base_sha                      # the NEWEST BASE commit the chain merged; "" when it merged
+                              # none (the rule below, not origin/<base_ref> at proof time)
 patch_id                      # the diff hash both commits produced
 reason                        # the sentence below
 attention_cleared             # true when the carry lowered the flag; absent otherwise (§6)
@@ -264,6 +287,10 @@ BASE commit walked and `""` when the chain held none.
 ```
 judged_sha, head_sha, proof, detail, chain
 ```
+
+**The RECORD keeps the name `patch_id`** — the payload field above and the `proof` value
+below — while the function is `diff_fingerprint`. Events already written on live orders
+carry it, and a reader of `jarvis wo show` matches strings, not symbols.
 
 `proof` is one of `"chain"` (parentage), `"patch_id"` (content differs),
 `"fetch"` (no local git answer), `"read"` (`gh` unreadable) — one value per condition, the
@@ -426,7 +453,9 @@ fixture (`fake_gh.set_parents`, src/jarvis/testing.py:1793) and the `ci.VERBS` A
    helper at testing.py:2243). Review round 1 added the two whitespace cases to the same
    fixture: a resolution that ONLY re-indents a branch line must differ and be refused, and
    a base merge that only shifts the branch hunk's line numbers must still compare equal
-   and carry;
+   and carry. Review round 3 added two more real-repository cases: a merge that swaps the
+   bytes of a BINARY file the branch added must differ, and a base merge that moves the
+   line the `@@` section heading sits on must still compare equal;
 6. a fetch that fails refuses with `proof == "fetch"` and merges nothing;
 7. the AST test extended: `branchproof.py` runs `git` and never `gh`; `ci.WRITE_VERBS` is
    still one entry.

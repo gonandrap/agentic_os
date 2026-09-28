@@ -710,12 +710,12 @@ def local_proof(monkeypatch):
     # THE REAL ONES, kept reachable: the two whitespace tests below drive the daemon with
     # ids a real repository produced, so they need the git behind the fake (review round 1).
     state = {"id": "b7f0deadbeef", "ids": {}, "ancestors": None, "contained": set(),
-             "git_fetch": branchproof.fetch, "git_patch_id": branchproof.patch_id}
+             "git_fetch": branchproof.fetch, "git_fingerprint": branchproof.diff_fingerprint}
 
     def fetch(repo, *refs):
         return True
 
-    def patch_id(repo, base_ref, sha):
+    def diff_fingerprint(repo, base_ref, sha):
         return state["ids"].get(sha, state["id"])
 
     def is_ancestor(repo, ancestor, descendant):
@@ -727,7 +727,7 @@ def local_proof(monkeypatch):
         return ancestor in state["contained"]
 
     monkeypatch.setattr(branchproof, "fetch", fetch)
-    monkeypatch.setattr(branchproof, "patch_id", patch_id)
+    monkeypatch.setattr(branchproof, "diff_fingerprint", diff_fingerprint)
     monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
     return state
 
@@ -966,9 +966,85 @@ def test_identical_patch_ids_carry_and_an_edited_branch_file_does_not(tmp_path):
     repo, judged, caught_up, evil = _a_branch_that_merged_main(tmp_path)
 
     assert branchproof.fetch(repo, "main")
-    clean = branchproof.patch_id(repo, "main", caught_up)
-    assert clean and clean == branchproof.patch_id(repo, "main", judged)
-    assert branchproof.patch_id(repo, "main", evil) != clean
+    clean = branchproof.diff_fingerprint(repo, "main", caught_up)
+    assert clean and clean == branchproof.diff_fingerprint(repo, "main", judged)
+    assert branchproof.diff_fingerprint(repo, "main", evil) != clean
+
+
+def _a_branch_that_added_a_binary_file(tmp_path) -> tuple[Path, str, str]:
+    """A real clone whose feature branch ADDED a binary file, then a merge swapped it.
+
+    Returns (repo, judged, swapped). `bin.dat` holds a NUL byte, so `git diff` prints only
+    `Binary files ... differ` for it and the `index` line's new-side blob id is the only
+    fingerprint of its content. `swapped` merges `origin/main` cleanly and rewrites those
+    bytes while resolving.
+    """
+    up = make_git_project(tmp_path, "upstream")
+    repo = tmp_path / "binwork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "bin.dat").write_bytes(b"\x00\x01judged payload\x00\xff")
+    _git(repo, "add", "bin.dat")
+    _git(repo, "commit", "-qm", "the branch adds a binary file")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "b.txt").write_text("a line main added\n")
+    _git(up, "add", "b.txt")
+    _git(up, "commit", "-qm", "main moves")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-commit", "--no-ff", "origin/main")
+    (repo / "bin.dat").write_bytes(b"\x00\x01swapped payload\x00\xff")
+    _git(repo, "add", "bin.dat")
+    _git(repo, "commit", "-qm", "a merge that swapped the binary file's bytes")
+    return repo, judged, _git(repo, "rev-parse", "HEAD")
+
+
+def test_a_merge_that_swaps_a_binary_files_bytes_is_not_the_judged_diff(tmp_path):
+    """REVIEW ROUND 3's BLOCKER. `git diff` prints no content for a binary file, only
+    `Binary files ... differ`, so dropping the `index` blob ids dropped the ONLY
+    fingerprint of it: a resolution that swapped the bytes of a file the branch added took
+    the judged commit's id and carried the verdict onto content no seat read."""
+    from jarvis import branchproof
+
+    repo, judged, swapped = _a_branch_that_added_a_binary_file(tmp_path)
+
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before != branchproof.diff_fingerprint(repo, "main", swapped)
+
+
+def test_a_base_merge_that_moves_the_hunks_section_heading_still_matches(tmp_path):
+    """The `@@`'s trailing SECTION HEADING is in the hash, unlike the ranges beside it, so
+    the tolerance of §3.3 only holds while a base merge MOVES that line without changing
+    which heading the branch's hunk sits under. `main` adds a function above `alpha`, so
+    the heading `def alpha():` slides down four lines and the id must not move. A base
+    change that lands BETWEEN the heading and the hunk renames it and does move the id:
+    that is the conservative false refusal `diff_fingerprint` documents and accepts."""
+    from jarvis import branchproof
+
+    up = make_git_project(tmp_path, "upstream")
+    (up / "mod.py").write_text(
+        "def alpha():\n    return 1\n\n\ndef omega():\n    return 9\n")
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "the module")
+    repo = tmp_path / "headwork"
+    subprocess.run(["git", "clone", "-q", str(up), str(repo)], check=True)
+    _git(repo, "checkout", "-qb", "feature")
+    (repo / "mod.py").write_text(
+        (repo / "mod.py").read_text().replace("return 9", "return 99"))
+    _git(repo, "add", "mod.py")
+    _git(repo, "commit", "-qm", "the branch's contribution")
+    judged = _git(repo, "rev-parse", "HEAD")
+    (up / "mod.py").write_text("def first():\n    return 0\n\n\n"
+                               + (up / "mod.py").read_text())
+    _git(up, "add", "mod.py")
+    _git(up, "commit", "-qm", "main inserts a function above the whole module")
+    _git(repo, "fetch", "-q", "origin", "main")
+    _git(repo, "merge", "-q", "--no-edit", "origin/main")
+    caught_up = _git(repo, "rev-parse", "HEAD")
+
+    merge_base = _git(repo, "merge-base", "origin/main", caught_up)
+    assert "@@ def alpha():" in _git(repo, "diff", f"{merge_base}..{caught_up}")
+    before = branchproof.diff_fingerprint(repo, "main", judged)
+    assert before and before == branchproof.diff_fingerprint(repo, "main", caught_up)
 
 
 def _a_python_branch_that_merged_main(tmp_path) -> tuple[Path, str, str, str]:
@@ -1017,11 +1093,11 @@ def test_a_resolution_that_only_re_indents_python_is_not_the_diff_that_was_judge
 
     Both halves in one test: the ids from a real repository must differ, and the daemon
     driven with those ids must refuse the carry as `patch_id`."""
-    git_patch_id = local_proof["git_patch_id"]
+    git_fingerprint = local_proof["git_fingerprint"]
     repo, judged, _caught_up, dedented = _a_python_branch_that_merged_main(tmp_path)
     assert local_proof["git_fetch"](repo, "main")
-    before = git_patch_id(repo, "main", judged)
-    after = git_patch_id(repo, "main", dedented)
+    before = git_fingerprint(repo, "main", judged)
+    after = git_fingerprint(repo, "main", dedented)
     assert before and after and before != after
 
     opt_in(started)
@@ -1045,11 +1121,11 @@ def test_a_base_merge_that_only_shifts_the_branchs_line_numbers_still_carries(
     contribution is unchanged and only the hunk header's numbers moved. A whitespace-exact
     hash that kept them would refuse this — the commonest catch-up on the fleet — so the
     ids must still be equal and the verdict must still carry with no round spent."""
-    git_patch_id = local_proof["git_patch_id"]
+    git_fingerprint = local_proof["git_fingerprint"]
     repo, judged, caught_up, _dedented = _a_python_branch_that_merged_main(tmp_path)
     assert local_proof["git_fetch"](repo, "main")
-    before = git_patch_id(repo, "main", judged)
-    assert before and before == git_patch_id(repo, "main", caught_up)
+    before = git_fingerprint(repo, "main", judged)
+    assert before and before == git_fingerprint(repo, "main", caught_up)
 
     opt_in(started)
     store, wo = parked(project)

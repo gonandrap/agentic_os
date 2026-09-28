@@ -5923,8 +5923,8 @@ class Daemon:
             return refuse(ops.PROOF_FETCH,
                           f"`git fetch origin {base} {pull_ref}` failed, so the pull "
                           f"request's own diff cannot be compared locally")
-        before = branchproof.patch_id(project.path, base, judged)
-        after = branchproof.patch_id(project.path, base, head)
+        before = branchproof.diff_fingerprint(project.path, base, judged)
+        after = branchproof.diff_fingerprint(project.path, base, head)
         if not before or not after:
             return refuse(ops.PROOF_FETCH,
                           "the diff this branch adds on top of its merge base could not "
@@ -5953,7 +5953,7 @@ class Daemon:
         bases = [merged for _sha, merged, is_base in chain if is_base]
         carried = ops.carry_merge_chain(
             store, wo, judged=judged, head=head, chain=chain, base=base,
-            base_sha=bases[-1] if bases else "", patch_ids=(before, after))
+            base_sha=bases[-1] if bases else "", fingerprints=(before, after))
         if carried is None:
             return refuse(ops.PROOF_CHAIN,
                           "the round this would have been carried from is no longer the "

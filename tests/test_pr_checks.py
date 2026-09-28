@@ -455,7 +455,7 @@ def test_a_sha_moved_tick_is_the_one_that_pays_for_the_walk(
     from jarvis import branchproof
 
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
-    monkeypatch.setattr(branchproof, "patch_id", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
     monkeypatch.setattr(branchproof, "is_ancestor",
                         lambda repo, ancestor, descendant: True)
     spec = started.catalog.project("proj_a")
