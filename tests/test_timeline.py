@@ -742,3 +742,44 @@ def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
     assert "2 merge(s) of main" in carried["detail"]
     assert refused["label"] == "Verdict not carried — re-judging"
     assert "c2120424ba" in refused["detail"] and "resolved content" in refused["detail"]
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+
+
+def test_the_two_rejudge_declines_are_told_apart_by_their_cause():
+    """One decline says the round budget is spent and offers `validation.max_rounds`;
+    the other is about a bound that never reads it. Same label, different news."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, budget = _describe("validation_rejudge_declined",
+                              {"head_sha": "bbbb1111bbbb2222", "round": 2,
+                               "cause": ops.REJUDGE_BUDGET_SPENT, "next_round": 3,
+                               "max_rounds": 3})
+    rebind_label, rebind = _describe("validation_rejudge_declined",
+                                     {"head_sha": "bbbb1111bbbb2222", "round": 2,
+                                      "cause": ops.REBIND_EXHAUSTED, "rebinds": 2,
+                                      "rebind_max": 2})
+
+    assert "round 3 of 3 would be the last" in budget
+    assert rebind_label == label
+    assert "re-judged this merge 2 time(s)" in rebind
+    assert "would be the last" not in rebind
+
+
+def test_a_rebind_reads_as_a_round_nobody_was_charged_for():
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    reason = ops.REBIND_FORCED_REASON.format(n=3, judged="aaaa1111aa",
+                                             head="bbbb1111bb", used=1,
+                                             max=ops.REBIND_MAX)
+    label, detail = _describe("validation_forced",
+                              {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": True,
+                               "reason": reason})
+
+    assert label.startswith("Validation forced by the OS")
+    assert "no round spent" in label
+    assert "does not count against validation.max_rounds" in detail

@@ -813,10 +813,13 @@ def test_an_evil_merge_still_costs_a_round_and_still_declines_at_the_last_one(
                         ["payload"], {})["by"] == ops.REJUDGE_BY_OS
 
 
-def test_an_evil_merge_on_the_last_round_is_still_left_for_the_user(
+def test_an_evil_merge_on_the_last_round_is_re_judged_as_a_rebind(
         tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof):
-    """The other half of the fall-through: at `max_rounds` the decline is still recorded,
-    so the blocker the user acts on is unchanged for the case the carry cannot prove."""
+    """THE DEFECT THIS TEST USED TO ASSERT, end to end and through the poll. At
+    `max_rounds` the decline stranded wo-8736a5c5 on the user for a merge the OS itself
+    demanded; proof (a) holds and proof (b) does not, so the round that reads the
+    resolution is a rebind and no budget is spent (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md)."""
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=2)
     local_proof["ids"][CAUGHT_UP] = "0ther00patch"
@@ -825,11 +828,15 @@ def test_an_evil_merge_on_the_last_round_is_still_left_for_the_user(
 
     poll(fleet, store)
 
-    assert rounds_of(store, wo) == [1, 2]
-    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
-    assert len(declined) == 1
-    assert db.from_json(declined[0]["payload"], {})["head_sha"] == CAUGHT_UP
-    assert invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT) == []
+    assert rounds_of(store, wo) == [1, 2, 3]
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert int(row["uncounted"]) == 1
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 2
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_forced")[-1]["payload"], {})
+    assert payload["by"] == ops.REJUDGE_BY_OS and payload["rebind"] is True
+    assert not invariants.rejudge_exhausted(store, store.get_work_order(wo["id"]))
 
 
 # -- the flag the carry itself puts down (spec §6 item 4) ------------------------------
@@ -1021,3 +1028,111 @@ def test_a_non_merge_head_change_past_the_cap_still_goes_to_the_user(
     assert payload["next_round"] == 3 and payload["max_rounds"] == 3
     assert invariants.true_blockers(
         store, store.get_work_order(wo["id"]))[0] == invariants.SHA_MOVED_BLOCKER
+
+
+def test_a_passing_rebind_arms_the_merge(tmp_path, project, jarvis_home, fake_claude,
+                                         fake_gh):
+    """§5 test 2. The point of the exemption is a pull request that MERGES: the rebind
+    binds a verdict to the head the OS's own merge produced, so `decide` arms on it and
+    nobody was asked for anything."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=True)
+    judge(fleet, store, Panel("passed"))
+
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert ProjectStore.validated_head(row) == PUSHED
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+    poll(fleet, store)
+
+    approvals = store.list_approvals(wo["id"])
+    assert [a["kind"] for a in approvals] == ["auto_merge"]
+    assert PUSHED in approvals[0]["command"]
+    fresh = store.get_work_order(wo["id"])
+    assert invariants.SHA_MOVED_BLOCKER not in invariants.true_blockers(store, fresh)
+    assert not fresh["attention_reason"]
+
+
+def test_a_rebind_says_so_on_the_round_listing(tmp_path, project, jarvis_home,
+                                               fake_claude, fake_gh):
+    """§4.3's last paragraph: round 4 under `max_rounds` 3 reads as the very bug this
+    spec is about unless the line says the round was not charged to anyone."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=True)
+
+    rows = ops.validation_rounds(store, wo_id=wo["id"])
+    assert rows[-1]["uncounted"] == 1
+    assert "uncounted" in ops.round_line(rows[-1])
+    assert "uncounted" not in ops.round_line(rows[0])
+
+
+def test_a_rejected_rebind_goes_to_the_worker(tmp_path, project, jarvis_home,
+                                              fake_claude, fake_gh):
+    """§5 test 3, §4.4. The row is numbered past `max_rounds`, and routing on that
+    would send it to the user — the rebind budget is what decides, and the feedback may
+    not tell the worker it has spent a round it has not."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=True)
+    assert int(store.latest_validation_round(wo_id=wo["id"])["round"]) == 4
+    judge(fleet, store, Panel("rejected"))
+
+    assert store.get_work_order(wo["id"])["status"] != "needs_review"
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_rejected")[-1]["payload"], {})
+    assert payload["uncounted"] is True and payload["of"] == ops.REBIND_MAX
+    spec = fleet.catalog.project("proj_a")
+    fleet.deliver_envelopes(spec, store)
+    queued = store.queued_messages(wo["id"])
+    assert len(queued) == 1
+    text = queued[0]["content"]
+    assert "no round spent" in text
+    assert "round 4 of 3" not in text and "REVIEW FEEDBACK (round" not in text
+
+
+def test_rebind_max_exhausted_goes_to_the_user(tmp_path, project, jarvis_home,
+                                               fake_claude, fake_gh):
+    """§5 test 4, §4.5. `SHA_MOVED_BLOCKER` would offer `validation.max_rounds` as the
+    remedy, and the rebind arm never reads it — so the sentence has to be the other
+    one, and raising the round budget must not restart anything."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    for head in (PUSHED, AGAIN):
+        artifact(fake_gh, head_oid=head)
+        ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                               decision=_moved(head), rebind=True)
+        row = store.latest_validation_round(wo_id=wo["id"])
+        store.set_validation_head(row["id"], head)
+        store.close_validation_round(row["id"], "passed", "")
+        store.set_status(wo["id"], "waiting_pr_merge")
+
+    third = "dddd1111dddd2222dddd3333dddd4444dddd5555"
+    artifact(fake_gh, head_oid=third)
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(third), rebind=True)
+    poll(fleet, store)          # writes the `sha_moved` hold the derivation reads
+
+    declined = store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT)
+    assert db.from_json(declined[-1]["payload"], {})["cause"] == ops.REBIND_EXHAUSTED
+    blockers = invariants.true_blockers(store, store.get_work_order(wo["id"]))
+    assert invariants.REBIND_EXHAUSTED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+    wider = boot(tmp_path, project, max_rounds=10)
+    before = rounds_of(store, wo)
+    assert ops.rejudge_moved_head(store, project, store.get_work_order(wo["id"]),
+                                  project="proj_a", cfg=_cfg(wider),
+                                  decision=_moved(third), rebind=True) is None
+    assert rounds_of(store, wo) == before

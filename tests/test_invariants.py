@@ -946,3 +946,61 @@ def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
     against a checkout, which is not something the reconcile loop should do every tick."""
     assert invariants.check_production_clean in invariants.OS_INVARIANTS
     assert invariants.check_production_clean not in invariants.INVARIANTS
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+
+
+def _declined_on_a_moved_head(store: ProjectStore, *, cause: str,
+                              head: str = "bbbb1111bbbb2222",
+                              judged: str = "aaaa1111aaaa2222") -> dict:
+    """A pull request parked on a head the OS refused to re-judge, for `cause`."""
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(row["id"], judged)
+    store.close_validation_round(row["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    store.add_event(wo["id"], invariants.REJUDGE_DECLINED_EVENT,
+                    {"head_sha": head, "judged_sha": judged, "cause": cause})
+    store.add_event(wo["id"], "automerge_held",
+                    {"code": invariants.HELD_SHA_MOVED, "head_sha": head})
+    return store.get_work_order(wo["id"])
+
+
+def test_a_rebind_decline_is_not_a_spent_round_budget(project):
+    """The two declines mean different things and only one is answered by
+    `validation.max_rounds` — so each derivation reads only its own."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    spent = _declined_on_a_moved_head(store, cause=ops.REBIND_EXHAUSTED)
+
+    assert invariants.rejudge_exhausted(store, spent) is False
+    assert invariants.rebind_exhausted(store, spent) is True
+    blockers = true_blockers(store, spent)
+    assert invariants.REBIND_EXHAUSTED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+
+def test_a_budget_decline_still_reads_as_one(project):
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    budget = _declined_on_a_moved_head(store, cause=ops.REJUDGE_BUDGET_SPENT)
+
+    assert invariants.rejudge_exhausted(store, budget) is True
+    assert invariants.rebind_exhausted(store, budget) is False
+    blockers = true_blockers(store, budget)
+    assert invariants.SHA_MOVED_BLOCKER in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+
+def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project):
+    """The migration reading: a payload with no `cause` is every row there was."""
+    store = ProjectStore(project)
+    old = _declined_on_a_moved_head(store, cause="")
+
+    assert invariants.rejudge_exhausted(store, old) is True
+    assert invariants.rebind_exhausted(store, old) is False

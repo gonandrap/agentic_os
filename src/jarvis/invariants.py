@@ -302,6 +302,17 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
 
+#: The OTHER `sha_moved` stall that reaches the user, and the reason it needs its own
+#: sentence: the OS asked for the merge, re-judged its resolution `ops.REBIND_MAX` times
+#: and the panel still refuses it. `SHA_MOVED_BLOCKER` above would offer
+#: `validation.max_rounds`, which the rebind arm never reads — advice that does nothing
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5).
+#: "twice" is `ops.REBIND_MAX`, spelled out here rather than imported: this module is
+#: below `ops` in the import order, and the bound is a constant of the design.
+REBIND_EXHAUSTED_BLOCKER = ("the OS re-judged the merge it asked for twice and the "
+                            "panel still refuses it — read the review and decide: "
+                            "merge it yourself, or send the worker back")
+
 #: What a work order says when the reviewer REFUSED the automatic merge of the commit the
 #: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
 #: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
@@ -523,8 +534,36 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     Derived, never stored. `ops.rejudge_moved_head` writes the decline;
     INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
     `acknowledged_blockers` (kn-089de524).
+
+    A decline caused by `ops.REBIND_EXHAUSTED` is NOT one of these — that one is
+    `rebind_exhausted` below, and the remedy this one names would do nothing for it.
     """
-    declined = store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+    return _parked_on_a_decline(store, wo, rebind=False)
+
+
+def rebind_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same question about the OTHER decline: the OS re-judged the merge it asked
+    for `ops.REBIND_MAX` times and the panel still refuses it.
+
+    A separate derivation because the remedy is different and `SHA_MOVED_BLOCKER`'s is
+    then FALSE: it offers `validation.max_rounds`, and the rebind arm never reads it
+    (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+    """
+    return _parked_on_a_decline(store, wo, rebind=True)
+
+
+def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
+                         rebind: bool) -> bool:
+    """The three facts both derivations above share, read for one `cause` only.
+
+    The decline dedupe is per head across both causes, so one head carries one decline
+    with one cause and the two can never both fire (spec §4.5).
+    """
+    from . import ops as ops_mod
+
+    declined = [e for e in store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+                if (str(db.from_json(e["payload"], {}).get("cause") or "")
+                    == ops_mod.REBIND_EXHAUSTED) is rebind]
     if not declined:
         return False
     held = store.events_of_kind(wo["id"], "automerge_held")
@@ -795,6 +834,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # THE SAME STALL WITH THE OTHER CAUSE, and the two cannot both fire: the decline
+    # dedupe is per head across both (spec 2026-09-27 §4.5).
+    if wo["status"] == "waiting_pr_merge" and rebind_exhausted(store, wo):
+        blockers.append(REBIND_EXHAUSTED_BLOCKER)
     # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
     # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
     # Gated on the status for the same reason as the branch above, and ordered after it

@@ -529,8 +529,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # person asked for must not read afterwards as one they did.
         rnd, was = p.get("round"), p.get("was")
         who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
-        return (f"Validation forced {who} — round {rnd}" if rnd
-                else f"Validation forced {who}",
+        # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a
+        # spent budget otherwise (spec 2026-09-27 §4.3).
+        spent = ", no round spent" if p.get("rebind") else ""
+        return (f"Validation forced {who} — round {rnd}{spent}" if rnd
+                else f"Validation forced {who}{spent}",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
     if kind == "validation_head_carried":
@@ -570,8 +573,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejudge_declined":
         # The one moved head the OS will NOT re-judge: the round it would open is the
         # last one, and that one is the user's (same spec, §4).
+        # ...and the OTHER decline, which `max_rounds` cannot answer: the OS re-judged
+        # the merge it asked for as often as it may (spec
+        # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+        head = str(p.get("head_sha") or "")[:10]
+        if str(p.get("cause") or "") == "rebind_exhausted":     # ops.REBIND_EXHAUSTED
+            return ("Left for you to re-judge",
+                    f"the head is now {head} and the OS has already re-judged this "
+                    f"merge {p.get('rebinds')} time(s) — the limit")
         return ("Left for you to re-judge",
-                f"the head is now {str(p.get('head_sha') or '')[:10]} and round "
+                f"the head is now {head} and round "
                 f"{p.get('next_round')} of {p.get('max_rounds')} would be the last")
     if kind == "validation_follow_ups_filed":
         # A SEVENTH kind, and the only one that is not a verdict: the round's

@@ -2065,7 +2065,11 @@ def round_line(rnd: dict[str, Any]) -> str:
     # THE WORD, not the raw outcome: `failed` is three different facts and only
     # `validation_standing` knows which one this row is (GitHub issue #581).
     word, _tone, _icon = validation_standing(rnd)
-    return (f"round {rnd['round']} · {rnd['fingerprint']} · {word}"
+    # A REBIND, marked where the number is: round 4 under `max_rounds` 3 reads as the
+    # defect unless the line says nobody was charged for it (spec
+    # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+    uncounted = " · uncounted" if rnd.get("uncounted") else ""
+    return (f"round {rnd['round']}{uncounted} · {rnd['fingerprint']} · {word}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
             + note
@@ -2836,9 +2840,12 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     read to answer "how many times, and what came back", not to re-read the submission.
     """
     filed = filed_follow_ups(store, wo_id=wo_id, fo_id=fo_id)
+    # `uncounted` is in the tuple because `round_line` must mark a rebind: a round
+    # numbered past `max_rounds` otherwise reads as the defect the spec is about
+    # (2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
     return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
                                   "reason", "pr_url", "config_version", "head_sha",
-                                  "forced_reason", "hold_cause")},
+                                  "forced_reason", "hold_cause", "uncounted")},
              # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
              # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
              # dashboard pages read THIS projection, so a key that came and went would
