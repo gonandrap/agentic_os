@@ -296,3 +296,77 @@ def test_submit_plan_reads_the_branchs_pull_request_through_gh(fleet, planner,  
     asked = [c["argv"] for c in fake_gh.calls if c["argv"][:2] == ["pr", "list"]]
     assert asked, "the branch's pull request was never asked about"
     assert planner["branch"] in asked[-1]
+
+
+# -- the planner settle does not share an exit code with the submission ----------------
+
+
+def _plan_questions(wo_id: str) -> list[dict]:
+    from jarvis.neo_store import NeoStore
+
+    neo = NeoStore()
+    try:
+        return [q for q in neo.list_questions() if q["wo_id"] == wo_id]
+    finally:
+        neo.close()
+
+
+def test_an_open_gate_warns_and_the_submission_stands(fleet, planner, monkeypatch):  # noqa: F811
+    """Issue #822's remaining instance, ruling 903.
+
+    `ops.finish` refuses over an open gate request, and planners do file merge gates
+    (kn-ae871d91). Refusing the WHOLE command there printed `error:` over a submission
+    that had already stored the plan and asked Neo, and the reporter retried three times
+    — a fresh review question each time.
+    """
+    _no_panel(fleet)
+    _lookup(monkeypatch, PR)
+    store = fleet.store()
+    try:
+        request = store.add_approval(planner["wo_id"], "pr_merge",
+                                     "gh pr " + "merge 9 --squash")
+    finally:
+        store.close()
+
+    out = ops.submit_plan(planner["fo_id"], a_plan(child("schema")))
+
+    # 1. Exit 0: the submission succeeded, so the command must not report failure.
+    assert out["status"] == "plan_review"
+    # 2. Stored ONCE.
+    assert _feature_row(fleet, planner["fo_id"])["plan"] is not None
+    assert len(_events(fleet, planner["wo_id"], "plan_submitted")) == 1
+    # 3. ONE review question.
+    assert len(_plan_questions(planner["wo_id"])) == 1
+    # 4. The warning names the blocker, its id, and the way on.
+    warning = out["warning"]
+    assert str(request["id"]) in warning
+    assert f"jarvis wo finish {planner['wo_id']}" in warning
+    # A reader must not be told the planner settled when it did not.
+    assert out.get("planner") is None
+    assert _row(fleet, planner["wo_id"])["status"] == "running"
+
+
+def test_a_planner_that_settles_reports_no_warning(fleet, planner, monkeypatch):  # noqa: F811
+    """The quiet path keeps `out["planner"]` and gains no warning."""
+    _no_panel(fleet)
+    _lookup(monkeypatch, PR)
+
+    out = ops.submit_plan(planner["fo_id"], a_plan(child("schema")))
+
+    assert "warning" not in out
+    assert out["planner"]["status"] == "completed"
+
+
+def test_a_non_ops_failure_from_the_planner_settle_still_propagates(fleet, planner,  # noqa: F811
+                                                                    monkeypatch):
+    """Ruling 903 condition 1: `OpsError` ONLY. A bug in `finish` is not a warning."""
+    _no_panel(fleet)
+    _lookup(monkeypatch, PR)
+
+    def boom(*a, **k):
+        raise RuntimeError("finish is broken")
+
+    monkeypatch.setattr(ops, "finish", boom)
+
+    with pytest.raises(RuntimeError):
+        ops.submit_plan(planner["fo_id"], a_plan(child("schema")))

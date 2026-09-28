@@ -241,6 +241,41 @@ the real function with a stub binary via the `GH_BIN` env override
    `GitHubError` with `URL_REFUSED` and runs no subprocess; a URL on another repository
    raises `UntrustedPullRequest` through `checked_pr_url`.
 
+## The second half: the planner settle is not the submission
+
+Ruling: Neo question 903 (answering for the user), on the reporter's correction to their
+own filing of #822.
+
+**The class, not the instance.** Everything above removes ONE way the trailing
+`finish(fo["plan_wo_id"], …)` can refuse over a submission that has already written
+everything. It is not the only one: `ops.finish` also raises
+`OpsError(gate_still_open(...))` on `store.open_approvals(wo_id)` (`ops.py:4836`), and
+planners do file merge gates (kn-ae871d91). Both instances share one cause — the plan
+submission and the planner settle share an exit code. The reporter read `error:` over a
+command whose every write succeeded, concluded nothing had been submitted, and retried
+three times; each retry re-stored the plan and asked a FRESH Neo review question for the
+same feature order.
+
+`submit_plan` therefore catches `OpsError` from that call and returns normally:
+
+* `out["warning"]` carries the failure — the key `ask_question` already uses
+  (`ops.py:7720`), rendered as a `warning:` line — naming the open approval ids and the
+  exact `jarvis wo finish <planner> --summary "…"` that settles the planner once the
+  blocker is cleared, with `finish`'s own refusal quoted underneath.
+* `out["planner"]` is ABSENT in that case. A reader must not be told the planner settled
+  when it did not.
+
+**Why `OpsError` is the boundary.** An `OpsError` is a refusal this module wrote: it is
+a state of the record someone chose to describe, and describing it in a warning loses
+nothing. Any other exception is a defect nobody has read — swallowing it under a
+`warning:` line would turn a bug in `finish` into text a planner is asked to act on. So
+the catch is `except OpsError` and never `except Exception`, and
+`test_a_non_ops_failure_from_the_planner_settle_still_propagates` holds that line.
+
+`test_an_open_gate_warns_and_the_submission_stands` asserts all four: no raise, the plan
+stored exactly once, exactly one Neo review question, and a warning naming the open
+approval id.
+
 ## Out of scope
 
 `unlanded_work` reading branches; `jarvis fo plan` gaining any flag; whether spec pull

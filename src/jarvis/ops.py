@@ -7276,11 +7276,41 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands, and a work order left
         # `running` with no turn in flight is what the reconciler calls idle.
-        out["planner"] = finish(
-            fo["plan_wo_id"],
-            f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
-        )
+        summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        try:
+            out["planner"] = finish(fo["plan_wo_id"], summary)
+        except OpsError as e:
+            # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
+            out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
+                                                summary, e)
     return out
+
+
+def _planner_unsettled(path: Path, fo_id: str, planner_id: str, summary: str,
+                       refusal: OpsError) -> str:
+    """The plan IS stored; only the planner could not settle. Ruling 903, issue #822.
+
+    ONLY `OpsError` reaches here — every other exception propagates, because an
+    `OpsError` is a refusal this module wrote and anything else is a defect nobody has
+    read. The refusal to expect is `finish`'s open-gate one (`gate_still_open`): planners
+    do file merge gates (kn-ae871d91). The class being closed is the shared exit code —
+    an `error:` over a command whose every write succeeded is what the reporter retried
+    three times, asking a fresh Neo review question each time.
+    """
+    store = ProjectStore(path)
+    try:
+        ids = [str(a["id"]) for a in store.open_approvals(planner_id)]
+    finally:
+        store.close()
+    blocker = (f"gate request{'s' if len(ids) > 1 else ''} {', '.join(ids)} still open"
+               if ids else "it could not be settled")
+    return (
+        f"{fo_id}'s plan IS stored and queued for review — nothing here needs "
+        f"resubmitting, and resubmitting would ask Neo a second time about the same "
+        f"plan. Only its planner {planner_id} is unsettled: {blocker}. Clear that, then "
+        f"settle the planner:\n"
+        f"    jarvis wo finish {planner_id} --summary \"{summary}\"\n\n{refusal}"
+    )
 
 
 def refresh_plan_spec(fo_id: str,
