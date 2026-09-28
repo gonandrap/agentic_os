@@ -572,63 +572,59 @@ INVESTIGATOR_REFUSED_PROGRAMS = frozenset({
     "tee", "dd", "truncate", "install", "patch", "ed", "ex", "vi", "vim",
 })
 
-#: `find` actions that write, delete or execute. `-exec`/`-ok` run an arbitrary command;
-#: the `-fprint*`/`-fls` family writes a named file; `-delete` needs no explanation.
-INVESTIGATOR_FIND_WRITES = frozenset({
-    "-delete", "-exec", "-execdir", "-ok", "-okdir",
-    "-fprint", "-fprint0", "-fprintf", "-fls",
+#: `find` predicates that MATCH or PRINT to stdout and nothing else — an ALLOWLIST, so
+#: `-delete`, `-exec*`, `-ok*` and the `-fprint*`/`-fls` family are refused by being
+#: absent rather than by being named (§2.6).
+INVESTIGATOR_FIND_READS = frozenset({
+    "-name", "-iname", "-lname", "-ilname", "-path", "-ipath", "-regex", "-iregex",
+    "-type", "-xtype", "-maxdepth", "-mindepth", "-depth", "-mount", "-xdev",
+    "-follow", "-empty", "-size", "-newer", "-anewer", "-cnewer",
+    "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin",
+    "-user", "-group", "-uid", "-gid", "-nouser", "-nogroup",
+    "-perm", "-links", "-inum", "-samefile", "-readable", "-writable", "-executable",
+    "-true", "-false", "-print", "-print0", "-printf", "-ls", "-quit", "-prune",
+    "-not", "-a", "-and", "-o", "-or",
+    "-noleaf", "-ignore_readdir_race", "-noignore_readdir_race",
+    "-H", "-L", "-P", "-D", "-O",
 })
 
+#: `sort` long options that write nothing. `--output` and `--compress-program` are absent,
+#: and so is every abbreviation of them git-style parsing would accept (§2.6).
+INVESTIGATOR_SORT_LONG = frozenset({
+    "--ignore-leading-blanks", "--dictionary-order", "--ignore-case",
+    "--general-numeric-sort", "--ignore-nonprinting", "--month-sort",
+    "--human-numeric-sort", "--numeric-sort", "--random-sort", "--reverse", "--sort",
+    "--stable", "--unique", "--version-sort", "--zero-terminated", "--check",
+    "--field-separator", "--key", "--buffer-size", "--temporary-directory",
+    "--parallel", "--debug", "--files0-from", "--help", "--version",
+})
 
-def _sed_script_writes(script: str) -> bool:
-    """Whether one `sed` SCRIPT leaves the stream: `w`/`W` write a file, `e` executes.
+#: …and its short options, `o` absent. `k t S T` take the rest of the cluster as their
+#: ARGUMENT, so the walk stops there rather than reading `-k2,2` as the letters `2`, `,`.
+INVESTIGATOR_SORT_SHORT = "bdfgiMhnRrsuVzcCktST"
+INVESTIGATOR_SORT_ARG_SHORT = "ktST"
 
-    Addresses and `s///` patterns are SKIPPED, so `sed -n '/error/p'` — an ordinary read
-    whose regex merely contains an `e` — is not refused. Everything this scanner cannot
-    place reads as a write: an unterminated regex is a script this parser does not model,
-    and §2.6's guarantee is not allowed to fail open.
-    """
-    i, n = 0, len(script)
-    while i < n:
-        c = script[i]
-        if c == "\\":
-            i += 2
-        elif c in "/":                      # an address regex: skip to its close
-            i = _sed_skip(script, i + 1, "/")
-            if i < 0:
-                return True
-        elif c in "sy":                     # s/re/rep/flags, y/from/to/ — flags can write
-            delim = script[i + 1] if i + 1 < n else ""
-            if not delim:
-                return True
-            i = _sed_skip(script, i + 2, delim)
-            if i < 0:
-                return True
-            i = _sed_skip(script, i, delim)
-            if i < 0:
-                return True
-            while i < n and script[i] not in ";}\n":
-                if script[i] in "wWe":
-                    return True
-                i += 1
-        elif c in "wWe":
-            return True
-        else:
-            i += 1
-    return False
+#: `sed` options that leave the stream alone. `--in-place`, `--file` and the short `i`
+#: and `f` are refused by absence (§2.6).
+INVESTIGATOR_SED_LONG = frozenset({
+    "--quiet", "--silent", "--regexp-extended", "--null-data", "--separate",
+    "--unbuffered", "--posix", "--sandbox", "--debug", "--expression", "--help",
+    "--version",
+})
+INVESTIGATOR_SED_SHORT = "nErsuze"
+
+#: A PLAIN `sed` script: addresses and at most one of `p P d = l q` per statement. `w`,
+#: `W`, `e`, `s`, `y`, `r`, `R`, `{` and the branch commands are refused by failing to
+#: match at all, so an unmodelled script is a refusal (§2.6).
+_SED_ADDRESS = r"(?:\d+(?:~\d+)?|\$|/(?:\\.|[^/\\])*/[IM]*)"
+_SED_RANGE = rf"{_SED_ADDRESS}(?:,(?:{_SED_ADDRESS}|\+\d+|~\d+))?"
+_SED_STATEMENT = rf"\s*(?:{_SED_RANGE})?\s*!?\s*[pPd=lq]?\s*"
+_SED_PLAIN = re.compile(rf"\A{_SED_STATEMENT}(?:[;\n]{_SED_STATEMENT})*\Z")
 
 
-def _sed_skip(script: str, start: int, delim: str) -> int:
-    """Index just past the next unescaped `delim` from `start`, or -1 if there is none."""
-    i = start
-    while i < len(script):
-        if script[i] == "\\":
-            i += 2
-            continue
-        if script[i] == delim:
-            return i + 1
-        i += 1
-    return -1
+def _sed_script_is_plain(script: str) -> bool:
+    """Whether one `sed` SCRIPT is an address/print script and nothing else (§2.6)."""
+    return bool(_SED_PLAIN.match(script))
 
 
 def _investigator_writer(segment: str) -> bool:
@@ -639,6 +635,10 @@ def _investigator_writer(segment: str) -> bool:
     That test is structural and shared by every gate; this one is scoped to the
     investigator, whose guarantee is "changes no file" rather than "runs nothing
     privileged", so it belongs here and never in `gate_rules`.
+
+    ALLOWLISTS, never denylists: each of the three is refused unless every option, and
+    for `sed` the script itself, is a form known to write nothing. A writing option
+    nobody thought to name — `--outp=f`, `-fprintf`, `W` — fails closed (§2.6).
     """
     # PARSED, for `_investigator_git_read`'s reason: the shell strips quotes before the
     # program sees the argument. A parse this cannot do is a refusal, not a pass.
@@ -653,12 +653,9 @@ def _investigator_writer(segment: str) -> bool:
     if program in INVESTIGATOR_REFUSED_PROGRAMS:
         return True
     if program == "find":
-        return any(a in INVESTIGATOR_FIND_WRITES for a in args)
+        return any(a.startswith("-") and a not in INVESTIGATOR_FIND_READS for a in args)
     if program == "sort":
-        # THE LETTERS IN THE CLUSTER, never the argument's prefix: `sort -nro f` writes
-        # and does not start with `-o`. `-n`, `-u`, `-r` carry no `o` and keep reading.
-        return any(a.startswith("--output")
-                   or ("o" in _short_cluster(a)) for a in args)
+        return _sort_writes(args)
     if program in ("sed", "gsed"):
         return _sed_writes(args)
     return False
@@ -674,8 +671,28 @@ def _short_cluster(arg: str) -> str:
     return arg[1:]
 
 
+def _sort_writes(args: list[str]) -> bool:
+    """Whether a `sort` invocation writes a file: anything off the allowlist (§2.6).
+
+    THE LETTERS IN THE CLUSTER, never the argument's prefix: `sort -nro f` writes and
+    does not start with `-o`.
+    """
+    for arg in args:
+        if arg.startswith("--"):
+            if arg.split("=", 1)[0] not in INVESTIGATOR_SORT_LONG:
+                return True
+            continue
+        for letter in _short_cluster(arg):
+            if letter not in INVESTIGATOR_SORT_SHORT:
+                return True
+            if letter in INVESTIGATOR_SORT_ARG_SHORT:
+                break   # the rest of the cluster is this option's argument
+    return False
+
+
 def _sed_writes(args: list[str]) -> bool:
-    """Whether a `sed` invocation leaves the stream: `-i`, `-f`, or a writing script.
+    """Whether a `sed` invocation leaves the stream: any option or script off the
+    allowlists (§2.6), so `-i`, `-f`, `--in-place=BAK`, `--file=` and `W` all refuse.
 
     The cluster is read LEFT TO RIGHT because sed's own parse does: `-i` takes an
     optional suffix glued to it and `-e`/`-f` take the rest of the cluster as their
@@ -691,10 +708,8 @@ def _sed_writes(args: list[str]) -> bool:
             continue
         if arg.startswith("--"):
             name = arg.split("=", 1)[0]
-            if name.startswith("--in-place") or name == "--file":
+            if name not in INVESTIGATOR_SED_LONG:
                 return True
-            if arg.startswith("--file="):
-                return True     # the script is in a file this hook cannot read
             if arg.startswith("--expression="):
                 scripts.append(arg.split("=", 1)[1])
                 seen_script = True
@@ -704,8 +719,8 @@ def _sed_writes(args: list[str]) -> bool:
         cluster = _short_cluster(arg)
         if cluster:
             for index, letter in enumerate(cluster):
-                if letter in "if":
-                    return True     # in-place, or a script file
+                if letter not in INVESTIGATOR_SED_SHORT:
+                    return True     # `i` in-place, `f` a script file, or an unknown
                 if letter == "e":
                     rest = cluster[index + 1:]
                     if rest:
@@ -720,7 +735,7 @@ def _sed_writes(args: list[str]) -> bool:
             seen_script = True
     if expect:
         return True     # `-e` with nothing after it
-    return any(_sed_script_writes(s) for s in scripts)
+    return not all(_sed_script_is_plain(s) for s in scripts)
 
 
 def investigator_write_decision(payload: dict[str, Any],
@@ -785,7 +800,8 @@ def investigator_bash_decision(payload: dict[str, Any],
     pair or passes `gate_rules.reads_only` (structural, already refusing command
     substitution, shell invokers, unterminated heredocs and `sed -i`). `reads_only` keys
     on the program name, so `_investigator_writer` is what stops `sed -n 'w f'`, `sort
-    -o f` and `awk` — readers that write from their own arguments.
+    -o f` and `awk` — readers that write from their own arguments — by ALLOWLISTING the
+    option and script forms that write nothing and refusing everything else.
     """
     if env.get(WO_KIND_ENV) != "investigator" or payload.get("tool_name") != "Bash":
         return None

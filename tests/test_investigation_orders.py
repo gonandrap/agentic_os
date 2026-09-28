@@ -227,6 +227,21 @@ WRITING_READERS = (
     "sed -ni 'p' README.md",
     "sed -nf script.sed README.md",
     "sed -ne 'w src/a.py' README.md",
+    # ALLOWLISTS, not denylists: each of these is a write the denylist shape never
+    # named, and fails closed only because the option or script form is not permitted.
+    "sed -n 's/a/b/w src/a.py' README.md",
+    "sed -n 'W src/a.py' README.md",
+    "sed --expression='w src/a.py' -n README.md",
+    "sed -n --file=x.sed README.md",
+    "sort --output=src/a.py README.md",
+    "sort --outp=src/a.py README.md",
+    # `-C` takes no argument, so the rest of the cluster is still options, `o` included.
+    "sort -Co src/a.py README.md",
+    "find . -fprintf src/a.py x",
+    "find . -fls src/a.py",
+    "find . -exec touch x \\;",
+    "find . -execdir touch x \\;",
+    "find . -ok rm {} \\;",
 )
 
 #: The pipelines an investigator actually needs, which the segment loop must keep.
@@ -302,9 +317,18 @@ def test_the_ordinary_reads_still_run():
     for command in ("grep -rn foo src", "cat README.md", "sed -n '1,20p' README.md",
                     # The same clusters, one letter different, still reading.
                     "sed -ne '1,20p' README.md", "sed -nE '/err/p' README.md",
-                    "sort -u README.md"):
+                    "sort -u README.md",
+                    # The allowlists must still pass ordinary match/print work.
+                    "sed -n '1,20!p' README.md", "sort -nr README.md"):
         assert _decision(
             hooks.preflight_decision(_bash(command), _env())) == "allow", command
+
+
+def test_the_find_allowlist_passes_a_plain_search():
+    """`find` never reaches an allow — `gate_rules._READERS` does not carry it — so the
+    positive control for its allowlist is on the test that changed (§2.6)."""
+    for command in ("find . -name '*.py' -maxdepth 2", "find src -type f -print0"):
+        assert hooks._investigator_writer(command) is False, command
 
 
 def test_an_investigator_may_not_use_an_mcp_write_tool():
