@@ -181,6 +181,32 @@ def origin_repo(cwd: Path | None) -> tuple[str, str] | None:
     return parts[-2].lower(), parts[-1].lower()
 
 
+def blob_url(cwd: Path | None, repo_path: str) -> str | None:
+    """`https://github.com/{owner}/{repo}/blob/{sha}/{repo_path}`, or None.
+
+    §6 of docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. Built on the
+    default branch's SHA rather than on the branch name, so the link keeps showing what
+    the page showed after main moves.
+
+    LOCAL GIT ONLY — a page render may not touch the network, so this never fetches.
+    None at every unreadable step, and the caller OMITS the link rather than guessing: a
+    404 on GitHub from a URL the OS assembled reads as the spec having been deleted.
+    """
+    from .evidence import base_ref, default_branch_head
+
+    if cwd is None or not repo_path:
+        return None
+    origin = origin_repo(cwd)
+    if origin is None:
+        return None
+    if not base_ref(Path(cwd)):
+        return None
+    sha = default_branch_head(Path(cwd))
+    if not sha:
+        return None
+    return f"https://github.com/{origin[0]}/{origin[1]}/blob/{sha}/{repo_path}"
+
+
 #: The fields of one `gh pr view --json …`. Four questions in one round trip: did this
 #: land, can it still land, is what it would land green, and — months later — is what
 #: landed all of it? See the spec's §2 for the second,
