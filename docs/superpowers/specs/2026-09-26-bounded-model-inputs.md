@@ -112,6 +112,11 @@ persisted and sent. Scanning bytes that are then dropped is a different and over
 rule, and a reviewer will otherwise read this change as weakening the net: say so in the
 pull request.
 
+The invariant to state in that pull request, and to pin with a test: **every byte that is
+persisted or sent has been through `decide_evidence`**. Trimming moves the cut BEFORE the
+net, never after it — there is no path where a byte reaches `neo_store.ask` or the transport
+that the net did not see. The net gets narrower input; it does not get less coverage.
+
 **The test trap in this section.** `fake_claude` branches on substrings found ANYWHERE in
 the prompt — `"ASSUMPTION REVIEW"`, then `FORCE_ACCEPT_HIGH` / `FORCE_ACCEPT` / `FORCE_DENY`
 (testing.py:945-965), defaulting to escalate. A `FORCE_*` token placed inside a large test
@@ -164,7 +169,7 @@ combined prompt of an OS-originated call. Two rules:
   seat prompt's size off the columns section 3 added — the default is a MEASURED number
   with the measurement in a comment beside it, never a number somebody liked the look of.
 * Over the ceiling the OS **trims and labels, or refuses loudly** — an attention item and
-  an inbox row naming the kind, the size and the work order. Never a silent trim, and never
+  an inbox row naming the kind, the size and the work order — sizes, never prompt text. Never a silent trim, and never
   a fabricated verdict: a call that was never made has decided nothing.
 
 **How the refusal is shaped, so it cannot become a verdict.** `run_headless_result` has no
@@ -173,7 +178,12 @@ or an `Authorisation` carrying one), and the work order comes from the caller or
 `JARVIS_WO_ID`. So refuse by RAISING a subclass of `claude_cli.ClaudeCliError`
 (claude_cli.py:76), which every consumer already treats as a transport failure that decides
 nothing, and let the call site that already records failures write the inbox row
-(`CentralStore.add_inbox`) and the attention flag (`ProjectStore.flag_attention`). A Neo
+(`CentralStore.add_inbox`) and the attention flag (`ProjectStore.flag_attention`).
+**Those two rows carry NUMBERS and identifiers only** — the call kind, the prompt and system
+byte sizes, the ceiling, the work order id — and NEVER a fragment of the prompt itself, not
+even a head or a tail of it. A refusal that quotes the payload copies the payload into the
+inbox, which is one of the places this feature exists to keep it out of, and the inbox is
+rendered to the user and digested by a model. A Neo
 question stays claimable, a panel seat writes no opinion and shrinks no quorum, an
 assumption stays pending with no `confirm_question_id`, and no `agent_calls` row claims
 success for a call that never ran.
@@ -233,6 +243,18 @@ Also refuse, in the same check, a `jarvis` command whose argument contains a com
 substitution of an unbounded producer — `$(git diff …)`, `$(cat …)`, `$(gh pr diff …)`,
 backtick forms. That is decidable before execution, which is the whole point.
 
+**Match on parsed words, and fail SHUT** (kn-21d73ac2, from the review of wo-4beada49 —
+read it before writing the check). That entry is about this exact defect: a denylist inside
+a permission hook that tested RAW text let a quoted argument through, because the shell
+strips quotes and backslashes before the program sees the word. So `shlex.split` the command
+first and match the parsed words, so that the quoted and unquoted spellings of the same
+payload reach the same decision. Two consequences carried from the same entry: when the
+parse RAISES — `shlex` raises `ValueError` on unbalanced quoting — the check REFUSES and
+does NOT fall through to the auto-allow, because an unparseable `jarvis` command is exactly
+the shape an evasion has; and where a long option is denied, its unambiguous prefixes are
+denied with it, since option parsers accept any unique abbreviation. `concision.py` is
+stdlib-only and `shlex` is stdlib, so this costs the hook nothing new.
+
 **Out of scope for this check, deliberately:** `jarvis bug report -d` is already clipped to
 4000 characters before it reaches the Neo re-assessment (issues.py), and `jarvis learn add`
 only ever rides into a prompt as an index headline. Both are database size, not prompt size.
@@ -270,6 +292,14 @@ knows where the CLI places a cache breakpoint inside a user message. Measure it;
 build on it, and do not reorder that prompt on the strength of a guess.
 
 ## 7 — Refused and deferred, with reasons, so nobody re-litigates them
+
+**Which of the user's eight items these are.** Item 2 (one diff per work order per
+confirmation pass, shared across assumptions) is DEFERRED. Item 4 (by-reference evidence:
+a tooled Neo that fetches the PR diff itself) is REFUSED — item 4's other half, the PR URL
+and head SHA travelling as plain text, IS shipped, in section 2. Item 6's `PostToolUse` half
+is CUT; its `PreToolUse` half is section 5. Items 1, 3, 5, 7 and 8 are all planned, in
+sections 2, 3, 4, 5 and 6. No planned child covers a deferred or refused item, so nothing
+below is drift.
 
 All three refusals below were put to Neo as question 753, on wo-7c7347e1, and sanctioned —
 with one condition, now in section 2: the trimmed evidence must carry the pull request link
