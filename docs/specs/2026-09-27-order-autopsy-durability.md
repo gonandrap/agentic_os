@@ -161,12 +161,14 @@ than or equal to the seal's, COMPARED AT THE SAME FLOORS. A fresh read at a high
 showing fewer writes is a floor artefact and is REFUSED. On adoption, `autopsy_sealed_at` is
 PRESERVED and a `resealed_at` is added, exactly as `src/jarvis/bill.py:881-888` does.
 
-**The gate seam.** This child ships `autopsy.records_autopsy(wo, cfg) -> bool` as a named
-one-line function returning True, called from `seal_autopsies`. Section 5 replaces its body.
-Stated here and in no other section: between this child landing and section 5's landing, the
-OS seals tier-1 autopsies for EVERY project regardless of level. That is accepted, because
-tier-1 is arithmetic with NO retained content, it runs off the hot path on settled orders
-only, and it writes to the project's own database.
+**The gate seam, and it ships CLOSED.** This child ships
+`autopsy.records_autopsy(wo, cfg) -> bool` as a named one-line function returning **False**,
+called from `seal_autopsies`. Section 5 replaces its body with the real level check, and until
+section 5 lands this writer seals NOTHING for anybody: it is complete, dark, and exercised only
+by tests that force the predicate. This is the user's ruling and it is not a trade-off to be
+re-opened — no autopsy is sealed fleet-wide ahead of the gate that governs it, whatever the
+argument that tier-1 retains no content. A test asserts the SHIPPED predicate returns False, so
+the dark state cannot be undone by accident.
 
 **Acceptance.**
 
@@ -202,9 +204,12 @@ committed transcript,
 eleven existing tests. Proving a cap means the folded numbers RECONCILE, never that a key
 appeared.
 
-The daemon step: settled orders only; exactly one `usage.index_sessions()` for a batch; an
-order whose seal raises gets an error payload and leaves the queue; a second tick seals
-nothing. Copy `tests/test_bill.py::test_the_daemon_seals_every_settled_order_and_only_once`.
+The daemon step, with the predicate FORCED TRUE by the test because the shipped one is False:
+settled orders only; exactly one `usage.index_sessions()` for a batch; an order whose seal
+raises gets an error payload and leaves the queue; a second tick seals nothing. Copy
+`tests/test_bill.py::test_the_daemon_seals_every_settled_order_and_only_once`. Beside it, the
+test that pins the dark state: with the predicate AS SHIPPED, a settled order's
+`autopsy_json` is still `None` after a tick.
 
 Survival is proven by DELETING the `tmp_path` `.jsonl` and re-reading, the idiom of
 `tests/test_bill.py::test_an_old_seal_stands_once_the_evidence_is_gone`. Nothing in the suite
@@ -286,10 +291,13 @@ must still pass: that packet is byte-pinned and `_session_lines` feeds it.
 ## 5. The gate, and the second write it now governs
 
 Child 3, key `gate`. This is the ONLY section that imports `src/jarvis/observability.py`, and
-therefore the only one with a PREREQUISITE: that module is the parent spec's section 10 and it
-is NOT on `main` — it is readable only at `git show
-origin/worktree-wo-92b0a58d:src/jarvis/observability.py`, on pull request #803. This child does
-not start until that has landed.
+it has NO prerequisite: that module is the parent spec's section 10, and pull request #803
+MERGED it to `main` on 2026-09-27. Read it there. Do NOT copy it, vendor it or reimplement
+`level_for`.
+
+THIS SECTION IS WHAT TURNS THE FEATURE ON. Section 3's writer ships with its predicate
+returning False, so until this child lands no order anywhere gains an autopsy. That is
+deliberate.
 
 **The ruling, and it is the planner's:** `normal` covers the autopsy, and the autopsy is OPT IN
 PER PROJECT. So the predicate is `observability.records_autopsy(wo, cfg)` returning
