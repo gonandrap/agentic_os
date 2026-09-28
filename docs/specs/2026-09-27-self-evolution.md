@@ -160,6 +160,14 @@ difference to state in the DDL comment, because the columns are identically name
 mean the same thing: `gate_rules.project` is provenance only, while `detectors.project` is
 provenance AND an optional SCOPE — `''` means every project, a name means that one.
 
+**And a rule learned on one project may not silently police the others.** Fleet-wide is the
+POWERFUL case, so it is the reviewed one: `add_detector` REFUSES an empty `project` when `source`
+is `io`, with the reason saying so. An investigation's rule is scoped to the project that
+produced it, always. Only `builtin` (the §3.5 seed rows, which are reviewed code in a diff) and
+`user` (a person typing) may be fleet-wide. Widening one afterwards is a person retracting the
+scoped row and registering a fleet-wide one, which leaves both on the record with reasons — not
+an `UPDATE` nobody reviews. A test asserts the refusal.
+
 ### 3.1 Two tables for the rule, not one
 
 A single row carrying condition and remedy together cannot express *"the detector was right and
@@ -322,6 +330,17 @@ acting authority on its own evidence, and there is no hit history yet to calibra
 against. The column exists so the calibration data accumulates; automating the flip is a
 follow-up once it has.
 
+**`remedy_rules.status` uses the same three values and is never set on its own.** Same enum,
+same transitions as above, and one rule binds them: a remedy row FOLLOWS its detector. §6's
+`arm_detector` flips the detector and every non-retracted remedy row under it in ONE transaction;
+the disarm interlock flips the same set back to `dry_run`; retracting a detector retracts its
+remedy rows with the detector's reason. The one independent verb is `retract_remedy_rule`, which
+retracts ONE remedy under a live detector — that is how a remedy is replaced without losing the
+condition's history, which is the whole reason the rule is two rows. So a remedy row is never
+`armed` under a `dry_run` detector, and the EFFECTIVE status of a rule is the weaker of the two:
+§5 and §6 read the pair, never the remedy row alone. A test asserts the pair can hold no other
+combination.
+
 Rows are never deleted and never rewritten in place except the counters, the timestamps and the
 arm/retract fields — the same append-mostly discipline as `gate_rules` and the knowledge base,
 because what the OS believed and when is evidence.
@@ -431,6 +450,14 @@ the same words) and `subjects`.
 | `drop_hold` | end a hold episode whose stated cause no longer holds | the hold is already ended |
 | `retry_neo_question` | requeue a question left `failed` with no attempt spent | the question is already pending |
 | `raise_attention` | flag attention with a precise reason naming the command to type | the reason is already that |
+
+**`raise_attention` renders its reason; it never relays one.** Its `params` carry a TEMPLATE KEY
+from a closed tuple in `remedies.py` plus ids, and the sentence the user reads is built in code
+from that key — no free-text parameter, and no parameter interpolated into the command the reason
+tells them to type. A rule row is data an investigation wrote, and a remedy that passed that data
+through to the user's attention list would be a path from a worker's prose to a command the user
+is being told to run. A test asserts an unknown key is refused on insert and that no param value
+reaches the rendered reason except as a validated id.
 
 Two additions to `Remedy` that the rest of the feature needs:
 
@@ -592,13 +619,27 @@ a switch wired to nothing, and the next session to touch it will wire it to some
 
 ## 7. What a fix order carries, and the mechanical gate before the panel is paid
 
-### 7.1 Three columns on `work_orders`, not `metadata`
+### 7.1 Four columns on `work_orders`, not `metadata`
 
 ```
 gap_class      TEXT   -- the class of gap this order closes
 detector_id    TEXT   -- a detectors.id, or a proposed detector's id
 remedy_rule_id TEXT   -- a remedy_rules.id
+trigger_wo_id  TEXT   -- the order the investigation was filed FROM; what the dry run runs against
 ```
+
+**These four names ARE the contract, and they are the names wo-4beada49 stamps.** They are
+spelled to match the registry's own columns — `detectors.id` is read through `detector_id`,
+`remedy_rules.id` through `remedy_rule_id`, exactly as `rule_fires` and `rule_recurrences` spell
+the same two joins — so one feature does not carry two spellings of one key. My earlier assumption
+recorded them as `detector_ref` / `remedy_ref` / `trigger_ref`; that spelling is SUPERSEDED here
+and nothing is built against it. Nothing has been built against either spelling yet: wo-4beada49
+stores its proposals as prose in its own verdict record and creates no column, so there is no
+migration and no collision — only one brief to correct, which this section is the source of truth
+for.
+
+`trigger_wo_id` is the fourth column because §7.2 cannot do its job without it, and because
+without it the refusal it prints names a field the submitter has no way to set.
 
 Added to the `SCHEMA` string AND to `project_store.ADDED_COLUMNS`, because the table already
 ships. Nullable, no backfill: every pre-existing row reads "not a fix order", which is true.
@@ -612,14 +653,14 @@ are the pre-check, `evidence.collect_work_order`, §8's recurrence lookup, `jarv
 is, in `metadata[ORIGIN_IO_KEY]` — do not add a fourth column for it.
 
 **They are set structurally and never inferred from prose.** `jarvis wo create` gains
-`--gap-class`, `--detector-id` and `--remedy-rule-id`; `ops.create_work_order` takes them as
-keyword arguments; the re-scoped investigation order (wo-4beada49) stamps them when it files a
+`--gap-class`, `--detector-id`, `--remedy-rule-id` and `--trigger-wo-id`;
+`ops.create_work_order` takes all four as keyword arguments; the re-scoped investigation order (wo-4beada49) stamps them when it files a
 fix order. An empty `gap_class` is the ordinary case and skips every gate below. Nothing scans a
 description, ever — kn-5d8a396a is the standing lesson about deriving a structural decision from
 free text, and a `gap_class` guessed from prose puts the panel's payment behind a regex over a
 worker's paragraph.
 
-`jarvis wo show` and the work order's page render the three as links when they resolve, and say
+`jarvis wo show` and the work order's page render all four as links when they resolve, and say
 plainly when a `detector_id` names no registered row. That is not an error: a fix order is filed
 BEFORE its rule is registered, and "proposed, not yet registered" is the normal state of a fresh
 one.
@@ -655,11 +696,21 @@ or the precondition's own sentence.
 order that has not registered its rule has not finished its job, and quietly doing it would
 remove the only forcing function this feature has.
 
-**The weak link, named so nobody has to discover it.** Finding the triggering order means
-`metadata[ORIGIN_IO_KEY]` → the improvement order's `--ref` evidence → a concrete order. If
-those refs do not resolve to one in this project, there is nothing to dry-run against. Then the
-check REFUSES — a detector that has never been shown to fire is unproven — and the reason tells
-the submitter to name the triggering order explicitly. That is the one case where the refusal is
+**Finding the triggering order: the column first, the chain second.** `wo.trigger_wo_id` is read
+FIRST and, when it is set, it is the whole answer — the submitter said which order this rule is
+proved against and nothing infers over them. Only when it is empty does the fallback run:
+`metadata[ORIGIN_IO_KEY]` → the improvement order's `--ref` evidence → a concrete order. The
+fallback exists because a fix order filed before this column shipped, or filed by hand, still has
+that back-link; it is a convenience and never the contract.
+
+**The weak link, named so nobody has to discover it.** If `trigger_wo_id` is empty AND those refs
+do not resolve to an order in this project, there is nothing to dry-run against. Then the check
+REFUSES — a detector that has never been shown to fire is unproven — with this reason and no
+other: *"gap_class '<slug>' has no triggering order to prove its detector against: trigger_wo_id
+is empty and the improvement-order refs resolve to no work order in this project. Re-file with
+`jarvis wo create --trigger-wo-id <wo-id>`, naming the order the investigation was filed from."*
+The refusal names the exact argument, because a refusal that says "name it explicitly" without
+saying HOW is the dead end this section exists to close (kn-85265170). That is the one case where the refusal is
 about the OS's records rather than the code, and it must read that way.
 
 **But a read that FAILED is not a refusal.** If the trigger order is named and cannot be read —
@@ -669,7 +720,8 @@ through to the panel. The pinned ruling applies here as much as to a model call.
 ### 7.3 The checklist, in the packet and never in the system prompt
 
 `evidence.EvidencePacket` gains `gap_class: str = ""`, `detector_id: str = ""`,
-`remedy_rule_id: str = ""` and `self_evolution: str = ""` (the rendered checklist), all populated
+`remedy_rule_id: str = ""`, `trigger_wo_id: str = ""` and `self_evolution: str = ""` (the rendered
+checklist), all populated
 in `evidence.collect_work_order`, which already takes `wo`.
 `validation.build_packet_prompt` renders it under a heading, copying the `spec_ref` /
 `spec_section` pattern exactly.
@@ -687,17 +739,18 @@ submitter who changed nothing. `head`, `summary` and `history` are each excluded
 So follow the ASSUMPTIONS precedent, which is the one thing that ever widened the formula and the
 only shape that is safe: assumptions are mixed in ONLY when there are any, *"so every work order
 that files none hashes exactly as it did before that existed."* Identically here —
-`gap_class`, `detector_id` and `remedy_rule_id` join the hash ONLY when `gap_class` is non-empty.
+`gap_class`, `detector_id`, `remedy_rule_id` and `trigger_wo_id` join the hash ONLY when
+`gap_class` is non-empty.
 An ordinary order, which is almost every order, must hash byte-identically to what it hashes
 today, and a test must assert that against a pre-change value rather than merely against itself.
 
-Those three ids go in because a submitter who registers a different detector without touching the
-diff HAS produced new evidence, and the repeat guard would otherwise call round 2 identical to
+Those ids go in because a submitter who registers a different detector, or names a different
+triggering order, without touching the diff HAS produced new evidence, and the repeat guard would otherwise call round 2 identical to
 round 1. The rendered `self_evolution` text stays OUT: it is prose the OS injected, not something
 the submitter produced, and it is regenerated every round — the `history` row of that docstring's
 table, arriving through a new door.
 
-**`EvidencePacket` therefore carries all three ids**, not just `gap_class`, or the function cannot
+**`EvidencePacket` therefore carries all four fields**, not just `gap_class`, or the function cannot
 hash what this section says it hashes.
 
 The three questions, and they are about QUALITY:
@@ -762,6 +815,24 @@ or a closed duplicate drops out of the answer and is re-filed for ever.
 in `filed_note`. The ledger is the OS's own record; the tracker is a mirror of it, and a network
 failure must not lose the finding.
 
+**What this section must PROVE, named because a verdict derived wrong is a finding filed against
+the wrong half of the rule.** One test per verdict, each built from a real fire record and not
+from a hand-set field: `not_armed` (a `dry_run` detector), `missed` (an `armed` detector with no
+fire on the order), `remedy_failed` (an `armed` detector with a `proposed` or `refused` fire and
+the order still stuck). Plus the fourth path that has no verdict: `gh` unreachable — the
+recurrence row IS written, `filed_note` carries the failure, and `ops.record_recurrence` returns
+normally rather than raising. And one asserting the tracker search uses the subject id and the gap
+class with `--state all`, since a closed duplicate dropping out of that answer is the failure
+kn-5d8a396a describes.
+
+**Redact before it leaves the OS.** The tracker is PUBLIC. A recurrence comment carries the order
+ID, the gap class, the verdict and the detector id — and nothing else. No order title, no
+description, no `detail` snapshot, no attention reason, no worker prose: those are private
+context, and a fire's `detail` in particular is text a worker wrote. The comment is BUILT in code
+from those four fields, so there is no path for anything else to reach it, and a test asserts the
+comment body contains no field outside that set. `filed_note` keeps the full local account, where
+it is not published.
+
 `rules.recurrence` is also the function the re-scoped investigation order (wo-4beada49) calls to
 decide "reopen or link, never duplicate". This section owns the lookup, the verdict, the ledger
 and the tracker act, and ships them callable and tested; that order only wires its filing path
@@ -806,6 +877,18 @@ Report keys:
   exactly the control group, which is the second reason rules start there. **It needs history on
   both sides of an arming event and there is none yet**, so ship it as an honest key reporting
   insufficient history, with fewer than `MIN_SAMPLES` on either side saying so.
+
+**The arithmetic is tested, key by key, against a fixture registry with known counts.** It is the
+number the user will judge the whole feature by, so: the mechanical share over a fixture where one
+rule fires twice on one order and once on another (numerator counts ORDERS, so 2, never 3); the
+same fixture with an investigation on one of those orders (it is in the denominator once); the
+empty registry returning the "no rule has been armed yet" sentence and NOT `0%`; a detector with
+no fires reporting no hit rate rather than a rate of zero; `by_gap_class` bucketing two fires in
+one week as one bucket of two; `stuck_resolution` with fewer than `MIN_SAMPLES` on either side
+reporting insufficient history; and the series carrying one point per week over the window with
+absent weeks absent rather than zero. The CLI and the page are then asserted to print what the
+dict says and to compute nothing — the `jarvis cost` / `_print_bill` pair is the pattern for that
+test too.
 
 Surfaces: `jarvis rules summary [project] [--days n] [--json]`, a dashboard page at `/evolution`
 for the fleet and `/evolution/<project>` for one, and a section on each project page linking to
