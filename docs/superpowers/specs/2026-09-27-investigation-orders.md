@@ -369,8 +369,12 @@ It denies unless the command satisfies one of:
 
 * `gate_rules.reads_only(command)` (src/jarvis/gate_rules.py:597) — the existing
   structural primitive, all-or-nothing across the pipeline, which already refuses command
-  substitution, shell invokers and unterminated heredocs. It covers `cat`/`grep`/`jq`/
-  `sed -n` and correctly refuses `sed -i`.
+  substitution, shell invokers and unterminated heredocs. It decides membership on the
+  PROGRAM NAME, which is the right question for "is this a reader" and is why every gate
+  in the OS shares it. It is the WRONG question for a kind whose guarantee is "changes no
+  file": `sed`, `sort` and `find` are readers by name and write from their own ARGUMENTS,
+  with no redirection to give them away, so `sed -i`, `sort -o` and `find -delete` all
+  clear it. It covers `cat`/`grep`/`jq`/`sed -n`, and it is not the first test.
 * a `(program, subcommand)` pair in a new `hooks.INVESTIGATOR_READS` table. **`reads_only`
   does not cover `git` or `gh` and must not** — `gate_rules._READERS`
   (src/jarvis/gate_rules.py:300-306) excludes them by the rule "membership is decided by
@@ -391,6 +395,43 @@ It denies unless the command satisfies one of:
   stats`, `config wiring`, `brief`, `inbox`), plus exactly four mutations: `jarvis wo ask`,
   `jarvis wo assume`, `jarvis learn add`, and `jarvis investigate verdict`. Anything else
   is denied.
+
+**Before either of those, every segment must clear `hooks._investigator_writer`**
+(src/jarvis/hooks.py:629) — it runs FIRST, ahead of the git-read / `reads_only` pair, at
+src/jarvis/hooks.py:892-894. It is scoped to this kind and touches `gate_rules` not at
+all, so no other order kind's behaviour changes: `reads_only`'s guarantee is "runs nothing
+privileged" and this kind's is "changes no file", and one program-name test cannot carry
+both. It works on the PARSED segment — `shlex.split`, and a `ValueError` is a REFUSAL —
+for `_investigator_git_read`'s reason: the shell strips quotes before the program sees the
+argument, so a denylist over unparsed text fails open on `sed -'i'` and every other
+spelling of the same word.
+
+Three rules, in the order the function applies them. **Interpreters are refused WHOLE**
+rather than parsed — `INVESTIGATOR_REFUSED_PROGRAMS`: `awk`, `gawk`, `mawk`, `perl`,
+`python`, `python3`, `ruby`, `node`, `xargs`, `tee`, `dd`, `truncate`, `install`, `patch`,
+`ed`, `ex`, `vi`, `vim`. Whether one `awk` program writes is not decidable, and this kind
+has `grep`, `cat`, `jq`, `git` and `gh` for everything it actually does. **`sed`, `sort`
+and `find` are then ALLOWLISTED, never denylisted** — `INVESTIGATOR_FIND_READS`,
+`INVESTIGATOR_SORT_LONG` / `INVESTIGATOR_SORT_SHORT`, `INVESTIGATOR_SED_LONG` /
+`INVESTIGATOR_SED_SHORT`, and for `sed` the SCRIPT FORM itself (`_sed_script_is_plain`:
+addresses, an optional `!`, and at most one of `p P d = l q` per statement, so `w`, `W`,
+`s///w`, `e`, `r`, `R`, `{` and the branch commands are refused by failing to match at
+all). The argument for the allowlist is validation round 5's finding: a filter keyed on
+the write forms someone thought to probe fails open on the next spelling — `--outp=f`,
+`W`, `s///w`, `-fprintf`, `-ok` — which is the same shape as the rounds 1 and 2 bypasses.
+Under an allowlist an UNKNOWN option is a refusal, so a reader that gains a new writing
+option refuses BY DEFAULT and the worst case is an allow control somebody has to add: a
+refused `sort --random-source=f`, not a written file.
+
+One parse detail is worth stating because it is where a hand-rolled option walk goes
+wrong: **`sort -Co f` writes `f`.** `-C` takes no argument, so that cluster is `-C -o`,
+and a walk that let any letter swallow the rest of its cluster would read `o` as `-C`'s
+operand and allow the write. Hence `INVESTIGATOR_SORT_ARG_SHORT = "ktST"` — only `k t S
+T` take the rest of the cluster as their ARGUMENT (so `-k2,2` is not the letters `2` and
+`,`), every other letter is checked, and `o` is absent from `INVESTIGATOR_SORT_SHORT`
+entirely. `sed`'s cluster is walked left to right for the same reason: `-ni` is in-place,
+`-nf` reads a script from a file this hook cannot see, and `-ne` is an ordinary read whose
+script is the next word.
 
 Both denials name the alternative in their reason string, as every refusal in this module
 does: the write denial says "put your verdict in `verdict.json` and submit it with
