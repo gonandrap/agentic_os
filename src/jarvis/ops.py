@@ -2134,7 +2134,9 @@ def round_line(rnd: dict[str, Any]) -> str:
     # A REBIND, marked where the number is: round 4 under `max_rounds` 3 reads as the
     # defect unless the line says nobody was charged for it (spec
     # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
-    uncounted = " · uncounted" if rnd.get("uncounted") else ""
+    cause = str(rnd.get("uncounted_cause") or "")
+    uncounted = (f" · uncounted ({cause})" if cause
+                 else " · uncounted") if rnd.get("uncounted") else ""
     return (f"round {rnd['round']}{uncounted} · {rnd['fingerprint']} · {word}"
             f" · config {rnd.get('config_version') or 'not recorded'}"
             f" · commit {sha[:10] or 'not recorded'}"
@@ -2912,7 +2914,8 @@ def validation_rounds(store: ProjectStore, *, wo_id: str | None = None,
     # (2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
     return [{**{k: r[k] for k in ("id", "round", "ts", "fingerprint", "outcome",
                                   "reason", "pr_url", "config_version", "head_sha",
-                                  "forced_reason", "hold_cause", "uncounted")},
+                                  "forced_reason", "hold_cause", "uncounted",
+                                  "uncounted_cause")},
              # ALWAYS PRESENT, even empty — the rule this key list, `assumptions` and
              # `alarms` already follow. `jarvis wo show`, `jarvis fo show` and both
              # dashboard pages read THIS projection, so a key that came and went would
@@ -4233,6 +4236,30 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
 
 
+def user_rework_pending(store: ProjectStore, wo_id: str) -> bool:
+    """Is this work order carrying a rework the USER asked for and nobody has judged?
+
+    THE SECOND UNCOUNTED CAUSE (Neo question 973, live case wo-299daf2e). Rounds bound
+    the worker-versus-panel rejection loop; a rejection the USER wrote is not part of
+    that loop, so the rework it asked for must be judged whatever the budget says — and
+    wo-299daf2e, whose rounds 1 and 2 passed and whose user-requested rework was then
+    declined on `max_rounds`, is what happens when it is not.
+
+    True when the newest `reviewed` event with `accepted` false is NEWER than the newest
+    SETTLED round. That self-terminates and so grants EXACTLY ONE free round per user
+    rejection: the moment the user-rework round settles it is itself the newest settled
+    round, and this reads False again until the user rejects once more.
+
+    Store reads only — no network, no `gh` — because both call sites ask it on a tick.
+    """
+    refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
+                if not db.from_json(e["payload"], {}).get("accepted", True)]
+    if not refusals:
+        return False
+    judged = store.last_judged_round(wo_id=wo_id)
+    return judged is None or float(refusals[-1]["ts"]) > float(judged["ts"] or 0)
+
+
 #: HOW MANY TIMES RUNNING a submitter may be sent back without the panel before the OS
 #: stops trying and asks the user. Two, because the bounce is free and a free loop with
 #: no ceiling is the failure this whole feature is about — spec
@@ -4324,7 +4351,8 @@ def consecutive_bounces(store: ProjectStore, wo_id: str, after_round: int) -> in
 def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str, Any],
                           *, declared: str, cfg: Any,
                           forced_reason: str = "",
-                          uncounted: bool = False) -> dict[str, Any] | None:
+                          uncounted: bool = False,
+                          uncounted_cause: str = "") -> dict[str, Any] | None:
     """Open a validation round over what this work order has produced, or bounce it.
 
     Collects the evidence, fingerprints it, opens the round and parks the work order in
@@ -4382,8 +4410,18 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     # rejection has spent them both and routes to the user.
     if not uncounted:
         previous = store.last_judged_round(wo_id=str(wo["id"]))
-        uncounted = bool(previous is not None and int(previous["uncounted"] or 0)
-                         and str(previous["outcome"] or "") == "rejected")
+        if (previous is not None and int(previous["uncounted"] or 0)
+                and str(previous["outcome"] or "") == "rejected"
+                # REBIND ONLY. A fix after a rejected USER-REWORK round is an ORDINARY
+                # counted round: the bound there is one round per USER rejection, not a
+                # pair, and the user has not rejected again (Neo question 973).
+                and str(previous["uncounted_cause"] or "") == REBIND_CAUSE):
+            uncounted, uncounted_cause = True, REBIND_CAUSE
+        elif user_rework_pending(store, str(wo["id"])):
+            # The worker's own re-delivery of a rework the USER asked for, through
+            # `jarvis wo finish`. Same free round as the moved-head route: the rework is
+            # the user's whichever way the panel is re-opened.
+            uncounted, uncounted_cause = True, USER_REWORK_CAUSE
     packet = evidence_mod.collect_work_order(
         project_path, wo, declared=declared, diff_chars=cfg.diff_chars,
         spec=specs.spec_of(store, wo), side_effects=side_effects_of(store, str(wo["id"])),
@@ -4426,7 +4464,7 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
         summary=str(wo.get("result_summary") or ""), evidence=declared,
         pr_url=wo.get("pr_url"), round=nxt,
         config_version=current_config_version(), forced_reason=forced_reason,
-        uncounted=uncounted)
+        uncounted=uncounted, uncounted_cause=uncounted_cause)
     store.set_status(wo["id"], "validating")
     # No attention flag: a unit under review is the system working. Only the give-up
     # transition flags anyone.
@@ -4612,6 +4650,16 @@ REBIND_FORCED_REASON = (
     "conflict, so the content changed and a seat has to read it. This round does not "
     "count against validation.max_rounds (rebind {used} of {max})")
 
+#: The `forced_reason` a USER-REWORK round carries: the work the user asked for when
+#: they rejected on review, which the round budget must never refuse to judge. Its own
+#: wording and not the rebind's — nobody merged anything here, and a sentence about a
+#: conflict resolution would misdescribe the record (Neo question 973, wo-299daf2e).
+USER_REWORK_FORCED_REASON = (
+    "the OS re-judged this itself, outside the round budget: the USER rejected this on "
+    "review, round {n} judged {judged}, and the head is now {head} — the rework they "
+    "asked for has to be judged. Rounds bound the worker-versus-panel loop and this is "
+    "not part of it, so this round does not count against validation.max_rounds")
+
 #: `cause` on `REJUDGE_DECLINED_EVENT`, one value per condition — the `PROOF_*`
 #: discipline, so a reader can tell "the rebind bound is spent" from "the round budget
 #: is spent". Written on BOTH declines: a payload without one is a pre-change row.
@@ -4643,7 +4691,8 @@ def rebind_possible(store: ProjectStore, wo: dict[str, Any], *, head: str,
         return False
     if force_validation_refusal(store, wo, project=project, cfg=cfg) is not None:
         return False
-    return store.uncounted_validation_rounds(wo_id=wo_id) < REBIND_MAX
+    return store.uncounted_validation_rounds(
+        wo_id=wo_id, cause=REBIND_CAUSE) < REBIND_MAX
 
 
 def rejudged_heads(store: ProjectStore, wo_id: str, *, declined: bool = False
@@ -4705,6 +4754,12 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
     the merge was the OS's own demand, so `cfg.max_rounds` is not consulted at all on
     that arm and `REBIND_MAX` bounds it instead (spec
     docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.3).
+
+    **AND EXCEPT ON A REWORK THE USER ASKED FOR** (`user_rework_pending`), where no bound
+    is consulted at all: each user rejection buys exactly one uncounted round, and
+    wo-299daf2e — rounds 1 and 2 passed, the user rejected, the worker reworked, the
+    re-judge was declined on `max_rounds` — is what the absence of that arm costs (Neo
+    question 973).
     """
     from . import worker_session
 
@@ -4723,8 +4778,17 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
     # THE BUDGET POSITION, never a row number: after the rebind the two can differ, and
     # the sentence this feeds ("round N of M would be the last") is about the budget.
     budget_nxt = store.counted_validation_rounds(wo_id=wo_id) + 1
-    used = store.uncounted_validation_rounds(wo_id=wo_id)
-    if rebind:
+    # THE REBIND BOUND COUNTS REBINDS AND NOTHING ELSE: a user-rework round that spent
+    # one of these would be the same defect one level along (Neo question 973).
+    used = store.uncounted_validation_rounds(wo_id=wo_id, cause=REBIND_CAUSE)
+    # A REWORK THE USER ASKED FOR IS JUDGED WHATEVER THE BUDGET SAYS, and this is asked
+    # BEFORE either decline. Independent of `rebind`: when both would apply the user
+    # rework wins, because it is the one the ruling protects and the rebind budget must
+    # stay for the OS's own merges. wo-299daf2e is exactly the arm below it.
+    rework = user_rework_pending(store, wo_id)
+    if rework:
+        pass                            # no bound at all: one free round per rejection
+    elif rebind:
         if used >= REBIND_MAX:
             if head in rejudged_heads(store, wo_id, declined=True):
                 return None             # said once per commit, not once per tick
@@ -4746,15 +4810,21 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
                 "head_sha": head, "judged_sha": judged, "next_round": budget_nxt,
                 "max_rounds": int(cfg.max_rounds)}
     was = str(wo["status"] or "")
-    reason = (REBIND_FORCED_REASON.format(n=round_n, judged=judged[:10],
-                                          head=head[:10], used=used + 1,
-                                          max=REBIND_MAX) if rebind
-              else REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
-                                                head=head[:10]))
+    if rework:
+        reason = USER_REWORK_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                                  head=head[:10])
+    elif rebind:
+        reason = REBIND_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                             head=head[:10], used=used + 1,
+                                             max=REBIND_MAX)
+    else:
+        reason = REJUDGE_FORCED_REASON.format(n=round_n, judged=judged[:10],
+                                              head=head[:10])
+    cause = USER_REWORK_CAUSE if rework else (REBIND_CAUSE if rebind else "")
     round_row = submit_for_validation(store, project_path, wo,
                                       declared=declared_evidence(store, wo_id),
                                       cfg=cfg, forced_reason=reason,
-                                      uncounted=rebind)
+                                      uncounted=bool(cause), uncounted_cause=cause)
     store.add_event(wo_id, "validation_forced",
                     {"round": round_row["round"], "round_id": round_row["id"],
                      "reason": reason, "was": was, "by": REJUDGE_BY_OS,
@@ -5834,6 +5904,14 @@ CATCH_UP_MAX = 3
 #: configured, and two is the smallest number that still allows one worker fix turn
 #: after the first rejection.
 REBIND_MAX = 2
+
+#: The two reasons a round may be `uncounted`, written on the round as `uncounted_cause`.
+#: SEPARATE BOUNDS, which is the whole reason the column exists: `REBIND_MAX` bounds the
+#: OS re-judging its own merge and NOTHING else, and each user rejection buys exactly one
+#: `USER_REWORK_CAUSE` round (Neo question 973). An unfiltered count would let a merge
+#: re-judge spend the round a user's rework needs — wo-299daf2e.
+REBIND_CAUSE = "rebind"
+USER_REWORK_CAUSE = "user_rework"
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
