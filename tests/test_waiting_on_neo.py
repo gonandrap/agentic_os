@@ -482,6 +482,35 @@ def test_escalation_keeps_the_work_order_parked_and_names_the_question(started, 
     assert true_blockers(store, fresh) == [neo_question_blocker(q)]
 
 
+# -- 5b. what it is waiting on when the user owes a review too --------------------------
+
+
+def test_a_needs_review_park_outranks_the_workers_own_escalated_question(project):
+    """`waiting_on` is ordered like `true_blockers`, and on this pair it was the reverse
+    of what the user owes: an order parked for review with an open worker question
+    reported the question. `true_blockers` lists the `needs_review` reasons first, so the
+    two only agree after this."""
+    store = ProjectStore(project)
+    wo, _q = park_on_a_question(store, status="escalated")
+    store.set_status(wo["id"], "needs_review")
+
+    answer = ops.waiting_on(store, store.get_work_order(wo["id"]))
+
+    assert answer["what"] == "needs_review"
+
+
+def test_a_question_escalated_on_an_unparked_order_still_reports_the_question(project):
+    """The other half: the re-rank is scoped to the `needs_review` park. Everywhere else
+    the escalation is the blocker and demoting it would hide it."""
+    store = ProjectStore(project)
+    wo, q = park_on_a_question(store, status="escalated")
+
+    answer = ops.waiting_on(store, store.get_work_order(wo["id"]))
+
+    assert answer["what"] == "neo_escalated"
+    assert answer["detail"] == neo_question_blocker(q)
+
+
 # -- 6. what the user reads ------------------------------------------------------------
 
 

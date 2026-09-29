@@ -656,3 +656,59 @@ def test_a_held_round_never_resubmitted_is_still_reported_as_open(record):
     assert spans[-1].cause == holds.PAUSE_USAGE_LIMIT
     assert spans[-1].open is True
     assert spans[-1].finish(T0 + 14_800) == T0 + 14_800
+
+
+def test_the_verdict_closes_the_synthesised_hold_and_no_episode_is_lost(record):
+    """wo-3615faf7: repeat `validation_failed(held)` then `validation_passed`, and the
+    hold read open 11.7h later instead of 57m. Two defects in the same three lines — the
+    round's own terminals closed only the keyed VALIDATION hold, and the repeat
+    overwrote the open synthesised one without keeping it. Spec §2d1."""
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_submitted", T0 + 120, {"round": 1})
+    rec.event("validation_failed", T0 + 180, {"round": 1, "cause": "usage_limit"})
+    rec.event("validation_submitted", T0 + 3_780, {"round": 2})
+    rec.event("validation_failed", T0 + 3_840, {"round": 2, "cause": "usage_limit"})
+    rec.event("validation_submitted", T0 + 7_440, {"round": 3})
+    rec.event("validation_passed", T0 + 7_500, {"round": 3})
+
+    spans = holds.held(store, wo, now=T0 + 50_000)
+
+    held_windows = [(h.started, h.ended) for h in spans
+                    if h.cause == holds.PAUSE_USAGE_LIMIT]
+    assert held_windows == [(T0 + 180, T0 + 3_780), (T0 + 3_840, T0 + 7_440)]
+    assert not any(h.open for h in spans)
+    assert sum(h.finish() - h.started for h in spans
+               if h.cause == holds.PAUSE_USAGE_LIMIT) == 7_200
+
+
+def test_a_verdict_with_no_resubmission_still_closes_the_synthesised_hold(record):
+    """The shape that produced the 11.7h: the panel settles the next round without the
+    held one ever being resubmitted, so `validation_submitted` never arrives."""
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_failed", T0 + 180, {"round": 1, "cause": "usage_limit"})
+    rec.event("validation_passed", T0 + 3_780, {"round": 2})
+
+    spans = holds.held(store, wo, now=T0 + 50_000)
+
+    assert [(h.cause, h.started, h.ended) for h in spans] == [
+        (holds.PAUSE_USAGE_LIMIT, T0 + 180, T0 + 3_780)]
+
+
+def test_the_auth_twin_is_closed_by_a_verdict_too(record):
+    """`VALIDATION_AUTH_CAUSE` differs from the usage-limit synthesis by a constant, and
+    had the identical hole — it was popped only by the same resubmission."""
+    rec, store, wo = record
+    rec.turn(T0, T0 + 60)
+    rec.event("validation_failed", T0 + 180, {"round": 1, "cause": "auth",
+                                              "attempt": 1})
+    rec.event("validation_failed", T0 + 3_780, {"round": 1, "cause": "auth",
+                                                "attempt": 2})
+    rec.event("validation_rejected", T0 + 7_380, {"round": 1})
+
+    spans = holds.held(store, wo, now=T0 + 50_000)
+
+    assert [(h.cause, h.started, h.ended) for h in spans] == [
+        (holds.PAUSE_AUTH, T0 + 180, T0 + 3_780),
+        (holds.PAUSE_AUTH, T0 + 3_780, T0 + 7_380)]

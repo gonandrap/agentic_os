@@ -1134,3 +1134,72 @@ def test_nothing_out_is_neither(project):
     assert not invariants.something_is_out(store, wo["id"])
     assert not invariants.user_facing_wait(store, wo["id"])
     store.close()
+# -- §2c: an undeclared delivery, as a predicate on its own -----------------------------
+
+PUSHED = "9999999999999999999999999999999999999999"
+DELIVERED = "1111111111111111111111111111111111111111"
+
+
+def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str) -> dict:
+    """wo-dbea82cf: delivered, judged, the user refused an assumption, then commits."""
+    wo = store.create_work_order("the refused one")
+    store.add_event(wo["id"], "finished", {"summary": "opened a PR"})
+    round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(round_["id"], judged)
+    store.close_validation_round(round_["id"], "passed", "green")
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
+    store.set_status(wo["id"], "needs_review", pr_url="https://example/pull/2",
+                     pr_head_oid=head, pr_head_seen_at=time.time())
+    return store.get_work_order(wo["id"])
+
+
+def test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery(project):
+    """Spec §2c. `ops.refusal_answered` stays False — the finish IS the declaration —
+    and the OS gets a detector instead of a widened predicate."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+    assert invariants.undeclared_delivery(store, wo)
+
+
+def test_a_head_still_at_the_judged_commit_is_not_an_undeclared_delivery(project):
+    """Nothing moved: the refusal is simply unanswered, which is today's sentence."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=DELIVERED, judged=DELIVERED)
+
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_no_recorded_head_is_never_an_undeclared_delivery(project):
+    """Empty is "not recorded", never "different" — the same rule as §2b."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head="", judged=DELIVERED)
+
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_a_finish_after_the_refusal_answers_it_and_ends_the_detection(project):
+    """The worker declared them, so there is nothing undeclared left to nudge for."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    store.add_event(wo["id"], "finished", {"summary": "here is what I pushed"})
+    wo = store.get_work_order(wo["id"])
+
+    assert ops.refusal_answered(store, wo["id"])
+    assert not invariants.undeclared_delivery(store, wo)
+
+
+def test_the_detector_raises_a_finding_once_and_never_an_alarm(project):
+    """`add_finding`, not `add_alarm`: the cost path's dedupe is what `add_alarm`'s one
+    call site is fenced by, and it does not fence this."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    check_project(store)
+    check_project(store)
+
+    raised = [a for a in store.alarms_of(wo["id"])
+              if a["kind"] == "undeclared_delivery"]
+    assert len(raised) == 1
+    assert raised[0]["source"] == "invariant"

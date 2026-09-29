@@ -5037,6 +5037,14 @@ class Daemon:
             except Exception:  # noqa: BLE001 — never let one work order stall the rest
                 log.exception("[%s] polling %s failed", project.name, wo["id"])
                 continue
+            # THE HEAD, CACHED. Spec §2b of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
+            # `invariants.parked_reason` runs per order per tick and may not go to the
+            # network, and this poll already holds the answer. Written only when it
+            # MOVED, so the green common case keeps its no-write budget.
+            if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
+                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
+                                        pr_head_seen_at=db.now())
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -5754,6 +5762,11 @@ class Daemon:
         round_n = int((latest or {}).get("round") or 0)
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
+        # ...and WHICH unanswered refusal this is. Spec §2c of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        # Read once per list for `answered`'s reason, and only when there is a hold to
+        # word — an answered refusal cannot reach the sentence.
+        undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
         dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         packet = None
@@ -5800,6 +5813,7 @@ class Daemon:
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
                             refusal_answered=answered,
+                            undeclared_delivery=undeclared,
                             unreachable_question_ids=dead_questions,
                             stakes=stakes_verdict)
 
@@ -6167,6 +6181,7 @@ class Daemon:
             round_n=int((latest or {}).get("round") or 0),
             round_reason=str((latest or {}).get("reason") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
+            undeclared_delivery=invariants_mod.undeclared_delivery(pstore, wo),
             # On a CONFIRMATION the question being delivered is not the one condition 6
             # would trip on: `neo_question_id` still points at the early question, so
             # that is the id to exclude, or every confirmed assumption would be dropped

@@ -130,6 +130,18 @@ HELD_STATUS = "status"
 HELD_SETTLED = "settled"
 HELD_PANEL_GAVE_UP = "panel_gave_up"
 HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
+
+#: The two sentences that code renders, and which one depends on whether anything moved.
+#: Spec §2c of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md: the
+#: first is FALSE on wo-dbea82cf, where the worker pushed three commits and never ran
+#: `jarvis wo finish`. Neither carries a count, a sha or an elapsed time — `ack_attention`
+#: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
+REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
+                             "worker has not delivered again since")
+REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
+                             "worker has pushed commits since without running `jarvis "
+                             "wo finish` — the OS has asked it to declare them")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 #: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
@@ -801,7 +813,7 @@ def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-           refusal_answered: bool = True,
+           refusal_answered: bool = True, undeclared_delivery: bool = False,
            asked_question_id: int = 0,
            unreachable_question_ids: Collection[int] = (),
            stakes: Stakes | None = None) -> Decision:
@@ -885,8 +897,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:
@@ -1013,7 +1025,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-                 refusal_answered: bool = True,
+                 refusal_answered: bool = True, undeclared_delivery: bool = False,
                  asked_question_id: int | None = None,
                  unreachable_question_ids: Collection[int] = (),
                  stakes: Stakes | None = None) -> Decision:
@@ -1080,8 +1092,8 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               "for you", fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:

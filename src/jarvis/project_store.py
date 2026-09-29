@@ -526,7 +526,10 @@ ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 # written before the health spec reads back as exactly what it was — a cost alarm about
 # a work order — without a backfill.
 ALARM_SUBJECTS = ("work_order", "feature_order")
-ALARM_SOURCES = ("cost", "health")
+#: `invariant` is `invariants.check_undeclared_delivery`'s — a finding raised by a
+#: post-condition rather than by a model, spec §2c of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+ALARM_SOURCES = ("cost", "health", "invariant")
 
 # How one health sweep ended (`health_reviews.outcome`, §4). `clear` and `failed` are
 # not the same answer and the difference is the whole fail-safe: `clear` is the model
@@ -1160,6 +1163,17 @@ ADDED_COLUMNS = {
         # order is there because the pull request was shut without merging, rather than
         # because a worker went idle. Absent means "never polled".
         "pr_state": "TEXT",
+        # The commit `pr_url`'s head was at the last time the poll read it, and when it
+        # was read. A CACHE of a fact the poll already had and threw away — so nothing
+        # here is a claim about now, and every reader must treat "" as "not recorded"
+        # rather than as a sha that could match one (github.py:540-543). Spec §2b of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        #
+        # Columns rather than a per-tick timeline event on purpose: an event every two
+        # minutes per open pull request would grow the timeline without bound and would
+        # be read as history rather than as the cache this is.
+        "pr_head_oid": "TEXT",
+        "pr_head_seen_at": "REAL",
         # Work orders that must finish before this one may be claimed (JSON list of
         # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
         # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
@@ -1600,12 +1614,44 @@ class ProjectStore:
         CLI invocation and every reconcile of every project: the count comparison is a
         fast path off the hot road and the covered-id SET rebuilt from the table is the
         real guard.
+
+        GAPS, NOT WHOLE ORDERS. An order already in `have` used to be skipped for ever,
+        so a partial history — a `status` event written by a daemon running the build
+        before spans existed — could never be repaired by anything. Spec §2d2 of
+        docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
         """
         total = self.conn.execute("SELECT COUNT(*) c FROM work_orders").fetchone()["c"]
         covered = self.conn.execute(
             "SELECT COUNT(DISTINCT order_id) c FROM wo_state_spans WHERE order_kind='wo'"
         ).fetchone()["c"]
-        if covered >= total:
+        # THE HIGH-WATER GUARD, and it is what keeps this off the hot road. Two scalar
+        # MAXes against `idx_events_kind` and `idx_state_spans_order`; the per-order
+        # GROUP BY below costs ~260ms on 500 orders and ran on EVERY construction —
+        # every CLI invocation and every reconcile of every project — because `set_status`
+        # stamped its event microseconds after its own span. They share a moment now, so
+        # a store whose spans reach the newest status write answers here and stops.
+        newest_event = self.conn.execute(
+            "SELECT MAX(ts) t FROM wo_events WHERE kind='status'").fetchone()["t"]
+        newest_span = self.conn.execute(
+            "SELECT MAX(ts) t FROM wo_state_spans WHERE order_kind='wo'").fetchone()["t"]
+        if covered >= total and (newest_event is None
+                                 or (newest_span is not None
+                                     and float(newest_span) >= float(newest_event))):
+            return
+        # One indexed pass (`idx_events_kind`, `idx_state_spans_order`) naming every
+        # order whose newest `status` event is newer than its newest span.
+        gaps = {r["wo_id"]: (float(r["last_span"]), str(r["tail"] or ""))
+                for r in self.conn.execute(
+                    """SELECT e.wo_id AS wo_id, MAX(e.ts) AS last_event,
+                              (SELECT s.to_status FROM wo_state_spans s
+                               WHERE s.order_id=e.wo_id AND s.order_kind='wo'
+                               ORDER BY s.ts DESC, s.id DESC LIMIT 1) AS tail,
+                              COALESCE((SELECT MAX(s.ts) FROM wo_state_spans s
+                                        WHERE s.order_id=e.wo_id AND s.order_kind='wo'),
+                                       0) AS last_span
+                       FROM wo_events e WHERE e.kind='status'
+                       GROUP BY e.wo_id HAVING last_event > last_span""")}
+        if covered >= total and not gaps:
             return
         have = {r["order_id"] for r in self.conn.execute(
             "SELECT DISTINCT order_id FROM wo_state_spans WHERE order_kind='wo'")}
@@ -1613,12 +1659,17 @@ class ProjectStore:
             "SELECT id, created_at FROM work_orders").fetchall()
         for wo in rows:
             if wo["id"] in have:
-                continue
-            self._record_span(wo["id"], "wo", "", "pending", ts=wo["created_at"])
-            previous = "pending"
+                if wo["id"] not in gaps:
+                    continue
+                since, previous = gaps[wo["id"]]
+            else:
+                self._record_span(wo["id"], "wo", "", "pending", ts=wo["created_at"])
+                since, previous = None, "pending"
             for event in self.conn.execute(
                     "SELECT ts, payload FROM wo_events WHERE wo_id=? AND kind='status' "
                     "ORDER BY ts, id", (wo["id"],)).fetchall():
+                if since is not None and float(event["ts"]) <= float(since):
+                    continue
                 status = str((db.from_json(event["payload"], {}) or {}).get("status") or "")
                 # The duplicate the store now prevents at the source: a zero-length span
                 # in the history would inflate the entry count.
@@ -2195,18 +2246,17 @@ class ProjectStore:
         if row is None:
             return "failed"
         attempts = int(row["dispatch_attempts"] or 0) + 1
+        # Through `set_status` rather than raw SQL: no status write without a span. Spec
+        # §2d2 of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
         if attempts >= max_attempts:
-            self.conn.execute(
-                "UPDATE work_orders SET status='failed', dispatch_attempts=?, "
-                "retry_after=NULL, updated_at=? WHERE id=?",
-                (attempts, db.now(), wo_id))
+            self.set_status(wo_id, "failed", trigger="dispatch_attempts_spent",
+                            dispatch_attempts=attempts, retry_after=None)
             return "failed"
         delay = DISPATCH_RETRY_BACKOFF_SECONDS[
             min(attempts - 1, len(DISPATCH_RETRY_BACKOFF_SECONDS) - 1)]
-        self.conn.execute(
-            "UPDATE work_orders SET status='pending', dispatch_attempts=?, "
-            "retry_after=?, updated_at=? WHERE id=?",
-            (attempts, db.now() + delay, db.now(), wo_id))
+        self.set_status(wo_id, "pending", trigger="dispatch_retry",
+                        dispatch_attempts=attempts, retry_after=db.now() + delay)
         return "pending"
 
     def hold_dispatch(self, wo_id: str, until: float | None) -> None:
@@ -2343,6 +2393,11 @@ class ProjectStore:
                *only_ids),
         )
         row = cur.fetchone()
+        if row is not None and cur.rowcount == 1:
+            # The claim stays ONE statement; the span is written beside it in the same
+            # transaction. Spec §2d2 of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim")
         return dict(row) if row else None
 
     def count_active(self) -> int:
@@ -2408,8 +2463,11 @@ class ProjectStore:
         self.update_work_order(wo_id, status=status, **extra)
         if was == status:
             return
-        self._record_span(wo_id, "wo", was, status, trigger)
-        self.add_event(wo_id, "status", {"status": status})
+        # ONE MOMENT for both rows: the span and the event are one transition, and
+        # `_backfill_wo_spans`' guard compares their timestamps.
+        at = db.now()
+        self._record_span(wo_id, "wo", was, status, trigger, ts=at)
+        self.add_event(wo_id, "status", {"status": status}, ts=at)
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there."""
@@ -3019,10 +3077,15 @@ class ProjectStore:
 
     # -- events --------------------------------------------------------------
 
-    def add_event(self, wo_id: str, kind: str, payload: dict[str, Any] | None = None) -> None:
+    def add_event(self, wo_id: str, kind: str, payload: dict[str, Any] | None = None,
+                  *, ts: float | None = None) -> None:
+        """One timeline row. `ts` is for a caller writing a row BESIDE another at the
+        same moment — `set_status` writes the span and this event as one transition, and
+        two independent `db.now()` calls made the event microseconds newer than its own
+        span, which `_backfill_wo_spans`' guard then reads as a gap on every order."""
         self.conn.execute(
             "INSERT INTO wo_events (wo_id, ts, kind, payload) VALUES (?,?,?,?)",
-            (wo_id, db.now(), kind, db.to_json(payload or {})),
+            (wo_id, db.now() if ts is None else ts, kind, db.to_json(payload or {})),
         )
 
     def events_of_kind(self, wo_id: str, kind: str) -> list[dict[str, Any]]:

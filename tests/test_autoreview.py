@@ -128,6 +128,60 @@ def test_a_refusal_the_worker_has_not_answered_holds_everything_behind_it():
     assert decide(refusal_answered=False).code == autoreview.HELD_REFUSAL_UNANSWERED
 
 
+def test_the_hold_says_so_when_the_worker_pushed_without_declaring_it():
+    """Spec §2c. Today's sentence — "has not delivered again since" — is FALSE in
+    wo-dbea82cf's case: the worker HAS worked since, it just never declared it."""
+    d = decide(refusal_answered=False, undeclared_delivery=True)
+
+    assert d.code == autoreview.HELD_REFUSAL_UNANSWERED
+    assert d.reason == autoreview.REFUSAL_UNDECLARED_REASON
+    assert "pushed commits since without running `jarvis wo finish`" in d.reason
+    assert "the OS has asked it to declare them" in d.reason
+
+
+def test_the_early_hold_carries_the_same_second_sentence():
+    """Both sites, per the spec: `decide` and `decide_early` render the same hold."""
+    d = autoreview.decide_early(assumption(), {**WO, "status": "running"}, cfg(),
+                                refusal_answered=False, undeclared_delivery=True)
+
+    assert d.code == autoreview.HELD_REFUSAL_UNANSWERED
+    assert d.reason == autoreview.REFUSAL_UNDECLARED_REASON
+
+
+def test_the_undeclared_sentence_is_free_of_a_count_a_sha_and_a_clock():
+    """It is stored verbatim by `ack_attention` and compared by INV-ATTENTION-REASON, so
+    anything in it that moves could never be acknowledged (kn-681db233 point 3)."""
+    text = autoreview.REFUSAL_UNDECLARED_REASON
+
+    assert not any(ch.isdigit() for ch in text)
+
+
+def test_the_undeclared_finding_reaches_the_existing_nudge_remedy(project):
+    """Spec §2c's remedy half. The detector does not act: it raises a finding, and the
+    supervisor's judge path hands that to `remedies.propose` with the SHIPPED `nudge` —
+    a gate request plus a Neo question, and nothing said to the worker until a grant."""
+    from jarvis import invariants, remedies
+    from jarvis.catalog import RemedyConfig
+
+    store = ProjectStore(project)
+    neo_store = NeoStore()
+    wo = store.create_work_order("the refused one")
+    finding = store.add_finding(wo["id"],
+                                kind=invariants.UNDECLARED_DELIVERY_KIND,
+                                reason=invariants.UNDECLARED_DELIVERY_REASON,
+                                source="invariant")
+
+    out = remedies.propose(store, neo_store, "proj_a", store.get_work_order(wo["id"]),
+                           finding, "nudge", "declare what you pushed",
+                           RemedyConfig(True, ("nudge",)))
+
+    assert out["proposed"]
+    assert out["approval"]["kind"] == "self_heal"
+    assert out["question"]["kind"] == "approval"
+    # A proposal is not an act: nothing has reached the session.
+    assert store.queued_messages(wo["id"]) == []
+
+
 def test_an_assumption_is_asked_about_once_and_never_again():
     """One question per assumption for its whole life — and an escalated one is held by
     the user, so re-asking every reconcile tick would be the OS lobbying them."""

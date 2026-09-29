@@ -1072,6 +1072,100 @@ def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
     return bool(cfg.enabled), int(cfg.alarm_parked_minutes)
 
 
+def judged_heads(store: ProjectStore, wo_id: str) -> set[str]:
+    """Every commit of this work order the OS has already judged, or seen land.
+
+    Two rows and no network: `ProjectStore.validated_head` of the LATEST round (the
+    existing documented predicate, which already prefers `carried_head_sha` — reading the
+    columns here instead would be a second home for the rule), and the `head_oid` of the
+    newest `pr_merged` event.
+
+    EMPTY IS NEVER A MEMBER. Pre-0.10.0 rounds recorded no commit (kn-48dadcce) and an
+    order polled before `pr_head_oid` shipped has none either; reading "" as equal would
+    turn "nothing was recorded" into "it matches".
+    """
+    from .project_store import ProjectStore as _Store
+
+    merged = store.events_of_kind(wo_id, "pr_merged")
+    heads = {
+        _Store.validated_head(store.latest_validation_round(wo_id=wo_id)) or "",
+        str((db.from_json(merged[-1]["payload"], {}) or {}).get("head_oid") or "")
+        if merged else "",
+    }
+    return heads - {""}
+
+
+def _head_already_judged(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is the head the poll last saw one of `judged_heads`? Spec §2b."""
+    current = str(wo.get("pr_head_oid") or "")
+    return bool(current) and current in judged_heads(store, wo["id"])
+
+
+#: `wo_alarms.kind` for §2c's detector, and the statuses it is asked about — the ones a
+#: refusal can leave an order parked in. A terminal order has nothing left to declare.
+UNDECLARED_DELIVERY_KIND = "undeclared_delivery"
+UNDECLARED_DELIVERY_STATUSES = ("needs_review", "waiting_pr_merge", "waiting_input")
+
+#: What the OS asks the worker to do about an undeclared delivery. The FINDING's words,
+#: which the supervisor's judge reads and a gate reviewer rules on.
+UNDECLARED_DELIVERY_REASON = (
+    "the user refused an assumption on this work order and the worker has pushed "
+    "commits since without running `jarvis wo finish`, so nothing has declared them and "
+    "the panel has nothing it may judge")
+
+
+def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Has this worker pushed past a refusal without declaring it? Spec §2c of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    `ops.refusal_answered` is CALLED rather than re-derived, and it stays finish-only:
+    the finish is the declaration, and widening it would let the panel judge a submission
+    nobody declared. This is the detector the OS lacked, so that an unanswered refusal
+    with commits behind it self-heals into a nudge instead of parking on the user for
+    ever.
+
+    Head movement is the observation, and it reuses §2b's column — so no network read of
+    its own. An EMPTY head is never movement: "" is "not recorded".
+    """
+    from .ops import refusal_answered
+
+    current = str(wo.get("pr_head_oid") or "")
+    if not current or refusal_answered(store, wo["id"]):
+        return False
+    judged = judged_heads(store, wo["id"])
+    return bool(judged) and current not in judged
+
+
+def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
+    """INV-UNDECLARED-DELIVERY — raise the finding; the supervisor decides what to do.
+
+    A FINDING, NEVER AN ALARM: `add_alarm`'s one call site is fenced by
+    `Daemon.check_burning_turns`' `(kind, seq)` dedupe and this is not on that path.
+    Nothing here acts on a work order — the supervisor's judge reaches
+    `remedies.propose(..., "nudge")`, which files a gate request, and only a live grant
+    lets `remedies.apply` say anything to a worker.
+
+    Raised ONCE per order while the condition stands: a finding per reconcile tick would
+    fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
+    exists to prevent one queue along.
+    """
+    if getattr(store, "readonly", False):
+        return
+    for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
+        if not undeclared_delivery(store, wo):
+            continue
+        if any(a["kind"] == UNDECLARED_DELIVERY_KIND for a in store.alarms_of(wo["id"])):
+            continue
+        store.add_finding(wo["id"], kind=UNDECLARED_DELIVERY_KIND,
+                          reason=UNDECLARED_DELIVERY_REASON, source="invariant")
+        yield Violation(
+            invariant="INV-UNDECLARED-DELIVERY",
+            wo_id=wo["id"],
+            detail=UNDECLARED_DELIVERY_REASON,
+            repaired=True,
+        )
+
+
 def parked_reason(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> str | None:
     """Why nothing is going to happen to this work order — or None if something is.
@@ -1135,7 +1229,14 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
             # reporting it sent the user to `jarvis wo send` against a worker whose pull
             # request was already green (issue #705 defect 3). The instruction and the
             # check were written against each other.
-            and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES):
+            and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES
+            # ...OR THE HEAD IS ONE THE OS HAS ALREADY JUDGED OR SEEN LAND. Spec §2b of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
+            # the allowlist above answers "why was this turn opened" and is being asked
+            # "is anything undelivered", so every new OS-opened turn kind was a new false
+            # blocker. This asks the question that cannot go stale, and it stays local —
+            # `rejudge_exhausted` is the precedent.
+            and not _head_already_judged(store, wo)):
         return STALE_FINISH_BLOCKER
     # A `needs_review` order with no stale finish is doing exactly what that status says,
     # and is already flagged for it. A second line on every review the user has not got
@@ -2282,7 +2383,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption")]
+                                 "assumption", "question")]
         # `triage` is the one kind whose subject is not a row in THIS database — it is a
         # central backlog item, and the question carries no work order at all (issue
         # #240). So ownership cannot be read off the project store the way the other
@@ -2301,7 +2402,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "plan": _stale_plan_question,
                     "alarm": _stale_alarm_question,
                     "triage": _stale_triage_question,
-                    "assumption": _stale_assumption_question}[q["kind"]](store, q)
+                    "assumption": _stale_assumption_question,
+                    "question": _stale_worker_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -2397,6 +2499,44 @@ def _stale_assumption_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — assumption {assumption['id']} is {assumption['status']}",
             f"assumption {assumption['id']} was already {assumption['status']}")
+
+
+def _stale_worker_question(store: ProjectStore,
+                           q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this worker question is moot, else None. Spec §2a of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    The one kind with NO subject pointer at all — `jarvis wo ask` writes a question and
+    nothing in any store points back at it — so the five siblings' shape, reading the
+    subject's current state, cannot be written here. The timeline carries the fact
+    instead: the user REVIEWED a delivery made after the question was asked, and settled
+    it that way.
+
+    Both halves are needed and neither is enough. A `finished` alone is the WORKER's act
+    rather than the user's answer (Neo's ruling), and a `reviewed` alone could be a
+    verdict on a delivery older than the question. The `reviewed` event is the user's
+    verdict and nothing else: `ops.review_work_order` is its only writer, and the
+    autoreview path settles assumptions without one — so a machine verdict can never
+    supersede a question here.
+
+    A MISSING ROW IS LEFT ALONE, as in all five siblings: the checks run per project
+    against an OS-wide `neo.db`, so a work order this project does not know is skipped.
+    """
+    if not _is_work_order(store, q["wo_id"]):
+        return None
+    asked = float(q["ts"])
+    reviews = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "reviewed")
+               if float(e["ts"]) > asked]
+    if not reviews:
+        return None
+    delivered = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "finished")
+                 if asked < float(e["ts"]) < max(reviews)]
+    if not delivered:
+        return None
+    return ("SUPERSEDED — the user reviewed a delivery made after this question was "
+            "asked",
+            f"the user reviewed work order {q['wo_id']} after it was asked, on a "
+            f"delivery newer than the question")
 
 
 def _stale_triage_question(store: ProjectStore,
@@ -4055,6 +4195,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
                                    # raised before them is read as phantom attention on
                                    # an alarm `true_blockers` cannot re-derive
+    check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
+                                   # and no status, so nothing else here reads its output
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place
