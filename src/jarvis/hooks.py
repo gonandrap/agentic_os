@@ -1832,22 +1832,62 @@ def claude_cli_version(env: dict[str, str]) -> str:
     return version if isinstance(version, str) and version else PREFIX_UNKNOWN
 
 
+def claude_md_excludes(root: Path, cwd: Path) -> list[Path]:
+    """The ancestor CLAUDE.md copies a worker must NOT be given, for `claudeMdExcludes`.
+
+    A worker's cwd is `<root>/.claude/worktrees/<id>`, inside the project, so the CLI
+    resolves the project's CLAUDE.md twice — the branch's copy and the main checkout's,
+    which can be a different revision. From `cwd.parent` up through `root`: the
+    worktree's own copy is the branch's, the one the worker must obey. Spec
+    docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §1.
+
+    Empty for a cwd at the root or outside it — such a turn has no ancestor copy to
+    drop, and that is the answer rather than an error.
+    """
+    here = cwd.resolve() if cwd.exists() else cwd
+    # Both sides resolved, for `memory_files`' reason below.
+    stop = root.resolve() if root.exists() else root
+    if stop not in here.parents:
+        return []
+    found: list[Path] = []
+    for candidate in here.parents:
+        path = candidate / "CLAUDE.md"
+        if path.is_file():
+            found.append(path)
+        if candidate == stop:
+            break
+    return found
+
+
 def memory_files(root: Path, cwd: Path) -> list[Path]:
     """The CLAUDE.md-shaped files Claude Code loads into the prompt, nearest first.
 
     The worktree and the directories above it up to the project root, then the user's own
     — which is the CLI's own resolution order, and the order that makes a truncated walk
     truncate the least relevant end.
+
+    Minus what `claude_md_excludes` drops from the spawn: one definition, so the
+    fingerprint below and `context._memory_row` cannot disagree about the prompt (spec
+    2026-09-29-one-copy-of-the-projects-claude-md §2).
     """
     found: list[Path] = []
     seen: set[Path] = set()
+    # BOTH SPELLINGS, because `add` compares resolved: a CLAUDE.md that is itself a
+    # symlink would otherwise be dropped from the spawn and still counted here.
+    excluded: set[Path] = set()
+    for path in claude_md_excludes(root, cwd):
+        excluded.add(path)
+        try:
+            excluded.add(path.resolve())
+        except OSError:
+            pass
 
     def add(path: Path) -> None:
         try:
             resolved = path.resolve()
         except OSError:
             return
-        if resolved not in seen and resolved.is_file():
+        if resolved not in seen and resolved not in excluded and resolved.is_file():
             seen.add(resolved)
             found.append(resolved)
 

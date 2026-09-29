@@ -123,6 +123,35 @@ def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
     assert not store.queued_messages(wo["id"])
 
 
+def test_a_turn_that_died_without_a_result_does_not_hide_the_conversation(
+        fleet, settle_turns):
+    """Issue #856: the last turn was killed (a fleet stop), so it measured no context.
+
+    Its 0 read as "small", and the next delivery re-sent a 126k conversation cold eight
+    hours later. The size is the newest turn that MEASURED one.
+    """
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    _big_context(store, wo["id"])
+    ops.send_message(wo["id"], "keep going")
+    _deliver(fleet, wo["id"])                      # warm: an ordinary second turn
+    assert _turns(store, wo["id"])[-1] == ("message", "keep going")
+    assert settle_turns(store)
+    killed = store.latest_turn(wo["id"])
+    store.conn.execute(
+        "UPDATE wo_turns SET state='failed', usage_json=NULL, error=? WHERE id=?",
+        ("the turn's process ended without writing a result", killed["id"]))
+    assert worker_session.turn_context(store.latest_turn(wo["id"])) == 0
+    ops.send_message(wo["id"], "you were interrupted — carry on")
+    _age_last_turn(store, wo["id"], 8 * 3600)
+
+    _deliver(fleet, wo["id"])
+
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == [
+        "you were interrupted — carry on"]
+
+
 def test_a_boundary_inside_the_ttl_does_not_compact(fleet, settle_turns):
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
