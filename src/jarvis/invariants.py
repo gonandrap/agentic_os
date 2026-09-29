@@ -309,6 +309,33 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
 
+#: The OTHER `sha_moved` stall that reaches the user, and the reason it needs its own
+#: sentence: the OS asked for the merge, re-judged its resolution `ops.REBIND_MAX` times
+#: and the panel still refuses it. `SHA_MOVED_BLOCKER` above would offer
+#: `validation.max_rounds`, which the rebind arm never reads — advice that does nothing
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5).
+#: "twice" is `ops.REBIND_MAX`, spelled out here rather than imported: this module is
+#: below `ops` in the import order, and the bound is a constant of the design.
+REBIND_EXHAUSTED_BLOCKER = ("the OS re-judged the merge it asked for twice and the "
+                            "panel still refuses it — read the review and decide: "
+                            "merge it yourself, or send the worker back")
+
+#: THE THIRD SENTENCE IN THIS FAMILY, and the one that names the LIVE cause: the rework
+#: the user asked for when they rejected on review was judged — outside the budget, as
+#: Neo's ruling on question 973 requires — and the panel refused it with no counted
+#: round left. `VALIDATION_STUCK_BLOCKER` would say only "the review could not be
+#: satisfied", which hides that this round was the user's own ask; the two `sha_moved`
+#: sentences above describe a merge nobody judged, which is the opposite of what
+#: happened here.
+#:
+#: Re-derived from the round by `user_rework_refused` for kn-089de524's reason: a flag
+#: `Daemon._escalate` writes is rewritten by INV-ATTENTION-REASON on the next tick
+#: unless `true_blockers` can derive it.
+USER_REWORK_REFUSED_BLOCKER = ("the rework you asked for was judged and the panel "
+                               "refused it, and no rounds are left — read the review "
+                               "and decide: accept it, send the worker back with "
+                               "another round (`validation.max_rounds`), or close it")
+
 #: What a work order says when the reviewer REFUSED the automatic merge of the commit the
 #: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
 #: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
@@ -556,8 +583,36 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     Derived, never stored. `ops.rejudge_moved_head` writes the decline;
     INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
     `acknowledged_blockers` (kn-089de524).
+
+    A decline caused by `ops.REBIND_EXHAUSTED` is NOT one of these — that one is
+    `rebind_exhausted` below, and the remedy this one names would do nothing for it.
     """
-    declined = store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+    return _parked_on_a_decline(store, wo, rebind=False)
+
+
+def rebind_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same question about the OTHER decline: the OS re-judged the merge it asked
+    for `ops.REBIND_MAX` times and the panel still refuses it.
+
+    A separate derivation because the remedy is different and `SHA_MOVED_BLOCKER`'s is
+    then FALSE: it offers `validation.max_rounds`, and the rebind arm never reads it
+    (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+    """
+    return _parked_on_a_decline(store, wo, rebind=True)
+
+
+def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
+                         rebind: bool) -> bool:
+    """The three facts both derivations above share, read for one `cause` only.
+
+    The decline dedupe is per head across both causes, so one head carries one decline
+    with one cause and the two can never both fire (spec §4.5).
+    """
+    from . import ops as ops_mod
+
+    declined = [e for e in store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+                if (str(db.from_json(e["payload"], {}).get("cause") or "")
+                    == ops_mod.REBIND_EXHAUSTED) is rebind]
     if not declined:
         return False
     held = store.events_of_kind(wo["id"], "automerge_held")
@@ -835,6 +890,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # THE SAME STALL WITH THE OTHER CAUSE, and the two cannot both fire: the decline
+    # dedupe is per head across both (spec 2026-09-27 §4.5).
+    if wo["status"] == "waiting_pr_merge" and rebind_exhausted(store, wo):
+        blockers.append(REBIND_EXHAUSTED_BLOCKER)
     # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
     # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
     # Gated on the status for the same reason as the branch above, and ordered after it
@@ -872,8 +931,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    dropping the give-up because a decision is also open is the silent
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
+        #    ONE OF TWO SENTENCES: a give-up on a round a USER rejection bought names
+        #    that cause instead (spec 2026-09-27 §5, Neo question 973).
         elif validation_escalated(store, wo):
-            blockers.append(VALIDATION_STUCK_BLOCKER)
+            blockers.append(USER_REWORK_REFUSED_BLOCKER
+                            if user_rework_refused(store, wo)
+                            else VALIDATION_STUCK_BLOCKER)
         # 3. The landing refused to complete it over code that is on nothing but its own
         #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
         #    not merged into it, because they are opposite facts about the same status:
@@ -1058,6 +1121,21 @@ def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """
     latest = store.latest_validation_round(wo_id=wo["id"])
     return bool(latest and latest["outcome"] == "escalated")
+
+
+def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Was the give-up above the panel refusing the rework the USER asked for?
+
+    The same latest-round rule as `validation_escalated`, read one column further: a
+    round carrying `ops.USER_REWORK_CAUSE` is one a user rejection bought, and a
+    rejection of it with the counted budget spent is a different piece of news from the
+    ordinary give-up (Neo question 973, live case wo-299daf2e).
+    """
+    from . import ops as ops_mod
+
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    return bool(latest and latest["outcome"] == "escalated"
+                and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE)
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
