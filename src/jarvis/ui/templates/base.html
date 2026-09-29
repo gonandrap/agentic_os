@@ -133,6 +133,18 @@
   .nav-badge { font-family: var(--mono); font-size: 10.5px; padding: 0 6px;
                border-radius: 99px; background: color-mix(in srgb, var(--amber) 25%, var(--surface));
                color: var(--amber-ink); }
+  /* The user's brake. Amber, not red: nothing is wrong, the user stopped it on purpose —
+     but it has to be unmissable on every page, because a quiet fleet looks the same. */
+  .brake { border: 1px solid color-mix(in srgb, var(--amber) 55%, transparent);
+           background: color-mix(in srgb, var(--amber) 12%, var(--surface));
+           border-radius: 8px; padding: 10px 16px; margin: 14px 0;
+           display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .brake .grow { flex: 1; min-width: 0; }
+  .brake .head { font-family: var(--mono); font-weight: 600; color: var(--amber-ink);
+                 letter-spacing: 0.06em; }
+  .brake.ramp { border-color: color-mix(in srgb, var(--cyan) 45%, transparent);
+                background: color-mix(in srgb, var(--cyan) 10%, var(--surface)); }
+  .brake.ramp .head { color: var(--cyan); }
   .error-flash { background: color-mix(in srgb, var(--red) 15%, var(--surface));
                  border: 1px solid var(--red); border-radius: 8px; padding: 10px 16px;
                  margin: 14px 0; }
@@ -237,6 +249,37 @@
     <button>Search</button>
   </form>
   {% endif %}
+  {# The fleet brake and the post-reopen ramp, worded as `jarvis status` prints them.
+     Its own live region: the dashboard's poll swaps it with the rest (issue #843). #}
+  <div id="live-brake">
+  {% if brake and brake.paused %}
+    <div class="brake" role="status">
+      <div class="grow">
+        <span class="head">⏸ FLEET PAUSED</span>{% if brake.reason %} — {{ brake.reason }}{% endif %}
+        {%- if brake.since_text %} · since {{ brake.since_text }}{% endif %}
+        <div class="sub">No work order starts a turn unless it is let through; turns in
+          flight finish. Allowed through:
+          {% for a in brake.allowed -%}
+            {%- if a.href %}<a class="mono" href="{{ a.href }}">{{ a.id }}</a>{% else %}<span class="mono">{{ a.id }}</span>{% endif %}{{ ', ' if not loop.last }}
+          {%- else %}nothing{% endfor %}</div>
+      </div>
+      <form class="inline" method="post" action="/fleet/resume">
+        <input type="hidden" name="next" value="{{ request.url.path }}">
+        <button class="accept" title="`jarvis resume --all`: lift the pause for the whole fleet">Resume all</button>
+      </form>
+    </div>
+  {% elif brake and brake.ramp %}
+    <div class="brake ramp" role="status">
+      <div class="grow">
+        <span class="head">↗ RAMPING UP</span> after the usage window reopened at
+        {{ brake.ramp.since_text }}: at most {{ brake.ramp.cap }} worker turn{{ 's' if brake.ramp.cap != 1 }}
+        in flight until {{ brake.ramp.until_text }}
+        {%- if brake.ramp.tripped %} (breaker tripped: the last window was spent again soon
+        after reopening){% endif %}
+      </div>
+    </div>
+  {% endif %}
+  </div>
   {% if request.query_params.get('error') %}
     <div class="error-flash">{{ request.query_params.get('error') }}</div>
   {% endif %}

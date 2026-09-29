@@ -52,11 +52,12 @@ import signal
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, worker_session)
+               notify, release, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -65,6 +66,7 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
@@ -234,6 +236,33 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
+
+#: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR. "round 5 of 3" is false on a
+#: rebind — the row's number is past the budget and its own bound held it — and a
+#: submitter told it had spent a round it had not would ration itself against a budget
+#: that is untouched. Shaped on `ops.BOUNCE_FEEDBACK`, which already has to say that
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4).
+REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The OS asked you to merge the base
+branch in, your resolution changed what this pull request contributes, and a seat has
+read it. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
+#: THE SAME REJECTION ON THE ROUND A USER REJECTION BOUGHT. No round was spent here
+#: either, but nothing about a rebind is true of it: nobody merged anything, and there
+#: is no "re-judgement 1 of 2" — the bound is one free round per USER rejection, so a
+#: number out of two would name a cap that does not exist (Neo question 973, live case
+#: wo-299daf2e). The last sentence is the one the rebind wording does not need: the
+#: NEXT attempt is charged like any other.
+USER_REWORK_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The user rejected this on review and
+asked for the rework, so it was judged outside the budget. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
+charged one."""
 
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
@@ -459,6 +488,21 @@ def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
     done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") if landed \
         else None
     return None if done == owed else int(owed)
+
+
+@dataclass(frozen=True)
+class CarryOutcome:
+    """What `Daemon._carry_catch_up` learned, which is three states and not two.
+
+    `carried` is the verdict now covering the live head — the caller re-decides on it.
+    `rebind` is the other answer worth having: proof (a) held and proof (b) did not, so
+    the merge the OS asked for resolved a conflict and the round that judges it must not
+    be charged to the worker's rework budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+    """
+
+    carried: bool
+    rebind: bool
 
 
 class Daemon:
@@ -742,6 +786,9 @@ class Daemon:
         state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
         if fleet.announce(self.central, state):
             log.warning("fleet held: %s", state.blocked())
+        # AFTER `announce`, which is what records a reopen: the ramp it starts has to be
+        # in force on the very tick the backlog comes due (issue #843).
+        fleet.attach(state, self.central)
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -786,7 +833,7 @@ class Daemon:
                 # waiting a whole poll interval for the next pass. With no envelope ever
                 # posted this is one indexed lookup that finds nothing.
                 self.deliver_envelopes(project, store)
-                self.deliver_messages(project, store)
+                self.deliver_messages(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
@@ -980,10 +1027,14 @@ class Daemon:
         leaves `pending` and nothing is written at all — the same nothing a
         dependency-blocked order costs, and why neither raises attention.
         """
+        # The user's pause is per order, so it narrows the CLAIM rather than stopping it:
+        # only allow-listed ids are claimable while the fleet is paused (issue #843).
+        only = (state.pause.allow if state is not None and state.pause is not None
+                else None)
         while store.count_active() < project.max_concurrent:
-            if state is not None and state.blocked():
+            if state is not None and (state.shut() or state.capacity_cause()):
                 return
-            wo = store.claim_next_pending()
+            wo = store.claim_next_pending(only=only)
             if wo is None:
                 return
             log.info("[%s] dispatching %s: %s", project.name, wo["id"], wo["title"])
@@ -1046,6 +1097,10 @@ class Daemon:
         than one loop over both kinds, because `list_feature_orders` filters kind
         POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
         undo that. See §3.1.
+
+        An INVESTIGATION order gets a third one, identical in shape: one work order,
+        `kind='investigator'`, the `why` verbatim, and `pending` left last (§2.7 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md).
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -1082,6 +1137,30 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+        # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: a third
+        # sibling loop, for the same reason as the second — `list_feature_orders` filters
+        # kind POSITIVELY and a shared loop would have to undo that.
+        for fo in store.list_feature_orders(statuses=("pending",),
+                                            kind="investigation"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Investigate: {fo['title']}"[:200],
+                    # The `why` verbatim; the investigator CONTRACT is composed at
+                    # dispatch (dispatch._investigator_prompt), as the analyst's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
+                log.exception("[%s] could not open an investigator for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, which is what makes a crashed tick re-file rather than strand an
+            # investigation with no investigator.
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
+                     wo["id"])
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over. Thin, like its
@@ -1515,7 +1594,7 @@ class Daemon:
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            held = state.blocked() if state is not None else ""
+            held = state.blocked(wo["id"]) if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1528,16 +1607,20 @@ class Daemon:
             # BELOW the filter above, so only an order that was going to be relaunched
             # on this pass is ever recorded — nothing else is being held.
             if held:
-                shut = state is not None and state.shut()
-                figures = {"in_flight": state.in_flight, "cap": state.cap}
-                if shut:
+                assert state is not None  # `held` is only ever set from a reading
+                cause = state.hold_cause(wo["id"]) or "fleet_cap"
+                figures: dict[str, Any] = {"in_flight": state.in_flight, "cap": state.cap}
+                if cause == "fleet_outage":
                     # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
                     # for an outage (issue #714), and the event exists for the invariant
                     # suppression, which an outage hold needs exactly as a cap hold does.
                     figures["reopens_at"] = state.outage.reopens_at
-                self._record_retry_held(
-                    store, wo, pause,
-                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                elif cause == "fleet_ramp":
+                    figures.update(cap=state.ramp.cap, until=state.ramp.until,
+                                   since=state.ramp.since)
+                elif cause == "fleet_paused":
+                    figures["since"] = state.pause.since
+                self._record_retry_held(store, wo, pause, cause=cause, figures=figures)
                 continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
@@ -1547,7 +1630,19 @@ class Daemon:
                              "max_concurrent": project.max_concurrent})
                 continue
             try:
-                turn = worker_session.retry(store, project, wo, pause)
+                # COLD, AND LARGE: compact first (issue #843). A pause outlives the cache,
+                # so the plain relaunch re-writes the whole conversation at the
+                # cache-WRITE rate — 100-170k tokens a worker, all due on the same tick.
+                # `compact_then_resume` queues the relaunch as an ordinary message, so the
+                # pause is not erased and the delivery path sends it into the compacted,
+                # warm conversation on the tick after the compaction settles.
+                due = worker_session.resume_compaction_due(
+                    store, project, wo, pause, self.catalog.os.compact_min_context)
+                if due is not None:
+                    turn = worker_session.compact_then_resume(
+                        store, project, wo, pause, due)
+                else:
+                    turn = worker_session.retry(store, project, wo, pause)
             except budget_mod.BudgetExhausted as e:
                 # `NOT_RETRIED` already keeps this sweep off an order already parked in
                 # `budget_exhausted`; this is the order that ran out BETWEEN the last
@@ -1631,7 +1726,8 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
         """Send queued user messages into their work orders' conversations.
 
         No roster lookup any more, and no thread pool: a turn is a detached process, so
@@ -1693,13 +1789,22 @@ class Daemon:
         budget = project.max_concurrent - store.count_active()
         for wo_id, msgs in pending.items():
             wo = store.get_work_order(wo_id)
+            # UNDER THE FLEET TOO (issue #843). A delivery starts a turn exactly as a
+            # dispatch or a resume does, so the user's pause, the post-reopen ramp and
+            # the account-wide cap bind it the same way. Held, the messages stay queued.
+            held = state.blocked(wo_id) if state is not None else ""
+            if held:
+                log.debug("[%s] holding %s message(s) for %s: %s",
+                          project.name, len(msgs), wo_id, held)
+                continue
             if resume_spends_slot(wo):
                 if budget <= 0:
                     log.debug("[%s] holding %s message(s) for %s: all %s slots are full",
                               project.name, len(msgs), wo_id, project.max_concurrent)
                     continue
                 budget -= 1
-            self._deliver(project, store, wo, msgs)
+            if self._deliver(project, store, wo, msgs) and state is not None:
+                state.launched()
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py).
@@ -1767,6 +1872,9 @@ class Daemon:
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(wo_id):
+                continue  # the user paused the fleet; the panel spends on this too (#843)
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
                 continue
@@ -1882,6 +1990,34 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # WHICH BUDGET THIS ROUND CAME OUT OF. A rebind's NUMBER can sit past
+            # `max_rounds` while its own bound has room, and routing on the number
+            # would send it to the user for being numbered 5 (spec
+            # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+            # `rebinds` counts the round being settled, so `<` means "another one left".
+            #
+            # `pos` is the ORDINARY arm's budget position, and it is not `n` either: a
+            # rebind spends a row number without spending budget, so after one the rows
+            # run ahead of the budget and routing on `n` would escalate a submission
+            # with a round still in hand (and tell it "round 3 of 3"). Same counter
+            # `ops.rejudge_moved_head` budgets off — the round being settled is still
+            # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
+            # is this `+ 1`.
+            uncounted = bool(round_row["uncounted"])
+            # WHICH EXEMPTION, not merely that there was one. A rework the USER asked
+            # for is bounded by the user's own rejections — one free round each — so a
+            # rejected one falls back to the ORDINARY rule and `REBIND_MAX` never reads
+            # it (Neo question 973, live case wo-299daf2e). An uncounted row with NO
+            # cause predates the column and could only have been a rebind, which is why
+            # the filter drops to unfiltered there.
+            cause = str(round_row["uncounted_cause"] or "")
+            as_rebind = uncounted and cause != ops.USER_REWORK_CAUSE
+            rebinds = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=cause or None) if as_rebind else 0
+            pos = store.counted_validation_rounds(wo_id=wo_id) + (
+                0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
+                else 1)
+            goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2057,14 +2193,16 @@ class Daemon:
                                      "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
-            elif outcome == "rejected" and n < max_rounds:
+            elif outcome == "rejected" and goes_back:
                 # The inadmissible follow-ups ride along HERE and nowhere else: a stale
                 # docstring or a missing test costs nothing in a session that is going
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
-                             note=ops.follow_up_feedback(follow_ups))
+                             note=ops.follow_up_feedback(follow_ups), budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
                 log.info("[%s] %s rejected in round %d of %d",
-                         project.name, wo_id, n, max_rounds)
+                         project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
                 # ask for a resubmission there is no round left to judge — and the loop
@@ -2159,7 +2297,9 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str, *, note: str = "") -> None:
+                reason: str, *, note: str = "", budget_round: int | None = None,
+                rebind: tuple[int, int] | None = None,
+                uncounted_cause: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -2172,18 +2312,53 @@ class Daemon:
         panel's verdict; the findings that were not admissible as tracker issues are an
         aside to whoever is fixing this, and writing them into the outcome would restate
         on every surface that prints a round.
+
+        `rebind` is `(used, ops.REBIND_MAX)` and swaps the wording for `REBIND_FEEDBACK`:
+        the round was not charged to the submitter, so it may not be told it was (spec
+        2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+
+        `uncounted_cause` is the round's OWN exemption and it picks the wording: a round
+        a USER rejection bought is not a rebind and may not be described as one — no
+        merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
+        event too, so every surface can tell the two uncounted causes apart.
+
+        `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
+        its row number, and it is what the ordinary feedback names — a submitter told
+        "round 3 of 3" on its second charged round would ration itself out of a round it
+        still has (same spec §4.4).
+
+        `"round"` in the event stays the ROW NUMBER: `holds.py` correlates it with
+        `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
+        open for ever. The position rides beside it as `budget_round`.
         """
+        from . import ops
+
         wo_id = wo["id"]
+        rework = uncounted_cause == ops.USER_REWORK_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
-        store.add_event(wo_id, "validation_rejected",
-                        {"round": n, "round_id": round_id, "of": max_rounds})
+        used, of = rebind or (0, max_rounds)
+        pos = n if budget_round is None else budget_round
+        # `of` is the bound this round was actually held by, so no surface prints
+        # "round 5 of 3" (spec 2026-09-27 §4.4).
+        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
+                                 "budget_round": pos}
+        if rebind is not None or rework:
+            event["uncounted"] = True
+        if uncounted_cause:
+            event["uncounted_cause"] = uncounted_cause
+        store.add_event(wo_id, "validation_rejected", event)
+        if rework:
+            text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
+                                               reason=reason + note, wo_id=wo_id)
+        elif rebind is not None:
+            text = REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
+                                          reason=reason + note, wo_id=wo_id)
+        else:
+            text = REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
+                                          wo_id=wo_id)
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
-                 payload=bus.ReviewFeedback(
-                     round=n, outcome="rejected",
-                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds,
-                                                   reason=reason + note,
-                                                   wo_id=wo_id)))
+                 payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -2469,6 +2644,9 @@ class Daemon:
             fo_id = fo["id"]
             if fo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(fo_id):
+                continue  # the user paused the fleet (#843)
             round_row = store.latest_validation_round(fo_id=fo_id)
             if round_row is None:
                 # In `validating` with no round at all: nothing this machine can judge.
@@ -2878,7 +3056,8 @@ class Daemon:
         return True
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msgs: list[dict[str, Any]]) -> None:
+                 msgs: list[dict[str, Any]]) -> bool:
+        """True when a turn was launched — the delivery itself, or a compaction first."""
         ids = [m["id"] for m in msgs]
         anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
@@ -2886,7 +3065,7 @@ class Daemon:
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
-            return
+            return True
         # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
         # whose last turn died on a background job used to re-enter the identical turn
         # shape knowing nothing, and the worker backgrounded and signed off again —
@@ -2915,7 +3094,7 @@ class Daemon:
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
             # the next tick from re-attempting, so this runs once per exhaustion.
             budget_mod.escalate(store, wo, e.exhausted)
-            return
+            return False
         except claude_cli.ClaudeCliError as e:
             # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
             # and only surfaced once the retries are genuinely gone — spec
@@ -2932,7 +3111,7 @@ class Daemon:
                     f"a message could not be delivered to this work order after "
                     f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
                     f"received it: {e}")
-            return
+            return False
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
         # would read it twice and pay a second boundary for the privilege.
@@ -2947,6 +3126,7 @@ class Daemon:
         if wo["status"] != "running":
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
+        return True
 
     # -- 5. Neo (answer worker questions) --------------------------------------------
 
@@ -4032,7 +4212,10 @@ class Daemon:
                     # What the OS was itself holding this order for, so a threshold
                     # judges the time it could work rather than the time that passed.
                     # Two indexed reads, no model — `holds.held`.
-                    spans=holds.held(store, wo["id"], now=now))
+                    spans=holds.held(store, wo["id"], now=now),
+                    # Spec 2026-09-27 §3: the alarm and `jarvis inspect` name one turn
+                    # the same way.
+                    turn_starts=store.turn_starts(wo["id"]))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}
@@ -4044,7 +4227,12 @@ class Daemon:
                 # `alarm_id` is purely additive to a payload whose other three keys are
                 # what `already` above matches on. Move the dedupe onto `wo_alarms` and
                 # this re-raises every tick for the life of the turn.
-                row = store.add_alarm(wo["id"], alarm.kind, turn["seq"], alarm.reason)
+                # Spec of 2026-09-27 §2: a note, not an interruption.
+                row = store.add_alarm(
+                    wo["id"], alarm.kind, turn["seq"], alarm.reason,
+                    status=("informational"
+                            if alarm.kind in inspection.INFORMATIONAL_KINDS
+                            else "raised"))
                 store.add_event(wo["id"], "cost_alarm",
                                 {"kind": alarm.kind, "seq": turn["seq"],
                                  "reason": alarm.reason, "alarm_id": row["id"]})
@@ -4052,8 +4240,12 @@ class Daemon:
             # Every alarm goes on the timeline; only the first reaches the attention
             # line, because `alarms` returns them most-actionable first and a flag can
             # carry one sentence.
-            if fresh and not wo["needs_attention"]:
-                store.flag_attention(wo["id"], fresh[0].reason)
+            # AFTER the loop above, so an informational kind still gets its row, its
+            # event and its dedupe memory — it is only kept off the attention line.
+            interrupting = [a for a in fresh
+                            if a.kind not in inspection.INFORMATIONAL_KINDS]
+            if interrupting and not wo["needs_attention"]:
+                store.flag_attention(wo["id"], interrupting[0].reason)
 
     def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise a project's STANDING re-write tax, split by the cause that produced it.
@@ -4228,7 +4420,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo, something_is_out, true_blockers
+        from .invariants import something_is_out, true_blockers, user_facing_wait
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
         # claim below. The budget governs the order's WHOLE bill, so what spends the last
@@ -4420,10 +4612,18 @@ class Daemon:
                 # and this ran a tick later and completed the order it had just held.
                 # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
-        elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
+        elif wo.get("kind") != "manager" and something_is_out(store, wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
             # and wait, so an idle worker here is compliance, not abandonment.
+            #
+            # THE WHOLE PREDICATE, and a manager is excluded from it: `something_is_out`
+            # adds `held_approvals`, which is what keeps an idle worker holding an
+            # unargued gate out of the `else` below and off the user's list (fix 2 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), and
+            # the exclusion is what keeps the manager branch below reachable exactly as
+            # before. The WRITE stays conditional on the wait being outward-facing: a
+            # held request is the worker's own move, so it parks nothing.
             #
             # The question half was missing, and the `else` below caught those instead:
             # a `jarvis wo ask` whose answer had not landed by the time the turn settled
@@ -4431,7 +4631,8 @@ class Daemon:
             # the user, for a worker doing exactly what the contract asks of it (GitHub
             # issue 100). Only the tightness of the Neo drain loop kept that rare; a
             # slow or disabled Neo makes it every `wo ask`.
-            if fresh["status"] != "waiting_input":
+            if (user_facing_wait(store, wo["id"])
+                    and fresh["status"] != "waiting_input"):
                 store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
@@ -4464,21 +4665,22 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif something_is_out(store, wo["id"]):
+            elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
                 # say the opposite — nothing to act on — about an order waiting for a
                 # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
                 #
-                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
-                # question and looks like all of it. That `elif` reads `pending_approvals`
-                # and misses `awaiting_case` — a gate request the worker filed by running
-                # the command before arguing it, which `gates.file_request` parks here
-                # just the same. Under the old code missing it cost nothing, because this
-                # branch's write was `waiting_input` either way; since issue #264 it is a
-                # rewrite, so the predicate has to be the whole one. `something_is_out` is
-                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
-                # the two cannot drift (kn-4ea33fe6).
+                # THE BRANCH ABOVE NOW COVERS THE REST, and a manager is excluded from it
+                # on purpose so this one stays reachable: `something_is_out` there is the
+                # whole predicate, including `awaiting_case`. What is left here is the
+                # narrower question — is somebody ELSE holding this — because a HELD gate
+                # request is the manager's own move and is owed by nobody. A manager
+                # holding only one falls through to `idle`, which is the truthful label:
+                # its feature is what wakes it. Fix 2 of
+                # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+                # `user_facing_wait` lives beside `something_is_out` so the pair cannot
+                # drift (kn-4ea33fe6).
                 pass
             elif fresh["status"] != "idle":
                 store.set_status(wo["id"], "idle")
@@ -5141,8 +5343,10 @@ class Daemon:
             # event describing a stall that lasted microseconds, and before the re-judge,
             # so the round machine never sees a head that moved for a reason no seat needs
             # to read. A refused carry falls through to both, untouched.
-            if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and self._carry_catch_up(project, store, wo, pr, decision)):
+            outcome = CarryOutcome(False, False)
+            if not record_only and decision.code == automerge.HELD_SHA_MOVED:
+                outcome = self._carry_catch_up(project, store, wo, pr, decision)
+            if outcome.carried:
                 round_row = store.latest_validation_round(wo_id=wo_id)
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
@@ -5162,7 +5366,11 @@ class Daemon:
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
-                    self._rejudge_moved_head(project, store, wo, decision)
+                    # `rebind` is the carry's reading of the two proofs, and the guard
+                    # above still holds it: a rebind is free of the round budget, not
+                    # of five seats (spec 2026-09-27 §4.2).
+                    self._rejudge_moved_head(project, store, wo, decision,
+                                             rebind=outcome.rebind)
                 return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
@@ -6120,12 +6328,21 @@ class Daemon:
                  "accept" if ruling.accept else "object", ruling.reason)
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                        pr: Any, decision: Any) -> bool:
+                        pr: Any, decision: Any) -> CarryOutcome:
         """Prove this head added no unjudged commit, and carry the verdict onto it.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
-        True when the verdict now covers the live head, so the caller may re-decide on the
-        same tick. False is the ordinary answer and writes nothing but the refusal.
+        `carried` when the verdict now covers the live head, so the caller may re-decide
+        on the same tick. Not carried is the ordinary answer and writes nothing but the
+        refusal.
+
+        `rebind` is the SECOND answer, for the case the predecessor spec left open: the
+        merge the OS asked for resolved a conflict, so proof (b) fails on content nobody
+        judged and the round that reads it is the OS's own doing (spec
+        docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+        The chain is walked on that branch ONLY when `ops.rebind_possible` says a rebind
+        could be opened — the walk is up to `ci.CHAIN_LIMIT` `gh api` calls on a pull
+        request polled every couple of minutes, and no other tick may pay it.
 
         `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
         rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
@@ -6144,21 +6361,22 @@ class Daemon:
         waiting for it would defer the carry into exactly the window where a round gets
         spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
         """
-        from . import branchproof, ci, github, ops
+        from . import branchproof, ops
 
         judged = str(getattr(decision, "judged_sha", "") or "")
         head = str(getattr(decision, "head_sha", "") or "")
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
         if not judged or not head or head == judged or not base or not pr_url:
-            return False
+            return CarryOutcome(False, False)
 
-        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+        def refuse(proof: str, detail: str,
+                   chain: tuple[str, ...] = ()) -> CarryOutcome:
             if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
                                         proof=proof, detail=detail, chain=chain):
                 log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
                          wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
-            return False
+            return CarryOutcome(False, False)
 
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
         if not branchproof.fetch(project.path, base, pull_ref):
@@ -6172,20 +6390,35 @@ class Daemon:
                           "the diff this branch adds on top of its merge base could not "
                           "be computed locally")
         if before != after:
-            return refuse(ops.PROOF_PATCH_ID,
-                          f"the diff on {head[:10]} is not the diff round "
-                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
-                          f"content nobody judged")
-        try:
-            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                        cwd=project.path)
-        except github.GitHubError as exc:
-            return refuse(ops.PROOF_READ,
-                          f"GitHub would not say what {head[:10]} merged ({exc})")
-        except Exception:  # noqa: BLE001 — a parked pull request stays parked
-            log.exception("[%s] could not read the chain behind %s", project.name,
-                          wo["id"])
-            return False
+            # THE REFUSAL IS UNCHANGED, `(head, proof)` dedupe and all: the diff really
+            # did change and it is still said once. What follows it is the rebind
+            # question — asked cheaply first, walked only if it could be answered yes
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.2).
+            refuse(ops.PROOF_PATCH_ID,
+                   f"the diff on {head[:10]} is not the diff round "
+                   f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                   f"content nobody judged")
+            if not ops.rebind_possible(store, wo, head=head, project=project.name,
+                                       cfg=project.validation):
+                return CarryOutcome(False, False)
+            def unreadable(exc: Exception) -> CarryOutcome:
+                log.info("[%s] %s: GitHub would not say what %s merged (%s)",
+                         project.name, wo["id"], head[:10], exc)
+                return CarryOutcome(False, False)
+
+            chain, failed = self._merge_chain(project, wo, pr_url=pr_url, judged=judged,
+                                              head=head, base=base,
+                                              github_error=unreadable)
+            if failed is not None:
+                return failed
+            return CarryOutcome(False, bool(chain))
+        chain, failed = self._merge_chain(
+            project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
+            github_error=lambda exc: refuse(
+                ops.PROOF_READ,
+                f"GitHub would not say what {head[:10]} merged ({exc})"))
+        if failed is not None:
+            return failed
         if not chain:
             return refuse(ops.PROOF_CHAIN,
                           f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
@@ -6203,7 +6436,34 @@ class Daemon:
         log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
                  "%s, no round spent", project.name, wo["id"], carried["round"],
                  judged[:10], head[:10], len(chain), len(bases), base)
-        return True
+        return CarryOutcome(True, False)
+
+    @staticmethod
+    def _merge_chain(project: ProjectSpec, wo: dict, *, pr_url: str, judged: str,
+                     head: str, base: str,
+                     github_error: Callable[[Exception], CarryOutcome],
+                     ) -> tuple[tuple[tuple[str, str, bool], ...] | None,
+                                CarryOutcome | None]:
+        """Walk `ci.base_merge_chain`, or say why it could not be walked.
+
+        `(chain, None)` on success and `(None, outcome)` on failure — ONE copy of the
+        walk for `_carry_catch_up`'s two branches, which asked GitHub the same question
+        and differed only in what a `GitHubError` means. That is `github_error`'s job:
+        the rebind branch has already written its refusal and only logs, the main path
+        refuses with `ops.PROOF_READ`. Anything else is a parked pull request staying
+        parked, which is the same answer on both.
+        """
+        from . import ci, github
+
+        try:
+            return ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                       cwd=project.path), None
+        except github.GitHubError as exc:
+            return None, github_error(exc)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return None, CarryOutcome(False, False)
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:
@@ -6302,7 +6562,7 @@ class Daemon:
         return fresh
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
-                            wo: dict, decision: Any) -> None:
+                            wo: dict, decision: Any, *, rebind: bool = False) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
 
         The policy is `ops.rejudge_moved_head` and lives there, testable without a
@@ -6317,16 +6577,24 @@ class Daemon:
 
         try:
             out = ops.rejudge_moved_head(store, project.path, wo, project=project.name,
-                                         cfg=project.validation, decision=decision)
+                                         cfg=project.validation, decision=decision,
+                                         rebind=rebind)
         except Exception:  # noqa: BLE001 — a parked pull request stays parked
             log.exception("[%s] could not re-judge %s", project.name, wo["id"])
             return
         if out is None:
             return
         if out["declined"]:
-            log.info("[%s] %s: the head moved to %s and round %s would be the last — "
-                     "leaving it for the user", project.name, wo["id"],
-                     out["head_sha"][:10], out["next_round"])
+            # Two causes, two sentences: `next_round` is on the budget decline only
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+            if out.get("cause") == ops.REBIND_EXHAUSTED:
+                log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
+                         "merge %s time(s) — leaving it for the user", project.name,
+                         wo["id"], out["head_sha"][:10], out["rebinds"])
+            else:
+                log.info("[%s] %s: the head moved to %s and round %s would be the "
+                         "last — leaving it for the user", project.name, wo["id"],
+                         out["head_sha"][:10], out["next_round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
@@ -6397,6 +6665,15 @@ class Daemon:
           from `PR_POLL_STATUSES` reaches the poll (issue #224), so this would otherwise
           fire on every `needs_review` order with a green pull request and tell the user
           the automatic merge declined something it was never asked about.
+
+        **THE ROUND IS PART OF THE KEY**, `_note_autoreview_held`'s medicine for
+        `panel_gave_up` (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+        merging.md §4). Nine poll-reachable codes carry no round number in their reason, so
+        at an unmoved head round N+1's sentence is byte-identical to round N's: without the
+        round it writes nothing, the stored payload still says N, and
+        `ops._automerge_hold_is_stale` then declares a TRUE hold stale (kn-96f47efb). The
+        bound this dedupe exists for is kept — `decide` is deterministic given state, and
+        the round changes only when a round opens.
         """
         from . import automerge
 
@@ -6404,11 +6681,12 @@ class Daemon:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
         key = (str(decision.head_sha or ""), str(decision.code or ""),
-               str(decision.reason or ""))
+               str(decision.reason or ""), int(decision.round_n or 0))
         if not _hold_is_news(store, wo_id, "automerge_held", key,
                              lambda p: (str(p.get("head_sha") or ""),
                                         str(p.get("code") or ""),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        int(p.get("round") or 0))):
             return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,
@@ -6874,10 +7152,11 @@ class Daemon:
                 continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
-    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
-    #: a column because it is a list that grows while the order waits, and because
-    #: nothing outside this file has a reason to query it.
-    RELEASE_BATCH_KEY = "release_for_issues"
+    #: fixes, and these are the ones it is shipping". The batch lives in `metadata`
+    #: rather than in a column because it is a list that grows while the order waits.
+    #: An ALIAS since 2026-09-29 spec §1 — `release.BATCH_KEY` is the literal's home now
+    #: that `ops` reads it too.
+    RELEASE_BATCH_KEY = release.BATCH_KEY
 
     #: What the release work order is told to do. It runs the ORDINARY release path —
     #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
@@ -6970,6 +7249,14 @@ the place to fix a red build."""
     #: (2026-09-27 spec §5.2).
     RED_HOLD_EVENT = "release_held_red_base"
 
+    #: How long `main` may stay red before a release order stops waiting and asks the
+    #: user. Measured from the FIRST red hold on that order, so the pending-dispatch hold
+    #: (#807) and the mid-run re-park (`ops.defer_red_release`) share one clock. Six
+    #: hours: a red `main` here is repaired by a work-order round trip, which is hours and
+    #: not minutes, and an hour would ask the user about a break the fleet was already
+    #: fixing (2026-09-29 spec §3).
+    RED_PARK_AFTER_SECONDS = 6 * 3600
+
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
 
@@ -6991,9 +7278,12 @@ the place to fix a red build."""
         indexed listing when it owns no pending release, and a `gh` call only once a
         hold has lapsed — an in-force hold IS the rate limit.
 
+        Also where the hold STOPS: past `RED_PARK_AFTER_SECONDS` the release asks the
+        user instead (2026-09-29 spec §3).
+
         docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
         """
-        from . import ci, evidence, github
+        from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
         # release script and the production checkout, both facts about this repository.
@@ -7032,6 +7322,18 @@ the place to fix a red build."""
                 if wo.get("retry_after") is not None and not int(
                         wo.get("dispatch_attempts") or 0):
                     store.hold_dispatch(wo_id, until=None)
+                continue
+            # §3's threshold, HERE: this tick is the only step that visits a release
+            # already held in `pending`, so `ops.defer_red_release`'s check — which runs
+            # only when a worker delivers — can never fire for one. `_say_base_is_red`
+            # below is what writes RED_HOLD_EVENT, so on the FIRST red tick there is no
+            # clock yet and nothing parks; and a parked order is `needs_review`, which
+            # the `statuses=("pending",)` selection above stops returning.
+            first = ops.first_red_hold(store, wo_id)
+            if first is not None and db.now() - first >= self.RED_PARK_AFTER_SECONDS:
+                ops.park_red_release(store, wo_id, {
+                    "base": base, "head_sha": red.head_sha, "workflow": red.workflow,
+                    "run_id": red.run_id, "run_url": getattr(red, "run_url", "") or ""})
                 continue
             until = max(float(wo.get("retry_after") or 0),
                         db.now() + self.RED_HOLD_SECONDS)

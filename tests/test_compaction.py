@@ -123,6 +123,35 @@ def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
     assert not store.queued_messages(wo["id"])
 
 
+def test_a_turn_that_died_without_a_result_does_not_hide_the_conversation(
+        fleet, settle_turns):
+    """Issue #856: the last turn was killed (a fleet stop), so it measured no context.
+
+    Its 0 read as "small", and the next delivery re-sent a 126k conversation cold eight
+    hours later. The size is the newest turn that MEASURED one.
+    """
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    _big_context(store, wo["id"])
+    ops.send_message(wo["id"], "keep going")
+    _deliver(fleet, wo["id"])                      # warm: an ordinary second turn
+    assert _turns(store, wo["id"])[-1] == ("message", "keep going")
+    assert settle_turns(store)
+    killed = store.latest_turn(wo["id"])
+    store.conn.execute(
+        "UPDATE wo_turns SET state='failed', usage_json=NULL, error=? WHERE id=?",
+        ("the turn's process ended without writing a result", killed["id"]))
+    assert worker_session.turn_context(store.latest_turn(wo["id"])) == 0
+    ops.send_message(wo["id"], "you were interrupted — carry on")
+    _age_last_turn(store, wo["id"], 8 * 3600)
+
+    _deliver(fleet, wo["id"])
+
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == [
+        "you were interrupted — carry on"]
+
+
 def test_a_boundary_inside_the_ttl_does_not_compact(fleet, settle_turns):
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
@@ -200,32 +229,82 @@ def test_a_compaction_is_never_followed_by_another(fleet, settle_turns):
     assert _turns(store, wo["id"])[-1] == ("message", "go on")
 
 
-def test_a_relaunched_turn_is_never_compacted_before(fleet, fake_claude, settle_turns):
-    """Two reasons, and the second is why this is not even asked at the decision.
-
-    `_nudge` tells the worker the conversation above is intact, which a compaction
-    makes false; and the pause is re-derived from the LATEST turn, so a compact turn
-    behind a paused one would erase the pause and strand the relaunch.
-    """
-    store, daemon = fleet["store"], fleet["daemon"]
+def _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch) -> dict:
+    """A work order whose last turn the usage window refused, now DUE and COLD."""
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     fake_claude.turns_rate_limited()
     worker_session.send(store, fleet["project"], store.get_work_order(wo["id"]), "more")
     assert settle_turns(store)
     fake_claude.turns_recover()
+    # A reset long gone (`test_fleet_cap` uses the same form), and an end older than
+    # the cache TTL: exactly the state every paused turn is in when a window reopens.
+    turn = store.latest_turn(wo["id"])
+    store.conn.execute("UPDATE wo_turns SET error=?, ended_at=? WHERE id=?",
+                       ("Claude AI usage limit reached|1000000000",
+                        turn["ended_at"] - 3 * usage.WRITE_TTL_SECONDS, turn["id"]))
     pause = worker_session.turn_pause(store, wo["id"])
-    assert pause is not None
-    store.conn.execute("UPDATE wo_turns SET ended_at=? WHERE id=?",
-                       (pause.turn["ended_at"] - 3 * usage.WRITE_TTL_SECONDS,
-                        pause.turn["id"]))
+    assert pause is not None and pause.due()
+    # Where a paused order really is: `running`, holding its slot (the retry sweep reads
+    # `RETRY_SWEEP_STATUSES`, which `_running_wo`'s bare `start` never reaches).
+    store.set_status(wo["id"], "running")
+    return store.get_work_order(wo["id"])
+
+
+def test_a_cold_relaunch_compacts_first_and_the_relaunch_survives(
+        fleet, fake_claude, settle_turns, monkeypatch):
+    """ISSUE #843: a relaunch after a usage window is ALWAYS cold, and on 2026-09-28
+    eleven of them re-wrote 2.25M cache-write tokens in two minutes.
+
+    The two reasons this used to be refused are both answered, and this pins each: the
+    relaunch is QUEUED before the compaction starts, so a compact turn behind the paused
+    one cannot strand it; and it is delivered afterwards, into the compacted session.
+    """
+    store, daemon = fleet["store"], fleet["daemon"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    before = len(store.list_turns(wo["id"]))
 
     daemon.retry_paused_turns(fleet["project"], store)
+    assert len(store.list_turns(wo["id"])) == before + 1, "nothing was relaunched"
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == ["more"], \
+        "the refused prompt never reached the model, so it is re-queued verbatim"
     assert settle_turns(store)
 
-    assert COMPACT_TURN not in [k for k, _ in _turns(store, wo["id"])]
-    # …and the pause survived to be retried at all, which is the half a compaction
-    # would have broken.
-    assert _turns(store, wo["id"])[-1][0] == "message"
+    _deliver(fleet, wo["id"])
+    assert _turns(store, wo["id"])[-1] == ("message", "more")
+    assert not store.queued_messages(wo["id"])
+
+
+def test_a_warm_or_small_relaunch_is_not_compacted(fleet, fake_claude, settle_turns,
+                                                   monkeypatch):
+    """The cost rule is `compaction_due`'s, unchanged: inside the TTL, or under the
+    floor, the plain relaunch is the cheaper one."""
+    store = fleet["store"]
+    fresh = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    pause = worker_session.turn_pause(store, fresh["id"])
+    assert pause is not None
+    project = fleet["project"]
+
+    assert worker_session.resume_compaction_due(store, project, fresh, pause, BIG,
+                                                now=pause.turn["ended_at"] + 1) is None
+    cold = pause.turn["ended_at"] + usage.WRITE_TTL_SECONDS + 1
+    assert worker_session.resume_compaction_due(store, project, fresh, pause, HUGE,
+                                                now=cold) is None
+    assert worker_session.resume_compaction_due(store, project, fresh, pause, None,
+                                                now=cold) is None
+    assert worker_session.resume_compaction_due(store, project, fresh, pause, BIG,
+                                                now=cold) is not None
+
+
+def test_a_relaunch_that_reached_the_model_is_told_it_was_compacted(fleet):
+    """`_nudge` says the conversation is intact; behind a compaction that is false."""
+    pause = worker_session.TurnPause(
+        reason=worker_session.PAUSE_USAGE_LIMIT, turn={}, retry_at=0.0, attempts=1,
+        message="limit")
+    text = worker_session._nudge_after_compaction(pause)
+    assert "COMPACTED" in text and "intact" not in text
 
 
 def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude,

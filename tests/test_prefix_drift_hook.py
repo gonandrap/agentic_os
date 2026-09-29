@@ -348,15 +348,23 @@ def test_the_fingerprint_does_not_import_the_catalog(tmp_path):
 
 
 def test_the_memory_walk_is_bounded(wo, project, monkeypatch, tmp_path):
-    """So the hook's cost cannot grow with the size of somebody's rules directory."""
+    """So the hook's cost cannot grow with the size of somebody's rules directory —
+    which is the whole of what the cap now protects against: ancestor CLAUDE.md copies
+    never reach the walk (spec docs/superpowers/specs/
+    2026-09-29-one-copy-of-the-projects-claude-md.md §2), so the unbounded end is the
+    user's own `~/.claude/rules`, and their home is the one supplied here rather than
+    the runner's."""
     monkeypatch.setattr(hooks, "PREFIX_MEMORY_FILE_CAP", 3)
-    deep = project
+    home = tmp_path / "user-home"
+    rules = home / ".claude" / "rules"
+    rules.mkdir(parents=True)
+    (home / ".claude" / "CLAUDE.md").write_text("the user's own")
     for i in range(10):
-        deep = deep / f"d{i}"
-        deep.mkdir()
-        (deep / "CLAUDE.md").write_text(f"level {i}")
+        (rules / f"r{i}.md").write_text(f"rule {i}")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    (project / "CLAUDE.md").write_text("the project's own")
 
-    assert len(hooks.memory_files(project, deep)) == 3
+    assert len(hooks.memory_files(project, project)) == 3
 
 
 def test_the_walk_stops_at_the_project_and_does_not_climb_out_of_it(wo, project):
@@ -376,8 +384,15 @@ def test_the_walk_stops_at_the_project_and_does_not_climb_out_of_it(wo, project)
 
     walked = hooks.memory_files(by_link, worktree)
 
-    assert project / "CLAUDE.md" in walked
+    # The root's own copy is now DROPPED FROM THE SPAWN rather than walked (spec
+    # docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §2), so the
+    # stop is what `claude_md_excludes` reached and stopped at. Nothing above the
+    # checkout is in either list.
+    assert project / "CLAUDE.md" in hooks.claude_md_excludes(by_link, worktree)
+    assert project / "CLAUDE.md" not in walked
     assert project.parent / "CLAUDE.md" not in walked
+    assert project.parent / "CLAUDE.md" not in hooks.claude_md_excludes(by_link,
+                                                                       worktree)
 
 
 def test_the_work_orders_own_standing_instructions_are_covered(wo, project):

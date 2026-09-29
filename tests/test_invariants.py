@@ -1043,3 +1043,94 @@ def test_a_transient_drop_strands_no_question_in_neo_attention(started):
         neo.close()
     assert [q["id"] for q in held if q["kind"] == "assumption"] == []
     assert list(invariants.check_neo_escalations_are_live(store)) == []
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+
+
+def _declined_on_a_moved_head(store: ProjectStore, *, cause: str,
+                              head: str = "bbbb1111bbbb2222",
+                              judged: str = "aaaa1111aaaa2222") -> dict:
+    """A pull request parked on a head the OS refused to re-judge, for `cause`."""
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(row["id"], judged)
+    store.close_validation_round(row["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+    store.add_event(wo["id"], invariants.REJUDGE_DECLINED_EVENT,
+                    {"head_sha": head, "judged_sha": judged, "cause": cause})
+    store.add_event(wo["id"], "automerge_held",
+                    {"code": invariants.HELD_SHA_MOVED, "head_sha": head})
+    return store.get_work_order(wo["id"])
+
+
+def test_a_rebind_decline_is_not_a_spent_round_budget(project):
+    """The two declines mean different things and only one is answered by
+    `validation.max_rounds` — so each derivation reads only its own."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    spent = _declined_on_a_moved_head(store, cause=ops.REBIND_EXHAUSTED)
+
+    assert invariants.rejudge_exhausted(store, spent) is False
+    assert invariants.rebind_exhausted(store, spent) is True
+    blockers = true_blockers(store, spent)
+    assert invariants.REBIND_EXHAUSTED_BLOCKER in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers
+
+
+def test_a_budget_decline_still_reads_as_one(project):
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    budget = _declined_on_a_moved_head(store, cause=ops.REJUDGE_BUDGET_SPENT)
+
+    assert invariants.rejudge_exhausted(store, budget) is True
+    assert invariants.rebind_exhausted(store, budget) is False
+    blockers = true_blockers(store, budget)
+    assert invariants.SHA_MOVED_BLOCKER in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+
+
+def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project):
+    """The migration reading: a payload with no `cause` is every row there was."""
+    store = ProjectStore(project)
+    old = _declined_on_a_moved_head(store, cause="")
+
+    assert invariants.rejudge_exhausted(store, old) is True
+    assert invariants.rebind_exhausted(store, old) is False
+# -- is somebody ELSE holding this, or is anything out at all? -------------------------
+# Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
+# questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).
+
+
+def test_a_held_gate_is_out_but_is_not_a_user_facing_wait(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4",
+                       status="awaiting_case")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_a_pending_gate_is_both(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_nothing_out_is_neither(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+
+    assert not invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()

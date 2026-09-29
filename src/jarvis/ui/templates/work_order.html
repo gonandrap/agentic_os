@@ -4,6 +4,7 @@
 {% import "_issues.html" as issues_ui %}
 {% import "_states.html" as states_ui %}
 {% import "_review.html" as review_ui %}
+{% import "_brake.html" as brake_ui %}
 {% block title %}{{ wo.id }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -60,6 +61,11 @@
        words a status for itself is how this page and the listings disagreed once. #}
     <p class="sub">{{ status_label }}</p>
   {% endif %}
+  {# The user's brake, per order — `jarvis resume <wo-id>` (issue #843). #}
+  {% if brake and brake.paused and wo.status in fleet_held_statuses %}
+    <div class="sub" style="margin: 8px 0;">⏸ The fleet is paused.
+      {{ brake_ui.let_through(brake, wo, '/wo/' ~ project ~ '/' ~ wo.id, full=true) }}</div>
+  {% endif %}
   {% if wo.hidden %}
     <p class="sub">🙈 Hidden — it stays on the record but is out of listings, the
       summary and the attention list, and won't be dispatched.</p>
@@ -104,10 +110,18 @@
      it is NAMED here rather than inlined: repeating it under every order is exactly the
      duplication the spec-driven change removed. See
      docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md §4. #}
+  {% set spec_href = '/spec/' ~ project ~ '/' ~ spec_link.fo_id ~ ('#' ~ spec_link.anchor if spec_link and spec_link.anchor else '') if spec_link %}
   {% if spec and spec.section %}
   <p class="kv">📄 <strong>Spec section {{ spec.section }}</strong>
-    of <span class="mono">{{ spec.repo_path }}</span> — that section is what this order
-    builds; the brief above is the boundary around it.</p>
+    of <a class="mono" href="{{ spec_href }}">{{ spec.repo_path }}</a> — that section is
+    what this order builds; the brief above is the boundary around it.</p>
+  {% elif spec_link %}
+  {# The planner's case, which had nothing at all: `specs.spec_of` answers None for a
+     planner by design, so this is the second, narrow projection beside it — §5(a) of
+     docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. #}
+  <p class="kv">📄 <strong>The spec this feature is built from</strong>:
+    <a class="mono" href="{{ spec_href }}">{{ spec_link.repo_path }}</a>
+    {% if spec_link.source %}<span class="mono">— {{ spec_link.source }}</span>{% endif %}</p>
   {% endif %}
   <p class="kv mono">
     created {{ fmt_age(wo.created_at) }} ago · updated {{ fmt_age(wo.updated_at) }} ago

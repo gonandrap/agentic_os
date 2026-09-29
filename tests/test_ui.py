@@ -1774,6 +1774,112 @@ def test_the_project_page_lists_feature_orders_without_repeating_the_tree(featur
     assert page.count(f"/fo/proj_a/{fo['id']}") == 1
 
 
+# -- the spec page ---------------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document the OS
+# HOLDS, rendered — it works before any pull request exists, which is the live bug.
+
+
+@pytest.fixture()
+def released_feature(client, daemon, project):
+    """A feature whose plan was released, so planner, feature and children all exist."""
+    from tests.test_feature_orders import ASK, a_plan, child
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+    ops.submit_plan(fo["id"], a_plan(child("schema", extra="FORCE_APPROVE"),
+                                     child("api", needs=["schema"])))
+    daemon._neo_drain()
+    return client, ops.show_feature_order(fo["id"])
+
+
+def test_the_spec_page_renders_a_held_document_with_no_pull_request(released_feature):
+    """Spec test 1 — wo-1170d758's shape, the one that must not regress."""
+    client, fo = released_feature
+    assert not any(c["pr_url"] for c in fo["children"])
+
+    page = client.get(f"/spec/proj_a/{fo['id']}")
+
+    assert page.status_code == 200
+    assert "Failure handling" in page.text          # a heading from the document
+    assert 'id="3-failure-handling"' in page.text   # rendered, not printed as a path
+
+
+def test_the_spec_page_prints_the_revision_it_holds_and_never_invents_one(
+        released_feature, project):
+    """Spec test 7, second half. A fabricated provenance line is worse than none on the
+    one page whose purpose is to show what the reviewer read."""
+    client, fo = released_feature
+
+    page = client.get(f"/spec/proj_a/{fo['id']}").text
+    assert html.escape(fo["plan"]["design_doc_source"]) in page
+
+    store = ProjectStore(project)
+    try:
+        plan = dict(fo["plan"])
+        plan.pop("design_doc_source")
+        store.update_feature_order(fo["id"], plan=json.dumps(plan))
+    finally:
+        store.close()
+
+    older = client.get(f"/spec/proj_a/{fo['id']}").text
+    assert "the revision this text came from was not recorded" in older
+    assert "origin/main" not in older
+
+
+def test_a_feature_with_no_plan_is_200_and_names_its_status(client, daemon):
+    """Spec test 7, first half: three outcomes, none of them a 500."""
+    from tests.test_feature_orders import ASK
+
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    daemon.tick()
+
+    page = client.get(f"/spec/proj_a/{fo['id']}")
+
+    assert page.status_code == 200
+    assert "planning" in page.text
+    assert f"/fo/proj_a/{fo['id']}" in page.text
+
+
+def test_an_unknown_project_spec_is_the_ordinary_error_page(client):
+    page = client.get("/spec/no_such_project/fo-1234")
+
+    assert page.status_code == 200
+    assert "no_such_project" in page.text
+
+
+def test_three_pages_link_to_the_one_spec_page(released_feature):
+    """Spec test 3: the planner's page, the feature page and a child's page."""
+    client, fo = released_feature
+    link = f"/spec/proj_a/{fo['id']}"
+
+    assert link in client.get(f"/fo/proj_a/{fo['id']}").text
+    assert link in client.get(f"/wo/proj_a/{fo['planner']['id']}").text
+    kid = fo["children"][0]["id"]
+    assert link in client.get(f"/wo/proj_a/{kid}").text
+
+
+def test_a_childs_link_carries_its_sections_anchor_and_that_id_exists(released_feature,
+                                                                      project):
+    """Spec test 4 — assert the PAIR. A fragment pointing at no id is the bug."""
+    from jarvis import specs
+
+    client, fo = released_feature
+    store = ProjectStore(project)
+    try:
+        kid = store.feature_children(fo["id"])[0]
+        anchor = specs.spec_link(store, kid)["anchor"]
+    finally:
+        store.close()
+    assert anchor
+
+    fragment = f"/spec/proj_a/{fo['id']}#{anchor}"
+    assert fragment in client.get(f"/wo/proj_a/{kid['id']}").text
+    # And the plan's child row on the feature page links to the same fragment.
+    assert fragment in client.get(f"/fo/proj_a/{fo['id']}").text
+    assert f'id="{anchor}"' in client.get(f"/spec/proj_a/{fo['id']}").text
+
+
 # -- improvement orders --------------------------------------------------------------
 #
 # §6.1 of docs/superpowers/specs/2026-09-23-improvement-orders.md: the page opens on the
@@ -1893,6 +1999,105 @@ def test_the_project_page_lists_improvement_orders_without_expanding_findings(im
     assert "findings awaiting you" in page   # the kind-aware label, not `plan_review`
     # Counts, not trees: the findings are what the order's own page is for.
     assert "before touching the dispatch path" not in page
+
+
+# -- investigation orders ------------------------------------------------------------
+#
+# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the page leads with
+# the classification and the subject, then the root cause, the evidence and what was
+# filed. NO POST action — there is nothing to decide, and that absence is what "the order
+# settles itself" looks like on a screen.
+
+
+@pytest.fixture()
+def investigation(client, project):
+    """A settled investigation with a WAITING_ON_USER verdict on it."""
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order(
+        "proj_a", subject,
+        "wo-x has been `validating` for six hours with no turn in flight.")
+    store = ProjectStore(project)
+    try:
+        investigator = store.create_work_order(f"investigate {subject}",
+                                               kind="investigator",
+                                               parent_id=inv["id"], status="running")
+        store.update_feature_order(inv["id"], plan_wo_id=investigator["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+    return client, ops.show_investigation_order(inv["id"]), investigator, subject
+
+
+def test_the_investigation_page_leads_with_the_classification_and_the_subject(
+        investigation):
+    client, inv, investigator, subject = investigation
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+
+    assert "WAITING_ON_USER" in page
+    assert subject in page
+    assert "is written once and never" in page          # the root cause
+    assert "the panel gave up after 3 rounds" in page   # the evidence quote
+    assert html.escape(f"jarvis wo show {subject}") in page   # its source
+    assert "as-4" in page                               # what the user owes
+    assert f"/wo/proj_a/{investigator['id']}" in page
+    # Nothing to decide: the difference from the improvement-order page. The base
+    # layout's search box is a GET, so the assertion is about POSTs.
+    assert 'method="post"' not in page
+
+
+def test_the_investigation_page_says_what_was_filed(client, project):
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "it has not moved in 6h.")
+    store = ProjectStore(project)
+    try:
+        child = store.create_work_order("investigate it", kind="investigator",
+                                        parent_id=inv["id"])
+        store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    out = ops.submit_verdict(inv["id"], a_verdict("ALREADY_TRACKED", subject=subject))
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+    assert "ALREADY_TRACKED" in page
+    assert "#790" in page          # the duplicate it matched
+    assert out["filed"] is None
+
+
+def test_an_unknown_investigation_says_so_instead_of_failing(client):
+    page = client.get("/inv/proj_a/inv-nosuchid")
+    assert page.status_code == 200
+    assert "inv-nosuchid" in page.text
+
+
+def test_the_project_page_lists_live_investigations_beside_the_other_kinds(client,
+                                                                          project):
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "no turn in six hours.")
+
+    page = client.get("/project/proj_a").text
+
+    assert page.count(f"/inv/proj_a/{inv['id']}") == 1
+    assert "Investigations" in page
+    assert subject in page   # the subject is what the line is about
 
 
 def _settle_feature(project, title, status):
@@ -2803,3 +3008,20 @@ def test_the_feature_order_page_never_grows_a_work_order_review_form(client, pro
     assert "Validation" in page and "the plan cannot be judged" in page
     assert "/wo/proj_a/" not in page.split(">Validation<")[1]
     assert "over the panel's objection" not in html.unescape(" ".join(page.split()))
+
+
+def test_the_open_span_says_when_it_last_moved(client, daemon, project):
+    """Fix 4's span line: "still in it" is true but is not the live fact.
+
+    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+    """
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        store.add_event(wo["id"], "turn_ended")
+    finally:
+        store.close()
+
+    page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
+    assert "still in it · active" in html.unescape(page)
