@@ -249,6 +249,56 @@ def test_one_unreadable_block_leaves_the_other_three_standing(client, dispatched
     assert "RuntimeError" in page.text and "kaboom" in page.text
 
 
+# -- 3b. the two derivations this page renders, after the 2026-09-28 spec -------------
+
+
+def test_a_hold_the_round_ended_renders_closed_on_the_debug_page(client, project):
+    """The dashboard end of §2d1. wo-3615faf7 read "still held" 11.7h after the round
+    that ended the hold passed, because the synthesised transport hold was closed only by
+    a resubmission. Spec §2d1 of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md."""
+    from jarvis import db
+    from jarvis.holds import HOLD_CAUSES, PAUSE_USAGE_LIMIT
+    from jarvis.project_store import VALIDATION_HELD_CAUSE
+
+    wo = ops.create_work_order("proj_a", "held, then judged")
+    store = ProjectStore(project)
+    try:
+        held_at = db.now() - 7200
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": 1, "cause": VALIDATION_HELD_CAUSE}, ts=held_at)
+        store.add_event(wo["id"], "validation_passed", {"round": 1}, ts=held_at + 3600)
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}/debug")
+
+    assert page.status_code == 200
+    assert HOLD_CAUSES[PAUSE_USAGE_LIMIT] in page.text
+    assert "still held" not in page.text
+
+
+def test_the_work_order_page_says_the_spans_stop_short_of_the_status(client, project):
+    """The dashboard end of §2d2's belt: `_states.html` renders `states.notes`, so the
+    page says the record stops short instead of presenting a stale span as the present
+    tense. A reader that silently believed the gap is why nobody noticed for 20.7h."""
+    wo = ops.create_work_order("proj_a", "the gapped one")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "waiting_input")
+        store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
+                           (wo["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+
+    assert page.status_code == 200
+    # Jinja-escaped, as every OS sentence on this page is: the note has an apostrophe.
+    assert ops.SPANS_BEHIND_NOTE.replace("'", "&#39;") in page.text
+
+
 # -- 4. absent is never zero (issue #227) ---------------------------------------------
 
 def test_an_order_with_no_session_says_so_instead_of_reporting_zeroes(client):

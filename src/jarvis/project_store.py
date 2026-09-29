@@ -2468,6 +2468,13 @@ class ProjectStore:
         at = db.now()
         self._record_span(wo_id, "wo", was, status, trigger, ts=at)
         self.add_event(wo_id, "status", {"status": status}, ts=at)
+        # THE CHOKEPOINT, ENFORCED. Spec §2d2 of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        tail = self.conn.execute(
+            "SELECT to_status FROM wo_state_spans WHERE order_id=? AND order_kind='wo' "
+            "ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
+        assert tail is not None and tail["to_status"] == status, (
+            f"{wo_id} moved to {status!r} without a span beside it")
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there."""

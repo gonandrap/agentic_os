@@ -359,6 +359,58 @@ def test_an_armed_remedy_files_one_request_and_leaves_the_work_order_alone(
         store.close()
 
 
+# -- 3b. a finding raised by an INVARIANT travels the same intake -----------------------
+
+
+def test_an_invariant_finding_carries_an_undeclared_delivery_to_the_nudge(
+        started, catalog_file, project, fake_claude):
+    """Spec §2c of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    STARTS AT `invariants.check_project`, not at a hand-written alarm row: the promise is
+    that a worker which pushed past a refusal without finishing gets NUDGED, and the only
+    thing that can prove it is the whole path — the detector raises a `source='invariant'`
+    finding, the supervisor's real intake claims and judges it, and the judge's `nudge`
+    reaches `remedies.propose`. A test that filed the finding and called `propose` itself
+    grades `propose`, which §5 already grades.
+    """
+    from jarvis import invariants
+    from test_invariants import DELIVERED, PUSHED, _refused_then_pushed
+
+    _arm(catalog_file, "nudge")
+    daemon = started()
+    store = ProjectStore(project)
+    try:
+        wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED,
+                                  description="FORCE_SUPERVISOR_PROPOSE")
+        raised = [v for v in invariants.check_project(store)
+                  if v.invariant == "INV-UNDECLARED-DELIVERY"]
+        assert [v.wo_id for v in raised] == [wo["id"]]
+        (finding,) = [a for a in store.alarms_of(wo["id"])
+                      if a["kind"] == "undeclared_delivery"]
+        assert finding["source"] == "invariant"
+        assert finding["status"] == "raised"
+    finally:
+        store.close()
+
+    _drain(daemon)
+    assert len(_supervisor_calls(fake_claude)) == 1
+
+    alarm = _alarm(wo["id"])
+    assert alarm["status"] == "proposed"
+    assert alarm["remedy"] == "nudge"
+
+    (approval,) = _approvals(wo["id"])
+    assert approval["kind"] == "self_heal"
+    assert approval["status"] == "pending"
+    assert approval["command"].startswith(f"heal {alarm['id']}: nudge {wo['id']}")
+
+    questions = [q for q in _neo_questions()
+                 if q["kind"] == "approval" and q["wo_id"] == wo["id"]]
+    assert len(questions) == 1
+    assert questions[0]["id"] == approval["neo_question_id"]
+
+
 # -- 4. the acting calls stay inside the handlers ---------------------------------------
 
 

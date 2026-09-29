@@ -1140,9 +1140,14 @@ PUSHED = "9999999999999999999999999999999999999999"
 DELIVERED = "1111111111111111111111111111111111111111"
 
 
-def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str) -> dict:
-    """wo-dbea82cf: delivered, judged, the user refused an assumption, then commits."""
-    wo = store.create_work_order("the refused one")
+def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
+                         description: str = "") -> dict:
+    """wo-dbea82cf: delivered, judged, the user refused an assumption, then commits.
+
+    `description` is for the callers that drive the supervisor: the brief is in the
+    evidence packet, which is how the fake `claude` is asked for a verdict.
+    """
+    wo = store.create_work_order("the refused one", description=description)
     store.add_event(wo["id"], "finished", {"summary": "opened a PR"})
     round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
     store.set_validation_head(round_["id"], judged)
@@ -1203,3 +1208,22 @@ def test_the_detector_raises_a_finding_once_and_never_an_alarm(project):
               if a["kind"] == "undeclared_delivery"]
     assert len(raised) == 1
     assert raised[0]["source"] == "invariant"
+
+
+def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project):
+    """`jarvis doctor` with no `--repair` must not write, and must still SAY it.
+
+    `check_neo_escalations_are_live` is the shape: the repair that cannot be intercepted
+    by the read-only proxy is skipped by the checker itself, and the violation is
+    reported as proposed. Returning early instead loses the report as well as the write,
+    which is a doctor that cannot see the thing it exists to see."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    reported = [v for v in check_project(store, repair=False)
+                if v.invariant == "INV-UNDECLARED-DELIVERY"]
+
+    assert [v.wo_id for v in reported] == [wo["id"]]
+    assert not reported[0].repaired
+    assert reported[0].repair.startswith("would raise")
+    assert store.alarms_of(wo["id"]) == []

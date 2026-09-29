@@ -1149,20 +1149,67 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
     fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
     exists to prevent one queue along.
     """
-    if getattr(store, "readonly", False):
-        return
+    # `add_finding` is not one of the proxy's blocked mutators, so the checker skips the
+    # write itself and still REPORTS — `check_neo_escalations_are_live`'s shape.
+    readonly = getattr(store, "readonly", False)
     for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
         if not undeclared_delivery(store, wo):
             continue
         if any(a["kind"] == UNDECLARED_DELIVERY_KIND for a in store.alarms_of(wo["id"])):
             continue
-        store.add_finding(wo["id"], kind=UNDECLARED_DELIVERY_KIND,
-                          reason=UNDECLARED_DELIVERY_REASON, source="invariant")
+        if not readonly:
+            store.add_finding(wo["id"], kind=UNDECLARED_DELIVERY_KIND,
+                              reason=UNDECLARED_DELIVERY_REASON, source="invariant")
         yield Violation(
             invariant="INV-UNDECLARED-DELIVERY",
             wo_id=wo["id"],
             detail=UNDECLARED_DELIVERY_REASON,
-            repaired=True,
+            repaired=not readonly,
+            repair=("would raise " if readonly else "raised ")
+                   + "a finding for the supervisor to judge",
+        )
+
+
+def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found.
+
+    Spec §2d2 of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md. The
+    fix is at the writer and `_backfill_wo_spans` now fills gaps, but neither can heal
+    this shape: a status written round `set_status` leaves no `status` event to replay,
+    so the disagreement between the span tail and `work_orders.status` is the only
+    evidence there is. The repair is one `approximate` span at the order's `updated_at`,
+    which is the only time the record holds for a write that recorded none.
+
+    Repairs on the daemon tick rather than behind `--repair`, for
+    `check_neo_escalations_are_live`' reason: appending a span creates nothing,
+    authorises nothing and moves no order.
+    """
+    readonly = getattr(store, "readonly", False)
+    # Hidden too: hiding takes an order out of the listings, not out of the record
+    # `jarvis inspect` and the dashboard bill against.
+    for wo in store.list_work_orders(include_hidden=True):
+        spans = store.state_spans(wo["id"])
+        tail = str(spans[-1]["to_status"]) if spans else ""
+        status = str(wo["status"] or "")
+        # No spans at all is `_backfill_wo_spans`' case, not this one.
+        if not spans or tail == status:
+            continue
+        if not readonly:
+            # Never BEFORE the span it follows: `state_spans` orders by ts, so a repair
+            # stamped earlier than the tail would reorder the history it is mending.
+            at = max(float(wo["updated_at"] or db.now()), float(spans[-1]["ts"]))
+            store._record_span(wo["id"], "wo", tail, status, trigger="repair",
+                               ts=at, approximate=True)
+        yield Violation(
+            invariant="INV-SPAN-BEHIND",
+            wo_id=wo["id"],
+            detail=(f"the recorded spans stop at {tail!r} while this order's status "
+                    f"column says {status!r}"),
+            repaired=not readonly,
+            repair=("would append " if readonly else "appended ")
+                   + "an approximate span at the order's last update",
+            context={"tail": tail, "status": status},
         )
 
 
@@ -4197,6 +4244,8 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # an alarm `true_blockers` cannot re-derive
     check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
                                    # and no status, so nothing else here reads its output
+    check_spans_reach_the_status,  # order-free: it appends a span and changes no status,
+                                   # and nothing else here reads `wo_state_spans`
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place

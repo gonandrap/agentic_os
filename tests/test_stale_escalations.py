@@ -468,6 +468,22 @@ def test_a_review_of_a_delivery_older_than_the_question_leaves_it_open(worker_qu
     assert question(neo, q["id"])["status"] == "escalated"
 
 
+def test_a_review_with_no_delivery_between_leaves_the_question_open(worker_question,
+                                                                    store, neo):
+    """The other boundary of the same predicate: a verdict with NO `finished` between it
+    and the question is a review of work the question was asked about, not of a delivery
+    answering it. Both halves are required, and this is the half where the timeline
+    carries a `reviewed` and nothing else."""
+    wo, q = worker_question
+    event_at(store, wo["id"], "reviewed", q["ts"] + 20, {"accepted": True})
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, q["id"])["status"] == "escalated"
+
+
 def test_another_projects_worker_question_is_left_alone(store, neo):
     """The rule all the siblings share: the checks run per project against an OS-wide
     `neo.db`, so a work order this project does not know is not this project's to close."""

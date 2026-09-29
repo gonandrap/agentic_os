@@ -611,3 +611,73 @@ def test_an_agreeing_open_span_is_still_the_current_status(store):
     assert reading.current_status == "running"
     assert reading.current_status_since == T0 + HOUR
     assert ops.SPANS_BEHIND_NOTE not in reading.notes
+
+
+def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
+    """The fix at the writer cannot heal a row a bypass already broke, and the backfill
+    structurally cannot either: a status written round `set_status` leaves no `status`
+    event to replay. So the disagreement itself is the repair trigger — an `approximate`
+    span at the order's `updated_at`, the only time the record holds for it."""
+    from jarvis import invariants
+    from jarvis.invariants import check_project
+
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "waiting_input")
+    backdate(store, wo["id"], T0, T0 + MINUTE)
+    store.conn.execute(
+        "UPDATE work_orders SET status='needs_review', updated_at=? WHERE id=?",
+        (T0 + HOUR, wo["id"]))
+    store.conn.commit()
+
+    # Called directly for the stamp — a reconcile runs every other check too, and one of
+    # them touching `updated_at` would make the assertion below about that check instead.
+    found = list(invariants.check_spans_reach_the_status(store))
+    assert invariants.check_spans_reach_the_status in invariants.INVARIANTS
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    tail = store.state_spans(wo["id"])[-1]
+    assert tail["to_status"] == "needs_review"
+    assert tail["from_status"] == "waiting_input"
+    assert tail["approximate"] == 1
+    assert tail["ts"] == T0 + HOUR
+    reading = ops.state_durations(store, wo_id=wo["id"], now=NOW)
+    assert reading.current_status == "needs_review"
+    assert ops.SPANS_BEHIND_NOTE not in reading.notes
+    # Repaired once: the tail agrees now, so the next tick has nothing to say.
+    assert [v for v in check_project(store) if v.invariant == "INV-SPAN-BEHIND"] == []
+
+
+def test_a_doctor_run_without_repair_proposes_the_span_and_writes_none(store):
+    """`jarvis doctor` with no `--repair` writes nothing at all — and still says it."""
+    from jarvis.invariants import check_project
+
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "waiting_input")
+    store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
+                       (wo["id"],))
+    store.conn.commit()
+
+    found = [v for v in check_project(store, repair=False)
+             if v.invariant == "INV-SPAN-BEHIND"]
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert not found[0].repaired
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == ["pending",
+                                                                    "waiting_input"]
+
+
+def test_set_status_refuses_to_leave_a_transition_half_written(store, monkeypatch):
+    """`_record_span` is the enforced chokepoint, not merely the current habit: an edit
+    that writes the column and skips the span fails at the writer rather than three
+    surfaces downstream. Both directions — the ordinary transition writes both rows, and
+    a `_record_span` that records nothing is caught."""
+    wo = store.create_work_order("t")
+
+    store.set_status(wo["id"], "running")
+
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == ["pending", "running"]
+    assert len(store.events_of_kind(wo["id"], "status")) == 1
+
+    monkeypatch.setattr(ProjectStore, "_record_span", lambda *a, **k: None)
+    with pytest.raises(AssertionError):
+        store.set_status(wo["id"], "needs_review")
