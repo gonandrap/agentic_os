@@ -5398,13 +5398,19 @@ class Daemon:
                     # names the old sha, so the catch-up orphans nothing that could still
                     # have landed (§3.1). AFTER the outcome, so a base that turned out not
                     # to have moved withdraws nothing.
+                    #
+                    # A FETCHED BASE FACT OR NONE AT ALL, and a deferral is retried rather
+                    # than withdrawn (spec 2026-09-28 §3.6 / Amendment E).
+                    moved = bool(caught.base_tip) and ops.catch_up_needed(
+                        pr, repo=project.path, base_tip=caught.base_tip)
                     judged = store.validated_head(round_row) or ""
                     filed = (store.latest_approval_for(
                         wo_id, automerge.GATE_KIND,
                         automerge.merge_command(str(wo.get("pr_url") or ""), judged))
                         if judged else None)
-                    if filed is not None and filed["status"] in ("pending",
-                                                                 "awaiting_case"):
+                    if (moved and caught.outcome != ops.CATCH_UP_DEFERRED
+                            and filed is not None
+                            and filed["status"] in ("pending", "awaiting_case")):
                         self._supersede_stale_request(store, filed, pr,
                                                       base_tip=caught.base_tip)
                     # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.

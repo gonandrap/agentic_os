@@ -316,6 +316,54 @@ def test_the_hold_on_a_refused_catch_up_names_the_fetched_tip_not_githubs(
     assert BASE_2[:10] not in held[-1]["reason"]
 
 
+# -- §3.6 / Amendment E: only a FETCHED base fact withdraws a request ------------------
+
+
+def test_a_deferred_catch_up_leaves_the_pending_request_standing(started, project,
+                                                                 fake_gh, local):
+    """A deferral is retried, not withdrawn (§3.6 / Amendment E). The guard clears by
+    itself and the next tick re-reads; withdrawing here buys a fresh Neo review for a base
+    move nobody has confirmed."""
+    opt_in(started)
+    store, wo = parked(project)
+    green_pr(fake_gh)
+    poll(started, store)
+    [approval] = store.list_approvals(wo["id"])
+    assert approval["status"] == "pending"
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=BASE_2)
+    local["tip"] = BASE_3
+    store.queue_message(wo["id"], "rebase this yourself")   # guard 2: pre-fetch deferral
+    poll(started, store)
+
+    row = store.get_approval(approval["id"])
+    assert row["status"] == "pending" and row["closed_as"] == ""
+    assert [db.from_json(e["payload"], {})["code"]
+            for e in store.events_of_kind(wo["id"], "automerge_held")] == ["base_moved"]
+
+
+def test_a_catch_up_that_never_fetched_leaves_the_pending_request_standing(
+        started, project, fake_gh, local):
+    """A pre-fetch FAILED carries no base fact at all — `base_tip` is empty (§3.6 /
+    Amendment E). Superseding on it withdraws a healthy request on the strength of
+    `pr.base_oid`, the read §3.1 exists because it cannot be trusted."""
+    opt_in(started)
+    store, wo = parked(project)
+    green_pr(fake_gh)
+    poll(started, store)
+    [approval] = store.list_approvals(wo["id"])
+    assert approval["status"] == "pending"
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=BASE_2)
+    local["fetch"] = False                     # the checkout could not fetch `main`
+    poll(started, store)
+
+    row = store.get_approval(approval["id"])
+    assert row["status"] == "pending" and row["closed_as"] == ""
+
+
 def test_held_base_moved_without_a_fetched_tip_names_no_commit_at_all():
     """No fetched read means no commit in the sentence — not `pr.base_oid`, and not a
     placeholder either."""

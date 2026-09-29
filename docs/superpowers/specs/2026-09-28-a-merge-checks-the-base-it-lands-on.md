@@ -584,3 +584,20 @@ is false, and the base moved regardless of age. The argument now rests on a test
 `tests/test_automerge.py::test_an_approved_grant_past_its_ttl_merges_nothing` backdates the
 grant's `expires_at` and asserts `AutoMergeRefused("no longer a live grant")` with nothing
 reaching `fake_gh`.
+
+**E — §3.6's supersede is narrowed to three conditions, all required.** A pending
+`auto_merge` request is withdrawn ONLY when: (1) the catch-up actually FETCHED, i.e.
+`ops.CatchUp.base_tip` is non-empty; (2) that fetched tip really shows the base moved
+(`ops.catch_up_needed(pr, repo=..., base_tip=tip)`); (3) the outcome is not
+`CATCH_UP_DEFERRED`. A PRE-fetch refusal — no base branch or pull request recorded,
+`branchproof.fetch` failed, a turn, message or round in flight — carries no base fact at
+all, so superseding on it withdraws a healthy request on the strength of `pr.base_oid`,
+the cached read this spec exists because it cannot be trusted. A deferral is transient: the
+guard clears by itself and the next tick re-reads, so withdrawing there costs a fresh
+five-seat request and a fresh Neo review for a move that may never need one. That covers
+the POST-fetch deferral too — the push that moved the head off the judged commit — which
+does carry a tip.
+
+**E, cont. — what did NOT change.** The HOLD still fires for every non-`CATCH_UP_NOT_NEEDED`
+outcome, so a refusal stays visible on the timeline; and superseding stays a no-op on
+anything already decided.
