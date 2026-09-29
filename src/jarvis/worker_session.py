@@ -419,6 +419,22 @@ def turn_context(turn: dict[str, Any] | None) -> int:
     return int(envelope.get("context_peak") or 0) if isinstance(envelope, dict) else 0
 
 
+def measured_context(store: ProjectStore, wo_id: str) -> int:
+    """The conversation's size as last MEASURED: the newest turn that recorded one.
+
+    Not the latest turn's own figure. A turn that ended without a result — killed, reaped
+    as dead, refused before it reached the model — records none, and reading its 0 as
+    "small" re-sent a 126k conversation cold (issue #856, a turn killed in a fleet stop).
+    A turn records only its own peak, so the newest measured one is the best lower bound
+    on what the next prompt will carry.
+    """
+    for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
+        context = turn_context(turn)
+        if context:
+            return context
+    return 0
+
+
 def compaction_due(store: ProjectStore, wo: dict[str, Any],
                    min_context: int | None,
                    now: float | None = None) -> Compaction | None:
@@ -463,7 +479,7 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     age = (time.time() if now is None else now) - ended
     if age < usage.WRITE_TTL_SECONDS:
         return None
-    context = turn_context(turn)
+    context = measured_context(store, wo["id"])
     if context < min_context:
         return None
     # Last, because it is the only one that costs a second query — and `turn_pause`
@@ -521,11 +537,7 @@ def resume_compaction_due(store: ProjectStore, project: ProjectSpec, wo: dict[st
     age = (time.time() if now is None else now) - ended
     if age < usage.WRITE_TTL_SECONDS:
         return None
-    context = 0
-    for turn in store.recent_turns(wo["id"], limit=MAX_RATE_LIMIT_RETRIES + 4):
-        context = turn_context(turn)
-        if context:
-            break
+    context = measured_context(store, wo["id"])
     if context < min_context:
         return None
     return Compaction(age=age, context=context)

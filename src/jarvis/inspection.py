@@ -105,10 +105,17 @@ TTL_5M = 300.0
 TTL_1H = 3600.0
 
 #: Tools whose span is the lead agent WAITING rather than working: it has dispatched
-#: something and is blocked on the result with no API call in flight. Only `TaskOutput`
-#: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
-#: wait it defers is exactly what `TaskOutput` later collects.
+#: something and is blocked on the result with no API call in flight. ALWAYS a wait,
+#: backgrounded or not — `TaskOutput` exists to collect a result.
 JOIN_TOOLS = ("TaskOutput",)
+
+#: Tools whose span is the lead DELEGATING and then waiting for the result. A foreground
+#: call blocks the lead until the subagent returns; only `run_in_background: true` makes
+#: `Agent` return immediately, and that is what `TaskOutput` later collects. Counting a
+#: foreground delegation as a tool the lead RAN is what made `jarvis inspect` report
+#: "blocked on a subagent 0%" for every delegation the fleet has ever made (issue #845,
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1).
+DELEGATION_TOOLS = ("Agent", "Task")
 
 #: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
 #: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
@@ -480,6 +487,10 @@ class ToolSpan:
     #: facts about the same key and a reader acts on them differently.
     params_truncated: list[str] = field(default_factory=list)
     params_dropped: list[str] = field(default_factory=list)
+    #: `run_in_background: true` on the call that opened this span. Read from the RAW
+    #: `tool_use` input, never from `params`: those are redacted strings capped by
+    #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
+    backgrounded: bool = False
 
     @property
     def finished(self) -> bool:
@@ -491,7 +502,9 @@ class ToolSpan:
 
     @property
     def is_join(self) -> bool:
-        return self.name in JOIN_TOOLS
+        if self.name in JOIN_TOOLS:
+            return True
+        return self.name in DELEGATION_TOOLS and not self.backgrounded
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "tool_id": self.tool_id, "started": self.started,
@@ -985,7 +998,11 @@ def _detail_of(payload: Any, limit: int) -> str:
     """
     if not isinstance(payload, dict):
         return ""
-    for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
+    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name, and the
+    # only field that says WHAT hung when that call runs away (issue #845, spec §2c —
+    # which assumed `pattern` covered it; the tool does not use that name).
+    for key in ("description", "command", "task_id", "file_path", "pattern",
+                "substring_pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return _first_line(redact_param(value), limit)
@@ -1110,7 +1127,11 @@ def read_transcript(path: Path | str,
                             detail=_detail_of(block.get("input"),
                                               cfg.quote_chars),
                             params=params, params_truncated=truncated,
-                            params_dropped=dropped)
+                            params_dropped=dropped,
+                            # The RAW block, the same read `background._scan_calls` does
+                            # and for the same reason (spec §1).
+                            backgrounded=bool((block.get("input") or {}).get(
+                                "run_in_background")))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -1348,6 +1369,31 @@ def _read_subagent(path: Path, cfg: InspectConfig,
         deeper=len(_subagent_transcripts(path)))
 
 
+def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
+                       *, since: float = 0.0) -> tuple[SubagentAnatomy, ToolSpan] | None:
+    """The first (subagent, span) whose LAST span is an unfinished tool call older than
+    `older_than` seconds. `None` when every subagent is working normally.
+
+    THIS NAMES THE SUBAGENT IT FOUND AND CLAIMS NO PARENTAGE. It scans the session's
+    anatomies and does not assert that the one it returns is the child of any particular
+    delegation span — an `Agent` span carries a `description` and no task id, so the
+    record does not say. `since` keeps a previous turn's leftovers out by requiring the
+    hung span to have started at or after that moment; it is a time WINDOW and not an
+    attribution, which is why `_attach_subagents` still refuses a timestamp fallback
+    (the issue-227 rule: a REPORT names a parent only where the record does — spec §2b).
+
+    "Last span" is the thing the subagent is doing right now. An unfinished span EARLIER
+    in its transcript is a killed call it already moved past, not a hang.
+    """
+    for sub in subs:
+        span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
+        if span is None or span.finished or span.started < since:
+            continue
+        if now - span.started >= older_than:
+            return sub, span
+    return None
+
+
 def _names(span: ToolSpan, task_id: str) -> bool:
     """Whether this span names that subagent — `detail` or any reported parameter.
 
@@ -1448,7 +1494,8 @@ ALARM_KINDS = {
                  "billed (historical: nothing raises this now, spec of 2026-09-27)",
     SLOW_RESPONSE_ALARM: "a request has been in flight this long with no completed "
                          "content block — the model is answering slowly",
-    JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
+    JOIN_ALARM: "a wait that is costing more than it buys — a `TaskOutput` open past "
+                "the cache TTL, or a delegation whose subagent has a tool call hung",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
     # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
     # reader of the legend cannot take them for another reading of `big-rewrite`.
@@ -1613,8 +1660,26 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"{held_note(wall, holding)} with nothing completed yet; the model is "
                 f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if span.is_join and not span.finished and now and \
-                now - span.started >= cfg.alarm_join_seconds:
+        if not span.is_join or span.finished or not now:
+            continue
+        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b):
+        # at `alarm_join_seconds` the literal reading fires on 43 of the fleet's 272
+        # foreground delegations, nearly all of them real subagent work, and an alarm
+        # that fires on normal work is trained away — the standing argument above.
+        if span.name in DELEGATION_TOOLS:
+            found = hung_subagent_call(
+                [*turn.subagents, *anatomy.unattached_subagents], now,
+                cfg.alarm_subagent_tool_minutes * 60, since=span.started)
+            if found is None:
+                continue
+            sub, hung = found
+            called = f"{hung.name} ({hung.detail})" if hung.detail else hung.name
+            raised.append(Alarm(JOIN_ALARM, (
+                f"subagent {sub.label or sub.task_id} blocked "
+                f"{_hours(now - hung.started)} in {called} — long enough to lose the "
+                f"prompt cache, so the wait will be paid for twice{hint}")))
+            break
+        if now - span.started >= cfg.alarm_join_seconds:
             waited = int((now - span.started) // 60)
             raised.append(Alarm(JOIN_ALARM, (
                 f"blocked {waited}m waiting on {span.detail or span.tool_id} with no "
