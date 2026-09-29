@@ -188,6 +188,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # settings file must not be able to disagree. §3 of docs/superpowers/specs/
         # 2026-09-23-the-crew-a-worker-must-use.md.
         claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        # WHAT ONE MCP TOOL CALL MAY TAKE, read by Claude Code itself (issue #845:
+        # nothing bounded the 18m50s Serena call that never returned). Set HERE and not
+        # in `settings.base.json`, because this `env.update` beats both the asset and the
+        # project's `settings_overrides` — a project that needs longer raises the catalog
+        # setting, and a value the asset carried could not be overridden from there. A
+        # STRING like every value in this dict: Claude Code's `env` is a
+        # `Record<string,string>` and an integer risks the CLI rejecting the whole file.
+        "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
         # Whether the lead must delegate its file edits to the crew (§7 of that spec).
         # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
         # write and must not parse the catalog to decide it has nothing to do.

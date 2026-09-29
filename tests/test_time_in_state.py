@@ -11,6 +11,7 @@ Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md.
 from __future__ import annotations
 
 import json as _json
+import os
 
 import pytest
 
@@ -333,3 +334,142 @@ def test_fo_show_carries_the_key_and_labels_a_coarse_span(
     out = _out(capsys, ["fo", "show", fo["id"]])
     assert "time in state" in out
     assert "a feature order keeps no event trail" in out
+
+
+# 10 ------------------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, fix 4 — the
+# sixth activity source. A lead whose own transcript is quiet while its subagent's grows
+# is the incident; `stat()` mtime, and an absent transcript contributes NOTHING.
+
+SECOND = 1.0
+
+
+def _transcript(config_dir, cwd, session_id: str, *, subagent: str = "",
+                mtime: float = 0.0):
+    munged = "".join(c if c.isalnum() else "-" for c in str(cwd))
+    base = config_dir / "projects" / munged
+    path = base / f"{session_id}.jsonl" if not subagent else (
+        base / session_id / "subagents" / subagent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"type": "assistant"}\n')
+    import os as _os
+    _os.utime(path, (mtime, mtime))
+    return path
+
+
+def _quiet_wo(store, *, session_id: str = "sess-1"):
+    """An order whose every table went quiet 45 minutes ago."""
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "running")
+    backdate(store, wo["id"], NOW - 20 * HOUR, NOW - 14 * HOUR)
+    turn_at(store, wo["id"], NOW - 14 * HOUR, NOW - 45 * MINUTE)
+    event_at(store, wo["id"], "turn_ended", NOW - 45 * MINUTE)
+    store.update_work_order(wo["id"], session_id=session_id)
+    return wo
+
+
+def test_a_live_subagent_transcript_counts_as_activity(store, tmp_path, monkeypatch):
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = _quiet_wo(store)
+    _transcript(config, store.project_path, "sess-1", mtime=NOW - 14 * HOUR)
+    _transcript(config, store.project_path, "sess-1", subagent="a.jsonl",
+                mtime=NOW - 30 * SECOND)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 30 * SECOND
+    assert payload["last_activity_kind"] == "transcript"
+
+
+def test_a_transcript_in_the_worktree_counts(store, tmp_path, monkeypatch):
+    """The cwd is the worktree when the order has one — `worktree_path`'s computation."""
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = _quiet_wo(store, session_id="sess-2")
+    store.update_work_order(wo["id"], worktree="wo-42639749")
+    worktree = store.project_path / ".claude" / "worktrees" / "wo-42639749"
+    _transcript(config, worktree, "sess-2", mtime=NOW - 2 * MINUTE)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 2 * MINUTE
+    assert payload["last_activity_kind"] == "transcript"
+
+
+def test_a_missing_transcript_contributes_nothing(store, tmp_path, monkeypatch):
+    """Absent, not 1970: no tuple at all, so the note stands and the timestamp is None."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-missing")
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert payload["last_activity_kind"] == ""
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+def test_an_unreadable_subagent_directory_is_absent_not_zero(
+        store, tmp_path, monkeypatch):
+    """The glob yields nothing: no tuple, so the note stands. Not the raising path."""
+    import os as _os
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-3")
+    path = _transcript(config, store.project_path, "sess-3", subagent="a.jsonl",
+                       mtime=NOW - 30 * SECOND)
+    _os.chmod(path.parent, 0o000)
+    try:
+        payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    finally:
+        _os.chmod(path.parent, 0o755)
+
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root reads through a 0o000 directory, so nothing raises")
+def test_an_unreadable_transcript_parent_is_absent_not_zero(
+        store, tmp_path, monkeypatch):
+    """The RAISING path: `stat()` on a file under a 0o000 parent is a PermissionError.
+
+    Swallowed, contributing no tuple — `Path.exists()` would have turned it into a
+    silent False, which is why the read stats directly.
+    """
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-4")
+    path = _transcript(config, store.project_path, "sess-4", mtime=NOW - 30 * SECOND)
+    os.chmod(path.parent, 0o000)
+    try:
+        with pytest.raises(PermissionError):    # the read is genuinely denied here
+            path.stat()
+        payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    finally:
+        os.chmod(path.parent, 0o755)
+
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+def test_a_feature_inherits_a_childs_transcript(store, tmp_path, monkeypatch):
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    fo = store.create_feature_order("f")
+    child = store.create_work_order("c", parent_id=fo["id"])
+    store.set_feature_status(fo["id"], "executing")
+    store.update_work_order(child["id"], session_id="sess-child")
+    _transcript(config, store.project_path, "sess-child", subagent="a.jsonl",
+                mtime=NOW - 3 * MINUTE)
+
+    payload = ops.state_durations(store, fo_id=fo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 3 * MINUTE
+    assert payload["last_activity_kind"] == "transcript"

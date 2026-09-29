@@ -872,22 +872,41 @@ def test_a_manager_parked_on_an_escalated_question_is_not_migrated(boot, store,
     assert blockers and str(q["id"]) in blockers[0]
 
 
-def test_a_manager_parked_on_a_held_gate_is_not_migrated(boot, store, settle_turns):
-    """The case the branch order genuinely did NOT cover, and the reason the guard is a
-    predicate rather than a fall-through.
+def test_a_manager_holding_an_unargued_gate_is_idle_not_waiting_on_you(boot, store,
+                                                                       settle_turns):
+    """Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, and
+    the one deliberate behaviour change beyond the status itself.
 
-    `gates.file_request` parks a work order in `waiting_input` down both its roads, but
-    the `elif` above the manager branch reads `pending_approvals`, which excludes
-    `awaiting_case` — a request the worker filed by running the command before arguing
-    it. Under the old code missing it cost nothing, because this branch's write was
-    `waiting_input` either way. `invariants.something_is_out` is the whole predicate.
+    A held request is the WORKER's move: nothing is owed by the user, and the manager's
+    feature is what wakes it. So the guard that holds a manager where it is reads
+    `user_facing_wait` — is somebody ELSE holding this — rather than `something_is_out`,
+    and a manager holding only an unargued gate falls through to `idle`, which is the
+    truthful label. The request itself is untouched and the command stays blocked.
     """
     daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
     store.set_status(manager["id"], "waiting_input")
-    store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42",
-                       status="awaiting_case")
+    approval = store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42",
+                                  status="awaiting_case")
     assert not store.pending_approvals(manager["id"]), "the premise: HELD, not pending"
     assert invariants.something_is_out(store, manager["id"])
+    assert not invariants.user_facing_wait(store, manager["id"])
+
+    daemon.settle_turns(spec, store)
+
+    fresh = store.get_work_order(manager["id"])
+    assert fresh["status"] == "idle"
+    assert invariants.true_blockers(store, fresh) == []
+    assert store.get_approval(approval["id"])["status"] == "awaiting_case"
+
+
+def test_a_manager_parked_on_a_gate_under_review_is_not_migrated(boot, store,
+                                                                 settle_turns):
+    """The other road, unchanged: a REVIEWER is holding a pending request, so the
+    manager really is waiting on somebody else and `waiting_input` is the truth."""
+    daemon, spec, manager = _manager_with_a_finished_turn(boot, store, settle_turns)
+    store.set_status(manager["id"], "waiting_input")
+    store.add_approval(manager["id"], "pr_merge", "gh " + "pr merge 42")
+    assert invariants.user_facing_wait(store, manager["id"])
 
     daemon.settle_turns(spec, store)
 

@@ -738,6 +738,185 @@ def _sed_writes(args: list[str]) -> bool:
     return not all(_sed_script_is_plain(s) for s in scripts)
 
 
+# The programs a heredoc body is HANDED TO as a program or a stream to edit — the set
+# fix 1 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md names. A
+# subset of `gate_rules._EXECUTORS` plus `cat` and `sed`: the routes a file edit actually
+# takes. `git commit -F - <<EOF` is not here, and that is the whole `data` versus
+# `program` distinction `gate_rules.program_spans` already draws.
+HEREDOC_INTERPRETERS = frozenset({
+    "python", "python3", "perl", "ruby", "node", "sed", "gsed", "awk", "gawk", "cat",
+})
+
+# `> path`, `>> path`. A descriptor on either side is not a file: `2>` is preceded by a
+# digit, `>&2` and `>&1` name a descriptor, and `/dev/null` keeps nothing.
+_HEREDOC_REDIRECT = re.compile(r"(?<![0-9<>&])>{1,2}\s*(?P<path>[^\s|;&<>()]+)")
+_HEREDOC_TEE = re.compile(r"\btee\b(?P<opts>(?:\s+-{1,2}[A-Za-z-]+)*)\s+(?P<path>[^\s|;&<>()]+)")
+
+# A Python write target INSIDE the body: the three spellings the spec names.
+_PY_OPEN_WRITE = re.compile(
+    r"""open\s*\(\s*(?P<target>[^,()]*?)\s*,\s*(?P<q>['"])(?P<mode>[rwxab+]{1,3})(?P=q)""")
+_PY_WRITE_TEXT = re.compile(r"""\.\s*write_text\s*\(|\.\s*open\s*\(\s*['"][wa]""")
+_PY_LITERAL = re.compile(r"""(?P<q>['"])(?P<value>[^'"\n]+)(?P=q)""")
+
+_HEREDOC_DENY = (
+    "Refused: this command writes a file through a heredoc. Use `Edit` or `Write`, which "
+    "are auto-allowed inside your worktree and cost you nothing. A heredoc that writes a "
+    "file hands your file's CONTENT to the command classifier — the file's own text is "
+    "then read as a command, and a test that merely MENTIONS `gh pr merge` files a gate "
+    "request nobody can argue.\n\nNothing was recorded against you and no approval "
+    "request was filed. Write the file with `Edit`/`Write` and carry on."
+)
+
+
+def _heredoc_owner_programs(command: str) -> tuple[list[str], list[tuple[int, int]]]:
+    """The program names in `command`, and the heredoc bodies it contains.
+
+    One parse, `gate_rules`', rather than a second spelling of "what is a heredoc" —
+    that module's `heredoc_spans` is the owner test the whole distinction rests on.
+    """
+    from . import gate_rules
+
+    bodies = [(s, e) for s, e, _, _ in gate_rules.heredoc_spans(command)]
+    if not bodies:
+        return [], []
+    names = [name.split()[0] for _, _, name in gate_rules.segments(command) if name]
+    return [Path(n).name for n in names], bodies
+
+
+def _inside(path_text: str, cwd: Path) -> bool:
+    """Whether `path_text` names a file inside the worker's own worktree.
+
+    A path OUTSIDE it is left to the rules that already own it — the same boundary
+    `investigator_write_decision` draws below.
+    """
+    if not path_text or path_text.startswith(("&", "-", "$")):
+        return False
+    try:
+        target = Path(path_text.strip("\"'"))
+        if not target.is_absolute():
+            target = cwd / target
+        target.resolve().relative_to(cwd.resolve())
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _heredoc_shell_writes(command: str, bodies: list[tuple[int, int]],
+                          cwd: Path) -> bool:
+    """A redirect or a `tee` to a path inside the worktree, bodies blanked.
+
+    Blanked because a `>` in the BODY is the interpreter's text, not the shell's.
+    """
+    chars = list(command)
+    for start, end in bodies:
+        for i in range(max(0, start), min(len(chars), end)):
+            chars[i] = " "
+    outside_bodies = "".join(chars)
+    for match in _HEREDOC_REDIRECT.finditer(outside_bodies):
+        path = match.group("path")
+        if path in ("/dev/null", "/dev/stdout", "/dev/stderr"):
+            continue
+        if _inside(path, cwd):
+            return True
+    for match in _HEREDOC_TEE.finditer(outside_bodies):
+        if _inside(match.group("path"), cwd):
+            return True
+    return False
+
+
+def _heredoc_sed_writes(command: str, cwd: Path) -> bool:
+    """`sed -i` on a file inside the worktree — `_sed_writes`' parse, not a second one."""
+    from . import gate_rules
+
+    for start, end, name in gate_rules.segments(command):
+        if not name or Path(name.split()[0]).name not in ("sed", "gsed"):
+            continue
+        try:
+            words = shlex.split(command[start:end].strip())
+        except ValueError:
+            words = command[start:end].split()
+        if not words:
+            continue
+        if not _sed_writes(words[1:]):
+            continue
+        if any(_inside(w, cwd) for w in words[1:] if not w.startswith("-")):
+            return True
+    return False
+
+
+def _heredoc_python_writes(command: str, bodies: list[tuple[int, int]],
+                           cwd: Path) -> bool:
+    """A write target named by a string literal in a heredoc body."""
+    for start, end in bodies:
+        body = command[start:end]
+        for match in _PY_OPEN_WRITE.finditer(body):
+            if not set(match.group("mode")) & {"w", "a", "x"}:
+                continue
+            if _inside(match.group("target"), cwd):
+                return True
+        for match in _PY_WRITE_TEXT.finditer(body):
+            line_start = body.rfind("\n", 0, match.start()) + 1
+            literals = list(_PY_LITERAL.finditer(body[line_start:match.start()]))
+            if literals and _inside(literals[-1].group("value"), cwd):
+                return True
+    return False
+
+
+def heredoc_write_decision(payload: dict[str, Any],
+                           env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a FILE EDIT written through a heredoc. It belongs in `Edit`/`Write`.
+
+    Fix 1 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md. The
+    classifier is right about what `python3 - <<PY` is — a program, not data — so the
+    fix is not to relax it (`gate_rules` is untouched, and kn-986fc008/kn-f5e46f07 rule
+    that relaxation out). The fix is that a file's CONTENT must never reach a command
+    classifier at all: `Edit`/`Write` are auto-allowed in the worktree below and cost
+    nothing, while the heredoc route is the only one that can trip a gate.
+
+    DENIES ONLY ON POSITIVE EVIDENCE OF A FILE WRITE inside the worker's own worktree —
+    a redirect or `tee` to a path, `sed -i`, or a Python write target in the body. Never
+    on "the gate matched" and never on "this is a heredoc": a body that computes and
+    prints goes through untouched, `git commit -F - <<EOF` is not an interpreter, and a
+    path outside the worktree is not this rule's business.
+
+    NO ALLOW BRANCH, EVER. It denies or it returns None, which is what makes it legal to
+    run BEFORE `gate_decision` — see `preflight_decision`'s docstring.
+    """
+    if payload.get("tool_name") != "Bash" or not env.get("JARVIS_WO_ID"):
+        return None
+    command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    cwd_text = payload.get("cwd") or ""
+    if not command or not cwd_text:
+        return None
+    programs, bodies = _heredoc_owner_programs(command)
+    if not bodies or not (set(programs) & HEREDOC_INTERPRETERS):
+        return None
+    cwd = Path(cwd_text)
+    if not (_heredoc_shell_writes(command, bodies, cwd)
+            or _heredoc_sed_writes(command, cwd)
+            or _heredoc_python_writes(command, bodies, cwd)):
+        return None
+    # On the deny path ONLY, so the common case pays no I/O at all. The event is not in
+    # `timeline.DEBUG_KINDS` on purpose: a refused write is a fact about the work, and
+    # the record is the only place anyone will see it.
+    ctx = _worker_context(env, Path(cwd_text))
+    if ctx is not None:
+        root, wo_id = ctx
+        try:
+            store = ProjectStore(root)
+            try:
+                store.add_event(wo_id, "heredoc_write_refused", {
+                    "session_id": payload.get("session_id", ""),
+                    "agent_type": payload.get("agent_type") or "",
+                    "command": command[:400],
+                })
+            finally:
+                store.close()
+        except Exception:  # noqa: BLE001 — the refusal stands whether or not it recorded
+            pass
+    return _deny(_HEREDOC_DENY)
+
+
 def investigator_write_decision(payload: dict[str, Any],
                                 env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse an INVESTIGATOR's file writes, so "it changes no code" is a control.
@@ -936,6 +1115,84 @@ def spec_shape_decision(payload: dict[str, Any],
     )
 
 
+#: Unbounded quantifiers that can consume a NEWLINE. `.` crosses one only under DOTALL,
+#: which is why rule 1 below is gated on `multiline`; the character-class pairs cross one
+#: whatever the flags. Bounded forms (`.{0,200}`, `[\s\S]{0,500}`) are deliberately absent
+#: — a counted range cannot blow up — and so is `[^\n]*`, which is what the denial
+#: recommends. Issue #845, §4 of
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md.
+_UNBOUNDED_WILDCARD = re.compile(
+    r"\.[*+]|\[\\s\\S\][*+]|\[\\S\\s\][*+]|\[\\d\\D\][*+]|\[\\D\\d\][*+]"
+    r"|\[\\w\\W\][*+]|\[\\W\\w\][*+]")
+
+_SEARCH_PATTERN_TOOL = "search_for_pattern"
+
+_BACKTRACKING_REFUSAL = (
+    "That pattern can backtrack catastrophically: `search_for_pattern` matches with "
+    "DOTALL, so `.*` crosses newlines and two of them over a large file can hang the "
+    "Serena server for minutes (issue #845 — 18m50s of CPU on one call). Bound the "
+    "wildcards: use `[^\\n]*` for a line-scoped match, a counted range like `.{0,200}`, "
+    "or pass `multiline: false`. For a structural question use `find_symbol` / "
+    "`get_symbols_overview` instead of a text search."
+)
+
+
+def _nests_an_unbounded_quantifier(pattern: str) -> bool:
+    """A group that CONTAINS an unbounded newline-crossing quantifier and is itself
+    quantified — `(.*\\n)*`, the classic exponential shape. Refused whatever `multiline`
+    says: this one does not need DOTALL to blow up."""
+    stack: list[int] = []
+    for i, ch in enumerate(pattern):
+        escaped = i > 0 and pattern[i - 1] == "\\"
+        if escaped:
+            continue
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            inner = pattern[stack.pop() + 1:i]
+            if pattern[i + 1:i + 2] in ("*", "+") and _UNBOUNDED_WILDCARD.search(inner):
+                return True
+    return False
+
+
+def search_pattern_decision(payload: dict[str, Any],
+                            env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a `search_for_pattern` whose regex can hang the Serena server.
+
+    §4 of the spec above. TWO SHAPES AND NOTHING ELSE, because this hook sits in front of
+    every worker's primary search tool and a predicate that over-refuses costs a retry on
+    most searches the fleet makes: two or more unbounded newline-crossing quantifiers
+    when newlines ARE crossed, or a nested unbounded quantifier at any setting. A single
+    `.*` is the common case (`class .*Store`) and returns.
+
+    AN INPUT IT CANNOT READ IS ALLOWED. The tool's schema is not Jarvis's to own, and a
+    renamed parameter would otherwise take every worker's search tool offline. The cost
+    is that a schema change disarms this guard, which is why the spec's alarm (§2) and
+    `MCP_TOOL_TIMEOUT` (§3) sit behind it.
+    """
+    from . import dispatch
+
+    tool = payload.get("tool_name") or ""
+    # Both Serena prefixes, built from the one tuple that owns them: a plugin install
+    # produces the long one and `claude mcp add serena` the short one.
+    if tool not in tuple(f"{p}{_SEARCH_PATTERN_TOOL}"
+                         for p in dispatch.SERENA_TOOL_PREFIXES):
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    pattern = tool_input.get("substring_pattern")
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    # Serena defaults `multiline=True`, which is `re.DOTALL | re.MULTILINE`.
+    crosses_newlines = bool(tool_input.get("multiline", True))
+    if crosses_newlines and len(_UNBOUNDED_WILDCARD.findall(pattern)) >= 2:
+        return _deny(_BACKTRACKING_REFUSAL)
+    if _nests_an_unbounded_quantifier(pattern):
+        return _deny(_BACKTRACKING_REFUSAL)
+    return None
+
+
 def _allow(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -1098,24 +1355,59 @@ def _resolve_gate(action: Any, wo_id: str, env: dict[str, str],
         # placeholder says so instead of asserting the worker never made one (#233).
         same_kind = next((a["id"] for a in store.list_approvals(wo_id)
                           if a["kind"] == action.kind), None)
+        seat = payload.get("agent_type") or None
         neo = NeoStore()
         try:
             # HELD, not queued. You ran the command instead of arguing for it, so there is
             # no case to review yet — and handing a reviewer the placeholder now would get
             # it decided before yours could arrive (GitHub issue 185).
+            #
+            # UNLESS A SUBAGENT RAN IT, and then there is no actor to hold it FOR. Issue
+            # 185's argument assumes somebody who will argue: the only mechanism that
+            # forces a held request to be argued is `held_request_turn_block`, which runs
+            # on the LEAD's `Stop`, and no `SubagentStop` hook is registered. So a held
+            # request raised in a seat is structurally guaranteed to reach
+            # `gates.sweep_unargued` — the choice is not "placeholder now versus case
+            # later", it is "placeholder now versus abandoned, every time". The lead can
+            # still attach a case afterwards: `ops.request_gate_approval` routes a pending
+            # row to `gates.amend_request`, which revises the reviewer's question in
+            # place. Fix 3 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
             approval, _ = gates.file_request(
                 store, neo, env.get("JARVIS_PROJECT", ""), wo, action,
                 justification=gates.no_case_justification(action.command, same_kind),
-                hold=True,
+                hold=seat is None,
                 # Which SEAT attempted it, if a subagent did. `JARVIS_WO_ID` is
                 # per-session, so the request is filed against the work order either way;
                 # this is the only thing that keeps the record from saying the lead ran a
                 # command its team ran. `PreToolUse` omits the key for the lead's own
                 # calls, so absence is the discriminator, not a sentinel value.
-                agent_type=payload.get("agent_type") or None,
+                agent_type=seat,
             )
         finally:
             neo.close()
+        if seat is not None:
+            # A SEAT'S TEXT, not the lead's. The two exits name actions this actor
+            # cannot take — it has no turn boundary the OS can block and no channel to
+            # its lead — so printing `exits_advice` here would instruct it to do the one
+            # thing it cannot. Its request is already with a reviewer; what it owes is a
+            # report upward. Fix 3 of the spec above.
+            return _deny(
+                f"Gate `{action.kind}`: {action.summary} needs approval, so this attempt "
+                f"was blocked. Request {approval['id']} was filed AND IS ALREADY WITH A "
+                f"REVIEWER — you do not have to argue for it and you cannot: you are a "
+                f"subagent, with no turn boundary the OS can hold and no way to reach "
+                f"the reviewer.\n\n"
+                f"STOP HERE. Report the block to your lead — quote request "
+                f"{approval['id']}, the command, and what you were trying to achieve — "
+                f"and END. Your lead can attach the case to that same request with "
+                f"`jarvis gate request {approval['id']} --why \"…\"`; it never files a "
+                f"second one.\n\n"
+                f"If what you wanted was a FILE EDIT, that belongs in `Edit` or `Write`, "
+                f"which are auto-allowed inside the worktree. A file written through a "
+                f"command hands its own content to the classifier, which is how a test "
+                f"that merely mentions a privileged command ends up here."
+            )
         # Both exits, every time, with the diagnosis first — spec 2026-09-12 §3.
         prior_abandoned = (prior is not None and prior["status"] == "expired"
                            and prior["closed_as"] == "abandoned")
@@ -1261,6 +1553,16 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     the same reason in reverse: they must not be reachable around by an auto-approval
     below them.
 
+    ONE CHECK LEGALLY PRECEDES THE GATE, and only because it can never allow anything:
+    `heredoc_write_decision` has no `_allow` branch, so it cannot hand out a merge or a
+    release, and a command it refuses stays BLOCKED — strictly fewer commands run than
+    before. The ordering argument above is about auto-ALLOWS, and this is not one. It
+    must run first to do anything at all: `gate_decision` never returns None once a
+    command is recognised as privileged, so placed after it this check is unreachable for
+    exactly the commands it exists for — and running first means no approval row is filed
+    for this class, which is the point (fix 1 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md).
+
     `under_review_decision` sits between the two, and the position is deliberate on both
     sides: after `gate_decision`, so a command a live grant covers still runs; before
     everything else, so the narrowing is not reachable around either.
@@ -1269,6 +1571,10 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     tool_input = payload.get("tool_input") or {}
 
     if tool == "Bash":
+        # BEFORE the gate, and only because it never allows — see the docstring.
+        heredoc = heredoc_write_decision(payload, env)
+        if heredoc is not None:
+            return heredoc
         gated = gate_decision(payload, env)
         if gated is not None:
             return gated
@@ -1307,6 +1613,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     # `Edit`/`Write` one below, so the refusal is unreachable anywhere else (§2.6 of
     # docs/superpowers/specs/2026-09-27-investigation-orders.md).
     if isinstance(tool, str) and tool.startswith("mcp__"):
+        # FIRST: `investigator_write_decision` returns `None` for a read-only Serena
+        # tool, so a refusal placed after it would still be reached — but an investigator
+        # would fall through to nothing and get no useful message (spec §4).
+        runaway = search_pattern_decision(payload, env)
+        if runaway is not None:
+            return runaway
         return investigator_write_decision(payload, env)
 
     if tool in ("Edit", "Write", "NotebookEdit") and env.get("JARVIS_WO_ID"):
@@ -1912,16 +2224,26 @@ def _is_current_session(store: ProjectStore, wo_id: str, session_id: str) -> boo
 def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
     """What this work order is parked on instead of the user — "" when nothing is.
 
-    Only ever consulted for a `waiting_input` work order, which is the state every wait
-    puts it in: `ops.ask_question`, and `gates.file_request` down both its roads — the
-    argued request `jarvis gate request` files, and the held one this hook files itself
-    when a worker runs the command first. A `running` worker's Notification is a real
-    mid-work block until proven otherwise, and swallowing that would strand it.
+    Consulted for a `waiting_input` work order, which is the state every OUTWARD-FACING
+    wait puts it in: `ops.ask_question`, and the argued request `gates.file_request`
+    files. A `running` worker's Notification is a real mid-work block until proven
+    otherwise, and swallowing that would strand it.
+
+    THE HELD REQUEST IS THE ONE EXCEPTION, and it is asked BEFORE the status. Since fix
+    2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md a held
+    request parks nothing — it is the worker's own move — so the order is `running` while
+    it holds one, and reading the status first would let exactly the case issue 197 added
+    this branch for through again. The proof is the request itself, not the status.
 
     The returned reason is recorded verbatim on the `notification_ignored` event, so it
     must name WHICH wait: "parked" and "parked on something a reviewer is holding" are
     different facts to whoever reads that timeline afterwards.
     """
+    if store.held_approvals(wo_id):
+        # A fourth reader of the held state, beyond the three kn-30036661 lists as the
+        # complete set. Held is with the WORKER, not the user: nobody is reviewing it,
+        # and the OS refuses it on a timer if nobody ever argues it.
+        return "a privileged-action gate awaiting the worker's case"
     if store.get_work_order(wo_id)["status"] != "waiting_input":
         return ""
     from .invariants import awaiting_neo
@@ -1931,11 +2253,6 @@ def _parked_on_the_delegate(store: ProjectStore, wo_id: str) -> str:
         return f"neo question {question['id']} ({question['status']})"
     if store.pending_approvals(wo_id):
         return "a privileged-action gate awaiting a verdict"
-    if store.held_approvals(wo_id):
-        # A fourth reader of the held state, beyond the three kn-30036661 lists as the
-        # complete set. Held is with the WORKER, not the user: nobody is reviewing it,
-        # and the OS refuses it on a timer if nobody ever argues it.
-        return "a privileged-action gate awaiting the worker's case"
     return ""
 
 
