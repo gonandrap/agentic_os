@@ -727,6 +727,20 @@ elif "-p" in argv and "--resume" not in argv:
         # nothing, and every "no alarm was raised" assertion passes for the wrong reason.
         # Claimed on the CHECKLIST, which only a sweep's system prompt carries.
         if "# The symptom checklist" in system:
+            # THE USAGE LIMIT, on the sweep's own call: the result-JSON shape
+            # `claude_cli.usage_limit` parses, so the test drives the REAL classifier
+            # into a real `UsageLimitError` (spec
+            # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md).
+            if os.environ.get("FAKE_HEALTH_REFUSE"):
+                reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                                       "11:50pm (America/Los_Angeles)")
+                print(json.dumps({
+                    "type": "result", "subtype": "success", "is_error": True,
+                    "num_turns": 1, "total_cost_usd": 0, "duration_api_ms": 0,
+                    "terminal_reason": "api_error", "api_error_status": 429,
+                    "result": "You've hit your session limit · resets " + reset,
+                }))
+                sys.exit(1)
             if "FORCE_HEALTH_FAIL" in prompt:
                 sys.stderr.write("health sweep failed (test-forced)\n"); sys.exit(1)
             if "FORCE_HEALTH_GARBAGE" in prompt:
@@ -2150,6 +2164,21 @@ def fake_claude(tmp_path, monkeypatch):
             """
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
+
+        def health_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
+                                ) -> None:
+            """Refuse every subsequent HEALTH SWEEP for the usage limit.
+
+            `turns_rate_limited`'s sibling on the other call the OS makes: a sweep is a
+            `claude -p` with no session, so the turn path's refusal never reaches it.
+            Emits the same result-JSON shape, so the test drives the real classifier.
+            """
+            monkeypatch.setenv("FAKE_HEALTH_REFUSE", "1")
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
+
+        def health_recover(self) -> None:
+            """Reopen the window — what the sweep is waiting for."""
+            monkeypatch.delenv("FAKE_HEALTH_REFUSE", raising=False)
 
         def turns_api_error(self, status: int = 500) -> None:
             """Break every subsequent turn with an API error, AFTER it has run.

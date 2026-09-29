@@ -950,7 +950,9 @@ class Daemon:
         # that raised on this tick is judged on the next one, which is the cadence §4
         # designs for — the sweep answers "is something wrong", the review answers
         # "does the user need to know".
-        self.health_tick()
+        # Carrying this tick's ONE fleet reading, the same value `validation_tick` gets
+        # and for the same reason: the account's window is a fleet fact, read once.
+        self.health_tick(state)
         # Last of the three, and never merged into the review: a proposal filed above
         # cannot be applied on the tick that filed it (its gate is `pending`), so the two
         # only ever meet across ticks — and that separation is what keeps the deciding
@@ -3915,19 +3917,25 @@ class Daemon:
                 and p.path.is_dir()
                 and self.tick_count % p.supervisor.health_every_ticks == 1]
 
-    def health_tick(self) -> None:
+    def health_tick(self, state: fleet.Fleet | None = None) -> None:
         """Kick a sweep when a unit is due and none is running.
 
         Modelled on `supervisor_tick`, including the guard: a sweep still in flight must
         never have a second one queued behind it, because the candidate list would be
         computed against state the first one is still writing. With no project swept it
         opens no store and reads no row.
+
+        `state` is the tick's ONE `fleet` reading, passed in for the reason
+        `validation_tick` takes it: the account's window is read once per tick, and a
+        sweep that bought a refusal per project would learn the same fact per project.
+        It is threaded into `_health_sweep`, which runs on the health thread — nothing
+        is opened here.
         """
         due = self._health_projects()
         if not due or self.health_sweeping:
             return
         self.health_sweeping = True
-        future = self.health_pool.submit(self._health_sweep, due)
+        future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
     def _health_candidates(self, pstore: ProjectStore,
@@ -3970,8 +3978,14 @@ class Daemon:
         out.sort(key=lambda c: c[0])
         return out
 
-    def _health_sweep(self, projects: list[ProjectSpec]) -> None:
-        """Sweep each project's due units, capped (on the health thread)."""
+    def _health_sweep(self, projects: list[ProjectSpec],
+                      state: fleet.Fleet | None = None) -> None:
+        """Sweep each project's due units, capped (on the health thread).
+
+        TWO HOLDS ARE READ BEFORE ANY CALL IS BOUGHT, one per account and one per
+        project — a recorded hold that nobody reads is just a quieter retry storm (spec
+        docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
+        """
         from . import supervisor as supervisor_mod
         from .neo_store import NeoStore
 
@@ -3981,6 +3995,16 @@ class Daemon:
                 cfg = project.supervisor
                 pstore = ProjectStore(project.path)
                 try:
+                    if state is not None and state.shut():
+                        self._hold_sweep_for_outage(project, pstore, state)
+                        continue
+                    hold = pstore.health_sweep_hold()
+                    if hold is not None:
+                        # Nothing is swept, no candidates are derived, no row is
+                        # written: the hold row that exists is the record.
+                        log.debug("[%s] health sweep held until %s: %s",
+                                  project.name, hold[0], hold[1])
+                        continue
                     for _, subject, trigger in self._health_candidates(
                             pstore, cfg)[:cfg.health_max_units_per_tick]:
                         supervisor_mod.review_health(
@@ -3992,6 +4016,30 @@ class Daemon:
                     pstore.close()
         finally:
             neo_store.close()
+
+    @staticmethod
+    def _hold_sweep_for_outage(project: ProjectSpec, pstore: ProjectStore,
+                               state: fleet.Fleet) -> None:
+        """Write down that the ACCOUNT's window — not this project — is why nobody swept.
+
+        ONCE PER WINDOW, not once per tick, and deduped on the MOMENT: at a 5s tick a
+        three-hour window would otherwise write two thousand identical rows per project.
+        `_hold_rounds_for_outage`'s rule verbatim.
+
+        RECORDED rather than merely skipped (kn-22ba6087): this row is the only place the
+        account fact becomes readable to a per-project invariant, which cannot see the
+        fleet object at all.
+        """
+        reopens = state.outage.reopens_at  # type: ignore[union-attr]
+        hold = pstore.health_sweep_hold()
+        if hold is not None and hold[0] >= reopens:
+            return
+        pstore.record_health_review(
+            "account", "", fingerprint="", trigger="account-window", outcome="held",
+            detail=state.outage.message[:500],  # type: ignore[union-attr]
+            reopens_at=reopens)
+        log.info("[%s] health sweep held by the account's usage window until %s",
+                 project.name, reopens)
 
     # -- 6b. the scheduler: work orders nobody typed ---------------------------------------
 
@@ -4164,7 +4212,9 @@ class Daemon:
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
                     body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
-                    level="warning", wo_id=v.wo_id, source="invariants",
+                    # The violation's OWN level: most are `warning`, and one that must
+                    # not arrive beside a stale attention flag says `critical`.
+                    level=v.level, wo_id=v.wo_id, source="invariants",
                 )
 
     # -- 2 & 6. turns, settlement, and injected sessions ---------------------------------------------------

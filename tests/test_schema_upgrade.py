@@ -242,6 +242,30 @@ def test_the_usage_json_column_reaches_a_database_that_already_has_wo_turns(tmp_
         store.close()
 
 
+def test_reopens_at_reaches_a_database_that_already_has_health_reviews(tmp_path):
+    """`health_reviews` already ships, so the hold's moment cannot arrive with the
+    `CREATE TABLE` — spec 2026-09-28-a-usage-limit-is-not-a-failed-sweep §1."""
+    proj = tmp_path / "legacy-health"
+    (proj / ".jarvis").mkdir(parents=True)
+    store = ProjectStore(proj)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed", detail="old")
+    store.close()
+    conn = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    conn.execute("ALTER TABLE health_reviews DROP COLUMN reopens_at")
+    conn.commit()
+    conn.close()
+
+    store = ProjectStore(proj)                      # the upgrade
+    try:
+        assert "reopens_at" in schema_of(store.conn)["health_reviews"]
+        (old,) = store.health_reviews_of("work_order", "wo-1")
+        assert old["reopens_at"] == 0.0
+        assert store.health_sweep_hold() is None
+    finally:
+        store.close()
+
+
 def test_the_columns_the_turn_runtime_reads_survive_the_upgrade(tmp_path):
     """The specific fields this transport depends on, named so a failure says which.
 

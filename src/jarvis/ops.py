@@ -10055,6 +10055,63 @@ def _project_names(document: dict[str, Any]) -> list[str]:
             if isinstance(p, dict) and isinstance(p.get("name"), str)]
 
 
+#: The OS-owning project's own health sweep is not a setting the user may turn off —
+#: USER RULE 2026-09-28, kn-7312c7de. Checked on the RESOLVED document, so it holds
+#: however the value was spelled: at the project level, on the `os.` block it inherits
+#: from, or by unsetting a key whose default is False.
+OS_SWEEP_KEYS = ("supervisor.enabled", "supervisor.health_enabled")
+
+
+def _refuse_os_sweep_off(key: str, document: dict[str, Any],
+                         resolved: dict[str, Any], file: Path) -> None:
+    """Refuse a write that would leave the OS's own health sweep off.
+
+    In `ops` so the CLI (`jarvis config set/unset`) and the dashboard's config console
+    inherit the refusal from one place — neither has its own validation layer. Called
+    against the document the write WOULD commit, before `_commit_document`, so nothing
+    is written on a refusal.
+
+    The OS project is DERIVED, never hardcoded: `schedule.os_owner`, so a renamed or
+    relocated checkout produces the right sentence with no edit. WITHOUT that function's
+    first-in-catalog fallback, deliberately unlike `Daemon._os_owner`: a project that
+    merely happens to be listed first is not the OS and may not be refused this write.
+    No owner means there is nothing to protect.
+
+    JUDGED ON THE KEY THE WRITE TOUCHES, and on that key's RESOLVED value afterwards —
+    so every spelling is covered (the project's own key, the `os.` block it inherits
+    from, an unset back to a False default) while an unrelated setting is never refused
+    for a switch it does not move. `health_enabled` ships False, so a rule that read both
+    keys on every write would refuse `os.ui.port` on a fresh catalog and, worse, refuse
+    turning the first of the two switches back on.
+    """
+    from . import schedule
+
+    suffix = next((k for k in OS_SWEEP_KEYS if key == k or key.endswith(f".{k}")), None)
+    if suffix is None:
+        return
+    projects = [p for p in document.get("projects", [])
+                if isinstance(p, dict) and isinstance(p.get("name"), str)]
+    try:
+        owner = schedule.os_owner(
+            ((p["name"], Path(str(p.get("path") or file.parent))) for p in projects),
+            fallback=False)
+    except (OSError, ValueError):       # an unreadable path is not an authorisation
+        return
+    if owner is None:
+        return
+    # A write scoped to ANOTHER project cannot move the owner's resolved value; only its
+    # own keys and the `os.` block it inherits from can. §4 stops the OS's project opting
+    # out and nothing else — every other project opts in and out freely.
+    if key.startswith("projects.") and not key.startswith(f"projects.{owner}."):
+        return
+    if not resolved.get(f"projects.{owner}.{suffix}"):
+        raise OpsError(
+            f"projects.{owner}.{suffix} would leave the health sweep of {owner} OFF, "
+            f"and that project runs the OS itself — its sweep must always be on and "
+            f"producing judgements (user rule, 2026-09-28). Change it on another "
+            f"project, or turn the sweep off nowhere.")
+
+
 def _key_path(path: str, project: str | None, document: dict[str, Any]) -> str:
     """The key-space path a user's `<path>` and optional `<project>` name together.
 
@@ -10244,6 +10301,7 @@ def set_config(path: str, value: Any, project: str | None = None, *, reason: str
     container[leaf] = value
 
     after = _resolved_of(document, file)
+    _refuse_os_sweep_off(key, document, after, file)
     changes = _one_change(key, before, after, doc_before, value, existed)
     _require_reason(changes, reason,
                     _retry("set", path, project, json.dumps(value, ensure_ascii=False)))
@@ -10273,6 +10331,7 @@ def unset_config(path: str, project: str | None = None, *, reason: str = "",
     doc_before = container.pop(leaf)
 
     after = _resolved_of(document, file)
+    _refuse_os_sweep_off(key, document, after, file)
     changes = _one_change(key, before, after, doc_before, after.get(key), True,
                           removed=True)
     _require_reason(changes, reason, _retry("unset", path, project))
