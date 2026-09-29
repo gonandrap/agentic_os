@@ -338,10 +338,18 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
     store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
+    row = {**wo, "session_id": session_id, "worktree": wo_id}
+    # RE-DECIDED FROM THE FILESYSTEM, `retry`'s way, because a work order can reach
+    # dispatch a second time carrying both: `ops.defer_red_release` re-parks a release to
+    # `pending` with its session and worktree intact (2026-09-29 spec §5). `--session-id`
+    # on a session that exists is refused by the CLI and `--worktree` asks for a
+    # directory that is already there. Byte-identical for an ordinary first dispatch.
+    started = _conversation_started(project, row)
+    tree = worktree_path(project, row)
     briefing: dict[str, Any] = {}
-    turn = _launch(store, project, {**wo, "session_id": session_id, "worktree": wo_id},
-                   prompt, kind="dispatch", resume=False, worktree=wo_id,
-                   cwd=project.path, briefing_out=briefing)
+    turn = _launch(store, project, row, prompt, kind="dispatch", resume=started,
+                   worktree=None if tree else wo_id, cwd=tree or project.path,
+                   briefing_out=briefing)
     return turn, briefing
 
 

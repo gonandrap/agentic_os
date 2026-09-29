@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, worker_session)
+               notify, release, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -6908,10 +6908,11 @@ class Daemon:
                 continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
-    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
-    #: a column because it is a list that grows while the order waits, and because
-    #: nothing outside this file has a reason to query it.
-    RELEASE_BATCH_KEY = "release_for_issues"
+    #: fixes, and these are the ones it is shipping". The batch lives in `metadata`
+    #: rather than in a column because it is a list that grows while the order waits.
+    #: An ALIAS since 2026-09-29 spec §1 — `release.BATCH_KEY` is the literal's home now
+    #: that `ops` reads it too.
+    RELEASE_BATCH_KEY = release.BATCH_KEY
 
     #: What the release work order is told to do. It runs the ORDINARY release path —
     #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
@@ -7004,6 +7005,14 @@ the place to fix a red build."""
     #: (2026-09-27 spec §5.2).
     RED_HOLD_EVENT = "release_held_red_base"
 
+    #: How long `main` may stay red before a release order stops waiting and asks the
+    #: user. Measured from the FIRST red hold on that order, so the pending-dispatch hold
+    #: (#807) and the mid-run re-park (`ops.defer_red_release`) share one clock. Six
+    #: hours: a red `main` here is repaired by a work-order round trip, which is hours and
+    #: not minutes, and an hour would ask the user about a break the fleet was already
+    #: fixing (2026-09-29 spec §3).
+    RED_PARK_AFTER_SECONDS = 6 * 3600
+
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
 
@@ -7025,9 +7034,12 @@ the place to fix a red build."""
         indexed listing when it owns no pending release, and a `gh` call only once a
         hold has lapsed — an in-force hold IS the rate limit.
 
+        Also where the hold STOPS: past `RED_PARK_AFTER_SECONDS` the release asks the
+        user instead (2026-09-29 spec §3).
+
         docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
         """
-        from . import ci, evidence, github
+        from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
         # release script and the production checkout, both facts about this repository.
@@ -7066,6 +7078,18 @@ the place to fix a red build."""
                 if wo.get("retry_after") is not None and not int(
                         wo.get("dispatch_attempts") or 0):
                     store.hold_dispatch(wo_id, until=None)
+                continue
+            # §3's threshold, HERE: this tick is the only step that visits a release
+            # already held in `pending`, so `ops.defer_red_release`'s check — which runs
+            # only when a worker delivers — can never fire for one. `_say_base_is_red`
+            # below is what writes RED_HOLD_EVENT, so on the FIRST red tick there is no
+            # clock yet and nothing parks; and a parked order is `needs_review`, which
+            # the `statuses=("pending",)` selection above stops returning.
+            first = ops.first_red_hold(store, wo_id)
+            if first is not None and db.now() - first >= self.RED_PARK_AFTER_SECONDS:
+                ops.park_red_release(store, wo_id, {
+                    "base": base, "head_sha": red.head_sha, "workflow": red.workflow,
+                    "run_id": red.run_id, "run_url": getattr(red, "run_url", "") or ""})
                 continue
             until = max(float(wo.get("retry_after") or 0),
                         db.now() + self.RED_HOLD_SECONDS)
