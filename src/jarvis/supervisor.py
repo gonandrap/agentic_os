@@ -123,6 +123,14 @@ API call count and its actual tokens and dollars. A turn with no API call bought
 however long it ran — it stalled, and an answer or escalation that describes it as billed
 is a false claim about money reaching the user.
 
+A TURN THAT IS AWAITING THE MODEL IS NOT A STALLED TURN. The transcript gains an assistant
+row only when a content block COMPLETES, so a turn whose last row is an input — a prompt
+or a tool result — with nothing after it has a request IN FLIGHT and is spending output
+tokens right now. The packet says so in those words. Never describe such a turn as
+stalled, as costing nothing, or as never having started, and never propose anything that
+would end it: a measured case ran 19 minutes at 3.5 tokens per second and was escalated as
+a dead turn.
+
 SOME ALARMS ARE NOT ABOUT A TURN AT ALL. `rewrite-tax-prefix` and `rewrite-tax-ttl` are a
 whole project's re-write tax over a window of already-settled orders; the work order they
 hang off is the biggest single contributor, shown as the EXEMPLAR and not as the culprit.
@@ -347,8 +355,11 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     if not session_id:
         return ["(the work order has no session)"]
     spans = holds.held(pstore, wo["id"]) if pstore is not None else []
+    # Spec 2026-09-27 §3: the OS's own turn numbers, degrading to 1..N without a store.
+    turn_starts = pstore.turn_starts(wo["id"]) if pstore is not None else []
     try:
-        anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans)
+        anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans,
+                                          turn_starts=turn_starts)
     except OSError:
         return ["(the session transcript could not be read)"]
     if not anatomy.found:
@@ -363,7 +374,15 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
         spend = turn.usage
         split = ", ".join(f"{getattr(turn, part):.0f}s {part}"
                           for part in inspection.PARTS)
-        stalled = "" if turn.observed else "NO API CALL WAS EVER MADE — it cost nothing. "
+        # AWAITING FIRST (spec of 2026-09-27 §1): THIS is the line that fed the judge,
+        # and an absent assistant row means a request in flight, not a dead turn.
+        if turn.awaiting:
+            stalled = (f"{inspection.awaiting_note(turn)} — nothing has COMPLETED yet; "
+                       "this is not a stall. ")
+        elif turn.observed:
+            stalled = ""
+        else:
+            stalled = "NO API CALL WAS EVER MADE — it cost nothing. "
         # Said BEFORE the split, like `stalled` above and for its reason: it changes what
         # every number after it means, and a judge that reads it last has already decided.
         # Only where the two clocks differ — a line saying "120s wall, 120s active" on
@@ -375,7 +394,8 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
                         f"permitting it to run and nothing was being spent. ")
         active = f" ({turn.active:.0f}s of it active)" if held_by else ""
         lines.append(
-            f"- turn {turn.seq}: {stalled}{turn.wall:.0f}s wall{active} ({split}), "
+            f"- {inspection.turn_name(turn.seq)}: {stalled}"
+            f"{turn.wall:.0f}s wall{active} ({split}), "
             f"{len(turn.calls)} API call{'' if len(turn.calls) == 1 else 's'} costing "
             f"{spend.total_tokens:,} tokens / ${spend.list_cost_usd:.2f}, "
             f"context peak {turn.context_peak:,}")
