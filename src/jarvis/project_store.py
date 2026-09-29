@@ -12,7 +12,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import db
+from . import db, release
 from .paths import project_db_path
 
 # Work order lifecycle.
@@ -279,7 +279,12 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # report and decides what happens next, instead of finishing a job and exiting.
 # `analyst` is an improvement order's planner-shaped child: one session that reads
 # records and hands back a diagnosis — §3.1 of the improvement-orders spec.
-WO_KINDS = ("worker", "planner", "manager", "analyst")
+# `investigator` is an INVESTIGATION order's read-only child: one session that diagnoses
+# one stuck subject and submits a verdict, and whose no-write rule is enforced by
+# `hooks.investigator_write_decision` / `hooks.investigator_bash_decision` rather than
+# stated in prose — §2.2 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md.
+WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
@@ -441,7 +446,15 @@ FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # What a `feature_orders` row IS. An improvement order reuses the table, the statuses and
 # three of its columns rather than earning a table of its own — §2.1 of
 # docs/superpowers/specs/2026-09-23-improvement-orders.md says what that reuse buys.
-FO_KINDS = ("feature", "improvement")
+# `investigation` reuses the same row for the same reason one level further on — §2.1 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md. It never reaches
+# `plan_review`: submitting the verdict settles it.
+FO_KINDS = ("feature", "improvement", "investigation")
+
+# The id prefix each kind mints, defaulting to `fo`. A MAP rather than the conditional it
+# replaced: a third arm of a two-arm ternary is where a fourth kind goes wrong (§2.1).
+# `inv` and not `in`, so it cannot collide with `io-` under `startswith`.
+FO_ID_PREFIXES = {"improvement": "io", "investigation": "inv"}
 
 # Kind-aware status LABELS. In this leaf module, beside the statuses they rename, because
 # all three renderers already import it and "one mapping" is then a property rather than a
@@ -449,6 +462,9 @@ FO_KINDS = ("feature", "improvement")
 # with no override falls through, so feature-order labels are unchanged by construction.
 FO_STATUS_LABELS: dict[str, dict[str, str]] = {
     "improvement": {"planning": "analysing", "plan_review": "findings awaiting you"},
+    # No `plan_review` entry: an investigation never enters that status (§2.1 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md).
+    "investigation": {"planning": "investigating"},
 }
 
 
@@ -460,7 +476,7 @@ def feature_status_label(kind: str | None, status: str) -> str:
 def is_feature_order_id(unit_id: str) -> bool:
     """Does this id name a `feature_orders` row? The one shared predicate — §2.5 of the
     spec above, which exists because three sites had grown their own `fo-` literal."""
-    return unit_id.startswith(("fo-", "io-"))
+    return unit_id.startswith(("fo-", "io-", "inv-"))
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
@@ -2679,9 +2695,10 @@ class ProjectStore:
         assert origin in WO_ORIGINS, origin
         assert kind in FO_KINDS, kind
         assert max_parallel is None or max_parallel >= 1, max_parallel
-        # An improvement order carries its own prefix so that every id in the OS still
-        # says what it names on sight — §2.1 of the improvement-orders spec.
-        fo_id = fo_id or db.new_id("io" if kind == "improvement" else "fo")
+        # Every kind carries its own prefix so that every id in the OS still says what it
+        # names on sight — §2.1 of the improvement-orders spec, and §2.1 of
+        # docs/superpowers/specs/2026-09-27-investigation-orders.md for the map.
+        fo_id = fo_id or db.new_id(FO_ID_PREFIXES.get(kind, "fo"))
         ts = db.now()
         self.conn.execute(
             """INSERT INTO feature_orders (id, title, description, status, kind, origin,
@@ -3581,6 +3598,24 @@ class ProjectStore:
             float(e["ts"]) > since
             for kind in ("finished", "abandoned", "pr_merged")
             for e in self.events_of_kind(wo_id, kind))
+
+    def release_red_park_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open red-base park on this release order, or None. `work_unlanded_open`'s
+        arithmetic over the other park (2026-09-29 spec §3).
+
+        Returns the PAYLOAD because `invariants.true_blockers` re-derives the attention
+        line from it — the run that broke the base, which is not something a constant can
+        carry. Closed by a re-delivery (`finished`), an abandonment or the release
+        settling, so a worker that delivers again is a new episode and does record.
+        """
+        parked = self.events_of_kind(wo_id, release.RED_PARK_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
 
     def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
         """How many events this work order has, unbounded, minus the kinds named.

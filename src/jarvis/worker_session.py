@@ -338,10 +338,18 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
     store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
+    row = {**wo, "session_id": session_id, "worktree": wo_id}
+    # RE-DECIDED FROM THE FILESYSTEM, `retry`'s way, because a work order can reach
+    # dispatch a second time carrying both: `ops.defer_red_release` re-parks a release to
+    # `pending` with its session and worktree intact (2026-09-29 spec §5). `--session-id`
+    # on a session that exists is refused by the CLI and `--worktree` asks for a
+    # directory that is already there. Byte-identical for an ordinary first dispatch.
+    started = _conversation_started(project, row)
+    tree = worktree_path(project, row)
     briefing: dict[str, Any] = {}
-    turn = _launch(store, project, {**wo, "session_id": session_id, "worktree": wo_id},
-                   prompt, kind="dispatch", resume=False, worktree=wo_id,
-                   cwd=project.path, briefing_out=briefing)
+    turn = _launch(store, project, row, prompt, kind="dispatch", resume=started,
+                   worktree=None if tree else wo_id, cwd=tree or project.path,
+                   briefing_out=briefing)
     return turn, briefing
 
 
@@ -411,6 +419,22 @@ def turn_context(turn: dict[str, Any] | None) -> int:
     return int(envelope.get("context_peak") or 0) if isinstance(envelope, dict) else 0
 
 
+def measured_context(store: ProjectStore, wo_id: str) -> int:
+    """The conversation's size as last MEASURED: the newest turn that recorded one.
+
+    Not the latest turn's own figure. A turn that ended without a result — killed, reaped
+    as dead, refused before it reached the model — records none, and reading its 0 as
+    "small" re-sent a 126k conversation cold (issue #856, a turn killed in a fleet stop).
+    A turn records only its own peak, so the newest measured one is the best lower bound
+    on what the next prompt will carry.
+    """
+    for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
+        context = turn_context(turn)
+        if context:
+            return context
+    return 0
+
+
 def compaction_due(store: ProjectStore, wo: dict[str, Any],
                    min_context: int | None,
                    now: float | None = None) -> Compaction | None:
@@ -455,7 +479,7 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     age = (time.time() if now is None else now) - ended
     if age < usage.WRITE_TTL_SECONDS:
         return None
-    context = turn_context(turn)
+    context = measured_context(store, wo["id"])
     if context < min_context:
         return None
     # Last, because it is the only one that costs a second query — and `turn_pause`
@@ -513,11 +537,7 @@ def resume_compaction_due(store: ProjectStore, project: ProjectSpec, wo: dict[st
     age = (time.time() if now is None else now) - ended
     if age < usage.WRITE_TTL_SECONDS:
         return None
-    context = 0
-    for turn in store.recent_turns(wo["id"], limit=MAX_RATE_LIMIT_RETRIES + 4):
-        context = turn_context(turn)
-        if context:
-            break
+    context = measured_context(store, wo["id"])
     if context < min_context:
         return None
     return Compaction(age=age, context=context)

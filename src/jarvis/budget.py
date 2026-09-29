@@ -649,6 +649,26 @@ def feature_default_for(project: ProjectSpec | None) -> float | None:
     return getattr(project.worker, "feature_budget_usd", None)
 
 
+def investigation_default_for(project: ProjectSpec | None) -> float | None:
+    """The standing budget for a new INVESTIGATION order — the order plus its one
+    investigator.
+
+    The one place in this codebase where "no ceiling is the default" does not hold, and
+    §2.8 of docs/superpowers/specs/2026-09-27-investigation-orders.md says why: the caller
+    is a daemon loop, not a human typing, so an uncapped default is an uncapped loop. So
+    the catalog's `investigation_budget_usd` ships NON-None, and the fallback is the
+    feature default rather than None.
+    """
+    from .catalog import DEFAULT_INVESTIGATION_BUDGET_USD
+
+    if project is None:
+        return DEFAULT_INVESTIGATION_BUDGET_USD
+    explicit = getattr(project.worker, "investigation_budget_usd", None)
+    if explicit is not None:
+        return explicit
+    return feature_default_for(project)
+
+
 def live_children(store: ProjectStore, fo_id: str) -> list[dict[str, Any]]:
     """The children of a feature that are still able to spend. Used by the escalation."""
     return [c for c in store.feature_children(fo_id)

@@ -294,7 +294,11 @@ def test_the_idle_prompt_is_ignored_while_a_gate_awaits_the_worker_s_case(projec
                                             store.get_work_order(wo["id"]), action,
                                             hold=True)
     assert question is None and approval["status"] == gates.AWAITING_CASE
-    assert store.get_work_order(wo["id"])["status"] == "waiting_input"
+    # `running`: a held request parks nothing, since fix 2 of
+    # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md. The suppression
+    # below never read the status — it reads `held_approvals` — which is exactly why it
+    # survives the change.
+    assert store.get_work_order(wo["id"])["status"] == "running"
 
     handle_hook(
         {"hook_event_name": "Notification", "session_id": "s1",

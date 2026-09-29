@@ -2508,6 +2508,55 @@ def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]
     return finding
 
 
+def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
+              **overrides: Any) -> dict[str, Any]:
+    """One verdict `verdicts.parse_verdict` accepts, for any classification.
+
+    §2.4 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the payload is
+    classification-dependent, so the helper carries EXACTLY the fields that
+    classification requires and none it forbids — a test that wants a rejection adds or
+    breaks one field and nothing else drags the document down with it.
+
+    Shared with the ops tests rather than re-declared per file, for `a_report`'s reason.
+    """
+    doc: dict[str, Any] = {
+        "subject": subject,
+        "classification": classification,
+        "gap_class": "stale-hold",
+        "root_cause": (f"The panel's give-up hold on {subject} is written once and never "
+                       f"re-derived, so the order stays parked after the cause clears."),
+        "evidence": [
+            {"source": f"jarvis wo show {subject}",
+             "quote": "validating — the panel gave up after 3 rounds (round 3, 6h ago)"},
+        ],
+    }
+    if classification == "GAP":
+        doc["proposed_fix"] = {
+            "title": "a stale panel hold parks an order after its cause has cleared",
+            "description": ("The hold the panel writes when it gives up is never "
+                            "re-derived, so an order whose pull request has since been "
+                            "updated stays parked for ever. Re-derive it on the "
+                            "reconcile tick that reads the pull request."),
+            "expected": "the hold clears on the next tick once the pull request moves",
+            "actual": "the order stays parked until a human runs `jarvis wo done`",
+            "priority": "high",
+            "detector": ("a reconciler invariant over state: an order in `validating` "
+                         "whose hold names a commit that is no longer the pull request's "
+                         "head"),
+            "remedy": "unblock",
+        }
+    elif classification == "WAITING_ON_USER":
+        doc["user_owes"] = f"assumption as-4 on {subject} is still pending review"
+    elif classification == "TRANSIENT":
+        doc["unsticks"] = {"what": "the reconciler re-reads the pull request and clears "
+                                   "the hold",
+                           "when": "next reconcile tick, within two minutes"}
+    elif classification == "ALREADY_TRACKED":
+        doc["duplicate_of"] = "#790"
+    doc.update(overrides)
+    return doc
+
+
 def a_report(**overrides: Any) -> dict[str, Any]:
     """A findings report `findings.parse_report` accepts — the shared document.
 

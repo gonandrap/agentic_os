@@ -771,6 +771,17 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # attempted. Deduped per head sha, so one line per broken commit.
         return ("Holding the release — the base branch is red",
                 p.get("detail") or (p.get("base") or ""))
+    if kind == "release_deferred_red_base":
+        # On the RELEASE order, mid-run: it delivered no release because the base is not
+        # buildable, so it waits rather than asking the user (2026-09-29 spec §1). Same
+        # head-sha dedupe as the hold above, one line per broken commit.
+        return ("Waiting to ship — the base branch is not buildable",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_park_red_base":
+        # ...and the end of that wait: past `Daemon.RED_PARK_AFTER_SECONDS` the release
+        # asks the user, once per episode (§3).
+        return ("Stopped waiting for the base branch and asked you",
+                p.get("detail") or (p.get("base") or ""))
     if kind == "release_completed":
         # The ending itself, whichever path reached it: `why` is which one (release.py
         # `settle`), and it is the whole difference between "we shipped it" and

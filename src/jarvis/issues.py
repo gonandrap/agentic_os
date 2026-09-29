@@ -532,6 +532,33 @@ def ensure_follow_up_label(repo: str) -> None:
          url=repo, tolerate="already exists")
 
 
+def issues_mentioning(repo: str, term: str) -> list[dict[str, Any]]:
+    """Every issue on `repo` whose BODY mentions `term`, open or closed.
+
+    `follow_ups_filed`'s read with the label dropped — §2.5 of
+    docs/superpowers/specs/2026-09-27-investigation-orders.md, where the question is "has
+    this cause already been filed BY ANYONE", so restricting to the panel's own label
+    would miss every issue a human filed and re-file it.
+
+    **`--state all`, and that keyword is the whole correctness of this**, for the reason
+    spelled out below: a closed duplicate that drops out of the answer is re-filed for
+    ever. An unreachable `gh` raises; `ops.submit_verdict` turns that into an attention
+    item rather than settling the order silently.
+    """
+    repo = checked_repo(repo)
+    term = (term or "").strip()
+    if not term:
+        return []
+    stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
+                   "--search", f"{term} in:body", "--limit", "100",
+                   "--json", "number,title,url,state"], url=repo)
+    try:
+        rows = json.loads(stdout or "[]")
+    except ValueError:
+        return []
+    return [r for r in rows if isinstance(r, dict) and r.get("url")]
+
+
 def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
     """Every follow-up the panel has already filed on `repo` for one unit.
 
