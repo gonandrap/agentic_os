@@ -21,6 +21,13 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: taken, and re-deriving it later reads the state as it is now.
 TRIGGERS = ("first-look", "changed", "stale")
 
+#: Statuses in which a unit is parked waiting on a HUMAN. Nothing is running inside one,
+#: so its fingerprint cannot move and its stale window is its whole cadence — which is
+#: why that window is its own setting (§4.2). NOT an exclusion: `waiting-on-nobody` is
+#: the probe that is most valuable here, because an order waiting on a message nobody
+#: will send looks exactly like one waiting on a merge.
+PARKED_STATUSES = ("waiting_input", "needs_review", "waiting_pr_merge")
+
 #: What separates the parts of a fingerprint. Any character not in a status, a sequence
 #: number or a count would do; the point is that the string is one opaque value to
 #: everything downstream, which compares it and never parses it.
@@ -87,7 +94,8 @@ def fingerprint(pstore: Any, subject: dict[str, Any]) -> str:
 
 
 def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
-        created: float, last_attempt: float | None = None) -> str | None:
+        created: float, last_attempt: float | None = None,
+        status: str = "") -> str | None:
     """Which trigger says to look at this unit now, or None to leave it alone.
 
     `review` is the unit's most recent `health_reviews` row, or None. `created` is the
@@ -98,6 +106,10 @@ def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
     `last_attempt` is the ts of the most recent sweep OF ANY OUTCOME, failures included,
     or None if never swept. `review` deliberately cannot answer that — see the floor.
 
+    `status` is the unit's own, and an argument for `created`'s reason — the fingerprint
+    is an opaque value here, never parsed. It selects the stale window (§4.2); `""`, a
+    feature order or any caller that names none, takes the ordinary one.
+
     THE `stale` CLAUSE FIRES ONCE PER STALE WINDOW, not once for ever. §4 words it as
     "exactly one review until it moves again", and once-for-ever is unbuildable against
     the dedupe test that same section specifies: it grades four consecutive sweeps at an
@@ -105,7 +117,11 @@ def due(review: dict[str, Any] | None, current: str, cfg: Any, now: float,
     the alarm-side dedupe as the thing that stops the repeat, which is where §4 puts it.
     """
     interval = cfg.health_min_interval_minutes * SECONDS_PER_MINUTE
-    stale = cfg.health_stale_minutes * SECONDS_PER_MINUTE
+    # A PARKED UNIT'S ONLY CADENCE IS THIS WINDOW — nothing can move its fingerprint
+    # while it waits on a human. The floor below is untouched: when its status does move,
+    # so does the fingerprint, and that is the sweep worth paying for. §4.2.
+    stale = (cfg.health_parked_stale_minutes if status in PARKED_STATUSES
+             else cfg.health_stale_minutes) * SECONDS_PER_MINUTE
     # THE FLOOR IS ON ATTEMPTS, NOT ON JUDGEMENTS. Every branch below floors on
     # `review`, which excludes a failure — so a sweep that always fails has no floor at
     # all and falls back to the tick rate. §4.1 of docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md.
