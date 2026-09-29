@@ -8,7 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -490,6 +490,10 @@ SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
 ALARM_STATUSES = (
     "raised",     # on the supervisor's queue, awaiting a look
+    # A NOTE, NOT AN INTERRUPTION: recorded and rendered, never claimed. Spec of
+    # 2026-09-27 §2 — `claim_next_alarm` selects `status='raised'`, so this status IS
+    # the enforcement and no filter is added anywhere downstream.
+    "informational",
     "reviewing",  # claimed by a supervisor tick
     "acked",      # judged and answered with a note to the user
     "escalated",  # judged and handed to Neo
@@ -2207,8 +2211,12 @@ class ProjectStore:
             return None
         return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
 
-    def claim_next_pending(self) -> dict[str, Any] | None:
+    def claim_next_pending(self, only: Collection[str] | None = None
+                           ) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
+
+        `only`, when given, restricts the claim to those work order ids — the user's
+        pause allow-list (`fleet.FleetPause`, issue #843). Empty means claim nothing.
 
         Two things can make a pending work order unclaimable, and neither writes anything
         when it fires: the order is passed over and stays `pending`, because nothing about
@@ -2247,6 +2255,13 @@ class ProjectStore:
         always was.
         """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        only_ids: tuple[str, ...] = ()
+        only_clause = ""
+        if only is not None:
+            only_ids = tuple(only)
+            if not only_ids:
+                return None
+            only_clause = f"AND w.id IN ({','.join('?' for _ in only_ids)})"
         cur = self.conn.execute(
             f"""UPDATE work_orders SET status='dispatching', updated_at=?
                WHERE id = (SELECT w.id FROM work_orders w
@@ -2274,9 +2289,11 @@ class ProjectStore:
                                  JOIN assumptions a ON a.wo_id = f.plan_wo_id
                                  WHERE f.id = w.parent_id AND a.status = 'pending'
                              ))
+                             {only_clause}
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
+            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES,
+               *only_ids),
         )
         row = cur.fetchone()
         return dict(row) if row else None
@@ -3031,18 +3048,22 @@ class ProjectStore:
 
     # -- cost alarms ---------------------------------------------------------
 
-    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str) -> dict[str, Any]:
+    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str,
+                  status: str = "raised") -> dict[str, Any]:
         """Record one raised alarm and return it. The caller still writes the event.
 
         Both, not one: the row is the identity everything downstream hangs off, and the
         `cost_alarm` event remains the raise's dedupe memory and the work order's
         timeline entry. See ALARM_EVENT_KINDS for the payloads of all four kinds.
+
+        `status` is `informational` for a kind in `inspection.INFORMATIONAL_KINDS` (spec
+        of 2026-09-27 §2): `claim_next_alarm` never sees it, so nothing escalates.
         """
         alarm_id = db.new_id("al")
         self.conn.execute(
-            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason)
-               VALUES (?,?,?,?,?,?)""",
-            (alarm_id, wo_id, db.now(), kind, int(seq), reason),
+            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (alarm_id, wo_id, db.now(), kind, int(seq), reason, status),
         )
         return self.get_alarm(alarm_id)
 
@@ -4018,6 +4039,15 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
+
+    def turn_starts(self, wo_id: str) -> list[tuple[int, float]]:
+        """`(seq, started_at)` for every turn — what `inspection.read_session` binds its
+        transcript turns to (spec 2026-09-27 §3). One indexed read, no JSON.
+        """
+        rows = self.conn.execute(
+            "SELECT seq, started_at FROM wo_turns WHERE wo_id=? ORDER BY seq",
+            (wo_id,)).fetchall()
+        return [(int(r["seq"]), float(r["started_at"])) for r in rows]
 
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first.

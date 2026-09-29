@@ -742,6 +742,9 @@ class Daemon:
         state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
         if fleet.announce(self.central, state):
             log.warning("fleet held: %s", state.blocked())
+        # AFTER `announce`, which is what records a reopen: the ramp it starts has to be
+        # in force on the very tick the backlog comes due (issue #843).
+        fleet.attach(state, self.central)
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -786,7 +789,7 @@ class Daemon:
                 # waiting a whole poll interval for the next pass. With no envelope ever
                 # posted this is one indexed lookup that finds nothing.
                 self.deliver_envelopes(project, store)
-                self.deliver_messages(project, store)
+                self.deliver_messages(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
@@ -980,10 +983,14 @@ class Daemon:
         leaves `pending` and nothing is written at all — the same nothing a
         dependency-blocked order costs, and why neither raises attention.
         """
+        # The user's pause is per order, so it narrows the CLAIM rather than stopping it:
+        # only allow-listed ids are claimable while the fleet is paused (issue #843).
+        only = (state.pause.allow if state is not None and state.pause is not None
+                else None)
         while store.count_active() < project.max_concurrent:
-            if state is not None and state.blocked():
+            if state is not None and (state.shut() or state.capacity_cause()):
                 return
-            wo = store.claim_next_pending()
+            wo = store.claim_next_pending(only=only)
             if wo is None:
                 return
             log.info("[%s] dispatching %s: %s", project.name, wo["id"], wo["title"])
@@ -1515,7 +1522,7 @@ class Daemon:
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            held = state.blocked() if state is not None else ""
+            held = state.blocked(wo["id"]) if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1528,16 +1535,20 @@ class Daemon:
             # BELOW the filter above, so only an order that was going to be relaunched
             # on this pass is ever recorded — nothing else is being held.
             if held:
-                shut = state is not None and state.shut()
-                figures = {"in_flight": state.in_flight, "cap": state.cap}
-                if shut:
+                assert state is not None  # `held` is only ever set from a reading
+                cause = state.hold_cause(wo["id"]) or "fleet_cap"
+                figures: dict[str, Any] = {"in_flight": state.in_flight, "cap": state.cap}
+                if cause == "fleet_outage":
                     # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
                     # for an outage (issue #714), and the event exists for the invariant
                     # suppression, which an outage hold needs exactly as a cap hold does.
                     figures["reopens_at"] = state.outage.reopens_at
-                self._record_retry_held(
-                    store, wo, pause,
-                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                elif cause == "fleet_ramp":
+                    figures.update(cap=state.ramp.cap, until=state.ramp.until,
+                                   since=state.ramp.since)
+                elif cause == "fleet_paused":
+                    figures["since"] = state.pause.since
+                self._record_retry_held(store, wo, pause, cause=cause, figures=figures)
                 continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
@@ -1547,7 +1558,19 @@ class Daemon:
                              "max_concurrent": project.max_concurrent})
                 continue
             try:
-                turn = worker_session.retry(store, project, wo, pause)
+                # COLD, AND LARGE: compact first (issue #843). A pause outlives the cache,
+                # so the plain relaunch re-writes the whole conversation at the
+                # cache-WRITE rate — 100-170k tokens a worker, all due on the same tick.
+                # `compact_then_resume` queues the relaunch as an ordinary message, so the
+                # pause is not erased and the delivery path sends it into the compacted,
+                # warm conversation on the tick after the compaction settles.
+                due = worker_session.resume_compaction_due(
+                    store, project, wo, pause, self.catalog.os.compact_min_context)
+                if due is not None:
+                    turn = worker_session.compact_then_resume(
+                        store, project, wo, pause, due)
+                else:
+                    turn = worker_session.retry(store, project, wo, pause)
             except budget_mod.BudgetExhausted as e:
                 # `NOT_RETRIED` already keeps this sweep off an order already parked in
                 # `budget_exhausted`; this is the order that ran out BETWEEN the last
@@ -1631,7 +1654,8 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
         """Send queued user messages into their work orders' conversations.
 
         No roster lookup any more, and no thread pool: a turn is a detached process, so
@@ -1693,13 +1717,22 @@ class Daemon:
         budget = project.max_concurrent - store.count_active()
         for wo_id, msgs in pending.items():
             wo = store.get_work_order(wo_id)
+            # UNDER THE FLEET TOO (issue #843). A delivery starts a turn exactly as a
+            # dispatch or a resume does, so the user's pause, the post-reopen ramp and
+            # the account-wide cap bind it the same way. Held, the messages stay queued.
+            held = state.blocked(wo_id) if state is not None else ""
+            if held:
+                log.debug("[%s] holding %s message(s) for %s: %s",
+                          project.name, len(msgs), wo_id, held)
+                continue
             if resume_spends_slot(wo):
                 if budget <= 0:
                     log.debug("[%s] holding %s message(s) for %s: all %s slots are full",
                               project.name, len(msgs), wo_id, project.max_concurrent)
                     continue
                 budget -= 1
-            self._deliver(project, store, wo, msgs)
+            if self._deliver(project, store, wo, msgs) and state is not None:
+                state.launched()
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py).
@@ -1767,6 +1800,9 @@ class Daemon:
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(wo_id):
+                continue  # the user paused the fleet; the panel spends on this too (#843)
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
                 continue
@@ -2469,6 +2505,9 @@ class Daemon:
             fo_id = fo["id"]
             if fo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(fo_id):
+                continue  # the user paused the fleet (#843)
             round_row = store.latest_validation_round(fo_id=fo_id)
             if round_row is None:
                 # In `validating` with no round at all: nothing this machine can judge.
@@ -2878,7 +2917,8 @@ class Daemon:
         return True
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msgs: list[dict[str, Any]]) -> None:
+                 msgs: list[dict[str, Any]]) -> bool:
+        """True when a turn was launched — the delivery itself, or a compaction first."""
         ids = [m["id"] for m in msgs]
         anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
@@ -2886,7 +2926,7 @@ class Daemon:
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
-            return
+            return True
         # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
         # whose last turn died on a background job used to re-enter the identical turn
         # shape knowing nothing, and the worker backgrounded and signed off again —
@@ -2915,7 +2955,7 @@ class Daemon:
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
             # the next tick from re-attempting, so this runs once per exhaustion.
             budget_mod.escalate(store, wo, e.exhausted)
-            return
+            return False
         except claude_cli.ClaudeCliError as e:
             # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
             # and only surfaced once the retries are genuinely gone — spec
@@ -2932,7 +2972,7 @@ class Daemon:
                     f"a message could not be delivered to this work order after "
                     f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
                     f"received it: {e}")
-            return
+            return False
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
         # would read it twice and pay a second boundary for the privilege.
@@ -2947,6 +2987,7 @@ class Daemon:
         if wo["status"] != "running":
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
+        return True
 
     # -- 5. Neo (answer worker questions) --------------------------------------------
 
@@ -4032,7 +4073,10 @@ class Daemon:
                     # What the OS was itself holding this order for, so a threshold
                     # judges the time it could work rather than the time that passed.
                     # Two indexed reads, no model — `holds.held`.
-                    spans=holds.held(store, wo["id"], now=now))
+                    spans=holds.held(store, wo["id"], now=now),
+                    # Spec 2026-09-27 §3: the alarm and `jarvis inspect` name one turn
+                    # the same way.
+                    turn_starts=store.turn_starts(wo["id"]))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}
@@ -4044,7 +4088,12 @@ class Daemon:
                 # `alarm_id` is purely additive to a payload whose other three keys are
                 # what `already` above matches on. Move the dedupe onto `wo_alarms` and
                 # this re-raises every tick for the life of the turn.
-                row = store.add_alarm(wo["id"], alarm.kind, turn["seq"], alarm.reason)
+                # Spec of 2026-09-27 §2: a note, not an interruption.
+                row = store.add_alarm(
+                    wo["id"], alarm.kind, turn["seq"], alarm.reason,
+                    status=("informational"
+                            if alarm.kind in inspection.INFORMATIONAL_KINDS
+                            else "raised"))
                 store.add_event(wo["id"], "cost_alarm",
                                 {"kind": alarm.kind, "seq": turn["seq"],
                                  "reason": alarm.reason, "alarm_id": row["id"]})
@@ -4052,8 +4101,12 @@ class Daemon:
             # Every alarm goes on the timeline; only the first reaches the attention
             # line, because `alarms` returns them most-actionable first and a flag can
             # carry one sentence.
-            if fresh and not wo["needs_attention"]:
-                store.flag_attention(wo["id"], fresh[0].reason)
+            # AFTER the loop above, so an informational kind still gets its row, its
+            # event and its dedupe memory — it is only kept off the attention line.
+            interrupting = [a for a in fresh
+                            if a.kind not in inspection.INFORMATIONAL_KINDS]
+            if interrupting and not wo["needs_attention"]:
+                store.flag_attention(wo["id"], interrupting[0].reason)
 
     def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise a project's STANDING re-write tax, split by the cause that produced it.
@@ -6330,6 +6383,15 @@ class Daemon:
           from `PR_POLL_STATUSES` reaches the poll (issue #224), so this would otherwise
           fire on every `needs_review` order with a green pull request and tell the user
           the automatic merge declined something it was never asked about.
+
+        **THE ROUND IS PART OF THE KEY**, `_note_autoreview_held`'s medicine for
+        `panel_gave_up` (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+        merging.md §4). Nine poll-reachable codes carry no round number in their reason, so
+        at an unmoved head round N+1's sentence is byte-identical to round N's: without the
+        round it writes nothing, the stored payload still says N, and
+        `ops._automerge_hold_is_stale` then declares a TRUE hold stale (kn-96f47efb). The
+        bound this dedupe exists for is kept — `decide` is deterministic given state, and
+        the round changes only when a round opens.
         """
         from . import automerge
 
@@ -6337,11 +6399,12 @@ class Daemon:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
         key = (str(decision.head_sha or ""), str(decision.code or ""),
-               str(decision.reason or ""))
+               str(decision.reason or ""), int(decision.round_n or 0))
         if not _hold_is_news(store, wo_id, "automerge_held", key,
                              lambda p: (str(p.get("head_sha") or ""),
                                         str(p.get("code") or ""),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        int(p.get("round") or 0))):
             return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,

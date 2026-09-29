@@ -746,6 +746,28 @@ def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
     assert rulings(store, wo["id"]) == [""]
 
 
+def test_a_status_hold_stops_being_shown_once_a_review_is_owed_again(started):
+    """A `status` hold claims the order is in no state this pass acts in, so it is stale
+    exactly when the order now IS in one (2026-09-27-a-stale-merge-hold-is-not-the-reason-
+    a-pr-is-not-merging.md §6). The live shape: an order cancelled mid-ruling, then
+    reopened — every surface went on saying the OS declined to look at the assumption.
+    """
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+    store.set_status(wo["id"], "cancelled")
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_STATUS,
+                     "reason": "the work order is cancelled, not waiting on a review",
+                     "assumption_id": row["id"], "n": 1})
+
+    assert "cancelled" in ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+
+    store.set_status(wo["id"], "needs_review")
+
+    assert ops.autoreview_state(store, store.get_work_order(wo["id"])) is None
+    assert rulings(store, wo["id"]) == [""]
+
+
 # -- the daemon: ruling ----------------------------------------------------------------
 
 
