@@ -946,3 +946,100 @@ def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
     against a checkout, which is not something the reconcile loop should do every tick."""
     assert invariants.check_production_clean in invariants.OS_INVARIANTS
     assert invariants.check_production_clean not in invariants.INVARIANTS
+
+
+# -- a dropped confirmation is the user's again ----------------------------------------
+#
+# §7 and §10.4 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+# an-assumption-for-ever.md. `_os_is_confirming` suppressed the blocker on
+# `provisional_verdict == 'accept'` alone, so an abandoned confirmation left the order
+# unflagged AND unclosable — the worst of both (§1.3).
+
+from jarvis.neo_store import NeoStore                                     # noqa: E402
+from tests.test_autoreview import ROUTINE, ask, park, started             # noqa: E402,F401
+from tests.test_autoreview_confirm import provisional, with_diff          # noqa: E402,F401
+
+ASSUMPTION_BLOCKER = "1 assumption pending your review"
+
+
+def _confirming(started, catalog_file):
+    """A parked order with one pending assumption the OS has an early ACCEPT on."""
+    store, wo = park(started, auto_review=True)
+    # AFTER `park`, which keeps the catalog FILE's `validation.enabled` false on purpose:
+    # `ops.auto_review_at` re-reads the file, and it reads BOTH halves of the switch.
+    for key in ("validation.enabled", "validation.auto_review"):
+        ops.set_config(key, True, project="proj_a",
+                       reason="the panel has been right for a month",
+                       catalog_path=str(catalog_file))
+    (row,) = store.all_assumptions(wo["id"])
+    store.record_provisional(row["id"], verdict="accept", reason="r", model="sonnet")
+    return store, wo, row["id"]
+
+
+def test_a_confirmation_in_flight_suppresses_the_blocker_and_a_dropped_one_does_not(
+        started, catalog_file):
+    """THE SAME ROW, walked from in-flight to spent. Asserting the suppression alone
+    passes against today's code, which suppresses for ever."""
+    store, wo, aid = _confirming(started, catalog_file)
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", wo["id"], "confirm it?", kind="assumption")
+        store.link_assumption_confirmation(aid, q["id"])
+
+        # queued: Neo has it, and the user owes nothing
+        assert ASSUMPTION_BLOCKER not in true_blockers(store,
+                                                       store.get_work_order(wo["id"]))
+        # ...and so is a link that is not there at all — a confirmation still to come
+        store.clear_assumption_confirmation(aid)
+        assert ASSUMPTION_BLOCKER not in true_blockers(store,
+                                                       store.get_work_order(wo["id"]))
+        store.link_assumption_confirmation(aid, q["id"])
+
+        neo.mark(q["id"], "escalated", reason="yours")
+    finally:
+        neo.close()
+
+    blockers = true_blockers(store, store.get_work_order(wo["id"]))
+    assert ASSUMPTION_BLOCKER in blockers
+
+    # ...and INV-ATTENTION-REASON then names it, instead of agreeing with the lie.
+    store.flag_attention(wo["id"], IDLE_NOTIFICATION)
+    violations = [v for v in invariants.check_attention_reason_is_true(store)]
+    assert [v.invariant for v in violations] == ["INV-ATTENTION-REASON"]
+    assert store.get_work_order(wo["id"])["attention_reason"] == ASSUMPTION_BLOCKER
+
+
+def test_a_confirmation_link_nobody_can_resolve_does_not_suppress(started, catalog_file):
+    """FAIL TOWARD THE USER (§7): an unreadable question is not evidence of a confirmation
+    in flight, and the failure direction `check_blocked_work_is_surfaced` calls dangerous
+    is the silent one."""
+    store, wo, aid = _confirming(started, catalog_file)
+
+    store.link_assumption_confirmation(aid, 999_999)      # no such question, ever
+
+    assert ASSUMPTION_BLOCKER in true_blockers(store, store.get_work_order(wo["id"]))
+
+
+def test_a_transient_drop_strands_no_question_in_neo_attention(started):
+    """§4.3's PAIR, and the reason the drop site supersedes BEFORE it clears: a cleared
+    link makes the question unresolvable through `assumption_for_question`, and
+    unresolvable is deliberately left alone — so an `escalated` question plus a cleared
+    link would sit in `ops._neo_attention` for ever, which is INV-NEO-ESCALATION-STALE's
+    exact failure re-introduced by the fix."""
+    from jarvis.neo_store import USER_HELD_Q_STATUSES
+
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    store.set_status(wo["id"], "running", trigger="test")
+
+    started._neo_drain()                                  # noqa: SLF001
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] is None
+    neo = NeoStore()
+    try:
+        held = neo.list_questions(statuses=USER_HELD_Q_STATUSES)
+    finally:
+        neo.close()
+    assert [q["id"] for q in held if q["kind"] == "assumption"] == []
+    assert list(invariants.check_neo_escalations_are_live(store)) == []

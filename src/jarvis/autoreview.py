@@ -159,6 +159,32 @@ HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
 
+#: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
+#: for-ever.md §5 and §6. `round_open` is `decide_confirm`'s alone — the confirmation
+#: judges the DELIVERED RESULT, so a round the panel has not finished may be about to send
+#: that result back (§5.2, and the ASK pass keeps its licence to arm on a pending round).
+#: `confirm_spent` is `confirming` SPLIT: one code with a conditional suppression would
+#: make `daemon._holds_not_recorded`'s answer depend on state it cannot see. The live one
+#: stays suppressed, the spent one is VISIBLE — it is the user's, and nothing else on the
+#: record says so.
+HELD_ROUND_OPEN = "round_open"
+HELD_CONFIRM_SPENT = "confirm_spent"
+
+#: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1). A
+#: code is here when the drop is a fact that can clear with the user doing nothing AND
+#: says nothing about whether the assumption is theirs to decide. An ALLOWLIST, not
+#: "everything but the three that stay": a blocklist admits a new code the day somebody
+#: writes a new hold, and this set governs whether the OS spends another model call.
+#: `settled` (no reader — the drop site returns earlier) and `evidence_secret` (a
+#: statement that the row is the user's, and a second chance to copy a secret into the
+#: question store) were examined and refused.
+TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
+                             HELD_OBJECTION_IN_FLIGHT})
+
+#: A round's outcome that means the panel has NOT finished with it. `pending` is the
+#: column's default on an open round and `''` is a row that never got one.
+_UNRESOLVED_OUTCOMES = ("", "pending")
+
 #: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
 #: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
 #: and asserts them at the write.
@@ -877,6 +903,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    refusal_answered: bool = True,
                    objections_outstanding: bool = False,
                    unreachable_question_ids: Collection[int] = (),
+                   confirmation_open: bool = True,
                    stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
 
@@ -893,7 +920,16 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
       `object` approved NOTHING, so there is nothing to confirm and no question is asked
       on one: the user decides it, with the objection in front of them.
     * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
-      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.**
+      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.** It splits
+      in two on `confirmation_open` (2026-09-28 spec §6): a question Neo still holds is
+      `confirming`, the pass working and suppressed; one that is no longer open is
+      `confirm_spent`, the row the user owes a decision on with nothing else saying so.
+    * A VALIDATION ROUND THE PANEL HAS NOT FINISHED — `round_open`, this function's
+      alone. The ask pass may arm on a pending round (`decide`'s docstring) because it
+      judges a sentence the worker wrote; this one interpolates the DIFF, and a round
+      still open means that diff may be about to be sent back (2026-09-28 spec §5.2).
+      A `round_n` of 0 is no round at all and does NOT hold: a project with validation
+      off behaves exactly as it did.
     * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
       Means NOT YET and costs nothing: retried next tick. Without it the two passes race
       on one assumption, one settling it while the other has a message to the worker in
@@ -901,7 +937,15 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
     `unreachable_question_ids` covers `confirm_question_id` as well as condition 6, and it
     means what it means in `decide`: the id is a question nobody will ever answer, so a
-    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4).
+    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4). It is
+    checked BEFORE `confirmation_open`, so a `failed` question is asked again rather than
+    reported as spent — an outage is not a decision.
+
+    `confirmation_open` is the caller's fact, derived the way `unreachable_question_ids`
+    is (`Daemon._question_liveness`) because this function is pure: open means the
+    question's status is one of `neo_store.NEO_HELD_Q_STATUSES`. `escalated` and
+    `answered` are NOT open — Neo is finished with it either way. The default is True, so
+    every existing caller keeps today's behaviour.
 
     **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
     own docstring documents for condition 6. `neo_question_id` points at the EARLY
@@ -923,9 +967,23 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      **fields)
     confirming = int(assumption.get("confirm_question_id") or 0)
     if confirming and confirming not in unreachable_question_ids:
+        if not confirmation_open:
+            # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's
+            # link is driven by `os_ruling.neo_question_id` and a hold payload has none.
+            return _held(HELD_CONFIRM_SPENT,
+                         f"assumption #{n} is yours — the OS asked Neo to confirm its "
+                         f"early reading (question {confirming}) and that question is no "
+                         f"longer open", **fields)
         return _held(HELD_CONFIRMING,
                      f"assumption #{n} is already with Neo to confirm "
                      f"(question {confirming})", **fields)
+    if round_n > 0 and str(round_outcome or "").lower() in _UNRESOLVED_OUTCOMES:
+        # 2026-09-28 spec §5.1. The round rides on the decision: it is part of the
+        # dedupe key, so the NEXT round's hold is written too.
+        return _held(HELD_ROUND_OPEN,
+                     f"the validation panel has not finished round {round_n} — the "
+                     f"result this confirms against may be about to be sent back",
+                     round=round_n, **fields)
     if objections_outstanding:
         return _held(HELD_OBJECTION_IN_FLIGHT,
                      "an objection on this work order has not reached the worker or "

@@ -99,6 +99,29 @@ def test_every_other_round_outcome_leaves_the_assumption_reviewable(outcome):
     assert decide(round_outcome=outcome).armed
 
 
+@pytest.mark.parametrize("outcome", ["", "pending"])
+def test_an_open_round_does_not_hold_the_ask_pass(outcome):
+    """§5.2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
+    assumption-for-ever.md, pinned so a later reader cannot "fix" the asymmetry by
+    symmetry: the ASK pass judges the assumption — a sentence the worker wrote — and a
+    panel verdict does not change it. Only the CONFIRMATION pass reads the diff."""
+    assert decide(round_n=1, round_outcome=outcome).armed
+    assert autoreview.decide_early(assumption(), {**WO, "status": "running"}, cfg(),
+                                   round_n=1, round_outcome=outcome).armed
+
+
+def test_the_open_round_hold_is_unreachable_from_either_ask_function():
+    """The pair: `round_open` is `decide_confirm`'s alone, so neither ask function can
+    produce it whatever the round says."""
+    for outcome in ("", "pending", "passed", "rejected", "escalated"):
+        for n in (0, 1, 3):
+            assert decide(round_n=n,
+                          round_outcome=outcome).code != autoreview.HELD_ROUND_OPEN
+            assert autoreview.decide_early(
+                assumption(), {**WO, "status": "running"}, cfg(), round_n=n,
+                round_outcome=outcome).code != autoreview.HELD_ROUND_OPEN
+
+
 def test_a_refusal_the_worker_has_not_answered_holds_everything_behind_it():
     """A refused assumption is guidance the worker has not answered, and settling its
     siblings would land the very decision the user turned down."""
@@ -744,6 +767,32 @@ def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
     settled_round(store, wo["id"], "passed")
 
     assert rulings(store, wo["id"]) == [""]
+
+
+def test_a_confirm_spent_hold_survives_the_panel_freshness_filter(started):
+    """§8 row 5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+    an-assumption-for-ever.md: the freshness filter is `panel_gave_up`'s alone. A
+    `HELD_CONFIRM_SPENT` hold is about a spent NEO QUESTION, not about a round, so a
+    later passed round says nothing about it — dropping it would put the stale settle-site
+    sentence back on every surface, which is the defect this spec fixes."""
+    store, wo = park(started, auto_review=True, outcome="passed")
+    (row,) = store.all_assumptions(wo["id"])
+    payload = {"code": autoreview.HELD_CONFIRM_SPENT,
+               "reason": "assumption #1 is yours — the OS asked Neo to confirm its early "
+                         "reading (question 920) and that question is no longer open",
+               "assumption_id": row["id"], "n": 1}
+    store.add_event(wo["id"], "autoreview_held", payload)
+
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    assert not ops._panel_hold_is_stale(latest, payload)
+    assert not ops._stale_panel_hold(store, wo["id"])("autoreview_held", payload)
+
+    # ...and the hold is what the readers render, on both surfaces.
+    (line,) = rulings(store, wo["id"])
+    assert "question 920" in line and "no longer open" in line
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))
+    assert state["code"] == autoreview.HELD_CONFIRM_SPENT
+    assert "question 920" in state["line"]
 
 
 # -- the daemon: ruling ----------------------------------------------------------------

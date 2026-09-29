@@ -153,6 +153,74 @@ def test_the_set_reaches_the_conditions_decide_owns_too():
     assert confirm(assumption=a, unreachable_question_ids=(77, 41)).armed
 
 
+# -- a dropped confirmation must not hold an assumption for ever -----------------------
+#
+# docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
+# for-ever.md. §4 clears the link at the settle site on a TRANSIENT drop, §5 holds the
+# pass while a round is open, §6 splits `confirming` from `confirm_spent`.
+
+
+def test_the_transient_drop_list_is_an_allowlist_of_exactly_three_codes():
+    """§4.1, asserted WHOLE so a fourth code is a visible edit rather than an accident.
+
+    The two rejected candidates are named too: `settled` has no reader (the drop site
+    returns earlier) and `evidence_secret` says the assumption is the user's."""
+    assert autoreview.TRANSIENT_DROPS == frozenset({
+        autoreview.HELD_STATUS,
+        autoreview.HELD_REFUSAL_UNANSWERED,
+        autoreview.HELD_OBJECTION_IN_FLIGHT,
+    })
+    for code in (autoreview.HELD_HIGH_STAKES, autoreview.HELD_PANEL_GAVE_UP,
+                 autoreview.HELD_DISABLED, autoreview.HELD_EVIDENCE_SECRET,
+                 autoreview.HELD_SETTLED):
+        assert code not in autoreview.TRANSIENT_DROPS
+
+
+def test_a_confirmation_question_nobody_is_answering_any_more_is_the_users():
+    """§6: the link is set and the question is closed, so nothing is in flight and the
+    hold has to say so — with the question id IN THE TEXT (§8 row 9)."""
+    a = judged(confirm_question_id=920)
+
+    spent = confirm(assumption=a, confirmation_open=False)
+
+    assert spent.code == autoreview.HELD_CONFIRM_SPENT
+    assert "920" in spent.reason and "is yours" in spent.reason
+
+
+def test_a_confirmation_genuinely_in_flight_still_reads_as_the_pass_working():
+    """The default keeps every existing caller on today's suppressed code."""
+    a = judged(confirm_question_id=920)
+
+    assert confirm(assumption=a).code == autoreview.HELD_CONFIRMING
+    assert confirm(assumption=a, confirmation_open=True).code == autoreview.HELD_CONFIRMING
+
+
+def test_a_dead_question_is_re_asked_rather_than_reported_as_spent():
+    """§6: `unreachable_question_ids` is checked FIRST — a `failed` question is an outage
+    (2026-09-26 spec §4), not a decision handed back."""
+    a = judged(confirm_question_id=920)
+
+    assert confirm(assumption=a, confirmation_open=False,
+                   unreachable_question_ids=(920,)).armed
+
+
+def test_a_validation_round_still_open_holds_the_confirmation():
+    """§5.1: the result this confirms against may be about to be sent back. The round
+    travels on the decision, because it is part of the dedupe key (§5.3)."""
+    held = confirm(round_n=2, round_outcome="pending")
+
+    assert held.code == autoreview.HELD_ROUND_OPEN and held.round == 2
+    assert "round 2" in held.reason
+    assert confirm(round_n=2, round_outcome="").code == autoreview.HELD_ROUND_OPEN
+
+
+def test_a_resolved_round_and_no_round_at_all_both_arm():
+    """The pair: a project with validation off has no round, and must behave exactly as
+    it does today."""
+    assert confirm(round_n=2, round_outcome="passed").armed
+    assert confirm(round_n=0, round_outcome="").armed
+
+
 # -- the daemon: asking the second question --------------------------------------------
 
 
@@ -395,6 +463,123 @@ def test_a_confirmed_assumption_settles_exactly_as_an_ordinary_acceptance_does(s
     assert event["neo_question_id"] == confirmation["id"]
     assert event["provisional_reason"] == PROVISIONAL_REASON
     assert event["provisional_verdict"] == "accept"
+
+
+def test_a_confirmation_dropped_because_the_status_flipped_is_asked_again(started):
+    """THE #833 SHAPE — wo-9b70ddec, wo-3312682f, wo-672bd388. The panel rejected the
+    round 19 seconds after the confirmation was filed, the settle site dropped the ruling
+    on `status`, and the link it left behind held the assumption for ever (§1.1).
+
+    §4: a transient drop clears the link and leaves the spent question CLOSED — never
+    `escalated`, which is what keeps it off `/neo` once nothing can resolve it back to an
+    assumption (§4.3) — and the next parked tick confirms against the FINAL delivered
+    diff. `neo.drain_queue` has already recorded Neo's real answer by the time the settle
+    site re-checks, so `supersede`'s open-status guard leaves that verdict alone: the
+    claim here is the STATUS, not who is credited with the answer.
+    """
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    (first,) = questions()
+    store.set_status(wo["id"], "running", trigger="test")
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] is None
+    spent = next(q for q in questions() if q["id"] == first["id"])
+    assert spent["status"] == "answered"
+    assert spent["status"] not in ("escalated", "queued", "answering")
+    (escalated,) = events(store, wo["id"], "autoreview_escalated")
+    assert escalated["dropped"] == autoreview.HELD_STATUS
+
+    store.set_status(wo["id"], "needs_review", trigger="test")
+    ask(started, store)
+
+    (second,) = [q for q in questions() if q["id"] != first["id"]]
+    assert "opened a PR" in second["question"]          # the delivered result, again
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == second["id"]
+
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "accepted" and row["decided_by"] == "neo"
+    (confirmed,) = events(store, wo["id"], "autoreview_confirmed")
+    assert confirmed["neo_question_id"] == second["id"]
+
+
+def test_a_high_stakes_drop_keeps_its_link_and_reads_as_the_users(started):
+    """§4.2: the drop says the assumption is the USER'S, so re-asking would lobby them
+    once per reconcile tick. The link stays, the question stays `escalated`, and §6's
+    visible hold is what stops the record showing the stale settle-site sentence."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    row = provisional(store, wo)
+    ask(started, store)
+    (first,) = questions()
+    # Condition 7 is re-run against the row AS IT STANDS when the ruling lands.
+    store.conn.execute("UPDATE assumptions SET content=? WHERE id=?",
+                       (SECRET, row["id"]))
+
+    drain(started)
+
+    assert store.all_assumptions(wo["id"])[0]["confirm_question_id"] == first["id"]
+    assert next(q for q in questions() if q["id"] == first["id"])["status"] == "escalated"
+
+    ask(started, store)
+    ask(started, store)
+
+    assert [q["id"] for q in questions()] == [first["id"]]
+    held = events(store, wo["id"], "autoreview_held")
+    assert held[-1]["code"] == autoreview.HELD_CONFIRM_SPENT
+    assert str(first["id"]) in held[-1]["reason"]
+    assert "not waiting on a review" not in held[-1]["reason"]
+    # §8 rows 2 and 3: both surfaces show the new sentence, and the question id is in the
+    # prose because a hold payload carries no `neo_question_id` for the template to link.
+    enriched = ops.assumptions_with_rulings(store, wo["id"])[0]
+    line = ops.assumption_ruling_line(enriched)
+    assert str(first["id"]) in line and "not waiting on a review" not in line
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))["line"]
+    assert str(first["id"]) in state and "not waiting on a review" not in state
+
+    before = len(held)
+    ask(started, store)
+    assert len(events(store, wo["id"], "autoreview_held")) == before
+
+
+def test_a_validation_round_still_open_files_no_confirmation_at_the_daemon_either(started):
+    """§5: the confirmation reads the DIFF, and an open round means that diff may be about
+    to be sent back. Recorded rather than suppressed (§5.3), and asked once it resolves."""
+    store, wo = with_diff(started, outcome="",
+                          assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+
+    ask(started, store)
+
+    assert questions() == []
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["code"] == autoreview.HELD_ROUND_OPEN and held["round"] == 1
+
+    store.close_validation_round(
+        store.latest_validation_round(wo_id=wo["id"])["id"], "passed", "")
+    ask(started, store)
+
+    assert len(questions()) == 1
+
+
+def test_a_confirmation_nothing_flips_under_settles_on_one_ask(started):
+    """THE wo-7c7347e1 CONTRAST (§1.4): the path that always worked pays nothing for any
+    of this — one confirmation question, no hold of either new code."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+
+    drain(started)
+
+    asked = events(store, wo["id"], "autoreview_asked")
+    assert [e.get("confirm") for e in asked] == [True]
+    codes = held_codes(store, wo["id"])
+    assert autoreview.HELD_CONFIRM_SPENT not in codes
+    assert autoreview.HELD_ROUND_OPEN not in codes
+    assert store.all_assumptions(wo["id"])[0]["status"] == "accepted"
 
 
 def test_a_verdict_that_does_not_confirm_leaves_the_assumption_with_the_user(started):
