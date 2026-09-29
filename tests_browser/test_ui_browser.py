@@ -390,6 +390,24 @@ def test_dashboard_refreshes_without_reloading_the_page(page, server):
     )
 
 
+def test_the_fleet_brake_from_the_dashboard(page, server):
+    """Pause from the form, the banner appears (and on other pages), resume lifts it."""
+    page.goto(server)
+    assert page.locator(".brake").count() == 0
+    page.fill("form[action='/fleet/pause'] input[name='reason']", "browser brake")
+    page.click("form[action='/fleet/pause'] button")
+    banner = page.locator(".brake")
+    assert "FLEET PAUSED" in banner.inner_text()
+    assert "browser brake" in banner.inner_text()
+    assert page.locator("form[action='/fleet/pause']").count() == 0
+    page.goto(f"{server}/inbox")
+    assert "FLEET PAUSED" in page.locator(".brake").inner_text()
+    page.click("form[action='/fleet/resume'] button")
+    assert page.url.endswith("/inbox")
+    assert page.locator(".brake").count() == 0
+    assert ops.os_status()["fleet"]["paused"] is False
+
+
 def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, project):
     page.goto(server)
     form = "form[action='/wo/create']"
