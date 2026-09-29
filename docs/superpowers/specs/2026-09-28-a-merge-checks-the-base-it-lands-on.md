@@ -566,12 +566,17 @@ variable. Left set, it withdraws a HEALTHY pending request on the next tick — 
 where the cheap read over-reports for ever — and the work order livelocks: superseded, re-filed,
 superseded again. Only the fetched answer may close a request.
 
-**D, cont. — the superseded-request reason names a FETCHED tip, never `pr.base_oid`.** `ops.CatchUp` gains
+**D, cont. — the hold AND the supersede name a FETCHED tip, never `pr.base_oid`.** `ops.CatchUp` gains
 `base_tip: str = ""`, carrying `origin/<base>` as read locally after the fetch;
 `Daemon._supersede_stale_request` takes it as a keyword and quotes a commit only when one is
 passed. `approval["base_oid"]` is still quoted — a recorded fact about the request, not a cached
 read. Quoting `pr.base_oid` would hand the user the very number this spec establishes is
-untrustworthy.
+untrustworthy. The hold sentence broke the same rule: `automerge.held_base_moved` took `base_oid`
+as the freshly-read tip but fell back to `pr.base_oid` when a caller passed none, and two of its
+three daemon call sites passed none — so the user-facing hold quoted the cached read, including a
+`CATCH_UP_DONE` sentence claiming the branch had caught up with it. The fallback is gone: no
+fetched tip means the sentence names no commit at all, and no placeholder stands in. All three
+call sites now pass `ops.CatchUp.base_tip`.
 
 **D, cont. — `gates.GRANT_TTL_SECONDS` is TESTED, not just argued about.** §6 keeps the argument that a TTL
 would not have prevented gate 308 — grant spent 4.3h after approval, so "inside the 3600s window"

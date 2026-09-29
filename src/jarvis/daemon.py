@@ -5294,8 +5294,10 @@ class Daemon:
                                                                  "awaiting_case"):
                         self._supersede_stale_request(store, filed, pr,
                                                       base_tip=caught.base_tip)
+                    # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
                     self._note_automerge_held(
-                        store, wo_id, automerge.held_base_moved(caught, pr))
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
                     return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
@@ -5323,8 +5325,10 @@ class Daemon:
             # up to date" and fell through to `propose` — gate 308's defect.
             caught = self._catch_up_with_base(project, store, wo, pr)
             if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
-                self._note_automerge_held(store, wo_id,
-                                          automerge.held_base_moved(caught, pr))
+                # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                self._note_automerge_held(
+                    store, wo_id,
+                    automerge.held_base_moved(caught, pr, caught.base_tip))
                 return
         if approval is not None and approval["status"] != "approved":
             # A PENDING REQUEST WHOSE BASE HAS MOVED IS SUPERSEDED, NEVER ANSWERED (spec

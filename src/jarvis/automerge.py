@@ -239,14 +239,18 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
     sentence differs per outcome — and `EXHAUSTED`'s is the one that has to be
     unambiguous: it is the only outcome that never clears on its own.
 
-    `base_oid` is the freshly-read tip when the caller has one; `pr.base_oid` is GitHub's
-    cached reading and only the fallback (Amendment B).
+    `base_oid` is the freshly-read tip. `pr.base_oid` is GitHub's cached reading, which
+    spec 2026-09-28 §3.1 establishes is untrustworthy — it is NEVER quoted here, not even
+    as a fallback, and no placeholder commit stands in for it. With no fetched tip the
+    sentence names no commit at all. Same rule as `Daemon._supersede_stale_request`.
     """
     from . import ops
 
     base = str(getattr(pr, "base_ref", "") or "the base")
-    oid = (base_oid or str(getattr(pr, "base_oid", "") or ""))[:10] or "an unknown commit"
-    moved = f"`{base}` has moved to {oid}"
+    oid = base_oid[:10]
+    moved = f"`{base}` has moved to {oid}" if oid else f"`{base}` has moved"
+    caught = (f"caught up with `{base}` at {oid}" if oid
+              else f"caught up with `{base}`")
     reason = {
         ops.CATCH_UP_DEFERRED:
             f"{moved}; the branch is being caught up as soon as "
@@ -260,7 +264,7 @@ def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
             f"{moved} and the update did not run: "
             f"{catch_up.reason or 'the OS could not say why'}. The OS retries next tick",
         ops.CATCH_UP_DONE:
-            f"caught up with `{base}` at {oid}; CI is running on the new head",
+            f"{caught}; CI is running on the new head",
     }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
     return _held(HELD_BASE_MOVED, reason,
                  head_sha=str(getattr(pr, "head_oid", "") or ""))

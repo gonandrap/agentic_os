@@ -290,3 +290,40 @@ def test_the_propose_supersede_loop_is_bounded_and_ends_in_one_exhausted_hold(
             for e in store.events_of_kind(wo["id"], "automerge_held")]
     assert held and f"the cap ({ops.CATCH_UP_MAX})" in held[-1]["reason"]
     assert merges(fake_gh) == []
+
+
+# -- §3.4: the hold names the FETCHED tip, never `pr.base_oid` -------------------------
+
+
+def test_the_hold_on_a_refused_catch_up_names_the_fetched_tip_not_githubs(
+        started, project, fake_gh, local):
+    """§3.1: GitHub's cached `baseRefOid` is untrustworthy, so it may not be quoted at a
+    user. GitHub says BASE_2; `origin/main` is really at BASE_3."""
+    opt_in(started)
+    store, wo = parked(project)
+    green_pr(fake_gh)
+    poll(started, store)
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
+                   base_oid=BASE_2)
+    local["tip"] = BASE_3
+    poll(started, store)
+
+    held = [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "automerge_held")]
+    assert held, "the refused catch-up wrote no hold"
+    assert BASE_3[:10] in held[-1]["reason"]
+    assert BASE_2[:10] not in held[-1]["reason"]
+
+
+def test_held_base_moved_without_a_fetched_tip_names_no_commit_at_all():
+    """No fetched read means no commit in the sentence — not `pr.base_oid`, and not a
+    placeholder either."""
+    catch_up = ops.CatchUp(pr=None, outcome=ops.CATCH_UP_FAILED, reason="fetch failed")
+    pr = type("PR", (), {"base_ref": "main", "base_oid": BASE_2, "head_oid": JUDGED})()
+
+    reason = automerge.held_base_moved(catch_up, pr).reason
+
+    assert BASE_2[:10] not in reason and BASE_2 not in reason
+    assert "unknown commit" not in reason
+    assert "`main` has moved" in reason
