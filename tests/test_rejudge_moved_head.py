@@ -1192,3 +1192,142 @@ def test_a_fix_after_a_rejected_rebind_is_itself_a_rebind(
     judge(fleet, store, Panel("rejected"))               # rebind 2 — the last one
     assert store.uncounted_validation_rounds(wo_id=wo["id"]) == ops.REBIND_MAX
     assert store.get_work_order(wo["id"])["status"] == "needs_review"
+
+
+# -- a rework the USER asked for: the second uncounted cause ---------------------------
+# Neo question 973: "a separate 'user_rework' cause, one uncounted round per user
+# rejection, no REBIND_MAX, with its own feedback wording and exhausted blocker".
+# wo-299daf2e: rounds 1 and 2 passed, the USER rejected on review, the worker delivered
+# the rework and merged main, and the OS declined the re-judge for the round cap — so
+# the rework the user asked for was never judged.
+
+
+def _user_rejected(store, wo, feedback: str = "not what I asked for") -> None:
+    """What `ops.review_work_order(accept=False)` leaves on the record."""
+    store.add_event(wo["id"], "reviewed",
+                    {"accepted": False, "count": 1, "feedback": feedback})
+
+
+def test_a_rework_the_user_asked_for_is_judged_past_the_cap(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """THE LIVE CASE, wo-299daf2e. The head moved by a chain that is NOT all merges of
+    the base, so `rebind` is False and the ordinary arm declines on `max_rounds` — and
+    the rework is the USER'S, so a round must open whatever the budget says."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    out = ops.rejudge_moved_head(store, project, wo, project="proj_a",
+                                 cfg=_cfg(fleet), decision=_moved(), rebind=False)
+
+    assert out is not None and not out["declined"]
+    assert store.events_of_kind(wo["id"], invariants.REJUDGE_DECLINED_EVENT) == []
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert int(row["uncounted"]) == 1
+    assert row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 3
+
+
+def test_one_free_round_per_user_rejection_and_no_more(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The predicate self-terminates: once the user-rework round has SETTLED it is the
+    newest settled round, so the next moved head past the cap is declined exactly as it
+    is today."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=False)
+    row = store.latest_validation_round(wo_id=wo["id"])
+    store.set_validation_head(row["id"], PUSHED)
+    store.close_validation_round(row["id"], "passed", "")
+    store.set_status(wo["id"], "waiting_pr_merge")
+
+    artifact(fake_gh, head_oid=AGAIN)
+    out = ops.rejudge_moved_head(store, project, store.get_work_order(wo["id"]),
+                                 project="proj_a", cfg=_cfg(fleet),
+                                 decision=_moved(AGAIN), rebind=False)
+
+    assert out is not None and out["declined"]
+    assert out["cause"] == ops.REJUDGE_BUDGET_SPENT
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.USER_REWORK_CAUSE) == 1
+
+
+def test_the_two_uncounted_causes_never_spend_each_other(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """`REBIND_MAX` bounds the OS's own merge re-judgements and NOTHING else: a work
+    order that has spent both rebinds still gets the round the user's rework needs, and
+    the rework round does not count towards the rebind bound."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    for head in (PUSHED, AGAIN):
+        artifact(fake_gh, head_oid=head)
+        ops.rejudge_moved_head(store, project, store.get_work_order(wo["id"]),
+                               project="proj_a", cfg=_cfg(fleet),
+                               decision=_moved(head), rebind=True)
+        row = store.latest_validation_round(wo_id=wo["id"])
+        store.set_validation_head(row["id"], head)
+        store.close_validation_round(row["id"], "passed", "")
+        store.set_status(wo["id"], "waiting_pr_merge")
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.REBIND_CAUSE) == ops.REBIND_MAX
+
+    _user_rejected(store, wo)
+    third = "dddd1111dddd2222dddd3333dddd4444dddd5555"
+    artifact(fake_gh, head_oid=third)
+    out = ops.rejudge_moved_head(store, project, store.get_work_order(wo["id"]),
+                                 project="proj_a", cfg=_cfg(fleet),
+                                 decision=_moved(third), rebind=True)
+
+    assert out is not None and not out["declined"]
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.REBIND_CAUSE) == ops.REBIND_MAX
+    line = ops.round_line(ops.validation_rounds(store, wo_id=wo["id"])[-1])
+    assert "uncounted" in line and ops.USER_REWORK_CAUSE in line
+
+
+def test_a_worker_re_delivery_of_a_user_rework_costs_no_round(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The worker coming back through `jarvis wo finish` gets the same free round: the
+    rework is the user's whichever route re-opens the panel."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="did the rework", cfg=_cfg(fleet))
+
+    assert row is not None and int(row["uncounted"]) == 1
+    assert row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 3
+
+
+def test_a_fix_after_a_rejected_user_rework_round_is_an_ordinary_round(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """UNLIKE a rebind, whose fix is itself a rebind: the bound here is ONE round per
+    user rejection, so the worker's next attempt is charged like any other."""
+    fleet = boot(tmp_path, project, max_rounds=5)
+    store, wo = parked(project, rounds=1)
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+    row = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                    declared="did the rework", cfg=_cfg(fleet))
+    assert row["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    store.close_validation_round(row["id"], "rejected", "still no")
+    counted = store.counted_validation_rounds(wo_id=wo["id"])
+
+    again = ops.submit_for_validation(store, project, store.get_work_order(wo["id"]),
+                                      declared="fixed what the panel said",
+                                      cfg=_cfg(fleet))
+
+    assert again is not None and int(again["uncounted"]) == 0
+    assert again["uncounted_cause"] == ""
+    assert int(again["round"]) == int(row["round"]) + 1
+    store.close_validation_round(again["id"], "passed", "")
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == counted + 1

@@ -844,6 +844,10 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- reasoning is (spec
     -- docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.1).
     uncounted INTEGER NOT NULL DEFAULT 0,
+    -- WHICH of the two causes exempted it — `ops.REBIND_CAUSE` or
+    -- `ops.USER_REWORK_CAUSE`. '' on an ordinary round. Also in ADDED_COLUMNS, where
+    -- the reasoning is.
+    uncounted_cause TEXT NOT NULL DEFAULT '',
     -- WHY this round is `failed` when nothing failed: a `VALIDATION_HOLDING_CAUSES`
     -- token, NULL on every other close. Also in ADDED_COLUMNS, where the reasoning is.
     hold_cause TEXT,
@@ -1291,6 +1295,17 @@ ADDED_COLUMNS = {
         # before this column existed, so no backfill. NOT NULL so there is one spelling
         # of "counts" rather than two.
         "uncounted": "INTEGER NOT NULL DEFAULT 0",
+        # WHICH CAUSE exempted this round. Two of them now: `ops.REBIND_CAUSE`, the
+        # OS's own merge re-judgement, bounded by `ops.REBIND_MAX`; and
+        # `ops.USER_REWORK_CAUSE`, one free round per USER rejection, bounded by the
+        # rejections themselves (Neo question 973). SEPARATE BOUNDS, so the counter has
+        # to be able to tell them apart — a merge re-judge that spent the round a
+        # user's rework needs is the defect on wo-299daf2e.
+        #
+        # '' MEANS "AN ORDINARY ROUND", which every row written before this column is:
+        # they all carry `uncounted=0`, so the default is inert and there is nothing to
+        # backfill.
+        "uncounted_cause": "TEXT NOT NULL DEFAULT ''",
         # WHY A `failed` ROUND IS NOT A FAILURE — `VALIDATION_CI_CAUSE` while GitHub is
         # still running the checks, `VALIDATION_HELD_CAUSE` while the account's usage
         # window is spent. The cause was already on the `validation_failed` event, which
@@ -4317,7 +4332,8 @@ class ProjectStore:
                               round: int | None = None,
                               config_version: str | None = None,
                               forced_reason: str = "",
-                              uncounted: bool = False) -> dict[str, Any]:
+                              uncounted: bool = False,
+                              uncounted_cause: str = "") -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -4337,8 +4353,9 @@ class ProjectStore:
         `forced_reason` is set only by `ops.force_validation`, and its emptiness is what
         every other surface reads as "a submission opened this".
 
-        `uncounted` marks a REBIND — a round exempt from `validation.max_rounds`; see
-        the column's own note in `ADDED_COLUMNS`.
+        `uncounted` marks a round exempt from `validation.max_rounds` and
+        `uncounted_cause` says WHICH exemption — the two have separate bounds; see the
+        columns' own notes in `ADDED_COLUMNS`.
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -4351,10 +4368,11 @@ class ProjectStore:
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
                                                    summary, evidence, pr_url,
                                                    config_version, forced_reason,
-                                                   uncounted)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                                   uncounted, uncounted_cause)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
-                 config_version, forced_reason, 1 if uncounted else 0),
+                 config_version, forced_reason, 1 if uncounted else 0,
+                 uncounted_cause if uncounted else ""),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
@@ -4415,17 +4433,26 @@ class ProjectStore:
         return int(row["n"] or 0)
 
     def uncounted_validation_rounds(self, *, wo_id: str | None = None,
-                                    fo_id: str | None = None) -> int:
-        """How many REBINDS this subject has had — the bound `ops.REBIND_MAX` applies.
+                                    fo_id: str | None = None,
+                                    cause: str | None = None) -> int:
+        """How many rounds this subject has had outside the budget, by cause.
 
-        Every row, settled or not: a rebind in flight has already been paid for, and a
-        bound that ignored it would open a second panel on the next tick.
+        Every row, settled or not: an uncounted round in flight has already been paid
+        for, and a bound that ignored it would open a second panel on the next tick.
+
+        `cause` narrows to ONE exemption, and the `ops.REBIND_MAX` arms all pass
+        `ops.REBIND_CAUSE`: the two causes have separate bounds, so a merge re-judge
+        that consumed the round a user's rework needs — wo-299daf2e — is exactly what
+        an unfiltered count would do (Neo question 973). None counts both, which is
+        what a reader asking "how many rounds did nobody pay for" wants.
         """
         col, subject_id = self._subject(wo_id, fo_id)
+        where, args = "", [subject_id]
+        if cause is not None:
+            where, args = " AND uncounted_cause=?", [subject_id, cause]
         row = self.conn.execute(
             f"SELECT COUNT(*) AS n FROM validation_rounds "
-            f"WHERE {col}=? AND uncounted=1",
-            (subject_id,)).fetchone()
+            f"WHERE {col}=? AND uncounted=1{where}", args).fetchone()
         return int(row["n"] or 0)
 
     def get_validation_round(self, round_id: int) -> dict[str, Any] | None:

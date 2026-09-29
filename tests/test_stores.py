@@ -482,3 +482,31 @@ def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
     assert row["observability"] is None
     assert observability.level_for(row, ObservabilityConfig(level="full")) == "full"
     assert observability.records_context(row, ObservabilityConfig()) is True
+
+
+def test_an_uncounted_round_records_why_it_is_uncounted(project):
+    """Two causes now open a round outside the budget — the OS's own merge rebind and
+    the rework a USER asked for — and each has its own bound, so a counter that could
+    not tell them apart would let one spend the other's budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md,
+    Neo question 973)."""
+    from jarvis import ops
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    ordinary = store.open_validation_round(wo_id=wo["id"], fingerprint="f1")
+    rebind = store.open_validation_round(wo_id=wo["id"], fingerprint="f2",
+                                         uncounted=True,
+                                         uncounted_cause=ops.REBIND_CAUSE)
+    rework = store.open_validation_round(wo_id=wo["id"], fingerprint="f3",
+                                         uncounted=True,
+                                         uncounted_cause=ops.USER_REWORK_CAUSE)
+
+    assert ordinary["uncounted_cause"] == ""
+    assert rebind["uncounted_cause"] == ops.REBIND_CAUSE
+    assert rework["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == 2
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.REBIND_CAUSE) == 1
+    assert store.uncounted_validation_rounds(
+        wo_id=wo["id"], cause=ops.USER_REWORK_CAUSE) == 1
