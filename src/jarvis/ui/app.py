@@ -943,6 +943,14 @@ def create_app() -> FastAPI:
                  "status_label": feature_status_label("improvement", row["status"])}
                 for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
                                                      kind="improvement")]
+            # A third kind beside them, on the same rule and for the same reason (§2.9 of
+            # docs/superpowers/specs/2026-09-27-investigation-orders.md): `planning` here
+            # reads `investigating`, and only LIVE ones are worth a line.
+            investigations = [
+                {**row,
+                 "status_label": feature_status_label("investigation", row["status"])}
+                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind="investigation")]
             fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
@@ -986,6 +994,7 @@ def create_app() -> FastAPI:
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features, fo_settled=fo_settled,
                       improvements=improvements,
+                      investigations=investigations,
                       issue_board=issue_board,
                       fo_revealed=fo_revealed)
 
@@ -1087,6 +1096,25 @@ def create_app() -> FastAPI:
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         return render(request, "improvement_order.html", io=detail,
+                      project=detail["project"], error=error)
+
+    @app.get("/inv/{name}/{inv_id}", response_class=HTMLResponse)
+    def investigation_order(request: Request, name: str, inv_id: str, error: str = ""):
+        """An investigation's page — §2.9 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md.
+
+        The classification and the subject first, then the root cause, the evidence and
+        what was filed: a diagnosis is only readable next to what it was quoted from.
+        Everything comes off `ops.show_investigation_order` — a second resolution here
+        would make the page and `jarvis investigate show` two answers to one question.
+        NO POST action: there is nothing to decide, which is the visible difference from
+        the improvement-order page above.
+        """
+        try:
+            detail = ops.show_investigation_order(inv_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "investigation_order.html", inv=detail,
                       project=detail["project"], error=error)
 
     @app.post("/io/{name}/{io_id}/review")

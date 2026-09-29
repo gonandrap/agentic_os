@@ -6823,9 +6823,20 @@ def _require_kind(fo: dict[str, Any], kind: str, verb: str) -> None:
     actual = fo.get("kind") or "feature"
     if actual == kind:
         return
-    other = "an improvement order" if actual == "improvement" else "a feature order"
-    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] == 'i' else 'a'} "
+    # A TABLE, not a derivation from two kinds: a third kind read as "a feature order"
+    # is a message that names the wrong surface — §2.1 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    other = _KIND_PHRASES.get(actual, "a feature order")
+    raise OpsError(f"{fo['id']} is {other}, not {'an' if kind[0] in 'aeiou' else 'a'} "
                    f"{kind} order — use `{verb} {fo['id']}` instead")
+
+
+#: How each `feature_orders.kind` reads in a refusal.
+_KIND_PHRASES = {
+    "feature": "a feature order",
+    "improvement": "an improvement order",
+    "investigation": "an investigation order",
+}
 
 
 def create_improvement_order(project_name: str, title: str, description: str = "",
@@ -7246,6 +7257,382 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 
     return {"project": name, "io_id": io_id, "status": status, "created": created,
             "learnings": learnings, "rejected": sorted(rejections), "errors": errors}
+
+
+# -- investigation orders --------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-investigation-orders.md. An investigation order is a
+# `feature_orders` row with `kind='investigation'` plus exactly one read-only child of
+# `kind='investigator'`, so everything here that can be the feature-order function IS the
+# feature-order function, kind-guarded — the improvement order's arrangement, one kind on.
+#
+# What is NOT shared is who decides: an improvement order files nothing until the user
+# decides each finding, and an investigation SETTLES ITSELF. Which is why the duplicate
+# check and the filing live here, in `ops`, where they have a failing test, rather than in
+# the investigator's prompt, where they would have the diligence #792 already disproved.
+
+#: `feature_orders.metadata` key: the id this investigation is about. The
+#: `EVIDENCE_REFS_KEY` pattern — resolved at creation (unlike an improvement order's refs)
+#: because both of this order's refusals are about the subject (§2.7).
+SUBJECT_KEY = "subject"
+
+
+def create_investigation_order(project_name: str | None, subject: str, why: str,
+                               budget_usd: float | None = None,
+                               origin: str = "jarvis") -> dict[str, Any]:
+    """Open an investigation into one stuck order. Nothing runs here.
+
+    A thin `ops` function holding all the logic, because the CLI is not its main caller:
+    the companion fleet-health order calls this from the daemon and never by shelling out
+    to `jarvis` (§2.7). `project_name=None` resolves it from the SUBJECT — the id already
+    names one project, so `jarvis investigate wo-x` needs no second answer and the CLI
+    holds no rule of its own (§2.7).
+
+    Two refusals of its own, both at this level rather than in a prompt:
+
+    * **At most one live investigation per subject.** Without it the companion order opens
+      one per tick. A SETTLED investigation does not block a new one — the subject being
+      stuck again is a new question (§6).
+    * **An investigation never investigates an investigation.** Diagnosing the
+      diagnostician is a loop with a budget attached.
+    """
+    paths = registered_project_paths()
+    if project_name is not None and project_name not in paths:
+        raise OpsError(f"project {project_name!r} not registered "
+                       f"(known: {sorted(paths)}). Run `jarvis start` first.")
+    subject = (subject or "").strip()
+    if not subject:
+        raise OpsError("an investigation needs a subject — the wo-/fo-/io- id that is "
+                       "not progressing")
+    if not (why or "").strip():
+        raise OpsError(
+            f"an investigation needs a `why`: the investigator's first reader is a fresh "
+            f"session with no memory of the conversation that produced it. Say what you "
+            f"saw — `jarvis investigate {subject} --why \"...\"`."
+        )
+    project_name, title, kind = _subject_identity(subject, project_name)
+    if kind in ("investigation", "investigator"):
+        raise OpsError(
+            f"{subject} is an {kind} — an investigation never investigates the "
+            f"diagnostician. Investigate the subject it was opened on instead."
+        )
+    live = _live_investigation(project_name, subject)
+    if live:
+        raise OpsError(
+            f"{live} is already investigating {subject} — `jarvis investigate show "
+            f"{live}`. One live investigation per subject; open a new one once that has "
+            f"settled."
+        )
+    store = ProjectStore(paths[project_name])
+    try:
+        return store.create_feature_order(
+            title=f"investigate {subject}: {title}"[:200], description=why,
+            origin=origin, kind="investigation",
+            metadata={SUBJECT_KEY: subject},
+            # The family is this order plus its one investigator, so the family
+            # arithmetic is already correct — `create_improvement_order`'s reasoning. The
+            # fallback is NOT "no ceiling": the caller is a daemon loop, not a human
+            # typing, and an uncapped default there is an uncapped loop (§2.8).
+            budget_usd=(budget_usd if budget_usd is not None
+                        else budget.investigation_default_for(
+                            _spec_or_none(project_name))))
+    finally:
+        store.close()
+
+
+def _subject_identity(subject: str,
+                      project_name: str | None) -> tuple[str, str, str]:
+    """The subject's project, title and kind, or an `OpsError` naming that it does not
+    exist.
+
+    Resolved at creation, unlike an improvement order's `--ref` strings, which are stored
+    verbatim on purpose: a ref that does not resolve is a FINDING there. Here the subject
+    is what both refusals are about, so an unresolvable one is a bad order.
+    """
+    if is_feature_order_id(subject):
+        name, _p, fo = find_feature_order(subject, project_name)
+        return name, str(fo["title"]), str(fo.get("kind") or "feature")
+    name, _p, wo = find_work_order(subject, project_name)
+    return name, str(wo["title"]), str(wo.get("kind") or "worker")
+
+
+def _live_investigation(project_name: str, subject: str) -> str:
+    """The id of the non-terminal investigation already on this subject, or `""`."""
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                             kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject:
+                return str(row["id"])
+    finally:
+        store.close()
+    return ""
+
+
+def list_investigation_orders(project_name: str | None = None,
+                              include_settled: bool = False) -> list[dict[str, Any]]:
+    """`jarvis investigate list`. The feature-order listing with the other kind asked
+    for — behaviour is identical, so a copy would only be a second thing to keep in
+    step."""
+    return list_feature_orders(project_name, include_settled=include_settled,
+                              kind="investigation")
+
+
+def show_investigation_order(inv_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis investigate show` — THE CLASSIFICATION AND THE SUBJECT FIRST, then the
+    root cause, the evidence, and what was filed or why nothing was.
+
+    The single resolution the dashboard route renders too (§2.9): a second one there
+    would make the page and this verb two answers to one question.
+    """
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo show")
+    # `plan` is NULL until the verdict is submitted, which is the NORMAL state here — so
+    # every read of it is defensive rather than trusting.
+    verdict = db.from_json(fo.get("plan"), None) or {}
+    if not isinstance(verdict, dict):
+        verdict = {}
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    store = ProjectStore(path)
+    try:
+        investigator = None
+        if fo.get("plan_wo_id"):
+            try:
+                row = store.get_work_order(fo["plan_wo_id"])
+                investigator = {k: row[k] for k in ("id", "title", "status",
+                                                    "result_summary")}
+            except KeyError:
+                investigator = None  # deleted out from under it; the link was released
+        alarms = store.alarms_for_feature(inv_id)
+    finally:
+        store.close()
+    return {
+        "project": name, **fo,
+        "subject": metadata.get(SUBJECT_KEY) or "",
+        "why": fo["description"],
+        "verdict": verdict,
+        "classification": verdict.get("classification") or "",
+        "filed": verdict.get("filed") or None,
+        "filing_error": verdict.get("filing_error") or "",
+        "investigator": investigator,
+        "status_label": feature_status_label("investigation", fo["status"]),
+        "alarms": alarms,
+    }
+
+
+def cancel_investigation_order(inv_id: str, project_name: str | None = None
+                               ) -> dict[str, Any]:
+    """`jarvis investigate cancel`. The feature-order path unchanged: it stops every
+    non-terminal work order the row owns — here just the investigator — and settles it."""
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo cancel")
+    return cancel_feature_order(inv_id, project_name)
+
+
+def submit_verdict(inv_id: str, doc: Any,
+                   project_name: str | None = None) -> dict[str, Any]:
+    """(Investigators) hand back the verdict. The investigator's terminal action.
+
+    Modelled step for step on `submit_findings`, AND THE ORDER OF THE STEPS IS THE DESIGN
+    (§2.5). The verdict is validated first, so a bad one costs the investigator one
+    revision and nothing else — nothing stored, no attention spent, no state to unwind.
+    Then the duplicate check and the filing. Only then is the order settled and the
+    investigator finished: `jarvis investigate verdict` IS its `jarvis wo finish`.
+
+    Three things this does that `submit_findings` does not, each a consequence of the
+    order settling ITSELF rather than parking for the user:
+
+    * **The duplicate check happens HERE**, before anything is filed. A prompt
+      instruction cannot be verified and a search in `ops` can be tested; #792
+      duplicating #790 is the standing proof that the diligent version fails.
+    * **A GAP files an EXPEDITED bug** — `bugreport.report_bug(..., expedite=True)`,
+      called as a Python function and not by an agent shelling out, so the route cannot
+      skip the check above. THE CASCADE IS INTENDED and is the highest-consequence thing
+      in this feature: per kn-efaad866 and kn-ffb94e3a that files the issue, dispatches a
+      work order on it and ships a release when the fix lands. A fix that lands without
+      shipping leaves production broken, which is what every issue in §1.1 was.
+    * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
+      re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
+      classification: `gh` unreachable keeps the order `planning` so the verdict can be
+      resubmitted.
+    """
+    from . import bugreport, verdicts
+
+    name, path, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo plan")
+    if fo["status"] != "planning":
+        raise OpsError(
+            f"{inv_id} is {fo['status']}, so it is not waiting for a verdict. There is "
+            f"no review round for an investigation — the verdict settles the order, and "
+            f"a second one is refused here rather than by a special case."
+        )
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    subject = str(metadata.get(SUBJECT_KEY) or "")
+    try:
+        verdict = verdicts.parse_verdict(doc, subject=subject)
+    except verdicts.VerdictError as e:
+        raise OpsError(
+            f"the verdict was not accepted, and nothing was stored. Fix all of these and "
+            f"resubmit:\n  - " + "\n  - ".join(e.problems)
+        ) from e
+
+    verdict["classified_by"] = "investigator"
+    verdict["filed"] = None
+    filing_error = ""
+    if verdict["classification"] == "GAP":
+        try:
+            duplicate = _verdict_duplicate(name, subject, verdict, fo)
+        except Exception as e:  # noqa: BLE001 — an unreadable tracker is the §2.5 case
+            filing_error = f"the duplicate check could not read the tracker: {e}"
+            duplicate = ""
+        if not filing_error and duplicate:
+            # RECORDED AS `ops`' DECISION, and the submitted classification is kept: the
+            # record must never read as though the investigator classified it this way,
+            # and never as though it was wrong — finding the duplicate was never its job.
+            verdict["submitted_classification"] = "GAP"
+            verdict["classification"] = "ALREADY_TRACKED"
+            verdict["classified_by"] = "ops"
+            verdict["duplicate_of"] = duplicate
+        elif not filing_error:
+            try:
+                filed = bugreport.report_bug(
+                    title=verdict["proposed_fix"]["title"],
+                    description=verdict["proposed_fix"]["description"],
+                    expected=verdict["proposed_fix"]["expected"],
+                    actual=verdict["proposed_fix"]["actual"],
+                    priority=verdict["proposed_fix"]["priority"],
+                    project=name, wo_id=fo.get("plan_wo_id") or "",
+                    expedite=True)
+            except Exception as e:  # noqa: BLE001 — same case, one step later
+                filing_error = f"the bug could not be filed: {e}"
+            else:
+                verdict["filed"] = {
+                    "issue_url": filed.get("url"),
+                    "wo_id": (filed.get("pickup") or {}).get("wo_id"),
+                    "expedited": True,
+                }
+
+    if filing_error:
+        return _verdict_filing_failed(name, path, fo, inv_id, verdict, filing_error)
+
+    classification = verdict["classification"]
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        store.set_feature_status(inv_id, "completed")
+        # THE ONE CLASSIFICATION THAT SPENDS ATTENTION, raised at the transition and
+        # nowhere else (§2.5 step 6). The other three settle silently, which is the whole
+        # difference from an improvement order.
+        if classification == "WAITING_ON_USER":
+            store.flag_feature_attention(inv_id,
+                                         verdicts.settle_headline(inv_id, verdict))
+        else:
+            store.clear_feature_attention(inv_id)
+        investigator_open = False
+        if fo.get("plan_wo_id"):
+            store.add_event(fo["plan_wo_id"], "verdict_submitted", {
+                "investigation": inv_id, "classification": classification,
+                "classified_by": verdict["classified_by"],
+                "filed": (verdict.get("filed") or {}).get("issue_url"),
+            })
+            try:
+                investigator_open = store.get_work_order(
+                    fo["plan_wo_id"])["status"] in OPEN_STATUSES
+            except KeyError:
+                investigator_open = False  # deleted; the link was released
+    finally:
+        store.close()
+
+    out: dict[str, Any] = {
+        "project": name, "inv_id": inv_id, "status": "completed",
+        "classification": classification, "filed": verdict.get("filed"),
+        "classified_by": verdict["classified_by"],
+        "note": "the investigation is settled — end your turn.",
+    }
+    if investigator_open:
+        # Conditional for `submit_findings`' reason: settling an already-settled work
+        # order is not an idempotent no-op in this codebase.
+        out["investigator"] = finish(
+            fo["plan_wo_id"], f"submitted a {classification} verdict for {inv_id}")
+    return out
+
+
+def _verdict_duplicate(project: str, subject: str, verdict: dict[str, Any],
+                       fo: dict[str, Any]) -> str:
+    """What already covers this GAP — a tracker issue url or a live order id — or `""`.
+
+    THE TRACKER FIRST, because "has this already been filed" is a question about the
+    destination — `issues.follow_ups_filed`'s reasoning, and `--state all` is load-bearing
+    for its reason too: a closed duplicate that drops out of the answer is re-filed for
+    ever.
+
+    THE TWO HALVES KEY ON DIFFERENT THINGS, and that asymmetry is the point.
+
+    The tracker keys on THE CAUSE — the proposed fix's title — and never on the subject
+    id. Issues whose body names an order id are common and usually about some OTHER
+    cause: every validation follow-up the panel filed on that order, every earlier
+    investigation's filing. Keying the tracker on the id turned each of those into a
+    duplicate, downgraded a real GAP to ALREADY_TRACKED and filed nothing. The cost of
+    keying on the cause is the opposite error: `gh` search is token-AND, so an existing
+    issue about the same cause in different words is missed and a duplicate gets filed.
+    That is the right direction to fail in — a duplicate issue is visible and closable, a
+    GAP that was never filed is not.
+
+    Live orders key on THE SUBJECT ID and never on the proposed title. `db.score_sql` is
+    word-OR (kn-c6e8fbf0), so a title search would match half the project on a shared word
+    and downgrade nearly every GAP — a duplicate check that never files is worse than
+    none, because it reads as one that works. The subject id is weighted and exact, and
+    "an order is already open about this subject" is the question worth asking anyway.
+    """
+    from . import bugreport, issues, search as search_mod
+
+    title = (verdict.get("proposed_fix") or {}).get("title") or ""
+    repo = bugreport.bug_repo()
+    if title:
+        for row in issues.issues_mentioning(repo, title):
+            return str(row["url"])
+    ours = {subject, fo["id"], fo.get("plan_wo_id") or ""}
+    for hit in search_mod.search(subject, project=project,
+                                 kinds=("work_order", "feature_order")):
+        if hit["id"] in ours or hit.get("status") in TERMINAL_STATUSES:
+            continue
+        return str(hit["id"])
+    return ""
+
+
+def _verdict_filing_failed(name: str, path: Path, fo: dict[str, Any], inv_id: str,
+                           verdict: dict[str, Any], error: str) -> dict[str, Any]:
+    """§2.5's one attention case that is not a classification: `gh` was unreachable.
+
+    An error is not a verdict, so this does NOT touch the "attention only for
+    WAITING_ON_USER" ruling. `review_findings`' `stuck` path, verbatim in shape: record
+    the error on the document, KEEP the order in `planning` so the verdict can be
+    resubmitted, flag attention naming the error and the retry command, and reach the
+    user's sinks rather than only a return value nobody reads.
+    """
+    verdict["filing_error"] = error
+    reason = (f"{inv_id}: the verdict could not be filed — {error} — retry with "
+              f"`jarvis investigate verdict {inv_id} --from-file verdict.json`")
+    store = ProjectStore(path)
+    try:
+        store.update_feature_order(inv_id, plan=db.to_json(verdict))
+        store.flag_feature_attention(inv_id, reason)
+    finally:
+        store.close()
+    central = CentralStore()
+    try:
+        central.add_inbox(
+            project=name, level="warning",
+            title=f"{inv_id}: an investigation's verdict could not be filed",
+            body=reason, wo_id=fo.get("plan_wo_id") or None)
+    finally:
+        central.close()
+    return {"project": name, "inv_id": inv_id, "status": fo["status"],
+            "classification": verdict["classification"], "filed": None,
+            "filing_error": error, "note": reason}
 
 
 def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str, Any]:

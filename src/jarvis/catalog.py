@@ -155,6 +155,23 @@ DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
+# THE ONE NON-None SHIPPED BUDGET, and §2.8 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md is why: an investigation's
+# caller is a daemon loop, not a human typing, so an uncapped default is an uncapped loop.
+# An investigation reads records and quotes lines — it should cost cents, and one that
+# costs more than the order it is diagnosing is not worth having.
+#
+# A named constant so the figure is a ONE-LINE edit. PENDING CONFIRMATION: no measurement
+# picked it, the nearest datum being `jarvis cost` on the improvement orders run in this
+# checkout (§7.1).
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+
+# Cheap by default for the same reason: a diagnosis is reading and quoting, not design.
+# An ALIAS rather than a pinned id, unlike DEFAULT_MODEL: "whatever is currently cheap in
+# that tier" is the intent here, and pinning it would freeze the price.
+DEFAULT_INVESTIGATION_MODEL = "sonnet"
+DEFAULT_INVESTIGATION_EFFORT = "low"
+
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
                   default: float | None) -> float | None:
@@ -364,6 +381,13 @@ class WorkerDefaults:
     # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
+    # An INVESTIGATION order's family (the order plus its one investigator), and the model
+    # and effort its investigator runs on. Non-None by design — see
+    # DEFAULT_INVESTIGATION_BUDGET_USD and §2.8 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
+    investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
+    investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
     # Whether the lead must delegate file edits to its crew. §7 of
     # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
     require_crew: bool = True
@@ -1975,6 +1999,14 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             feature_budget_usd=_parse_budget(
                 w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
                 os_cfg.default_feature_budget_usd),
+            investigation_budget_usd=_parse_budget(
+                w, "investigation_budget_usd",
+                f"project {name}: worker.investigation_budget_usd",
+                DEFAULT_INVESTIGATION_BUDGET_USD),
+            investigation_model=w.get("investigation_model",
+                                      DEFAULT_INVESTIGATION_MODEL),
+            investigation_effort=w.get("investigation_effort",
+                                       DEFAULT_INVESTIGATION_EFFORT),
             require_crew=require_crew,
         )
         try:
