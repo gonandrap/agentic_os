@@ -265,16 +265,15 @@ def test_validate_params_refuses_a_primitive_that_is_not_in_the_registry():
 
 
 def test_validate_params_accepts_a_shipped_primitive_while_no_schema_exists():
-    assert getattr(remedies.REMEDIES["nudge"], "params", None) is None
+    assert remedies.REMEDIES["nudge"].params == ()
     assert rules.validate_params("nudge", {}) == []
 
 
 def test_validate_params_reads_a_tuple_of_param_objects_as_a_schema():
     """The primitives section spells `Remedy.params` as `tuple[Param, ...]`, not a dict.
 
-    That section is on a parallel branch and its exact spelling is not settled, so the
-    schema branch accepts either shape. A schema check that raises `AttributeError` the
-    day the other shape lands is worse than one that adapts.
+    That spelling has landed and is settled; the schema branch still accepts either
+    shape, and this covers the tuple one.
     """
 
     class _Param:
