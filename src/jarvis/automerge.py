@@ -109,8 +109,16 @@ HELD_SHA_UNRECORDED = "sha_unrecorded"
 HELD_SHA_MOVED = "sha_moved"
 HELD_PR_CLOSED = "pr_closed"
 HELD_NOT_MERGEABLE = "not_mergeable"
-HELD_CHECKS_NOT_GREEN = "checks_not_green"
+#: Three worlds `github.PullRequest.checks_green` is false in, and three codes: the
+#: dedupe above would drop the second to hold a commit as a repeat of the first (spec
+#: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §5).
+HELD_CHECKS_FAILED = "checks_failed"
+HELD_CHECKS_RUNNING = "checks_running"
+HELD_CHECKS_NONE = "checks_none"
 HELD_MERGE_STATE_UNCLEAN = "merge_state_unclean"
+#: The default branch is broken. Not this pull request's fact, and it pauses the merge
+#: anyway: merging onto a red base hides the next break behind the same red run (§4).
+HELD_BASE_RED = "base_red"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5).
 #: Two causes, never folded into one: a command that RAN and exited non-zero is a local
@@ -151,6 +159,24 @@ class MergeFailed(AutoMergeRefused):
 
 
 @dataclass(frozen=True)
+class BaseRed:
+    """The default branch of this project is red, as plain data `decide` can read.
+
+    No store and no clock: the daemon reads `base_health:<project>` and judges the
+    reading's freshness, so `decide` stays pure (spec
+    docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2, §4).
+    `wo_id` is the order the OS merged the red commit for, `""` when nothing is
+    attributed — a red base with no attribution is still the fact that pauses the merge.
+    """
+
+    base: str
+    workflow: str
+    run_url: str
+    head_sha: str
+    wo_id: str = ""
+
+
+@dataclass(frozen=True)
 class Decision:
     """Armed, or held with a reason a person can read. Nothing else.
 
@@ -179,7 +205,8 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
            *, validated_head: str | None,
            pending_assumptions: bool = False,
-           plan_assumptions: str = "") -> Decision:
+           plan_assumptions: str = "",
+           base_red: BaseRed | None = None) -> Decision:
     """May the OS merge this pull request right now? PURE — no store, no clock, no `gh`.
 
     Dicts and one `github.PullRequest` in, armed-or-held-with-a-reason out. Pure for
@@ -199,7 +226,14 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     4. `ProjectStore.validated_head` yields a commit — which is one fact, not two: the
        latest round settled `passed` AND it recorded which commit it judged;
     5. that commit IS the live head;
-    6. GitHub says the pull request is open, mergeable, green and CLEAN.
+    6. GitHub says the pull request is open, mergeable, green and CLEAN — and "not
+       green" holds under three codes, because failed, still running and nothing reported
+       are three different things to tell the user (spec §5).
+
+    A SEVENTH is about the WORLD rather than about this pull request: a `base_red` fact
+    pauses every merge, judged between conditions 3 and 4 (spec
+    docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4), so no
+    round number is spent re-judging a branch whose CI is inheriting `main`'s failure.
 
     **`validated_head` IS PASSED IN AND NEVER RE-DERIVED HERE.** Conditions 4 and 5 rest
     on "which commit did the panel accept", and that question has exactly one home
@@ -246,6 +280,20 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"the plan this work order implements is still waiting on you — "
                      f"assumptions on {plan_assumptions}, and the machine does not "
                      f"merge over a decision a person owes")
+    # Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4.
+    if base_red is not None:
+        blamed = f" (merged by the OS for {base_red.wo_id})" if base_red.wo_id else ""
+        # Matched on WORKFLOW, never on job name — `ci.inherited`'s reason: fail-fast
+        # makes the base and the branch different shards of one matrix.
+        rider = (f" This pull request's own `{base_red.workflow}` failure is the same "
+                 f"break and not its fault."
+                 if any(str(c.get("workflow") or "") == base_red.workflow
+                        for c in pr.red) else "")
+        return _held(HELD_BASE_RED,
+                     f"`{base_red.base}` itself is red — workflow "
+                     f"`{base_red.workflow}`, run {base_red.run_url}, at "
+                     f"{base_red.head_sha[:10] or 'an unknown commit'}{blamed}. Nothing "
+                     f"merges onto a broken default branch.{rider}")
 
     outcome = str((round_row or {}).get("outcome") or "")
     n = int((round_row or {}).get("round") or 0)
@@ -293,8 +341,14 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
         return _held(HELD_NOT_MERGEABLE,
                      "GitHub does not (yet) say the branch merges cleanly", **fields)
     if not pr.checks_green:
-        return _held(HELD_CHECKS_NOT_GREEN,
-                     "CI has not finished a unanimous pass on this commit", **fields)
+        if pr.failing:
+            return _held(HELD_CHECKS_FAILED,
+                         f"CI failed: {', '.join(pr.failing)}", **fields)
+        if pr.unfinished:
+            return _held(HELD_CHECKS_RUNNING,
+                         f"CI has not finished on this commit — "
+                         f"{len(pr.unfinished)} check(s) still running", **fields)
+        return _held(HELD_CHECKS_NONE, "no check has reported on this commit", **fields)
     if str(getattr(pr, "merge_state", "") or "").upper() != "CLEAN":
         return _held(HELD_MERGE_STATE_UNCLEAN,
                      f"GitHub reports the merge state as "

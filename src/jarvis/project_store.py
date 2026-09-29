@@ -490,6 +490,10 @@ SUPERSEDED_CHILDREN_KEY = "superseded_children"
 
 ALARM_STATUSES = (
     "raised",     # on the supervisor's queue, awaiting a look
+    # A NOTE, NOT AN INTERRUPTION: recorded and rendered, never claimed. Spec of
+    # 2026-09-27 §2 — `claim_next_alarm` selects `status='raised'`, so this status IS
+    # the enforcement and no filter is added anywhere downstream.
+    "informational",
     "reviewing",  # claimed by a supervisor tick
     "acked",      # judged and answered with a note to the user
     "escalated",  # judged and handed to Neo
@@ -703,6 +707,40 @@ CREATE TABLE IF NOT EXISTS health_reviews (
     findings INTEGER NOT NULL DEFAULT 0,
     detail TEXT NOT NULL DEFAULT ''
 );
+-- EVERY STATUS MOVE OF EVERY ORDER IN THIS PROJECT, work orders and feature orders in one
+-- table. One table and not two because the two loops record identical facts and a reader
+-- of both (`ops.state_durations`, and the fleet-health checker that consumes it) would
+-- otherwise be two readers that can disagree about what a span is.
+--
+-- NO FOREIGN KEY ON `order_id`, and that is a consequence of the polymorphism rather than
+-- laxity: the id is either a `work_orders` or a `feature_orders` row and SQLite has no
+-- way to reference one of two tables from one column. The alternative shape — the nullable
+-- `wo_id`/`fo_id` pair with a CHECK that `validation_rounds` uses — buys ON DELETE CASCADE
+-- and costs every reader a two-column predicate; it is rejected in §"Rejected
+-- alternatives" of docs/superpowers/specs/2026-09-27-time-in-each-state.md.
+-- `delete_work_order` deletes these rows itself, exactly as it already does for
+-- `health_reviews`.
+--
+-- `from_status` is '' for an order's FIRST row only (nothing preceded it).
+-- `trigger` is '' whenever no caller named one, which is nearly always; the reader
+-- derives a cause from the neighbouring timeline event instead — `ops.state_durations`.
+-- `approximate` marks a row the BACKFILL inferred rather than observed: a feature order
+-- has no event trail, so its history is one coarse span and must say so.
+CREATE TABLE IF NOT EXISTS wo_state_spans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id TEXT NOT NULL,
+    order_kind TEXT NOT NULL,           -- 'wo' | 'fo'
+    from_status TEXT NOT NULL DEFAULT '',
+    to_status TEXT NOT NULL,
+    ts REAL NOT NULL,
+    trigger TEXT NOT NULL DEFAULT '',
+    approximate INTEGER NOT NULL DEFAULT 0
+);
+-- One index and it is the only read pattern: every consumer asks for one order's rows
+-- oldest first. `(order_kind, ts)` is NOT indexed — no surface asks "every transition in
+-- this project" and an unused index is a write cost on the hot path.
+CREATE INDEX IF NOT EXISTS idx_state_spans_order
+    ON wo_state_spans(order_id, ts);
 -- THE SCHEDULER'S CLOCK, one row per job this project runs
 -- (docs/superpowers/specs/2026-09-14-the-scheduler.md §3). In the PROJECT store rather
 -- than `os_state`, because what a firing produces is a project work order and two
@@ -1502,6 +1540,71 @@ class ProjectStore:
         self._backfill_abandoned_gates()
         self._backfill_spent_gates()
         self._backfill_pending_at()
+        self._backfill_wo_spans()
+        self._backfill_fo_spans()
+
+    def _backfill_wo_spans(self) -> None:
+        """Rebuild every historical work order's spans from its `kind='status'` events.
+
+        EXACT: the timestamps are the OS's own write moments, so `approximate` stays 0.
+        §3 of docs/superpowers/specs/2026-09-27-time-in-each-state.md.
+
+        `_backfill_alarms`' idempotence discipline — this runs in `__init__`, so on every
+        CLI invocation and every reconcile of every project: the count comparison is a
+        fast path off the hot road and the covered-id SET rebuilt from the table is the
+        real guard.
+        """
+        total = self.conn.execute("SELECT COUNT(*) c FROM work_orders").fetchone()["c"]
+        covered = self.conn.execute(
+            "SELECT COUNT(DISTINCT order_id) c FROM wo_state_spans WHERE order_kind='wo'"
+        ).fetchone()["c"]
+        if covered >= total:
+            return
+        have = {r["order_id"] for r in self.conn.execute(
+            "SELECT DISTINCT order_id FROM wo_state_spans WHERE order_kind='wo'")}
+        rows = self.conn.execute(
+            "SELECT id, created_at FROM work_orders").fetchall()
+        for wo in rows:
+            if wo["id"] in have:
+                continue
+            self._record_span(wo["id"], "wo", "", "pending", ts=wo["created_at"])
+            previous = "pending"
+            for event in self.conn.execute(
+                    "SELECT ts, payload FROM wo_events WHERE wo_id=? AND kind='status' "
+                    "ORDER BY ts, id", (wo["id"],)).fetchall():
+                status = str((db.from_json(event["payload"], {}) or {}).get("status") or "")
+                # The duplicate the store now prevents at the source: a zero-length span
+                # in the history would inflate the entry count.
+                if not status or status == previous:
+                    continue
+                self._record_span(wo["id"], "wo", previous, status, ts=event["ts"])
+                previous = status
+        self.conn.commit()
+
+    def _backfill_fo_spans(self) -> None:
+        """One APPROXIMATE span per historical feature order: creation to now, as it is.
+
+        A feature order has no event trail at all (`wo_events.wo_id` is a real foreign key
+        into `work_orders`), so an exact history is not reconstructible. `updated_at` is
+        deliberately not used as a boundary — it moves on every unrelated column write.
+        Neo's ruling: a labelled coarse span beats a missing one. Same idempotence as
+        above.
+        """
+        total = self.conn.execute("SELECT COUNT(*) c FROM feature_orders").fetchone()["c"]
+        covered = self.conn.execute(
+            "SELECT COUNT(DISTINCT order_id) c FROM wo_state_spans WHERE order_kind='fo'"
+        ).fetchone()["c"]
+        if covered >= total:
+            return
+        have = {r["order_id"] for r in self.conn.execute(
+            "SELECT DISTINCT order_id FROM wo_state_spans WHERE order_kind='fo'")}
+        for fo in self.conn.execute(
+                "SELECT id, status, created_at FROM feature_orders").fetchall():
+            if fo["id"] in have:
+                continue
+            self._record_span(fo["id"], "fo", "", str(fo["status"] or "pending"),
+                              ts=fo["created_at"], approximate=True)
+        self.conn.commit()
 
     def _backfill_pending_at(self) -> None:
         """Give historical rows the best `pending_at` the record can support. Spec §4.
@@ -1668,6 +1771,10 @@ class ProjectStore:
                                           **({"parent_id": parent_id} if parent_id else {}),
                                           **({"kind": kind} if kind != "worker" else {}),
                                           **({"budget_usd": budget_usd} if budget_usd else {})})
+        # The first span, which no transition can supply — the row is INSERTed already in
+        # a status. §3 of docs/superpowers/specs/2026-09-27-time-in-each-state.md is the
+        # same row for history, derived from `created_at`.
+        self._record_span(wo_id, "wo", "", status, ts=ts)
         return self.get_work_order(wo_id)
 
     def get_work_order(self, wo_id: str) -> dict[str, Any]:
@@ -1688,6 +1795,27 @@ class ProjectStore:
         rows = self.conn.execute(
             "SELECT * FROM work_orders WHERE issue_url=? ORDER BY created_at DESC",
             (issue_url,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def work_orders_for_pr_number(self, number: int,
+                                  limit: int = 20) -> list[dict[str, Any]]:
+        """Every work order whose pull-request URL ends `/pull/<number>`, newest first.
+
+        WHAT ATTRIBUTES A RED DEFAULT BRANCH (spec
+        docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2): the
+        squash subject carries the number, and the shas cannot be compared.
+
+        **A LOOKUP AND NEVER A SCAN OF A LISTING.** `list_work_orders` is `created_at DESC
+        LIMIT 200`, so on a mature project the order that merged five minutes ago — filed
+        months ago — falls outside the window and would be attributed to nobody. Every
+        status, hidden included: the question is which order's merge landed this commit,
+        and it was answered before the order was settled or tidied away.
+
+        The suffix is anchored with the separator, so `/pull/7` cannot claim `/pull/17`.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE pr_url LIKE ? ORDER BY created_at DESC "
+            "LIMIT ?", (f"%/pull/{int(number)}", limit)).fetchall()
         return db.rows_to_dicts(rows)
 
     # -- the issue <-> work order relation ------------------------------------------
@@ -2206,10 +2334,47 @@ class ProjectStore:
             f"UPDATE work_orders SET {cols} WHERE id=?", (*fields.values(), wo_id)
         )
 
-    def set_status(self, wo_id: str, status: str, **extra: Any) -> None:
+    def set_status(self, wo_id: str, status: str, *, trigger: str = "",
+                   **extra: Any) -> None:
+        """Move a work order, and record the span. Spec §2 of
+        docs/superpowers/specs/2026-09-27-time-in-each-state.md.
+
+        A move to the status the order is ALREADY IN writes nothing — no span row and no
+        `status` event — so a re-assertion is not a transition for any caller. `extra`
+        still applies on that path: `set_status(..., pr_url=…)` writes the column.
+        """
         assert status in WO_STATUSES, status
+        was = self._status_of("work_orders", wo_id)
         self.update_work_order(wo_id, status=status, **extra)
+        if was == status:
+            return
+        self._record_span(wo_id, "wo", was, status, trigger)
         self.add_event(wo_id, "status", {"status": status})
+
+    def _status_of(self, table: str, order_id: str) -> str:
+        """The status an order is in right now, '' when the row is not there."""
+        row = self.conn.execute(
+            f"SELECT status FROM {table} WHERE id=?", (order_id,)).fetchone()
+        return str(row["status"] or "") if row else ""
+
+    def _record_span(self, order_id: str, kind: str, from_status: str, to_status: str,
+                     trigger: str = "", *, ts: float | None = None,
+                     approximate: bool = False) -> None:
+        """One status transition, stamped now. The only writer of `wo_state_spans`."""
+        self.conn.execute(
+            """INSERT INTO wo_state_spans (order_id, order_kind, from_status, to_status,
+                   ts, trigger, approximate)
+               VALUES (?,?,?,?,?,?,?)""",
+            (order_id, kind, from_status, to_status, db.now() if ts is None else ts,
+             trigger, int(approximate)),
+        )
+
+    def state_spans(self, order_id: str) -> list[dict[str, Any]]:
+        """Every status transition recorded for one order, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM wo_state_spans WHERE order_id=? ORDER BY ts, id", (order_id,)
+        ).fetchall()
+        return db.rows_to_dicts(rows)
 
     def seal_bill(self, order_id: str, payload_json: str, *, feature: bool = False,
                   at: float | None = None) -> None:
@@ -2466,6 +2631,11 @@ class ProjectStore:
             self.conn.execute(
                 "DELETE FROM health_reviews WHERE subject_kind='work_order' "
                 "AND subject_id=?", (wo_id,))
+            # Same reason, same rule: no foreign key to cascade, and not a seventh key in
+            # `deleted` (spec 2026-09-27-time-in-each-state §1).
+            self.conn.execute(
+                "DELETE FROM wo_state_spans WHERE order_kind='wo' AND order_id=?",
+                (wo_id,))
             self.conn.execute("DELETE FROM work_orders WHERE id=?", (wo_id,))
         return deleted
 
@@ -2499,6 +2669,9 @@ class ProjectStore:
             (fo_id, title, description, kind, origin, ts, ts, backlog_id,
              db.to_json(metadata or {}), max_parallel, budget_usd),
         )
+        # As above: the span a transition cannot supply, so a feature's history tiles from
+        # its creation (spec 2026-09-27-time-in-each-state §3).
+        self._record_span(fo_id, "fo", "", "pending", ts=ts)
         return self.get_feature_order(fo_id)
 
     def get_feature_order(self, fo_id: str) -> dict[str, Any]:
@@ -2569,7 +2742,8 @@ class ProjectStore:
             f"UPDATE feature_orders SET {cols} WHERE id=?", (*fields.values(), fo_id)
         )
 
-    def set_feature_status(self, fo_id: str, status: str, **extra: Any) -> None:
+    def set_feature_status(self, fo_id: str, status: str, *, trigger: str = "",
+                           **extra: Any) -> None:
         """Move a feature order, and retire its agent type when it settles.
 
         The deletion lives HERE, not at the four callers that settle a feature (the
@@ -2581,13 +2755,20 @@ class ProjectStore:
         `remove_agent` never raises and the spec snapshot stays in the stored plan, so
         `jarvis fo agent <fo-id>` rebuilds it — §3 of
         docs/superpowers/specs/2026-08-29-spec-driven-feature-orders.md.
+
+        The span, and the no-change guard over it: §2 of
+        docs/superpowers/specs/2026-09-27-time-in-each-state.md.
         """
         from . import specs
 
         assert status in FO_STATUSES, status
+        was = self._status_of("feature_orders", fo_id)
         self.update_feature_order(fo_id, status=status, **extra)
         if status in FO_TERMINAL_STATUSES:
             specs.remove_agent(self.project_path, fo_id)
+        if was == status:
+            return
+        self._record_span(fo_id, "fo", was, status, trigger)
 
     def flag_feature_attention(self, fo_id: str, reason: str) -> None:
         self.update_feature_order(fo_id, needs_attention=1, attention_reason=reason)
@@ -2854,18 +3035,22 @@ class ProjectStore:
 
     # -- cost alarms ---------------------------------------------------------
 
-    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str) -> dict[str, Any]:
+    def add_alarm(self, wo_id: str, kind: str, seq: int, reason: str,
+                  status: str = "raised") -> dict[str, Any]:
         """Record one raised alarm and return it. The caller still writes the event.
 
         Both, not one: the row is the identity everything downstream hangs off, and the
         `cost_alarm` event remains the raise's dedupe memory and the work order's
         timeline entry. See ALARM_EVENT_KINDS for the payloads of all four kinds.
+
+        `status` is `informational` for a kind in `inspection.INFORMATIONAL_KINDS` (spec
+        of 2026-09-27 §2): `claim_next_alarm` never sees it, so nothing escalates.
         """
         alarm_id = db.new_id("al")
         self.conn.execute(
-            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason)
-               VALUES (?,?,?,?,?,?)""",
-            (alarm_id, wo_id, db.now(), kind, int(seq), reason),
+            """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (alarm_id, wo_id, db.now(), kind, int(seq), reason, status),
         )
         return self.get_alarm(alarm_id)
 
@@ -3842,6 +4027,15 @@ class ProjectStore:
             "SELECT * FROM wo_turns WHERE wo_id=? ORDER BY seq", (wo_id,)).fetchall()
         return db.rows_to_dicts(rows)
 
+    def turn_starts(self, wo_id: str) -> list[tuple[int, float]]:
+        """`(seq, started_at)` for every turn — what `inspection.read_session` binds its
+        transcript turns to (spec 2026-09-27 §3). One indexed read, no JSON.
+        """
+        rows = self.conn.execute(
+            "SELECT seq, started_at FROM wo_turns WHERE wo_id=? ORDER BY seq",
+            (wo_id,)).fetchall()
+        return [(int(r["seq"]), float(r["started_at"])) for r in rows]
+
     def recent_turns(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """The conversation's most recent turns, newest first.
 
@@ -3917,6 +4111,24 @@ class ProjectStore:
             self.conn.execute(
                 "DELETE FROM violation_reports WHERE invariant=? AND wo_id=?", key)
         return gone
+
+    def close_violation_report(self, invariant: str, wo_id: str | None = None) -> bool:
+        """Forget ONE report, so the same violation coming back is announced again.
+
+        **`close_violation_reports` above is unusable for this** and the difference is not
+        stylistic: the plural version DELETES every report not in the iterable it is
+        given, so calling it with one key would wipe every other standing report in the
+        project. It is sound only where every check ran — `Daemon.check_invariants` on a
+        sweep tick. A caller that knows one violation is over (the base went green, spec
+        docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §2) knows
+        nothing about the others and must say so by closing one row.
+
+        True when a row went. False means nothing was standing, which is not an error.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM violation_reports WHERE invariant=? AND wo_id=?",
+            (invariant, wo_id or ""))
+        return cur.rowcount > 0
 
     def violation_reports(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(

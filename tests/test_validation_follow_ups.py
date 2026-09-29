@@ -552,7 +552,10 @@ def test_with_filing_off_the_finding_is_discarded_and_still_does_not_reject(flee
     wo = judged(fleet, "passed", "Name the retry budget")
 
     assert filed(tracker) == []
-    assert tracker.calls == [], "a `gh` call was made with filing switched off"
+    # The base-health poll shares this reconcile tick and its `gh` calls are not filing.
+    shaped = [c for c in tracker.calls
+              if tuple(c["argv"][:2]) in {("issue", "create"), ("label", "create")}]
+    assert shaped == [], "an issue-shaped `gh` call was made with filing switched off"
     store = fleet.store()
     try:
         assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "passed"

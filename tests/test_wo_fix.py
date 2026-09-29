@@ -233,7 +233,9 @@ def test_no_grant_no_user_fix_and_the_handler_is_never_reached(started, monkeypa
     monkeypatch.setitem(
         remedies.REMEDIES, "nudge",
         remedies.Remedy(**{**vars(remedies.REMEDIES["nudge"]),
-                           "apply": lambda *a: calls.append(a) or "ran"}))
+                           # takes `params` because every handler does (Neo 904);
+                           # this test asserts on the POSITIONALS only
+                           "apply": lambda *a, params=None: calls.append(a) or "ran"}))
     store, central = _store(wo["id"]), CentralStore()
     try:
         outcome = _propose(store, "proj_a", store.get_work_order(wo["id"]), "nudge",

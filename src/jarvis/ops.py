@@ -38,7 +38,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, invariants, observability
+from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
@@ -52,12 +52,14 @@ from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
     FO_OPEN_STATUSES,
+    FO_STATUSES,
     FO_TERMINAL_STATUSES,
     NO_TURN,
     OPEN_STATUSES,
     FORCEABLE_STATUSES,
     OPEN_VALIDATION_OUTCOMES,
     TERMINAL_STATUSES,
+    WO_STATUSES,
     ProjectStore,
     feature_status_label,
     is_feature_order_id,
@@ -1451,6 +1453,249 @@ UNEXPLAINED_NOTE = ("idle the record does not account for — not a cause, a res
 NO_TRANSCRIPT_NOTE = ("the transcript for this order is absent (never written, or pruned "
                       "by Claude Code), so the residual is unmeasurable rather than zero")
 
+# -- time in each state -------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md §4. The ONE computation
+# over `wo_state_spans`; every surface renders this payload and derives no duration of its
+# own.
+
+#: How near a timeline event has to sit to a transition to be read as its cause. Spec §4
+#: rule 6: the trigger is derived at READ time, identically for live and backfilled rows,
+#: which is why no `set_status` call site has to be annotated.
+TRIGGER_WINDOW = 120.0
+
+#: `None` and a sentence, never `0` — issue #227's rule, as `NO_TURN_NOTE` above.
+NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
+                    "last activity to date — absent, not zero")
+SETTLED_NOTE = "this order has settled, so it has no current status age"
+FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
+                       "coarse span from its creation")
+#: What a renderer prints for a transition nothing was written about. Never a guess and
+#: never blank (spec §4 rule 6).
+NO_TRIGGER_PHRASE = "cause not recorded"
+
+#: What is NOT activity. `health.observer_kinds()` is imported rather than re-listed for
+#: the reason it exists: an order the supervisor swept would otherwise read as progressing
+#: BECAUSE it was examined. `status` is the thing being measured, so counting it would make
+#: every transition reset the idle clock, and `created` is when the record BEGAN rather than
+#: something that happened to the order.
+def _quiet_kinds() -> tuple[str, ...]:
+    return tuple(sorted({*health.observer_kinds(), "status", "created"}))
+
+
+@dataclass(frozen=True)
+class Span:
+    """One status the order was in, and when. `left is None` means it is in it now."""
+
+    status: str
+    entered: float
+    left: float | None
+    trigger: str                # '' when the record names no cause
+    approximate: bool
+
+    def seconds(self, now: float) -> float:
+        """A backwards clock must not produce a negative span (`holds.Hold.overlap`)."""
+        return max(0.0, (now if self.left is None else self.left) - self.entered)
+
+
+@dataclass(frozen=True)
+class StateDurations:
+    """One order's whole status history. `now` is never baked in; `as_dict` applies it."""
+
+    order_id: str
+    order_kind: str             # 'wo' | 'fo'
+    spans: tuple[Span, ...]     # oldest first
+    current_status: str         # '' for a settled order
+    current_status_since: float | None
+    last_activity_ts: float | None
+    last_activity_kind: str     # the wo_events kind / table that supplied it, '' if none
+    approximate: bool           # any span is
+    notes: tuple[str, ...]
+    #: FO_KINDS, so an improvement order's rows read `analysing` and not `planning`. '' for
+    #: a work order.
+    row_kind: str = ""
+    #: The read moment `state_durations` was given, and the default `as_dict` applies when
+    #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
+    #: are the same document.
+    asof: float = 0.0
+
+    def label(self, status: str) -> str:
+        if self.order_kind == "fo":
+            return feature_status_label(self.row_kind, status)
+        return timeline.STATUS_LABEL.get(status, status)
+
+    def as_dict(self, now: float | None = None) -> dict[str, Any]:
+        now = self.asof if now is None else now
+        order = FO_STATUSES if self.order_kind == "fo" else WO_STATUSES
+        end = now
+        if self.spans and self.spans[-1].left is not None:
+            end = self.spans[-1].left
+        lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
+
+        def share(seconds: float) -> float:
+            return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
+                  "left": s.left, "open": s.left is None,
+                  "seconds": round(s.seconds(now), 2),
+                  "seconds_human": ago_phrase(s.seconds(now)),
+                  "share": share(s.seconds(now)), "trigger": s.trigger,
+                  "approximate": s.approximate}
+                 for s in self.spans]
+        totals = []
+        for status in order:
+            mine = [s for s in self.spans if s.status == status]
+            if not mine:
+                continue
+            seconds = round(sum(s.seconds(now) for s in mine), 2)
+            totals.append({"status": status, "label": self.label(status),
+                           "seconds": seconds, "seconds_human": ago_phrase(seconds),
+                           "entries": len(mine), "share": share(seconds)})
+        age = (round(now - self.current_status_since, 2)
+               if self.current_status_since is not None else None)
+        idle = (round(max(0.0, now - self.last_activity_ts), 2)
+                if self.last_activity_ts is not None else None)
+        return {
+            "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
+            "approximate": self.approximate,
+            "lifetime_seconds": round(lifetime, 2),
+            "lifetime_human": ago_phrase(lifetime),
+            "spans": spans, "totals": totals,
+            "current_status": self.current_status,
+            "current_status_since": self.current_status_since,
+            "current_status_age": age,
+            "current_status_age_human": None if age is None else ago_phrase(age),
+            "last_activity_ts": self.last_activity_ts,
+            "last_activity_kind": self.last_activity_kind,
+            "last_activity_age": idle,
+            "last_activity_age_human": None if idle is None else ago_phrase(idle),
+            "notes": list(self.notes),
+        }
+
+
+def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
+    """The kind of the newest quiet-excluded event at `ts <= entered` within the window."""
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    row = store.conn.execute(
+        f"SELECT kind FROM wo_events WHERE wo_id=? AND ts<=? AND ts>=? "
+        f"AND kind NOT IN ({marks}) ORDER BY ts DESC, id DESC LIMIT 1",
+        (wo_id, entered, entered - TRIGGER_WINDOW, *quiet),
+    ).fetchone()
+    return str(row["kind"]) if row else ""
+
+
+def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """Every moment the record says something happened TO one work order. Spec §4.
+
+    All five tables, though every activity class in today's code also writes a `wo_events`
+    row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
+    events-only read is one future writer away from calling a busy order idle.
+    """
+    quiet = _quiet_kinds()
+    marks = ", ".join("?" for _ in quiet)
+    found: list[tuple[float, str]] = []
+    row = store.conn.execute(
+        f"SELECT kind, ts FROM wo_events WHERE wo_id=? AND kind NOT IN ({marks}) "
+        f"ORDER BY ts DESC, id DESC LIMIT 1", (wo_id, *quiet)).fetchone()
+    if row is not None:
+        found.append((float(row["ts"]), str(row["kind"])))
+    for sql, source in (
+        ("SELECT MAX(started_at), MAX(ended_at) FROM wo_turns WHERE wo_id=?", "wo_turns"),
+        ("SELECT MAX(ts), MAX(delivered_at) FROM wo_messages WHERE wo_id=?",
+         "wo_messages"),
+        ("SELECT MAX(ts) FROM validation_rounds WHERE wo_id=?", "validation_rounds"),
+        ("SELECT MAX(ts), MAX(decided_at) FROM approvals WHERE wo_id=?", "approvals"),
+    ):
+        got = store.conn.execute(sql, (wo_id,)).fetchone()
+        stamps = [float(v) for v in tuple(got or ()) if v is not None]
+        if stamps:
+            found.append((max(stamps), source))
+    return found
+
+
+def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
+    """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
+
+    A FEATURE ORDER'S ACTIVITY IS ITS FAMILY'S — every child, the planner and the manager,
+    not `carrier_for_feature`: picking one carrier would call a feature idle while three of
+    its other children were running. A feature progresses when anything in it does.
+    """
+    if kind == "wo":
+        found = _activity_of(store, order_id)
+    else:
+        family = [c["id"] for c in store.feature_children(order_id)]
+        fo = store.get_feature_order(order_id)
+        if fo.get("plan_wo_id"):
+            family.append(str(fo["plan_wo_id"]))
+        manager = store.manager_work_order(order_id)
+        if manager:
+            family.append(str(manager["id"]))
+        found = [seen for child in family for seen in _activity_of(store, child)]
+        row = store.conn.execute(
+            "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
+        if row and row[0] is not None:
+            found.append((float(row[0]), "validation_rounds"))
+    if not found:
+        return (0.0, "")
+    return max(found, key=lambda seen: seen[0])
+
+
+def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
+                    now: float | None = None) -> StateDurations:
+    """How long this order has been in its status, and how long it spent in each before.
+
+    Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
+    on both or neither. `now` is a parameter because every figure here is a present-tense
+    claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
+    injectable by a test. One indexed read per table, no model, nothing written.
+    """
+    if bool(wo_id) == bool(fo_id):
+        raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    now = time.time() if now is None else now
+    kind = "wo" if wo_id else "fo"
+    order_id = wo_id or fo_id
+    terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
+    row_kind = ""
+    if kind == "fo":
+        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+
+    rows = store.state_spans(order_id)
+    spans: list[Span] = []
+    for i, row in enumerate(rows):
+        entered = float(row["ts"])
+        status = str(row["to_status"])
+        if i + 1 < len(rows):
+            left: float | None = float(rows[i + 1]["ts"])
+        else:
+            # The last span is OPEN unless the order settled there, in which case it
+            # closed at its own moment and there is no open span at all (spec §4 rule 2).
+            left = entered if status in terminal else None
+        trigger = str(row["trigger"] or "")
+        if not trigger and kind == "wo":
+            trigger = _derived_trigger(store, order_id, entered)
+        spans.append(Span(status=status, entered=entered, left=left, trigger=trigger,
+                          approximate=bool(row["approximate"])))
+
+    open_span = spans[-1] if spans and spans[-1].left is None else None
+    activity_ts, activity_kind = _last_activity(store, kind, order_id)
+    approximate = any(s.approximate for s in spans)
+    notes: list[str] = []
+    if approximate:
+        notes.append(FO_APPROXIMATE_NOTE)
+    if not activity_kind:
+        notes.append(NO_ACTIVITY_NOTE)
+    if spans and open_span is None:
+        notes.append(SETTLED_NOTE)
+    return StateDurations(
+        order_id=order_id, order_kind=kind, spans=tuple(spans),
+        current_status=open_span.status if open_span else "",
+        current_status_since=open_span.entered if open_span else None,
+        last_activity_ts=activity_ts if activity_kind else None,
+        last_activity_kind=activity_kind, approximate=approximate,
+        notes=tuple(notes), row_kind=row_kind, asof=now,
+    )
+
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
 #: retried and gave up is today visible only as a cost row, and the whole point of
 #: surfacing it here is that the reader can see it was NEVER REACHED. The wording avoids
@@ -1521,7 +1766,8 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
     # so the spans are passed in. The walk itself is not touched here — this report reads
     # one number off it (Neo, question 680).
     anatomy = (inspection.read_session(session, inspect_config(project),
-                                       spans=list(episodes))
+                                       spans=list(episodes),
+                                       turn_starts=store.turn_starts(wo["id"]))
                if session else None)
     if anatomy is not None and anatomy.found:
         unexplained = {"seconds": round(anatomy.unexplained, 2),
@@ -2332,6 +2578,7 @@ def round_line(rnd: dict[str, Any]) -> str:
 #: not the interesting one: the supervisor ships off.
 ALARM_STANDING = {
     "raised": "raised",
+    "informational": "a note, never escalated",
     "reviewing": "with the supervisor",
     "acked": "acked by the supervisor",
     "escalated": "escalated to Neo",
@@ -3183,6 +3430,17 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     hold on a different head means the head moved, which is a new submission the denial
     does not describe. An APPROVAL gains no stickiness at all, which is the case the
     paragraph above exists for.
+
+    **A HOLD THAT IS NO LONGER ABOUT NOW IS MARKED, AND THE PAYLOAD SURVIVES** —
+    2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The line is
+    present tense and the event is immutable, so a hold written at round 3 on an order that
+    has since left `waiting_pr_merge` went on being rendered for ever — nothing can write a
+    newer one, because `Daemon.auto_merge` returns before `decide` for such an order. Only
+    `line` changes: `code`, `judged_sha`, `head_sha` and `round` all stay, because
+    `force_validation_state` builds the re-judge control's diagnosis out of them and a
+    dropped event or a mutated `kind` would erase it. That is the difference from
+    `autoreview_state`, which filters stale rows out: nothing downstream of it reads the
+    payload's fields.
     """
     from . import db
     from .automerge import decided_sha
@@ -3213,6 +3471,21 @@ def automerge_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     newest = terminal or newest
     if newest is None:
         return None
+    # A HOLD IS MARKED STALE, NEVER DROPPED (2026-09-27-a-stale-merge-hold-is-not-the-
+    # reason-a-pr-is-not-merging.md §2), and after the two rules above have chosen
+    # `newest`, so neither of them changes. The round is read only for a hold —
+    # `_stale_panel_hold`'s discipline.
+    if newest["kind"] == "automerge_held":
+        latest = store.latest_validation_round(wo_id=wo["id"])
+        if why := _automerge_hold_is_stale(wo, latest, newest):
+            newest = {**newest, "stale_because": why,
+                      "stale_status": str(wo.get("status") or ""),
+                      "stale_round": int((latest or {}).get("round") or 0)}
+            # `rejudging` REWORDS ONLY and never sets `stale`: `force_validation_state`
+            # blanks its diagnosis on that key, and the `HELD_SHA_MOVED` population it
+            # exists for is the one sitting in `validating` (2026-09-27 spec §1, §3).
+            if why != "rejudging":
+                newest["stale"] = True
     return {**newest, "line": _automerge_line(newest)}
 
 
@@ -3258,7 +3531,7 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
     from . import db
 
     newest: dict[str, Any] | None = None
-    stale = _stale_panel_hold(store, wo["id"])
+    stale = _stale_panel_hold(store, wo["id"], status=str(wo.get("status") or ""))
     for kind in AUTOREVIEW_EVENTS:
         rows = store.events_of_kind(wo["id"], kind)
         # A `panel_gave_up` hold about an overtaken round cannot be this kind's candidate,
@@ -3295,6 +3568,55 @@ def autoreview_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] 
             newest = {**newest, "resolved_status": status,
                       "resolved_decider": assumption_decider(row or {})}
     return {**newest, "line": _autoreview_line(newest)}
+
+
+def review_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The decision this work order owes the user, and what each button would do — or None.
+
+    docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2.
+
+    None on every order that owes nothing, on `automerge_state`'s never-always rule: no key
+    in `jarvis wo show`, no control on the page.
+
+    `placement` IS THE MUTUAL EXCLUSION, computed here and once. An order can be escalated
+    AND hold a pending assumption (reachable since issue 212, `invariants.py:828-836`), and
+    POST `/wo/…/review` decides the WHOLE order either way, so two template conditions
+    would render two differently-labelled controls doing the same thing — Neo 838.
+
+    The sentences are here rather than in the template because both surfaces print them
+    (`cli._readable_autoreview`'s rule): a phrase in Jinja could not reach a terminal.
+
+    A PENDING ASSUMPTION IS OWED WHATEVER THE STATUS (§2): the early pass records them
+    while the worker still runs, and the page has carried the form there since before this
+    projection existed
+    (tests/test_ui.py::test_mark_done_is_not_offered_while_assumptions_are_pending). The
+    `needs_review` check gates the ESCALATED half only, because a later submission can move
+    the status on past an older escalated round.
+    """
+    from .invariants import validation_escalated
+
+    pending = len(store.pending_assumptions(wo["id"]))
+    escalated = (wo["status"] == "needs_review" and validation_escalated(store, wo))
+    if not pending and not escalated:
+        return None
+    latest = store.latest_validation_round(wo_id=wo["id"]) if escalated else None
+    rows = f"{pending} pending assumption" + ("" if pending == 1 else "s")
+    accept = ("Accepts " + rows + " and lands" if pending else "Lands") + \
+        " the work order" + (" over the panel's objection" if escalated else "")
+    reject = ("Rejects " + rows + " and resumes" if pending else "Resumes") + \
+        " the worker, with your reason as the guidance it is sent back with"
+    return {
+        "pending": pending,
+        "escalated": escalated,
+        "round": int(latest["round"]) if latest else None,
+        "placement": "assumptions" if pending else "validation",
+        "scope": "One decision, and it settles the whole order — every pending "
+                 "assumption and the order itself, in a single call",
+        "accept": accept + ".",
+        "reject": reject + ".",
+        "strands": "Rejecting with no reason leaves the work order flagged and the "
+                   "worker unguided.",
+    }
 
 
 def assumption_decider(a: dict[str, Any]) -> str:
@@ -3344,8 +3666,62 @@ _RULING_RANK = {"autoreview_confirmed": 9, "autoreview_unconfirmed": 8,
                 "autoreview_asked": 1}
 
 
+#: THE STATUSES A FRESH HOLD CAN STILL ARRIVE IN, and freshness is judged ONLY outside
+#: them. `Daemon.auto_merge` returns at src/jarvis/daemon.py:4941 on any other status
+#: whatever `record_only` says, so `waiting_pr_merge` is the only status a hold is ever
+#: WRITTEN in — and one tick writes a `HELD_SHA_MOVED` hold and then `_rejudge_moved_head`
+#: (src/jarvis/daemon.py:4963-4968) moves the order to `validating`, where the hold would
+#: otherwise be stale at birth. In `validating` the round machine owns the row and the poll
+#: rewrites the hold within a tick of it settling, so the running round IS the answer to
+#: "why has this not merged".
+_HOLD_REFRESHABLE_STATUSES = ("waiting_pr_merge", "validating")
+
+
+def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | None,
+                             payload: dict[str, Any]) -> str:
+    """WHY this `automerge_held` event is no longer a claim about now — `""` when it is.
+
+    THREE ANSWERS: `"status"`, `"round"` and `"rejudging"` — the last for an order in
+    `validating`, where the user's follow-up to the spec forbids the present tense: the
+    panel is judging it again, so the hold it superseded is history, never the current
+    state (#786, #813). `"rejudging"` changes only the SENTENCE; see `automerge_state`.
+
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §1. Beside `_panel_hold_is_stale` so the two freshness rules sit in one
+    place and one reader can see they agree: both are a present-tense claim derived from
+    an append-only timeline event and re-derived here against the current row (kn-a2ebbbdb,
+    kn-96f47efb).
+
+    Judged against LOCAL ROWS ONLY, which is `automerge_state`'s standing rule: no `gh`
+    call from a render path.
+
+    BOTH CHECKS ARE GATED ON `_HOLD_REFRESHABLE_STATUSES` — an order a fresh hold can still
+    arrive in is never judged, because the next tick judges it instead.
+
+    (a) `status` — outside those two statuses, which is where `Daemon.auto_merge` returns
+        before `decide` and so where no newer hold can ever be written. The same condition
+        that froze the sentence, not a second opinion about it.
+    (b) `round` — in `waiting_pr_merge` only, and strictly `<`, never `!=`: a payload round
+        ABOVE the latest row is not something the store can produce, and calling that stale
+        would hide a hold on an arithmetic surprise.
+
+    A PAYLOAD WITH ROUND 0 OR NO ROUND IS SKIPPED BY (b) ENTIRELY — `HELD_ASSUMPTIONS`,
+    `HELD_PLAN_ASSUMPTIONS` and every hold written before this shipped. No freshness key,
+    no round verdict: silence rather than a guess.
+    """
+    status = str(wo.get("status") or "")
+    if status not in _HOLD_REFRESHABLE_STATUSES:
+        return "status"
+    if status != "waiting_pr_merge":
+        return "rejudging"
+    held_round = int(payload.get("round") or 0)
+    if held_round and held_round < int((latest_round or {}).get("round") or 0):
+        return "round"
+    return ""
+
+
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any]) -> bool:
+                         payload: dict[str, Any], status: str = "") -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -3363,9 +3739,22 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     A PAYLOAD WITH NO ROUND — written before this shipped — is dropped only by clause (i).
     An order whose newest round is still escalated HAS had its panel give up, so
     suppressing the sentence there would replace a stale truth with a fresh silence.
+
+    `HELD_STATUS` IS THE SECOND CODE THIS ANSWERS FOR, and it needs no round and no payload
+    field (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6): the
+    claim is that the order is not in a state one of the two review passes acts in, so it
+    is stale exactly when the order now IS in one. The authority is
+    `autoreview.REVIEW_PASS_STATUSES`, which is the pair of literals `decide` and
+    `decide_early` test themselves — no second list of statuses exists to drift. The UNION
+    is deliberately imprecise: the payload does not say which pass wrote the hold, so a
+    hold from either is dropped once the order reaches either status. Both mis-drops lose a
+    stale sentence about a pass that no longer owns the row, while the pass that does own
+    it writes its own events on the next tick — never a lost live one.
     """
     from . import autoreview
 
+    if str(payload.get("code") or "") == autoreview.HELD_STATUS:
+        return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
         return False
     if not latest_round or str(latest_round.get("outcome") or "").lower() != "escalated":
@@ -3374,24 +3763,36 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     return bool(held_round) and held_round != int(latest_round.get("round") or 0)
 
 
-def _stale_panel_hold(store: ProjectStore, wo_id: str):
-    """`_panel_hold_is_stale` bound to this work order, reading the round LAZILY and ONCE.
+def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = None):
+    """`_panel_hold_is_stale` bound to this work order, reading its rows LAZILY and ONCE.
 
     An order with no panel hold pays nothing for the check — the discipline
     `assumptions_with_rulings` already applies to `_overtaken` and `objection_response`.
+
+    `status` is the work order's, for the `HELD_STATUS` clause: a caller that already holds
+    the row passes it rather than making this read the row again, and one that holds only
+    the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
+    of that code turns up.
     """
     from . import autoreview
 
-    cache: dict[str, dict[str, Any] | None] = {}
+    cache: dict[str, Any] = {}
+    codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
-        if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
+        code = str(payload.get("code") or "")
+        if code not in codes:
             return False
+        if "status" not in cache:
+            cache["status"] = (status if status is not None
+                              else str(store.get_work_order(wo_id)["status"] or ""))
+        if code == autoreview.HELD_STATUS:
+            return _panel_hold_is_stale(None, payload, cache["status"])
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload)
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
 
     return stale
 
@@ -3834,6 +4235,21 @@ def _automerge_line(state: dict[str, Any]) -> str:
                 f"{str(state.get('head_sha') or '')[:10]}")
     if kind == "automerge_failed":
         return f"the merge failed: {state.get('reason') or 'no reason recorded'}"
+    # A hold `automerge_state` marked stale. NEITHER SENTENCE REUSES THE STORED REASON —
+    # quoted even in the past tense it is what sent wo-659be188's reader to a CI run that
+    # had passed two rounds earlier (2026-09-27 spec §5).
+    if state.get("stale_because") == "status":
+        return f"not parked for merge: {state.get('stale_status') or 'in no status'}"
+    if state.get("stale_because") == "round":
+        return (f"round {state.get('round')}'s hold is out of date — round "
+                f"{state.get('stale_round')} is the current round")
+    # THIS ONE DOES QUOTE THE REASON: past tense beside "was held" it is the history the
+    # user asked for, not a claim about now (2026-09-27 spec §5, third sentence).
+    if state.get("stale_because") == "rejudging":
+        reason = state.get("reason") or "no reason recorded"
+        if round_n := int(state.get("stale_round") or 0):
+            return f"re-judging in round {round_n} (was held: {reason})"
+        return f"re-judging (was held: {reason})"
     return f"held — {state.get('reason') or 'no reason recorded'}"
 
 
@@ -4151,9 +4567,14 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     `acknowledged_blockers`, which re-flagging here would silently overwrite. A user who
     ran `jarvis wo ack` over a parked order must not have the flag raised again by the
     next tick; that is the same renotify defect wearing the column instead of the event.
+
+    THE STORE ENFORCES THE NO-DUPLICATE RULE NOW, not this function: `set_status` writes
+    neither a `status` event nor a span row for a move to the status the order is already
+    in (spec 2026-09-27-time-in-each-state §2), so the quiet path asserts the status
+    through the chokepoint like every other caller instead of dodging it.
     """
     if store.work_unlanded_open(wo["id"]):
-        store.update_work_order(wo["id"], status="needs_review")
+        store.set_status(wo["id"], "needs_review", trigger="unlanded_repark")
         return "needs_review"
     store.add_event(wo["id"], "work_unlanded", {**work.record(), "was": wo["status"]})
     store.set_status(wo["id"], "needs_review")
@@ -4697,6 +5118,11 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
     and would answer about a different moment than the record is describing
     (`automerge_state`'s own note).
 
+    A hold `automerge_state` marked STALE is treated exactly as a non-hold kind — no
+    diagnosis, `refusal` and `can_force` untouched. The claim it would build is about a
+    commit a later round has since judged, which is the class of claim the 2026-09-27 spec
+    removes, and restating it inside a button is no better than printing it on a line.
+
     Only the two holds a fresh round CLEARS are diagnosed. A red build or a conflict is a
     hold this control cannot help with, and wording one of those as something to force a
     round over is how a user comes to spend round numbers on a failing CI run.
@@ -4708,7 +5134,9 @@ def force_validation_state(store: ProjectStore, wo: dict[str, Any], *, project: 
         return None
     refusal = force_validation_refusal(store, wo, project=project, cfg=cfg)
     state: dict[str, Any] = dict(held or {})
-    if state.get("kind") != "automerge_held":
+    # A STALE HOLD IS TREATED AS NO HOLD (2026-09-27 spec §3): diagnosing from one would
+    # say the head moved away from a commit a later round has since judged.
+    if state.get("kind") != "automerge_held" or state.get("stale"):
         state = {}
     code = str(state.get("code") or "")
     judged = str(state.get("judged_sha") or "")
@@ -5705,7 +6133,41 @@ def resettle_after_repair(store: ProjectStore, wo_id: str) -> bool:
 
 #: The event `carry_validated_head` writes. Not a `PrRepair` and not an automerge event:
 #: it is a fact about a VERDICT, and it belongs beside the round it moved.
+#:
+#: ONE KIND FOR BOTH CARRIES, with a `cause` — `"base_heal"` here, `"base_merge_chain"` in
+#: `carry_merge_chain` — for `ProjectStore.validated_head`'s one-home reason (spec
+#: 2026-09-27 §4, Neo question 791 rejected a second kind).
 HEAD_CARRIED_EVENT = "validation_head_carried"
+
+#: A carry the OS could NOT justify, and the reason the round machine is about to spend a
+#: round. Its own kind because it is the opposite fact, and `proof` says which of the two
+#: independent proofs failed.
+CARRY_REFUSED_EVENT = "validation_carry_refused"
+
+#: `cause` on `HEAD_CARRIED_EVENT`: the OS's own merge-ref rebuild, or a chain of base
+#: merges anybody made.
+CARRY_BASE_HEAL = "base_heal"
+CARRY_BASE_MERGE_CHAIN = "base_merge_chain"
+
+#: `cause` on `PR_BASE_UPDATED_EVENT` / `PR_BASE_UPDATE_FAILED_EVENT`: which of the two
+#: reasons asked the OS to rebuild this merge ref. THE KEY IS SHARED (`base_heal_spent`)
+#: and the reason is not — the bound is about how often one merge ref may be rebuilt, and
+#: the record still has to say why (spec 2026-09-27 §5.3 guard 4).
+BASE_UPDATE_BEHIND = "behind"
+BASE_UPDATE_BASE_RED = "base_red"
+
+#: How many times the OS may catch one pull request up with a MOVING base. The per-base-sha
+#: key cannot bound this on its own: every new commit on `main` is a new key and would earn
+#: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
+CATCH_UP_MAX = 3
+
+#: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
+#: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
+#: not reach GitHub" (spec §4).
+PROOF_CHAIN = "chain"
+PROOF_PATCH_ID = "patch_id"
+PROOF_FETCH = "fetch"
+PROOF_READ = "read"
 
 
 def record_base_health(store: ProjectStore, wo: dict[str, Any], *, red: bool,
@@ -5760,24 +6222,28 @@ def base_heal_spent(store: ProjectStore, wo_id: str, base_sha: str) -> bool:
 
 def record_base_update(store: ProjectStore, wo: dict[str, Any], *, base: str,
                        base_sha: str, head_before: str, head_after: str,
-                       checks: tuple[str, ...]) -> None:
+                       checks: tuple[str, ...], cause: str) -> None:
     """The OS healed this pull request itself. Spec §4: say so, on the record.
 
     `head_before`/`head_after` are not decoration — they are what `carry_validated_head`
     is allowed to rely on afterwards, and what tells a reader six weeks later that the
     commit an automatic merge landed differed from the judged one by a base merge and
     nothing else.
+
+    `cause` is `BASE_UPDATE_BASE_RED` or `BASE_UPDATE_BEHIND` — the two reasons the OS
+    updates a branch, sharing one key and one event kind, distinguishable on the record
+    and countable apart (`catch_up_attempts`).
     """
     from . import invariants as invariants_mod
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
                      "head_before": head_before, "head_after": head_after,
-                     "checks": list(checks)})
+                     "checks": list(checks), "cause": cause})
 
 
 def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: str,
-                              base_sha: str, reason: str) -> None:
+                              base_sha: str, reason: str, cause: str) -> None:
     """GitHub refused the update. Spends the attempt — see `base_heal_spent`.
 
     `reason` is `GitHubError.reason`, this OS's own short phrase, never `str(e)`: that
@@ -5788,7 +6254,99 @@ def record_base_update_failed(store: ProjectStore, wo: dict[str, Any], *, base: 
 
     store.add_event(wo["id"], invariants_mod.PR_BASE_UPDATE_FAILED_EVENT,
                     {"pr_url": wo.get("pr_url"), "base": base, "base_sha": base_sha,
-                     "reason": reason})
+                     "reason": reason, "cause": cause})
+
+
+def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
+    """How often the OS has already caught this pull request up with a moving base.
+
+    `CATCH_UP_MAX`'s counter (spec 2026-09-27 §5.3 guard 5), and it counts
+    `cause="behind"` rows only: a red base rebuilt the same merge ref for a different
+    reason, on its own key, and the two bounds must not eat each other's budget.
+    """
+    from . import invariants as invariants_mod
+
+    n = 0
+    for row in store.events_of_kind(wo_id, invariants_mod.PR_BASE_UPDATED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if payload.get("cause") == BASE_UPDATE_BEHIND:
+            n += 1
+    return n
+
+
+def catch_up_needed(pr: Any, *, repo: Path) -> bool:
+    """Is this pull request behind its base? `.behind` ALONE IS NOT THE QUESTION.
+
+    Spec 2026-09-27 §5.1. `PullRequest.behind` is `mergeStateStatus == "BEHIND"`, and on a
+    repository whose `strict_required_status_checks_policy` is off — this one — a merely
+    behind branch reports CLEAN. Keying the catch-up on it would make the feature a no-op
+    on the fleet's busiest project, silently. So it is a cheap positive short-circuit, and
+    the authoritative test is ancestry: the base's head commit, read from the same
+    `gh pr view` the poll already makes, must be reachable from the pull request's head.
+
+    Asked of the LOCAL checkout (`branchproof.is_ancestor`) after the fetch proof (b)
+    needs anyway. A checkout that cannot answer reads as BEHIND — the caller's seven
+    guards then decide whether to spend an update, and every one of them is bounded.
+    """
+    from . import branchproof
+
+    if getattr(pr, "behind", False):
+        return True
+    base_oid = str(getattr(pr, "base_oid", "") or "")
+    head = str(getattr(pr, "head_oid", "") or "")
+    if not base_oid or not head:
+        return False        # GitHub answered no base commit: nothing to be behind of
+    return not branchproof.is_ancestor(repo, base_oid, head)
+
+
+def _carry_round_onto(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      facts: Callable[[dict], tuple[str, dict] | None]) -> dict | None:
+    """The guard both carries owe and the one write both make. Spec 2026-09-27 §3.1.
+
+    TWO ENTRY POINTS, ONE RULE (review round 1): `carry_validated_head` and
+    `carry_merge_chain` differ only in what they prove, and a second copy of the write is a
+    second place for `validated_head`'s one-home invariant to drift out of. What is shared
+    is exactly this — there must be a latest round, its verdict must be the one on `judged`,
+    the head must have actually moved, and the binding is `carry_round_head` plus ONE
+    `HEAD_CARRIED_EVENT` carrying the round it moved.
+
+    `facts` is the caller's own proof, given the round row so it can name the round in its
+    refusal log; it returns `(reason, payload extras)` or None to refuse. Nothing is written
+    until it holds, so a refusal at either level leaves the record exactly as it was.
+
+    **AND IT PUTS THE FLAG DOWN ITSELF when nothing else is blocking** (spec §6 item 4):
+    the carry made `sha_moved` untrue, and nothing else lowers a stored flag before the
+    order completes on the merge, so without this the user keeps an attention item about a
+    stall that is over. Only when `true_blockers` is EMPTY — another blocker is somebody
+    else's reason and is left exactly as it was — and only while the flag is actually up,
+    which is what makes it idempotent across reconcile ticks and keeps it off the user's
+    acks (kn-089de524).
+    """
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if row is None or not judged or not head or head == judged:
+        return None
+    if ProjectStore.validated_head(row) != judged:
+        return None
+    built = facts(row)
+    if built is None:
+        return None
+    reason, extra = built
+    store.carry_round_head(int(row["id"]), head, reason)
+    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
+               "judged_sha": judged, "carried_head_sha": head, "reason": reason, **extra}
+    # AFTER the binding, so `rejudge_exhausted`'s last clause reads the carried head, and
+    # from the live row rather than the caller's snapshot (spec §6 item 4).
+    from . import invariants as invariants_mod
+
+    fresh = store.get_work_order(wo["id"])
+    lowered = bool(fresh["needs_attention"]) and not invariants_mod.true_blockers(
+        store, fresh)
+    if lowered:
+        carried["attention_cleared"] = True
+    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
+    if lowered:
+        store.clear_attention(wo["id"])
+    return carried
 
 
 def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str,
@@ -5842,29 +6400,127 @@ def carry_validated_head(store: ProjectStore, wo: dict[str, Any], *, judged: str
     merge still files its AUTO_MERGE gate for Neo. This changes what that request says,
     never whether one happens.
     """
-    row = store.latest_validation_round(wo_id=wo["id"])
-    if row is None or not judged or not head_after or head_after == judged:
-        return None
-    if ProjectStore.validated_head(row) != judged:
-        return None
-    if len(parents) != 2 or parents[0] != judged:
-        log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
-                 "of %s with the base", wo["id"], row["round"], head_after[:10],
-                 [p[:10] for p in parents] or "unreadable", judged[:10])
-        return None
-    reason = (f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
-              f"failure inherited from a red base — no authored content changed")
-    store.carry_round_head(int(row["id"]), head_after, reason)
-    carried = {"round": int(row["round"]), "round_id": int(row["id"]),
-               "judged_sha": judged, "carried_head_sha": head_after,
-               "base": base, "base_sha": base_sha, "reason": reason,
-               # THE PROOF, not a restatement of the claim: the commit's own parents as
-               # GitHub answered them. `merged_base_sha` is the base commit that
-               # actually went in, which is not necessarily `base_sha` — the base can
-               # move between the CI read and the update.
-               "parents": list(parents), "merged_base_sha": parents[1]}
-    store.add_event(wo["id"], HEAD_CARRIED_EVENT, carried)
-    return carried
+    def facts(row: dict) -> tuple[str, dict] | None:
+        if len(parents) != 2 or parents[0] != judged:
+            log.info("%s: not carrying round %s onto %s — its parents are %s, not a merge "
+                     "of %s with the base", wo["id"], row["round"], head_after[:10],
+                     [p[:10] for p in parents] or "unreadable", judged[:10])
+            return None
+        return ((f"the OS merged `{base}` ({base_sha[:10]}) into this branch to clear a "
+                 f"failure inherited from a red base — no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commit's own parents as
+                # GitHub answered them. `merged_base_sha` is the base commit that
+                # actually went in, which is not necessarily `base_sha` — the base can
+                # move between the CI read and the update.
+                {"cause": CARRY_BASE_HEAL, "base": base, "base_sha": base_sha,
+                 "parents": list(parents), "merged_base_sha": parents[1]})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head_after, facts=facts)
+
+
+def carry_merge_chain(store: ProjectStore, wo: dict[str, Any], *, judged: str, head: str,
+                      chain: tuple[tuple[str, str, bool], ...], base: str, base_sha: str,
+                      fingerprints: tuple[str, str]) -> dict | None:
+    """Bind the panel's verdict to a head that is `judged` plus merges that added nothing.
+
+    docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3. The
+    generalisation of `carry_validated_head` above: the same weakening of "nothing merges a
+    commit no round judged", licensed by the same fact, for a CHAIN of base merges made by
+    anyone rather than one merge the OS made. Every catch-up with `main` is one — and the
+    OS's own gate reviewer demands the catch-up, so charging a round for it is the OS
+    charging for what it asked for.
+
+    **THE FACTS ARRIVE AS ARGUMENTS AND THE POLICY IS HERE.** `chain` is
+    `ci.base_merge_chain`'s proof (a), oldest first, each element `(merge, commit merged
+    in, whether that is a base commit)` — the second kind is a `git pull --no-rebase` merge
+    of the branch's own lineage, which Neo question 806 widened proof (a) to accept because
+    the judged commit already contained it; `fingerprints` is proof (b) —
+    `branchproof.diff_fingerprint` for `judged` and for `head` — and they must be
+    non-empty and EQUAL, which is what excludes an evil merge
+    whose conflict resolution edited the branch's own files. `Daemon._carry_catch_up` does
+    the `gh`/`git` and names the proof that failed; nothing here touches a network, so the
+    rule stays unit-testable exactly as `carry_validated_head` is.
+
+    **IT READS NEITHER `cfg`, `counted_validation_rounds` NOR `rejudged_heads`, and that is
+    a requirement rather than an omission (§6 item 2).** Part 3 of the spec is two live
+    orders stranded with their round budget spent and a decline already written for the
+    very head this would carry; both recover with nothing typed only because no round
+    accounting can reach this function. Enforced structurally — there is no `cfg`
+    parameter — and not by a comment.
+
+    Returns the payload written, or None when the facts do not hold.
+    """
+    before, after = fingerprints
+
+    def facts(_row: dict) -> tuple[str, dict] | None:
+        if not chain or chain[-1][0] != head:
+            return None         # oldest-first: the newest commit walked IS the head
+        if not before or not after or before != after:
+            # Belt to the daemon's braces: a differing diff is authored content, and the
+            # one thing this function may never do is carry a verdict onto it.
+            return None
+        bases = [merged for _sha, merged, is_base in chain if is_base]
+        branch = [merged for _sha, merged, is_base in chain if not is_base]
+        # Two sentences and not one, because `merged_base_shas` must not lie: past Neo
+        # question 806 a walked merge may have brought in the branch's own lineage.
+        said = ([f"`{base}` was merged into this branch {len(bases)} time(s)"]
+                if bases else [])
+        if branch:
+            said.append(f"{len(branch)} merge(s) brought in only commits {judged[:10]} "
+                        f"already contained")
+        # SAY WHAT IS TRUE, and it is a HASH comparison and not a comparison of the diff
+        # text (review round 1): `branchproof.diff_fingerprint` hashes the diff whitespace
+        # and all, dropping only the line numbers and text blob ids a base merge moves —
+        # a binary file's new-side id stays in (round 3). So "unchanged
+        # down to its whitespace", never "byte-identical" — the bytes of the two diffs do
+        # differ, in exactly the bookkeeping this is licensed to ignore.
+        return ((" and ".join(said) + f", and the pull request's own diff is unchanged "
+                 f"down to its whitespace (diff hash {after[:12]}, line numbers aside) "
+                 f"— no authored content changed"),
+                # THE PROOF, not a restatement of the claim: the commits walked and what
+                # each of them merged in, as GitHub answered, plus the id both diffs
+                # produced. A reader six weeks later can re-run either proof from this.
+                {"cause": CARRY_BASE_MERGE_CHAIN,
+                 "chain": [sha for sha, _merged, _base in chain],
+                 "merged_base_shas": bases, "merged_branch_shas": branch,
+                 "base": base, "base_sha": base_sha, "patch_id": after})
+
+    return _carry_round_onto(store, wo, judged=judged, head=head, facts=facts)
+
+
+def carry_refusal_told(store: ProjectStore, wo_id: str, head_sha: str,
+                       proof: str) -> bool:
+    """Has this refusal already been written for this commit? §4's dedupe.
+
+    Keyed on (head, proof) rather than saturating — `rejudged_heads` and `base_heal_spent`'
+    shape and kn-089de524's rule. A parked pull request reaches the carry every two
+    minutes, so an event per tick would bury the record; a key that saturated would hide
+    the refusal on the commit that arrives next.
+    """
+    for row in store.events_of_kind(wo_id, CARRY_REFUSED_EVENT):
+        payload = db.from_json(row.get("payload"), {}) or {}
+        if (str(payload.get("head_sha") or "") == head_sha
+                and str(payload.get("proof") or "") == proof):
+            return True
+    return False
+
+
+def record_carry_refusal(store: ProjectStore, wo: dict[str, Any], *, judged: str,
+                         head_sha: str, proof: str, detail: str,
+                         chain: tuple[str, ...] = ()) -> bool:
+    """Say on the record that the verdict was NOT carried, and which proof said so.
+
+    Neo's second condition (§4): a round the OS skipped and a round it spent must both be
+    auditable from `jarvis wo show` alone. Written once per (head, proof), and never for an
+    empty head — an unreadable head is `gh` failing to answer, and keying the dedupe on
+    `""` would swallow the real commit when it arrives (`rejudged_heads`' trap).
+    """
+    if not head_sha or carry_refusal_told(store, wo["id"], head_sha, proof):
+        return False
+    store.add_event(wo["id"], CARRY_REFUSED_EVENT,
+                    {"judged_sha": judged, "head_sha": head_sha, "proof": proof,
+                     "detail": detail, "chain": list(chain)})
+    return True
 
 
 def pr_repair_origin(store: ProjectStore, wo_id: str) -> str | None:
@@ -7088,6 +7744,9 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
             # `jarvis wo show --json` carries a work order's (§6). By subject, never by
             # carrier: a child's own alarm belongs on the child.
             "alarms": store.alarms_for_feature(fo_id),
+            # How long it has been where it is, on the same always-present rule — the
+            # identical document `jarvis wo show` carries for a work order (spec §6).
+            "time_in_state": state_durations(store, fo_id=fo_id).as_dict(),
             "children": children,
             "progress": feature_progress(store, fo),
             # Only meaningful next to `max_parallel`, but returned unconditionally so a
@@ -7199,7 +7858,12 @@ def submit_plan(fo_id: str, doc: Any,
             f"committed text, never your working tree. Commit it and resubmit:\n"
             f"  git add {plan['design_doc']} && git commit -m \"spec: …\""
         )
-    plan["design_doc_content"], source = found
+    # THE REVISION, PERSISTED IN THE SAME STATEMENT AS THE TEXT, so the two can never
+    # disagree — §4 of
+    # docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The spec page
+    # prints it verbatim and a plan that predates this key says so rather than guessing.
+    plan["design_doc_content"], plan["design_doc_source"] = found
+    source = plan["design_doc_source"]
     spec_problems = plans.spec_problems(plan, plan["design_doc_content"])
     if spec_problems:
         raise OpsError(
@@ -7315,7 +7979,7 @@ def refresh_plan_spec(fo_id: str,
                     project_name=name)
         return {**out, "reason": "rejected", "problems": problems}
 
-    plan["design_doc_content"] = text
+    plan["design_doc_content"], plan["design_doc_source"] = text, source
     planner_id = fo.get("plan_wo_id") or fo_id
     q2 = _ask_plan_review(name, fo, plan, planner_id, source,
                           why=f"the spec was revised on {source}")
@@ -7436,6 +8100,47 @@ def review_plan(fo_id: str, accept: bool = True, feedback: str = "",
             )
         except OpsError as e:
             out["delivery_error"] = str(e)
+    return out
+
+
+def feature_spec(fo_id: str, project_name: str | None = None,
+                 section: str | None = None) -> dict[str, Any]:
+    """The document the OS HOLDS for this feature — `jarvis fo spec`.
+
+    §7 of docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The snapshot,
+    never the file on disk: the planner's branch is the only place the text exists before
+    a pull request, and the snapshot is what every reviewer and every child was given.
+
+    `content` is the whole document, or with `section` the extracted section alone. The
+    terminal gets MARKDOWN — `ui.markdown` serves the page and nothing else.
+    """
+    from . import sections
+    from .ui import markdown
+
+    name, _path, fo = find_feature_order(fo_id, project_name)
+    plan = db.from_json(fo.get("plan"), {}) or {}
+    content = str(plan.get("design_doc_content") or "")
+    repo_path = str(plan.get("design_doc") or "")
+    if not (content and repo_path):
+        raise OpsError(
+            f"{fo_id} is {fo['status']} and holds no spec — a feature's document is "
+            f"snapshotted when its planner submits a plan"
+        )
+    out = {"project": name, "fo_id": fo_id, "repo_path": repo_path,
+           "source": str(plan.get("design_doc_source") or ""), "content": content}
+    if section:
+        text = sections.extract_section(content, section)
+        if text is None:
+            # The same courtesy `plans.spec_problems` gives a planner: name what exists
+            # rather than leaving the reader to guess at the heading.
+            names = [t for t, _s in markdown.anchors(content)]
+            headings = ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
+            raise OpsError(
+                f"{section!r} matches no section of {repo_path}. It carries: "
+                f"{headings or 'no headings at all'}"
+            )
+        out["section"] = section
+        out["content"] = text
     return out
 
 
@@ -8433,6 +9138,251 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
     return {"rule": rule, "canary_failures": failures,
             "note": ("retracted — it no longer applies, and the record keeps that it "
                      "once did")}
+
+
+# -- the self-evolution registry (detectors and remedy rules; see rules.py) --------------
+#
+# docs/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
+# PLAIN DICT the CLI and the dashboard both consume verbatim; neither of them derives a
+# number, so the two surfaces cannot disagree about what the registry says.
+#
+# ABSENT IS NEVER ZERO, throughout. A detector that has never fired has NO hit rate — it
+# carries `None` and a sentence saying why, never `0.0`, because a fabricated zero reads
+# as a measurement and a rule nobody has evidence about is not a rule with bad evidence.
+
+#: What a fire counts as evidence FOR. The other three outcomes are not the detector
+#: being wrong: a `refused` is the gate working, an `unreadable` is not a decision at
+#: all, and a `cleared` closes a fire that was already counted when it opened.
+_HIT_OUTCOMES = ("recorded", "proposed", "applied")
+
+
+def _rule_entry(central: CentralStore, detector: dict[str, Any]) -> dict[str, Any]:
+    """One detector as every surface renders it: the row, its live remedies, its
+    condition IN PROSE, and its fire counts.
+
+    The condition is parsed again here rather than trusted: a row written by an older
+    release may name a field this one removed, and a listing that crashed on such a row
+    would take the whole registry down with it. An unreadable row is LISTED, with its
+    problems, and says so.
+    """
+    from . import rules as rules_mod
+
+    prose: str | None = None
+    problems: list[str] = []
+    try:
+        prose = rules_mod.render_condition(
+            rules_mod.parse_condition(detector["condition"]))
+    except rules_mod.RulesError as e:
+        problems = list(e.args[0]) if e.args and isinstance(e.args[0], list) else [str(e)]
+
+    fires = central.list_rule_fires(detector_id=detector["id"], limit=500)
+    by_outcome: dict[str, int] = {}
+    for f in fires:
+        by_outcome[f["outcome"]] = by_outcome.get(f["outcome"], 0) + 1
+    hits = sum(by_outcome.get(o, 0) for o in _HIT_OUTCOMES)
+    return {
+        **detector,
+        "condition_prose": prose,
+        "condition_problems": problems,
+        "readable": not problems,
+        "remedies": [_remedy_entry(r) for r in central.remedy_rules_for(detector["id"])],
+        "fires": {"total": len(fires), "by_outcome": by_outcome, "hits": hits},
+        "hit_rate": (hits / len(fires)) if fires else None,
+        "hit_rate_note": None if fires else (
+            "this detector has never fired, so it has no hit rate yet — which is not a "
+            "hit rate of zero"),
+    }
+
+
+def _remedy_entry(row: dict[str, Any]) -> dict[str, Any]:
+    """A remedy row with its parameters DECODED, so no surface parses JSON itself."""
+    return {**row, "params": db.from_json(row.get("params"), {})}
+
+
+def rules_list(*, project: str = "", status: str = "",
+               gap_class: str = "") -> dict[str, Any]:
+    """The registry: what the OS has learned to recognise about itself.
+
+    The counts LEAD, because "twelve rules" is the number a reader can act on and the
+    list is the detail. `project` is a scope filter — it returns that project's rules and
+    the fleet-wide ones — for the reason `CentralStore.list_detectors` gives.
+
+    `enabled` is `None` in this release and that is deliberate: nothing evaluates these
+    rules yet, so there is no engine to be on or off, and `False` would state that one
+    exists and is switched off.
+    """
+    central = CentralStore()
+    try:
+        every = central.list_detectors(project=project, gap_class=gap_class,
+                                       include_retired=True)
+        counts = {
+            "total": len(every),
+            "armed": sum(1 for d in every if d["status"] == "armed"),
+            "dry_run": sum(1 for d in every if d["status"] == "dry_run"),
+            "retracted": sum(1 for d in every if d["status"] == "retracted"),
+        }
+        shown = [d for d in every if not status or d["status"] == status]
+        if not status:
+            shown = [d for d in shown if d["retired_at"] is None]
+        entries = [_rule_entry(central, d) for d in shown]
+    finally:
+        central.close()
+    if not counts["total"]:
+        note = ("no detectors are registered — the registry is empty, which is a "
+                "different thing from a registry whose rules have never matched")
+    else:
+        note = ("every rule is in dry run: it records what it would have proposed and "
+                "acts on nothing. Only a person arms one")
+        if counts["armed"]:
+            note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
+                    f"proposes; the gate still decides whether anything runs")
+    return {"counts": counts, "rules": entries, "enabled": None, "note": note}
+
+
+def rules_show(detector_id: str) -> dict[str, Any]:
+    """One detector in full: the condition as prose, every remedy rule with its
+    primitive and parameters, the whole provenance chain, and the newest fires.
+
+    The provenance chain is grouped rather than left scattered through the row because it
+    is the one thing a person arming a rule reads as a unit: which improvement order
+    found the gap, which work order fixed it, which issue and which pull request.
+    """
+    central = CentralStore()
+    try:
+        detector = central.get_detector(detector_id)
+        if detector is None:
+            raise OpsError(f"detector {detector_id!r} not found — "
+                           f"`jarvis rules list` shows the registered ones")
+        entry = _rule_entry(central, detector)
+        retired = [_remedy_entry(r) for r
+                   in central.remedy_rules_for(detector_id, include_retired=True)
+                   if r["retired_at"] is not None]
+        fires = central.list_rule_fires(detector_id=detector_id, limit=20)
+    finally:
+        central.close()
+    return {
+        "detector": detector,
+        "condition_prose": entry["condition_prose"],
+        "condition_problems": entry["condition_problems"],
+        "readable": entry["readable"],
+        "remedies": entry["remedies"],
+        "retired_remedies": retired,
+        "provenance": {
+            "source": detector["source"], "io_id": detector["io_id"],
+            "fix_wo_id": detector["fix_wo_id"], "issue_url": detector["issue_url"],
+            "pr_url": detector["pr_url"], "seed_version": detector["seed_version"],
+        },
+        "fires": fires,
+        "hit_rate": entry["hit_rate"],
+        "hit_rate_note": entry["hit_rate_note"],
+    }
+
+
+def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
+    """Retire a detector or one remedy rule. NEVER deletes.
+
+    Dispatches on the id prefix, because the two live in different tables and a user
+    holding an id from `jarvis rules show` should not have to know which. Retracting a
+    DETECTOR takes its live remedy rows with it — see `CentralStore.retract_detector`.
+    """
+    if not reason.strip():
+        raise OpsError("a retraction needs a reason — it is the only record of why the "
+                       "OS stopped believing something it acted on")
+    central = CentralStore()
+    try:
+        try:
+            if rule_id.startswith("dt-"):
+                rule = central.retract_detector(rule_id, reason.strip())
+                note = ("retracted, with its live remedy rules — they no longer apply, "
+                        "and the record keeps that they once did")
+            elif rule_id.startswith("rm-"):
+                rule = central.retract_remedy_rule(rule_id, reason.strip())
+                note = ("retracted — the detector still recognises the gap, it just no "
+                        "longer proposes this")
+            else:
+                raise OpsError(f"{rule_id!r} is neither a detector (`dt-…`) nor a "
+                               f"remedy rule (`rm-…`)")
+        except KeyError as e:
+            raise OpsError(str(e)) from e
+        except ValueError as e:
+            raise OpsError(str(e)) from e
+    finally:
+        central.close()
+    return {"rule": rule, "note": note}
+
+
+def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
+    """What this detector reads, and — given an order — what it would decide. WRITES
+    NOTHING.
+
+    The stored condition is RE-PARSED here, not trusted: a row written by an older
+    release may name a field a later one removed, and a row that fails on read is
+    reported UNREADABLE and never evaluated. The pinned ruling is that a thing which
+    could not be read decides nothing, so `matched` stays `None` — it is never reported
+    as "no match", which would be an answer nobody computed.
+    """
+    from . import rules as rules_mod
+
+    central = CentralStore()
+    try:
+        detector = central.get_detector(detector_id)
+        if detector is None:
+            raise OpsError(f"detector {detector_id!r} not found")
+        remedies_rows = [_remedy_entry(r)
+                         for r in central.remedy_rules_for(detector_id)]
+    finally:
+        central.close()
+
+    out: dict[str, Any] = {
+        "detector": detector, "remedies": remedies_rows, "order_id": order_id,
+        "readable": True, "evaluated": False, "matched": None, "problems": [],
+        "fields": [], "sources": [], "condition_prose": None, "explanation": None,
+        "absent": [], "note": "",
+    }
+    try:
+        cond = rules_mod.parse_condition(detector["condition"])
+    except rules_mod.RulesError as e:
+        problems = list(e.args[0]) if e.args and isinstance(e.args[0], list) else [str(e)]
+        out.update(readable=False, problems=problems, note=(
+            "this condition could not be read, so nothing was evaluated and nothing was "
+            "decided — a row written by an older release may name a field this one no "
+            "longer has"))
+        return out
+
+    out.update(condition_prose=rules_mod.render_condition(cond),
+               fields=sorted(rules_mod.fields_used(cond)),
+               sources=sorted(rules_mod.sources_used(cond)))
+    if not order_id:
+        out["note"] = ("no order given, so nothing was evaluated — this is what the "
+                       "condition reads")
+        return out
+
+    project, path, wo = find_work_order(order_id)
+    store = ProjectStore(path)
+    try:
+        try:
+            facts = rules_mod.facts(store, wo, now=db.now())
+        except NotImplementedError:
+            # `rules.facts` is DECLARED by the grammar section and implemented by the
+            # evaluation-and-firing section, which owns the readers behind every
+            # `FactField.source` slug. Until it lands there is no snapshot, and the
+            # honest answer is to say so: fabricating one, or returning "no match",
+            # would report a verdict nobody computed.
+            out["note"] = (
+                "the fact snapshot is not built in this release — `rules.facts` is "
+                "implemented by the evaluation-and-firing section, so this order was "
+                "not evaluated and nothing was decided")
+            return out
+    finally:
+        store.close()
+
+    evaluation = rules_mod.evaluate(cond, facts)
+    out.update(evaluated=True, matched=evaluation.matched,
+               absent=list(evaluation.absent),
+               explanation=rules_mod.explain(cond, evaluation),
+               project=project,
+               note="a dry run: this wrote nothing and acted on nothing")
+    return out
 
 
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
@@ -10009,7 +10959,9 @@ def inspect_report(target: str, project: str | None = None, *,
         # The OS's own record of what it was holding this order for, so the report can
         # state both clocks and name the difference (`holds`). Two indexed reads.
         spans = holds.held(store, wo["id"])
-        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans)
+        # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
+        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
+                                           turn_starts=store.turn_starts(wo["id"]))
                    if session
                    else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,
@@ -10123,11 +11075,11 @@ def context_report(wo_id: str, project: str | None = None, *,
     the renderers compute nothing: the residual subtraction, the per-turn delta and the
     sentence naming a prefix break are keys of this payload.
 
-    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`,
-    never by transcript turn numbering — `inspection` renumbers the turns it finds in the
-    transcript files, and that sequence is not `wo_turns.seq` (a coalesced delivery, an
-    adopted session or a second segment file makes them disagree). The window is the OS's
-    own record of when the process ran, which is the thing both sides share.
+    Cache writes are joined to turns BY TIMESTAMP against `wo_turns.started_at/ended_at`:
+    the window is the OS's own record of when the process ran, which is the thing both
+    sides share. The two numberings now AGREE — `read_session` takes `turn_starts` and
+    binds every transcript turn to a `wo_turns.seq` (spec 2026-09-27 §3) — so this join
+    is no longer a workaround for a sequence that meant something else.
     """
     from . import context as context_mod
     from . import inspection
@@ -10141,8 +11093,12 @@ def context_report(wo_id: str, project: str | None = None, *,
         rows = store.all_turns(wo_id)
         session = wo.get("session_id") or ""
         cfg = inspect_config(name)
-        anatomy = (inspection.read_session(session, cfg,
-                                          index=usage_mod.index_sessions())
+        # Spec 2026-09-27 §3: the same rows this report already read, reused to bind
+        # inspect's numbering to `wo_turns.seq`.
+        anatomy = (inspection.read_session(
+                       session, cfg, index=usage_mod.index_sessions(),
+                       turn_starts=[(int(r["seq"]), float(r["started_at"]))
+                                    for r in rows])
                    if session else None)
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "
