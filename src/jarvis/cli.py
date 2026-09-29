@@ -3460,6 +3460,11 @@ def _print_rules_list(data: dict) -> None:
     noun = "rule" if c["total"] == 1 else "rules"
     print(f"{c['total']} {noun}: {c['armed']} armed, {c['dry_run']} in dry run, "
           f"{c['retracted']} retracted")
+    # SAID ON ITS OWN LINE, above the rules rather than in the closing note, because it
+    # changes what every number below MEANS: with the pass off, a rule showing no fires
+    # has not failed to match, it has never been looked at.
+    if data.get("enabled") is False:
+        print("  the evaluation pass is OFF — nothing evaluates these rules")
     for r in data["rules"]:
         scope = r["project"] or "fleet-wide"
         retired = " ⊘ retracted" if r["retired_at"] else ""

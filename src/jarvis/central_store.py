@@ -489,6 +489,7 @@ class CentralStore:
         self._migrate()
         self.fts = self._ensure_fts()
         self._seed_gate_rules()
+        self._seed_detectors()
 
     def _migrate(self) -> None:
         for table, columns in ADDED_COLUMNS.items():
@@ -1260,9 +1261,66 @@ class CentralStore:
     # the same append-mostly discipline as `gate_rules` and the knowledge base, because
     # what the OS believed, and when, is evidence.
     #
-    # Nothing here seeds: `rules.seed_rows()` is invoked by the section that owns the
-    # evaluation pass, and calling it from this module would put builtin rows into every
-    # `os.db` before anything could fire them.
+    # Seeding runs where `gate_rules`' does — `_seed_detectors` below, called from the
+    # same place — because §5.3 of docs/specs/2026-09-27-self-evolution.md assigns the
+    # call site to the section that owns the evaluation pass, and that section now
+    # exists. The five builtin rows are in `os.db` from the first open, which is safe
+    # precisely because they are all `dry_run` and because `Daemon.rules_tick` is gated
+    # on a config flag that ships off: a fleet that upgrades gains the rules and
+    # evaluates none of them until somebody says so.
+
+    def _seed_detectors(self) -> None:
+        """Write the five builtin detectors and their remedy rows, once.
+
+        `_seed_gate_rules`' argument, unchanged: the version key is a SPEED guard and the
+        correctness rests on the ids, which `rules.seed_id` derives from the row's
+        content. An insert that already happened is ignored rather than replayed, so a
+        builtin rule the user RETRACTED stays retracted across upgrades and restarts.
+
+        That matters more here than it does for a gate recogniser. A retracted detector
+        resurrected by a release would start recording fires against a person's explicit
+        decision — and once §6 lands and a detector can be ARMED, the same bug would be a
+        rule ACTING on orders after somebody decided it should not.
+
+        The rows are INSERTed directly rather than through `add_detector`, which is what
+        `_seed_gate_rules` does with `gate_rules` and for the same two reasons: the seed
+        row already carries its own id and its already-canonical condition JSON (
+        `rules.seed_rows` parsed and serialised it), and `add_detector` refuses a
+        `status` argument at all because nothing may write an ARMED detector — which is
+        true of these too and is why every seed row ships `dry_run`.
+        """
+        from . import rules
+
+        # COMPARED AS TEXT, and the `str()` is load-bearing. `os_state` is a text column,
+        # so `set_state` stores `"1"` and `get_state` reads `"1"` back, while
+        # `rules.SEED_VERSION` is an INTEGER (`detectors.seed_version` is). `"1" == 1` is
+        # False in Python, so the unguarded comparison re-seeds on EVERY open — which
+        # `INSERT OR IGNORE` hides, right up until somebody deletes a seed row and finds
+        # it back on the next `CentralStore()`. `gate_rules.SEED_VERSION` is a string and
+        # never met this.
+        if str(self.get_state("detectors_seed") or "") == str(rules.SEED_VERSION):
+            return
+        now = db.now()
+        for seed in rules.seed_rows():
+            det = seed["detector"]
+            self.conn.execute(
+                """INSERT OR IGNORE INTO detectors
+                   (id, ts, gap_class, project, subjects, condition, summary, status,
+                    source, issue_url, seed_version)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (det["id"], now, det["gap_class"], det["project"], det["subjects"],
+                 det["condition"], det["summary"], det["status"], det["source"],
+                 det["issue_url"], det["seed_version"]),
+            )
+            for row in seed["remedies"]:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO remedy_rules
+                       (id, detector_id, ts, primitive, params, argument, status)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (row["id"], row["detector_id"], now, row["primitive"],
+                     row["params"], row["argument"], row["status"]),
+                )
+        self.set_state("detectors_seed", str(rules.SEED_VERSION))
 
     def add_detector(self, gap_class: str, condition: Any, *, project: str = "",
                      subjects: str = "work_order", summary: str = "",

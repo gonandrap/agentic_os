@@ -8694,9 +8694,10 @@ def rules_list(*, project: str = "", status: str = "",
     list is the detail. `project` is a scope filter — it returns that project's rules and
     the fleet-wide ones — for the reason `CentralStore.list_detectors` gives.
 
-    `enabled` is `None` in this release and that is deliberate: nothing evaluates these
-    rules yet, so there is no engine to be on or off, and `False` would state that one
-    exists and is switched off.
+    `enabled` answers whether anything EVALUATES these rules — `catalog.RulesConfig`,
+    which ships off. ABSENT IS NOT ZERO and off is not empty: a registry nobody is
+    evaluating has a note saying so, because "no rule has ever matched" and "nothing has
+    ever looked" are different facts and only one of them is about the rules.
     """
     central = CentralStore()
     try:
@@ -8714,16 +8715,25 @@ def rules_list(*, project: str = "", status: str = "",
         entries = [_rule_entry(central, d) for d in shown]
     finally:
         central.close()
+    enabled = rules_enabled(project or None)
     if not counts["total"]:
         note = ("no detectors are registered — the registry is empty, which is a "
                 "different thing from a registry whose rules have never matched")
+    elif not enabled:
+        # THE SENTENCE, NOT AN EMPTY COUNT. A registry that is not evaluated has never
+        # been given the chance to match, and rendering that as "0 fires" would read as a
+        # measurement of the rules rather than of the switch above them.
+        note = (f"the evaluation pass is OFF ({counts['total']} rules registered and "
+                f"nothing is evaluating them) — no rule here has been given the chance "
+                f"to match. Turn it on with `jarvis config set <project> rules.enabled "
+                f"true`")
     else:
         note = ("every rule is in dry run: it records what it would have proposed and "
                 "acts on nothing. Only a person arms one")
         if counts["armed"]:
             note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
                     f"proposes; the gate still decides whether anything runs")
-    return {"counts": counts, "rules": entries, "enabled": None, "note": note}
+    return {"counts": counts, "rules": entries, "enabled": enabled, "note": note}
 
 
 def rules_show(detector_id: str) -> dict[str, Any]:
@@ -8798,6 +8808,186 @@ def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
     return {"rule": rule, "note": note}
 
 
+def rules_config(project: str | None = None) -> Any:
+    """The `rules` settings in force for `project` — or the OS's — or None.
+
+    `validation_config`'s shape exactly, for its reasons: a catalog that has moved or was
+    never registered answers None rather than raising, and None reads as OFF, which is
+    the shipped default anyway. There is no path on which failing to read a config file
+    should start the OS evaluating rules it was not told to evaluate.
+    """
+    try:
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.rules
+        return catalog.project(project).rules
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
+def rules_enabled(project: str | None = None) -> bool:
+    """Is the evaluation pass on — for `project`, or fleet-wide? False if unreadable."""
+    cfg = rules_config(project)
+    return bool(cfg is not None and cfg.enabled)
+
+
+def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
+               sources: frozenset[str] | set[str] | None = None,
+               project: str = "", max_rounds: int | None = None) -> Any:
+    """One work order's `rules.Facts`. THE READER BEHIND EVERY `FactField.source` SLUG.
+
+    `rules.facts` declares the contract and this is the implementation, for the reason
+    the grammar module's docstring gives: `rules` is a LEAF — stdlib, `db`, `catalog` and
+    `remedies` — and every reader named below sits above it (`ops` itself, `holds`,
+    `invariants`, `budget`). Putting the readers here rather than there is what keeps
+    that leaf true at IMPORT time, which is the property `remedies` and `central_store`
+    depend on when they import `rules` inside a function body. `rules.facts` still works
+    and is still the one public contract; it reaches this function through a call-time
+    import, which costs its own importers nothing.
+
+    **`sources` IS THE WHOLE COST MODEL** (spec §5.2.3). It is the union of
+    `rules.sources_used(cond)` over the detectors that will actually be evaluated, and a
+    source not in it is NOT READ — its fields are absent from `values`, which the
+    evaluator treats as a third thing distinct from `None` and `False`. `holds` is the
+    expensive one: `holds.held` walks up to `holds._EVENT_LIMIT` events per order, so a
+    table full of conditions about `status` must never pay for it. `None` means read
+    EVERYTHING, which is what a single-order `jarvis rules dry-run` wants and what no
+    sweep should ever pass.
+
+    **A COLUMN THAT IS NULL OR EMPTY IS ABSENT, NOT `""`.** A condition that matched
+    because a field was missing would fire on exactly the orders nobody recorded anything
+    about, which is the commonest way a rule over-fires.
+
+    Read-only: no model, no network, no subprocess, nothing written.
+    """
+    from . import budget as budget_mod
+    from . import holds as holds_mod
+    from . import invariants as invariants_mod
+    from . import rules as rules_mod
+
+    wanted = None if sources is None else frozenset(sources)
+
+    def need(slug: str) -> bool:
+        return wanted is None or slug in wanted
+
+    wo_id = str(wo["id"])
+    values: dict[str, Any] = {}
+
+    def put(name: str, value: Any) -> None:
+        """Record a field, or leave it ABSENT. Empty strings and None are absent; `0`,
+        `False` and `{}` are recorded, because those are answers."""
+        if value is None or value == "":
+            return
+        values[name] = value
+
+    if need("work_order"):
+        put("status", str(wo.get("status") or ""))
+        put("kind", str(wo.get("kind") or ""))
+        # The two flags are recorded as BOOLEANS even when false: a work order always has
+        # an answer to "is it hidden", so absent here would be a lie about the record.
+        values["hidden"] = bool(wo.get("hidden"))
+        values["needs_attention"] = bool(wo.get("needs_attention"))
+        put("attention_reason", str(wo.get("attention_reason") or ""))
+
+    if need("state_durations"):
+        durations = state_durations(store, wo_id=wo_id, now=now)
+        if durations.current_status_since is not None:
+            put("seconds_in_status", max(0.0, now - durations.current_status_since))
+        if durations.last_activity_ts is not None:
+            put("seconds_since_activity", max(0.0, now - durations.last_activity_ts))
+        if durations.spans:
+            put("lifetime_seconds", max(0.0, now - durations.spans[0].entered))
+        put("last_activity_kind", durations.last_activity_kind)
+
+    if need("holds"):
+        # THE EXPENSIVE ONE. The MERGED open hold is what a condition asks about — the
+        # same object every other surface renders — so `holds.held`'s merge is used
+        # rather than a second reading of the timeline.
+        open_holds = [h for h in holds_mod.held(store, wo_id, now=now) if h.open]
+        if open_holds:
+            hold = open_holds[-1]
+            put("hold_cause", hold.cause)
+            put("hold_seconds", max(0.0, now - hold.started))
+
+    if need("automerge"):
+        state = automerge_state(store, wo)
+        # A STALE HOLD IS NOT A CLAIM ABOUT NOW — docs/superpowers/specs/2026-09-27-a-
+        # stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The event is
+        # immutable and `automerge_state` marks rather than drops it, so contributing a
+        # marked one would let a rule fire on a hold the OS has already said is history.
+        if (state and state.get("kind") == "automerge_held"
+                and not state.get("stale")):
+            put("automerge_code", str(state.get("code") or ""))
+
+    if need("waiting_on"):
+        put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
+
+    if need("validation_round"):
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is not None:
+            round_no = int(latest["round"] or 0)
+            put("round_no", round_no)
+            put("round_outcome", str(latest["outcome"] or ""))
+            put("judged_head_sha", str(latest["head_sha"] or ""))
+            cap = max_rounds
+            if cap is None:
+                cfg = validation_config(project or None)
+                cap = getattr(cfg, "max_rounds", None)
+            # ABSENT rather than a guess when the catalog cannot answer: `rounds_left` is
+            # a subtraction from a configured ceiling, and a ceiling nobody could read is
+            # not a ceiling of zero.
+            if cap is not None:
+                put("rounds_left", max(0, int(cap) - round_no))
+
+    if need("pull_request"):
+        # THE RECORDED COLUMNS, never a live `gh` call: this runs for every open order on
+        # every sweep, and a rule engine that reached the network per order per tick is a
+        # rate limit with extra steps. The poller that already owns that job refreshes
+        # them.
+        put("pr_url", str(wo.get("pr_url") or ""))
+        put("pr_state", str(wo.get("pr_state") or ""))
+
+    if need("event_counts"):
+        values["event_counts"] = store.event_kind_counts(wo_id)
+
+    if need("invariant_events"):
+        # THE ROUTE A DETECTOR TAKES WHEN AN INVARIANT ALREADY DETECTS THE CONDITION —
+        # `Daemon.check_invariants` writes one `invariant` event per violation it
+        # reports, and seed rule 5 keys off that rather than re-deriving the predicate.
+        counts: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "invariant"):
+            name = str(db.from_json(event["payload"], {}).get("invariant") or "")
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        values["invariant_events"] = counts
+
+    if need("dependencies"):
+        values["depends_on_count"] = len(store.dependencies(wo))
+        values["dead_dependency_count"] = len(
+            invariants_mod.dead_dependencies(store, wo))
+
+    if need("neo_question"):
+        question = invariants_mod.awaiting_neo(wo_id)
+        if question is not None:
+            put("neo_question_status", str(question.get("status") or ""))
+            values["neo_question_attempts"] = int(question.get("attempts") or 0)
+
+    if need("budget"):
+        # NO BUDGET IS NOT A BUDGET OF ZERO, so a NULL column is absent and a rule asking
+        # `budget_usd lte 0` never matches an order that has no ceiling at all.
+        if wo.get("budget_usd") is not None:
+            values["budget_usd"] = float(wo["budget_usd"])
+        values["spent_usd"] = budget_mod.spent(store, None, wo_id).total_usd
+
+    return rules_mod.Facts(
+        project=project, order_id=wo_id,
+        # THE SUBJECT KIND, not `work_orders.kind`. `rule_fires.order_kind` records which
+        # of `rules.SUBJECTS` this row is about; the row's own `worker`/`planner` kind is
+        # the separate `kind` FACT FIELD above.
+        order_kind=rules_mod.DEFAULT_SUBJECT,
+        values=values, now=now)
+
+
 def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
     """What this detector reads, and — given an order — what it would decide. WRITES
     NOTHING.
@@ -8848,17 +9038,17 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
     store = ProjectStore(path)
     try:
         try:
-            facts = rules_mod.facts(store, wo, now=db.now())
-        except NotImplementedError:
-            # `rules.facts` is DECLARED by the grammar section and implemented by the
-            # evaluation-and-firing section, which owns the readers behind every
-            # `FactField.source` slug. Until it lands there is no snapshot, and the
-            # honest answer is to say so: fabricating one, or returning "no match",
-            # would report a verdict nobody computed.
-            out["note"] = (
-                "the fact snapshot is not built in this release — `rules.facts` is "
-                "implemented by the evaluation-and-firing section, so this order was "
-                "not evaluated and nothing was decided")
+            # LAZY HERE TOO, for the sweep's reason: only the sources this one condition
+            # names are read, so a dry run of a rule about `status` does not walk the
+            # order's holds to answer it.
+            facts = rules_mod.facts(store, wo, now=db.now(),
+                                    sources=rules_mod.sources_used(cond))
+        except Exception as e:  # noqa: BLE001
+            # A SNAPSHOT THAT COULD NOT BE BUILT DECIDES NOTHING. `matched` stays None
+            # rather than becoming "no match", which would report a verdict nobody
+            # computed — the same rule the unreadable branch above follows.
+            out["note"] = (f"the fact snapshot for {order_id} could not be built, so "
+                           f"nothing was evaluated and nothing was decided: {e}")
             return out
     finally:
         store.close()

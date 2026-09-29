@@ -44,6 +44,15 @@ SAFETY_KEYS = (
     # the same act at two magnitudes — and a change here is invisible until the morning
     # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
     "*.schedule.*",
+    # What the OS is permitted to WATCH — and, once §6 of
+    # docs/specs/2026-09-27-self-evolution.md lands, the switch everything it is
+    # permitted to DO about what it watched hangs off. It is here at the WATCHING stage
+    # deliberately: the registry is a table of admitted heuristics that a person arms one
+    # at a time, so the moment the fleet starts evaluating them is the moment a reader
+    # needs on the record, not the later moment one of them first acts. `*.` rather than
+    # `os.` for `*.validation.*`'s reason: the per-project form is the same switch with a
+    # smaller blast radius.
+    "*.rules.*",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -1047,6 +1056,27 @@ class RemedyConfig:
 
 
 @dataclass
+class RulesConfig:
+    """Whether the self-evolution registry is EVALUATED at all. §5.2 of
+    docs/specs/2026-09-27-self-evolution.md.
+
+    SHIPS OFF, and off means `Daemon.rules_tick` returns before it reads anything — not
+    "runs in dry run". The distinction matters because the detectors themselves are
+    already in `dry_run` and a reader who saw the pass running would reasonably conclude
+    the fleet had opted in to the feature when all it had done was upgrade. `jarvis rules
+    list` says which of the two it is, and that sentence is the only thing standing
+    between "no rule has ever matched" and "nothing has ever looked".
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. One
+    field today, and the shape is the house one so the arming threshold and the remedy
+    allow-list §6 adds do not arrive as a second config object.
+    """
+
+    enabled: bool = False
+
+
+@dataclass
 class SupervisorConfig:
     """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
 
@@ -1110,6 +1140,7 @@ class ProjectSpec:
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    rules: RulesConfig = field(default_factory=RulesConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -1221,6 +1252,7 @@ class OsConfig:
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    rules: RulesConfig = field(default_factory=RulesConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
@@ -1561,6 +1593,19 @@ def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
         raise _err(f"{where}.level {level!r} not in "
                    f"{list(OBSERVABILITY_LEVELS)}")
     return ObservabilityConfig(level=level)
+
+
+def _parse_rules(raw: Any, base: RulesConfig | None = None,
+                 where: str = "os.rules") -> RulesConfig:
+    """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Nothing to validate beyond the shape: one boolean, whose default is the shipped
+    `False` when neither the fleet nor the project names it.
+    """
+    base = base or RulesConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)))
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -1914,6 +1959,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
+        rules=_parse_rules(os_raw.get("rules", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
@@ -1996,6 +2042,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor_cfg = _parse_supervisor(
             p.get("supervisor", {}), base=os_cfg.supervisor,
             where=f"projects[{i}] ({name}).supervisor")
+        rules_cfg = _parse_rules(
+            p.get("rules", {}), base=os_cfg.rules,
+            where=f"projects[{i}] ({name}).rules")
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
@@ -2026,6 +2075,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
+                rules=rules_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
                 schedule=schedule_cfg,
