@@ -52,6 +52,7 @@ import signal
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -65,6 +66,7 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
@@ -234,6 +236,33 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
+
+#: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR. "round 5 of 3" is false on a
+#: rebind — the row's number is past the budget and its own bound held it — and a
+#: submitter told it had spent a round it had not would ration itself against a budget
+#: that is untouched. Shaped on `ops.BOUNCE_FEEDBACK`, which already has to say that
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4).
+REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The OS asked you to merge the base
+branch in, your resolution changed what this pull request contributes, and a seat has
+read it. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
+#: THE SAME REJECTION ON THE ROUND A USER REJECTION BOUGHT. No round was spent here
+#: either, but nothing about a rebind is true of it: nobody merged anything, and there
+#: is no "re-judgement 1 of 2" — the bound is one free round per USER rejection, so a
+#: number out of two would name a cap that does not exist (Neo question 973, live case
+#: wo-299daf2e). The last sentence is the one the rebind wording does not need: the
+#: NEXT attempt is charged like any other.
+USER_REWORK_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The user rejected this on review and
+asked for the rework, so it was judged outside the budget. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
+charged one."""
 
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
@@ -459,6 +488,21 @@ def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
     done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") if landed \
         else None
     return None if done == owed else int(owed)
+
+
+@dataclass(frozen=True)
+class CarryOutcome:
+    """What `Daemon._carry_catch_up` learned, which is three states and not two.
+
+    `carried` is the verdict now covering the live head — the caller re-decides on it.
+    `rebind` is the other answer worth having: proof (a) held and proof (b) did not, so
+    the merge the OS asked for resolved a conflict and the round that judges it must not
+    be charged to the worker's rework budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+    """
+
+    carried: bool
+    rebind: bool
 
 
 class Daemon:
@@ -1946,6 +1990,34 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # WHICH BUDGET THIS ROUND CAME OUT OF. A rebind's NUMBER can sit past
+            # `max_rounds` while its own bound has room, and routing on the number
+            # would send it to the user for being numbered 5 (spec
+            # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+            # `rebinds` counts the round being settled, so `<` means "another one left".
+            #
+            # `pos` is the ORDINARY arm's budget position, and it is not `n` either: a
+            # rebind spends a row number without spending budget, so after one the rows
+            # run ahead of the budget and routing on `n` would escalate a submission
+            # with a round still in hand (and tell it "round 3 of 3"). Same counter
+            # `ops.rejudge_moved_head` budgets off — the round being settled is still
+            # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
+            # is this `+ 1`.
+            uncounted = bool(round_row["uncounted"])
+            # WHICH EXEMPTION, not merely that there was one. A rework the USER asked
+            # for is bounded by the user's own rejections — one free round each — so a
+            # rejected one falls back to the ORDINARY rule and `REBIND_MAX` never reads
+            # it (Neo question 973, live case wo-299daf2e). An uncounted row with NO
+            # cause predates the column and could only have been a rebind, which is why
+            # the filter drops to unfiltered there.
+            cause = str(round_row["uncounted_cause"] or "")
+            as_rebind = uncounted and cause != ops.USER_REWORK_CAUSE
+            rebinds = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=cause or None) if as_rebind else 0
+            pos = store.counted_validation_rounds(wo_id=wo_id) + (
+                0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
+                else 1)
+            goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2121,14 +2193,16 @@ class Daemon:
                                      "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
-            elif outcome == "rejected" and n < max_rounds:
+            elif outcome == "rejected" and goes_back:
                 # The inadmissible follow-ups ride along HERE and nowhere else: a stale
                 # docstring or a missing test costs nothing in a session that is going
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
-                             note=ops.follow_up_feedback(follow_ups))
+                             note=ops.follow_up_feedback(follow_ups), budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
                 log.info("[%s] %s rejected in round %d of %d",
-                         project.name, wo_id, n, max_rounds)
+                         project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
                 # ask for a resubmission there is no round left to judge — and the loop
@@ -2223,7 +2297,9 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str, *, note: str = "") -> None:
+                reason: str, *, note: str = "", budget_round: int | None = None,
+                rebind: tuple[int, int] | None = None,
+                uncounted_cause: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -2236,18 +2312,53 @@ class Daemon:
         panel's verdict; the findings that were not admissible as tracker issues are an
         aside to whoever is fixing this, and writing them into the outcome would restate
         on every surface that prints a round.
+
+        `rebind` is `(used, ops.REBIND_MAX)` and swaps the wording for `REBIND_FEEDBACK`:
+        the round was not charged to the submitter, so it may not be told it was (spec
+        2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+
+        `uncounted_cause` is the round's OWN exemption and it picks the wording: a round
+        a USER rejection bought is not a rebind and may not be described as one — no
+        merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
+        event too, so every surface can tell the two uncounted causes apart.
+
+        `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
+        its row number, and it is what the ordinary feedback names — a submitter told
+        "round 3 of 3" on its second charged round would ration itself out of a round it
+        still has (same spec §4.4).
+
+        `"round"` in the event stays the ROW NUMBER: `holds.py` correlates it with
+        `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
+        open for ever. The position rides beside it as `budget_round`.
         """
+        from . import ops
+
         wo_id = wo["id"]
+        rework = uncounted_cause == ops.USER_REWORK_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
-        store.add_event(wo_id, "validation_rejected",
-                        {"round": n, "round_id": round_id, "of": max_rounds})
+        used, of = rebind or (0, max_rounds)
+        pos = n if budget_round is None else budget_round
+        # `of` is the bound this round was actually held by, so no surface prints
+        # "round 5 of 3" (spec 2026-09-27 §4.4).
+        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
+                                 "budget_round": pos}
+        if rebind is not None or rework:
+            event["uncounted"] = True
+        if uncounted_cause:
+            event["uncounted_cause"] = uncounted_cause
+        store.add_event(wo_id, "validation_rejected", event)
+        if rework:
+            text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
+                                               reason=reason + note, wo_id=wo_id)
+        elif rebind is not None:
+            text = REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
+                                          reason=reason + note, wo_id=wo_id)
+        else:
+            text = REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
+                                          wo_id=wo_id)
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
-                 payload=bus.ReviewFeedback(
-                     round=n, outcome="rejected",
-                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds,
-                                                   reason=reason + note,
-                                                   wo_id=wo_id)))
+                 payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -5241,8 +5352,10 @@ class Daemon:
             # event describing a stall that lasted microseconds, and before the re-judge,
             # so the round machine never sees a head that moved for a reason no seat needs
             # to read. A refused carry falls through to both, untouched.
-            if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and self._carry_catch_up(project, store, wo, pr, decision)):
+            outcome = CarryOutcome(False, False)
+            if not record_only and decision.code == automerge.HELD_SHA_MOVED:
+                outcome = self._carry_catch_up(project, store, wo, pr, decision)
+            if outcome.carried:
                 round_row = store.latest_validation_round(wo_id=wo_id)
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
@@ -5305,7 +5418,11 @@ class Daemon:
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
-                    self._rejudge_moved_head(project, store, wo, decision)
+                    # `rebind` is the carry's reading of the two proofs, and the guard
+                    # above still holds it: a rebind is free of the round budget, not
+                    # of five seats (spec 2026-09-27 §4.2).
+                    self._rejudge_moved_head(project, store, wo, decision,
+                                             rebind=outcome.rebind)
                 return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
@@ -6229,12 +6346,21 @@ class Daemon:
                  "accept" if ruling.accept else "object", ruling.reason)
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                        pr: Any, decision: Any) -> bool:
+                        pr: Any, decision: Any) -> CarryOutcome:
         """Prove this head added no unjudged commit, and carry the verdict onto it.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
-        True when the verdict now covers the live head, so the caller may re-decide on the
-        same tick. False is the ordinary answer and writes nothing but the refusal.
+        `carried` when the verdict now covers the live head, so the caller may re-decide
+        on the same tick. Not carried is the ordinary answer and writes nothing but the
+        refusal.
+
+        `rebind` is the SECOND answer, for the case the predecessor spec left open: the
+        merge the OS asked for resolved a conflict, so proof (b) fails on content nobody
+        judged and the round that reads it is the OS's own doing (spec
+        docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+        The chain is walked on that branch ONLY when `ops.rebind_possible` says a rebind
+        could be opened — the walk is up to `ci.CHAIN_LIMIT` `gh api` calls on a pull
+        request polled every couple of minutes, and no other tick may pay it.
 
         `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
         rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
@@ -6253,21 +6379,22 @@ class Daemon:
         waiting for it would defer the carry into exactly the window where a round gets
         spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
         """
-        from . import branchproof, ci, github, ops
+        from . import branchproof, ops
 
         judged = str(getattr(decision, "judged_sha", "") or "")
         head = str(getattr(decision, "head_sha", "") or "")
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
         if not judged or not head or head == judged or not base or not pr_url:
-            return False
+            return CarryOutcome(False, False)
 
-        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+        def refuse(proof: str, detail: str,
+                   chain: tuple[str, ...] = ()) -> CarryOutcome:
             if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
                                         proof=proof, detail=detail, chain=chain):
                 log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
                          wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
-            return False
+            return CarryOutcome(False, False)
 
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
         if not branchproof.fetch(project.path, base, pull_ref):
@@ -6281,20 +6408,35 @@ class Daemon:
                           "the diff this branch adds on top of its merge base could not "
                           "be computed locally")
         if before != after:
-            return refuse(ops.PROOF_PATCH_ID,
-                          f"the diff on {head[:10]} is not the diff round "
-                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
-                          f"content nobody judged")
-        try:
-            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                        cwd=project.path)
-        except github.GitHubError as exc:
-            return refuse(ops.PROOF_READ,
-                          f"GitHub would not say what {head[:10]} merged ({exc})")
-        except Exception:  # noqa: BLE001 — a parked pull request stays parked
-            log.exception("[%s] could not read the chain behind %s", project.name,
-                          wo["id"])
-            return False
+            # THE REFUSAL IS UNCHANGED, `(head, proof)` dedupe and all: the diff really
+            # did change and it is still said once. What follows it is the rebind
+            # question — asked cheaply first, walked only if it could be answered yes
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.2).
+            refuse(ops.PROOF_PATCH_ID,
+                   f"the diff on {head[:10]} is not the diff round "
+                   f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                   f"content nobody judged")
+            if not ops.rebind_possible(store, wo, head=head, project=project.name,
+                                       cfg=project.validation):
+                return CarryOutcome(False, False)
+            def unreadable(exc: Exception) -> CarryOutcome:
+                log.info("[%s] %s: GitHub would not say what %s merged (%s)",
+                         project.name, wo["id"], head[:10], exc)
+                return CarryOutcome(False, False)
+
+            chain, failed = self._merge_chain(project, wo, pr_url=pr_url, judged=judged,
+                                              head=head, base=base,
+                                              github_error=unreadable)
+            if failed is not None:
+                return failed
+            return CarryOutcome(False, bool(chain))
+        chain, failed = self._merge_chain(
+            project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
+            github_error=lambda exc: refuse(
+                ops.PROOF_READ,
+                f"GitHub would not say what {head[:10]} merged ({exc})"))
+        if failed is not None:
+            return failed
         if not chain:
             return refuse(ops.PROOF_CHAIN,
                           f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
@@ -6312,7 +6454,34 @@ class Daemon:
         log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
                  "%s, no round spent", project.name, wo["id"], carried["round"],
                  judged[:10], head[:10], len(chain), len(bases), base)
-        return True
+        return CarryOutcome(True, False)
+
+    @staticmethod
+    def _merge_chain(project: ProjectSpec, wo: dict, *, pr_url: str, judged: str,
+                     head: str, base: str,
+                     github_error: Callable[[Exception], CarryOutcome],
+                     ) -> tuple[tuple[tuple[str, str, bool], ...] | None,
+                                CarryOutcome | None]:
+        """Walk `ci.base_merge_chain`, or say why it could not be walked.
+
+        `(chain, None)` on success and `(None, outcome)` on failure — ONE copy of the
+        walk for `_carry_catch_up`'s two branches, which asked GitHub the same question
+        and differed only in what a `GitHubError` means. That is `github_error`'s job:
+        the rebind branch has already written its refusal and only logs, the main path
+        refuses with `ops.PROOF_READ`. Anything else is a parked pull request staying
+        parked, which is the same answer on both.
+        """
+        from . import ci, github
+
+        try:
+            return ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                       cwd=project.path), None
+        except github.GitHubError as exc:
+            return None, github_error(exc)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return None, CarryOutcome(False, False)
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:
@@ -6439,7 +6608,7 @@ class Daemon:
         return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
-                            wo: dict, decision: Any) -> None:
+                            wo: dict, decision: Any, *, rebind: bool = False) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
 
         The policy is `ops.rejudge_moved_head` and lives there, testable without a
@@ -6454,16 +6623,24 @@ class Daemon:
 
         try:
             out = ops.rejudge_moved_head(store, project.path, wo, project=project.name,
-                                         cfg=project.validation, decision=decision)
+                                         cfg=project.validation, decision=decision,
+                                         rebind=rebind)
         except Exception:  # noqa: BLE001 — a parked pull request stays parked
             log.exception("[%s] could not re-judge %s", project.name, wo["id"])
             return
         if out is None:
             return
         if out["declined"]:
-            log.info("[%s] %s: the head moved to %s and round %s would be the last — "
-                     "leaving it for the user", project.name, wo["id"],
-                     out["head_sha"][:10], out["next_round"])
+            # Two causes, two sentences: `next_round` is on the budget decline only
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+            if out.get("cause") == ops.REBIND_EXHAUSTED:
+                log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
+                         "merge %s time(s) — leaving it for the user", project.name,
+                         wo["id"], out["head_sha"][:10], out["rebinds"])
+            else:
+                log.info("[%s] %s: the head moved to %s and round %s would be the "
+                         "last — leaving it for the user", project.name, wo["id"],
+                         out["head_sha"][:10], out["next_round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
