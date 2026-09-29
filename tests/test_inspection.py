@@ -455,29 +455,136 @@ def test_each_threshold_raises_its_own_alarm():
                                               dispatched=0.0)] == [inspection.JOIN_ALARM]
 
 
-def test_a_stalled_turn_is_alarmed_as_stalled_and_never_as_billed():
-    """THE DETECTOR THAT SHOULD HAVE FIRED on wo-f1ce0f24 turn 3. `going-in-circles`
-    said effort was being re-spent and the escalation said it was BILLED IN FULL; the
-    turn had made no API call at all, so nothing had started and nothing was billed."""
+def awaiting(*, since: float, wall: float, calls: int = 0) -> tuple:
+    """A one-turn anatomy whose last row is an input — a request is in flight."""
+    turn = inspection.Turn(seq=1, started=since, ended=since + wall)
+    turn.awaiting_since = since
+    turn.calls = [api_call(since + 1.0 + n) for n in range(calls)]
+    return inspection.Anatomy(session_id="s", found=True, turns=[turn]), since + wall
+
+
+def test_a_turn_whose_last_row_is_an_input_is_awaiting_and_not_stalled():
+    """Spec §1: the absence of an assistant row is a request in flight, not a dead turn."""
     cfg = InspectConfig()
-    stalled, now = burning(wall=cfg.alarm_stalled_minutes * 60 + 1, calls=0)
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 - 60)
 
-    raised = inspection.alarms(stalled, cfg, now=now, dispatched=0.0)
-
-    assert [a.kind for a in raised] == [inspection.STALL_ALARM]
-    assert "no API call" in raised[0].reason
-    assert "billed" not in raised[0].reason
+    assert anatomy.turns[0].awaiting is True
+    assert inspection.alarms(anatomy, cfg, now=now, dispatched=0.0) == []
 
 
-def test_a_stalled_turn_never_raises_the_long_turn_alarm():
-    """The two are the same wall clock read two ways, and only one of them is true. The
-    long-turn alarm's whole claim is that money is being spent."""
+def test_past_the_awaiting_threshold_exactly_one_informational_alarm_is_raised():
+    """Spec §2 branch 1."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
+
+    raised = inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.SLOW_RESPONSE_ALARM]
+    assert raised[0].reason.startswith(inspection.awaiting_note(anatomy.turns[0]))
+    assert "no API call" not in raised[0].reason
+    assert inspection.SLOW_RESPONSE_ALARM in inspection.INFORMATIONAL_KINDS
+
+
+def test_a_billed_turn_awaiting_a_tool_result_still_raises_the_long_turn_alarm():
+    """THE TWO ARE INDEPENDENT, NOT EXCLUSIVE. `awaiting_since` is set on every
+    `tool_result` row, so a healthy turn 27 calls deep is awaiting at the sampling
+    moment — an `elif` here would make `long-turn` unraisable on most running turns."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
+                            calls=3)
+    # Awaiting only since the last tool result, well inside the awaiting threshold.
+    anatomy.turns[0].awaiting_since = now - 60
+
+    kinds = [a.kind for a in inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)]
+
+    assert kinds == [inspection.TURN_ALARM]
+
+
+def test_a_long_billed_turn_can_raise_both():
+    """Both findings are true at once: it is being billed AND the current request has
+    completed nothing for an hour."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
+                            calls=3)
+
+    kinds = [a.kind for a in inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)]
+
+    assert kinds == [inspection.TURN_ALARM, inspection.SLOW_RESPONSE_ALARM]
+
+
+def test_the_awaiting_clock_is_the_active_one():
+    """The user's 2026-09-18 ruling: a held order is obeying, not answering slowly."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
+    anatomy.holds = [inspection.Hold(cause="usage_window", started=1_000.0, ended=now)]
+
+    assert inspection.alarms(anatomy, cfg, now=now, dispatched=0.0) == []
+
+
+def test_the_stalled_turn_alarm_is_never_raised_live():
+    """Spec §2 branch 2: the evidence for "the work never started" was an absence, and
+    the absence is what this spec proves unreliable. `worker_session.TURN_STALL_SECONDS`
+    judges the PROCESS and still catches a genuinely hung turn."""
     cfg = InspectConfig()
     stalled, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=0)
 
-    kinds = [a.kind for a in inspection.alarms(stalled, cfg, now=now, dispatched=0.0)]
+    assert inspection.alarms(stalled, cfg, now=now, dispatched=0.0) == []
 
-    assert kinds == [inspection.STALL_ALARM]
+
+def test_a_historical_stalled_turn_row_still_renders():
+    """Spec §2: the kind and its legend stay for the rows already in `wo_alarms`."""
+    row = {"kind": inspection.STALL_ALARM, "source": "cost"}
+
+    assert ops.alarm_kind_label(row, {}) == "stalled-turn"
+    assert "was open" in inspection.ALARM_KINDS[inspection.STALL_ALARM]
+
+
+def test_awaiting_is_derived_in_the_walk_read_transcript_already_does(write_transcript):
+    """Spec §1: no second pass, no new file read."""
+    session = write_transcript("s", [
+        prompt_row(1_000.0, "You are the worker agent for wo-1"),
+        assistant_row(1_030.0, "m1"),
+        prompt_row(1_100.0, "carry on"),
+    ])
+
+    first, second = inspection.read_session(session).turns
+
+    assert first.awaiting is False and first.awaiting_since == 0.0
+    assert second.awaiting is True and second.awaiting_since == 1_100.0
+
+
+def test_a_tool_result_reopens_the_wait(write_transcript):
+    """Spec §1: the model is answering again after every tool_result too."""
+    session = write_transcript("s", [
+        prompt_row(1_000.0, "You are the worker agent for wo-1"),
+        *tool_rows(1_030.0, 1_060.0, "t1", "Bash"),
+    ])
+
+    (turn,) = inspection.read_session(session).turns
+
+    assert turn.awaiting is True and turn.awaiting_since == 1_060.0
+
+
+def test_the_turn_dict_carries_awaiting_additively():
+    """Spec §1: the rule `subagents` was added under."""
+    turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
+    turn.awaiting_since = 1_000.0
+
+    said = turn.as_dict()
+
+    assert said["awaiting"] is True and said["awaiting_since"] == 1_000.0
+    assert said["observed"] is False
+
+
+def test_the_awaiting_sentence_is_written_once_for_every_surface():
+    """Spec §1: one formatter, so no surface invents a second vocabulary."""
+    turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
+    turn.awaiting_since = 1_000.0
+
+    said = inspection.awaiting_note(turn)
+
+    assert said.startswith("awaiting the model since ")
+    assert "request in flight, no block completed" in said
 
 
 def test_the_stall_is_named_before_the_long_turn_alarm_could_call_it_spend():
@@ -668,6 +775,9 @@ def test_the_defaults_are_the_measured_ones():
     # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds, so this
     # is fifteen times a slow start and fires on 0.26% of them.
     assert cfg.alarm_stalled_minutes == 15
+    # The measured slow response was 19 minutes, so anything under the hour would
+    # re-raise the very case the spec exists to stop reporting.
+    assert cfg.alarm_awaiting_minutes == 60
     assert cfg.alarm_join_seconds == inspection.TTL_5M
     # The report is deliberately far more talkative than the alarm: the same blocking
     # join is worth a line at 30s and worth interrupting someone at 300s.
@@ -696,6 +806,9 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
                1e6,                             # tokens per million: the price unit
                inspection.NAMED_SESSIONS,       # a display bound, see the docstring
+               # A measurement of the order two files are written in (spec 2026-09-27
+               # §3), not a judgement anyone gets to set — so not a catalog setting.
+               inspection.TURN_BIND_TOLERANCE_SECONDS,
                # The parameter caps (spec §4a) are a STRUCTURAL bound on how big one
                # report may get, not a per-project judgement about what is expensive —
                # no catalog wants its own answer to "may this print a megabyte". 6 and
@@ -742,12 +855,14 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
     from jarvis import config_version
 
     cat = catalog.parse_catalog({
-        "os": {"inspect": {"alarm_turn_minutes": 90, "report_write_floor": 50_000}},
+        "os": {"inspect": {"alarm_turn_minutes": 90, "report_write_floor": 50_000,
+                           "alarm_awaiting_minutes": 120}},
         "projects": [{"name": "quick", "path": str(tmp_path),
                       "inspect": {"alarm_turn_minutes": 15}}],
     })
     project = cat.project("quick")
 
+    assert project.inspect.alarm_awaiting_minutes == 120   # inherited from os
     assert project.inspect.alarm_turn_minutes == 15        # its own
     assert project.inspect.report_write_floor == 50_000    # inherited from os
     assert project.inspect.alarm_write_tokens == 300_000   # inherited from the default
@@ -758,7 +873,7 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
 
 @pytest.mark.parametrize("key", ["alarm_write_tokens", "report_write_floor",
                                  "quote_chars", "alarm_turn_minutes",
-                                 "alarm_stalled_minutes"])
+                                 "alarm_stalled_minutes", "alarm_awaiting_minutes"])
 def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
     """Zero would report every write a session makes and flag every work order the fleet
     runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
@@ -867,6 +982,23 @@ def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
     assert "unacc 100%" in line and "gen   0%" in line
 
 
+def test_a_turn_awaiting_the_model_is_not_flagged_as_having_made_no_call(capsys):
+    """Spec §1: the flag is a claim about the API, and here a request is in flight."""
+    from jarvis import cli
+
+    turn = inspection.Turn(seq=3, started=1_000.0, ended=1_000.0 + 65 * 60)
+    turn.awaiting_since = 1_000.0
+    anatomy = inspection.Anatomy(session_id="s", found=True, turns=[turn])
+    unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
+
+    cli._print_anatomy(unit, InspectConfig().report_write_floor)
+    line = next(l for l in capsys.readouterr().out.splitlines() if "turn  3" in l)
+
+    assert cli.AWAITING_FLAG in line and cli.NO_CALL_FLAG not in line
+    # One column, so the split after it stays a column whichever flag is printed.
+    assert cli.FLAG_WIDTH >= max(len(cli.AWAITING_FLAG), len(cli.NO_CALL_FLAG))
+
+
 def test_a_work_order_with_no_session_reports_no_transcript(started):
     wo = ops.create_work_order("proj_a", "never dispatched")
 
@@ -934,35 +1066,36 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         store.close()
 
 
-def test_a_stalled_turn_reaches_the_user_as_a_stall_and_not_as_a_bill(
+def test_a_slow_response_is_recorded_and_never_escalated(
         started, monkeypatch, tmp_path):
-    """END TO END, the case that was reported backwards (issue 227). The attention line
-    is what became a Telegram saying an hour of generation had been billed."""
+    """END TO END, spec §2's "what must not escalate means mechanically"."""
     from jarvis.project_store import ProjectStore
 
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
     daemon = started
-    wo = ops.create_work_order("proj_a", "the dead one")
+    wo = ops.create_work_order("proj_a", "the slow one")
 
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     try:
         turn = store.create_turn(wo["id"], "dispatch", "go")
         at = turn["started_at"]
-        # A prompt and nothing else: the turn opened and no API call was ever made.
-        (root / "-proj" / "dead.jsonl").write_text(
+        # A prompt and nothing after it: a request is in flight, no block has landed.
+        (root / "-proj" / "slow.jsonl").write_text(
             json.dumps(prompt_row(at + 1, "You are the worker agent for wo-1")) + "\n")
-        store.update_work_order(wo["id"], status="running", session_id="dead")
+        store.update_work_order(wo["id"], status="running", session_id="slow")
         monkeypatch.setattr("jarvis.daemon.time.time", lambda: at + 2 * 3600)
         daemon.check_burning_turns(daemon.catalog.projects[0], store)
 
-        flagged = store.get_work_order(wo["id"])
         (alarm,) = store.alarms_of(wo["id"])
-        assert alarm["kind"] == inspection.STALL_ALARM
-        assert "no API call at all" in flagged["attention_reason"]
-        assert "billed" not in flagged["attention_reason"]
-        assert "still being billed" not in flagged["attention_reason"]
+        assert alarm["kind"] == inspection.SLOW_RESPONSE_ALARM
+        assert alarm["status"] == "informational"
+        # The queue's own predicate is the enforcement — no new filter anywhere.
+        assert store.claim_next_alarm() is None
+        assert store.get_work_order(wo["id"])["needs_attention"] == 0
+        # The timeline and the dedupe memory are unchanged.
+        assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
     finally:
         store.close()
 
@@ -2024,3 +2157,101 @@ def test_a_credential_flag_inside_quotes_loses_its_value(line, leak):
 
     assert "<redacted: a credential passed as a flag>" in out
     assert leak not in out
+
+
+# -- binding transcript turns to the OS's own numbering ---------------------------------
+#
+# Spec docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.
+
+
+def _numbered(write_transcript, starts: list[float], session: str = "numbered") -> str:
+    """One transcript turn per entry, each with an assistant row so the next one opens."""
+    rows: list[dict] = []
+    for i, at in enumerate(starts):
+        rows.append(prompt_row(at, f"<task-notification> turn {i}"))
+        rows.append(assistant_row(at + 1, f"m{i}"))
+    return write_transcript(session, rows)
+
+
+def test_turn_numbers_match_the_turn_files_across_a_compaction(write_transcript):
+    """§3's measured case, wo-dbea82cf: 11 `wo_turns` rows, 10 transcript turns, and the
+    `/compact` turn leaves no prompt row of its own. Every later number shifted by one,
+    so the alarm said turn 11 and `jarvis inspect` said turn 10 about one turn."""
+    os_starts = [(1, 0.0), (2, 100.0), (3, 200.0), (4, 300.0), (5, 400.0),
+                 (6, 420.0), (7, 500.0), (8, 600.0), (9, 700.0), (10, 800.0),
+                 (11, 900.0)]
+    # The turn file is written 3-4s before the transcript's prompt row (§3's tolerance).
+    session = _numbered(write_transcript,
+                        [4.0, 104.0, 204.0, 304.0, 424.0, 504.0, 604.0, 704.0,
+                         804.0, 904.0])
+
+    anatomy = inspection.read_session(session, turn_starts=os_starts)
+
+    assert [t.seq for t in anatomy.turns] == [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]
+    assert anatomy.unmatched_os_turns == [5]
+    assert anatomy.turns[-1].seq == 11
+
+
+def test_read_session_without_turn_starts_still_numbers_one_to_n(write_transcript):
+    """The regression guard for every existing caller — §3's first rule."""
+    session = _numbered(write_transcript, [0.0, 100.0, 200.0], session="plain")
+
+    anatomy = inspection.read_session(session)
+
+    assert [t.seq for t in anatomy.turns] == [1, 2, 3]
+    assert anatomy.unmatched_os_turns == []
+    assert [t.part for t in anatomy.turns] == [1, 1, 1]
+
+
+def test_two_transcript_turns_on_one_os_turn_are_parts_of_it(write_transcript):
+    """§3: the compaction shape read forwards. Both keep the `seq`; `part` tells them
+    apart, and `jarvis inspect` renders part 2 as `turn 1 (continued)`."""
+    session = _numbered(write_transcript, [4.0, 50.0, 104.0], session="parts")
+
+    anatomy = inspection.read_session(
+        session, turn_starts=[(1, 0.0), (2, 100.0)])
+
+    assert [(t.seq, t.part) for t in anatomy.turns] == [(1, 1), (1, 2), (2, 1)]
+    assert anatomy.turns[0].as_dict()["part"] == 1
+
+
+def test_a_transcript_turn_before_the_first_os_turn_is_unrecorded(write_transcript):
+    """§3: what an injected or adopted session looks like. Never -1 — `NO_TURN` belongs
+    to `wo_alarms` and this module must not import a store."""
+    session = _numbered(write_transcript, [10.0, 104.0], session="injected")
+
+    anatomy = inspection.read_session(session, turn_starts=[(1, 100.0)])
+
+    assert [t.seq for t in anatomy.turns] == [0, 1]
+    assert inspection.turn_name(0) == "an unrecorded turn"
+    assert inspection.turn_name(7) == "turn 7"
+
+
+def test_an_os_turn_with_no_transcript_turn_is_reported_not_dropped(write_transcript):
+    """§3: the `/compact` case. `Anatomy.unmatched_os_turns` carries it and the renderer
+    prints a line per entry rather than letting the number vanish."""
+    session = _numbered(write_transcript, [4.0, 304.0], session="unmatched")
+
+    anatomy = inspection.read_session(
+        session, turn_starts=[(1, 0.0), (2, 100.0), (3, 200.0), (4, 300.0)])
+
+    assert [t.seq for t in anatomy.turns] == [1, 4]
+    assert anatomy.unmatched_os_turns == [2, 3]
+    assert anatomy.as_dict()["unmatched_os_turns"] == [2, 3]
+
+
+def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
+    """`ProjectStore.turn_starts` is the only new read §3 needs: `(seq, started_at)`,
+    in seq order, for `read_session(turn_starts=...)`."""
+    from jarvis.project_store import ProjectStore
+
+    wo = ops.create_work_order("proj_a", "numbered")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        first = store.create_turn(wo["id"], "dispatch", "go")
+        second = store.create_turn(wo["id"], "message", "more")
+
+        assert store.turn_starts(wo["id"]) == [
+            (1, first["started_at"]), (2, second["started_at"])]
+    finally:
+        store.close()

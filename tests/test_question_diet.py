@@ -253,6 +253,21 @@ def test_extract_section_by_number_and_name():
     assert sections.extract_section(DESIGN_DOC, "no such heading") is None
 
 
+def test_find_heading_is_the_one_matcher_extract_section_uses():
+    """The §3 split: one rule, so a child's brief and its spec link cannot disagree."""
+    heads = [m.group(2) for m in sections.HEADING_RE.finditer(DESIGN_DOC)]
+
+    by_number = sections.find_heading(DESIGN_DOC, "3")
+    assert by_number is not None and "Failure handling" in heads[by_number]
+    by_name = sections.find_heading(DESIGN_DOC, "data model")
+    assert by_name is not None and "Data model" in heads[by_name]
+    assert sections.find_heading(DESIGN_DOC, "no such heading") is None
+    # And the slice still starts at the heading the matcher chose.
+    section = sections.extract_section(DESIGN_DOC, "3")
+    assert section is not None and section.startswith("#")
+    assert heads[by_number] in section.splitlines()[0]
+
+
 @pytest.fixture()
 def dispatched(started, project):
     daemon = started
