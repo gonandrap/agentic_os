@@ -48,6 +48,7 @@ jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE. No work order
                                            # flight finish; nothing is killed or lost.
                                            # Reach for this, never `systemctl stop` plus
                                            # kill, when spend is out of control.
+                                           # The dashboard has the same controls.
 jarvis resume <wo-id...> | --all           # let named orders through a pause (one at a
                                            # time serialises spend), or lift it. After a
                                            # usage window reopens the OS ramps back by
