@@ -516,7 +516,18 @@ ALARM_SOURCES = ("cost", "health")
 # not the same answer and the difference is the whole fail-safe: `clear` is the model
 # saying it found nothing, `failed` is nobody having judged at all — which is why a
 # `failed` sweep does not record its fingerprint as reviewed and the next tick retries.
-HEALTH_OUTCOMES = ("clear", "findings", "failed")
+#
+# `held` is the fourth and is NEITHER A JUDGEMENT NOR A DEFECT: the account refused the
+# call, so nothing was judged and nothing is broken. Recording it as `failed` made the
+# sweep re-buy the refusal every interval for the whole window and then alarm about it —
+# spec docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md.
+HEALTH_OUTCOMES = ("clear", "findings", "failed", "held")
+
+#: What a `health_reviews` row can be ABOUT. The two unit kinds, plus the ACCOUNT — a
+#: usage window is not a property of any unit, and recording it against an arbitrary one
+#: would make a fleet fact read as a work order's problem. Deliberately not a widening of
+#: ALARM_SUBJECTS: no alarm is ever about an account.
+HEALTH_SUBJECTS = ALARM_SUBJECTS + ("account",)
 
 # How long an alarm held back by a transport failure waits before it may be claimed
 # again, indexed by attempts already spent. `neo_store.RETRY_BACKOFF_SECONDS`' reasoning:
@@ -696,16 +707,22 @@ CREATE TABLE IF NOT EXISTS wo_alarms (
 -- re-raised for a (subject, probe) pair already reported at the same fingerprint. That
 -- is why `detail` carries the probe ids a sweep REPORTED (comma-separated) when
 -- `outcome='findings'`, and the failure's reason when `outcome='failed'`.
+--
+-- `reopens_at` is when a `held` row's usage window lifts, and 0 on every other outcome:
+-- a hold is the only row that states a future moment. Documented here rather than beside
+-- the column because SQLite re-parses this text on `ALTER TABLE ... DROP COLUMN` and a
+-- stranded comment makes that fail.
 CREATE TABLE IF NOT EXISTS health_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
-    subject_kind TEXT NOT NULL,         -- ALARM_SUBJECTS
+    subject_kind TEXT NOT NULL,         -- HEALTH_SUBJECTS
     subject_id TEXT NOT NULL,
     fingerprint TEXT NOT NULL,          -- health.fingerprint
     trigger TEXT NOT NULL,              -- health.TRIGGERS
     outcome TEXT NOT NULL,              -- HEALTH_OUTCOMES
     findings INTEGER NOT NULL DEFAULT 0,
-    detail TEXT NOT NULL DEFAULT ''
+    detail TEXT NOT NULL DEFAULT '',
+    reopens_at REAL NOT NULL DEFAULT 0
 );
 -- EVERY STATUS MOVE OF EVERY ORDER IN THIS PROJECT, work orders and feature orders in one
 -- table. One table and not two because the two loops record identical facts and a reader
@@ -1359,6 +1376,13 @@ ADDED_COLUMNS = {
     # The pairing the schema cannot express — `subject_kind == 'feature_order'` iff
     # `fo_id` — is enforced in `add_finding`, because a constraint neither the database
     # nor Python enforces is one that fails as a wrong page three weeks later.
+    # The moment a usage-limit hold expires. This table already ships, so a live database
+    # gets the column only here — spec
+    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §1. `0` on
+    # every row written before it, which is what "no hold" already says.
+    "health_reviews": {
+        "reopens_at": "REAL NOT NULL DEFAULT 0",
+    },
     "wo_alarms": {
         "subject_kind": "TEXT NOT NULL DEFAULT 'work_order'",   # ALARM_SUBJECTS
         "fo_id": "TEXT",                                        # set iff feature_order
@@ -3313,16 +3337,22 @@ class ProjectStore:
 
     def record_health_review(self, subject_kind: str, subject_id: str, *,
                              fingerprint: str, trigger: str, outcome: str,
-                             findings: int = 0, detail: str = "") -> int:
-        """One sweep, whatever it concluded. Returns the row id."""
-        assert subject_kind in ALARM_SUBJECTS, subject_kind
+                             findings: int = 0, detail: str = "",
+                             reopens_at: float = 0.0) -> int:
+        """One sweep, whatever it concluded. Returns the row id.
+
+        `reopens_at` is the moment a `held` row's usage window lifts, and 0 on every
+        other outcome — the only row that states a future moment.
+        """
+        assert subject_kind in HEALTH_SUBJECTS, subject_kind
         assert outcome in HEALTH_OUTCOMES, outcome
         cur = self.conn.execute(
             """INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint,
-                                           trigger, outcome, findings, detail)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                                           trigger, outcome, findings, detail,
+                                           reopens_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (db.now(), subject_kind, subject_id, fingerprint, trigger, outcome,
-             int(findings), detail),
+             int(findings), detail, float(reopens_at)),
         )
         return int(cur.lastrowid or 0)
 
@@ -3334,10 +3364,14 @@ class ProjectStore:
         against the live one to decide whether to look again, and a failure recorded a
         fingerprint nobody judged: counted as a look, an unreadable reply would suppress
         the retry §4 requires.
+
+        A `held` sweep is excluded for the same reason: the account refused the call, so
+        nothing was judged, and a hold that looked like a look would suppress the retry.
         """
         row = self.conn.execute(
             """SELECT * FROM health_reviews
-                WHERE subject_kind=? AND subject_id=? AND outcome!='failed'
+                WHERE subject_kind=? AND subject_id=?
+                  AND outcome NOT IN ('failed','held')
              ORDER BY ts DESC, id DESC LIMIT 1""",
             (subject_kind, subject_id),
         ).fetchone()
@@ -3352,10 +3386,14 @@ class ProjectStore:
         this answers "when did we last spend a call", which must not. `health.due` needs
         both and they disagree exactly when the sweep is broken — which is when the
         difference is worth money (issue #216).
+
+        A `held` row is NOT an attempt: the account refused before any call was bought,
+        so flooring the next real look on it would make one refused tick cost a whole
+        interval of watching. A `failed` row still counts — that one DID spend money.
         """
         row = self.conn.execute(
             """SELECT ts FROM health_reviews
-                WHERE subject_kind=? AND subject_id=?
+                WHERE subject_kind=? AND subject_id=? AND outcome!='held'
              ORDER BY ts DESC, id DESC LIMIT 1""",
             (subject_kind, subject_id),
         ).fetchone()
@@ -3368,17 +3406,37 @@ class ProjectStore:
             """SELECT * FROM health_reviews WHERE subject_kind=? AND subject_id=?
              ORDER BY ts, id""", (subject_kind, subject_id)).fetchall())
 
-    def recent_health_reviews(self, limit: int) -> list[dict[str, Any]]:
+    def recent_health_reviews(self, limit: int,
+                              include_held: bool = True) -> list[dict[str, Any]]:
         """The project's last `limit` sweeps, newest first, of every unit and outcome.
 
         Across subjects on purpose: a sweep that cannot produce a judgement is broken
         for the PROJECT, not for one work order, and asking per unit would need a run
         long enough on a single order — which is exactly the unit that then settles and
         takes the evidence with it.
+
+        `include_held=False` drops the usage-limit holds BEFORE the limit is taken, which
+        is what INV-HEALTH-SWEEP-MUTE needs: ten holds must never trip it, and a hold in
+        the middle of a genuine failure run must not reset that run either. The default
+        keeps every row, for `jarvis doctor`-style readers that want the whole ledger.
         """
+        where = "" if include_held else "WHERE outcome!='held' "
         return db.rows_to_dicts(self.conn.execute(
-            "SELECT * FROM health_reviews ORDER BY ts DESC, id DESC LIMIT ?",
+            f"SELECT * FROM health_reviews {where}ORDER BY ts DESC, id DESC LIMIT ?",
             (int(limit),)).fetchall())
+
+    def health_sweep_hold(self) -> tuple[float, str] | None:
+        """The project's newest usage-limit hold if it has not expired — (reopens_at,
+        detail).
+
+        PROJECT-WIDE, not per unit: the account's window is not a property of a work
+        order, and a per-unit read would re-buy the refusal once per candidate.
+        """
+        row = self.conn.execute(
+            """SELECT reopens_at, detail FROM health_reviews
+                WHERE outcome='held' AND reopens_at > ?
+             ORDER BY ts DESC, id DESC LIMIT 1""", (db.now(),)).fetchone()
+        return (float(row["reopens_at"]), str(row["detail"] or "")) if row else None
 
     def probes_reported_at(self, subject_kind: str, subject_id: str,
                            fingerprint: str) -> set[str]:

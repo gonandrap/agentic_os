@@ -14,6 +14,7 @@ persona (`tests/test_supervisor.py`). `remedies.py` acts, and only under a grant
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from . import claude_cli, structured
@@ -914,6 +915,20 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
                 "health", project=project, wo_id=carrier["id"], label=trigger,
                 model=cfg.model, record=record),
         )
+    except claude_cli.UsageLimitError as exc:
+        # BEFORE the generic outage below, and the ordering is the fix: a spent window
+        # is not a transport fault and must not be recorded as a broken sweep
+        # (issue #235's lesson, kn-96bc2417; `neo.drain_queue` src/jarvis/neo.py:418).
+        from .worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+        reopens = exc.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+        pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
+                                    trigger=trigger, outcome="held",
+                                    detail=_clip(exc.limit.message, cfg.reason_chars),
+                                    reopens_at=reopens)
+        log.info("[%s] health sweep of %s held until the usage window reopens",
+                 project, subject_id)
+        return {**_nothing_found(exc.limit.message), "raised": [], "outcome": "held"}
     except claude_cli.ClaudeCliError as exc:
         # `on_invalid` does NOT cover this: `ClaudeCliError` propagates untouched by
         # design (kn-9b18a8eb), and without this the sweep raises out of the daemon's

@@ -581,3 +581,57 @@ def test_an_unregistered_catalog_says_how_to_name_one(tmp_path, capsys):
     path.write_text(json.dumps(DOCUMENT))
     cli.main(["config", "get", "os.defaults.model", "--catalog", str(path)])
     assert '"opus"' in capsys.readouterr().out
+
+
+# --- the OS's own health sweep may not be switched off -------------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §4. USER RULE,
+# 2026-09-28 (kn-7312c7de). Refused in `ops`, so the CLI and the dashboard's console
+# inherit it from one place. `proj_a` is the OS owner here: `schedule.os_owner` falls
+# back to the catalog's first project when none contains the running install.
+
+SWEEP_OFF = [
+    ("projects.proj_a.supervisor.health_enabled", False),
+    ("projects.proj_a.supervisor.enabled", False),
+    ("os.supervisor.health_enabled", False),
+    ("os.supervisor.enabled", False),
+]
+
+
+@pytest.mark.parametrize("path,value", SWEEP_OFF)
+def test_turning_the_os_projects_own_sweep_off_is_refused(catalog, path, value):
+    before = catalog.read_text()
+
+    with pytest.raises(ops.OpsError) as e:
+        ops.set_config(path, value, reason="I would like it quiet")
+
+    assert "proj_a" in str(e.value), "the project comes from the derivation"
+    assert "supervisor." in str(e.value)
+    assert catalog.read_text() == before
+    assert no_head()
+
+
+def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(catalog):
+    """`health_enabled` ships False, so an unset is a way of turning it off — which is
+    why the predicate is on the RESOLVED document and not on the value written."""
+    ops.set_config("projects.proj_a.supervisor.health_enabled", True,
+                   reason="the OS watches itself")
+    ops.set_config("projects.proj_a.supervisor.enabled", True, reason="same")
+    before = catalog.read_text()
+    version = head()["id"]
+
+    with pytest.raises(ops.OpsError, match="proj_a"):
+        ops.unset_config("projects.proj_a.supervisor.health_enabled", reason="quiet")
+
+    assert catalog.read_text() == before
+    assert head()["id"] == version
+
+
+@pytest.mark.parametrize("path", ["supervisor.health_enabled", "supervisor.enabled"])
+def test_the_same_write_on_an_ordinary_project_is_allowed(catalog, path):
+    """§4 only stops the OS's own project opting out. Everyone else opts in and out."""
+    res = ops.set_config(path, False, project="proj_b", reason="not the OS's own")
+
+    assert res["path"] == f"projects.proj_b.{path}"
+    assert document_of(catalog)["projects"][1][path.split(".")[0]][path.split(".")[1]] \
+        is False

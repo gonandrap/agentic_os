@@ -458,6 +458,11 @@ class Violation:
     repaired: bool = False
     repair: str = ""
     context: dict[str, Any] = field(default_factory=dict)
+    #: How loudly the notification arrives. `warning` for every violation that predates
+    #: this field, so it is additive; a checker that must not land beside a stale
+    #: attention flag says `critical` (spec
+    #: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
+    level: str = "warning"
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -2706,7 +2711,15 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     Silent on a project that has never swept: the sweep ships disabled, and no rows is
     not a run of failures.
     """
-    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN)
+    if store.health_sweep_hold() is not None:
+        # The check claims the sweep IS SPENDING model calls right now. During a
+        # usage-limit hold it is spending none.
+        return
+    # HELD ROWS ARE FILTERED OUT BEFORE THE LAST TEN ARE TAKEN, not skipped in the loop.
+    # Two consequences, both wanted: ten holds can never trip it, and a hold in the
+    # middle of a genuine failure run does not RESET that run either — a window that
+    # interrupted a broken prompt did not fix the prompt.
+    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN, include_held=False)
     if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
         return
     if any(r["outcome"] != "failed" for r in recent):
@@ -2716,11 +2729,157 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
         return
     yield Violation(
         invariant="INV-HEALTH-SWEEP-MUTE",
-        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all failed, so the "
-                f"sweep is spending model calls and producing no judgement. Most recent "
+        # FAILING, never held: the word "held" is reserved for the usage-limit rows, so
+        # the two are never confused in an inbox line.
+        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all FAILED (the "
+                f"account's usage window is a hold, not a failure), so the sweep is "
+                f"spending model calls and producing no judgement. Most recent "
                 f"reason: {str(recent[0]['detail'] or '(none recorded)')[:200]}"),
         context={"failures": HEALTH_SWEEP_FAILURE_RUN,
                  "last_detail": str(recent[0]["detail"] or "")[:500]},
+    )
+
+
+#: How long the OS's own sweep may produce no judgement before the user is told. Six
+#: missed sweeps at the shipped 30-minute floor: long enough that a transport blip, a
+#: daemon restart or one capped tick cannot trip it, short enough that a sweep switched
+#: off by a bad edit is reported the same working day. Time inside a live usage-limit
+#: hold does not count against it.
+OS_HEALTH_SWEEP_DARK_MINUTES = 180
+
+
+def _live_catalog() -> Any:
+    """The registered catalog, or None. `_validation_timeout`'s rule: best-effort, and
+    an invariant must never be the thing that raises."""
+    try:
+        from .ops import resolve_catalog
+
+        return resolve_catalog()
+    except Exception:  # noqa: BLE001 — no catalog, an unreadable one, a moved path
+        return None
+
+
+def _os_owning_project(store: ProjectStore) -> Any:
+    """This store's `ProjectSpec` if it is the project that runs the OS, else None.
+
+    Derived, NEVER hardcoded: `schedule.os_owner` over the live catalog, compared on the
+    RESOLVED PATH rather than on a name, because a store knows its directory and not
+    what the catalog calls it.
+    """
+    from . import schedule
+
+    catalog = _live_catalog()
+    if catalog is None:
+        return None
+    try:
+        owner = schedule.os_owner((p.name, p.path) for p in catalog.projects)
+        if owner is None:
+            return None
+        spec = catalog.project(owner)
+        if Path(spec.path).resolve() != Path(store.project_path).resolve():
+            return None
+        return spec
+    except Exception:  # noqa: BLE001 — same rule: never the thing that raises
+        return None
+
+
+def _health_hold_seconds(store: ProjectStore, since: float, until: float) -> float:
+    """How much of `[since, until]` the account's usage window was shut for.
+
+    Summed from the `held` rows' `[ts, reopens_at]` intervals — the same active-clock
+    shape the duration alarms use. Overlapping windows are merged so a per-unit hold and
+    the account's own hold are not counted twice.
+    """
+    spans = []
+    for row in store.conn.execute(
+            "SELECT ts, reopens_at FROM health_reviews WHERE outcome='held' "
+            "AND reopens_at > ? ORDER BY ts", (since,)).fetchall():
+        start = max(float(row["ts"] or 0.0), since)
+        end = min(float(row["reopens_at"] or 0.0), until)
+        if end > start:
+            spans.append((start, end))
+    total, edge = 0.0, since
+    for start, end in spans:
+        start = max(start, edge)
+        if end > start:
+            total += end - start
+            edge = end
+    return total
+
+
+def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
+    """INV-OS-HEALTH-SWEEP-DARK — the OS's own health sweep must never be dark.
+
+    USER RULE, 2026-09-28 (kn-7312c7de): the project that runs the OS must ALWAYS have
+    the sweep on and producing judgements. Nothing enforced it, and two things worked
+    against it — `supervisor.health_enabled` ships False, and `jarvis config set` reached
+    both switches like any other key. §4 refuses the write; this is the liveness half,
+    because a catalog edited by hand bypasses `ops` entirely.
+
+    RUNS ONLY ON THE OS-OWNING PROJECT. INV-HEALTH-SWEEP-MUTE answers "is this project's
+    sweep broken" for every project; this answers "is the OS's own sweep alive" for one,
+    and it is deliberately loud where that one says nothing (its docstring's "silent on a
+    project that has never swept" is correct for an ordinary project and is exactly the
+    blind spot here).
+
+    NOT repairable: re-enabling the sweep would be the OS editing the user's catalog, and
+    a failing sweep's cause is not derivable from state. The detail names WHICH of the
+    three causes it is, because they have three different fixes.
+
+    Time inside a usage-limit hold does not count: a sweep that is silent only because
+    the account was is not dark (spec
+    docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
+    """
+    spec = _os_owning_project(store)
+    if spec is None:
+        return
+    name = spec.name
+    supervisor = getattr(spec, "supervisor", None)
+    for key, on in (("supervisor.enabled", getattr(supervisor, "enabled", False)),
+                    ("supervisor.health_enabled",
+                     getattr(supervisor, "health_enabled", False))):
+        if not on:
+            yield Violation(
+                invariant="INV-OS-HEALTH-SWEEP-DARK",
+                detail=(f"the OS's own health sweep is DISABLED ({key}=false) and must "
+                        f"not be — {name} runs the OS itself, and its sweep must always "
+                        f"be on and producing judgements (user rule, 2026-09-28)"),
+                level="critical", context={"project": name, "cause": "disabled",
+                                           "key": key},
+            )
+            return
+
+    now = db.now()
+    window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
+    judged = store.conn.execute(
+        "SELECT ts FROM health_reviews WHERE outcome IN ('clear','findings') "
+        "ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
+    # With no judgement ever recorded the clock starts at the window's own edge: the
+    # check then fires as soon as a full window has passed with the account awake, which
+    # is what "enabled but never scheduled" looks like from the outside.
+    since = float(judged["ts"]) if judged else now - window
+    dark = (now - since) - _health_hold_seconds(store, since, now)
+    if dark < window:
+        return
+
+    minutes = int(dark / 60)
+    newest = store.recent_health_reviews(1, include_held=False)
+    if newest and newest[0]["outcome"] == "failed":
+        detail = (f"the OS's own health sweep has produced no judgement for {minutes}m; "
+                  f"the newest sweep FAILED: "
+                  f"{str(newest[0]['detail'] or '(none recorded)')[:200]}")
+        cause = "failing"
+    elif judged is None and not newest:
+        detail = ("the OS's own health sweep is enabled but has never run — no sweep "
+                  "has been scheduled")
+        cause = "not-scheduled"
+    else:
+        detail = (f"the OS's own health sweep has produced no judgement for {minutes}m, "
+                  f"and {name} runs the OS itself")
+        cause = "silent"
+    yield Violation(
+        invariant="INV-OS-HEALTH-SWEEP-DARK", detail=detail, level="critical",
+        context={"project": name, "cause": cause, "dark_minutes": minutes},
     )
 
 
@@ -3869,6 +4028,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,
                                    # repairing nothing and read by nothing else
+    check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing,
+                                   # and a liveness check that runs hourly is a liveness
+                                   # check with an hour of blind spot
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing

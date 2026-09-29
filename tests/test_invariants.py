@@ -946,3 +946,175 @@ def test_it_is_a_doctor_check_not_a_reconcile_tick_check():
     against a checkout, which is not something the reconcile loop should do every tick."""
     assert invariants.check_production_clean in invariants.OS_INVARIANTS
     assert invariants.check_production_clean not in invariants.INVARIANTS
+
+
+# -- INV-OS-HEALTH-SWEEP-DARK: the OS's own sweep must be alive -------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5. USER RULE,
+# 2026-09-28 (kn-7312c7de): the OS's own project must ALWAYS have the health sweep on and
+# producing judgements.
+
+def _register_catalog(tmp_path, projects: list[dict], enabled=True, health=True) -> None:
+    import json
+
+    from jarvis.central_store import CentralStore
+
+    path = tmp_path / "dark-catalog.json"
+    path.write_text(json.dumps({
+        "os": {"supervisor": {"enabled": enabled, "health_enabled": health},
+               "notifications": {"sinks": ["log"]}},
+        "projects": projects,
+    }))
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(path))
+    finally:
+        central.close()
+
+
+def _dark(store) -> list:
+    return [v for v in invariants.check_os_health_sweep_alive(store)]
+
+
+def _owning(tmp_path, project, **kw) -> ProjectStore:
+    """The catalog's FIRST project is the OS owner when no project contains the install
+    (`schedule.os_owner`'s deterministic fallback), which is every test checkout."""
+    _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                  "description": "the OS's own"}], **kw)
+    return ProjectStore(project)
+
+
+def test_the_os_sweep_switched_off_is_reported_critical(tmp_path, project):
+    store = _owning(tmp_path, project, health=False)
+
+    (violation,) = _dark(store)
+
+    assert violation.invariant == "INV-OS-HEALTH-SWEEP-DARK"
+    assert violation.level == "critical"
+    assert not violation.repaired, "re-enabling it would be the OS editing the catalog"
+    assert "DISABLED" in violation.detail
+    assert "health_enabled" in violation.detail
+    store.close()
+
+
+def test_the_supervisor_switch_takes_the_sweep_dark_too(tmp_path, project):
+    """Two switches, either of which is fatal: `_health_projects` requires both."""
+    store = _owning(tmp_path, project, enabled=False)
+
+    (violation,) = _dark(store)
+
+    assert "supervisor.enabled" in violation.detail
+    store.close()
+
+
+def test_an_enabled_sweep_that_has_never_run_is_reported(tmp_path, project):
+    store = _owning(tmp_path, project)
+
+    (violation,) = _dark(store)
+
+    assert "never run" in violation.detail
+    assert violation.level == "critical"
+    store.close()
+
+
+def test_a_failing_sweep_names_the_failure(tmp_path, project):
+    store = _owning(tmp_path, project)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed",
+                               detail="unreadable health sweep output: {...}")
+
+    (violation,) = _dark(store)
+
+    assert "FAILED" in violation.detail
+    assert "unreadable health sweep output" in violation.detail
+    store.close()
+
+
+def test_a_sweep_that_judged_recently_is_not_dark(tmp_path, project):
+    store = _owning(tmp_path, project)
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="clear")
+
+    assert _dark(store) == []
+    store.close()
+
+
+def test_a_usage_limit_window_is_not_darkness(tmp_path, project):
+    """A sweep that is silent only because the ACCOUNT was is not dark: the elapsed
+    clock excludes time spent inside a hold."""
+    from jarvis import db
+    from jarvis.invariants import OS_HEALTH_SWEEP_DARK_MINUTES
+
+    store = _owning(tmp_path, project)
+    window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
+    started_at = db.now() - window - 600
+    store.conn.execute(
+        "INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint, "
+        "trigger, outcome, findings, detail, reopens_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (started_at, "work_order", "wo-1", "fp", "first-look", "clear", 0, "", 0.0))
+    store.conn.execute(
+        "INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint, "
+        "trigger, outcome, findings, detail, reopens_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (started_at + 1, "account", "", "", "account-window", "held", 0,
+         "You've hit your session limit", db.now() + 600))
+
+    assert _dark(store) == [], "the account was asleep, not the sweep"
+    store.close()
+
+
+def test_a_project_that_does_not_run_the_os_is_never_reported(tmp_path, project):
+    """Every state above, on a project that is not the owner."""
+    other = tmp_path / "other"
+    (other / ".jarvis").mkdir(parents=True)
+    _register_catalog(tmp_path, [
+        {"name": "proj_a", "path": str(project), "description": "the OS's own"},
+        {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
+    ], health=False)
+    store = ProjectStore(other)
+
+    assert _dark(store) == []
+
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="failed", detail="boom")
+    assert _dark(store) == []
+    store.close()
+
+
+def test_an_unreadable_catalog_yields_no_violation(project):
+    """An invariant must never be the thing that raises — `_validation_timeout`'s rule."""
+    store = ProjectStore(project)
+    assert _dark(store) == []
+    store.close()
+
+
+def test_the_dark_check_runs_every_tick(tmp_path, project):
+    """A liveness check that runs hourly is a liveness check with an hour of blind
+    spot."""
+    assert invariants.check_os_health_sweep_alive in invariants.INVARIANTS
+    assert invariants.check_os_health_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+def test_the_notification_carries_the_violations_own_level(tmp_path, project,
+                                                           monkeypatch, catalog_file):
+    """`Daemon.check_invariants` passed the literal `"warning"`, which would file this
+    one beside a stale attention flag."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.projects[0]
+    store = ProjectStore(spec.path)
+    monkeypatch.setattr(invariants, "check_project", lambda *a, **k: [
+        invariants.Violation(invariant="INV-MADE-UP-CRITICAL", detail="the loud one",
+                             level="critical"),
+        invariants.Violation(invariant="INV-MADE-UP-ORDINARY", detail="the usual one"),
+    ])
+
+    daemon.check_invariants(spec, store)
+
+    levels = {n["title"].split(": ")[-1]: n["level"]
+              for n in store.unrouted_notifications() if n["source"] == "invariants"}
+    assert levels["INV-MADE-UP-CRITICAL"] == "critical"
+    assert levels["INV-MADE-UP-ORDINARY"] == "warning", "every existing one is additive"
+    store.close()
