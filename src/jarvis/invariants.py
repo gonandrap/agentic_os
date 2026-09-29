@@ -1638,13 +1638,32 @@ def something_is_out(store: ProjectStore, wo_id: str) -> bool:
 
     `held_approvals` counts as out, and it is the clause a caller inheriting this from
     `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
-    held request, so it is not "with a reviewer" — but the work order is not free either:
-    `gates.file_request` parks it in `waiting_input` down BOTH its roads, the OS refuses
-    it on the `gates.case_ttl_seconds` timer, and until then the worker is waiting for a
-    verdict exactly as it would be for an argued one.
+    held request, so it is not "with a reviewer" — and it parks NOTHING: since fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md `gates.file_request`
+    writes `waiting_input` only down the PENDING road. The work order is still out all the
+    same: the command is blocked, the `gates.case_ttl_seconds` clock is running, and the
+    only thing that can close the request is the worker's own next command.
+
+    WHAT IS OUT, not who is waited on — `user_facing_wait` below is the other question,
+    and the pair lives here together so the two cannot drift.
     """
     return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
                 or awaiting_neo(wo_id))
+
+
+def user_facing_wait(store: ProjectStore, wo_id: str) -> bool:
+    """Is somebody ELSE holding this work order — a reviewer, or Neo?
+
+    The narrower half of the pair above, and the discriminator for the one status that
+    says "Waiting on you". A HELD gate request is excluded on purpose: it is the
+    WORKER's move, its only exit is the worker's own next command, and nothing about it
+    is owed by the user — which is the whole of fix 2.
+
+    Beside `something_is_out` rather than in a caller, because the two are read against
+    each other: `settle_work_order` asks this one before writing a status and that one
+    before deciding a manager is free (kn-4ea33fe6).
+    """
+    return bool(store.pending_approvals(wo_id) or awaiting_neo(wo_id))
 
 
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:

@@ -1097,6 +1097,10 @@ class Daemon:
         than one loop over both kinds, because `list_feature_orders` filters kind
         POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
         undo that. See §3.1.
+
+        An INVESTIGATION order gets a third one, identical in shape: one work order,
+        `kind='investigator'`, the `why` verbatim, and `pending` left last (§2.7 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md).
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -1133,6 +1137,30 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+        # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: a third
+        # sibling loop, for the same reason as the second — `list_feature_orders` filters
+        # kind POSITIVELY and a shared loop would have to undo that.
+        for fo in store.list_feature_orders(statuses=("pending",),
+                                            kind="investigation"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Investigate: {fo['title']}"[:200],
+                    # The `why` verbatim; the investigator CONTRACT is composed at
+                    # dispatch (dispatch._investigator_prompt), as the analyst's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
+                log.exception("[%s] could not open an investigator for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, which is what makes a crashed tick re-file rather than strand an
+            # investigation with no investigator.
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
+                     wo["id"])
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over. Thin, like its
@@ -4392,7 +4420,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo, something_is_out, true_blockers
+        from .invariants import something_is_out, true_blockers, user_facing_wait
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
         # claim below. The budget governs the order's WHOLE bill, so what spends the last
@@ -4584,10 +4612,18 @@ class Daemon:
                 # and this ran a tick later and completed the order it had just held.
                 # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
-        elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
+        elif wo.get("kind") != "manager" and something_is_out(store, wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
             # and wait, so an idle worker here is compliance, not abandonment.
+            #
+            # THE WHOLE PREDICATE, and a manager is excluded from it: `something_is_out`
+            # adds `held_approvals`, which is what keeps an idle worker holding an
+            # unargued gate out of the `else` below and off the user's list (fix 2 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), and
+            # the exclusion is what keeps the manager branch below reachable exactly as
+            # before. The WRITE stays conditional on the wait being outward-facing: a
+            # held request is the worker's own move, so it parks nothing.
             #
             # The question half was missing, and the `else` below caught those instead:
             # a `jarvis wo ask` whose answer had not landed by the time the turn settled
@@ -4595,7 +4631,8 @@ class Daemon:
             # the user, for a worker doing exactly what the contract asks of it (GitHub
             # issue 100). Only the tightness of the Neo drain loop kept that rare; a
             # slow or disabled Neo makes it every `wo ask`.
-            if fresh["status"] != "waiting_input":
+            if (user_facing_wait(store, wo["id"])
+                    and fresh["status"] != "waiting_input"):
                 store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
@@ -4628,21 +4665,22 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif something_is_out(store, wo["id"]):
+            elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
                 # say the opposite — nothing to act on — about an order waiting for a
                 # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
                 #
-                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
-                # question and looks like all of it. That `elif` reads `pending_approvals`
-                # and misses `awaiting_case` — a gate request the worker filed by running
-                # the command before arguing it, which `gates.file_request` parks here
-                # just the same. Under the old code missing it cost nothing, because this
-                # branch's write was `waiting_input` either way; since issue #264 it is a
-                # rewrite, so the predicate has to be the whole one. `something_is_out` is
-                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
-                # the two cannot drift (kn-4ea33fe6).
+                # THE BRANCH ABOVE NOW COVERS THE REST, and a manager is excluded from it
+                # on purpose so this one stays reachable: `something_is_out` there is the
+                # whole predicate, including `awaiting_case`. What is left here is the
+                # narrower question — is somebody ELSE holding this — because a HELD gate
+                # request is the manager's own move and is owed by nobody. A manager
+                # holding only one falls through to `idle`, which is the truthful label:
+                # its feature is what wakes it. Fix 2 of
+                # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+                # `user_facing_wait` lives beside `something_is_out` so the pair cannot
+                # drift (kn-4ea33fe6).
                 pass
             elif fresh["status"] != "idle":
                 store.set_status(wo["id"], "idle")

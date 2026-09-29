@@ -1004,3 +1004,36 @@ def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project)
 
     assert invariants.rejudge_exhausted(store, old) is True
     assert invariants.rebind_exhausted(store, old) is False
+# -- is somebody ELSE holding this, or is anything out at all? -------------------------
+# Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
+# questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).
+
+
+def test_a_held_gate_is_out_but_is_not_a_user_facing_wait(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4",
+                       status="awaiting_case")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_a_pending_gate_is_both(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+    store.add_approval(wo["id"], "release", "scripts/deploy.sh 0.5.4")
+
+    assert invariants.something_is_out(store, wo["id"])
+    assert invariants.user_facing_wait(store, wo["id"])
+    store.close()
+
+
+def test_nothing_out_is_neither(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("ship it")
+
+    assert not invariants.something_is_out(store, wo["id"])
+    assert not invariants.user_facing_wait(store, wo["id"])
+    store.close()
