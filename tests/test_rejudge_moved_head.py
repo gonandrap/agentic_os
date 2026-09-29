@@ -1331,3 +1331,80 @@ def test_a_fix_after_a_rejected_user_rework_round_is_an_ordinary_round(
     assert int(again["round"]) == int(row["round"]) + 1
     store.close_validation_round(again["id"], "passed", "")
     assert store.counted_validation_rounds(wo_id=wo["id"]) == counted + 1
+
+
+def test_a_passing_user_rework_round_arms_the_merge(tmp_path, project, jarvis_home,
+                                                    fake_claude, fake_gh):
+    """The point of the exemption is a pull request that MERGES: the rework the user
+    asked for is judged past the budget, passes, and the OS asks for the gate."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    _user_rejected(store, wo)
+    # The worker answered it: `ops.refusal_answered` is the other half of the user's
+    # gate, and without a re-delivery the landing correctly refuses.
+    store.add_event(wo["id"], "finished", {"summary": "did the rework"})
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=False)
+    judge(fleet, store, Panel("passed"))
+
+    row = store.latest_validation_round(wo_id=wo["id"])
+    assert ProjectStore.validated_head(row) == PUSHED
+    assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+
+    poll(fleet, store)
+
+    approvals = store.list_approvals(wo["id"])
+    assert [a["kind"] for a in approvals] == ["auto_merge"]
+    assert PUSHED in approvals[0]["command"]
+    assert not store.get_work_order(wo["id"])["attention_reason"]
+
+
+def test_a_rejected_user_rework_round_goes_back_to_the_worker(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """The counted budget still has room, so the worker gets the feedback — and it may
+    not read as a rebind: there is no "re-judgement 1 of 2" bound here."""
+    fleet = boot(tmp_path, project, max_rounds=5)
+    store, wo = parked(project, rounds=2)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=False)
+    judge(fleet, store, Panel("rejected"))
+
+    assert store.get_work_order(wo["id"])["status"] != "needs_review"
+    payload = db.from_json(
+        store.events_of_kind(wo["id"], "validation_rejected")[-1]["payload"], {})
+    assert payload["uncounted"] is True
+    assert payload["uncounted_cause"] == ops.USER_REWORK_CAUSE
+    fleet.deliver_envelopes(fleet.catalog.project("proj_a"), store)
+    text = store.queued_messages(wo["id"])[0]["content"]
+    assert "no round spent" in text
+    assert "re-judgement" not in text and "merge the base branch" not in text
+    assert "REVIEW FEEDBACK (round" not in text
+
+
+def test_a_rejected_user_rework_round_with_no_budget_left_goes_to_the_user(
+        tmp_path, project, jarvis_home, fake_claude, fake_gh):
+    """One free round per user rejection and no more: the counted budget is spent, so
+    the refusal is the user's to read — and the sentence has to name THIS cause, not the
+    older `sha_moved` refusal and not the rebind's."""
+    fleet = boot(tmp_path, project, max_rounds=3)
+    store, wo = parked(project, rounds=3)
+    _user_rejected(store, wo)
+    artifact(fake_gh, head_oid=PUSHED)
+
+    ops.rejudge_moved_head(store, project, wo, project="proj_a", cfg=_cfg(fleet),
+                           decision=_moved(), rebind=False)
+    judge(fleet, store, Panel("rejected"))
+
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "needs_review"
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.USER_REWORK_REFUSED_BLOCKER in blockers
+    assert invariants.VALIDATION_STUCK_BLOCKER not in blockers
+    assert invariants.REBIND_EXHAUSTED_BLOCKER not in blockers
+    assert invariants.SHA_MOVED_BLOCKER not in blockers

@@ -250,6 +250,20 @@ branch in, your resolution changed what this pull request contributes, and a sea
 read it. Fix what is above and run
 `jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
 
+#: THE SAME REJECTION ON THE ROUND A USER REJECTION BOUGHT. No round was spent here
+#: either, but nothing about a rebind is true of it: nobody merged anything, and there
+#: is no "re-judgement 1 of 2" — the bound is one free round per USER rejection, so a
+#: number out of two would name a cap that does not exist (Neo question 973, live case
+#: wo-299daf2e). The last sentence is the one the rebind wording does not need: the
+#: NEXT attempt is charged like any other.
+USER_REWORK_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The user rejected this on review and
+asked for the rework, so it was judged outside the budget. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
+charged one."""
+
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
 #: a manager that read "address this" would go and edit the repository itself.
@@ -1962,11 +1976,20 @@ class Daemon:
             # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
             # is this `+ 1`.
             uncounted = bool(round_row["uncounted"])
-            rebinds = store.uncounted_validation_rounds(wo_id=wo_id) if uncounted else 0
+            # WHICH EXEMPTION, not merely that there was one. A rework the USER asked
+            # for is bounded by the user's own rejections — one free round each — so a
+            # rejected one falls back to the ORDINARY rule and `REBIND_MAX` never reads
+            # it (Neo question 973, live case wo-299daf2e). An uncounted row with NO
+            # cause predates the column and could only have been a rebind, which is why
+            # the filter drops to unfiltered there.
+            cause = str(round_row["uncounted_cause"] or "")
+            as_rebind = uncounted and cause != ops.USER_REWORK_CAUSE
+            rebinds = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=cause or None) if as_rebind else 0
             pos = store.counted_validation_rounds(wo_id=wo_id) + (
                 0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
                 else 1)
-            goes_back = (rebinds < ops.REBIND_MAX) if uncounted else (pos < max_rounds)
+            goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2148,7 +2171,8 @@ class Daemon:
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
                              note=ops.follow_up_feedback(follow_ups), budget_round=pos,
-                             rebind=(rebinds, ops.REBIND_MAX) if uncounted else None)
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
                 log.info("[%s] %s rejected in round %d of %d",
                          project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
@@ -2246,7 +2270,8 @@ class Daemon:
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
                 reason: str, *, note: str = "", budget_round: int | None = None,
-                rebind: tuple[int, int] | None = None) -> None:
+                rebind: tuple[int, int] | None = None,
+                uncounted_cause: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -2264,6 +2289,11 @@ class Daemon:
         the round was not charged to the submitter, so it may not be told it was (spec
         2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
 
+        `uncounted_cause` is the round's OWN exemption and it picks the wording: a round
+        a USER rejection bought is not a rebind and may not be described as one — no
+        merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
+        event too, so every surface can tell the two uncounted causes apart.
+
         `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
         its row number, and it is what the ordinary feedback names — a submitter told
         "round 3 of 3" on its second charged round would ration itself out of a round it
@@ -2273,7 +2303,10 @@ class Daemon:
         `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
         open for ever. The position rides beside it as `budget_round`.
         """
+        from . import ops
+
         wo_id = wo["id"]
+        rework = uncounted_cause == ops.USER_REWORK_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
         used, of = rebind or (0, max_rounds)
         pos = n if budget_round is None else budget_round
@@ -2281,14 +2314,20 @@ class Daemon:
         # "round 5 of 3" (spec 2026-09-27 §4.4).
         event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
                                  "budget_round": pos}
-        if rebind is not None:
+        if rebind is not None or rework:
             event["uncounted"] = True
+        if uncounted_cause:
+            event["uncounted_cause"] = uncounted_cause
         store.add_event(wo_id, "validation_rejected", event)
-        text = (REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
-                                       reason=reason + note, wo_id=wo_id)
-                if rebind is not None
-                else REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
-                                            wo_id=wo_id))
+        if rework:
+            text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
+                                               reason=reason + note, wo_id=wo_id)
+        elif rebind is not None:
+            text = REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
+                                          reason=reason + note, wo_id=wo_id)
+        else:
+            text = REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
+                                          wo_id=wo_id)
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
                  payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))

@@ -517,3 +517,77 @@ would hand the next submission a `void` row. That is a pre-existing defect, unto
 and deliberately not fixed by widening `numbered_validation_rounds` — widening it would
 change numbering for rows that exist on live databases. If test 6's void case shows it
 biting, file it separately.
+
+## 7. The second uncounted cause: a rework the USER asked for
+
+**The defect, measured.** wo-299daf2e: rounds 1 and 2 passed, the USER rejected it on
+review with feedback, the worker delivered the rework and merged `main`, and the head then
+sat past the verdict. The re-judge was declined on `max_rounds` — the chain was not all
+merges of the base, so `rebind` was false and the ordinary arm applied — and the rework the
+user had asked for was never judged by anyone. The round budget bounds the
+worker-versus-panel rejection loop; a rejection the USER wrote is not part of that loop,
+and spending the loop's budget on it is what left the order stuck.
+
+**The ruling (Neo, question 973), not open for revision.** "Option A: a separate
+`user_rework` cause, one uncounted round per user rejection, no `REBIND_MAX`, with its own
+feedback wording and exhausted blocker. Each user rejection is the bound, and an OS merge
+re-judge must never use up the round the user's rework needs."
+
+**The predicate.** `ops.user_rework_pending(store, wo_id)`: the newest `reviewed` event
+with `accepted` false is NEWER than the newest SETTLED round. Store reads only — both call
+sites ask it on a tick. It SELF-TERMINATES, which is what makes "one per rejection" a bound
+rather than a hole: the moment the user-rework round settles it is itself the newest
+settled round, so the predicate reads false again until the user rejects once more.
+
+**The two `ops` call sites** (built first, commit 768d8d8):
+
+1. `submit_for_validation` — the worker's own re-delivery through `jarvis wo finish`. Also
+   the place the rebind's "a fix after a rejected rebind is itself a rebind" rule lives,
+   and that rule is now filtered to `REBIND_CAUSE`: a fix after a rejected USER-REWORK
+   round is an ORDINARY counted round, because the bound is one round per user rejection
+   and the user has not rejected again.
+2. `rejudge_moved_head` — asked BEFORE either decline and independent of `rebind`. When
+   both would apply the user rework wins: it is the arm the ruling protects, and the rebind
+   budget must stay for the OS's own merges. `REBIND_MAX` counts
+   `uncounted_validation_rounds(cause=REBIND_CAUSE)` and nothing else, so the two causes
+   can never spend each other.
+
+**The surfaces (this stage).**
+
+* `Daemon._validate_work_order` routes on the CAUSE, never on `uncounted` alone. A rejected
+  REBIND round keeps `rebinds < ops.REBIND_MAX`; a rejected USER-REWORK round falls back to
+  the ORDINARY rule, `pos < max_rounds` — its one free round has been used. An uncounted row
+  with NO cause predates the column and could only have been a rebind, so the count drops to
+  unfiltered there.
+* `daemon.USER_REWORK_FEEDBACK` beside `REBIND_FEEDBACK`. It may NOT say "re-judgement 1 of
+  2": there is no such cap here. It says no round was spent, that the user asked for the
+  rework, and — the sentence the rebind wording does not need — that the next attempt is
+  charged. `_reject` picks it off the round's `uncounted_cause`; the `rebind` parameter's
+  behaviour is unchanged.
+* `invariants.USER_REWORK_REFUSED_BLOCKER`, derived by `invariants.user_rework_refused`
+  (latest round `escalated` and `uncounted_cause == ops.USER_REWORK_CAUSE`) and appended in
+  `true_blockers`'s `needs_review` triage in place of `VALIDATION_STUCK_BLOCKER`. DERIVED
+  rather than written at `Daemon._escalate`: that flag is on a reconciler's path and
+  INV-ATTENTION-REASON rewrites any reason `true_blockers` cannot re-derive (kn-089de524).
+  Neither `SHA_MOVED_BLOCKER` nor `REBIND_EXHAUSTED_BLOCKER` fits — both describe a merge
+  nobody judged, and here the rework WAS judged and refused.
+* `validation_forced` carries `cause` and keeps `rebind` beside it, now written as
+  `cause == REBIND_CAUSE` so the bool can never claim a user rework. `validation_rejected`
+  carries `uncounted_cause`. `timeline.py` renders both — "no round spent — the rework you
+  asked for" — reading `cause` with the old `rebind` bool as the fallback, so a pre-change
+  row still renders correctly. It quotes `"user_rework"` as a literal for the `"patch_id"`
+  precedent: the module imports nothing from `jarvis`.
+* `validation_rejudge_declined` needs NO user-rework rendering: the arm has no bound, so it
+  writes no decline. A decline after a settled user-rework round is an ordinary
+  `REJUDGE_BUDGET_SPENT` one and reads correctly already.
+
+**Tests.** `tests/test_rejudge_moved_head.py` — 12. the live wo-299daf2e shape is judged
+past the cap; 13. one free round per rejection and no more; 14. the two causes never spend
+each other; 15. a worker re-delivery costs no round; 16. a fix after a rejected user-rework
+round is ordinary; 17. a passing user-rework round arms the merge; 18. a rejected one with
+budget left goes back to the worker with the user-rework wording and not the rebind's;
+19. a rejected one with no budget left goes to the user under
+`USER_REWORK_REFUSED_BLOCKER`, and neither `sha_moved` sentence.
+`tests/test_timeline.py` — 20. the forced line; 21. the rejected line; 22. a pre-change
+forced row with `rebind` and no `cause` still reads as a rebind.
+`tests/test_stores.py` — the `uncounted_cause` column and the filtered counter.

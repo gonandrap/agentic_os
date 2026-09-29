@@ -531,7 +531,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
         # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a
         # spent budget otherwise (spec 2026-09-27 §4.3).
-        spent = ", no round spent" if p.get("rebind") else ""
+        #
+        # ...AND SO DOES THE OTHER UNCOUNTED CAUSE, which is NOT a rebind: nobody merged
+        # anything, the user asked for the rework, and the line has to say so. `cause`
+        # is `ops.USER_REWORK_CAUSE` / `ops.REBIND_CAUSE`, quoted as a literal like
+        # "patch_id" below because this module imports nothing from `jarvis`. A row
+        # written before the cause existed carries only `rebind`, and reads as one.
+        cause = str(p.get("cause") or ("rebind" if p.get("rebind") else ""))
+        spent = (", no round spent — the rework you asked for"
+                 if cause == "user_rework"                  # ops.USER_REWORK_CAUSE
+                 else ", no round spent" if cause else "")
         return (f"Validation forced {who} — round {rnd}{spent}" if rnd
                 else f"Validation forced {who}{spent}",
                 f"{p.get('reason') or ''}"
@@ -626,6 +635,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejected":
         # The reason IS the ask the worker has to answer, so unlike the "answered"
         # kinds above it is shown here: nothing else in the timeline carries it.
+        #
+        # A REJECTED USER-REWORK ROUND SAYS NO ROUND WAS SPENT, for the reason the
+        # forced line above does: the row number runs past `max_rounds` and a reader
+        # counting it against the budget concludes it is gone when it is untouched
+        # (Neo question 973). "user_rework" is `ops.USER_REWORK_CAUSE`.
+        if str(p.get("uncounted_cause") or "") == "user_rework":
+            return ("Validation rejected — sent back, no round spent (the rework you "
+                    "asked for)", p.get("reason") or "")
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_bounced":
         # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against

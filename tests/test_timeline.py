@@ -783,3 +783,53 @@ def test_a_rebind_reads_as_a_round_nobody_was_charged_for():
     assert label.startswith("Validation forced by the OS")
     assert "no round spent" in label
     assert "does not count against validation.max_rounds" in detail
+
+
+# -- a rework the USER asked for: the second uncounted cause ---------------------------
+# Neo question 973, live case wo-299daf2e.
+
+
+def test_a_user_rework_round_reads_as_the_rework_the_user_asked_for():
+    """Not a rebind: nobody merged anything, so a line about a conflict resolution
+    would misdescribe the record — and no round was spent either way."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    reason = ops.USER_REWORK_FORCED_REASON.format(n=3, judged="aaaa1111aa",
+                                                  head="bbbb1111bb")
+    label, detail = _describe("validation_forced",
+                              {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": False,
+                               "cause": ops.USER_REWORK_CAUSE, "reason": reason})
+
+    assert label.startswith("Validation forced by the OS")
+    assert "no round spent" in label and "rework you asked for" in label
+    assert "does not count against validation.max_rounds" in detail
+
+
+def test_a_rejected_user_rework_round_says_no_round_was_spent():
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, detail = _describe("validation_rejected",
+                              {"round": 4, "of": 3, "budget_round": 4,
+                               "uncounted": True,
+                               "uncounted_cause": ops.USER_REWORK_CAUSE,
+                               "reason": "the rework misses the case"})
+    plain, _ = _describe("validation_rejected", {"round": 2, "reason": "no"})
+
+    assert "no round spent" in label and "rework you asked for" in label
+    assert detail == "the rework misses the case"
+    assert "no round spent" not in plain
+
+
+def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
+    """No surface may print a wrong sentence for a row written before the cause
+    existed: `rebind: true` and no `cause` is a rebind."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, _ = _describe("validation_forced",
+                         {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": True,
+                          "reason": "x"})
+
+    assert "no round spent" in label and "rework you asked for" not in label

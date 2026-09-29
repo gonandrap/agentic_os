@@ -4828,7 +4828,10 @@ def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, An
     store.add_event(wo_id, "validation_forced",
                     {"round": round_row["round"], "round_id": round_row["id"],
                      "reason": reason, "was": was, "by": REJUDGE_BY_OS,
-                     "rebind": rebind,
+                     # THE CAUSE, and `rebind` beside it for the rows written before it
+                     # existed — a reader that only knows the bool must not read a user
+                     # rework as a conflict resolution (Neo question 973).
+                     "cause": cause, "rebind": cause == REBIND_CAUSE,
                      "head_sha": head, "judged_sha": judged})
     return {"wo_id": wo_id, "declined": False, "round": round_row["round"],
             "round_id": round_row["id"], "head_sha": head, "judged_sha": judged,
