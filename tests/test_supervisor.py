@@ -1099,13 +1099,18 @@ def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
     named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert not (named & forbidden), sorted(named & forbidden)
 
-    imported: list[str] = []
+    # `worker_session` is the machinery that LAUNCHES AND KILLS turns, and none of it
+    # belongs here. Its rate-limit fallback DELAY is the one exception: a number, no
+    # behaviour, and the same import `neo.drain_queue` takes for the same hold (spec
+    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §2).
+    allowed = {"RATE_LIMIT_FALLBACK_DELAY"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported += [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            imported += [a.name for a in node.names] + [node.module or ""]
-    assert not any("worker_session" in name.split(".") for name in imported), imported
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [a.name for a in node.names] + [node.module or ""]
+                 if isinstance(node, ast.ImportFrom) else [])
+        if any("worker_session" in name.split(".") for name in names):
+            assert isinstance(node, ast.ImportFrom), ast.dump(node)
+            assert {a.name for a in node.names} <= allowed, [a.name for a in node.names]
 
 
 def test_the_pin_would_catch_the_move_it_forbids():

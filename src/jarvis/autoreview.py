@@ -130,6 +130,18 @@ HELD_STATUS = "status"
 HELD_SETTLED = "settled"
 HELD_PANEL_GAVE_UP = "panel_gave_up"
 HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
+
+#: The two sentences that code renders, and which one depends on whether anything moved.
+#: Spec §2c of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md: the
+#: first is FALSE on wo-dbea82cf, where the worker pushed three commits and never ran
+#: `jarvis wo finish`. Neither carries a count, a sha or an elapsed time — `ack_attention`
+#: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
+REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
+                             "worker has not delivered again since")
+REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
+                             "worker has pushed commits since without running `jarvis "
+                             "wo finish` — the OS has asked it to declare them")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 #: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
@@ -158,6 +170,32 @@ HELD_OBJECTED = "objected"
 HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
+
+#: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
+#: for-ever.md §5 and §6. `round_open` is `decide_confirm`'s alone — the confirmation
+#: judges the DELIVERED RESULT, so a round the panel has not finished may be about to send
+#: that result back (§5.2, and the ASK pass keeps its licence to arm on a pending round).
+#: `confirm_spent` is `confirming` SPLIT: one code with a conditional suppression would
+#: make `daemon._holds_not_recorded`'s answer depend on state it cannot see. The live one
+#: stays suppressed, the spent one is VISIBLE — it is the user's, and nothing else on the
+#: record says so.
+HELD_ROUND_OPEN = "round_open"
+HELD_CONFIRM_SPENT = "confirm_spent"
+
+#: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1). A
+#: code is here when the drop is a fact that can clear with the user doing nothing AND
+#: says nothing about whether the assumption is theirs to decide. An ALLOWLIST, not
+#: "everything but the three that stay": a blocklist admits a new code the day somebody
+#: writes a new hold, and this set governs whether the OS spends another model call.
+#: `settled` (no reader — the drop site returns earlier) and `evidence_secret` (a
+#: statement that the row is the user's, and a second chance to copy a secret into the
+#: question store) were examined and refused.
+TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
+                             HELD_OBJECTION_IN_FLIGHT})
+
+#: A round's outcome that means the panel has NOT finished with it. `pending` is the
+#: column's default on an open round and `''` is a row that never got one.
+_UNRESOLVED_OUTCOMES = ("", "pending")
 
 #: THE STATUS EACH PASS ACTS IN, and the conditions below read these rather than a literal
 #: of their own (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6).
@@ -775,7 +813,7 @@ def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-           refusal_answered: bool = True,
+           refusal_answered: bool = True, undeclared_delivery: bool = False,
            asked_question_id: int = 0,
            unreachable_question_ids: Collection[int] = (),
            stakes: Stakes | None = None) -> Decision:
@@ -859,8 +897,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:
@@ -886,6 +924,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    refusal_answered: bool = True,
                    objections_outstanding: bool = False,
                    unreachable_question_ids: Collection[int] = (),
+                   confirmation_open: bool = True,
                    stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
 
@@ -902,7 +941,16 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
       `object` approved NOTHING, so there is nothing to confirm and no question is asked
       on one: the user decides it, with the objection in front of them.
     * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
-      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.**
+      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.** It splits
+      in two on `confirmation_open` (2026-09-28 spec §6): a question Neo still holds is
+      `confirming`, the pass working and suppressed; one that is no longer open is
+      `confirm_spent`, the row the user owes a decision on with nothing else saying so.
+    * A VALIDATION ROUND THE PANEL HAS NOT FINISHED — `round_open`, this function's
+      alone. The ask pass may arm on a pending round (`decide`'s docstring) because it
+      judges a sentence the worker wrote; this one interpolates the DIFF, and a round
+      still open means that diff may be about to be sent back (2026-09-28 spec §5.2).
+      A `round_n` of 0 is no round at all and does NOT hold: a project with validation
+      off behaves exactly as it did.
     * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
       Means NOT YET and costs nothing: retried next tick. Without it the two passes race
       on one assumption, one settling it while the other has a message to the worker in
@@ -910,7 +958,15 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
     `unreachable_question_ids` covers `confirm_question_id` as well as condition 6, and it
     means what it means in `decide`: the id is a question nobody will ever answer, so a
-    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4).
+    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4). It is
+    checked BEFORE `confirmation_open`, so a `failed` question is asked again rather than
+    reported as spent — an outage is not a decision.
+
+    `confirmation_open` is the caller's fact, derived the way `unreachable_question_ids`
+    is (`Daemon._question_liveness`) because this function is pure: open means the
+    question's status is one of `neo_store.NEO_HELD_Q_STATUSES`. `escalated` and
+    `answered` are NOT open — Neo is finished with it either way. The default is True, so
+    every existing caller keeps today's behaviour.
 
     **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
     own docstring documents for condition 6. `neo_question_id` points at the EARLY
@@ -932,9 +988,23 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      **fields)
     confirming = int(assumption.get("confirm_question_id") or 0)
     if confirming and confirming not in unreachable_question_ids:
+        if not confirmation_open:
+            # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's
+            # link is driven by `os_ruling.neo_question_id` and a hold payload has none.
+            return _held(HELD_CONFIRM_SPENT,
+                         f"assumption #{n} is yours — the OS asked Neo to confirm its "
+                         f"early reading (question {confirming}) and that question is no "
+                         f"longer open", **fields)
         return _held(HELD_CONFIRMING,
                      f"assumption #{n} is already with Neo to confirm "
                      f"(question {confirming})", **fields)
+    if round_n > 0 and str(round_outcome or "").lower() in _UNRESOLVED_OUTCOMES:
+        # 2026-09-28 spec §5.1. The round rides on the decision: it is part of the
+        # dedupe key, so the NEXT round's hold is written too.
+        return _held(HELD_ROUND_OPEN,
+                     f"the validation panel has not finished round {round_n} — the "
+                     f"result this confirms against may be about to be sent back",
+                     round=round_n, **fields)
     if objections_outstanding:
         return _held(HELD_OBJECTION_IN_FLIGHT,
                      "an objection on this work order has not reached the worker or "
@@ -955,7 +1025,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-                 refusal_answered: bool = True,
+                 refusal_answered: bool = True, undeclared_delivery: bool = False,
                  asked_question_id: int | None = None,
                  unreachable_question_ids: Collection[int] = (),
                  stakes: Stakes | None = None) -> Decision:
@@ -1022,8 +1092,8 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               "for you", fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:

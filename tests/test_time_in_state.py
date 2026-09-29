@@ -11,6 +11,7 @@ Spec: docs/superpowers/specs/2026-09-27-time-in-each-state.md.
 from __future__ import annotations
 
 import json as _json
+import os
 
 import pytest
 
@@ -333,3 +334,350 @@ def test_fo_show_carries_the_key_and_labels_a_coarse_span(
     out = _out(capsys, ["fo", "show", fo["id"]])
     assert "time in state" in out
     assert "a feature order keeps no event trail" in out
+
+
+# 10 ------------------------------------------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, fix 4 — the
+# sixth activity source. A lead whose own transcript is quiet while its subagent's grows
+# is the incident; `stat()` mtime, and an absent transcript contributes NOTHING.
+
+SECOND = 1.0
+
+
+def _transcript(config_dir, cwd, session_id: str, *, subagent: str = "",
+                mtime: float = 0.0):
+    munged = "".join(c if c.isalnum() else "-" for c in str(cwd))
+    base = config_dir / "projects" / munged
+    path = base / f"{session_id}.jsonl" if not subagent else (
+        base / session_id / "subagents" / subagent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"type": "assistant"}\n')
+    import os as _os
+    _os.utime(path, (mtime, mtime))
+    return path
+
+
+def _quiet_wo(store, *, session_id: str = "sess-1"):
+    """An order whose every table went quiet 45 minutes ago."""
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "running")
+    backdate(store, wo["id"], NOW - 20 * HOUR, NOW - 14 * HOUR)
+    turn_at(store, wo["id"], NOW - 14 * HOUR, NOW - 45 * MINUTE)
+    event_at(store, wo["id"], "turn_ended", NOW - 45 * MINUTE)
+    store.update_work_order(wo["id"], session_id=session_id)
+    return wo
+
+
+def test_a_live_subagent_transcript_counts_as_activity(store, tmp_path, monkeypatch):
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = _quiet_wo(store)
+    _transcript(config, store.project_path, "sess-1", mtime=NOW - 14 * HOUR)
+    _transcript(config, store.project_path, "sess-1", subagent="a.jsonl",
+                mtime=NOW - 30 * SECOND)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 30 * SECOND
+    assert payload["last_activity_kind"] == "transcript"
+
+
+def test_a_transcript_in_the_worktree_counts(store, tmp_path, monkeypatch):
+    """The cwd is the worktree when the order has one — `worktree_path`'s computation."""
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = _quiet_wo(store, session_id="sess-2")
+    store.update_work_order(wo["id"], worktree="wo-42639749")
+    worktree = store.project_path / ".claude" / "worktrees" / "wo-42639749"
+    _transcript(config, worktree, "sess-2", mtime=NOW - 2 * MINUTE)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 2 * MINUTE
+    assert payload["last_activity_kind"] == "transcript"
+
+
+def test_a_missing_transcript_contributes_nothing(store, tmp_path, monkeypatch):
+    """Absent, not 1970: no tuple at all, so the note stands and the timestamp is None."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-missing")
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert payload["last_activity_kind"] == ""
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+def test_an_unreadable_subagent_directory_is_absent_not_zero(
+        store, tmp_path, monkeypatch):
+    """The glob yields nothing: no tuple, so the note stands. Not the raising path."""
+    import os as _os
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-3")
+    path = _transcript(config, store.project_path, "sess-3", subagent="a.jsonl",
+                       mtime=NOW - 30 * SECOND)
+    _os.chmod(path.parent, 0o000)
+    try:
+        payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    finally:
+        _os.chmod(path.parent, 0o755)
+
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root reads through a 0o000 directory, so nothing raises")
+def test_an_unreadable_transcript_parent_is_absent_not_zero(
+        store, tmp_path, monkeypatch):
+    """The RAISING path: `stat()` on a file under a 0o000 parent is a PermissionError.
+
+    Swallowed, contributing no tuple — `Path.exists()` would have turned it into a
+    silent False, which is why the read stats directly.
+    """
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    wo = store.create_work_order("t")
+    backdate(store, wo["id"], NOW - MINUTE)
+    store.update_work_order(wo["id"], session_id="sess-4")
+    path = _transcript(config, store.project_path, "sess-4", mtime=NOW - 30 * SECOND)
+    os.chmod(path.parent, 0o000)
+    try:
+        with pytest.raises(PermissionError):    # the read is genuinely denied here
+            path.stat()
+        payload = ops.state_durations(store, wo_id=wo["id"], now=NOW).as_dict(NOW)
+    finally:
+        os.chmod(path.parent, 0o755)
+
+    assert payload["last_activity_ts"] is None
+    assert payload["last_activity_age"] is None
+    assert ops.NO_ACTIVITY_NOTE in payload["notes"]
+
+
+def test_a_feature_inherits_a_childs_transcript(store, tmp_path, monkeypatch):
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    fo = store.create_feature_order("f")
+    child = store.create_work_order("c", parent_id=fo["id"])
+    store.set_feature_status(fo["id"], "executing")
+    store.update_work_order(child["id"], session_id="sess-child")
+    _transcript(config, store.project_path, "sess-child", subagent="a.jsonl",
+                mtime=NOW - 3 * MINUTE)
+
+    payload = ops.state_durations(store, fo_id=fo["id"], now=NOW).as_dict(NOW)
+    assert payload["last_activity_age"] == 3 * MINUTE
+    assert payload["last_activity_kind"] == "transcript"
+# 11 -- no status write without a span, and a reader that refuses to disagree ----------
+# Spec: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md §2d2
+
+
+def test_the_atomic_claim_records_its_span(store):
+    """`claim_next_pending` is one conditional UPDATE and stays one — the span is written
+    beside it on a claim that won."""
+    wo = store.create_work_order("t")
+
+    claimed = store.claim_next_pending()
+
+    assert claimed["id"] == wo["id"] and claimed["status"] == "dispatching"
+    spans = store.state_spans(wo["id"])
+    assert [s["to_status"] for s in spans] == ["pending", "dispatching"]
+    assert spans[-1]["from_status"] == "pending"
+    assert spans[-1]["trigger"] == "claim"
+
+
+def test_a_claim_that_found_nothing_writes_no_span(store):
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "running")
+
+    assert store.claim_next_pending() is None
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == ["pending", "running"]
+
+
+def test_a_dispatch_retry_records_the_way_back_to_pending(store):
+    """The three raw-SQL bypasses left neither a span nor a `status` event, so an order
+    that went round the retry loop read as still `dispatching` for ever."""
+    wo = store.create_work_order("t")
+    store.claim_next_pending()
+
+    assert store.release_dispatch_claim(wo["id"], "claude is not on PATH") == "pending"
+
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == [
+        "pending", "dispatching", "pending"]
+    assert store.get_work_order(wo["id"])["dispatch_attempts"] == 1
+    assert store.get_work_order(wo["id"])["retry_after"]
+
+
+def test_a_dispatch_that_spent_its_launches_records_the_failed_span(store):
+    wo = store.create_work_order("t")
+    store.claim_next_pending()
+
+    assert store.release_dispatch_claim(wo["id"], "boom", max_attempts=1) == "failed"
+
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == [
+        "pending", "dispatching", "failed"]
+    fresh = store.get_work_order(wo["id"])
+    assert fresh["status"] == "failed" and fresh["retry_after"] is None
+
+
+def test_the_backfill_fills_a_gap_instead_of_skipping_the_order(tmp_path):
+    """wo-3615faf7's durable half: `_backfill_wo_spans` was all-or-nothing per order, so
+    an order with a partial history could never be repaired by anything."""
+    path = tmp_path / "gapped"
+    store = ProjectStore(path)
+    try:
+        wo = store.create_work_order("t")
+        store.set_status(wo["id"], "running")
+        store.set_status(wo["id"], "needs_review")
+        # The pre-upgrade daemon's shape: the `status` event with no span beside it.
+        store.conn.execute(
+            "DELETE FROM wo_state_spans WHERE order_id=? AND to_status='needs_review'",
+            (wo["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    reopened = ProjectStore(path)
+    try:
+        assert [s["to_status"] for s in reopened.state_spans(wo["id"])] == [
+            "pending", "running", "needs_review"]
+        assert ops.state_durations(reopened, wo_id=wo["id"],
+                                   now=NOW).current_status == "needs_review"
+    finally:
+        reopened.close()
+
+
+def test_a_store_whose_spans_are_current_pays_two_scalar_reads(tmp_path):
+    """The gap-fill runs in `__init__`, so on every CLI invocation and every reconcile of
+    every project. Without the high-water guard the per-order GROUP BY ran EVERY time —
+    260ms on a 500-order project — because `set_status` stamped its event after its own
+    span. The two rows share a moment now, and this is the assertion that keeps it."""
+    path = tmp_path / "current"
+    store = ProjectStore(path)
+    try:
+        for i in range(3):
+            wo = store.create_work_order(f"t{i}")
+            store.set_status(wo["id"], "running")
+            store.set_status(wo["id"], "needs_review")
+    finally:
+        store.close()
+
+    reopened = ProjectStore(path)
+    sql: list[str] = []
+    reopened.conn.set_trace_callback(sql.append)
+    try:
+        reopened._backfill_wo_spans()
+    finally:
+        reopened.conn.set_trace_callback(None)
+        reopened.close()
+
+    assert not [s for s in sql if "GROUP BY" in s.upper()]
+    assert len(sql) == 4      # two counts, two MAXes, and nothing per order
+
+
+def test_the_reader_reports_the_column_when_the_spans_disagree(store):
+    """The belt. A reader that silently believed the gap is why nobody noticed for 20.7h
+    — and the note carries no elapsed time, because it becomes an attention reason."""
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "waiting_input")
+    store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
+                       (wo["id"],))
+    store.conn.commit()
+
+    reading = ops.state_durations(store, wo_id=wo["id"], now=NOW)
+    payload = reading.as_dict(NOW)
+
+    assert reading.current_status == "needs_review"
+    assert reading.current_status_since is None
+    assert ops.SPANS_BEHIND_NOTE in reading.notes
+    assert payload["current_status_age"] is None
+    assert payload["current_status_age_human"] is None
+
+
+def test_an_agreeing_open_span_is_still_the_current_status(store):
+    """The other half: the belt only fires on a disagreement, and the ordinary reading
+    is unchanged."""
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "running")
+    backdate(store, wo["id"], T0, T0 + HOUR)
+
+    reading = ops.state_durations(store, wo_id=wo["id"], now=NOW)
+
+    assert reading.current_status == "running"
+    assert reading.current_status_since == T0 + HOUR
+    assert ops.SPANS_BEHIND_NOTE not in reading.notes
+
+
+def test_the_invariant_repairs_a_tail_that_disagrees_with_the_column(store):
+    """The fix at the writer cannot heal a row a bypass already broke, and the backfill
+    structurally cannot either: a status written round `set_status` leaves no `status`
+    event to replay. So the disagreement itself is the repair trigger — an `approximate`
+    span at the order's `updated_at`, the only time the record holds for it."""
+    from jarvis import invariants
+    from jarvis.invariants import check_project
+
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "waiting_input")
+    backdate(store, wo["id"], T0, T0 + MINUTE)
+    store.conn.execute(
+        "UPDATE work_orders SET status='needs_review', updated_at=? WHERE id=?",
+        (T0 + HOUR, wo["id"]))
+    store.conn.commit()
+
+    # Called directly for the stamp — a reconcile runs every other check too, and one of
+    # them touching `updated_at` would make the assertion below about that check instead.
+    found = list(invariants.check_spans_reach_the_status(store))
+    assert invariants.check_spans_reach_the_status in invariants.INVARIANTS
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    tail = store.state_spans(wo["id"])[-1]
+    assert tail["to_status"] == "needs_review"
+    assert tail["from_status"] == "waiting_input"
+    assert tail["approximate"] == 1
+    assert tail["ts"] == T0 + HOUR
+    reading = ops.state_durations(store, wo_id=wo["id"], now=NOW)
+    assert reading.current_status == "needs_review"
+    assert ops.SPANS_BEHIND_NOTE not in reading.notes
+    # Repaired once: the tail agrees now, so the next tick has nothing to say.
+    assert [v for v in check_project(store) if v.invariant == "INV-SPAN-BEHIND"] == []
+
+
+def test_a_doctor_run_without_repair_proposes_the_span_and_writes_none(store):
+    """`jarvis doctor` with no `--repair` writes nothing at all — and still says it."""
+    from jarvis.invariants import check_project
+
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "waiting_input")
+    store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
+                       (wo["id"],))
+    store.conn.commit()
+
+    found = [v for v in check_project(store, repair=False)
+             if v.invariant == "INV-SPAN-BEHIND"]
+
+    assert [v.wo_id for v in found] == [wo["id"]]
+    assert not found[0].repaired
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == ["pending",
+                                                                    "waiting_input"]
+
+
+def test_set_status_refuses_to_leave_a_transition_half_written(store, monkeypatch):
+    """`_record_span` is the enforced chokepoint, not merely the current habit: an edit
+    that writes the column and skips the span fails at the writer rather than three
+    surfaces downstream. Both directions — the ordinary transition writes both rows, and
+    a `_record_span` that records nothing is caught."""
+    wo = store.create_work_order("t")
+
+    store.set_status(wo["id"], "running")
+
+    assert [s["to_status"] for s in store.state_spans(wo["id"])] == ["pending", "running"]
+    assert len(store.events_of_kind(wo["id"], "status")) == 1
+
+    monkeypatch.setattr(ProjectStore, "_record_span", lambda *a, **k: None)
+    with pytest.raises(AssertionError):
+        store.set_status(wo["id"], "needs_review")

@@ -37,6 +37,7 @@ import ast
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -392,7 +393,7 @@ def test_a_pull_request_with_no_session_is_healed_too(started, project, fake_gh)
 
 
 def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
-        started, project, fake_gh):
+        started, project, fake_gh, local_base):
     """END TO END, AND THIS IS THE ACCEPTANCE THAT MATTERS. A test stopping at "CI went
     green" passes on an implementation that leaves the pull request held `sha_moved`,
     which is what happened by hand on production: PR #280 judged 709582ae53, head moved
@@ -744,7 +745,7 @@ def refusals(store, wo) -> list[str]:
 
 
 def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
-        started, project, fake_gh, local_proof):
+        started, project, fake_gh, local_proof, local_base):
     """THE WHOLE FEATURE. `main` was merged in twice — by a worker clearing a conflict, by
     the user pressing "Update branch", it does not matter — so the head is two commits
     past the one round 1 read. Today that costs a round, and on the last one it strands
@@ -894,6 +895,57 @@ def test_the_walk_is_bounded_and_spends_no_more_api_calls_than_the_limit(
     assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
     assert refusals(store, wo) == ["chain"]
     assert len(api_reads(fake_gh)) == ci.CHAIN_LIMIT
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2
+
+
+def _resolved(local_proof, fake_gh, head=None):
+    """A merge of the base whose CONFLICT RESOLUTION changed the branch's own diff —
+    proof (a) holds, proof (b) does not. wo-8736a5c5 / PR #794."""
+    head = head or CAUGHT_UP
+    local_proof["ids"][head] = "a-resolution-nobody-judged"
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=head)
+    fake_gh.set_parents(head, [JUDGED, BASE1])
+
+
+def test_a_changed_diff_walks_the_chain_only_when_a_rebind_could_open(
+        started, project, fake_gh, local_proof):
+    """THE READ BUDGET. A parked pull request is polled every couple of minutes and the
+    walk is up to `ci.CHAIN_LIMIT` `gh api` calls; paying that on every tick of every
+    pull request whose diff genuinely changed buys nothing when no rebind could open."""
+    opt_in(started)
+    store, wo = parked(project)
+    _resolved(local_proof, fake_gh)
+    store.create_turn(wo["id"], "message", "resolve the conflict")
+
+    poll(started, store)
+    poll(started, store)
+    poll(started, store)
+
+    assert api_reads(fake_gh) == []
+    assert refusals(store, wo) == ["patch_id"]          # the (head, proof) dedupe
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
+
+
+def test_a_changed_diff_on_a_proved_chain_reports_a_rebind(started, project, fake_gh,
+                                                           local_proof):
+    """The carry is still REFUSED — that resolution is content no seat has read — and
+    the caller is told a rebind may be opened on it."""
+    opt_in(started)
+    store, wo = parked(project)
+    _resolved(local_proof, fake_gh)
+
+    out = started._carry_catch_up(
+        started.catalog.project("proj_a"), store, store.get_work_order(wo["id"]),
+        SimpleNamespace(base_ref="main"),
+        automerge._held(automerge.HELD_SHA_MOVED, "the head moved", judged_sha=JUDGED,
+                        head_sha=CAUGHT_UP, round_n=1))
+
+    assert out.carried is False and out.rebind is True
+    assert refusals(store, wo) == ["patch_id"]
+    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
 
 
 def test_a_fetch_that_fails_refuses_the_carry_and_merges_nothing(started, project,

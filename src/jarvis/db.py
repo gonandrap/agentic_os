@@ -75,11 +75,23 @@ def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
 MIN_SEARCH_WORD = 3
 
 
+#: At most this many distinct words reach SQL. Every word is one LIKE per column per row,
+#: unindexed, so a pasted work-order description (hundreds of words) made one search take
+#: over a minute and tied up a dashboard thread for all of it. The first words of a paste
+#: are its title, which is what the reader is looking for.
+MAX_SEARCH_WORDS = 12
+
+
+def cap_words(words: Sequence[str]) -> list[str]:
+    """Distinct words, first occurrence kept, at most `MAX_SEARCH_WORDS`."""
+    return list(dict.fromkeys(words))[:MAX_SEARCH_WORDS]
+
+
 def search_words(query: str) -> list[str]:
     """The query as words. Empty means "no query" — a search verb, unlike a listing,
     returns nothing for it rather than everything."""
     words = [w.lower() for w in (query or "").split() if w.strip()]
-    return [w for w in words if len(w) >= MIN_SEARCH_WORD] or words
+    return cap_words([w for w in words if len(w) >= MIN_SEARCH_WORD] or words)
 
 
 def score_sql(words: Sequence[str], weights: Mapping[str, int]) -> tuple[str, list[str]]:

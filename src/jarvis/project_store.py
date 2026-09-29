@@ -12,7 +12,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import db
+from . import db, release
 from .paths import project_db_path
 
 # Work order lifecycle.
@@ -279,7 +279,12 @@ UNGOVERNED_ORIGINS = ("adhoc", "injected")
 # report and decides what happens next, instead of finishing a job and exiting.
 # `analyst` is an improvement order's planner-shaped child: one session that reads
 # records and hands back a diagnosis — §3.1 of the improvement-orders spec.
-WO_KINDS = ("worker", "planner", "manager", "analyst")
+# `investigator` is an INVESTIGATION order's read-only child: one session that diagnoses
+# one stuck subject and submits a verdict, and whose no-write rule is enforced by
+# `hooks.investigator_write_decision` / `hooks.investigator_bash_decision` rather than
+# stated in prose — §2.2 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md.
+WO_KINDS = ("worker", "planner", "manager", "analyst", "investigator")
 
 # A work order with a LIVE SESSION: dispatched, running, or parked mid-conversation on
 # somebody else. The per-feature cap (`claim_next_pending`, spent by
@@ -441,7 +446,15 @@ FO_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
 # What a `feature_orders` row IS. An improvement order reuses the table, the statuses and
 # three of its columns rather than earning a table of its own — §2.1 of
 # docs/superpowers/specs/2026-09-23-improvement-orders.md says what that reuse buys.
-FO_KINDS = ("feature", "improvement")
+# `investigation` reuses the same row for the same reason one level further on — §2.1 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md. It never reaches
+# `plan_review`: submitting the verdict settles it.
+FO_KINDS = ("feature", "improvement", "investigation")
+
+# The id prefix each kind mints, defaulting to `fo`. A MAP rather than the conditional it
+# replaced: a third arm of a two-arm ternary is where a fourth kind goes wrong (§2.1).
+# `inv` and not `in`, so it cannot collide with `io-` under `startswith`.
+FO_ID_PREFIXES = {"improvement": "io", "investigation": "inv"}
 
 # Kind-aware status LABELS. In this leaf module, beside the statuses they rename, because
 # all three renderers already import it and "one mapping" is then a property rather than a
@@ -449,6 +462,9 @@ FO_KINDS = ("feature", "improvement")
 # with no override falls through, so feature-order labels are unchanged by construction.
 FO_STATUS_LABELS: dict[str, dict[str, str]] = {
     "improvement": {"planning": "analysing", "plan_review": "findings awaiting you"},
+    # No `plan_review` entry: an investigation never enters that status (§2.1 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md).
+    "investigation": {"planning": "investigating"},
 }
 
 
@@ -460,7 +476,7 @@ def feature_status_label(kind: str | None, status: str) -> str:
 def is_feature_order_id(unit_id: str) -> bool:
     """Does this id name a `feature_orders` row? The one shared predicate — §2.5 of the
     spec above, which exists because three sites had grown their own `fo-` literal."""
-    return unit_id.startswith(("fo-", "io-"))
+    return unit_id.startswith(("fo-", "io-", "inv-"))
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
@@ -510,13 +526,27 @@ ALARM_REVIEW_STATUSES = ("unreviewed", "approved", "corrected")
 # written before the health spec reads back as exactly what it was — a cost alarm about
 # a work order — without a backfill.
 ALARM_SUBJECTS = ("work_order", "feature_order")
-ALARM_SOURCES = ("cost", "health")
+#: `invariant` is `invariants.check_undeclared_delivery`'s — a finding raised by a
+#: post-condition rather than by a model, spec §2c of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+ALARM_SOURCES = ("cost", "health", "invariant")
 
 # How one health sweep ended (`health_reviews.outcome`, §4). `clear` and `failed` are
 # not the same answer and the difference is the whole fail-safe: `clear` is the model
 # saying it found nothing, `failed` is nobody having judged at all — which is why a
 # `failed` sweep does not record its fingerprint as reviewed and the next tick retries.
-HEALTH_OUTCOMES = ("clear", "findings", "failed")
+#
+# `held` is the fourth and is NEITHER A JUDGEMENT NOR A DEFECT: the account refused the
+# call, so nothing was judged and nothing is broken. Recording it as `failed` made the
+# sweep re-buy the refusal every interval for the whole window and then alarm about it —
+# spec docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md.
+HEALTH_OUTCOMES = ("clear", "findings", "failed", "held")
+
+#: What a `health_reviews` row can be ABOUT. The two unit kinds, plus the ACCOUNT — a
+#: usage window is not a property of any unit, and recording it against an arbitrary one
+#: would make a fleet fact read as a work order's problem. Deliberately not a widening of
+#: ALARM_SUBJECTS: no alarm is ever about an account.
+HEALTH_SUBJECTS = ALARM_SUBJECTS + ("account",)
 
 # How long an alarm held back by a transport failure waits before it may be claimed
 # again, indexed by attempts already spent. `neo_store.RETRY_BACKOFF_SECONDS`' reasoning:
@@ -696,16 +726,22 @@ CREATE TABLE IF NOT EXISTS wo_alarms (
 -- re-raised for a (subject, probe) pair already reported at the same fingerprint. That
 -- is why `detail` carries the probe ids a sweep REPORTED (comma-separated) when
 -- `outcome='findings'`, and the failure's reason when `outcome='failed'`.
+--
+-- `reopens_at` is when a `held` row's usage window lifts, and 0 on every other outcome:
+-- a hold is the only row that states a future moment. Documented here rather than beside
+-- the column because SQLite re-parses this text on `ALTER TABLE ... DROP COLUMN` and a
+-- stranded comment makes that fail.
 CREATE TABLE IF NOT EXISTS health_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
-    subject_kind TEXT NOT NULL,         -- ALARM_SUBJECTS
+    subject_kind TEXT NOT NULL,         -- HEALTH_SUBJECTS
     subject_id TEXT NOT NULL,
     fingerprint TEXT NOT NULL,          -- health.fingerprint
     trigger TEXT NOT NULL,              -- health.TRIGGERS
     outcome TEXT NOT NULL,              -- HEALTH_OUTCOMES
     findings INTEGER NOT NULL DEFAULT 0,
-    detail TEXT NOT NULL DEFAULT ''
+    detail TEXT NOT NULL DEFAULT '',
+    reopens_at REAL NOT NULL DEFAULT 0
 );
 -- EVERY STATUS MOVE OF EVERY ORDER IN THIS PROJECT, work orders and feature orders in one
 -- table. One table and not two because the two loops record identical facts and a reader
@@ -843,6 +879,15 @@ CREATE TABLE IF NOT EXISTS validation_rounds (
     -- ordinary round, opened by a submission. Also in ADDED_COLUMNS, where the
     -- reasoning is.
     forced_reason TEXT NOT NULL DEFAULT '',
+    -- Whether this round is EXEMPT from `validation.max_rounds` — a rebind, the round
+    -- the OS opens on a merge it asked for itself. Also in ADDED_COLUMNS, where the
+    -- reasoning is (spec
+    -- docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.1).
+    uncounted INTEGER NOT NULL DEFAULT 0,
+    -- WHICH of the two causes exempted it — `ops.REBIND_CAUSE` or
+    -- `ops.USER_REWORK_CAUSE`. '' on an ordinary round. Also in ADDED_COLUMNS, where
+    -- the reasoning is.
+    uncounted_cause TEXT NOT NULL DEFAULT '',
     -- WHY this round is `failed` when nothing failed: a `VALIDATION_HOLDING_CAUSES`
     -- token, NULL on every other close. Also in ADDED_COLUMNS, where the reasoning is.
     hold_cause TEXT,
@@ -1135,6 +1180,17 @@ ADDED_COLUMNS = {
         # order is there because the pull request was shut without merging, rather than
         # because a worker went idle. Absent means "never polled".
         "pr_state": "TEXT",
+        # The commit `pr_url`'s head was at the last time the poll read it, and when it
+        # was read. A CACHE of a fact the poll already had and threw away — so nothing
+        # here is a claim about now, and every reader must treat "" as "not recorded"
+        # rather than as a sha that could match one (github.py:540-543). Spec §2b of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        #
+        # Columns rather than a per-tick timeline event on purpose: an event every two
+        # minutes per open pull request would grow the timeline without bound and would
+        # be read as history rather than as the cache this is.
+        "pr_head_oid": "TEXT",
+        "pr_head_seen_at": "REAL",
         # Work orders that must finish before this one may be claimed (JSON list of
         # work-order ids). Deliberately NOT a `blocked` status: this codebase's statuses
         # are load-bearing — OPEN_STATUSES, TERMINAL_STATUSES, true_blockers and the
@@ -1279,6 +1335,28 @@ ADDED_COLUMNS = {
         # written by a submission and of every round written before this column existed.
         # NOT NULL so there is one spelling of "nobody forced this" rather than two.
         "forced_reason": "TEXT NOT NULL DEFAULT ''",
+        # WHETHER THIS ROUND COUNTS AGAINST `validation.max_rounds`. 1 is a REBIND: the
+        # round the OS opens on a merge it demanded itself, whose conflict resolution
+        # changed content no seat has read. `max_rounds` bounds ONE thing — the worker's
+        # rework loop against the panel's rejections — and a judgement the OS caused is
+        # not that, so charging it there strands a parked order on the user (spec
+        # docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md).
+        #
+        # DEFAULT 0 MEANS "AN ORDINARY ROUND", the honest reading of every row written
+        # before this column existed, so no backfill. NOT NULL so there is one spelling
+        # of "counts" rather than two.
+        "uncounted": "INTEGER NOT NULL DEFAULT 0",
+        # WHICH CAUSE exempted this round. Two of them now: `ops.REBIND_CAUSE`, the
+        # OS's own merge re-judgement, bounded by `ops.REBIND_MAX`; and
+        # `ops.USER_REWORK_CAUSE`, one free round per USER rejection, bounded by the
+        # rejections themselves (Neo question 973). SEPARATE BOUNDS, so the counter has
+        # to be able to tell them apart — a merge re-judge that spent the round a
+        # user's rework needs is the defect on wo-299daf2e.
+        #
+        # '' MEANS "AN ORDINARY ROUND", which every row written before this column is:
+        # they all carry `uncounted=0`, so the default is inert and there is nothing to
+        # backfill.
+        "uncounted_cause": "TEXT NOT NULL DEFAULT ''",
         # WHY A `failed` ROUND IS NOT A FAILURE — `VALIDATION_CI_CAUSE` while GitHub is
         # still running the checks, `VALIDATION_HELD_CAUSE` while the account's usage
         # window is spent. The cause was already on the `validation_failed` event, which
@@ -1348,6 +1426,15 @@ ADDED_COLUMNS = {
         # `pending`). The one reader is `gate_open_at`; §4 of
         # docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
         "pending_at": "REAL",
+        # THE BASE THIS REQUEST WAS FILED AGAINST — spec 2026-09-28 §3.5. A column and
+        # not only the `automerge_proposed` payload: the sweep asks "has this pending
+        # request's base moved" of every pending `auto_merge` row on every tick and
+        # already holds the row, so a payload field would make it a timeline scan per
+        # gate per tick.
+        #
+        # `''` MEANS "THIS REQUEST RECORDS NO BASE" — every approval written before this
+        # and every gate kind that has no base. `validation_rounds.head_sha`'s discipline.
+        "base_oid": "TEXT NOT NULL DEFAULT ''",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -1359,6 +1446,13 @@ ADDED_COLUMNS = {
     # The pairing the schema cannot express — `subject_kind == 'feature_order'` iff
     # `fo_id` — is enforced in `add_finding`, because a constraint neither the database
     # nor Python enforces is one that fails as a wrong page three weeks later.
+    # The moment a usage-limit hold expires. This table already ships, so a live database
+    # gets the column only here — spec
+    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §1. `0` on
+    # every row written before it, which is what "no hold" already says.
+    "health_reviews": {
+        "reopens_at": "REAL NOT NULL DEFAULT 0",
+    },
     "wo_alarms": {
         "subject_kind": "TEXT NOT NULL DEFAULT 'work_order'",   # ALARM_SUBJECTS
         "fo_id": "TEXT",                                        # set iff feature_order
@@ -1553,12 +1647,44 @@ class ProjectStore:
         CLI invocation and every reconcile of every project: the count comparison is a
         fast path off the hot road and the covered-id SET rebuilt from the table is the
         real guard.
+
+        GAPS, NOT WHOLE ORDERS. An order already in `have` used to be skipped for ever,
+        so a partial history — a `status` event written by a daemon running the build
+        before spans existed — could never be repaired by anything. Spec §2d2 of
+        docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
         """
         total = self.conn.execute("SELECT COUNT(*) c FROM work_orders").fetchone()["c"]
         covered = self.conn.execute(
             "SELECT COUNT(DISTINCT order_id) c FROM wo_state_spans WHERE order_kind='wo'"
         ).fetchone()["c"]
-        if covered >= total:
+        # THE HIGH-WATER GUARD, and it is what keeps this off the hot road. Two scalar
+        # MAXes against `idx_events_kind` and `idx_state_spans_order`; the per-order
+        # GROUP BY below costs ~260ms on 500 orders and ran on EVERY construction —
+        # every CLI invocation and every reconcile of every project — because `set_status`
+        # stamped its event microseconds after its own span. They share a moment now, so
+        # a store whose spans reach the newest status write answers here and stops.
+        newest_event = self.conn.execute(
+            "SELECT MAX(ts) t FROM wo_events WHERE kind='status'").fetchone()["t"]
+        newest_span = self.conn.execute(
+            "SELECT MAX(ts) t FROM wo_state_spans WHERE order_kind='wo'").fetchone()["t"]
+        if covered >= total and (newest_event is None
+                                 or (newest_span is not None
+                                     and float(newest_span) >= float(newest_event))):
+            return
+        # One indexed pass (`idx_events_kind`, `idx_state_spans_order`) naming every
+        # order whose newest `status` event is newer than its newest span.
+        gaps = {r["wo_id"]: (float(r["last_span"]), str(r["tail"] or ""))
+                for r in self.conn.execute(
+                    """SELECT e.wo_id AS wo_id, MAX(e.ts) AS last_event,
+                              (SELECT s.to_status FROM wo_state_spans s
+                               WHERE s.order_id=e.wo_id AND s.order_kind='wo'
+                               ORDER BY s.ts DESC, s.id DESC LIMIT 1) AS tail,
+                              COALESCE((SELECT MAX(s.ts) FROM wo_state_spans s
+                                        WHERE s.order_id=e.wo_id AND s.order_kind='wo'),
+                                       0) AS last_span
+                       FROM wo_events e WHERE e.kind='status'
+                       GROUP BY e.wo_id HAVING last_event > last_span""")}
+        if covered >= total and not gaps:
             return
         have = {r["order_id"] for r in self.conn.execute(
             "SELECT DISTINCT order_id FROM wo_state_spans WHERE order_kind='wo'")}
@@ -1566,12 +1692,17 @@ class ProjectStore:
             "SELECT id, created_at FROM work_orders").fetchall()
         for wo in rows:
             if wo["id"] in have:
-                continue
-            self._record_span(wo["id"], "wo", "", "pending", ts=wo["created_at"])
-            previous = "pending"
+                if wo["id"] not in gaps:
+                    continue
+                since, previous = gaps[wo["id"]]
+            else:
+                self._record_span(wo["id"], "wo", "", "pending", ts=wo["created_at"])
+                since, previous = None, "pending"
             for event in self.conn.execute(
                     "SELECT ts, payload FROM wo_events WHERE wo_id=? AND kind='status' "
                     "ORDER BY ts, id", (wo["id"],)).fetchall():
+                if since is not None and float(event["ts"]) <= float(since):
+                    continue
                 status = str((db.from_json(event["payload"], {}) or {}).get("status") or "")
                 # The duplicate the store now prevents at the source: a zero-length span
                 # in the history would inflate the entry count.
@@ -2148,18 +2279,17 @@ class ProjectStore:
         if row is None:
             return "failed"
         attempts = int(row["dispatch_attempts"] or 0) + 1
+        # Through `set_status` rather than raw SQL: no status write without a span. Spec
+        # §2d2 of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
         if attempts >= max_attempts:
-            self.conn.execute(
-                "UPDATE work_orders SET status='failed', dispatch_attempts=?, "
-                "retry_after=NULL, updated_at=? WHERE id=?",
-                (attempts, db.now(), wo_id))
+            self.set_status(wo_id, "failed", trigger="dispatch_attempts_spent",
+                            dispatch_attempts=attempts, retry_after=None)
             return "failed"
         delay = DISPATCH_RETRY_BACKOFF_SECONDS[
             min(attempts - 1, len(DISPATCH_RETRY_BACKOFF_SECONDS) - 1)]
-        self.conn.execute(
-            "UPDATE work_orders SET status='pending', dispatch_attempts=?, "
-            "retry_after=?, updated_at=? WHERE id=?",
-            (attempts, db.now() + delay, db.now(), wo_id))
+        self.set_status(wo_id, "pending", trigger="dispatch_retry",
+                        dispatch_attempts=attempts, retry_after=db.now() + delay)
         return "pending"
 
     def hold_dispatch(self, wo_id: str, until: float | None) -> None:
@@ -2296,6 +2426,11 @@ class ProjectStore:
                *only_ids),
         )
         row = cur.fetchone()
+        if row is not None and cur.rowcount == 1:
+            # The claim stays ONE statement; the span is written beside it in the same
+            # transaction. Spec §2d2 of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+            self._record_span(row["id"], "wo", "pending", "dispatching", trigger="claim")
         return dict(row) if row else None
 
     def count_active(self) -> int:
@@ -2361,8 +2496,18 @@ class ProjectStore:
         self.update_work_order(wo_id, status=status, **extra)
         if was == status:
             return
-        self._record_span(wo_id, "wo", was, status, trigger)
-        self.add_event(wo_id, "status", {"status": status})
+        # ONE MOMENT for both rows: the span and the event are one transition, and
+        # `_backfill_wo_spans`' guard compares their timestamps.
+        at = db.now()
+        self._record_span(wo_id, "wo", was, status, trigger, ts=at)
+        self.add_event(wo_id, "status", {"status": status}, ts=at)
+        # THE CHOKEPOINT, ENFORCED. Spec §2d2 of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        tail = self.conn.execute(
+            "SELECT to_status FROM wo_state_spans WHERE order_id=? AND order_kind='wo' "
+            "ORDER BY ts DESC, id DESC LIMIT 1", (wo_id,)).fetchone()
+        assert tail is not None and tail["to_status"] == status, (
+            f"{wo_id} moved to {status!r} without a span beside it")
 
     def _status_of(self, table: str, order_id: str) -> str:
         """The status an order is in right now, '' when the row is not there."""
@@ -2670,9 +2815,10 @@ class ProjectStore:
         assert origin in WO_ORIGINS, origin
         assert kind in FO_KINDS, kind
         assert max_parallel is None or max_parallel >= 1, max_parallel
-        # An improvement order carries its own prefix so that every id in the OS still
-        # says what it names on sight — §2.1 of the improvement-orders spec.
-        fo_id = fo_id or db.new_id("io" if kind == "improvement" else "fo")
+        # Every kind carries its own prefix so that every id in the OS still says what it
+        # names on sight — §2.1 of the improvement-orders spec, and §2.1 of
+        # docs/superpowers/specs/2026-09-27-investigation-orders.md for the map.
+        fo_id = fo_id or db.new_id(FO_ID_PREFIXES.get(kind, "fo"))
         ts = db.now()
         self.conn.execute(
             """INSERT INTO feature_orders (id, title, description, status, kind, origin,
@@ -2971,10 +3117,15 @@ class ProjectStore:
 
     # -- events --------------------------------------------------------------
 
-    def add_event(self, wo_id: str, kind: str, payload: dict[str, Any] | None = None) -> None:
+    def add_event(self, wo_id: str, kind: str, payload: dict[str, Any] | None = None,
+                  *, ts: float | None = None) -> None:
+        """One timeline row. `ts` is for a caller writing a row BESIDE another at the
+        same moment — `set_status` writes the span and this event as one transition, and
+        two independent `db.now()` calls made the event microseconds newer than its own
+        span, which `_backfill_wo_spans`' guard then reads as a gap on every order."""
         self.conn.execute(
             "INSERT INTO wo_events (wo_id, ts, kind, payload) VALUES (?,?,?,?)",
-            (wo_id, db.now(), kind, db.to_json(payload or {})),
+            (wo_id, db.now() if ts is None else ts, kind, db.to_json(payload or {})),
         )
 
     def events_of_kind(self, wo_id: str, kind: str) -> list[dict[str, Any]]:
@@ -3326,16 +3477,22 @@ class ProjectStore:
 
     def record_health_review(self, subject_kind: str, subject_id: str, *,
                              fingerprint: str, trigger: str, outcome: str,
-                             findings: int = 0, detail: str = "") -> int:
-        """One sweep, whatever it concluded. Returns the row id."""
-        assert subject_kind in ALARM_SUBJECTS, subject_kind
+                             findings: int = 0, detail: str = "",
+                             reopens_at: float = 0.0) -> int:
+        """One sweep, whatever it concluded. Returns the row id.
+
+        `reopens_at` is the moment a `held` row's usage window lifts, and 0 on every
+        other outcome — the only row that states a future moment.
+        """
+        assert subject_kind in HEALTH_SUBJECTS, subject_kind
         assert outcome in HEALTH_OUTCOMES, outcome
         cur = self.conn.execute(
             """INSERT INTO health_reviews (ts, subject_kind, subject_id, fingerprint,
-                                           trigger, outcome, findings, detail)
-               VALUES (?,?,?,?,?,?,?,?)""",
+                                           trigger, outcome, findings, detail,
+                                           reopens_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
             (db.now(), subject_kind, subject_id, fingerprint, trigger, outcome,
-             int(findings), detail),
+             int(findings), detail, float(reopens_at)),
         )
         return int(cur.lastrowid or 0)
 
@@ -3347,10 +3504,14 @@ class ProjectStore:
         against the live one to decide whether to look again, and a failure recorded a
         fingerprint nobody judged: counted as a look, an unreadable reply would suppress
         the retry §4 requires.
+
+        A `held` sweep is excluded for the same reason: the account refused the call, so
+        nothing was judged, and a hold that looked like a look would suppress the retry.
         """
         row = self.conn.execute(
             """SELECT * FROM health_reviews
-                WHERE subject_kind=? AND subject_id=? AND outcome!='failed'
+                WHERE subject_kind=? AND subject_id=?
+                  AND outcome NOT IN ('failed','held')
              ORDER BY ts DESC, id DESC LIMIT 1""",
             (subject_kind, subject_id),
         ).fetchone()
@@ -3365,10 +3526,14 @@ class ProjectStore:
         this answers "when did we last spend a call", which must not. `health.due` needs
         both and they disagree exactly when the sweep is broken — which is when the
         difference is worth money (issue #216).
+
+        A `held` row is NOT an attempt: the account refused before any call was bought,
+        so flooring the next real look on it would make one refused tick cost a whole
+        interval of watching. A `failed` row still counts — that one DID spend money.
         """
         row = self.conn.execute(
             """SELECT ts FROM health_reviews
-                WHERE subject_kind=? AND subject_id=?
+                WHERE subject_kind=? AND subject_id=? AND outcome!='held'
              ORDER BY ts DESC, id DESC LIMIT 1""",
             (subject_kind, subject_id),
         ).fetchone()
@@ -3381,17 +3546,37 @@ class ProjectStore:
             """SELECT * FROM health_reviews WHERE subject_kind=? AND subject_id=?
              ORDER BY ts, id""", (subject_kind, subject_id)).fetchall())
 
-    def recent_health_reviews(self, limit: int) -> list[dict[str, Any]]:
+    def recent_health_reviews(self, limit: int,
+                              include_held: bool = True) -> list[dict[str, Any]]:
         """The project's last `limit` sweeps, newest first, of every unit and outcome.
 
         Across subjects on purpose: a sweep that cannot produce a judgement is broken
         for the PROJECT, not for one work order, and asking per unit would need a run
         long enough on a single order — which is exactly the unit that then settles and
         takes the evidence with it.
+
+        `include_held=False` drops the usage-limit holds BEFORE the limit is taken, which
+        is what INV-HEALTH-SWEEP-MUTE needs: ten holds must never trip it, and a hold in
+        the middle of a genuine failure run must not reset that run either. The default
+        keeps every row, for `jarvis doctor`-style readers that want the whole ledger.
         """
+        where = "" if include_held else "WHERE outcome!='held' "
         return db.rows_to_dicts(self.conn.execute(
-            "SELECT * FROM health_reviews ORDER BY ts DESC, id DESC LIMIT ?",
+            f"SELECT * FROM health_reviews {where}ORDER BY ts DESC, id DESC LIMIT ?",
             (int(limit),)).fetchall())
+
+    def health_sweep_hold(self) -> tuple[float, str] | None:
+        """The project's newest usage-limit hold if it has not expired — (reopens_at,
+        detail).
+
+        PROJECT-WIDE, not per unit: the account's window is not a property of a work
+        order, and a per-unit read would re-buy the refusal once per candidate.
+        """
+        row = self.conn.execute(
+            """SELECT reopens_at, detail FROM health_reviews
+                WHERE outcome='held' AND reopens_at > ?
+             ORDER BY ts DESC, id DESC LIMIT 1""", (db.now(),)).fetchone()
+        return (float(row["reopens_at"]), str(row["detail"] or "")) if row else None
 
     def probes_reported_at(self, subject_kind: str, subject_id: str,
                            fingerprint: str) -> set[str]:
@@ -3572,6 +3757,24 @@ class ProjectStore:
             float(e["ts"]) > since
             for kind in ("finished", "abandoned", "pr_merged")
             for e in self.events_of_kind(wo_id, kind))
+
+    def release_red_park_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open red-base park on this release order, or None. `work_unlanded_open`'s
+        arithmetic over the other park (2026-09-29 spec §3).
+
+        Returns the PAYLOAD because `invariants.true_blockers` re-derives the attention
+        line from it — the run that broke the base, which is not something a constant can
+        carry. Closed by a re-delivery (`finished`), an abandonment or the release
+        settling, so a worker that delivers again is a new episode and does record.
+        """
+        parked = self.events_of_kind(wo_id, release.RED_PARK_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
 
     def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
         """How many events this work order has, unbounded, minus the kinds named.
@@ -4265,6 +4468,22 @@ class ProjectStore:
         self.conn.execute("UPDATE assumptions SET confirm_question_id=? WHERE id=?",
                           (question_id, assumption_id))
 
+    def clear_assumption_confirmation(self, assumption_id: int) -> None:
+        """Forget a confirmation the OS itself threw the ruling away on, so it re-asks.
+
+        docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
+        assumption-for-ever.md §4.3, and `Daemon._deliver_assumption_verdict` is the only
+        caller: a link written at ask time is read everywhere as a present-tense claim,
+        and the settle site is the one place that knows for certain the question is spent.
+
+        A verb of its own rather than `link_assumption_confirmation(aid, None)`: that
+        parameter is typed `int`, and a nullable overload would let the ASK path clear a
+        link by passing a falsy question id. The early link and the `provisional_*`
+        columns are untouched — only the CONFIRMATION is asked again.
+        """
+        self.conn.execute("UPDATE assumptions SET confirm_question_id=NULL WHERE id=?",
+                          (assumption_id,))
+
     def record_objection(self, assumption_id: int, *, envelope_id: int,
                          transport: str, sent_ts: float | None = None) -> None:
         """Record that an objection was handed to a transport. Called BEFORE the send.
@@ -4369,7 +4588,9 @@ class ProjectStore:
                               pr_url: str | None = None,
                               round: int | None = None,
                               config_version: str | None = None,
-                              forced_reason: str = "") -> dict[str, Any]:
+                              forced_reason: str = "",
+                              uncounted: bool = False,
+                              uncounted_cause: str = "") -> dict[str, Any]:
         """Start a round on one subject, or return the one that already holds its number.
 
         1-based and per subject. Left to itself the number is derived from what is
@@ -4388,6 +4609,10 @@ class ProjectStore:
 
         `forced_reason` is set only by `ops.force_validation`, and its emptiness is what
         every other surface reads as "a submission opened this".
+
+        `uncounted` marks a round exempt from `validation.max_rounds` and
+        `uncounted_cause` says WHICH exemption — the two have separate bounds; see the
+        columns' own notes in `ADDED_COLUMNS`.
         """
         col, subject_id = self._subject(wo_id, fo_id)
         if round is None:
@@ -4399,10 +4624,12 @@ class ProjectStore:
             cur = self.conn.execute(
                 f"""INSERT INTO validation_rounds ({col}, round, ts, fingerprint,
                                                    summary, evidence, pr_url,
-                                                   config_version, forced_reason)
-                    VALUES (?,?,?,?,?,?,?,?,?)""",
+                                                   config_version, forced_reason,
+                                                   uncounted, uncounted_cause)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (subject_id, round, db.now(), fingerprint, summary, evidence, pr_url,
-                 config_version, forced_reason),
+                 config_version, forced_reason, 1 if uncounted else 0,
+                 uncounted_cause if uncounted else ""),
             )
         except sqlite3.IntegrityError:
             existing = self.conn.execute(
@@ -4423,14 +4650,66 @@ class ProjectStore:
         invisible here, or three bad nights on the network would give up on a unit
         nothing ever judged; a `pending` round is the one in flight, and counting it
         would make a retried submission consume a second.
+
+        A REBIND is excluded (`uncounted=1`): it is a round the OS opened on a merge it
+        demanded itself, and the submitter did not spend it. Numbering is a different
+        question and has its own method — `numbered_validation_rounds`.
         """
         col, subject_id = self._subject(wo_id, fo_id)
         marks = ",".join("?" * len(COUNTED_VALIDATION_OUTCOMES))
         row = self.conn.execute(
             f"SELECT COUNT(*) AS n FROM validation_rounds "
-            f"WHERE {col}=? AND outcome IN ({marks})",
+            f"WHERE {col}=? AND uncounted=0 AND outcome IN ({marks})",
             (subject_id, *COUNTED_VALIDATION_OUTCOMES),
         ).fetchone()
+        return int(row["n"] or 0)
+
+    def numbered_validation_rounds(self, *, wo_id: str | None = None,
+                                   fo_id: str | None = None) -> int:
+        """How many round NUMBERS this subject has already spent.
+
+        SEPARATE FROM THE BUDGET because a rebind spends a number without spending a
+        round: a submission numbered off `counted_validation_rounds` would re-derive the
+        rebind's number, hit the idempotent insert, be handed that settled row and park
+        the work order in `validating` for ever (spec
+        docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.1).
+
+        `pending` and `failed` stay excluded on BOTH sides — that is what keeps a retried
+        submission reusing its number — so on a database with no rebind in it this
+        returns exactly what `counted_validation_rounds` returns.
+        """
+        col, subject_id = self._subject(wo_id, fo_id)
+        counted = ",".join("?" * len(COUNTED_VALIDATION_OUTCOMES))
+        runnable = ",".join("?" * len(RUNNABLE_VALIDATION_OUTCOMES))
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM validation_rounds WHERE {col}=? AND ("
+            f"outcome IN ({counted}) "
+            f"OR (uncounted=1 AND outcome NOT IN ({runnable})))",
+            (subject_id, *COUNTED_VALIDATION_OUTCOMES, *RUNNABLE_VALIDATION_OUTCOMES),
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    def uncounted_validation_rounds(self, *, wo_id: str | None = None,
+                                    fo_id: str | None = None,
+                                    cause: str | None = None) -> int:
+        """How many rounds this subject has had outside the budget, by cause.
+
+        Every row, settled or not: an uncounted round in flight has already been paid
+        for, and a bound that ignored it would open a second panel on the next tick.
+
+        `cause` narrows to ONE exemption, and the `ops.REBIND_MAX` arms all pass
+        `ops.REBIND_CAUSE`: the two causes have separate bounds, so a merge re-judge
+        that consumed the round a user's rework needs — wo-299daf2e — is exactly what
+        an unfiltered count would do (Neo question 973). None counts both, which is
+        what a reader asking "how many rounds did nobody pay for" wants.
+        """
+        col, subject_id = self._subject(wo_id, fo_id)
+        where, args = "", [subject_id]
+        if cause is not None:
+            where, args = " AND uncounted_cause=?", [subject_id, cause]
+        row = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM validation_rounds "
+            f"WHERE {col}=? AND uncounted=1{where}", args).fetchone()
         return int(row["n"] or 0)
 
     def get_validation_round(self, round_id: int) -> dict[str, Any] | None:
@@ -4695,17 +4974,19 @@ class ProjectStore:
                      max_uses: int = 3,
                      agent_type: str | None = None,
                      status: str = "pending",
-                     contested: bool = False) -> dict[str, Any]:
+                     contested: bool = False,
+                     base_oid: str = "") -> dict[str, Any]:
         now = db.now()
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
                                       evidence, max_uses, agent_type, status, contested,
-                                      pending_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                      pending_at, base_oid)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             # `pending_at` iff it is pending from birth: an `awaiting_case` row gets one
             # in `start_review` or never at all.
             (wo_id, now, kind, command, matched, justification, evidence, max_uses,
-             agent_type, status, int(contested), now if status == "pending" else None),
+             agent_type, status, int(contested), now if status == "pending" else None,
+             base_oid),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -4720,6 +5001,8 @@ class ProjectStore:
             # In the payload as well as the column: the timeline is read on its own, and
             # "the planner ran this" is exactly the wrong thing for it to imply.
             **({"agent_type": agent_type} if agent_type else {}),
+            # Spec 2026-09-28 §3.5: only when there is one — `''` is "no base recorded".
+            **({"base_oid": base_oid} if base_oid else {}),
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
 

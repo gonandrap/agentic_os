@@ -538,8 +538,20 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # person asked for must not read afterwards as one they did.
         rnd, was = p.get("round"), p.get("was")
         who = "by the OS" if str(p.get("by") or "") == "os" else "by hand"
-        return (f"Validation forced {who} — round {rnd}" if rnd
-                else f"Validation forced {who}",
+        # A REBIND says so beside the number: round 4 under `max_rounds` 3 reads as a
+        # spent budget otherwise (spec 2026-09-27 §4.3).
+        #
+        # ...AND SO DOES THE OTHER UNCOUNTED CAUSE, which is NOT a rebind: nobody merged
+        # anything, the user asked for the rework, and the line has to say so. `cause`
+        # is `ops.USER_REWORK_CAUSE` / `ops.REBIND_CAUSE`, quoted as a literal like
+        # "patch_id" below because this module imports nothing from `jarvis`. A row
+        # written before the cause existed carries only `rebind`, and reads as one.
+        cause = str(p.get("cause") or ("rebind" if p.get("rebind") else ""))
+        spent = (", no round spent — the rework you asked for"
+                 if cause == "user_rework"                  # ops.USER_REWORK_CAUSE
+                 else ", no round spent" if cause else "")
+        return (f"Validation forced {who} — round {rnd}{spent}" if rnd
+                else f"Validation forced {who}{spent}",
                 f"{p.get('reason') or ''}"
                 + (f" (was {was})" if was else ""))
     if kind == "validation_head_carried":
@@ -579,8 +591,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejudge_declined":
         # The one moved head the OS will NOT re-judge: the round it would open is the
         # last one, and that one is the user's (same spec, §4).
+        # ...and the OTHER decline, which `max_rounds` cannot answer: the OS re-judged
+        # the merge it asked for as often as it may (spec
+        # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+        head = str(p.get("head_sha") or "")[:10]
+        if str(p.get("cause") or "") == "rebind_exhausted":     # ops.REBIND_EXHAUSTED
+            return ("Left for you to re-judge",
+                    f"the head is now {head} and the OS has already re-judged this "
+                    f"merge {p.get('rebinds')} time(s) — the limit")
         return ("Left for you to re-judge",
-                f"the head is now {str(p.get('head_sha') or '')[:10]} and round "
+                f"the head is now {head} and round "
                 f"{p.get('next_round')} of {p.get('max_rounds')} would be the last")
     if kind == "validation_follow_ups_filed":
         # A SEVENTH kind, and the only one that is not a verdict: the round's
@@ -624,6 +644,14 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "validation_rejected":
         # The reason IS the ask the worker has to answer, so unlike the "answered"
         # kinds above it is shown here: nothing else in the timeline carries it.
+        #
+        # A REJECTED USER-REWORK ROUND SAYS NO ROUND WAS SPENT, for the reason the
+        # forced line above does: the row number runs past `max_rounds` and a reader
+        # counting it against the budget concludes it is gone when it is untouched
+        # (Neo question 973). "user_rework" is `ops.USER_REWORK_CAUSE`.
+        if str(p.get("uncounted_cause") or "") == "user_rework":
+            return ("Validation rejected — sent back, no round spent (the rework you "
+                    "asked for)", p.get("reason") or "")
         return "Validation rejected — sent back", p.get("reason") or ""
     if kind == "validation_bounced":
         # NO ROUND WAS SPENT and the line has to say so, or a reader counts this against
@@ -742,6 +770,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "automerge_command_unfinished":
         return ("The merge command never finished — GitHub says the merge landed",
                 (p.get("reason") or "")[:200])
+    # Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything.
+    if kind == "automerge_base_stale":
+        head = str(p.get("head_sha") or "")
+        base = str(p.get("base") or "the base")
+        oid = str(p.get("base_oid") or "")
+        return ("Merge refused — the base moved under it",
+                f"round {p.get('round') or '?'} passed on "
+                f"{head[:10] or 'an unknown commit'}, and {base} is now "
+                f"at {oid[:10] or 'a commit the OS could not read'}, which that commit "
+                f"does not contain — catching the branch up instead")
     # THE TRACKER SIDE OF THE RECORD (issue #240). `issues.record_applied` writes one of
     # these three after — and only after — GitHub accepted the change, so each is the
     # evidence that a claim on the public tracker is now true. The timeline is their only
@@ -769,6 +807,17 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # On the RELEASE order: the base is red, so the ship is deferred rather than
         # attempted. Deduped per head sha, so one line per broken commit.
         return ("Holding the release — the base branch is red",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_deferred_red_base":
+        # On the RELEASE order, mid-run: it delivered no release because the base is not
+        # buildable, so it waits rather than asking the user (2026-09-29 spec §1). Same
+        # head-sha dedupe as the hold above, one line per broken commit.
+        return ("Waiting to ship — the base branch is not buildable",
+                p.get("detail") or (p.get("base") or ""))
+    if kind == "release_park_red_base":
+        # ...and the end of that wait: past `Daemon.RED_PARK_AFTER_SECONDS` the release
+        # asks the user, once per episode (§3).
+        return ("Stopped waiting for the base branch and asked you",
                 p.get("detail") or (p.get("base") or ""))
     if kind == "release_completed":
         # The ending itself, whichever path reached it: `why` is which one (release.py
