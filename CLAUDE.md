@@ -42,6 +42,22 @@ operator: route, don't do.
 jarvis status [--json]                     # whole-OS pulse; --attention for the short list
 jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
+jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE. No work order starts a
+                                           # turn — dispatch, relaunch, message delivery,
+                                           # validation — unless allow-listed. Turns in
+                                           # flight finish; nothing is killed or lost.
+                                           # Reach for this, never `systemctl stop` plus
+                                           # kill, when spend is out of control.
+                                           # The dashboard has the same controls.
+jarvis resume <wo-id...> | --all           # let named orders through a pause (one at a
+                                           # time serialises spend), or lift it. After a
+                                           # usage window reopens the OS ramps back by
+                                           # itself — at most 2 turns in flight for 30min,
+                                           # 1 for 60min if the last window was spent
+                                           # again right after reopening (that also puts
+                                           # a critical item in the inbox) — and compacts
+                                           # a cold, large conversation before relaunching
+                                           # it rather than re-sending it whole.
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo create ... --depends-on <wo-id,...>   # don't dispatch until those COMPLETE.
                                            # Order a multi-step job in one go instead of
@@ -130,6 +146,18 @@ jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--ac
 jarvis io cancel <id>                      # stops the order and its analyst. Orders
                                            # already filed from accepted findings stay:
                                            # those were your decision.
+jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"
+                                           # an INVESTIGATION order: one order is not
+                                           # moving and you want the cause. A read-only
+                                           # session reads the record and NEVER writes
+                                           # code — a hook refuses every write and every
+                                           # mutating command. It SETTLES ITSELF, unlike
+                                           # `io`, with one of four verdicts: GAP (files
+                                           # an EXPEDITED bug after a duplicate check, so
+                                           # the fix ships a release), WAITING_ON_USER
+                                           # (the only one that asks for you), TRANSIENT,
+                                           # ALREADY_TRACKED. One live per subject.
+jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on

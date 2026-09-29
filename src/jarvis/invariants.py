@@ -309,6 +309,33 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
 
+#: The OTHER `sha_moved` stall that reaches the user, and the reason it needs its own
+#: sentence: the OS asked for the merge, re-judged its resolution `ops.REBIND_MAX` times
+#: and the panel still refuses it. `SHA_MOVED_BLOCKER` above would offer
+#: `validation.max_rounds`, which the rebind arm never reads — advice that does nothing
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5).
+#: "twice" is `ops.REBIND_MAX`, spelled out here rather than imported: this module is
+#: below `ops` in the import order, and the bound is a constant of the design.
+REBIND_EXHAUSTED_BLOCKER = ("the OS re-judged the merge it asked for twice and the "
+                            "panel still refuses it — read the review and decide: "
+                            "merge it yourself, or send the worker back")
+
+#: THE THIRD SENTENCE IN THIS FAMILY, and the one that names the LIVE cause: the rework
+#: the user asked for when they rejected on review was judged — outside the budget, as
+#: Neo's ruling on question 973 requires — and the panel refused it with no counted
+#: round left. `VALIDATION_STUCK_BLOCKER` would say only "the review could not be
+#: satisfied", which hides that this round was the user's own ask; the two `sha_moved`
+#: sentences above describe a merge nobody judged, which is the opposite of what
+#: happened here.
+#:
+#: Re-derived from the round by `user_rework_refused` for kn-089de524's reason: a flag
+#: `Daemon._escalate` writes is rewritten by INV-ATTENTION-REASON on the next tick
+#: unless `true_blockers` can derive it.
+USER_REWORK_REFUSED_BLOCKER = ("the rework you asked for was judged and the panel "
+                               "refused it, and no rounds are left — read the review "
+                               "and decide: accept it, send the worker back with "
+                               "another round (`validation.max_rounds`), or close it")
+
 #: What a work order says when the reviewer REFUSED the automatic merge of the commit the
 #: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
 #: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
@@ -509,6 +536,32 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: What a release order says when it stopped waiting for a red base and asked the user
+#: (2026-09-29 spec §3). NAMES THE RED RUN, not the release: the user is being asked
+#: about a build, and the release is waiting on it rather than on anything about itself.
+#:
+#: FREE OF ANY ELAPSED TIME, under PARKED_BLOCKER's rule — the hours are the THRESHOLD,
+#: which is a constant, and never a clock that ticks between two reconciles.
+RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}` failed at "
+                            "{sha} ({run_url}). The release is waiting on that build, "
+                            "not on anything about the release.")
+
+
+def release_base_red_blocker(said: dict[str, Any]) -> str:
+    """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote.
+
+    ONE renderer for both ends: `ops` flags it and this module re-derives it, or
+    INV-ATTENTION-REASON relabels the flag on the next tick (PR_CLOSED_BLOCKER's rule).
+    """
+    from .daemon import Daemon
+
+    return RELEASE_BASE_RED_BLOCKER.format(
+        base=said.get("base") or "main",
+        hours=Daemon.RED_PARK_AFTER_SECONDS // SECONDS_PER_HOUR,
+        workflow=said.get("workflow") or "ci", sha=str(said.get("head_sha") or "")[:10],
+        run_url=said.get("run_url") or "")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker — its
 #: message spent its retries, or its envelope ended in a terminal state that is not
 #: `delivered`. Nobody but the user can move it now, because the worker was never told.
@@ -535,8 +588,36 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     Derived, never stored. `ops.rejudge_moved_head` writes the decline;
     INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
     `acknowledged_blockers` (kn-089de524).
+
+    A decline caused by `ops.REBIND_EXHAUSTED` is NOT one of these — that one is
+    `rebind_exhausted` below, and the remedy this one names would do nothing for it.
     """
-    declined = store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+    return _parked_on_a_decline(store, wo, rebind=False)
+
+
+def rebind_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same question about the OTHER decline: the OS re-judged the merge it asked
+    for `ops.REBIND_MAX` times and the panel still refuses it.
+
+    A separate derivation because the remedy is different and `SHA_MOVED_BLOCKER`'s is
+    then FALSE: it offers `validation.max_rounds`, and the rebind arm never reads it
+    (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+    """
+    return _parked_on_a_decline(store, wo, rebind=True)
+
+
+def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
+                         rebind: bool) -> bool:
+    """The three facts both derivations above share, read for one `cause` only.
+
+    The decline dedupe is per head across both causes, so one head carries one decline
+    with one cause and the two can never both fire (spec §4.5).
+    """
+    from . import ops as ops_mod
+
+    declined = [e for e in store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+                if (str(db.from_json(e["payload"], {}).get("cause") or "")
+                    == ops_mod.REBIND_EXHAUSTED) is rebind]
     if not declined:
         return False
     held = store.events_of_kind(wo["id"], "automerge_held")
@@ -654,16 +735,47 @@ def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
     return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
 
 
+def _confirmation_is_open(question_id: int) -> bool:
+    """Is Neo still holding this confirmation question? Cross-DB and best-effort.
+
+    `awaiting_neo`'s precedent below and `ops._unreachable_asks`', including the failure
+    direction: an unreadable `neo.db`, or a link that resolves to nothing, must fail
+    TOWARD the user — so this answers False and the blocker appears. One row read per
+    pending assumption that carries a link, on an order already in `needs_review`.
+    """
+    from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
+
+    try:
+        neo = NeoStore()
+        try:
+            q = neo.get(question_id)
+        finally:
+            neo.close()
+    except Exception:  # noqa: BLE001 — see docstring: never take a caller down with us
+        return False
+    return bool(q) and str(q["status"] or "") in NEO_HELD_Q_STATUSES
+
+
 def _os_is_confirming(a: dict[str, Any]) -> bool:
     """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
 
     Two rows, and in both the user owes nothing: an accepted one is being confirmed
     against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
     answer. An objection still in flight is neither, so it is not here.
+
+    **`accept` IS NOT ENOUGH ON ITS OWN** (2026-09-28 spec §7, issue #833). The column is
+    written once and never cleared, so it could not tell a confirmation in flight from one
+    dropped in February — and the rows in that spec's §1.1 were suppressed from the
+    attention list for hours while the user could not close them either. A link that is
+    NOT there is a confirmation still to come, or one §4 cleared to re-ask, and suppresses
+    as it always did; a link to a question Neo has finished with does not.
+
+    The `object` branch is untouched: it is about a delivered objection and the worker.
     """
     verdict = str(a.get("provisional_verdict") or "")
     if verdict == "accept":
-        return True
+        qid = int(a.get("confirm_question_id") or 0)
+        return not qid or _confirmation_is_open(qid)
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
@@ -772,6 +884,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
+    # on the status so no other work order pays the query; the ordinary re-park raises
+    # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
+    if wo["status"] == "needs_review":
+        park = store.release_red_park_open(wo["id"])
+        if park is not None:
+            blockers.append(release_base_red_blocker(park))
     # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or
     # both. Derived at ONE site from PR_REPAIR_BLOCKERS, in that tuple's order; see its
     # note for what being derived at two sites cost.
@@ -807,6 +926,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # THE SAME STALL WITH THE OTHER CAUSE, and the two cannot both fire: the decline
+    # dedupe is per head across both (spec 2026-09-27 §4.5).
+    if wo["status"] == "waiting_pr_merge" and rebind_exhausted(store, wo):
+        blockers.append(REBIND_EXHAUSTED_BLOCKER)
     # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
     # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
     # Gated on the status for the same reason as the branch above, and ordered after it
@@ -844,8 +967,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    dropping the give-up because a decision is also open is the silent
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
+        #    ONE OF TWO SENTENCES: a give-up on a round a USER rejection bought names
+        #    that cause instead (spec 2026-09-27 §5, Neo question 973).
         elif validation_escalated(store, wo):
-            blockers.append(VALIDATION_STUCK_BLOCKER)
+            blockers.append(USER_REWORK_REFUSED_BLOCKER
+                            if user_rework_refused(store, wo)
+                            else VALIDATION_STUCK_BLOCKER)
         # 3. The landing refused to complete it over code that is on nothing but its own
         #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
         #    not merged into it, because they are opposite facts about the same status:
@@ -1030,6 +1157,21 @@ def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """
     latest = store.latest_validation_round(wo_id=wo["id"])
     return bool(latest and latest["outcome"] == "escalated")
+
+
+def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Was the give-up above the panel refusing the rework the USER asked for?
+
+    The same latest-round rule as `validation_escalated`, read one column further: a
+    round carrying `ops.USER_REWORK_CAUSE` is one a user rejection bought, and a
+    rejection of it with the counted budget spent is a different piece of news from the
+    ordinary give-up (Neo question 973, live case wo-299daf2e).
+    """
+    from . import ops as ops_mod
+
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    return bool(latest and latest["outcome"] == "escalated"
+                and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE)
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1272,7 +1414,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # renders the bare "pending" the surface would have printed anyway, rather than a
     # guess. Like the two above, it raises no attention: the window reopens and the slot
     # frees, neither of which is a decision anyone owes (`fleet.blocked`).
-    held = fleet.blocked() if fleet is not None else ""
+    held = fleet.blocked(wo["id"]) if fleet is not None else ""
     if held:
         return f"pending — {held}"
     return "pending"
@@ -1386,6 +1528,13 @@ def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
     if cause == "project_cap":
         return (f"waiting for a free slot in this project ({hold.get('active')} of "
                 f"{hold.get('max_concurrent')} running)")
+    if cause == "fleet_paused":
+        return ("held: the fleet is paused by the user — `jarvis resume "
+                f"{wo['id']}` lets this order through")
+    if cause == "fleet_ramp":
+        return (f"waiting for the fleet to ramp back up after the usage window reopened "
+                f"({hold.get('in_flight')} of {hold.get('cap')} worker turns in flight "
+                f"until {clock(float(hold.get('until') or 0))})")
     if cause == "fleet_outage":
         # `fleet_hold_note` owns these words wherever it is gated to speak them; a second
         # source for one sentence is the drift this spec pays for elsewhere. Said here
@@ -1558,13 +1707,32 @@ def something_is_out(store: ProjectStore, wo_id: str) -> bool:
 
     `held_approvals` counts as out, and it is the clause a caller inheriting this from
     `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
-    held request, so it is not "with a reviewer" — but the work order is not free either:
-    `gates.file_request` parks it in `waiting_input` down BOTH its roads, the OS refuses
-    it on the `gates.case_ttl_seconds` timer, and until then the worker is waiting for a
-    verdict exactly as it would be for an argued one.
+    held request, so it is not "with a reviewer" — and it parks NOTHING: since fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md `gates.file_request`
+    writes `waiting_input` only down the PENDING road. The work order is still out all the
+    same: the command is blocked, the `gates.case_ttl_seconds` clock is running, and the
+    only thing that can close the request is the worker's own next command.
+
+    WHAT IS OUT, not who is waited on — `user_facing_wait` below is the other question,
+    and the pair lives here together so the two cannot drift.
     """
     return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
                 or awaiting_neo(wo_id))
+
+
+def user_facing_wait(store: ProjectStore, wo_id: str) -> bool:
+    """Is somebody ELSE holding this work order — a reviewer, or Neo?
+
+    The narrower half of the pair above, and the discriminator for the one status that
+    says "Waiting on you". A HELD gate request is excluded on purpose: it is the
+    WORKER's move, its only exit is the worker's own next command, and nothing about it
+    is owed by the user — which is the whole of fix 2.
+
+    Beside `something_is_out` rather than in a caller, because the two are read against
+    each other: `settle_work_order` asks this one before writing a status and that one
+    before deciding a manager is free (kn-4ea33fe6).
+    """
+    return bool(store.pending_approvals(wo_id) or awaiting_neo(wo_id))
 
 
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:

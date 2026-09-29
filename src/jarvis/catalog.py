@@ -155,6 +155,42 @@ DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
+# THE ONE NON-None SHIPPED BUDGET, and §2.8 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md is why: an investigation's
+# caller is a daemon loop, not a human typing, so an uncapped default is an uncapped loop.
+# An investigation reads records and quotes lines — it should cost cents, and one that
+# costs more than the order it is diagnosing is not worth having.
+#
+# A named constant so the figure is a ONE-LINE edit. PENDING CONFIRMATION: no measurement
+# picked it, the nearest datum being `jarvis cost` on the improvement orders run in this
+# checkout (§7.1).
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+
+# Cheap by default for the same reason: a diagnosis is reading and quoting, not design.
+# An ALIAS rather than a pinned id, unlike DEFAULT_MODEL: "whatever is currently cheap in
+# that tier" is the intent here, and pinning it would freeze the price.
+DEFAULT_INVESTIGATION_MODEL = "sonnet"
+DEFAULT_INVESTIGATION_EFFORT = "low"
+
+# A CEILING ON ONE MCP TOOL CALL, in milliseconds, read by Claude Code itself from
+# `MCP_TOOL_TIMEOUT` in the worker's environment (issue #845: Serena's
+# `search_for_pattern` backtracked catastrophically and burned 18m50s of CPU on one call
+# that never returned — nothing bounded it, and it ended when the work order did).
+#
+# FIVE MINUTES, and the figure is the OS's existing cost boundary rather than a new one:
+# it is the 5-minute prompt-cache TTL `claude_cli.PROMPT_CACHE_5M_ENV` buys and what
+# `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` is set to. A call that outlives the cache has
+# already cost the conversation a re-write; letting it run further buys nothing. Every
+# legitimate Serena/context7 call in this fleet's transcripts is sub-minute.
+#
+# A catalog setting and not a literal because a project with a genuinely slow MCP server
+# must be able to RAISE it — which is also why `dispatch` sets it in its `env.update`
+# block rather than in `assets/settings.base.json`, where the catalog cannot reach.
+DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS = 300_000
+# Under a second is a typo — it would make every MCP call in the project fail — and it
+# arrives through `jarvis config set`, so it is refused where the message can name the key.
+WORKER_MCP_TOOL_TIMEOUT_MS_MIN = 1000
+
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
                   default: float | None) -> float | None:
@@ -364,9 +400,19 @@ class WorkerDefaults:
     # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
+    # An INVESTIGATION order's family (the order plus its one investigator), and the model
+    # and effort its investigator runs on. Non-None by design — see
+    # DEFAULT_INVESTIGATION_BUDGET_USD and §2.8 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
+    investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
+    investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
     # Whether the lead must delegate file edits to its crew. §7 of
     # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
     require_crew: bool = True
+    # What one MCP tool call may take, in milliseconds — see
+    # DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS and issue #845.
+    mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -621,6 +667,21 @@ DEFAULT_INSPECT_ALARM_AWAITING_MINUTES = 60
 #: user's ruling explicitly kept on the books.
 DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
 
+#: A subagent's last tool call still unfinished after this long — the evidence that turns
+#: an open foreground delegation from "a subagent is working" into "something is hung"
+#: (issue #845). FIVE MINUTES, and the number is not free-standing: it is the same
+#: boundary as `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` above and the same as the
+#: `MCP_TOOL_TIMEOUT` every worker is launched with, so the OS holds ONE opinion about
+#: how long a single tool call may take. The issue asked for "well before 60 min" —
+#: `alarm_turn_minutes`, the only thing that would eventually have fired — and this is
+#: twelve times earlier than that. No legitimate Serena or context7 call in this fleet's
+#: transcripts takes a minute; the hang in #845 took nineteen.
+#:
+#: IN MINUTES, not seconds, because every other "how long may this run" setting on
+#: `InspectConfig` is in minutes; `alarm_join_seconds` is in seconds because it is a
+#: cache TTL and not a judgement about work.
+DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES = 5
+
 #: One call re-sending this much of the conversation. p95 of the largest re-write per work
 #: order (the median is 130,519), so it fires on 5% — about $1.88 at Opus list prices in a
 #: single event.
@@ -755,6 +816,7 @@ class InspectConfig:
     alarm_stalled_minutes: int = DEFAULT_INSPECT_ALARM_STALLED_MINUTES
     alarm_awaiting_minutes: int = DEFAULT_INSPECT_ALARM_AWAITING_MINUTES
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
+    alarm_subagent_tool_minutes: int = DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
     alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
@@ -1508,6 +1570,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                            base.alarm_awaiting_minutes)),
         alarm_join_seconds=int(raw.get("alarm_join_seconds",
                                        base.alarm_join_seconds)),
+        alarm_subagent_tool_minutes=int(raw.get("alarm_subagent_tool_minutes",
+                                                base.alarm_subagent_tool_minutes)),
         alarm_write_tokens=int(raw.get("alarm_write_tokens",
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
@@ -1960,6 +2024,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "
                        f"got {require_crew!r}")
+        mcp_timeout = int(w.get("mcp_tool_timeout_ms",
+                                DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS))
+        if mcp_timeout < WORKER_MCP_TOOL_TIMEOUT_MS_MIN:
+            raise _err(f"project {name}: worker.mcp_tool_timeout_ms must be >= "
+                       f"{WORKER_MCP_TOOL_TIMEOUT_MS_MIN} (milliseconds — a ceiling "
+                       f"under a second would fail every MCP call), got {mcp_timeout}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -1975,7 +2045,16 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             feature_budget_usd=_parse_budget(
                 w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
                 os_cfg.default_feature_budget_usd),
+            investigation_budget_usd=_parse_budget(
+                w, "investigation_budget_usd",
+                f"project {name}: worker.investigation_budget_usd",
+                DEFAULT_INVESTIGATION_BUDGET_USD),
+            investigation_model=w.get("investigation_model",
+                                      DEFAULT_INVESTIGATION_MODEL),
+            investigation_effort=w.get("investigation_effort",
+                                       DEFAULT_INVESTIGATION_EFFORT),
             require_crew=require_crew,
+            mcp_tool_timeout_ms=mcp_timeout,
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

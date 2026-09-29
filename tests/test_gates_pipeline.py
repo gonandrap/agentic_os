@@ -64,10 +64,10 @@ def fleet(jarvis_home, fake_claude, gated_catalog, project):
             )
             return settings["env"]
 
-        def attempt(self, command):
+        def attempt(self, command, **extra):
             return preflight_decision(
                 {"tool_name": "Bash", "tool_input": {"command": command},
-                 "cwd": str(project)}, self.env())
+                 "cwd": str(project), **extra}, self.env())
 
         def request(self, command, why="tests are green", evidence=""):
             """Attempt it, then argue it — a compliant worker's two moves, in one call.
@@ -557,13 +557,17 @@ def test_the_daemon_is_what_closes_it(fleet):
     assert fleet.approval()["closed_as"] == "abandoned"
 
 
-def test_an_abandoned_request_unparks_the_work_order(fleet):
-    """The request parked it; the close has to unpark it. Otherwise a work order nobody
-    is reviewing anything for reads as "waiting on your input" for ever."""
+def test_an_abandoned_request_leaves_the_work_order_unparked(fleet):
+    """The close still calls `end_wait_if_nothing_is_out`, and it must stay: a held
+    request no longer parks anything (fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), so from
+    `running` that call is a no-op — but an order sitting in `waiting_input` for a
+    DIFFERENT reason still needs it. Either way, nothing may read as "waiting on your
+    input" once the sweep has closed the request."""
     fleet.attempt("./scripts/shipit.sh")
     store = fleet.store()
     try:
-        assert store.get_work_order(fleet.wo_id)["status"] == "waiting_input"
+        assert store.get_work_order(fleet.wo_id)["status"] == "running"
         store.conn.execute("UPDATE approvals SET ts = ts - 7200")
         gates.sweep_unargued(store, gates.DEFAULT_CASE_TTL_SECONDS)
         assert store.get_work_order(fleet.wo_id)["status"] != "waiting_input"
@@ -626,7 +630,10 @@ def test_a_held_gate_does_not_ask_the_user_for_anything(fleet):
     store = fleet.store()
     try:
         wo = store.get_work_order(fleet.wo_id)
-        assert wo["status"] == "waiting_input"
+        # `running`, since fix 2 of
+        # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: the status
+        # itself was the loudest way this asked the user for something.
+        assert wo["status"] == "running"
         assert true_blockers(store, wo) == []
         check_project(store, repair=True)
         assert store.get_work_order(fleet.wo_id)["needs_attention"] == 0
@@ -1324,3 +1331,62 @@ def test_an_escalated_contest_never_offers_the_user_the_approve_button(fleet):
     assert "jarvis gate dismiss" in items[0]["body"]
     assert "jarvis gate approve" not in items[0]["body"]
     assert fleet.approval()["status"] == "pending"      # still claimable by the user
+
+
+# -- fixes 2 and 3 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md
+
+
+def test_an_idle_worker_holding_a_gate_is_not_filed_for_review(fleet, fake_claude):
+    """Fix 2's other half. With a held request no longer writing `waiting_input`, an
+    idle worker must not fall to `settle_work_order`'s `else` and reach the user as
+    `needs_review` + IDLE_NO_FINISH_BLOCKER. Nothing is owed by the user; the command
+    is still blocked.
+
+    Neo is off for the same reason as the test above: a verdict landing mid-tick would
+    decide the assertions for a reason this test does not state (kn-95a32178).
+    """
+    from jarvis.invariants import IDLE_NO_FINISH_BLOCKER
+
+    fleet.daemon.catalog.os.neo.enabled = False
+    fleet.attempt("./scripts/shipit.sh")
+
+    store = fleet.store()
+    try:
+        assert store.held_approvals(fleet.wo_id), "the premise: HELD, not pending"
+        session_id = store.get_work_order(fleet.wo_id)["session_id"]
+    finally:
+        store.close()
+    fake_claude.set_session_state(session_id, "done")
+
+    fleet.daemon.tick()
+
+    store = fleet.store()
+    try:
+        wo = store.get_work_order(fleet.wo_id)
+        assert wo["status"] == "running"
+        assert wo["needs_attention"] == 0
+        assert (wo["attention_reason"] or "") != IDLE_NO_FINISH_BLOCKER
+    finally:
+        store.close()
+
+
+def test_a_subagent_gate_is_decided_by_the_neo_drain(fleet):
+    """Fix 3 end to end: no actor will ever argue a subagent's request, so it is filed
+    for review on the spot and a reviewer decides it within the minute."""
+    fleet.attempt("./scripts/shipit.sh", agent_type="jarvis-implementer")
+
+    approval = fleet.approval()
+    assert approval["status"] == "pending"
+    assert approval["neo_question_id"]
+
+    fleet.daemon._neo_drain()
+
+    neo = NeoStore()
+    try:
+        question = [q for q in neo.list_questions()
+                    if q["id"] == approval["neo_question_id"]][0]
+    finally:
+        neo.close()
+    # A REVIEWER LOOKED AT IT — which is the whole claim. Which way the verdict went
+    # depends on the case, and a subagent's request carries the placeholder.
+    assert question["status"] != "pending"

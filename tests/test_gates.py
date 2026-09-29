@@ -28,6 +28,7 @@ ALL_GATES = gates.GateConfig(enabled=frozenset(gates.KIND_NAMES))
 # `cat scripts/shipit.sh` and `grep … scripts/shipit.sh`, which is exactly the point of
 # it, so the dismissal tests need one it cannot reach. `uv run pytest` really does
 # execute something, and what it executes is a test: gated, and not a release.
+RELEASE_COMMAND = "./scripts/shipit.sh"
 FALSE_POSITIVE = "uv run pytest tests/test_release_staging.py -k shipit"
 OTHER_FALSE_POSITIVE = "uv run pytest evals/ -k shipit"
 
@@ -318,10 +319,12 @@ def gated(jarvis_home, project):
             self.env = env
             self.project = project
 
-        def attempt(self, command):
+        def attempt(self, command, **extra):
+            """`**extra` is how a test says WHICH SEAT ran it: `agent_type="…"` is the
+            key `PreToolUse` sets iff a subagent did, and fix 3 routes on it."""
             return preflight_decision(
                 {"tool_name": "Bash", "tool_input": {"command": command},
-                 "cwd": str(project)}, env)
+                 "cwd": str(project), **extra}, env)
 
         def request(self, command, why="tests are green", evidence=""):
             """Attempt it, then argue it — a compliant worker's two moves, in one call.
@@ -392,7 +395,11 @@ def test_making_the_case_is_what_puts_the_request_in_front_of_a_reviewer(gated):
 
 
 def test_worker_parked_on_a_gate_is_marked_waiting_not_running(gated):
-    gated.attempt("./scripts/shipit.sh")
+    """ARGUED, so a reviewer really is holding it. The held road no longer parks the
+    work order at all — fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md, pinned in
+    `test_a_held_request_leaves_the_work_order_running` below."""
+    gated.request("./scripts/shipit.sh")
     assert gated.store.get_work_order(gated.wo["id"])["status"] == "waiting_input"
 
 
@@ -680,7 +687,7 @@ def test_a_gate_with_neo_costs_the_user_no_attention(gated):
     anyway is the bottleneck this feature was built to remove."""
     from jarvis.invariants import check_project, true_blockers
 
-    gated.attempt("./scripts/shipit.sh")
+    gated.request("./scripts/shipit.sh")
     wo = gated.store.get_work_order(gated.wo["id"])
     assert wo["status"] == "waiting_input"
     assert true_blockers(gated.store, wo) == []
@@ -1497,7 +1504,7 @@ def test_a_decided_gate_puts_the_work_order_back_to_running(gated, verdict):
     the invariant checker turned that into "worker is waiting on your input" — asking
     the user to unstick a worker that had never stalled.
     """
-    gated.attempt("./scripts/shipit.sh")
+    gated.request("./scripts/shipit.sh")
     assert gated.store.get_work_order(gated.wo["id"])["status"] == "waiting_input"
 
     approval = gated.store.list_approvals(gated.wo["id"])[0]
@@ -1509,8 +1516,8 @@ def test_a_decided_gate_puts_the_work_order_back_to_running(gated, verdict):
 
 def test_a_gate_still_under_review_keeps_the_work_order_waiting(gated):
     """One verdict does not end the wait when another request is still out."""
-    gated.attempt("./scripts/shipit.sh")
-    gated.attempt("gh pr merge 31")
+    gated.request("./scripts/shipit.sh")
+    gated.request("gh pr merge 31")
     first, second = sorted(gated.store.list_approvals(gated.wo["id"]),
                            key=lambda a: a["id"])
 
@@ -2576,3 +2583,75 @@ def test_the_assertion_fails_when_a_raw_interpolation_is_reintroduced(source, of
     found = untagged_borrowed_reads(source, ("build_request_question",
                                             "_request_question"))
     assert bool(found) is offends, found
+
+
+# -- a held request is the WORKER's move, so it is not a user wait ---------------------
+# Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+
+
+def test_a_held_request_leaves_the_work_order_running(gated):
+    """`waiting_input` renders "Waiting on you" everywhere. An `awaiting_case` request
+    is owed by the WORKER — by construction its only exit is the worker's own next
+    command — so parking the order there asked the user for something nobody owed."""
+    from jarvis.invariants import true_blockers
+
+    gated.attempt(RELEASE_COMMAND)
+
+    wo = gated.store.get_work_order(gated.wo["id"])
+    assert wo["status"] == "running"
+    assert gated.store.held_approvals(gated.wo["id"]), "the premise: HELD, not pending"
+    assert true_blockers(gated.store, wo) == []
+    assert not wo["needs_attention"]
+
+
+def test_an_argued_request_still_parks_the_work_order(gated):
+    """The other road is unchanged: a reviewer really is holding a pending request."""
+    gated.request(RELEASE_COMMAND)
+
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "waiting_input"
+
+
+def test_the_sweep_still_abandons_a_held_request_on_a_running_order(gated):
+    """The clock is unchanged by the status: `sweep_unargued` never read it."""
+    gated.attempt(RELEASE_COMMAND)
+    gated.store.conn.execute("UPDATE approvals SET ts = ts - 7200")
+
+    closed = gates.sweep_unargued(gated.store, gates.DEFAULT_CASE_TTL_SECONDS)
+
+    assert [c["closed_as"] for c in closed] == ["abandoned"]
+    assert gated.store.get_work_order(gated.wo["id"])["status"] == "running"
+
+
+# -- a gate a subagent raised goes straight to a reviewer ------------------------------
+# Fix 3 of the same spec: nothing will ever argue it, so a placeholder now beats an
+# abandonment every time.
+
+
+def test_a_subagents_gate_goes_straight_to_a_reviewer(gated):
+    result = gated.attempt(RELEASE_COMMAND, agent_type="jarvis-implementer")
+
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    assert approval["status"] == "pending"
+    assert approval["neo_question_id"]
+    reason = _reason(result)
+    # NOT the two exits: they name actions this actor cannot take.
+    assert gates.exits_advice(gated.wo["id"], RELEASE_COMMAND, "release",
+                              approval["id"]) not in reason
+    assert "jarvis gate contest" not in reason
+    assert "report the block to your lead" in reason.lower()
+    assert "Edit" in reason and "Write" in reason
+
+
+def test_a_leads_gate_still_holds(gated):
+    """Keyed on `agent_type` ALONE. The lead has a turn boundary the OS can block, so
+    the argument for holding — issue 185's placeholder race — still applies to it."""
+    gated.attempt(RELEASE_COMMAND)
+
+    approval = gated.store.list_approvals(gated.wo["id"])[0]
+    assert approval["status"] == gates.AWAITING_CASE
+    assert approval["neo_question_id"] is None
+
+
+def test_a_subagents_gate_still_blocks_the_command(gated):
+    assert _decision(gated.attempt(RELEASE_COMMAND,
+                                   agent_type="jarvis-implementer")) == "deny"

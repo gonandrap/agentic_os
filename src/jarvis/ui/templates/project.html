@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_issues.html" as issues_ui %}
+{% import "_brake.html" as brake_ui %}
 {% block title %}{{ project_name }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -79,6 +80,26 @@
 </div>
 {% endif %}
 
+{# Investigations, beside the two blocks above on the same "counts, not trees" rule
+   (§2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md): the verdict is
+   what the order's own page is for, and this line only says what is being diagnosed. #}
+{% if investigations %}
+<h3>Investigations</h3>
+<div class="panel">
+  {% for inv in investigations %}
+    {% set vm = fo_status_meta.get(inv.status, {'word': inv.status, 'icon': '•', 'tone': 'muted'}) %}
+    <div class="row">
+      <span class="st tone-{{ vm.tone }}"><span class="i">{{ vm.icon }}</span>{{ inv.status_label }}</span>
+      <div class="grow">
+        <a href="/inv/{{ project_name }}/{{ inv.id }}" class="mono">{{ inv.id }}</a> {{ inv.title }}
+        {% if inv.needs_attention %}<div class="sub tone-warn">◭ {{ inv.attention_reason }}</div>{% endif %}
+      </div>
+      <span class="sub mono">{{ fmt_age(inv.created_at) }}</span>
+    </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 {# Feature orders sit ABOVE the work orders and do not expand into their children here:
    the children are already in the listing below as ordinary work orders, and printing
    the same tree twice on one page is how a page stops being read. The tree is on the
@@ -131,6 +152,7 @@
               href="/wo/{{ project_name }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
           </div>
         {% endif %}
+        {{ brake_ui.let_through(brake, wo, '/project/' ~ project_name) }}
         {# Not an attention item on purpose: the OS resumes this one itself. #}
         {% if pauses.get(wo.id) %}
           <div class="sub">⏳ {{ pauses[wo.id] }}</div>

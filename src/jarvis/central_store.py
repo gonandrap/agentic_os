@@ -62,7 +62,7 @@ def fts_query(term: str) -> str:
     instead of as FTS5 syntax — see
     docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §5.
     """
-    words = [w for w in (term or "").split() if any(c.isalnum() for c in w)]
+    words = db.cap_words([w for w in (term or "").split() if any(c.isalnum() for c in w)])
     return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
@@ -908,7 +908,7 @@ class CentralStore:
         Catches what stemming splits apart, and keeps the empty term meaning
         "everything" — the read `jarvis learn list` and the dashboard rely on.
         """
-        words = [w for w in (term or "").split() if w] or [""]
+        words = db.cap_words([w for w in (term or "").split() if w]) or [""]
         score = " + ".join(
             "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
             for _ in words)

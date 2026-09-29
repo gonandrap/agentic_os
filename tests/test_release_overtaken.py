@@ -551,3 +551,31 @@ def test_a_red_hold_never_shortens_a_dispatch_backoff(project, store, daemon, ba
     row = store.get_work_order(rel)
     assert float(row["retry_after"]) == lapsed, "green may not clear a launch backoff"
     assert row["dispatch_attempts"] == attempts
+
+
+# -- the deferred release ------------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §4.
+
+
+def test_overtaken_settles_a_release_deferred_in_pending(project, store, daemon, deploy):
+    """§4: a release re-parked into `pending` by a red base is still settled when a newer
+    release ships its batch.
+
+    Works today by the accident of one tuple's contents — `pending` is the FIRST entry of
+    `OPEN_STATUSES` and `_settle_shipped_release` has no status guard at all — and either
+    would break it silently. This is the pin.
+    """
+    from jarvis.project_store import OPEN_STATUSES
+
+    assert "pending" in OPEN_STATUSES
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    rel = release_order(store, project, shas={ISSUE: landed}, status="pending")
+    store.hold_dispatch(rel, until=db.now() + Daemon.RED_HOLD_SECONDS)
+
+    step(daemon, store)
+
+    assert store.get_work_order(rel)["status"] == "completed"
+    assert len(events(store, rel, "release_completed")) == 1

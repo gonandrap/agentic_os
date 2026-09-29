@@ -310,8 +310,9 @@ def _what_it_is(wo: dict[str, Any]) -> str:
     """What KIND of session is burning, in the judge's words.
 
     Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
-    the running ones), but `WO_KINDS` has four members: two belong to a FEATURE order and
-    one to an IMPROVEMENT order, so "a work order" alone hides the thing that most
+    the running ones), but `WO_KINDS` has five members: two belong to a FEATURE order, one
+    to an IMPROVEMENT order and one to an INVESTIGATION, so "a work order" alone hides the
+    thing that most
     changes what normal looks like. A planner reading a whole codebase for an hour is
     doing its job; a worker doing the same on a one-file fix is not. Reported as evidence
     rather than instructed in the persona, because a judge told to weigh something it
@@ -328,6 +329,16 @@ def _what_it_is(wo: dict[str, Any]) -> str:
                 f"records through the CLI to diagnose a root cause, so it is expected "
                 f"to be read-heavy; a long GENERATING stretch, or any sign of it "
                 f"editing product code, is not")
+    if kind == "investigator":
+        # §2.2 of docs/superpowers/specs/2026-09-27-investigation-orders.md, and it says
+        # the sharper thing: its writes are REFUSED by a hook, so a long stretch of
+        # retried denied tool calls is the abnormality — not the reading.
+        owns = f" of investigation {parent}" if parent else ""
+        return (f"the INVESTIGATOR{owns} — one read-only session diagnosing one stuck "
+                f"order through the CLI, so it is expected to be read-heavy and to end "
+                f"in a verdict; a long GENERATING stretch, or a run of DENIED tool calls "
+                f"it keeps retrying (its writes and mutating commands are refused by a "
+                f"hook), is not")
     if kind == "planner":
         return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
                 f"a single ask into work orders, so it is expected to be long and "

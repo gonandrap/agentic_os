@@ -458,6 +458,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stop", help="stop the daemon")
 
+    sp = sub.add_parser(
+        "pause", help="stop the fleet starting turns (only allow-listed orders run)",
+        description="The user's brake (issue #843). No work order starts a turn — "
+                    "dispatch, paused-turn resume, message delivery, validation — "
+                    "unless it is allow-listed. Turns in flight finish; nothing is "
+                    "killed. Re-running replaces the allow-list.")
+    sp.add_argument("--allow", default="",
+                    help="comma-separated work/feature order ids that may keep running")
+    sp.add_argument("--reason", default="", help="why, shown on every held order")
+
+    sp = sub.add_parser(
+        "resume", help="let orders through a pause, or lift it with --all")
+    sp.add_argument("order_ids", nargs="*", help="work/feature order ids to let through")
+    sp.add_argument("--all", action="store_true", dest="everything",
+                    help="lift the pause for the whole fleet")
+
     sp = sub.add_parser("status", help="whole-OS status; flags what needs your attention")
     sp.add_argument("--attention", action="store_true", help="only show attention items")
 
@@ -951,6 +967,56 @@ def build_parser() -> argparse.ArgumentParser:
     for i in io.choices.values():
         i.add_argument("--json", action="store_true", help="machine-readable output")
 
+    # investigation orders ---------------------------------------------------------------
+    # Beside the improvement order, the surface it is a pair with: `io` wants the cause
+    # argued and files nothing until the user decides; an investigation settles itself.
+    # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    inv = sub.add_parser(
+        "investigate",
+        help="investigation orders: diagnose one stuck order read-only and classify it",
+    ).add_subparsers(dest="inv_cmd", required=True)
+
+    v = inv.add_parser("create", help="open an investigation into one stuck order (the "
+                                      "default: `jarvis investigate <subject>`)")
+    v.add_argument("subject", help="the wo-/fo-/io- id that is not progressing")
+    v.add_argument("--why", required=True,
+                   help="what you saw. Required: the investigator's first reader is a "
+                        "fresh session with no memory of the conversation that produced "
+                        "it")
+    v.add_argument("--project", help="whose project the subject is in (default: resolved "
+                                     "from the subject id)")
+    v.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    v.add_argument("--budget", metavar="USD",
+                   help="cap the whole order — it and its investigator — at N dollars. "
+                        "Omit for the catalog's `investigation_budget_usd`, which is NOT "
+                        "no ceiling: the caller here is usually a daemon loop")
+
+    v = inv.add_parser("list", help="investigations and where each one stands")
+    v.add_argument("project", nargs="?")
+    v.add_argument("--all", action="store_true", help="include settled ones")
+
+    v = inv.add_parser("show", help="one investigation: the classification and the "
+                                    "subject, then the root cause and the evidence")
+    v.add_argument("inv_id")
+    v.add_argument("--project")
+
+    v = inv.add_parser("cancel", help="stop an investigation and its investigator")
+    v.add_argument("inv_id")
+    v.add_argument("--project")
+
+    v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
+                                       "investigator's terminal action, and what settles "
+                                       "the order")
+    v.add_argument("inv_id")
+    v.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the verdict, as JSON. A file rather than an argument on purpose: "
+                        "a verdict is full of repo paths and quoted log lines, which is "
+                        "exactly what trips the privileged-action classifier")
+    v.add_argument("--project")
+
+    for v in inv.choices.values():
+        v.add_argument("--json", action="store_true", help="machine-readable output")
+
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
         "gate",
@@ -1390,6 +1456,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pause(args: argparse.Namespace) -> int:
+    from . import ops
+    allow = [i.strip() for i in args.allow.split(",") if i.strip()]
+    _print(ops.pause_fleet(reason=args.reason, allow=allow), args.json)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    from . import ops
+    _print(ops.resume_fleet(args.order_ids, everything=args.everything), args.json)
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from . import ops
     st = ops.os_status()
@@ -1399,6 +1478,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     d = st["daemon"]
     print(f"Jarvis {'🟢 running' if d['running'] else '🔴 daemon stopped'}"
           + (f" (pid {d['pid']})" if d["pid"] else ""))
+    fl = st.get("fleet") or {}
+    if fl.get("paused"):
+        allowed = ", ".join(fl["allow"]) or "nothing"
+        print(f"⏸ FLEET PAUSED{' — ' + fl['reason'] if fl.get('reason') else ''} · "
+              f"allowed through: {allowed} · `jarvis resume <wo-id>` / `--all`")
+    elif fl.get("ramp"):
+        r = fl["ramp"]
+        print(f"↗ ramping up after the usage window reopened: at most {r['cap']} "
+              f"worker turn(s) in flight"
+              + (" (breaker tripped: the last window was spent again soon after "
+                 "reopening)" if r.get("tripped") else ""))
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
         for a in st["attention"]:
@@ -2238,6 +2328,27 @@ def _normalise_issues(argv: list[str]) -> list[str]:
     if len(argv) > 1 and argv[1] in (*ISSUES_SUBCOMMANDS, "-h", "--help"):
         return argv
     return [argv[0], "list", *argv[1:]]
+
+
+#: The `investigate` sub-verbs — a CLOSED set, and that is the whole disambiguation:
+#: `jarvis investigate <subject>` takes a bare subject while every other spelling takes a
+#: sub-verb, so the second word is a sub-verb when it is one of these and a SUBJECT
+#: otherwise. A subject is always a `wo-`/`fo-`/`io-` id and can therefore never collide
+#: with one of these four words.
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict")
+
+
+def _normalise_investigate(argv: list[str]) -> list[str]:
+    """Insert the implicit `create` so `jarvis investigate <subject> --why …` parses.
+
+    `_normalise_alarms`' mechanism and its argparse reason: a subparser group IS the
+    positional, so a bare subject beside it would be read as an invalid sub-verb.
+    """
+    if not argv or argv[0] != "investigate":
+        return argv
+    if len(argv) > 1 and argv[1] in (*INVESTIGATE_SUBCOMMANDS, "-h", "--help"):
+        return argv
+    return [argv[0], "create", *argv[1:]]
 
 
 def cmd_issues_start(args: argparse.Namespace) -> int:
@@ -3235,6 +3346,87 @@ def cmd_io(args: argparse.Namespace) -> int:
         else:
             amount = None if args.clear else _parse_budget_amount(args.amount)
             _print(ops.set_feature_budget(args.io_id, amount, args.project), args.json)
+
+    return 0
+
+
+def cmd_investigate(args: argparse.Namespace) -> int:
+    """`jarvis investigate …` — A THIN WRAPPER HOLDING NO LOGIC.
+
+    §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: every verb calls
+    the matching `ops` function and formats what comes back, because the companion
+    fleet-health order calls those same functions directly from the daemon and must never
+    shell out to `jarvis`. A rule written here would be a rule that caller does not have.
+
+    Statuses and icons are the feature order's, as `jarvis io` reuses them: the statuses
+    ARE `FO_STATUSES`; only the labels differ, and those come from
+    `project_store.feature_status_label`.
+    """
+    from . import ops, verdicts
+
+    if args.inv_cmd == "create":
+        inv = ops.create_investigation_order(args.project, args.subject, args.why,
+                                             budget_usd=_budget_arg(args),
+                                             origin=args.origin)
+        _print({"created": inv["id"], "subject": args.subject,
+                "status": inv["status"],
+                **({"budget_usd": inv["budget_usd"]} if inv.get("budget_usd") else {}),
+                "note": "it reads the record and settles itself — a GAP files an "
+                        "expedited bug after a duplicate check"}, args.json)
+
+    elif args.inv_cmd == "list":
+        rows = ops.list_investigation_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no investigations")
+        else:
+            for row in rows:
+                icon = FO_ICON.get(row["status"], "•")
+                att = " ⚠" if row["needs_attention"] else ""
+                print(f"{icon} {row['id']} [{row['project']}] {row['title']} "
+                      f"({row['status_label']}, {_age(row['created_at'])}){att}")
+
+    elif args.inv_cmd == "show":
+        detail = ops.show_investigation_order(args.inv_id, args.project)
+        detail["budget"] = ops.feature_order_budget(args.inv_id, detail["project"])
+        if args.json:
+            _print(detail, True)
+        else:
+            # THE CLASSIFICATION AND THE SUBJECT FIRST (§2.9), then the argument.
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['status_label']}")
+            print(f"\n{detail['classification'] or 'no verdict yet'} — "
+                  f"{detail['subject']}")
+            print(f"\n{detail['why']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["budget"]["budget_usd"]:
+                b = detail["budget"]
+                print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
+            if detail["investigator"]:
+                i = detail["investigator"]
+                print(f"investigator: {i['id']} ({i['status']})")
+            if detail["alarms"]:
+                print(f"alarms: {ops.alarm_standing_line(detail['alarms'])}")
+            if detail["verdict"]:
+                print()
+                for line in verdicts.render_verdict(detail["verdict"]):
+                    print(line)
+
+    elif args.inv_cmd == "cancel":
+        _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
+
+    elif args.inv_cmd == "verdict":
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise ops.OpsError(f"no such verdict file: {path}")
+        try:
+            doc = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+        _print(ops.submit_verdict(args.inv_id, doc, project_name=args.project),
+               args.json)
 
     return 0
 
@@ -4321,8 +4513,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = _normalise_issues(
-        _normalise_alarms(list(sys.argv[1:] if argv is None else argv)))
+    argv = _normalise_investigate(_normalise_issues(
+        _normalise_alarms(list(sys.argv[1:] if argv is None else argv))))
     # accept --json anywhere, not only before the subcommand
     as_json = "--json" in argv
     args = build_parser().parse_args([a for a in argv if a != "--json"])
@@ -4338,6 +4530,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_start(args)
         if args.cmd == "stop":
             return cmd_stop(args)
+        if args.cmd == "pause":
+            return cmd_pause(args)
+        if args.cmd == "resume":
+            return cmd_resume(args)
         if args.cmd == "status":
             return cmd_status(args)
         if args.cmd == "doctor":
@@ -4365,6 +4561,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_fo(args)
         if args.cmd == "io":
             return cmd_io(args)
+        if args.cmd == "investigate":
+            return cmd_investigate(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "rules":

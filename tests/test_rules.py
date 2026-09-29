@@ -265,7 +265,7 @@ def test_validate_params_refuses_a_primitive_that_is_not_in_the_registry():
 
 
 def test_validate_params_accepts_a_shipped_primitive_while_no_schema_exists():
-    assert getattr(remedies.REMEDIES["nudge"], "params", None) is None
+    assert not getattr(remedies.REMEDIES["nudge"], "params", None), "no schema declared"
     assert rules.validate_params("nudge", {}) == []
 
 

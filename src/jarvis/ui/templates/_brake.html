@@ -1,0 +1,18 @@
+{# The user's brake (`jarvis pause`, issue #843), per order: the button that lets ONE
+   order through, or the fact that it already is. Rendered only while the fleet is paused
+   and only for a status the brake can hold — `fleet_held_statuses`, the daemon's list.
+   `back` is where the press returns the reader. #}
+{% macro let_through(brake, wo, back, full=false) %}
+{% if brake and brake.paused and wo.status in fleet_held_statuses %}
+  {% if wo.id in brake.allow %}
+    <span class="sub tone-ok brake-allowed">▶ allowed through the pause</span>
+  {% else %}
+    <form class="inline" method="post" action="/fleet/allow">
+      <input type="hidden" name="order_id" value="{{ wo.id }}">
+      <input type="hidden" name="next" value="{{ back }}">
+      <button title="`jarvis resume {{ wo.id }}`: this order may start turns while the rest of the fleet stays paused">
+        {{ 'Let this order through' if full else 'Let through' }}</button>
+    </form>
+  {% endif %}
+{% endif %}
+{% endmacro %}
