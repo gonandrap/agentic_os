@@ -118,6 +118,25 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     # --append-system-prompt (tests/test_stable_prefix.py holds the two together).
     settings["includeGitInstructions"] = False
 
+    # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker. Its worktree is inside the
+    # project, so the CLI loads the branch's copy AND the main checkout's — ~11k
+    # duplicated tokens in every request's prefix, and two instruction sets that may
+    # disagree. The worktree path is PREDICTED, not checked: this file is written before
+    # the spawn whose `--worktree` flag creates it. Spec docs/superpowers/specs/
+    # 2026-09-29-one-copy-of-the-projects-claude-md.md §3.
+    # BOTH SPELLINGS of the root when a catalog path runs through a symlink: an entry
+    # naming a file the CLI did not load is inert, a missing one leaves the duplicate.
+    resolved = project.path.resolve() if project.path.exists() else project.path
+    excludes = [str(p) for p in (settings.get("claudeMdExcludes") or [])]
+    for path in hooks.claude_md_excludes(
+            resolved, resolved / ".claude" / "worktrees" / wo["id"]):
+        rel = path.relative_to(resolved)
+        for root in dict.fromkeys((resolved, project.path)):
+            if str(root / rel) not in excludes:
+                excludes.append(str(root / rel))
+    if excludes:
+        settings["claudeMdExcludes"] = excludes
+
     env = dict(settings.get("env") or {})
     env.update({
         "JARVIS_WO_ID": wo["id"],
@@ -1322,7 +1341,10 @@ def dispatch_work_order(
     # file, and a measurement must not have side effects. Spec docs/specs/
     # 2026-09-24-order-observability.md §5.
     if turn["seq"] == 1:
-        context.record(store, project, wo, turn, briefing, knowledge=knowledge)
+        # `worktree` is written by `start` above, AFTER the row this `wo` was read from —
+        # spec 2026-09-29-one-copy-of-the-projects-claude-md §4 defect (b).
+        context.record(store, project, {**wo, "worktree": wo["id"]}, turn, briefing,
+                       knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {
