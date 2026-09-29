@@ -730,16 +730,47 @@ def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
     return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
 
 
+def _confirmation_is_open(question_id: int) -> bool:
+    """Is Neo still holding this confirmation question? Cross-DB and best-effort.
+
+    `awaiting_neo`'s precedent below and `ops._unreachable_asks`', including the failure
+    direction: an unreadable `neo.db`, or a link that resolves to nothing, must fail
+    TOWARD the user — so this answers False and the blocker appears. One row read per
+    pending assumption that carries a link, on an order already in `needs_review`.
+    """
+    from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
+
+    try:
+        neo = NeoStore()
+        try:
+            q = neo.get(question_id)
+        finally:
+            neo.close()
+    except Exception:  # noqa: BLE001 — see docstring: never take a caller down with us
+        return False
+    return bool(q) and str(q["status"] or "") in NEO_HELD_Q_STATUSES
+
+
 def _os_is_confirming(a: dict[str, Any]) -> bool:
     """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
 
     Two rows, and in both the user owes nothing: an accepted one is being confirmed
     against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
     answer. An objection still in flight is neither, so it is not here.
+
+    **`accept` IS NOT ENOUGH ON ITS OWN** (2026-09-28 spec §7, issue #833). The column is
+    written once and never cleared, so it could not tell a confirmation in flight from one
+    dropped in February — and the rows in that spec's §1.1 were suppressed from the
+    attention list for hours while the user could not close them either. A link that is
+    NOT there is a confirmation still to come, or one §4 cleared to re-ask, and suppresses
+    as it always did; a link to a question Neo has finished with does not.
+
+    The `object` branch is untouched: it is about a delivered objection and the worker.
     """
     verdict = str(a.get("provisional_verdict") or "")
     if verdict == "accept":
-        return True
+        qid = int(a.get("confirm_question_id") or 0)
+        return not qid or _confirmation_is_open(qid)
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 

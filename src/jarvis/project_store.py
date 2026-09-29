@@ -4331,6 +4331,22 @@ class ProjectStore:
         self.conn.execute("UPDATE assumptions SET confirm_question_id=? WHERE id=?",
                           (question_id, assumption_id))
 
+    def clear_assumption_confirmation(self, assumption_id: int) -> None:
+        """Forget a confirmation the OS itself threw the ruling away on, so it re-asks.
+
+        docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
+        assumption-for-ever.md §4.3, and `Daemon._deliver_assumption_verdict` is the only
+        caller: a link written at ask time is read everywhere as a present-tense claim,
+        and the settle site is the one place that knows for certain the question is spent.
+
+        A verb of its own rather than `link_assumption_confirmation(aid, None)`: that
+        parameter is typed `int`, and a nullable overload would let the ASK path clear a
+        link by passing a falsy question id. The early link and the `provisional_*`
+        columns are untouched — only the CONFIRMATION is asked again.
+        """
+        self.conn.execute("UPDATE assumptions SET confirm_question_id=NULL WHERE id=?",
+                          (assumption_id,))
+
     def record_objection(self, assumption_id: int, *, envelope_id: int,
                          transport: str, sent_ts: float | None = None) -> None:
         """Record that an objection was handed to a transport. Called BEFORE the send.

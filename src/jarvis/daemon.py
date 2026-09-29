@@ -5684,16 +5684,44 @@ class Daemon:
         `autoreview`, which is pure by contract; `ops._unreachable_asks` is the read-side
         twin for the surfaces.
         """
+        return self._question_liveness(neo_store, assumptions)[0]
+
+    def _question_liveness(self, neo_store: Any,
+                           assumptions: list[dict]) -> tuple[set[int], set[int]]:
+        """`(dead, open)` for every question these rows link to. ONE READ PER LINK.
+
+        Two facts off one row, because they are read on the same tick by two gates and a
+        second pass over `neo.db` would buy nothing (2026-09-28 spec §6). They are
+        DIFFERENT predicates and deliberately not each other's complement:
+
+        * DEAD is `status == 'failed'` and nothing else — the retry ladder is spent, so
+          the link is an outage rather than a question in flight, and the pass asks again
+          (2026-09-26 spec §4, and `_unreachable_question_ids` above is this half);
+        * OPEN is `neo_store.NEO_HELD_Q_STATUSES` — Neo still holds it. `escalated` and
+          `answered` are NOT open: Neo is finished either way, and an escalated
+          confirmation is a decision handed back to the user. What `decide_confirm` tells
+          `confirming` from `confirm_spent` with.
+        """
+        from .neo_store import NEO_HELD_Q_STATUSES
+
         dead: set[int] = set()
+        live: set[int] = set()
+        seen: set[int] = set()
         for a in assumptions:
             for column in ("neo_question_id", "confirm_question_id"):
                 qid = int(a.get(column) or 0)
-                if not qid or qid in dead:
+                if not qid or qid in seen:
                     continue
+                seen.add(qid)
                 q = neo_store.get(qid)
-                if q and str(q["status"] or "") == "failed":
+                if q is None:
+                    continue
+                status = str(q["status"] or "")
+                if status == "failed":
                     dead.add(qid)
-        return dead
+                if status in NEO_HELD_Q_STATUSES:
+                    live.add(qid)
+        return dead, live
 
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
@@ -5727,7 +5755,7 @@ class Daemon:
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
         objecting = bool(store.outstanding_objections(wo["id"]))
-        dead_questions = self._unreachable_question_ids(neo_store, assumptions)
+        dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
@@ -5740,7 +5768,11 @@ class Daemon:
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
                         round_reason=round_reason, refusal_answered=answered,
                         objections_outstanding=objecting,
-                        unreachable_question_ids=dead_questions, stakes=stakes_verdict)
+                        unreachable_question_ids=dead_questions,
+                        # 2026-09-28 spec §6: is Neo still holding the confirmation?
+                        confirmation_open=int(a.get("confirm_question_id") or 0)
+                        in open_questions,
+                        stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -6026,6 +6058,13 @@ class Daemon:
         call, and once, against freshly read state, to justify the settle it came back
         to do. Only the second one is guarding anything irreversible.
 
+        **THE ONLY PLACE THAT THROWS AWAY A RULING THE OS PAID FOR, so it is also the
+        only place that can say the link to the question is spent** (2026-09-28 spec §4,
+        issue #833). A CONFIRMATION dropped for a transient reason clears
+        `confirm_question_id` and supersedes the question, and the next parked tick
+        confirms against the final delivered diff; every other reason means the row is the
+        user's and stays linked.
+
         A ruling that does not accept is NOT an inbox row. The work order is already on
         the user's attention list carrying "assumptions pending review" — the state it was
         in before the OS asked and the state it stays in — and a second announcement of an
@@ -6141,18 +6180,46 @@ class Daemon:
             # None, which is the regex, which is what decided the ask under both.
             stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
-            # Escalated rather than left `answered`: the assumption is the user's again,
-            # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
-            # non-acceptance branch above does, for the same reason. The hold event is
-            # what puts the WHY on the work order, where `ops.autoreview_state` renders
-            # it as the one `⚙ auto-review:` line.
-            neo_store.mark(q["id"], "escalated", reason=still.reason)
+            # A CONFIRMATION DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN — issue #833
+            # and docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+            # an-assumption-for-ever.md §4. Every code in `TRANSIENT_DROPS` is a fact that
+            # clears with the user doing nothing and says nothing about whose decision
+            # this is, so leaving the link set held the assumption for the life of the
+            # work order: pending for the user, and suppressed from their attention list
+            # as a confirmation in flight. Everything else means the row is THEIRS and
+            # stays linked (§4.2) — re-asking would lobby them once per reconcile tick.
+            retry = confirming and still.code in autoreview.TRANSIENT_DROPS
+            if not retry:
+                # Escalated rather than left `answered`: the assumption is the user's
+                # again, and `/neo` and `jarvis neo list` have to say so — the same
+                # re-mark the non-acceptance branch above does, for the same reason. The
+                # hold event is what puts the WHY on the work order, where
+                # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
+                neo_store.mark(q["id"], "escalated", reason=still.reason)
             self._note_autoreview_held(pstore, wo["id"], still, settling=True)
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": still.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
                 "overridden": False, "dropped": still.code})
+            if retry:
+                # §4.3, IN THIS ORDER and after the record of the drop is complete. NOT
+                # `mark(escalated)`: `escalated` means the user must answer, and after the
+                # clear below nobody can. A ruling that reached here was already recorded
+                # `answered` by `neo.drain_queue`, so `supersede`'s OPEN_Q_STATUSES guard
+                # makes this a no-op on that path and a real close on any other — either
+                # way the row is off `ops._neo_attention`, which is what §4.3 requires.
+                # SUPERSEDE FIRST: clearing the link makes the question unresolvable
+                # through `assumption_for_question`, and
+                # `invariants._stale_assumption_question` deliberately leaves an
+                # unresolvable row alone — so an `escalated` question plus a cleared link
+                # would sit in `ops._neo_attention` for ever.
+                neo_store.supersede(
+                    q["id"],
+                    f"SUPERSEDED — the OS dropped its own ruling: {still.reason}. A "
+                    f"fresh confirmation will be asked against the delivered result.",
+                    still.reason)
+                pstore.clear_assumption_confirmation(assumption["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return
