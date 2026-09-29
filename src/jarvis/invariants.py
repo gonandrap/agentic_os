@@ -2940,7 +2940,9 @@ def _os_owning_project(store: ProjectStore) -> Any:
     if catalog is None:
         return None
     try:
-        owner = schedule.os_owner((p.name, p.path) for p in catalog.projects)
+        # §5: no fallback — an arbitrary first-in-catalog project is not the OS.
+        owner = schedule.os_owner(((p.name, p.path) for p in catalog.projects),
+                                  fallback=False)
         if owner is None:
             return None
         spec = catalog.project(owner)

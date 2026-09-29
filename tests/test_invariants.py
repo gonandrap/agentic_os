@@ -976,16 +976,20 @@ def _dark(store) -> list:
     return [v for v in invariants.check_os_health_sweep_alive(store)]
 
 
-def _owning(tmp_path, project, **kw) -> ProjectStore:
-    """The catalog's FIRST project is the OS owner when no project contains the install
-    (`schedule.os_owner`'s deterministic fallback), which is every test checkout."""
+def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
+    """A project owns the OS only by CONTAINING the running install — there is no
+    first-in-catalog fallback here (spec §3), so the install is pointed inside it."""
+    from jarvis import schedule
+
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
     _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
                                   "description": "the OS's own"}], **kw)
     return ProjectStore(project)
 
 
-def test_the_os_sweep_switched_off_is_reported_critical(tmp_path, project):
-    store = _owning(tmp_path, project, health=False)
+def test_the_os_sweep_switched_off_is_reported_critical(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project, health=False)
 
     (violation,) = _dark(store)
 
@@ -997,9 +1001,9 @@ def test_the_os_sweep_switched_off_is_reported_critical(tmp_path, project):
     store.close()
 
 
-def test_the_supervisor_switch_takes_the_sweep_dark_too(tmp_path, project):
+def test_the_supervisor_switch_takes_the_sweep_dark_too(monkeypatch, tmp_path, project):
     """Two switches, either of which is fatal: `_health_projects` requires both."""
-    store = _owning(tmp_path, project, enabled=False)
+    store = _owning(monkeypatch, tmp_path, project, enabled=False)
 
     (violation,) = _dark(store)
 
@@ -1007,8 +1011,8 @@ def test_the_supervisor_switch_takes_the_sweep_dark_too(tmp_path, project):
     store.close()
 
 
-def test_an_enabled_sweep_that_has_never_run_is_reported(tmp_path, project):
-    store = _owning(tmp_path, project)
+def test_an_enabled_sweep_that_has_never_run_is_reported(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
 
     (violation,) = _dark(store)
 
@@ -1017,8 +1021,8 @@ def test_an_enabled_sweep_that_has_never_run_is_reported(tmp_path, project):
     store.close()
 
 
-def test_a_failing_sweep_names_the_failure(tmp_path, project):
-    store = _owning(tmp_path, project)
+def test_a_failing_sweep_names_the_failure(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
     store.record_health_review("work_order", "wo-1", fingerprint="fp",
                                trigger="first-look", outcome="failed",
                                detail="unreadable health sweep output: {...}")
@@ -1030,8 +1034,8 @@ def test_a_failing_sweep_names_the_failure(tmp_path, project):
     store.close()
 
 
-def test_a_sweep_that_judged_recently_is_not_dark(tmp_path, project):
-    store = _owning(tmp_path, project)
+def test_a_sweep_that_judged_recently_is_not_dark(monkeypatch, tmp_path, project):
+    store = _owning(monkeypatch, tmp_path, project)
     store.record_health_review("work_order", "wo-1", fingerprint="fp",
                                trigger="first-look", outcome="clear")
 
@@ -1039,13 +1043,13 @@ def test_a_sweep_that_judged_recently_is_not_dark(tmp_path, project):
     store.close()
 
 
-def test_a_usage_limit_window_is_not_darkness(tmp_path, project):
+def test_a_usage_limit_window_is_not_darkness(monkeypatch, tmp_path, project):
     """A sweep that is silent only because the ACCOUNT was is not dark: the elapsed
     clock excludes time spent inside a hold."""
     from jarvis import db
     from jarvis.invariants import OS_HEALTH_SWEEP_DARK_MINUTES
 
-    store = _owning(tmp_path, project)
+    store = _owning(monkeypatch, tmp_path, project)
     window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
     started_at = db.now() - window - 600
     store.conn.execute(
@@ -1062,10 +1066,15 @@ def test_a_usage_limit_window_is_not_darkness(tmp_path, project):
     store.close()
 
 
-def test_a_project_that_does_not_run_the_os_is_never_reported(tmp_path, project):
+def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_path,
+                                                              project):
     """Every state above, on a project that is not the owner."""
+    from jarvis import schedule
+
     other = tmp_path / "other"
     (other / ".jarvis").mkdir(parents=True)
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
     _register_catalog(tmp_path, [
         {"name": "proj_a", "path": str(project), "description": "the OS's own"},
         {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
@@ -1076,6 +1085,16 @@ def test_a_project_that_does_not_run_the_os_is_never_reported(tmp_path, project)
 
     store.record_health_review("work_order", "wo-1", fingerprint="fp",
                                trigger="first-look", outcome="failed", detail="boom")
+    assert _dark(store) == []
+    store.close()
+
+
+def test_a_catalog_with_no_project_holding_the_install_owns_nothing(tmp_path, project):
+    """§5: derived WITHOUT `os_owner`'s first-in-catalog fallback."""
+    _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                  "description": "an ordinary one"}], health=False)
+    store = ProjectStore(project)
+
     assert _dark(store) == []
     store.close()
 

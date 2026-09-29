@@ -587,8 +587,15 @@ def test_an_unregistered_catalog_says_how_to_name_one(tmp_path, capsys):
 #
 # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §4. USER RULE,
 # 2026-09-28 (kn-7312c7de). Refused in `ops`, so the CLI and the dashboard's console
-# inherit it from one place. `proj_a` is the OS owner here: `schedule.os_owner` falls
-# back to the catalog's first project when none contains the running install.
+# inherit it from one place. The owner is derived WITHOUT `schedule.os_owner`'s
+# first-in-catalog fallback, so a test project owns the OS only by holding the install.
+
+@pytest.fixture()
+def os_project(monkeypatch):
+    """`proj_a` (path `/tmp`) contains the running install."""
+    from jarvis import schedule
+
+    monkeypatch.setattr(schedule, "__file__", "/tmp/src/jarvis/schedule.py")
 
 SWEEP_OFF = [
     ("projects.proj_a.supervisor.health_enabled", False),
@@ -599,7 +606,7 @@ SWEEP_OFF = [
 
 
 @pytest.mark.parametrize("path,value", SWEEP_OFF)
-def test_turning_the_os_projects_own_sweep_off_is_refused(catalog, path, value):
+def test_turning_the_os_projects_own_sweep_off_is_refused(os_project, catalog, path, value):
     before = catalog.read_text()
 
     with pytest.raises(ops.OpsError) as e:
@@ -611,7 +618,8 @@ def test_turning_the_os_projects_own_sweep_off_is_refused(catalog, path, value):
     assert no_head()
 
 
-def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(catalog):
+def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(os_project,
+                                                                        catalog):
     """`health_enabled` ships False, so an unset is a way of turning it off — which is
     why the predicate is on the RESOLVED document and not on the value written."""
     ops.set_config("projects.proj_a.supervisor.health_enabled", True,
@@ -627,8 +635,17 @@ def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(catalog):
     assert head()["id"] == version
 
 
+def test_a_catalog_holding_no_install_has_no_os_project_to_protect(catalog):
+    """§4: derived WITHOUT `os_owner`'s first-in-catalog fallback."""
+    res = ops.set_config("projects.proj_a.supervisor.health_enabled", False,
+                         reason="proj_a is not the OS")
+
+    assert res["path"] == "projects.proj_a.supervisor.health_enabled"
+    assert document_of(catalog)["projects"][0]["supervisor"]["health_enabled"] is False
+
+
 @pytest.mark.parametrize("path", ["supervisor.health_enabled", "supervisor.enabled"])
-def test_the_same_write_on_an_ordinary_project_is_allowed(catalog, path):
+def test_the_same_write_on_an_ordinary_project_is_allowed(os_project, catalog, path):
     """§4 only stops the OS's own project opting out. Everyone else opts in and out."""
     res = ops.set_config(path, False, project="proj_b", reason="not the OS's own")
 

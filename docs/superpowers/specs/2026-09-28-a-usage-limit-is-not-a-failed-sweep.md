@@ -225,9 +225,12 @@ def _refuse_os_sweep_off(document: dict[str, Any], resolved: dict[str, Any],
 ```
 
 - The OS project is derived, NEVER hardcoded: `schedule.os_owner((p["name"], Path(p["path"]))
-  for p in document["projects"])` — the same derivation `Daemon._os_owner`
-  (src/jarvis/daemon.py:3818-3822) uses. `None` (no project contains the running install)
-  means there is nothing to protect and the helper returns.
+  for p in document["projects"]), fallback=False)`. `None` (no project contains the running
+  install) means there is nothing to protect and the helper returns.
+- **`fallback=False`, deliberately unlike `Daemon._os_owner`.** `os_owner`'s default picks
+  the first project in catalog order when none holds the install, which answers "who runs
+  the fleet checks once" — not "which project IS the OS". A project that merely happens to
+  be listed first is not the OS and must not be refused this write.
 - Predicate: for the owning project `name`, refuse when
   `resolved[f"projects.{name}.{k}"]` is falsy for either `k` in `OS_SWEEP_KEYS`.
   `config_version.resolve` materialises every default (src/jarvis/config_version.py:130-143),
@@ -252,9 +255,11 @@ def _refuse_os_sweep_off(document: dict[str, Any], resolved: dict[str, Any],
 
 New checker in src/jarvis/invariants.py, beside
 `check_health_sweep_produces_judgements` (:2679). Runs ONLY on the OS-owning project:
-`schedule.os_owner` over the live catalog's projects, compared against the store's own
-project; any other project returns immediately, and so does an unresolvable owner (an
-invariant must never be the thing that raises — `_validation_timeout`'s rule, :2651-2663).
+`schedule.os_owner(..., fallback=False)` over the live catalog's projects, compared against
+the store's own project; any other project returns immediately, and so does an unresolvable
+owner (an invariant must never be the thing that raises — `_validation_timeout`'s rule,
+:2651-2663). `fallback=False` for the same reason as §4: the first project in catalog order
+is an arbitrary pick, and an arbitrary project must never be told to run the OS's own sweep.
 
 ```python
 #: How long the OS's own sweep may produce no judgement before the user is told. Six
