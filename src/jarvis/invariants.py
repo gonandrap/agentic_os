@@ -239,6 +239,13 @@ PR_BASE_UPDATED_EVENT = "pr_base_updated"
 #: there rather than being retried every two minutes.
 PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 
+#: The finding when a project's DEFAULT BRANCH is red — the fleet-level fact, not one
+#: pull request's inherited failure. In `INVARIANTS` and never `OS_INVARIANTS`: `main` of
+#: project P is P's fact, and this has to reach the reconcile tick, which is the path that
+#: reports and notifies (spec
+#: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
+INV_BASE_RED = "INV-BASE-BRANCH-RED"
+
 #: What a work order says while its base is broken. NOT an attention reason and NOT a
 #: blocker: nobody owes a decision, the OS is waiting for a build that is already
 #: running, and `true_blockers` deliberately does not derive it. It exists because the
@@ -1260,7 +1267,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # renders the bare "pending" the surface would have printed anyway, rather than a
     # guess. Like the two above, it raises no attention: the window reopens and the slot
     # frees, neither of which is a decision anyone owes (`fleet.blocked`).
-    held = fleet.blocked() if fleet is not None else ""
+    held = fleet.blocked(wo["id"]) if fleet is not None else ""
     if held:
         return f"pending — {held}"
     return "pending"
@@ -1374,6 +1381,13 @@ def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
     if cause == "project_cap":
         return (f"waiting for a free slot in this project ({hold.get('active')} of "
                 f"{hold.get('max_concurrent')} running)")
+    if cause == "fleet_paused":
+        return ("held: the fleet is paused by the user — `jarvis resume "
+                f"{wo['id']}` lets this order through")
+    if cause == "fleet_ramp":
+        return (f"waiting for the fleet to ramp back up after the usage window reopened "
+                f"({hold.get('in_flight')} of {hold.get('cap')} worker turns in flight "
+                f"until {clock(float(hold.get('until') or 0))})")
     if cause == "fleet_outage":
         # `fleet_hold_note` owns these words wherever it is gated to speak them; a second
         # source for one sentence is the drift this spec pays for elsewhere. Said here
@@ -3780,7 +3794,60 @@ def check_budgets_are_enforced(store: ProjectStore) -> Iterator[Violation]:
             central.close()
 
 
+def check_default_branch_green(store: ProjectStore) -> Iterator[Violation]:
+    """This project's default branch is red, and the OS says so ONCE, out loud.
+
+    Spec docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3. The
+    incident: `main` was red for ~4h after the OS's own merge broke it and no surface said
+    anything, because every base-health fact the OS held was per work order and written
+    only for an order whose own pull request was failing.
+
+    **DERIVED, NEVER FETCHED**, under `base_red_note`'s rule: an invariant that shelled
+    out to `gh` would put a subprocess behind `jarvis wo list`. `Daemon.poll_default_
+    branch` writes the reading; this reads it back. The reading's own freshness is the
+    merge pause's business (`BASE_HEALTH_FRESH_SECONDS`) and not this one's: a fact that
+    has stopped being refreshed is still the last thing the OS knows, and the remedy — a
+    commit on the default branch — does not expire.
+
+    Not repairable, and it must not try.
+    """
+    from .central_store import CentralStore
+
+    central = None
+    try:
+        central = CentralStore()
+        fact = central.base_health(central.project_name_for_path(store.project_path))
+    except Exception:  # noqa: BLE001 — an unreadable central database is not a red base
+        return
+    finally:
+        if central is not None:
+            central.close()
+    if not fact.get("red"):
+        return
+    base = str(fact.get("base") or "the default branch")
+    workflow = str(fact.get("workflow") or "an unnamed workflow")
+    url = str(fact.get("run_url") or "")
+    sha = str(fact.get("head_sha") or "")
+    wo_id = str(fact.get("wo_id") or "")
+    blamed = f", merged by the OS for {wo_id}" if wo_id else ""
+    yield Violation(
+        invariant=INV_BASE_RED,
+        wo_id=None,
+        repaired=False,
+        detail=(f"`{base}` is red — workflow `{workflow}`, run {url}, at "
+                f"{sha[:10] or 'an unknown commit'}{blamed}. Nothing merges onto a "
+                f"broken default branch, and every pull request built against it "
+                f"inherits the failure. The remedy is a commit on `{base}`."),
+        context={"base": base, "workflow": workflow, "run_url": url, "head_sha": sha,
+                 "wo_id": wo_id, "run_id": fact.get("run_id"),
+                 "checked_at": fact.get("checked_at")},
+    )
+
+
 INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
+    check_default_branch_green,    # first and order-free: a pure read of the central
+                                   # reading, repairing nothing and touching no flag any
+                                   # other check derives
     check_assumptions_persisted,   # rows first: the others read pending_assumptions
     check_no_orphan_gate_requests,  # ...and gates before the flag checks: an orphan
                                     # request is a blocker they would otherwise believe

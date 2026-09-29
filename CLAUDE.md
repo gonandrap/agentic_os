@@ -42,6 +42,21 @@ operator: route, don't do.
 jarvis status [--json]                     # whole-OS pulse; --attention for the short list
 jarvis start --catalog <path-to-catalog>   # boot the OS (user catalogs live untracked under catalogs/)
 jarvis stop
+jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE. No work order starts a
+                                           # turn — dispatch, relaunch, message delivery,
+                                           # validation — unless allow-listed. Turns in
+                                           # flight finish; nothing is killed or lost.
+                                           # Reach for this, never `systemctl stop` plus
+                                           # kill, when spend is out of control.
+jarvis resume <wo-id...> | --all           # let named orders through a pause (one at a
+                                           # time serialises spend), or lift it. After a
+                                           # usage window reopens the OS ramps back by
+                                           # itself — at most 2 turns in flight for 30min,
+                                           # 1 for 60min if the last window was spent
+                                           # again right after reopening (that also puts
+                                           # a critical item in the inbox) — and compacts
+                                           # a cold, large conversation before relaunching
+                                           # it rather than re-sending it whole.
 jarvis wo create <project> "title" -d "details" [--model m]
 jarvis wo create ... --depends-on <wo-id,...>   # don't dispatch until those COMPLETE.
                                            # Order a multi-step job in one go instead of

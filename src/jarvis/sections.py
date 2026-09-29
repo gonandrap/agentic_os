@@ -46,27 +46,38 @@ def find_refs(text: str) -> list[tuple[str, str]]:
     return out
 
 
-def extract_section(markdown: str, which: str) -> str | None:
-    """One section of a markdown document, heading included, or None.
+def find_heading(markdown: str, which: str) -> int | None:
+    """Index into `HEADING_RE`'s matches for `which`, or None. THE ONE MATCHER.
 
     `which` is a number — matched against numbered headings like `## 3. Failure
     handling` — or a name, matched case-insensitively as a substring of the heading
     text. A number that matches no numbered heading returns None rather than guessing
     at "the Nth heading": a wrong section delivered confidently is worse than a
     reference the asker is told did not resolve.
+
+    Split out of `extract_section` so the anchor a page links to and the section a
+    child's brief was cut from cannot disagree — §3 of
+    docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. A second matcher
+    is a child whose brief gets section 4 and whose link lands on section 5.
     """
-    heads = [(m.start(), len(m.group(1)), m.group(2)) for m in HEADING_RE.finditer(markdown)]
     want = which.strip().strip('"').lower()
-    target = None
-    for i, (_, _, text) in enumerate(heads):
-        low = text.lower()
+    for i, m in enumerate(HEADING_RE.finditer(markdown)):
+        low = m.group(2).lower()
         if want.isdigit():
             if low == want or re.match(rf"{re.escape(want)}[.):\s]", low):
-                target = i
-                break
+                return i
         elif want in low:
-            target = i
-            break
+            return i
+    return None
+
+
+def extract_section(markdown: str, which: str) -> str | None:
+    """One section of a markdown document, heading included, or None.
+
+    Matching is `find_heading`'s and nowhere else's; this adds only the slicing.
+    """
+    heads = [(m.start(), len(m.group(1)), m.group(2)) for m in HEADING_RE.finditer(markdown)]
+    target = find_heading(markdown, which)
     if target is None:
         return None
     start, level, _ = heads[target]

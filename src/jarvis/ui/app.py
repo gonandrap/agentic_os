@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, invariants, ops, specs, uilog, wiring
+from .. import bill, fleet, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -33,6 +33,7 @@ from ..project_store import (
     validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
+from . import markdown
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -747,6 +748,10 @@ def create_app() -> FastAPI:
         # Shared with `jarvis alarms` rather than spelled inline, so neither surface can
         # be the one that shows a subject-level finding as `turn -1`.
         turn_label=ops.turn_label, no_turn=NO_TURN,
+        # "What is not on this bill", worded ONCE in `bill.ABSENT_NOTES` and read by this
+        # page and `jarvis cost` both — it was spelled out in each until §10 needed a
+        # fourth sentence, and a caveat worded two ways is one the reader stops trusting.
+        absent_notes=bill.absent_notes,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,
@@ -786,6 +791,10 @@ def create_app() -> FastAPI:
         # The residual's own sentence, shared with `jarvis wo why` for the same reason:
         # a residual described in two wordings is one the reader learns to ignore.
         unexplained_note=ops.UNEXPLAINED_NOTE,
+        # The status-span view's two sentences, from `ops` and not spelled here — the
+        # CLI prints the identical words (spec §6, §7).
+        approximate_note=ops.FO_APPROXIMATE_NOTE,
+        no_trigger_phrase=ops.NO_TRIGGER_PHRASE,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",
@@ -1008,14 +1017,69 @@ def create_app() -> FastAPI:
         store = ProjectStore(ops.registered_project_paths()[detail["project"]])
         try:
             validation = ops.validation_detail(store, fo_id=fo_id)
+            # Taken in the same block, for the same reason: one connection per page
+            # (spec §7).
+            states = ops.state_durations(store, fo_id=fo_id).as_dict()
         finally:
             store.close()
+        # EACH PLAN ROW'S FRAGMENT, RESOLVED SERVER-SIDE — §5(c). Jinja would need the
+        # number-or-substring matching rule spelled a second time in HTML, where it
+        # could be neither unit-tested nor reused by the CLI; `markdown.anchor_for` is
+        # the one resolver, here as on a child's own page.
+        doc = str((detail.get("plan") or {}).get("design_doc_content") or "")
+        child_anchors = {
+            c["key"]: markdown.anchor_for(doc, str(c.get("spec_section") or "")) or ""
+            for c in (detail.get("plan") or {}).get("children", [])
+            if c.get("spec_section")
+        }
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
+                      states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"]),
                       # Already on `detail` for `jarvis fo show`; passed separately so
                       # the template reads the same name on both pages.
                       issues=detail["issues"],
                       validation=validation, error=error)
+
+    @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
+    def spec_page(request: Request, name: str, fo_id: str):
+        """THE FEATURE'S SPEC, RENDERED — §1 of
+        docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md.
+
+        Keyed on the FEATURE, never on a work order: a planner, a manager and nine
+        children would otherwise give one document ten URLs, and an anchor is only
+        useful if everyone links to the same one. A child's page gets a FRAGMENT into
+        this page, resolved when the link is built.
+
+        Three outcomes, all 200 and none a 500 — the document, a plan stored before the
+        OS snapshotted spec text, or a feature with no plan at all. `specs.plan_of`
+        returns `{}` for the last two, which is `specs.py`'s stated degradation contract.
+        """
+        paths = ops.registered_project_paths()
+        if name not in paths:
+            return render(request, "error.html",
+                          message=f"no project named {name!r} is registered")
+        store = ProjectStore(paths[name])
+        try:
+            plan = specs.plan_of(store, fo_id)
+            try:
+                fo = store.get_feature_order(fo_id)
+            except KeyError:
+                fo = {}
+        finally:
+            store.close()
+        content = str(plan.get("design_doc_content") or "")
+        repo_path = str(plan.get("design_doc") or "")
+        source = str(plan.get("design_doc_source") or "")
+        # The blob link only once it can be DERIVED, and never from a branch: a 404 on
+        # GitHub from a URL the OS assembled reads as the spec having been deleted (§6).
+        blob = (github.blob_url(paths[name], repo_path)
+                if content and repo_path and source and not source.startswith("branch ")
+                else None)
+        return render(request, "spec.html", project=name, fo_id=fo_id,
+                      title=str(fo.get("title") or ""),
+                      status=str(fo.get("status") or ""),
+                      repo_path=repo_path, source=source, blob_url=blob,
+                      body=markdown.render(content) if content else "")
 
     @app.get("/io/{name}/{io_id}", response_class=HTMLResponse)
     def improvement_order(request: Request, name: str, io_id: str, error: str = ""):
@@ -1148,12 +1212,23 @@ def create_app() -> FastAPI:
             # same reason one authority along: None keeps the line off the page for
             # every order the mechanism never looked at.
             auto_review = ops.autoreview_state(store, wo)
+            # WHETHER THIS ORDER OWES THE USER A DECISION, and where the one form goes —
+            # spec 2026-09-27-a-review-control-for-an-escalated-round §2. None keeps every
+            # control off the page, as it keeps the line out of `jarvis wo show`.
+            review = ops.review_state(store, wo)
             # WHERE THE REST OF THIS ORDER IS. The brief is deliberately only the margin
             # around a section of the feature's spec now, so a page that showed the brief
             # alone would be a page missing most of the work. `section_text` is NOT passed
             # to the template: pasting it here would re-create the duplication the whole
             # change removed — the pointer is the point.
             spec = specs.spec_of(store, wo)
+            # WHERE THAT SPEC CAN BE READ — §5(a). A second, narrow projection:
+            # `spec_of` answers None for a planner by design and keeps doing so,
+            # and a planner's page is the case that had nothing at all.
+            spec_link = specs.spec_link(store, wo)
+            # How long it has been where it is — the same document `jarvis wo show`
+            # carries, rendered by `_states.html` (spec §7).
+            states = ops.state_durations(store, wo_id=wo_id).as_dict()
         finally:
             store.close()
         show_debug = debug not in ("", "0", "false")
@@ -1171,7 +1246,8 @@ def create_app() -> FastAPI:
                       seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
-                      validation=validation, spec=spec, auto_merge=auto_merge,
+                      validation=validation, spec=spec, spec_link=spec_link,
+                      auto_merge=auto_merge,
                       merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
@@ -1181,8 +1257,8 @@ def create_app() -> FastAPI:
                       # What was said, and what happened — two readings of one record,
                       # neither derivable from the other. See `timeline`'s docstring.
                       conversation=build_conversation(events, messages),
-                      assumptions=assumptions, unreviewed=unreviewed,
-                      approvals=approvals, bill=bill,
+                      assumptions=assumptions, unreviewed=unreviewed, review=review,
+                      approvals=approvals, bill=bill, states=states,
                       turn_lines=turn_lines_by_message(bill))
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)

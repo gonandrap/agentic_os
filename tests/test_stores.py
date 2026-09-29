@@ -443,3 +443,44 @@ def test_only_db_write_transaction_opens_a_transaction():
     assert offenders == [], (
         "open transactions with `db.write_transaction`, not a bare BEGIN — its "
         "docstring says what a deferred one costs")
+
+
+# -- the per-order observability override ----------------------------------------------
+#
+# §10 of docs/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
+# nullable, and NULL is "this order has no answer" and not `off`.
+
+
+def test_the_observability_column_is_written_at_creation_and_by_the_setter(project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("stamped", observability="full")
+    assert store.get_work_order(wo["id"])["observability"] == "full"
+
+    store.set_observability(wo["id"], "off")
+    assert store.get_work_order(wo["id"])["observability"] == "off"
+
+    store.set_observability(wo["id"], None)      # clear: back to "no answer"
+    assert store.get_work_order(wo["id"])["observability"] is None
+
+    with pytest.raises(ValueError, match="observability"):
+        store.set_observability(wo["id"], "verbose")
+    with pytest.raises(ValueError, match="observability"):
+        store.create_work_order("bad level", observability="loud")
+
+
+def test_a_row_that_predates_the_column_has_no_answer_and_is_not_off(project):
+    """A pre-existing row: the column was added by `ADDED_COLUMNS`, so it is NULL — which
+    the resolver must treat as "no answer" and fall through to the config."""
+    from jarvis import observability
+    from jarvis.catalog import ObservabilityConfig
+
+    store = ProjectStore(project)
+    wo = store.create_work_order("filed before the column existed")
+    store.conn.execute("UPDATE work_orders SET observability=NULL WHERE id=?",
+                       (wo["id"],))
+    store.conn.commit()
+    row = store.get_work_order(wo["id"])
+
+    assert row["observability"] is None
+    assert observability.level_for(row, ObservabilityConfig(level="full")) == "full"
+    assert observability.records_context(row, ObservabilityConfig()) is True

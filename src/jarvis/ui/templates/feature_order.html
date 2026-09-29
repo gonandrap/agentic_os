@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% import "_validation.html" as validation_ui %}
 {% import "_issues.html" as issues_ui %}
+{% import "_states.html" as states_ui %}
 {% block title %}{{ fo.id }} — Jarvis{% endblock %}
 {% block content %}
 {# The one page where the whole feature is visible at once: the ask the user wrote, the
@@ -92,8 +93,8 @@
    top because a reader who does not know the spec exists will read twelve thin briefs
    and conclude the feature was under-specified. #}
 {% if fo.plan.design_doc %}
-<p class="sub">📄 Spec: <span class="mono">{{ fo.plan.design_doc }}</span> — each child
-  below implements one section of it.</p>
+<p class="sub">📄 Spec: <a class="mono" href="/spec/{{ project }}/{{ fo.id }}"
+  >{{ fo.plan.design_doc }}</a> — each child below implements one section of it.</p>
 {% endif %}
 {# Rendered from the stored document rather than from the children, so it keeps saying
    what was APPROVED even after the children have moved on from it. #}
@@ -103,7 +104,9 @@
     <div class="grow">
       <span class="mono">{{ c.key }}</span> <strong>{{ c.title }}</strong>
       {% if c.needs %}<span class="sub">needs {{ c.needs | join(', ') }}</span>{% endif %}
-      {% if c.spec_section %}<span class="sub">§ {{ c.spec_section }}</span>{% endif %}
+      {# The fragment is resolved SERVER-SIDE (`app.py`'s `child_anchors`): one resolver,
+         two call sites — this row and the child's own page. #}
+      {% if c.spec_section %}<span class="sub"><a href="/spec/{{ project }}/{{ fo.id }}{% if child_anchors.get(c.key) %}#{{ child_anchors[c.key] }}{% endif %}">§ {{ c.spec_section }}</a></span>{% endif %}
       <div class="sub">{{ c.description }}</div>
       {% if c.acceptance %}<div class="sub">done when: {{ c.acceptance }}</div>{% endif %}
     </div>
@@ -134,6 +137,10 @@
 {% endif %}
 
 {{ validation_ui.section(validation, 'h3') }}
+
+{# How long this feature has been where it is — the same fragment as the work-order page,
+   after the rounds (spec §7). #}
+{{ states_ui.view(states, 'h3') }}
 
 {{ issues_ui.unit(issues, 'h3') }}
 
