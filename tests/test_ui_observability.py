@@ -19,6 +19,7 @@ from jarvis import ops, uilog  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
+from jarvis.project_store import ProjectStore  # noqa: E402
 from jarvis.ui.app import create_app  # noqa: E402
 
 
@@ -233,3 +234,49 @@ def test_the_dashboards_own_refresh_poll_is_not_logged_unless_it_fails(started,
     monkeypatch.setattr(ops, "os_status", lambda: 1 / 0)
     client.get("/api/status")
     assert "[500] GET /api/status" in uilog.access_log_path().read_text()
+
+
+# -- time in each state (spec 2026-09-27-time-in-each-state §7) ----------------------
+
+@pytest.fixture()
+def browser(started):
+    return TestClient(create_app(), follow_redirects=False)
+
+
+def test_the_work_order_page_shows_time_in_state(browser, project):
+    """The fourth tab. Diagnostic, so it lives behind a tab and not above them."""
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("ship the exporter")
+        store.set_status(wo["id"], "needs_review")
+        store.add_event(wo["id"], "turn_ended")   # so both figures have a value
+    finally:
+        store.close()
+
+    page = browser.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert "Time in state" in page
+    assert "tab-states" in page
+    assert "Needs your review" in page              # a per-status row, labelled
+    assert "Queued" in page                         # and the span it came from
+    # Two figures, labelled differently: equal numbers are the common case.
+    assert "in this status" in page
+    assert "nothing on the record for" in page
+
+
+def test_the_feature_page_labels_a_coarse_span_as_approximate(browser, project):
+    """The flag, on the surface: an unlabelled coarse span is the defect Neo's ruling
+    names. A feature that predates the table is reproduced by dropping its rows — the
+    next open of the store backfills the one approximate span."""
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order("CSV export", description="the whole ask")
+        store.conn.execute("DELETE FROM wo_state_spans WHERE order_id=?", (fo["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    page = browser.get(f"/fo/proj_a/{fo['id']}").text
+
+    assert "Time in state" in page
+    assert "a feature order keeps no event trail" in page

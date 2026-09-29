@@ -573,7 +573,7 @@ def test_an_escalation_is_not_an_empty_speech_bubble():
 
 
 def test_every_alarm_status_has_a_reading_a_person_can_use():
-    """All seven, because the supervisor ships OFF and `raised` is therefore the common
+    """All eight, because the supervisor ships OFF and `raised` is therefore the common
     case — an example built from `acked` alone would grade the interesting one only.
     The ids are asserted too: they are what makes the line reachable rather than a
     count of things the reader cannot open."""
@@ -583,10 +583,10 @@ def test_every_alarm_status_has_a_reading_a_person_can_use():
     assert set(ALARM_STANDING) == set(ALARM_STATUSES)
     alarms = [{"id": f"al-{i}", "status": s} for i, s in enumerate(ALARM_STATUSES)]
     assert alarm_standing_line(alarms) == (
-        "7 (1 raised, 1 with the supervisor, 1 acked by the supervisor, "
-        "1 escalated to Neo, 1 a remedy proposed, 1 not reviewed, "
-        "1 supervisor failed) — "
-        "al-0, al-1, al-2, al-3, al-4, al-5, al-6")
+        "8 (1 raised, 1 a note, never escalated, 1 with the supervisor, "
+        "1 acked by the supervisor, 1 escalated to Neo, 1 a remedy proposed, "
+        "1 not reviewed, 1 supervisor failed) — "
+        "al-0, al-1, al-2, al-3, al-4, al-5, al-6, al-7")
     assert alarm_standing_line([{"id": "al-1a2b", "status": "acked"},
                                 {"id": "al-3c4d", "status": "escalated"}]) == (
         "2 (1 acked by the supervisor, 1 escalated to Neo) — al-1a2b, al-3c4d")
@@ -721,3 +721,24 @@ def test_an_auto_review_event_with_no_reason_still_says_something():
     ], [])
 
     assert all(e["detail"] == "no reason recorded" for e in entries), entries
+
+
+def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
+    """docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4, Neo's
+    second condition: a round the OS did NOT spend must be auditable from `jarvis wo show`
+    alone, and a refusal has to say which of the two proofs failed — "someone resolved a
+    conflict" and "the daemon could not reach GitHub" are different news."""
+    carried, refused = build_timeline({}, [
+        ev("validation_head_carried", 1.0, cause="base_merge_chain", round=1,
+           judged_sha="709582ae53000000", carried_head_sha="c2120424ba000000",
+           base="main", chain=["1a2b3c4d5e", "2b3c4d5e6f"], patch_id="b7f0deadbeef"),
+        ev("validation_carry_refused", 2.0, proof="patch_id", round=1,
+           judged_sha="709582ae53000000", head_sha="c2120424ba000000",
+           detail="the branch's own diff changed"),
+    ], [])
+
+    assert carried["label"] == "Verdict carried to the new head"
+    assert "709582ae53" in carried["detail"] and "c2120424ba" in carried["detail"]
+    assert "2 merge(s) of main" in carried["detail"]
+    assert refused["label"] == "Verdict not carried — re-judging"
+    assert "c2120424ba" in refused["detail"] and "resolved content" in refused["detail"]
