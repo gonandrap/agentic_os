@@ -2402,6 +2402,41 @@ def signin(tmp_path, monkeypatch):
     return sign_in
 
 
+#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout.
+FIXTURE_BASE_TIP = "ba5e11d000000000000000000000000000000f00"
+
+
+@pytest.fixture()
+def local_base(monkeypatch):
+    """What the local checkout answers about the base. Returns the state, to be changed.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1:
+    a merge re-reads `origin/<base>` and refuses if the judged head does not contain it.
+    The `project` fixture has no `origin`, so real git refuses and NOTHING would ever
+    merge in a test — this is the fresh, up-to-date base that used to be implied.
+
+    THE ONE FAKE OF `branchproof` FOR THE WHOLE SUITE — every test that needs the local
+    checkout's answers builds on this rather than re-patching the three functions.
+    `contains` is what the judged head carries: empty is a branch behind its base, which
+    is the incident's shape. `base_ancestors` is proof (a) item 6's other question — was
+    this a BASE merge — and None means yes to all of them.
+    """
+    from . import branchproof
+
+    state = {"fetch": True, "tip": FIXTURE_BASE_TIP, "contains": {FIXTURE_BASE_TIP},
+             "base_ancestors": None}
+
+    def is_ancestor(repo, ancestor, descendant):
+        if str(descendant).startswith("origin/"):
+            return state["base_ancestors"] is None or ancestor in state["base_ancestors"]
+        return ancestor in state["contains"]
+
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
+    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
+    monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
+    return state
+
+
 @pytest.fixture()
 def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")

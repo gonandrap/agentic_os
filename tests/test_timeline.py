@@ -122,6 +122,20 @@ def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
     assert entry["detail"] == "the merge command did not complete: timeout"
 
 
+def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
+    """Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything, so the sentence
+    has to name BOTH commits — the one a round passed on and the one the base is at —
+    because "the merge was refused" about an unmoved head is what gate 308's reviewer was
+    told and could not act on."""
+    entry = build_timeline({}, [ev("automerge_base_stale", 1.0, head_sha="fa85f88ccd0",
+                                   base="main", base_oid="37fe650fab0", round=2,
+                                   reason="the base moved")], [])[0]
+    assert entry["label"] == "Merge refused — the base moved under it"
+    assert "round 2 passed on fa85f88ccd" in entry["detail"]
+    assert "main is now at 37fe650fab" in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [

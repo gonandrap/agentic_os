@@ -1409,6 +1409,15 @@ ADDED_COLUMNS = {
         # `pending`). The one reader is `gate_open_at`; §4 of
         # docs/superpowers/specs/2026-09-19-an-attempt-the-worker-could-not-make.md.
         "pending_at": "REAL",
+        # THE BASE THIS REQUEST WAS FILED AGAINST — spec 2026-09-28 §3.5. A column and
+        # not only the `automerge_proposed` payload: the sweep asks "has this pending
+        # request's base moved" of every pending `auto_merge` row on every tick and
+        # already holds the row, so a payload field would make it a timeline scan per
+        # gate per tick.
+        #
+        # `''` MEANS "THIS REQUEST RECORDS NO BASE" — every approval written before this
+        # and every gate kind that has no base. `validation_rounds.head_sha`'s discipline.
+        "base_oid": "TEXT NOT NULL DEFAULT ''",
     },
     # An alarm can name a FEATURE ORDER as its subject and a health probe as its source.
     # All four are additive with defaults and no CHECK: `_migrate` runs inside
@@ -4907,17 +4916,19 @@ class ProjectStore:
                      max_uses: int = 3,
                      agent_type: str | None = None,
                      status: str = "pending",
-                     contested: bool = False) -> dict[str, Any]:
+                     contested: bool = False,
+                     base_oid: str = "") -> dict[str, Any]:
         now = db.now()
         cur = self.conn.execute(
             """INSERT INTO approvals (wo_id, ts, kind, command, matched, justification,
                                       evidence, max_uses, agent_type, status, contested,
-                                      pending_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                      pending_at, base_oid)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             # `pending_at` iff it is pending from birth: an `awaiting_case` row gets one
             # in `start_review` or never at all.
             (wo_id, now, kind, command, matched, justification, evidence, max_uses,
-             agent_type, status, int(contested), now if status == "pending" else None),
+             agent_type, status, int(contested), now if status == "pending" else None,
+             base_oid),
         )
         approval_id = int(cur.lastrowid)  # type: ignore[arg-type]
         self.add_event(wo_id, "gate_requested", {
@@ -4932,6 +4943,8 @@ class ProjectStore:
             # In the payload as well as the column: the timeline is read on its own, and
             # "the planner ran this" is exactly the wrong thing for it to imply.
             **({"agent_type": agent_type} if agent_type else {}),
+            # Spec 2026-09-28 §3.5: only when there is one — `''` is "no base recorded".
+            **({"base_oid": base_oid} if base_oid else {}),
         })
         return self.get_approval(approval_id)  # type: ignore[return-value]
 

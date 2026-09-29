@@ -1247,7 +1247,7 @@ def merge_gate(store, wo_id: str) -> None:
 
 
 def test_an_order_with_an_assumption_reaches_merged_with_nobody_typing_anything(
-        started, fake_gh):
+        started, fake_gh, local_base):
     """THE WHOLE POINT, end to end: assumption -> Neo -> settled -> parked -> gate ->
     merged, and no `automerge` condition was weakened to get there. Condition 3 passes
     because the assumption is genuinely no longer pending."""

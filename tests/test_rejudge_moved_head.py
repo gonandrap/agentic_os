@@ -196,7 +196,7 @@ def rounds_of(store, wo) -> list[int]:
 
 
 def test_the_head_the_os_moved_is_re_judged_and_the_pull_request_then_merges(
-        fleet, project, fake_gh):
+        fleet, project, fake_gh, local_base):
     """THE WHOLE BUG. The conflict resolution moved the head past the verdict; nothing
     used to re-open a round, so the order sat green and unmerged until a person noticed.
 
@@ -750,7 +750,8 @@ def test_the_carry_runs_with_no_rounds_left_and_a_decline_already_written(
 
 
 def test_the_stranded_blocker_falls_by_itself_on_the_tick_after_the_carry(
-        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof):
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof,
+        local_base):
     """§6 item 4. Attention is re-derived every tick, so nothing has to be acked and
     nothing has to be forced: the carry binds a verdict to the head, `rejudge_exhausted`
     stops being true at its last clause, and the flag goes down on its own."""
@@ -1031,10 +1032,11 @@ def test_a_non_merge_head_change_past_the_cap_still_goes_to_the_user(
 
 
 def test_a_passing_rebind_arms_the_merge(tmp_path, project, jarvis_home, fake_claude,
-                                         fake_gh):
+                                         fake_gh, local_base):
     """§5 test 2. The point of the exemption is a pull request that MERGES: the rebind
     binds a verdict to the head the OS's own merge produced, so `decide` arms on it and
     nobody was asked for anything."""
+    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4.
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     artifact(fake_gh, head_oid=PUSHED)
@@ -1334,9 +1336,10 @@ def test_a_fix_after_a_rejected_user_rework_round_is_an_ordinary_round(
 
 
 def test_a_passing_user_rework_round_arms_the_merge(tmp_path, project, jarvis_home,
-                                                    fake_claude, fake_gh):
+                                                    fake_claude, fake_gh, local_base):
     """The point of the exemption is a pull request that MERGES: the rework the user
     asked for is judged past the budget, passes, and the OS asks for the gate."""
+    # local_base: spec 2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.2/§3.4.
     fleet = boot(tmp_path, project, max_rounds=3)
     store, wo = parked(project, rounds=3)
     _user_rejected(store, wo)

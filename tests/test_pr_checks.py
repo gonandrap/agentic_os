@@ -402,7 +402,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
 
 def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
-        started, project, fake_gh, parked, monkeypatch):
+        started, project, fake_gh, parked, monkeypatch, local_base):
     """SPEC 2026-09-27 §7 TEST 19: the carry's extra reads happen on a `sha_moved` tick and
     on no other. A green, up-to-date pull request whose verdict covers its head pays the
     base budget, no `gh api` commit walk and no local diff — so the price of the feature is
@@ -430,6 +430,8 @@ def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
     store.close_validation_round(row["id"], "passed", "")
     fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
                    merge_state="CLEAN", head_oid=judged, base_oid=judged)
+    # Up to date: the checkout agrees the head carries the base (spec 2026-09-28 §3.2).
+    local_base.update({"tip": judged, "contains": {judged}})
     poll(started, store)                 # the merge is proposed on this one
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)

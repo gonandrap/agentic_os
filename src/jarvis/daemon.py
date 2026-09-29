@@ -5317,7 +5317,7 @@ class Daemon:
         not be merged must leave the work order exactly where it was, and "exactly where
         it was" is the behaviour the whole feature is an optimisation over.
         """
-        from . import automerge, ops
+        from . import automerge, branchproof, ops
 
         cfg = project.validation
         if not (cfg.enabled and cfg.auto_merge):
@@ -5339,11 +5339,20 @@ class Daemon:
         # §2.4). Nothing is poked when it clears: the next poll re-decides from scratch.
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
+        # Spec 2026-09-28 §3.2. NO FETCH PER TICK, and `pr.base_oid` on purpose. That read
+        # is wrong in BOTH directions: it UNDER-reports while GitHub's cache lags, and it
+        # OVER-reports for ever on a checkout that does not have `pr.base_oid` at all
+        # (ancestry unanswerable reads as behind). So this hold is a cheap early stop and
+        # never the safety property. The safety property is the pair that fetches — the
+        # pre-propose catch-up and `automerge.apply`'s precondition — and no merge reaches
+        # GitHub without passing the second.
+        base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
+                       if ops.catch_up_needed(pr, repo=project.path) else None)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red)
+            base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec
             # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md
@@ -5360,16 +5369,65 @@ class Daemon:
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions)
+            if not decision.armed and not record_only \
+                    and decision.code == automerge.HELD_BASE_MOVED:
+                # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2, §3.6):
+                # the base fact outranks every condition below it, so the armed path can
+                # no longer be reached while the branch is behind. Both ways of being
+                # behind arrive here — GitHub's own `BEHIND`, and the ancestry answer it
+                # reports CLEAN for. The hold is written from the OUTCOME rather than
+                # from `decision`, so it says which guard refused.
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome == ops.CATCH_UP_NOT_NEEDED:
+                    # THE FETCHED READ WINS, AND NOT DECIDING HERE WOULD STALL FOR EVER.
+                    # The pre-`decide` fact is unfetched, so a checkout that does not have
+                    # `pr.base_oid` at all cannot answer the ancestry question and reads as
+                    # BEHIND on every tick (`ops.catch_up_needed`) — a persistent
+                    # OVER-report, not the transient under-report §3.2 assumed. Returning
+                    # on it held a mergeable pull request for ever, silently.
+                    #
+                    # AND THE CHEAP FACT IS DROPPED WITH IT: §3.6's supersede below reads
+                    # it, so leaving it set withdraws a healthy pending request.
+                    base_behind = None
+                    log.debug("[%s] %s: the fetched base contradicts the poll's reading "
+                              "— base_oid %s, behind=%s, and the head already contains "
+                              "the tip; deciding without it", project.name, wo_id,
+                              str(getattr(pr, "base_oid", "") or "")[:10] or "unknown",
+                              bool(getattr(pr, "behind", False)))
+                    decision = automerge.decide(
+                        round_row, wo, pr, cfg,
+                        validated_head=store.validated_head(round_row),
+                        pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                        base_red=base_red)
+                else:
+                    # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a
+                    # base that has moved, so its CI evidence no longer describes what the
+                    # merge would land on. Superseded, never answered — and its command
+                    # names the old sha, so the catch-up orphans nothing that could still
+                    # have landed (§3.1). AFTER the outcome, so a base that turned out not
+                    # to have moved withdraws nothing.
+                    #
+                    # A FETCHED BASE FACT OR NONE AT ALL, and a deferral is retried rather
+                    # than withdrawn (spec 2026-09-28 §3.6 / Amendment E).
+                    moved = bool(caught.base_tip) and ops.catch_up_needed(
+                        pr, repo=project.path, base_tip=caught.base_tip)
+                    judged = store.validated_head(round_row) or ""
+                    filed = (store.latest_approval_for(
+                        wo_id, automerge.GATE_KIND,
+                        automerge.merge_command(str(wo.get("pr_url") or ""), judged))
+                        if judged else None)
+                    if (moved and caught.outcome != ops.CATCH_UP_DEFERRED
+                            and filed is not None
+                            and filed["status"] in ("pending", "awaiting_case")):
+                        self._supersede_stale_request(store, filed, pr,
+                                                      base_tip=caught.base_tip)
+                    # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
+                    return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
-                if (not record_only
-                        and decision.code == automerge.HELD_MERGE_STATE_UNCLEAN
-                        and str(getattr(pr, "merge_state", "") or "").upper() == "BEHIND"):
-                    # GitHub said BEHIND outright — the rarer half of §5.1, and the only
-                    # one `decide` can see. The commoner one reports CLEAN and is caught
-                    # on the armed path below, by ancestry.
-                    self._catch_up_with_base(project, store, wo, pr)
-                    return
                 if (not record_only and decision.code == automerge.HELD_SHA_MOVED
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
@@ -5392,10 +5450,25 @@ class Daemon:
             # live grant would orphan a permission Neo already gave and silently ask for
             # another. A head the OS moved is not decided on this tick: the next one
             # re-reads it, waits out its CI and carries the verdict across (§3).
-            caught_up = self._catch_up_with_base(project, store, wo, pr)
-            if caught_up.head_oid != pr.head_oid:
+            #
+            # ANYTHING BUT "NOT NEEDED" HOLDS (spec 2026-09-28 §3.4). The old test was
+            # `caught_up.head_oid != pr.head_oid`, which read a guard's refusal as "already
+            # up to date" and fell through to `propose` — gate 308's defect.
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                self._note_automerge_held(
+                    store, wo_id,
+                    automerge.held_base_moved(caught, pr, caught.base_tip))
                 return
         if approval is not None and approval["status"] != "approved":
+            # A PENDING REQUEST WHOSE BASE HAS MOVED IS SUPERSEDED, NEVER ANSWERED (spec
+            # 2026-09-28 §3.6): the CI evidence in it no longer describes what the merge
+            # would land on, so nothing is authorised and nothing is refused.
+            if (approval["status"] in ("pending", "awaiting_case")
+                    and base_behind is not None):
+                self._supersede_stale_request(store, approval, pr)
+                return
             # Filed and not granted: pending with Neo, escalated to the user, denied,
             # expired. Every one of those is somebody's business and none of them is
             # this loop's — and `propose` would refuse anyway, after opening a NeoStore
@@ -5417,7 +5490,9 @@ class Daemon:
                 automerge.propose(store, neo_store, project.name, wo, decision,
                                   # Whole, with each conclusion — spec 2026-09-24 fix 2.
                                   checks=pr.checks,
-                                  protection=self._protection_fact(project, pr))
+                                  protection=self._protection_fact(project, pr),
+                                  # The base it was filed against — spec 2026-09-28 §3.5.
+                                  pr=pr)
             finally:
                 neo_store.close()
             return
@@ -5426,7 +5501,23 @@ class Daemon:
         # `automerge.attempts` for why spec §8's counter would enforce nothing.
         try:
             merged = automerge.apply(store, wo, decision.judged_sha, approval,
-                                     cwd=project.path)
+                                     cwd=project.path, base_ref=pr.base_ref)
+        except automerge.StaleBase as exc:
+            # THE BASE MOVED UNDER THE JUDGED COMMIT (spec 2026-09-28 §3.1). News, unlike
+            # its parent: recorded once per (head, base tip) and answered with a catch-up.
+            # No grant was spent — the check ran before `gates.open_gate`.
+            log.info("[%s] auto-merge of %s refused: %s", project.name, wo_id, exc)
+            tip = branchproof.tip(project.path, f"origin/{pr.base_ref}")
+            if tip not in ops.stale_base_bases(store, wo_id, decision.judged_sha):
+                store.add_event(wo_id, ops.MERGE_BASE_STALE_EVENT, {
+                    "head_sha": decision.judged_sha, "base": pr.base_ref,
+                    "base_oid": tip, "round": decision.round_n,
+                    "approval_id": approval["id"],
+                    "reason": str(exc), "pr_url": wo.get("pr_url")})
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            self._note_automerge_held(store, wo_id,
+                                      automerge.held_base_moved(caught, pr, tip))
+            return
         except automerge.MergeFailed as exc:
             # It reached GitHub and GitHub said no. Counted, recorded and — once per
             # commit — reported.
@@ -6482,7 +6573,7 @@ class Daemon:
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:
-        """Merge the base into this branch, when it is behind. Returns the head to decide on.
+        """Merge the base into this branch, when it is behind. Returns an `ops.CatchUp`.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5. The
         OS's own gate reviewer refuses a merge whose CI ran against a base behind `main`,
@@ -6490,10 +6581,24 @@ class Daemon:
         exactly that reason — so the move is compulsory and the OS may as well make it,
         now that §3's carry means it costs no round.
 
-        **RETURNS THE RE-READ `PullRequest`**, `heal_inherited_failure`'s contract and for
-        its reason: the caller must decide against the head the update produced, not the
-        one it replaced. The pull request it was given comes back unchanged whenever
-        nothing happened, which is the ordinary answer.
+        **IT RETURNS AN OUTCOME AND NOT A PULL REQUEST** (spec 2026-09-28 §3.4, issue
+        #837). The old return type could not tell "already up to date" from "behind and I
+        could not fix it this tick", so the caller's `head_oid` comparison read every
+        refusal as up to date and fell straight through to `automerge.propose` — which is
+        how gate 308 asked Neo to merge a commit that did not contain `main`'s tip.
+        `CatchUp.pr` is the pull request to decide against: the one it was given, unchanged
+        unless the update ran (`heal_inherited_failure`'s contract, for its reason).
+
+        **THE BASE TIP IS READ LOCALLY, AFTER THE FETCH, AND IT IS THE KEY** (Amendment B).
+        `pr.base_oid` is GitHub's cached `baseRefOid`; on the measured incident it lagged
+        the real tip of `main` by three commits and 5.3 hours, so the ancestry test said
+        "up to date" and `ops.base_heal_spent` was keyed on a commit that was not the base.
+        Every one of the three now uses the freshly-read tip.
+
+        The guard order differs from §3.4's table in one place, and deliberately: "not
+        needed" is judged BEFORE the two spending guards. Keyed on the fresh tip, a branch
+        that is already up to date must never read as `EXHAUSTED` — that outcome never
+        clears on its own and would park a mergeable pull request for ever.
 
         **THE SEVEN GUARDS ARE §5.3 AND EVERY ONE OF THEM DEFERS RATHER THAN DROPS.** In
         order, cheapest first: a turn in flight or an undelivered message (never move the
@@ -6515,25 +6620,36 @@ class Daemon:
         wo_id = wo["id"]
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
-        base_oid = str(getattr(pr, "base_oid", "") or "")
         if not base or not pr_url:
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               "the work order records no pull request or no base branch")
         if (worker_session.busy(store, wo_id) or store.queued_messages(wo_id)
                 or store.validation_round_open(wo_id)):
             log.debug("[%s] %s is in flight — catching up with %s deferred",
                       project.name, wo_id, base)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_DEFERRED,
+                               "the turn, message or validation round in flight")
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            # logged there, with the refs it asked for
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the checkout could not fetch `{base}`")
+        base_oid = branchproof.tip(project.path, f"origin/{base}")
+        # Every return from here down carries the FETCHED tip — the caller's reasons quote
+        # it and never `pr.base_oid` (spec 2026-09-28 §3.1).
+        if not ops.catch_up_needed(pr, repo=project.path, base_tip=base_oid):
+            return ops.CatchUp(pr, ops.CATCH_UP_NOT_NEEDED, "", base_tip=base_oid)
         if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"this branch has already been rebuilt against "
+                               f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
             log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
                       project.name, wo_id, base, ops.CATCH_UP_MAX)
-            return pr
-        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
-        if not branchproof.fetch(project.path, base, pull_ref):
-            return pr           # logged there, with the refs it asked for
-        if not ops.catch_up_needed(pr, repo=project.path):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
+                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
         # at the top of the poll, and a worker turn can end and push in the meantime. The
@@ -6544,13 +6660,16 @@ class Daemon:
         except github.GitHubError as e:
             log.debug("[%s] could not re-read %s before catching it up: %s",
                       project.name, pr_url, e)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the OS could not re-read the pull request: {e.reason}",
+                               base_tip=base_oid)
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo_id)) or ""
         head_before = fresh.head_oid
         if not head_before or head_before != judged:
-            return fresh
-        base_oid = fresh.base_oid or base_oid
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               "the push that moved the head off the judged commit",
+                               base_tip=base_oid)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6559,7 +6678,7 @@ class Daemon:
             ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
                                           reason=e.reason,
                                           cause=ops.BASE_UPDATE_BEHIND)
-            return fresh
+            return ops.CatchUp(fresh, ops.CATCH_UP_FAILED, e.reason, base_tip=base_oid)
         try:
             fresh = github.pr_view(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6574,7 +6693,7 @@ class Daemon:
         log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
                  project.name, pr_url, base, base_oid[:10], head_before[:10],
                  fresh.head_oid[:10])
-        return fresh
+        return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
                             wo: dict, decision: Any, *, rebind: bool = False) -> None:
@@ -6637,6 +6756,45 @@ class Daemon:
                      pr.base_ref, exc)
             protection = automerge.PROTECTION_UNREADABLE
         return automerge.protection_fact(protection, pr.base_ref)
+
+    def _supersede_stale_request(self, store: ProjectStore, approval: dict,
+                                 pr: Any, *, base_tip: str = "") -> None:
+        """Close a pending merge request whose base has moved. Spec 2026-09-28 §3.6.
+
+        `base_tip` is a tip read LOCALLY, after a fetch, and the reason names a commit
+        only when one is passed: `pr.base_oid` is the cached read this whole spec
+        establishes is untrustworthy, so it is never quoted. `approval["base_oid"]` still
+        is — that one is a recorded fact about the request.
+
+        NEVER A VERDICT: nothing is authorised and nothing is refused, because the CI
+        evidence in the request stopped describing what the merge would land on. The
+        command string stays blocked, so the next tick catches the branch up and files a
+        fresh request on the new commit.
+
+        `supersede_approval` is a NO-OP on anything already decided, which is what makes
+        the race safe: Neo can answer between the read and the write, and then
+        `automerge.apply`'s precondition is what stops the merge instead. A Neo question
+        that was already answered returns False from `supersede` for the same reason —
+        `gates.open_gate` is the precedent.
+        """
+        from .neo_store import NeoStore
+
+        base = str(getattr(pr, "base_ref", "") or "the base")
+        moved = f" to {base_tip[:10]}" if base_tip else ""
+        reason = (f"`{base}` has moved{moved} "
+                  f"since this request was filed against "
+                  f"{str(approval['base_oid'] or '')[:10] or 'an unrecorded base'}; the "
+                  f"CI evidence in it no longer describes what this merge would land on. "
+                  f"Nothing is authorised and nothing is refused — the OS catches the "
+                  f"branch up and files a fresh request on the new commit.")
+        store.supersede_approval(approval["id"], reason)
+        if approval["neo_question_id"]:
+            neo_store = NeoStore()
+            try:
+                neo_store.supersede(approval["neo_question_id"],
+                                    f"SUPERSEDED — `{base}` moved", reason)
+            finally:
+                neo_store.close()
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
