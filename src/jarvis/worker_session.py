@@ -485,6 +485,65 @@ def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
                    resume=True, worktree=None, cwd=cwd)
 
 
+#: The source a relaunch queued behind a compaction carries (`compact_then_resume`).
+RESUME_SOURCE = "jarvis"
+
+
+def resume_compaction_due(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                          pause: "TurnPause", min_context: int | None,
+                          now: float | None = None) -> Compaction | None:
+    """Should a PAUSED turn's relaunch go out behind a compaction? (issue #843)
+
+    `compaction_due` refuses every paused turn, for two reasons it states: the relaunch
+    nudge claims the conversation is intact, and a compact turn behind a paused one
+    erases the pause. `compact_then_resume` answers both — the relaunch is QUEUED as an
+    ordinary message before the compaction starts, and it says the conversation was
+    compacted — so the one question left is the cost one, answered exactly as
+    `compaction_due` answers it: the cache has expired (always true after a usage-limit
+    window, which lasts hours) and the conversation is over the floor.
+
+    Never for a paused compaction (re-send the `/compact` itself), and the size is the
+    last turn that MEASURED one — a turn refused before it reached the model records
+    none. A measured size over the floor is also the proof that there is a conversation
+    to summarise: an opening turn refused before it ran measured nothing.
+    """
+    if min_context is None or pause.turn["kind"] == COMPACT_TURN:
+        return None
+    ended = pause.turn.get("ended_at") or pause.turn["started_at"]
+    age = (time.time() if now is None else now) - ended
+    if age < usage.WRITE_TTL_SECONDS:
+        return None
+    context = 0
+    for turn in store.recent_turns(wo["id"], limit=MAX_RATE_LIMIT_RETRIES + 4):
+        context = turn_context(turn)
+        if context:
+            break
+    if context < min_context:
+        return None
+    return Compaction(age=age, context=context)
+
+
+def compact_then_resume(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                        pause: "TurnPause", due: Compaction) -> dict[str, Any]:
+    """Queue the paused turn's relaunch, then compact; delivery sends it afterwards.
+
+    WHAT IS QUEUED is what `retry` would have sent, with one honest change: a turn that
+    reached the model is told its conversation was compacted rather than that it is
+    intact. A turn refused before it ran is queued verbatim — the worker never saw it.
+    The queued message is held while the compaction runs (the order is busy) and goes
+    out on the tick after it settles, into a summarised, warm conversation.
+    """
+    turn = pause.turn
+    prompt = (_nudge_after_compaction(pause) if _reached_model(turn)
+              else turn["prompt"])
+    msg_id = store.queue_message(wo["id"], prompt, source=RESUME_SOURCE)
+    store.add_event(wo["id"], "resume_compacting", {
+        "retried_seq": turn["seq"], "msg_id": msg_id, "reason": pause.reason,
+        "context": due.context, "idle_seconds": round(due.age),
+    })
+    return compact(store, project, wo, due)
+
+
 def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
                        turn: dict[str, Any], result: claude_cli.TurnResult) -> None:
     """Put the compaction's outcome on the timeline and its cost on the bill.
@@ -1254,6 +1313,28 @@ def _nudge(pause: TurnPause) -> str:
         "Carry on from there and finish that turn. Do not start again and do not "
         "repeat work that is already done; re-check the state on disk first if you "
         "are unsure how far you got."
+    )
+
+
+def _nudge_after_compaction(pause: TurnPause) -> str:
+    """`_nudge`, for a relaunch that goes out behind a compaction (issue #843).
+
+    The one sentence `_nudge` cannot say here is "the conversation above is intact": the
+    OS summarised it while it waited, because re-sending it whole after the cache expired
+    would have cost more than the summary. The worker is told so, and told to trust the
+    disk over its memory of details the summary may have dropped.
+    """
+    what = ("Claude's usage limit was reached" if pause.reason == PAUSE_USAGE_LIMIT
+            else "the Claude API failed" if pause.reason == PAUSE_TRANSIENT
+            else "the work order was paused")
+    return (
+        f"[Jarvis] Your previous turn was cut short because {what}. This was the "
+        "transport, not anything you or the work did. While the conversation waited, "
+        "its prompt cache expired, so the OS COMPACTED it: the summary above stands in "
+        "for the earlier transcript. Nothing you did on disk was lost. Continue from "
+        "where the summary says you were and finish that turn. Do not start again; "
+        "re-check the state on disk (git status, git log, the files you were editing) "
+        "before redoing anything the summary may not mention."
     )
 
 
