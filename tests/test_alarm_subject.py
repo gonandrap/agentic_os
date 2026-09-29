@@ -356,11 +356,15 @@ def test_the_two_hand_maintained_event_vocabularies_agree():
 def test_the_values_later_sections_write_are_declared_here():
     """Declared now, including the ones nothing in this diff writes: two sections
     editing the same tuple is a conflict for no reason. `update_alarm` asserts against
-    these tuples, so a missing value is a sibling's assertion failure, not a bad row."""
+    these tuples, so a missing value is a sibling's assertion failure, not a bad row.
+
+    `invariant` joined `ALARM_SOURCES` for the same reason: a finding raised by a
+    post-condition (`invariants.check_undeclared_delivery`) rather than by a model or by
+    a cost reading, and the source is what tells the reader which of the three it was."""
     from jarvis.project_store import (ALARM_SOURCES, ALARM_STATUSES, ALARM_SUBJECTS,
                                       ALARM_VERDICTS)
 
     assert "proposed" in ALARM_STATUSES
     assert "propose" in ALARM_VERDICTS
     assert ALARM_SUBJECTS == ("work_order", "feature_order")
-    assert ALARM_SOURCES == ("cost", "health")
+    assert ALARM_SOURCES == ("cost", "health", "invariant")
