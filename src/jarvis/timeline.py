@@ -733,6 +733,16 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
     if kind == "automerge_command_unfinished":
         return ("The merge command never finished — GitHub says the merge landed",
                 (p.get("reason") or "")[:200])
+    # Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything.
+    if kind == "automerge_base_stale":
+        head = str(p.get("head_sha") or "")
+        base = str(p.get("base") or "the base")
+        oid = str(p.get("base_oid") or "")
+        return ("Merge refused — the base moved under it",
+                f"round {p.get('round') or '?'} passed on "
+                f"{head[:10] or 'an unknown commit'}, and {base} is now "
+                f"at {oid[:10] or 'a commit the OS could not read'}, which that commit "
+                f"does not contain — catching the branch up instead")
     # THE TRACKER SIDE OF THE RECORD (issue #240). `issues.record_applied` writes one of
     # these three after — and only after — GitHub accepted the change, so each is the
     # evidence that a claim on the public tracker is now true. The timeline is their only

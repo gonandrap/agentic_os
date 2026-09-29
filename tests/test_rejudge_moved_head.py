@@ -196,7 +196,7 @@ def rounds_of(store, wo) -> list[int]:
 
 
 def test_the_head_the_os_moved_is_re_judged_and_the_pull_request_then_merges(
-        fleet, project, fake_gh):
+        fleet, project, fake_gh, local_base):
     """THE WHOLE BUG. The conflict resolution moved the head past the verdict; nothing
     used to re-open a round, so the order sat green and unmerged until a person noticed.
 
@@ -750,7 +750,8 @@ def test_the_carry_runs_with_no_rounds_left_and_a_decline_already_written(
 
 
 def test_the_stranded_blocker_falls_by_itself_on_the_tick_after_the_carry(
-        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof):
+        tmp_path, project, jarvis_home, fake_claude, fake_gh, local_proof,
+        local_base):
     """§6 item 4. Attention is re-derived every tick, so nothing has to be acked and
     nothing has to be forced: the carry binds a verdict to the head, `rejudge_exhausted`
     stops being true at its last clause, and the flag goes down on its own."""

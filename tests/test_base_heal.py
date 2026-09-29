@@ -392,7 +392,7 @@ def test_a_pull_request_with_no_session_is_healed_too(started, project, fake_gh)
 
 
 def test_the_heal_carries_the_verdict_and_the_pull_request_actually_merges(
-        started, project, fake_gh):
+        started, project, fake_gh, local_base):
     """END TO END, AND THIS IS THE ACCEPTANCE THAT MATTERS. A test stopping at "CI went
     green" passes on an implementation that leaves the pull request held `sha_moved`,
     which is what happened by hand on production: PR #280 judged 709582ae53, head moved
@@ -744,7 +744,7 @@ def refusals(store, wo) -> list[str]:
 
 
 def test_two_base_merges_in_a_row_carry_the_verdict_and_cost_no_round(
-        started, project, fake_gh, local_proof):
+        started, project, fake_gh, local_proof, local_base):
     """THE WHOLE FEATURE. `main` was merged in twice — by a worker clearing a conflict, by
     the user pressing "Update branch", it does not matter — so the head is two commits
     past the one round 1 read. Today that costs a round, and on the last one it strands

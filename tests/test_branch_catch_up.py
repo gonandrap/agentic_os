@@ -63,10 +63,15 @@ def local_proof(monkeypatch):
     its base, which is the state this whole file is about.
     """
     state = {"id": "b7f0deadbeef", "fetch": True, "contains": set(),
-             "base_ancestors": None}
+             "base_ancestors": None, "tip": BASE_OID}
 
     def fetch(repo, *refs):
         return state["fetch"]
+
+    def tip(repo, ref):
+        # Spec 2026-09-28 §3.1: what `origin/<base>` is at LOCALLY, after the fetch —
+        # the authoritative reading, and the one `pr.base_oid` lagged on gate 308.
+        return state["tip"]
 
     def diff_fingerprint(repo, base_ref, sha):
         return state["id"]
@@ -77,6 +82,7 @@ def local_proof(monkeypatch):
         return ancestor in state["contains"]
 
     monkeypatch.setattr(branchproof, "fetch", fetch)
+    monkeypatch.setattr(branchproof, "tip", tip)
     monkeypatch.setattr(branchproof, "diff_fingerprint", diff_fingerprint)
     monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
     return state
@@ -170,9 +176,9 @@ def test_a_head_that_already_carries_the_base_commit_is_left_alone(
 
 def test_a_pull_request_github_calls_behind_is_caught_up_from_the_held_path(
         started, project, fake_gh, local_proof):
-    """THE OTHER ARM, §5.2's first bullet — the rarer half, and the only one `decide` can
-    see. GitHub says BEHIND outright, so the hold is `merge_state_unclean` and the catch-up
-    fires from the held path rather than from in front of the approval lookup.
+    """THE OTHER ARM, §5.2's first bullet — the rarer half. GitHub says BEHIND outright,
+    and since spec 2026-09-28 §3.2 both halves hold on `base_moved` and catch up from the
+    held path: the base fact outranks every condition below it.
 
     The head already CARRIES the base commit here, so ancestry says up to date and `.behind`
     is the only thing left saying otherwise: an implementation that dropped the cheap
@@ -194,7 +200,9 @@ def test_a_pull_request_github_calls_behind_is_caught_up_from_the_held_path(
     # reader sees why the branch was moved (§3.5's first ordering note keeps that order).
     held = [db.from_json(e["payload"], {})
             for e in store.events_of_kind(wo["id"], "automerge_held")]
-    assert [h["code"] for h in held] == ["merge_state_unclean"]
+    # DONE, not a refusal: the sentence says the head moved and CI is running on it.
+    assert [h["code"] for h in held] == ["base_moved"]
+    assert "caught up with `main`" in held[0]["reason"]
     assert store.list_approvals(wo["id"]) == []
 
 
@@ -281,8 +289,8 @@ def test_an_open_validation_round_defers_the_catch_up(started, project, fake_gh,
     store.open_validation_round(wo_id=wo["id"], fingerprint="fp-2")
     pr = github.pr_view(PR, cwd=project)
 
-    assert started._catch_up_with_base(started.catalog.project("proj_a"), store, wo,
-                                       pr) is pr
+    caught = started._catch_up_with_base(started.catalog.project("proj_a"), store, wo, pr)
+    assert caught.pr is pr and caught.outcome == ops.CATCH_UP_DEFERRED
     assert_deferred(fake_gh, store, wo)
 
 
@@ -384,3 +392,175 @@ def test_behind_then_updated_then_green_then_carried_then_merged_with_no_round(
         == [PR]
     assert store.get_work_order(wo["id"])["status"] == "completed"
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+def test_a_merge_that_moved_the_base_makes_the_next_one_catch_up_before_it_merges(
+        started, project, fake_gh, local_proof):
+    """TWO APPROVED MERGES IN A ROW (spec 2026-09-28 §5 test 7, §4). The first landing
+    moves `main`, and every other outstanding approval then fails the ancestry check —
+    which is why serialising merge execution buys nothing this does not.
+
+    The second pull request refuses at §3.1, catches up, re-greens, carries and merges,
+    with NO round spent: one round, start to finish."""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh, base_oid=BASE_OID)
+    local_proof["contains"] = {BASE_OID}          # up to date when the grant was given
+
+    poll(started, store)                          # armed -> a request is filed
+    [approval] = store.list_approvals(wo["id"])
+    gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
+                         project="proj_a")
+
+    # The other merge lands: `main` moves to a commit this head cannot contain.
+    local_proof["tip"] = BASE_OID2
+    poll(started, store)
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+    assert fake_gh.updates == [PR]                # caught up instead
+    assert store.get_approval(approval["id"])["uses"] == 0
+
+    # CI runs on the new head, goes green, the verdict carries and the merge happens.
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=UPDATED,
+                   base_oid=BASE_OID2)
+    local_proof["contains"] = {BASE_OID, BASE_OID2}
+    poll(started, store)
+    fresh = [a for a in store.list_approvals(wo["id"]) if UPDATED in a["command"]]
+    assert len(fresh) == 1
+    gates.apply_decision(store, fresh[0]["id"], "approved", "ok", "neo",
+                         project="proj_a")
+
+    poll(started, store)
+
+    assert [c["argv"][2] for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]] \
+        == [PR]
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+
+
+# -- 18. the base tip the ancestry test is asked about (spec 2026-09-28 Amendment B) ---
+
+
+def a_pull_request(**over):
+    """The three fields `ops.catch_up_needed` reads, and nothing else."""
+    import types
+
+    return types.SimpleNamespace(**{"behind": False, "base_oid": BASE_OID,
+                                    "head_oid": JUDGED, **over})
+
+
+def test_a_given_base_tip_outranks_githubs_cached_reading(project, local_proof):
+    """THE MEASURED CASE, issue #837. `pr.base_oid` is GitHub's `baseRefOid`, and on gate
+    308 it lagged the real tip of `main` by three commits and 5.3 hours — so ancestry said
+    "already up to date" and none of the seven guards ever fired. A caller that has just
+    fetched passes the tip it read, and that answer wins."""
+    local_proof["contains"] = {BASE_OID}          # the head carries what GitHub reported
+
+    assert not ops.catch_up_needed(a_pull_request(), repo=project)
+    assert ops.catch_up_needed(a_pull_request(), repo=project, base_tip=BASE_OID2)
+
+
+def test_no_base_tip_keeps_todays_behaviour_exactly(project, local_proof):
+    """The empty default is the other arm: `pr.base_oid` is read, as it always was, so no
+    hidden network call appears inside a helper the daemon runs every poll tick."""
+    local_proof["contains"] = {BASE_OID}
+
+    assert not ops.catch_up_needed(a_pull_request(), repo=project, base_tip="")
+    assert ops.catch_up_needed(a_pull_request(base_oid=BASE_OID2), repo=project)
+    # `.behind` stays a positive short-circuit in BOTH arms — kn-907c9a61.
+    assert ops.catch_up_needed(a_pull_request(behind=True), repo=project)
+    assert ops.catch_up_needed(a_pull_request(behind=True), repo=project,
+                               base_tip=BASE_OID)
+
+
+# -- 19. every guard has an outcome, and none of them reaches `propose` ----------------
+
+
+def held(store, wo) -> list[dict]:
+    return [db.from_json(e["payload"], {})
+            for e in store.events_of_kind(wo["id"], "automerge_held")]
+
+
+def test_a_deferred_catch_up_says_so_and_proposes_nothing(started, project, fake_gh,
+                                                          local_proof):
+    """§3.4 `DEFERRED`: a guard that clears by itself, and the sentence says the OS
+    retries."""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    store.queue_message(wo["id"], "rebase this yourself")
+
+    poll(started, store)
+
+    assert [h["code"] for h in held(store, wo)] == ["base_moved"]
+    assert "retries every tick" in held(store, wo)[0]["reason"]
+    assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+
+
+def test_an_exhausted_catch_up_names_the_cap_and_proposes_nothing(started, project,
+                                                                  fake_gh, local_proof):
+    """§3.4 `EXHAUSTED`, AND THE REGRESSION THIS SPEC TURNS ON. Past the cap the old code
+    returned the pull request unchanged, the caller read that as "already up to date" and
+    filed a merge request on a stale base. It HOLDS now, and the sentence is unambiguous
+    because this is the one outcome that never clears on its own."""
+    opt_in(started)
+    store, wo = parked(project)
+    for i in range(ops.CATCH_UP_MAX):
+        ops.record_base_update(store, wo, base="main", base_sha=f"{i}" * 40,
+                               head_before=JUDGED, head_after=JUDGED, checks=(),
+                               cause=ops.BASE_UPDATE_BEHIND)
+    behind_pr(fake_gh, base_oid=BASE_OID2)
+    local_proof["tip"] = BASE_OID2
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved"
+    assert f"the cap ({ops.CATCH_UP_MAX})" in row["reason"] and "will NOT" in row["reason"]
+    assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+
+
+def test_a_base_commit_already_chased_once_is_exhausted_too(started, project, fake_gh,
+                                                            local_proof):
+    """§3.4's other `EXHAUSTED` row: `ops.base_heal_spent`, keyed on the FRESHLY READ tip
+    (Amendment B). Keying that bound on `pr.base_oid` is how the guard mis-fires."""
+    opt_in(started)
+    store, wo = parked(project)
+    ops.record_base_update(store, wo, base="main", base_sha=BASE_OID,
+                           head_before=JUDGED, head_after=JUDGED, checks=(),
+                           cause=ops.BASE_UPDATE_BEHIND)
+    behind_pr(fake_gh)
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and BASE_OID[:10] in row["reason"]
+    assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []
+
+
+def test_a_failed_update_holds_with_the_reason_github_gave(started, project, fake_gh,
+                                                           local_proof):
+    """§3.4 `FAILED`: the attempt is spent, the record says why, and the OS retries."""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    fake_gh.refuse_update("failed to update branch")
+
+    poll(started, store)
+
+    [row] = held(store, wo)
+    assert row["code"] == "base_moved" and "retries next tick" in row["reason"]
+    assert store.list_approvals(wo["id"]) == []
+
+
+def test_a_fetch_that_fails_holds_rather_than_proposing(started, project, fake_gh,
+                                                        local_proof):
+    """§3.4 `FAILED`'s first row, and the fall-through this spec exists to close: a
+    checkout that cannot fetch proves nothing, so it may not end in a merge request."""
+    opt_in(started)
+    store, wo = parked(project)
+    behind_pr(fake_gh)
+    local_proof["fetch"] = False
+
+    poll(started, store)
+
+    assert [h["code"] for h in held(store, wo)] == ["base_moved"]
+    assert store.list_approvals(wo["id"]) == [] and fake_gh.updates == []

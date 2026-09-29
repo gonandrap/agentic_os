@@ -402,7 +402,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
 
 def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
-        started, project, fake_gh, parked, monkeypatch):
+        started, project, fake_gh, parked, monkeypatch, local_base):
     """SPEC 2026-09-27 §7 TEST 19: the carry's extra reads happen on a `sha_moved` tick and
     on no other. A green, up-to-date pull request whose verdict covers its head pays the
     base budget, no `gh api` commit walk and no local diff — so the price of the feature is

@@ -119,6 +119,9 @@ HELD_MERGE_STATE_UNCLEAN = "merge_state_unclean"
 #: The default branch is broken. Not this pull request's fact, and it pauses the merge
 #: anyway: merging onto a red base hides the next break behind the same red run (§4).
 HELD_BASE_RED = "base_red"
+#: The base moved and this head does not contain it, so its CI never ran against the code
+#: the merge would land on (spec 2026-09-28 §3.2). One code per condition — kn-0aba30f0.
+HELD_BASE_MOVED = "base_moved"
 
 #: WHY the merge command did not succeed on a pull request that merged anyway (§5.5).
 #: Two causes, never folded into one: a command that RAN and exited non-zero is a local
@@ -156,6 +159,32 @@ class MergeFailed(AutoMergeRefused):
     user's inbox row then quoted that as the reason the merge failed, instead of the 403
     that actually caused it.
     """
+
+
+class StaleBase(AutoMergeRefused):
+    """The base moved under the judged commit. The OS refused BEFORE GitHub heard anything.
+
+    Spec 2026-09-28 §3.1. Its own arm rather than the parent's, for `MergeFailed`'s own
+    reason: the daemon logs a bare `AutoMergeRefused` at DEBUG and writes nothing, because
+    its commonest instance is an ordinary spent grant. A base that moved is news — it is
+    recorded and it triggers a catch-up.
+
+    NO GRANT IS SPENT: the check runs before `gates.open_gate`, nothing was attempted, and
+    a fetch that merely failed refuses here too. Spending the one authorisation on a
+    three-second network blip would strand a green merge behind a fresh Neo round trip.
+    """
+
+
+@dataclass(frozen=True)
+class BaseBehind:
+    """The pull request's base has a commit this head does not contain. Spec §3.2.
+
+    Plain data, like `BaseRed`: the ancestry answer arrives as a parameter so `decide`
+    stays pure. `base_oid` is the base's tip as the tick that built this read it.
+    """
+
+    base: str
+    base_oid: str
 
 
 @dataclass(frozen=True)
@@ -202,11 +231,47 @@ def _held(code: str, reason: str, **fields: Any) -> Decision:
     return Decision(armed=False, code=code, reason=reason, **fields)
 
 
+def held_base_moved(catch_up: Any, pr: Any, base_oid: str = "") -> Decision:
+    """The hold a refused catch-up produces. Spec 2026-09-28 §3.4.
+
+    Here rather than in the daemon because the hold code and its sentence belong to the
+    module that owns them. `_note_automerge_held` dedupes on the reason TEXT, so the
+    sentence differs per outcome — and `EXHAUSTED`'s is the one that has to be
+    unambiguous: it is the only outcome that never clears on its own.
+
+    `base_oid` is the freshly-read tip when the caller has one; `pr.base_oid` is GitHub's
+    cached reading and only the fallback (Amendment B).
+    """
+    from . import ops
+
+    base = str(getattr(pr, "base_ref", "") or "the base")
+    oid = (base_oid or str(getattr(pr, "base_oid", "") or ""))[:10] or "an unknown commit"
+    moved = f"`{base}` has moved to {oid}"
+    reason = {
+        ops.CATCH_UP_DEFERRED:
+            f"{moved}; the branch is being caught up as soon as "
+            f"{catch_up.reason or 'the work in flight'} finishes — the OS retries every "
+            f"tick",
+        ops.CATCH_UP_EXHAUSTED:
+            f"{moved} and the OS has stopped catching this branch up: "
+            f"{catch_up.reason or 'its budget is spent'}. It will NOT try again: merge it "
+            f"by hand, or `jarvis wo send` the worker to rebase",
+        ops.CATCH_UP_FAILED:
+            f"{moved} and the update did not run: "
+            f"{catch_up.reason or 'the OS could not say why'}. The OS retries next tick",
+        ops.CATCH_UP_DONE:
+            f"caught up with `{base}` at {oid}; CI is running on the new head",
+    }.get(catch_up.outcome, f"{moved} and this branch does not contain it")
+    return _held(HELD_BASE_MOVED, reason,
+                 head_sha=str(getattr(pr, "head_oid", "") or ""))
+
+
 def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: Any,
            *, validated_head: str | None,
            pending_assumptions: bool = False,
            plan_assumptions: str = "",
-           base_red: BaseRed | None = None) -> Decision:
+           base_red: BaseRed | None = None,
+           base_behind: BaseBehind | None = None) -> Decision:
     """May the OS merge this pull request right now? PURE — no store, no clock, no `gh`.
 
     Dicts and one `github.PullRequest` in, armed-or-held-with-a-reason out. Pure for
@@ -234,6 +299,11 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
     pauses every merge, judged between conditions 3 and 4 (spec
     docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §4), so no
     round number is spent re-judging a branch whose CI is inheriting `main`'s failure.
+
+    AN EIGHTH is the other half of that shelf: `base_behind` says the base has a commit
+    this head does not carry, so the CI evidence describes code this merge would not land
+    on (spec 2026-09-28 §3.2). Judged after `base_red` — nothing is caught up onto a
+    broken base — and before conditions 4 and 5, because the catch-up moves the head.
 
     **`validated_head` IS PASSED IN AND NEVER RE-DERIVED HERE.** Conditions 4 and 5 rest
     on "which commit did the panel accept", and that question has exactly one home
@@ -294,6 +364,14 @@ def decide(round_row: dict[str, Any] | None, wo: dict[str, Any], pr: Any, cfg: A
                      f"`{base_red.workflow}`, run {base_red.run_url}, at "
                      f"{base_red.head_sha[:10] or 'an unknown commit'}{blamed}. Nothing "
                      f"merges onto a broken default branch.{rider}")
+    # Spec 2026-09-28 §3.2: after `base_red`, before the sha checks — a catch-up moves
+    # the head, so a round spent here would be spent on a commit about to be replaced.
+    if base_behind is not None:
+        return _held(HELD_BASE_MOVED,
+                     f"`{base_behind.base}` has moved to "
+                     f"{base_behind.base_oid[:10] or 'an unknown commit'} and this "
+                     f"branch does not contain it, so its CI has never run against the "
+                     f"code this merge would land on — catching the branch up first")
 
     outcome = str((round_row or {}).get("outcome") or "")
     n = int((round_row or {}).get("round") or 0)
@@ -505,7 +583,8 @@ def protection_fact(protection: Any, base: str) -> str:
 
 def _request_question(project: str, wo: dict[str, Any], decision: Decision,
                       pr_url: str, checks: tuple[dict[str, str], ...] = (),
-                      protection: str = "") -> str:
+                      protection: str = "", base: str = "the base",
+                      base_oid: str = "") -> str:
     """What the reviewer reads. Not `gates.build_request_question`, for one reason.
 
     That renderer opens "The worker for work order X wants to …", and here the worker
@@ -530,9 +609,12 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
         f"# The unit\n{wo['id']}\n{pr_url}",
         f"# What was judged\n"
         f"Round {decision.round_n} passed, on commit {decision.judged_sha}.\n"
-        f"That is the commit at the head right now — the two were compared this tick, "
-        f"and `--match-head-commit` makes GitHub refuse the merge if it moves before it "
-        f"runs.\n"
+        f"That is the commit at the head right now, and it CONTAINS the current tip of "
+        f"`{base}` ({base_oid or 'unrecorded'}) — both were read this tick, so the CI "
+        f"evidence below ran against the code this merge would land on. "
+        f"`--match-head-commit` makes GitHub refuse the merge if the head moves before "
+        f"it runs, and the OS re-reads `{base}` immediately before merging and refuses "
+        f"on its own if it has moved since you read this.\n"
         f"CI on that commit: {checks_evidence(checks)}.\n"
         f"Read the deliberation with: jarvis validation show {wo['id']}",
     ]
@@ -557,7 +639,7 @@ def _request_question(project: str, wo: dict[str, Any], decision: Decision,
 
 def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
             decision: Decision, checks: tuple[dict[str, str], ...] = (),
-            protection: str = "") -> dict[str, Any] | None:
+            protection: str = "", pr: Any = None) -> dict[str, Any] | None:
     """File the `auto_merge` approval and its Neo question. Returns the approval, or None.
 
     None means one already exists for this exact command — filed, decided or refused —
@@ -576,6 +658,9 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     command = merge_command(pr_url, decision.judged_sha)
     if store.latest_approval_for(wo["id"], GATE_KIND, command) is not None:
         return None
+    # Spec 2026-09-28 §3.5: the base this request was filed against, ON the request.
+    base = str(getattr(pr, "base_ref", "") or "the base")
+    base_oid = str(getattr(pr, "base_oid", "") or "")
     approval = store.add_approval(
         wo["id"], GATE_KIND, command,
         # No recogniser fired: this was filed by the OS, not matched out of a command
@@ -586,10 +671,12 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
         evidence=f"round {decision.round_n} passed on {decision.judged_sha}; "
                  f"checks: {checks_evidence(checks)}",
         max_uses=GRANT_USES,
+        base_oid=base_oid,
     )
     question = neo.ask(
         project, wo["id"],
-        _request_question(project, wo, decision, pr_url, checks, protection),
+        _request_question(project, wo, decision, pr_url, checks, protection,
+                          base=base, base_oid=base_oid),
         # Spec 2026-09-24 fix 1: the field that actually carried the defect.
         context=borrowed_context((
             Borrowed(label=WO_TITLE, whose=WO_TITLE_WHOSE, text=wo.get("title") or "",
@@ -606,7 +693,9 @@ def propose(store: Any, neo: Any, project: str, wo: dict[str, Any],
     store.add_event(wo["id"], "automerge_proposed", {
         "approval_id": approval["id"], "neo_question_id": question["id"],
         "round_id": decision.round_id, "round": decision.round_n,
-        "head_sha": decision.judged_sha, "pr_url": pr_url})
+        "head_sha": decision.judged_sha, "pr_url": pr_url,
+        # The event is read on its own, so it carries the base too (§3.5).
+        "base": base, "base_oid": base_oid})
     log.info("auto-merge proposed for %s as gate request %s (sha %s)",
              wo["id"], approval["id"], decision.judged_sha[:10])
     return approval
@@ -704,8 +793,22 @@ def attempts(store: Any, wo_id: str, head_sha: str) -> int:
 
 
 def apply(store: Any, wo: dict[str, Any], sha: str,
-          approval: dict[str, Any] | None, cwd: Any = None) -> dict[str, Any]:
+          approval: dict[str, Any] | None, cwd: Any = None, *,
+          base_ref: str) -> dict[str, Any]:
     """Perform one approved merge, once. Raises `AutoMergeRefused` if it may not.
+
+    **THE BASE IS RE-READ HERE, FRESH, AND THE MERGE REFUSES IF THE HEAD DOES NOT CONTAIN
+    IT** (spec 2026-09-28 §3.1, issue #837). `--match-head-commit` pins the HEAD; on gate
+    308 the head had not moved and the base had, twice — once before the request was filed
+    and once between the verdict and the merge, 2.5 minutes apart, which no TTL closes.
+    The fetch plus `branchproof.tip` is one round trip on a path about to make an
+    irreversible write, and NOT `pr.base_oid`: that is GitHub's cached bookkeeping, which
+    on the measured incident lagged the real tip of `main` by three commits.
+
+    `base_ref` is REQUIRED keyword-only and the repo is `cwd`. Either missing REFUSES —
+    fail-closed, because a merge with no local checkout cannot prove freshness — and so
+    does a fetch or an ancestry test git could not answer. There is one production call
+    site and it passes both.
 
     Four refusals before anything runs, and `AutoMergeRefused` rather than a falsy return
     for each: a caller that cannot tell "refused" from "merged nothing successfully" is a
@@ -736,7 +839,7 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
     # module that owns talking to GitHub. `JARVIS_GH_BIN` and the PATH story are
     # `github.py`'s contract, and a second import path is how a caller comes to resolve
     # the binary one way while the module it is imitating resolves it another.
-    from . import gates, github
+    from . import branchproof, gates, github
     from .github import gh_bin
 
     wo_id = wo["id"]
@@ -758,6 +861,19 @@ def apply(store: Any, wo: dict[str, Any], sha: str,
             f"or its one use is spent")
 
     url = github.checked_pr_url(str(wo.get("pr_url") or ""), cwd=cwd)
+    # Spec 2026-09-28 §3.1 — BEFORE `open_gate`, so a refusal here spends no grant.
+    if cwd is None or not base_ref:
+        raise StaleBase(
+            f"{wo_id}: no local checkout or no base ref, so the OS cannot prove "
+            f"`{base_ref or 'the base'}` has not moved under {sha[:10]}")
+    # A fetch that failed leaves `origin/<base>` at whatever it was: stale, not fresh.
+    fetched = branchproof.fetch(cwd, base_ref)
+    tip = branchproof.tip(cwd, f"origin/{base_ref}") if fetched else ""
+    if not tip or not branchproof.is_ancestor(cwd, tip, sha):
+        raise StaleBase(
+            f"{wo_id}: `{base_ref}` is at {tip[:10] or 'a commit git could not read'} "
+            f"and {sha[:10]} does not contain it — the CI that was judged never ran "
+            f"against the code this merge would land on")
     spent = gates.open_gate(store, grant)
     args = _merge_args(url, sha)
     try:

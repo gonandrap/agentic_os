@@ -2402,6 +2402,31 @@ def signin(tmp_path, monkeypatch):
     return sign_in
 
 
+#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout.
+FIXTURE_BASE_TIP = "ba5e11d000000000000000000000000000000f00"
+
+
+@pytest.fixture()
+def local_base(monkeypatch):
+    """What the local checkout answers about the base. Returns the state, to be changed.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1:
+    a merge re-reads `origin/<base>` and refuses if the judged head does not contain it.
+    The `project` fixture has no `origin`, so real git refuses and NOTHING would ever
+    merge in a test — this is the fresh, up-to-date base that used to be implied.
+
+    `behind` True makes the head NOT contain the tip, which is the incident's shape.
+    """
+    from . import branchproof
+
+    state = {"fetch": True, "tip": FIXTURE_BASE_TIP, "behind": False}
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
+    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
+    monkeypatch.setattr(branchproof, "is_ancestor",
+                        lambda repo, ancestor, descendant: not state["behind"])
+    return state
+
+
 @pytest.fixture()
 def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")

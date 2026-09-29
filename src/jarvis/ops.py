@@ -4603,6 +4603,21 @@ def rejudged_heads(store: ProjectStore, wo_id: str, *, declined: bool = False
     return seen
 
 
+def stale_base_bases(store: ProjectStore, wo_id: str, head_sha: str) -> set[str]:
+    """The base tips a merge of THIS commit has already been refused against.
+
+    `rejudged_heads`' shape and its reason (spec 2026-09-28 §3.1): a parked pull request
+    reaches the precondition every two minutes, so the event is written once per (head,
+    base tip) and a base that moves again is news.
+    """
+    seen = set()
+    for event in store.events_of_kind(wo_id, MERGE_BASE_STALE_EVENT):
+        payload = db.from_json(event["payload"], {}) or {}
+        if str(payload.get("head_sha") or "") == head_sha:
+            seen.add(str(payload.get("base_oid") or ""))
+    return seen
+
+
 def rejudge_moved_head(store: ProjectStore, project_path: Path, wo: dict[str, Any], *,
                        project: str, cfg: Any,
                        decision: Any) -> dict[str, Any] | None:
@@ -5727,6 +5742,37 @@ BASE_UPDATE_BASE_RED = "base_red"
 #: a fresh update, so a busy day would have the OS chasing the base for ever (§5.3 guard 5).
 CATCH_UP_MAX = 3
 
+#: A merge the OS refused because the base moved under the judged commit — spec
+#: 2026-09-28 §3.1. Deduped per (head sha, base tip): a parked pull request reaches the
+#: precondition every two minutes, and a row per tick would bury the rows that mean
+#: something (`rejudged_heads`' shape).
+MERGE_BASE_STALE_EVENT = "automerge_base_stale"
+
+#: WHAT A CATCH-UP DID, and the reason `CatchUp` exists: the old return type could not
+#: tell "already up to date" from "behind and I could not fix it this tick", so every one
+#: of the seven guards fell through to `propose` and filed a stale-base merge request
+#: (spec 2026-09-28 §3.4). Two of them never clear on their own, and `EXHAUSTED` is named
+#: apart for exactly that: a user reading "deferred" for ever is the bug this prevents.
+CATCH_UP_NOT_NEEDED = "not_needed"
+CATCH_UP_DONE = "done"
+CATCH_UP_DEFERRED = "deferred"
+CATCH_UP_EXHAUSTED = "exhausted"
+CATCH_UP_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class CatchUp:
+    """What `Daemon._catch_up_with_base` did, as data its caller can branch on.
+
+    `pr` is the pull request to decide against — the one it was given, unchanged, unless
+    the update ran. `reason` is one sentence per guard, for the user.
+    """
+
+    pr: Any
+    outcome: str
+    reason: str = ""
+
+
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code
 #: discipline, so a reader can tell "someone resolved a conflict" from "the daemon could
 #: not reach GitHub" (spec §4).
@@ -5840,7 +5886,7 @@ def catch_up_attempts(store: ProjectStore, wo_id: str) -> int:
     return n
 
 
-def catch_up_needed(pr: Any, *, repo: Path) -> bool:
+def catch_up_needed(pr: Any, *, repo: Path, base_tip: str = "") -> bool:
     """Is this pull request behind its base? `.behind` ALONE IS NOT THE QUESTION.
 
     Spec 2026-09-27 §5.1. `PullRequest.behind` is `mergeStateStatus == "BEHIND"`, and on a
@@ -5853,12 +5899,21 @@ def catch_up_needed(pr: Any, *, repo: Path) -> bool:
     Asked of the LOCAL checkout (`branchproof.is_ancestor`) after the fetch proof (b)
     needs anyway. A checkout that cannot answer reads as BEHIND — the caller's seven
     guards then decide whether to spend an update, and every one of them is bounded.
+
+    **`base_tip` IS AUTHORITATIVE WHEN GIVEN, and `pr.base_oid` is then not read at all**
+    (spec 2026-09-28 Amendment B, issue #837). `pr.base_oid` is not a reading of the base:
+    it is GitHub's cached `baseRefOid`, and on gate 308 it lagged the real tip of `main` by
+    three commits and 5.3 hours — so the ancestry test answered "already up to date" on a
+    stale fact and none of the seven guards ever fired. A caller that has just fetched
+    passes the tip it read; one that has not keeps today's behaviour exactly, so no hidden
+    network call appears inside a helper the daemon runs every poll tick. `pr.behind` stays
+    a positive short-circuit in both arms (kn-907c9a61).
     """
     from . import branchproof
 
     if getattr(pr, "behind", False):
         return True
-    base_oid = str(getattr(pr, "base_oid", "") or "")
+    base_oid = base_tip or str(getattr(pr, "base_oid", "") or "")
     head = str(getattr(pr, "head_oid", "") or "")
     if not base_oid or not head:
         return False        # GitHub answered no base commit: nothing to be behind of

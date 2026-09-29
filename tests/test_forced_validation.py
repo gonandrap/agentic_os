@@ -180,7 +180,7 @@ def test_a_forced_round_records_the_commit_the_round_before_it_could_not(
 
 
 def test_the_forced_round_is_what_finally_lets_the_pull_request_merge_itself(
-        fleet, project, fake_gh):
+        fleet, project, fake_gh, local_base):
     """The motivating outcome, and why stopping at the column would prove too little: the
     point is not that a commit was written down, it is that condition 4 can now be
     satisfied and the OS asks to merge."""
