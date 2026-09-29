@@ -383,6 +383,44 @@ def alarm_badge() -> int | None:
         return None
 
 
+def _order_href(order_id: str) -> str | None:
+    """Where an allow-listed order's page is, or None when it no longer resolves."""
+    try:
+        if order_id.startswith("fo-"):
+            pname, _, _ = ops.find_feature_order(order_id)
+            return f"/fo/{pname}/{order_id}"
+        pname, _, _ = ops.find_work_order(order_id)
+        return f"/wo/{pname}/{order_id}"
+    except ops.OpsError:
+        return None
+
+
+def brake_state() -> dict | None:
+    """The user's brake (`jarvis pause`) and the post-reopen ramp, for the banner every
+    page carries — or None when neither is in force.
+
+    `ops.fleet_summary`, the dict `jarvis status` prints its "⏸ FLEET PAUSED" line from,
+    so the page and the terminal read one record (issue #843). Never raises, like the nav
+    badges: a banner must not be the reason a page 500s.
+    """
+    try:
+        central = CentralStore()
+        try:
+            fl = ops.fleet_summary(central)
+        finally:
+            central.close()
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    if not fl["paused"] and not fl["ramp"]:
+        return None
+    fl["since_text"] = invariants.clock(fl["since"]) if fl.get("since") else ""
+    fl["allowed"] = [{"id": i, "href": _order_href(i)} for i in fl["allow"]]
+    if fl["ramp"]:
+        fl["ramp"] = {**fl["ramp"], "since_text": invariants.clock(fl["ramp"]["since"]),
+                      "until_text": invariants.clock(fl["ramp"]["until"])}
+    return fl
+
+
 def _decorate_question(q: dict) -> dict:
     """Add the two display-only fields the `/neo` question blocks render.
 
@@ -774,6 +812,9 @@ def create_app() -> FastAPI:
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
+        # The statuses the user's brake can hold — where a "let this order through"
+        # button means something. The daemon's own list, not a page-local guess.
+        fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
         # The bill's two explanations, taken from the module that computes the numbers
@@ -811,6 +852,7 @@ def create_app() -> FastAPI:
                             + c.get("unreviewed", 0)) or None
         ctx["gate_badge"] = gate_badge()
         ctx["alarm_badge"] = alarm_badge()
+        ctx["brake"] = brake_state()
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -1917,6 +1959,41 @@ def create_app() -> FastAPI:
                 f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
                 status_code=303)
         return RedirectResponse(back, status_code=303)
+
+    # -- the brake: `jarvis pause` / `jarvis resume` (issue #843) ------------------------
+
+    @app.post("/fleet/pause")
+    def pause_fleet(reason: str = Form(""), next: str = Form("")):
+        """`jarvis pause`, from the dashboard. Refuses a second press while paused rather
+        than calling through: re-pausing REPLACES the allow-list, and a form on a page
+        rendered before someone else paused would silently throw it away."""
+        central = CentralStore()
+        try:
+            current = fleet.load_pause(central)
+        finally:
+            central.close()
+        if current is not None:
+            return RedirectResponse(_same_site_back(
+                next, "/", quote("the fleet is already paused — nothing changed")),
+                status_code=303)
+        ops.pause_fleet(reason=reason.strip())
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
+
+    @app.post("/fleet/resume")
+    def resume_fleet(next: str = Form("")):
+        """`jarvis resume --all`: lift the pause for the whole fleet."""
+        ops.resume_fleet(everything=True)
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
+
+    @app.post("/fleet/allow")
+    def allow_through(order_id: str = Form(...), next: str = Form("")):
+        """`jarvis resume <wo-id>`: let one order through the pause."""
+        try:
+            ops.resume_fleet([order_id.strip()])
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/", quote(str(e))),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_issues.html" as issues_ui %}
+{% import "_brake.html" as brake_ui %}
 {% block title %}{{ project_name }} — Jarvis{% endblock %}
 {% block content %}
 
@@ -151,6 +152,7 @@
               href="/wo/{{ project_name }}/{{ b.id }}">{{ b.id }}</a> ({{ b.status }}){{ ', ' if not loop.last }}{% endfor %}
           </div>
         {% endif %}
+        {{ brake_ui.let_through(brake, wo, '/project/' ~ project_name) }}
         {# Not an attention item on purpose: the OS resumes this one itself. #}
         {% if pauses.get(wo.id) %}
           <div class="sub">⏳ {{ pauses[wo.id] }}</div>
