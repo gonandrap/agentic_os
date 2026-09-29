@@ -54,38 +54,15 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 @pytest.fixture()
-def local_proof(monkeypatch):
-    """What the local checkout answers. The `project` fixture has no `origin`.
-
-    Two different ancestry questions run through one function and the descendant says
-    which: `origin/<base>` is proof (a) item 6 (was this a BASE merge), a sha is §5.1
-    (does the head already carry the base commit). `contains` empty is a branch behind
-    its base, which is the state this whole file is about.
+def local_proof(local_base, monkeypatch):
+    """The shared checkout fake (`testing.local_base`) plus the one thing it does not
+    fake: `diff_fingerprint`, proof (a) item 5. `contains` empty is a branch behind its
+    base, which is the state this whole file is about.
     """
-    state = {"id": "b7f0deadbeef", "fetch": True, "contains": set(),
-             "base_ancestors": None, "tip": BASE_OID}
-
-    def fetch(repo, *refs):
-        return state["fetch"]
-
-    def tip(repo, ref):
-        # Spec 2026-09-28 §3.1: what `origin/<base>` is at LOCALLY, after the fetch —
-        # the authoritative reading, and the one `pr.base_oid` lagged on gate 308.
-        return state["tip"]
-
-    def diff_fingerprint(repo, base_ref, sha):
-        return state["id"]
-
-    def is_ancestor(repo, ancestor, descendant):
-        if str(descendant).startswith("origin/"):
-            return state["base_ancestors"] is None or ancestor in state["base_ancestors"]
-        return ancestor in state["contains"]
-
-    monkeypatch.setattr(branchproof, "fetch", fetch)
-    monkeypatch.setattr(branchproof, "tip", tip)
-    monkeypatch.setattr(branchproof, "diff_fingerprint", diff_fingerprint)
-    monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
-    return state
+    local_base.update({"id": "b7f0deadbeef", "contains": set(), "tip": BASE_OID})
+    monkeypatch.setattr(branchproof, "diff_fingerprint",
+                        lambda repo, base_ref, sha: local_base["id"])
+    return local_base
 
 
 def parked(project_path, *, judged: str = JUDGED):

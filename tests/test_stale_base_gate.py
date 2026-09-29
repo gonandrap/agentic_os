@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import automerge, branchproof, db, gates, ops
+from jarvis import automerge, db, gates, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.neo_store import NeoStore
@@ -26,6 +26,8 @@ PR = "https://github.com/acme/proj/pull/7"
 JUDGED = "709582ae53000000000000000000000000000aaa"
 BASE_1 = "8ea18feec4000000000000000000000000000821"
 BASE_2 = "37fe650fab000000000000000000000000000827"
+#: Where `origin/main` REALLY is when GitHub is still reporting BASE_2.
+BASE_3 = "9d41c0be77000000000000000000000000000833"
 UPDATED = "c2120424ba000000000000000000000000000bbb"
 
 
@@ -44,14 +46,10 @@ def started(jarvis_home, fake_claude, catalog_file, project):
 
 
 @pytest.fixture()
-def local(monkeypatch):
-    """What the checkout answers: where `origin/main` is, and what the head carries."""
-    state = {"fetch": True, "tip": BASE_1, "contains": {BASE_1}}
-    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
-    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
-    monkeypatch.setattr(branchproof, "is_ancestor",
-                        lambda repo, ancestor, descendant: ancestor in state["contains"])
-    return state
+def local(local_base):
+    """The shared checkout fake (`testing.local_base`), at this file's base commit."""
+    local_base.update({"tip": BASE_1, "contains": {BASE_1}})
+    return local_base
 
 
 def opt_in(daemon):
@@ -136,7 +134,11 @@ def test_a_checkout_that_cannot_resolve_githubs_base_oid_does_not_stall_for_ever
     tip IS contained, so the tick re-decides without the stale fact and carries on.
 
     Holding on the cheap read instead would park a mergeable pull request for ever, and
-    write nothing saying why. The safety property is untouched — `apply` fetches too."""
+    write nothing saying why. The safety property is untouched — `apply` fetches too.
+
+    THE REQUEST MUST SURVIVE THE RE-DECIDE and the merge must actually land: §3.6's
+    supersede reads the cheap fact too, so an over-report there withdraws a healthy
+    pending request and blocks its command string for ever."""
     opt_in(started)
     store, wo = parked(project)
     # GitHub reports a base commit this checkout has never seen; `origin/main` is at BASE_1
@@ -149,8 +151,16 @@ def test_a_checkout_that_cannot_resolve_githubs_base_oid_does_not_stall_for_ever
 
     assert [db.from_json(e["payload"], {})["code"]
             for e in store.events_of_kind(wo["id"], "automerge_held")] == []
-    assert [a["kind"] for a in store.list_approvals(wo["id"])] == [gates.AUTO_MERGE]
+    [approval] = store.list_approvals(wo["id"])
+    assert approval["kind"] == gates.AUTO_MERGE
+    assert approval["status"] == "pending" and approval["closed_as"] == ""
     assert fake_gh.updates == []
+
+    gates.apply_decision(store, approval["id"], "approved", "ok", "neo",
+                         project="proj_a")
+    poll(started, store)
+
+    assert [c["argv"][:2] for c in merges(fake_gh)] == [["pr", "merge"]]
 
 
 # -- §3.5: the base is ON the request -------------------------------------------------
@@ -211,14 +221,20 @@ def test_a_pending_request_whose_base_moved_is_superseded_and_never_answered(
     [approval] = store.list_approvals(wo["id"])
     assert approval["status"] == "pending"
 
+    # GitHub says BASE_2; the checkout, after fetching, says BASE_3 — the commit the merge
+    # would really land on.
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
                    base_oid=BASE_2)
-    local["tip"] = BASE_2
+    local["tip"] = BASE_3
     poll(started, store)
 
     row = store.get_approval(approval["id"])
     assert row["status"] == "expired" and row["closed_as"] == "superseded"
-    assert row["decided_by"] == "os" and BASE_2[:10] in row["decision_reason"]
+    # The recorded base of the request, and the FETCHED tip — never `pr.base_oid`: §3.1's
+    # whole point is that GitHub's cached read is untrustworthy.
+    assert row["decided_by"] == "os" and BASE_1[:10] in row["decision_reason"]
+    assert BASE_3[:10] in row["decision_reason"]
+    assert BASE_2[:10] not in row["decision_reason"]
     assert store.usable_grant(wo["id"], gates.AUTO_MERGE, row["command"]) is None
     neo = NeoStore()
     try:

@@ -558,3 +558,24 @@ a helper the daemon runs every poll tick. Three call sites:
 reproduces gate 308's shape: the judged head contains the base tip `pr.base_oid` reports,
 `origin/main` is really at a descendant the head does not contain, and nothing is proposed
 and nothing is merged.
+
+**D — §3.6's supersede may only read a FETCHED base fact.** `Daemon.auto_merge` computes a
+cheap `base_behind` from `pr.base_oid` before `decide`. On `CATCH_UP_NOT_NEEDED` the daemon
+re-decides AND sets `base_behind = None`, because §3.6's supersede branch reads that same
+variable. Left set, it withdraws a HEALTHY pending request on the next tick — on a checkout
+where the cheap read over-reports for ever — and the work order livelocks: superseded, re-filed,
+superseded again. Only the fetched answer may close a request.
+
+**D, cont. — the superseded-request reason names a FETCHED tip, never `pr.base_oid`.** `ops.CatchUp` gains
+`base_tip: str = ""`, carrying `origin/<base>` as read locally after the fetch;
+`Daemon._supersede_stale_request` takes it as a keyword and quotes a commit only when one is
+passed. `approval["base_oid"]` is still quoted — a recorded fact about the request, not a cached
+read. Quoting `pr.base_oid` would hand the user the very number this spec establishes is
+untrustworthy.
+
+**D, cont. — `gates.GRANT_TTL_SECONDS` is TESTED, not just argued about.** §6 keeps the argument that a TTL
+would not have prevented gate 308 — grant spent 4.3h after approval, so "inside the 3600s window"
+is false, and the base moved regardless of age. The argument now rests on a test:
+`tests/test_automerge.py::test_an_approved_grant_past_its_ttl_merges_nothing` backdates the
+grant's `expires_at` and asserts `AutoMergeRefused("no longer a live grant")` with nothing
+reaching `fake_gh`.

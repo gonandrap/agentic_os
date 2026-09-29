@@ -430,6 +430,8 @@ def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
     store.close_validation_round(row["id"], "passed", "")
     fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
                    merge_state="CLEAN", head_oid=judged, base_oid=judged)
+    # Up to date: the checkout agrees the head carries the base (spec 2026-09-28 §3.2).
+    local_base.update({"tip": judged, "contains": {judged}})
     poll(started, store)                 # the merge is proposed on this one
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)

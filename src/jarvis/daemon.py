@@ -5182,8 +5182,10 @@ class Daemon:
         # §2.4). Nothing is poked when it clears: the next poll re-decides from scratch.
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
-        # Spec 2026-09-28 §3.2. NO FETCH PER TICK, and `pr.base_oid` on purpose: that
-        # read can only UNDER-report behind-ness, so this hold is a cheap early stop and
+        # Spec 2026-09-28 §3.2. NO FETCH PER TICK, and `pr.base_oid` on purpose. That read
+        # is wrong in BOTH directions: it UNDER-reports while GitHub's cache lags, and it
+        # OVER-reports for ever on a checkout that does not have `pr.base_oid` at all
+        # (ancestry unanswerable reads as behind). So this hold is a cheap early stop and
         # never the safety property. The safety property is the pair that fetches — the
         # pre-propose catch-up and `automerge.apply`'s precondition — and no merge reaches
         # GitHub without passing the second.
@@ -5224,6 +5226,10 @@ class Daemon:
                     # BEHIND on every tick (`ops.catch_up_needed`) — a persistent
                     # OVER-report, not the transient under-report §3.2 assumed. Returning
                     # on it held a mergeable pull request for ever, silently.
+                    #
+                    # AND THE CHEAP FACT IS DROPPED WITH IT: §3.6's supersede below reads
+                    # it, so leaving it set withdraws a healthy pending request.
+                    base_behind = None
                     log.debug("[%s] %s: the fetched base contradicts the poll's reading "
                               "— base_oid %s, behind=%s, and the head already contains "
                               "the tip; deciding without it", project.name, wo_id,
@@ -5248,7 +5254,8 @@ class Daemon:
                         if judged else None)
                     if filed is not None and filed["status"] in ("pending",
                                                                  "awaiting_case"):
-                        self._supersede_stale_request(store, filed, pr)
+                        self._supersede_stale_request(store, filed, pr,
+                                                      base_tip=caught.base_tip)
                     self._note_automerge_held(
                         store, wo_id, automerge.held_base_moved(caught, pr))
                     return
@@ -6329,18 +6336,21 @@ class Daemon:
             return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
                                f"the checkout could not fetch `{base}`")
         base_oid = branchproof.tip(project.path, f"origin/{base}")
+        # Every return from here down carries the FETCHED tip — the caller's reasons quote
+        # it and never `pr.base_oid` (spec 2026-09-28 §3.1).
         if not ops.catch_up_needed(pr, repo=project.path, base_tip=base_oid):
-            return ops.CatchUp(pr, ops.CATCH_UP_NOT_NEEDED, "")
+            return ops.CatchUp(pr, ops.CATCH_UP_NOT_NEEDED, "", base_tip=base_oid)
         if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"this branch has already been rebuilt against "
-                               f"{base_oid[:10]} once")
+                               f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
             log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
                       project.name, wo_id, base, ops.CATCH_UP_MAX)
             return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
                                f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
-                               f" which is the cap ({ops.CATCH_UP_MAX})")
+                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
         # at the top of the poll, and a worker turn can end and push in the meantime. The
@@ -6352,13 +6362,15 @@ class Daemon:
             log.debug("[%s] could not re-read %s before catching it up: %s",
                       project.name, pr_url, e)
             return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
-                               f"the OS could not re-read the pull request: {e.reason}")
+                               f"the OS could not re-read the pull request: {e.reason}",
+                               base_tip=base_oid)
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo_id)) or ""
         head_before = fresh.head_oid
         if not head_before or head_before != judged:
             return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
-                               "the push that moved the head off the judged commit")
+                               "the push that moved the head off the judged commit",
+                               base_tip=base_oid)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6367,7 +6379,7 @@ class Daemon:
             ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
                                           reason=e.reason,
                                           cause=ops.BASE_UPDATE_BEHIND)
-            return ops.CatchUp(fresh, ops.CATCH_UP_FAILED, e.reason)
+            return ops.CatchUp(fresh, ops.CATCH_UP_FAILED, e.reason, base_tip=base_oid)
         try:
             fresh = github.pr_view(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6382,7 +6394,7 @@ class Daemon:
         log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
                  project.name, pr_url, base, base_oid[:10], head_before[:10],
                  fresh.head_oid[:10])
-        return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "")
+        return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
                             wo: dict, decision: Any) -> None:
@@ -6439,8 +6451,13 @@ class Daemon:
         return automerge.protection_fact(protection, pr.base_ref)
 
     def _supersede_stale_request(self, store: ProjectStore, approval: dict,
-                                 pr: Any) -> None:
+                                 pr: Any, *, base_tip: str = "") -> None:
         """Close a pending merge request whose base has moved. Spec 2026-09-28 §3.6.
+
+        `base_tip` is a tip read LOCALLY, after a fetch, and the reason names a commit
+        only when one is passed: `pr.base_oid` is the cached read this whole spec
+        establishes is untrustworthy, so it is never quoted. `approval["base_oid"]` still
+        is — that one is a recorded fact about the request.
 
         NEVER A VERDICT: nothing is authorised and nothing is refused, because the CI
         evidence in the request stopped describing what the merge would land on. The
@@ -6456,8 +6473,8 @@ class Daemon:
         from .neo_store import NeoStore
 
         base = str(getattr(pr, "base_ref", "") or "the base")
-        reason = (f"`{base}` has moved to "
-                  f"{str(getattr(pr, 'base_oid', '') or '')[:10] or 'a newer commit'} "
+        moved = f" to {base_tip[:10]}" if base_tip else ""
+        reason = (f"`{base}` has moved{moved} "
                   f"since this request was filed against "
                   f"{str(approval['base_oid'] or '')[:10] or 'an unrecorded base'}; the "
                   f"CI evidence in it no longer describes what this merge would land on. "

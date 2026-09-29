@@ -5765,12 +5765,15 @@ class CatchUp:
     """What `Daemon._catch_up_with_base` did, as data its caller can branch on.
 
     `pr` is the pull request to decide against — the one it was given, unchanged, unless
-    the update ran. `reason` is one sentence per guard, for the user.
+    the update ran. `reason` is one sentence per guard, for the user. `base_tip` is
+    `origin/<base>` read LOCALLY after the fetch, the only base fact spec 2026-09-28 §3.1
+    trusts — empty when the helper refused before it read one.
     """
 
     pr: Any
     outcome: str
     reason: str = ""
+    base_tip: str = ""
 
 
 #: `proof` on `CARRY_REFUSED_EVENT`, one value per condition — the `automerge` hold-code

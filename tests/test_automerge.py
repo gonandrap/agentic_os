@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import automerge, branchproof, db, gate_rules, gates, invariants, ops
+from jarvis import automerge, db, gate_rules, gates, invariants, ops
 from jarvis.catalog import ValidationConfig, load_catalog
 from jarvis.daemon import Daemon
 from jarvis.github import PullRequest
@@ -499,18 +499,13 @@ def test_a_denial_records_and_notifies_and_raises_no_flag_of_its_own(started, pr
 
 
 @pytest.fixture()
-def apply_merge(project, monkeypatch):
-    """`automerge.apply` with the local facts §3.1 reads, faked. The `project` fixture
-    has no `origin`, so a real fetch refuses fail-closed and nothing would ever merge.
-
-    `state` is the base as the checkout sees it: `tip` is what `origin/main` is at and
-    `contains` is what the judged head carries.
+def apply_merge(project, local_base):
+    """`automerge.apply` with the local facts §3.1 reads, faked by the shared
+    `testing.local_base` fixture. The `project` fixture has no `origin`, so a real fetch
+    refuses fail-closed and nothing would ever merge.
     """
-    state = {"fetch": True, "tip": BASE_TIP, "contains": {BASE_TIP}}
-    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
-    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
-    monkeypatch.setattr(branchproof, "is_ancestor",
-                        lambda repo, ancestor, descendant: ancestor in state["contains"])
+    state = local_base
+    state.update({"tip": BASE_TIP, "contains": {BASE_TIP}})
 
     def run(store, wo, sha, approval, *, cwd=project, base_ref="main"):
         return automerge.apply(store, wo, sha, approval, cwd=cwd, base_ref=base_ref)
@@ -707,6 +702,23 @@ def test_a_head_that_does_not_contain_the_current_base_tip_never_merges(
         apply_merge(store, wo, JUDGED, approval)
 
     assert merges(fake_gh) == []
+
+
+def test_an_approved_grant_past_its_ttl_merges_nothing(granted, fake_gh, apply_merge):
+    """The TTL that ALREADY EXISTS — `gates.GRANT_TTL_SECONDS`, re-checked in
+    `usable_grant` — and spec 2026-09-28 §2 item (2) argues it would not have prevented
+    gate 308 (base moved 2.5 minutes after the verdict). It still bounds a grant nobody
+    spent: an hour-old approval is not permission to merge now."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    store.conn.execute("UPDATE approvals SET expires_at=? WHERE id=?",
+                       (db.now() - gates.GRANT_TTL_SECONDS, approval["id"]))
+
+    with pytest.raises(automerge.AutoMergeRefused, match="no longer a live grant"):
+        apply_merge(store, wo, JUDGED, store.get_approval(approval["id"]))
+
+    assert merges(fake_gh) == []
+    assert store.get_approval(approval["id"])["uses"] == 0
 
 
 def test_a_refused_stale_base_spends_no_grant_and_a_refused_merge_does(
