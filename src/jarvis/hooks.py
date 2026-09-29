@@ -1115,6 +1115,84 @@ def spec_shape_decision(payload: dict[str, Any],
     )
 
 
+#: Unbounded quantifiers that can consume a NEWLINE. `.` crosses one only under DOTALL,
+#: which is why rule 1 below is gated on `multiline`; the character-class pairs cross one
+#: whatever the flags. Bounded forms (`.{0,200}`, `[\s\S]{0,500}`) are deliberately absent
+#: — a counted range cannot blow up — and so is `[^\n]*`, which is what the denial
+#: recommends. Issue #845, §4 of
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md.
+_UNBOUNDED_WILDCARD = re.compile(
+    r"\.[*+]|\[\\s\\S\][*+]|\[\\S\\s\][*+]|\[\\d\\D\][*+]|\[\\D\\d\][*+]"
+    r"|\[\\w\\W\][*+]|\[\\W\\w\][*+]")
+
+_SEARCH_PATTERN_TOOL = "search_for_pattern"
+
+_BACKTRACKING_REFUSAL = (
+    "That pattern can backtrack catastrophically: `search_for_pattern` matches with "
+    "DOTALL, so `.*` crosses newlines and two of them over a large file can hang the "
+    "Serena server for minutes (issue #845 — 18m50s of CPU on one call). Bound the "
+    "wildcards: use `[^\\n]*` for a line-scoped match, a counted range like `.{0,200}`, "
+    "or pass `multiline: false`. For a structural question use `find_symbol` / "
+    "`get_symbols_overview` instead of a text search."
+)
+
+
+def _nests_an_unbounded_quantifier(pattern: str) -> bool:
+    """A group that CONTAINS an unbounded newline-crossing quantifier and is itself
+    quantified — `(.*\\n)*`, the classic exponential shape. Refused whatever `multiline`
+    says: this one does not need DOTALL to blow up."""
+    stack: list[int] = []
+    for i, ch in enumerate(pattern):
+        escaped = i > 0 and pattern[i - 1] == "\\"
+        if escaped:
+            continue
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            inner = pattern[stack.pop() + 1:i]
+            if pattern[i + 1:i + 2] in ("*", "+") and _UNBOUNDED_WILDCARD.search(inner):
+                return True
+    return False
+
+
+def search_pattern_decision(payload: dict[str, Any],
+                            env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a `search_for_pattern` whose regex can hang the Serena server.
+
+    §4 of the spec above. TWO SHAPES AND NOTHING ELSE, because this hook sits in front of
+    every worker's primary search tool and a predicate that over-refuses costs a retry on
+    most searches the fleet makes: two or more unbounded newline-crossing quantifiers
+    when newlines ARE crossed, or a nested unbounded quantifier at any setting. A single
+    `.*` is the common case (`class .*Store`) and returns.
+
+    AN INPUT IT CANNOT READ IS ALLOWED. The tool's schema is not Jarvis's to own, and a
+    renamed parameter would otherwise take every worker's search tool offline. The cost
+    is that a schema change disarms this guard, which is why the spec's alarm (§2) and
+    `MCP_TOOL_TIMEOUT` (§3) sit behind it.
+    """
+    from . import dispatch
+
+    tool = payload.get("tool_name") or ""
+    # Both Serena prefixes, built from the one tuple that owns them: a plugin install
+    # produces the long one and `claude mcp add serena` the short one.
+    if tool not in tuple(f"{p}{_SEARCH_PATTERN_TOOL}"
+                         for p in dispatch.SERENA_TOOL_PREFIXES):
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    pattern = tool_input.get("substring_pattern")
+    if not isinstance(pattern, str) or not pattern:
+        return None
+    # Serena defaults `multiline=True`, which is `re.DOTALL | re.MULTILINE`.
+    crosses_newlines = bool(tool_input.get("multiline", True))
+    if crosses_newlines and len(_UNBOUNDED_WILDCARD.findall(pattern)) >= 2:
+        return _deny(_BACKTRACKING_REFUSAL)
+    if _nests_an_unbounded_quantifier(pattern):
+        return _deny(_BACKTRACKING_REFUSAL)
+    return None
+
+
 def _allow(reason: str) -> dict[str, Any]:
     return {
         "hookSpecificOutput": {
@@ -1535,6 +1613,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
     # `Edit`/`Write` one below, so the refusal is unreachable anywhere else (§2.6 of
     # docs/superpowers/specs/2026-09-27-investigation-orders.md).
     if isinstance(tool, str) and tool.startswith("mcp__"):
+        # FIRST: `investigator_write_decision` returns `None` for a read-only Serena
+        # tool, so a refusal placed after it would still be reached — but an investigator
+        # would fall through to nothing and get no useful message (spec §4).
+        runaway = search_pattern_decision(payload, env)
+        if runaway is not None:
+            return runaway
         return investigator_write_decision(payload, env)
 
     if tool in ("Edit", "Write", "NotebookEdit") and env.get("JARVIS_WO_ID"):

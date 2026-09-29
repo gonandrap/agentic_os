@@ -17,6 +17,7 @@ the user has put it down.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,7 +43,11 @@ def real_session(monkeypatch):
 
 def test_the_wall_clock_splits_the_way_the_method_says(real_session):
     """`docs/findings/anatomy-of-an-expensive-turn.md`'s summary table, to the second:
-    1886s of wall clock, 576s blocked on a subagent join, 58s executing tools.
+    1886s of wall clock, 582s blocked on a subagent join, 52s executing tools.
+
+    CORRECTED from 576/58 by issue #845: the session's two foreground `Agent` spans (2.8s
+    and 2.9s) are a JOIN and were being counted as tools the lead ran. Six seconds move
+    between two buckets; the wall clock and the finding's conclusion are unchanged.
 
     The question that started this: a DESIGN-ONLY agent with three 14-minute turns. A
     third of it was the lead agent asleep with no API call in flight, which is invisible
@@ -51,8 +56,8 @@ def test_the_wall_clock_splits_the_way_the_method_says(real_session):
     part = real_session.partition()
 
     assert round(part["wall"]) == 1886
-    assert round(part["blocked"]) == 576
-    assert round(part["tools"]) == 58
+    assert round(part["blocked"]) == 582
+    assert round(part["tools"]) == 52
     assert sum(part[k] for k in inspection.PARTS) == pytest.approx(part["wall"])
 
 
@@ -70,11 +75,15 @@ def test_the_method_s_66_percent_is_generating_plus_idle(real_session):
 
 
 def test_each_turn_matches_the_method_s_per_turn_table(real_session):
-    """§2: 865s / 136s blocked / 26s tools, then 885s / 440s / 23s, then 136s / 0 / 9s."""
+    """§2: 865s / 139s blocked / 23s tools, then 885s / 443s / 20s, then 136s / 0 / 9s.
+
+    CORRECTED from 136/26 and 440/23 for the reason above (issue #845): each of the first
+    two turns delegated once in the foreground, and those ~3s are a wait, not a tool.
+    """
     rows = [(round(t.wall), round(t.blocked), round(t.tools))
             for t in real_session.turns]
 
-    assert rows == [(865, 136, 26), (885, 440, 23), (136, 0, 9)]
+    assert rows == [(865, 139, 23), (885, 443, 20), (136, 0, 9)]
     # "Half of turn 2 was the lead agent doing nothing, holding a 193k context."
     assert round(real_session.turns[1].share()["blocked"], 2) == 0.50
 
@@ -665,6 +674,157 @@ def test_a_join_that_came_back_is_not_an_alarm(write_transcript):
     assert inspection.live_alarms(session, InspectConfig(), now=500, dispatched=0.0) == []
 
 
+# -- a foreground delegation is a WAIT, and a hung subagent call is the alarm -----------
+#
+# docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md,
+# issue #845.
+
+
+def test_a_foreground_delegation_is_a_wait_and_not_a_tool_the_lead_ran(write_transcript):
+    """Spec §1. `Agent` returns immediately only when the subagent is BACKGROUNDED; a
+    foreground call blocks the lead until the subagent returns, so its seconds are
+    `blocked` and not `tools`."""
+    session = write_transcript("delegated", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(10, 130, "t1", "Agent", {"description": "write the spec"}),
+    ])
+    anatomy = inspection.read_session(session)
+    (turn,) = anatomy.turns
+    (span,) = turn.spans
+
+    assert span.is_join is True
+    assert anatomy.joins(0) == [span]
+    assert (turn.blocked, turn.tools) == (120.0, 0.0)
+
+
+def test_a_backgrounded_agent_is_not_a_wait(write_transcript):
+    """The other half of §1, and why `backgrounded` is read from the RAW `tool_use`
+    input: `run_in_background: true` hands the wait to `TaskOutput`."""
+    session = write_transcript("backgrounded", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(10, 130, "t1", "Agent",
+                   {"description": "write the spec", "run_in_background": True}),
+    ])
+    anatomy = inspection.read_session(session)
+    (turn,) = anatomy.turns
+    (span,) = turn.spans
+
+    assert span.is_join is False
+    assert anatomy.joins(0) == []
+    assert (turn.blocked, turn.tools) == (0.0, 120.0)
+
+
+def delegation_transcript(write_transcript, *, session: str, sub_rows: list[dict],
+                          background: bool = False, label: str = "") -> str:
+    """A lead whose foreground `Agent` span is still open, plus one subagent transcript.
+
+    The `Agent` input carries a `description` and no task id, which is what Claude Code
+    actually writes — so the subagent is UNATTACHED and the alarm has to scan the
+    session's anatomies rather than one turn's children.
+    """
+    inp: dict = {"description": "write the spec", "subagent_type": "jarvis-spec-writer"}
+    if background:
+        inp["run_in_background"] = True
+    written = write_transcript(session, [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[{"type": "tool_use", "id": "t1",
+                                          "name": "Agent", "input": inp}]),
+    ], subagents={"agent-a7b62083": sub_rows})
+    if label:
+        root = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV])
+        (root / "-proj" / session / "subagents" / "agent-a7b62083.meta.json").write_text(
+            json.dumps({"agentType": label, "description": "write the spec"}))
+    return written
+
+
+def healthy_sub_rows() -> list[dict]:
+    return [prompt_row(100, "write the spec"),
+            *tool_rows(110, 130, "s1", "Read", {"file_path": "/x.py"})]
+
+
+HUNG_PATTERN = r"^def .*\n(.*\n)*?.*return"
+
+
+def hung_sub_rows(at: float = 130.0) -> list[dict]:
+    return [prompt_row(100, "write the spec"),
+            *tool_rows(110, 120, "s1", "Read", {"file_path": "/x.py"}),
+            assistant_row(at, "s-m2", content=[
+                {"type": "tool_use", "id": "s2",
+                 "name": "mcp__serena__search_for_pattern",
+                 "input": {"substring_pattern": HUNG_PATTERN}}])]
+
+
+def test_a_working_subagent_raises_nothing_however_long_the_delegation(write_transcript):
+    """Spec §2 test 1, THE REGRESSION GUARD: 43 of the fleet's 272 foreground
+    delegations run past 20 minutes and nearly all of them are real work. Elapsed wait
+    alone is not evidence of a hang."""
+    session = delegation_transcript(write_transcript, session="working",
+                                    sub_rows=healthy_sub_rows())
+
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=311,
+                                  dispatched=0.0) == []
+
+
+def test_a_backgrounded_delegation_is_never_considered_by_the_join_loop(write_transcript):
+    """Spec §2 test 2. Not a join at all, so the hang evidence is never even read — the
+    wait it defers is `TaskOutput`'s."""
+    session = delegation_transcript(write_transcript, session="bg-hung",
+                                    sub_rows=hung_sub_rows(), background=True)
+    anatomy = inspection.read_session(session)
+    (span,) = anatomy.turns[0].spans
+
+    assert span.is_join is False
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=500,
+                                  dispatched=0.0) == []
+
+
+def test_a_hung_subagent_tool_call_raises_one_join_alarm_that_names_it(write_transcript):
+    """Spec §2 tests 3 and §2c: the alarm names the hung TOOL and the subagent it found,
+    which is what issue #845 asks for."""
+    cfg = InspectConfig()
+    session = delegation_transcript(write_transcript, session="hung",
+                                    sub_rows=hung_sub_rows(),
+                                    label="jarvis-spec-writer")
+    now = 130 + cfg.alarm_subagent_tool_minutes * 60 + 1
+
+    raised = inspection.live_alarms(session, cfg, wo_id="wo-1", now=now, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.JOIN_ALARM]
+    assert "mcp__serena__search_for_pattern" in raised[0].reason
+    assert "jarvis-spec-writer" in raised[0].reason
+    # The pattern itself, through `_detail_of` — the bound and the redaction already in
+    # place, and the thing the user needs to see to know what to stop writing.
+    assert HUNG_PATTERN[:20] in raised[0].reason
+    assert "jarvis inspect wo-1" in raised[0].reason
+
+
+def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript):
+    """The threshold is a threshold: one minute into an MCP call is normal."""
+    session = delegation_transcript(write_transcript, session="slow-not-hung",
+                                    sub_rows=hung_sub_rows())
+
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=190,
+                                  dispatched=0.0) == []
+
+
+def test_task_output_still_alarms_on_elapsed_wait_alone(write_transcript):
+    """Spec §2a, unchanged byte for byte: a pure wait with no subagent transcript of its
+    own to inspect, judged on the 5-minute cache TTL."""
+    cfg = InspectConfig()
+    session = write_transcript("collected", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[{"type": "tool_use", "id": "t1",
+                                          "name": "TaskOutput",
+                                          "input": {"task_id": "a7b62083"}}]),
+    ], subagents={"agent-a7b62083": healthy_sub_rows()})
+
+    raised = inspection.live_alarms(session, cfg, wo_id="wo-1",
+                                    now=10 + cfg.alarm_join_seconds + 1, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.JOIN_ALARM]
+    assert "blocked" in raised[0].reason
+
+
 def synthetic_row(at: float, mid: str, text: str) -> dict:
     """The zero-token assistant message Claude Code writes ITSELF — the usage-limit
     notice, and the copy of it laid down beside the next prompt."""
@@ -772,6 +932,11 @@ def test_the_defaults_are_the_measured_ones():
 
     assert (cfg.alarm_turn_minutes, cfg.alarm_join_seconds,
             cfg.alarm_write_tokens) == (60, 300, 300_000)
+    # The hang evidence behind a foreground delegation's join alarm (issue #845). ONE
+    # opinion about how long a single tool call may take: the same boundary as
+    # `alarm_join_seconds` and as the `MCP_TOOL_TIMEOUT` every worker is launched with.
+    assert cfg.alarm_subagent_tool_minutes == 5
+    assert cfg.alarm_subagent_tool_minutes * 60 == cfg.alarm_join_seconds
     # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds, so this
     # is fifteen times a slow start and fires on 0.26% of them.
     assert cfg.alarm_stalled_minutes == 15
@@ -862,6 +1027,7 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
     })
     project = cat.project("quick")
 
+    assert project.inspect.alarm_subagent_tool_minutes == 5  # inherited from the default
     assert project.inspect.alarm_awaiting_minutes == 120   # inherited from os
     assert project.inspect.alarm_turn_minutes == 15        # its own
     assert project.inspect.report_write_floor == 50_000    # inherited from os
@@ -871,9 +1037,28 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
         "projects.quick.inspect.alarm_turn_minutes"] == 15
 
 
+def test_the_hang_threshold_is_settable_fleet_wide_and_per_project(tmp_path):
+    """Spec §2 test 5. A project whose MCP server is genuinely slow raises it; the rest
+    of `InspectConfig` still inherits field by field."""
+    from jarvis import config_version
+
+    cat = catalog.parse_catalog({
+        "os": {"inspect": {"alarm_subagent_tool_minutes": 10}},
+        "projects": [{"name": "slow-mcp", "path": str(tmp_path),
+                      "inspect": {"alarm_subagent_tool_minutes": 20}}],
+    })
+
+    assert cat.os.inspect.alarm_subagent_tool_minutes == 10
+    assert cat.project("slow-mcp").inspect.alarm_subagent_tool_minutes == 20
+    assert cat.project("slow-mcp").inspect.alarm_join_seconds == 300   # inherited
+    assert config_version.resolve(cat)[
+        "projects.slow-mcp.inspect.alarm_subagent_tool_minutes"] == 20
+
+
 @pytest.mark.parametrize("key", ["alarm_write_tokens", "report_write_floor",
                                  "quote_chars", "alarm_turn_minutes",
-                                 "alarm_stalled_minutes", "alarm_awaiting_minutes"])
+                                 "alarm_stalled_minutes", "alarm_awaiting_minutes",
+                                 "alarm_subagent_tool_minutes"])
 def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
     """Zero would report every write a session makes and flag every work order the fleet
     runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
