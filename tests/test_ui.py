@@ -3008,3 +3008,20 @@ def test_the_feature_order_page_never_grows_a_work_order_review_form(client, pro
     assert "Validation" in page and "the plan cannot be judged" in page
     assert "/wo/proj_a/" not in page.split(">Validation<")[1]
     assert "over the panel's objection" not in html.unescape(" ".join(page.split()))
+
+
+def test_the_open_span_says_when_it_last_moved(client, daemon, project):
+    """Fix 4's span line: "still in it" is true but is not the live fact.
+
+    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+    """
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        store.add_event(wo["id"], "turn_ended")
+    finally:
+        store.close()
+
+    page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
+    assert "still in it · active" in html.unescape(page)

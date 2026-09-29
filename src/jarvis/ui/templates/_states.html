@@ -69,8 +69,15 @@
       <div style="width: {{ offset }}%;"></div>
       <div style="width: {{ s.share * 100 }}%; background: {{ colour }};"></div>
     </div>
+    {# THE OPEN SPAN SAYS WHEN IT LAST MOVED. "still in it" is true but is not the live
+       fact; the comparison is the renderer's, off keys `as_dict` already exposes, so no
+       payload key is added (fix 4 of
+       docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md). #}
     <span class="grow sub" style="margin-left: 12px;">{{ fmt_ts(s.entered) }} ·
-      {{ s.trigger or no_trigger_phrase }}{% if s.open %} · still in it{% endif %}</span>
+      {{ s.trigger or no_trigger_phrase }}{% if s.open %} · still in it
+      {%- if states.last_activity_ts is not none and states.last_activity_ts > s.entered %}
+       · active {{ fmt_dur(states.last_activity_age) }} ago
+      {%- endif %}{% endif %}</span>
     <span class="mono">{{ fmt_dur(s.seconds) }}</span>
   </div>
   {% endfor %}

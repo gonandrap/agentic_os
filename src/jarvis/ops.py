@@ -1650,12 +1650,53 @@ def _derived_trigger(store: ProjectStore, wo_id: str, entered: float) -> str:
     return str(row["kind"]) if row else ""
 
 
+def _transcript_activity(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
+    """The last write to the worker's transcript and to the subagent files beside it.
+
+    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md fix 4. A
+    LEAD's transcript is quiet for the whole time its implementer types, so the subagent
+    files are the source that matters. `stat()` mtime, never a parsed last row: the
+    question is "did anything happen recently", not "what", and seeking a multi-megabyte
+    JSONL on every render would break `state_durations`' one-cheap-read contract.
+
+    ABSENT CONTRIBUTES NOTHING — no tuple, never a `0.0`, because `NO_ACTIVITY_NOTE` and
+    the view distinguish "nothing on the record at all" from "old".
+    """
+    from . import claude_cli, inspection
+    try:
+        wo = store.get_work_order(wo_id)
+        session_id = str(wo.get("session_id") or "")
+        if not session_id:
+            return []
+        # `worker_session.worktree_path`'s own computation, without the ProjectSpec
+        # import: `ops` must not load the catalog for a read this cheap.
+        worktree = wo.get("worktree")
+        cwd = (store.project_path / ".claude" / "worktrees" / str(worktree)
+               if worktree else store.project_path)
+        path = claude_cli.session_transcript_path(cwd, session_id)
+        stamps = []
+        for p in [path, *inspection._subagent_transcripts(path)]:
+            # `stat()` and not `exists()`: `exists()` swallows a PermissionError into
+            # False, and a lead whose file is merely GONE must not hide its subagents'.
+            try:
+                stamps.append(p.stat().st_mtime)
+            except FileNotFoundError:
+                continue
+    except (OSError, KeyError):
+        return []
+    return [(max(stamps), "transcript")] if stamps else []
+
+
 def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     """Every moment the record says something happened TO one work order. Spec §4.
 
     All five tables, though every activity class in today's code also writes a `wo_events`
     row: the union costs four cheap indexed `MAX()`es and cannot under-report, while the
     events-only read is one future writer away from calling a busy order idle.
+
+    Plus a sixth source off the record entirely — the session transcript's last write
+    (`_transcript_activity`), which is the only thing that moves while a worker's subagent
+    types.
     """
     quiet = _quiet_kinds()
     marks = ", ".join("?" for _ in quiet)
@@ -1676,6 +1717,7 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
         stamps = [float(v) for v in tuple(got or ()) if v is not None]
         if stamps:
             found.append((max(stamps), source))
+    found.extend(_transcript_activity(store, wo_id))
     return found
 
 
@@ -1713,7 +1755,8 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     Discriminated by keyword exactly as `validation_rounds` is — one of the two, `OpsError`
     on both or neither. `now` is a parameter because every figure here is a present-tense
     claim computed at read time from immutable rows (kn-96f47efb): un-cacheable, and
-    injectable by a test. One indexed read per table, no model, nothing written.
+    injectable by a test. One indexed read per table plus one `stat()` per transcript
+    file, no model, nothing written.
     """
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
