@@ -885,10 +885,10 @@ def validate_params(primitive: str, params: Mapping[str, Any]) -> list[str]:
     be extended by a row is not closed and `remedies`' whole argument rests on its being
     closed.
 
-    The schema check is written to SWITCH ITSELF ON. `Remedy` carries no `params` schema
-    today — that lands with the primitives section — so `getattr` returns None and only
-    the name is checked. The day a schema appears, unknown parameters, missing required
-    ones and wrong types start being refused here with no edit to this function.
+    The schema check SWITCHED ITSELF ON. `Remedy.params` now exists and defaults to `()`,
+    so "declares no schema" is an empty tuple and only the name is checked. A primitive
+    that DOES declare params has unknown parameters, missing required ones and wrong types
+    refused here already.
     """
     problems: list[str] = []
     remedy = remedies.REMEDIES.get(primitive)
@@ -921,11 +921,10 @@ def _param_specs(schema: Any) -> dict[str, tuple[str, bool]]:
     TOLERANT ON PURPOSE. The primitives section spells `Remedy.params` as
     `tuple[Param, ...]` — objects carrying `.name`, `.type` and `.required` — while the
     obvious reading of an insert-time schema is a mapping of name to spec dict. That
-    section is on a PARALLEL branch and its exact spelling is not settled, and neither
-    worker can see the other's text; a schema check that raises `AttributeError` the day
-    the other shape lands is strictly worse than one that adapts to both. Anything this
-    cannot read at all is treated as "no schema declared", which leaves the unconditional
-    name check — the one that matters — doing its job.
+    spelling has landed and is settled; the mapping branch stays because a schema check
+    that adapts to both shapes is strictly cheaper than one that raises `AttributeError`
+    if either moves. Anything this cannot read at all is treated as "no schema declared",
+    which leaves the unconditional name check — the one that matters — doing its job.
     """
     if not schema:
         return {}
