@@ -287,3 +287,72 @@ def test_an_ordinary_work_order_is_untouched(started, store):
 
     assert out["status"] == "completed"
     assert events(store, wo["id"], ops.RED_DEFER_EVENT) == []
+
+
+# -- 6: the tick that is the only step touching a held release --------------------
+
+
+def _red_runs(monkeypatch, sha: str = RED_SHA) -> None:
+    """`ci.base_runs` answering red on the base's newest head."""
+    from jarvis import ci
+
+    monkeypatch.setattr(ci, "base_runs", lambda *a, **k: (
+        ci.Run(run_id=36273250195, head_sha=sha, conclusion="failure",
+               status="completed", started_at=2.0, workflow="ci"),))
+
+
+def test_the_daemon_tick_parks_a_release_held_red_past_the_threshold(
+        started, store, monkeypatch):
+    """§3: the threshold has to fire on the step that VISITS a held release.
+
+    `defer_red_release` runs only when a worker DELIVERS, so a release re-parked to
+    `pending` is touched by `hold_red_release` alone — which only ever extended the
+    hold. A `main` red for a day left the release silently `pending` with no attention.
+    """
+    rel = release_order(store, status="pending")
+    store.add_event(rel, Daemon.RED_HOLD_EVENT, {"head_sha": RED_SHA, "base": "main"})
+    backdate(store, rel, Daemon.RED_HOLD_EVENT, Daemon.RED_PARK_AFTER_SECONDS + 60)
+    _red_runs(monkeypatch)
+    spec = started.catalog.project("proj_a")
+
+    started.hold_red_release(spec, store)
+
+    wo = store.get_work_order(rel)
+    assert wo["status"] == "needs_review"
+    assert len(events(store, rel, ops.RED_PARK_EVENT)) == 1
+    assert invariants.true_blockers(store, wo)[0] == wo["attention_reason"]
+    assert "ci" in wo["attention_reason"] and RED_SHA[:10] in wo["attention_reason"]
+
+    # A parked order leaves the `pending` population, so the park cannot repeat.
+    started.hold_red_release(spec, store)
+    assert len(events(store, rel, ops.RED_PARK_EVENT)) == 1
+
+
+def test_the_tick_under_the_threshold_only_extends_the_hold(
+        started, store, monkeypatch):
+    """§3's near miss: one minute short of six hours is still an ordinary red base."""
+    rel = release_order(store, status="pending")
+    store.add_event(rel, Daemon.RED_HOLD_EVENT, {"head_sha": RED_SHA, "base": "main"})
+    backdate(store, rel, Daemon.RED_HOLD_EVENT, Daemon.RED_PARK_AFTER_SECONDS - 60)
+    _red_runs(monkeypatch)
+
+    started.hold_red_release(started.catalog.project("proj_a"), store)
+
+    wo = store.get_work_order(rel)
+    assert wo["status"] == "pending"
+    assert events(store, rel, ops.RED_PARK_EVENT) == []
+    assert abs(float(wo["retry_after"]) - (db.now() + Daemon.RED_HOLD_SECONDS)) < 10
+    assert not wo["needs_attention"]
+
+
+def test_the_first_red_tick_never_parks(started, store, monkeypatch):
+    """§3's ordering: `_say_base_is_red` is what writes RED_HOLD_EVENT, so on the first
+    red tick `first_red_hold` is None and there is no clock to be past."""
+    rel = release_order(store, status="pending")
+    _red_runs(monkeypatch)
+
+    started.hold_red_release(started.catalog.project("proj_a"), store)
+
+    assert store.get_work_order(rel)["status"] == "pending"
+    assert events(store, rel, ops.RED_PARK_EVENT) == []
+    assert len(events(store, rel, Daemon.RED_HOLD_EVENT)) == 1

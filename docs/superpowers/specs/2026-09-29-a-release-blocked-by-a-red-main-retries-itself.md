@@ -170,10 +170,33 @@ over a release that verifiably did NOT happen is the one direction that must nev
 RED_PARK_AFTER_SECONDS = 6 * 3600
 ```
 
-Beside `RED_HOLD_SECONDS` in `daemon.py:6991`, read lazily by `ops.defer_red_release`
-(the `from .daemon import ...` inside-a-function idiom `escalate_validation_round` already
-uses). The clock is the earliest `Daemon.RED_HOLD_EVENT` (`release_held_red_base`) OR
-`RED_DEFER_EVENT` row on the order — the two paths write different kinds and both count.
+Beside `RED_HOLD_SECONDS` in `daemon.py:6991`. The clock is the earliest
+`Daemon.RED_HOLD_EVENT` (`release_held_red_base`) OR `RED_DEFER_EVENT` row on the order —
+the two paths write different kinds and both count (`ops.first_red_hold`).
+
+**The threshold is evaluated in `Daemon.hold_red_release`, not only in
+`ops.defer_red_release`.** `defer_red_release` runs from `ops.finish` and therefore only
+when a worker DELIVERS; once the release is re-parked to `pending`, that never happens
+again. `hold_red_release` is then the ONLY step that visits the order, and all it did was
+extend the hold while `main` stayed red — so a base red for 24h left the release silently
+`pending` with no attention, which is the opposite of what this section promises. So, in
+the `red is not None` branch of its `for wo in due:` loop, BEFORE extending the hold: if
+`ops.first_red_hold` is past `RED_PARK_AFTER_SECONDS`, park through the same
+`ops.park_red_release` and `continue` — an order that just parked does not also get its
+hold extended. `daemon` imports `ops` lazily inside the step, the idiom the rest of the
+file already uses; the `fact` it passes is built from the `base` string and the `ci.Run`
+that holds it (which carries no run url, so that field is `""`).
+
+Two orderings make this safe and are why nothing double-fires:
+
+* `_say_base_is_red` is what WRITES `RED_HOLD_EVENT`, so on the first red tick
+  `first_red_hold` is None and nothing parks.
+* A parked order is `needs_review`, which the step's `statuses=("pending",)` selection
+  stops returning — the park cannot repeat, on top of the episode discipline below.
+
+`defer_red_release` keeps its own check: a worker delivering onto a base that has been red
+past the threshold should park then and there, rather than wait a tick. That check was
+never wrong, only insufficient.
 
 **Recommend 6 hours.** A red `main` on this repo is repaired by a work order round trip
 (file the bug, dispatch, PR, merge), which is hours and not minutes; one hour would ask
@@ -183,7 +206,7 @@ expedited fix the user asked for in production never ships. 6h costs at most 72 
 cycles at `RED_HOLD_SECONDS` and no `gh` calls beyond the one the daemon makes anyway
 (an in-force hold IS the rate limit).
 
-Past the threshold `defer_red_release` parks instead: `needs_review`, one
+Past the threshold either caller parks instead: `needs_review`, one
 `release_park_red_base` event, one `flag_attention`. Episode discipline is
 `park_unlanded`'s (`src/jarvis/ops.py:4110-4148`) and kn-7b122cd9's: the event and the
 flag are written only when no park episode is open (a park with no later `finished` /
@@ -276,6 +299,23 @@ One per behaviour. New file `tests/test_release_red_defer.py` unless named other
    (`tests/test_release_overtaken.py`) — the §4 regression: a release order in `pending`
    with `retry_after` in the future, whose batch a newer `jarvis-*` tag carries and which
    production runs, is `completed` by `settle_shipped_releases`.
+
+9. `test_the_daemon_tick_parks_a_release_held_red_past_the_threshold` — §3's real path:
+   an order left in `pending` with its red-hold event backdated past
+   `RED_PARK_AFTER_SECONDS`, `main` still red, ONE `hold_red_release` tick, and NO status
+   set to `running` by hand. Status `needs_review`, one park event, the attention line
+   naming the red run, and a second tick writing nothing. Its two neighbours:
+   `test_the_tick_under_the_threshold_only_extends_the_hold` (one minute short leaves it
+   `pending` with the hold extended) and `test_the_first_red_tick_never_parks`.
+10. `test_a_release_that_delivered_nothing_reaches_no_panel`
+    (`tests/test_validation_release_skip.py`) — defect (b) EXACTLY, which test 6 does not
+    reach because it stages a release and is voided: validation ENABLED, no release
+    effect, `evidence.nothing_to_judge` monkeypatched to fail if it is ever called.
+    `test_a_release_with_a_pull_request_reaches_no_panel_either` pins that the exemption
+    is about the ORDER and not the artifact, and `test_the_predicate_is_the_batch_keys_presence`
+    pins `release.is_release_order`: True for an EMPTY list (the key's presence is the
+    whole test — a release whose fixes were all overtaken is still a release), False when
+    the key is absent or holds something that is not a list.
 
 Two supporting assertions, folded into 1 and 5 rather than given their own functions:
 `hold_dispatch` leaving `dispatch_attempts` alone, and the head-sha dedupe writing one

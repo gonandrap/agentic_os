@@ -4192,13 +4192,15 @@ def defer_red_release(store: ProjectStore, project_name: str,
         return None
     fact = _stored_base_health(project_name)
     checked = fact.get("checked_at")
+    # `db.now()` for both clocks in this function, `Daemon._base_red`'s freshness test
+    # over the same epoch seconds the fact carries.
     fresh = (isinstance(checked, (int, float))
-             and time.time() - float(checked) <= BASE_HEALTH_FRESH_SECONDS)
+             and db.now() - float(checked) <= BASE_HEALTH_FRESH_SECONDS)
     if fresh and not fact.get("red"):
         return None
-    first = _first_red_hold(store, wo_id)
+    first = first_red_hold(store, wo_id)
     if first is not None and db.now() - first >= Daemon.RED_PARK_AFTER_SECONDS:
-        return _park_red_release(store, wo_id, fact)
+        return park_red_release(store, wo_id, fact)
     # `hold_dispatch` writes `retry_after` ONLY: `dispatch_attempts` is
     # `release_dispatch_claim`'s ladder, and a deferral for a reason outside the order
     # must not spend a launch. NO attention flag and no notification — a red base for a
@@ -4243,11 +4245,11 @@ def _red_base_said(fact: dict[str, Any]) -> dict[str, Any]:
                        f"delivered no release and waits for the base to go green")}
 
 
-def _first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
+def first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
     """When this order was FIRST held on a red base, by either path — §3's one clock.
 
     The pending-dispatch hold (#807, `Daemon.RED_HOLD_EVENT`) and the mid-run re-park
-    write different kinds and both count.
+    write different kinds and both count. Public: `Daemon.hold_red_release` calls it.
     """
     from .daemon import Daemon
 
@@ -4257,11 +4259,15 @@ def _first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
     return min(stamps) if stamps else None
 
 
-def _park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
+def park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
     """Past the threshold the release stops waiting and asks the user (§3).
 
     ONCE PER EPISODE, `park_unlanded`'s discipline and kn-7b122cd9's: the event and the
     flag are written only while no park is open, so nothing renotifies.
+
+    Two callers, both required: this path (a worker delivering onto a base red past the
+    threshold) and `Daemon.hold_red_release`'s tick, which is the ONLY step that visits
+    a release already held in `pending`. `fact` is `base_health`-shaped either way.
     """
     if store.release_red_park_open(wo_id):
         store.set_status(wo_id, "needs_review", trigger="release_red_repark")

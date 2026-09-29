@@ -7024,9 +7024,12 @@ the place to fix a red build."""
         indexed listing when it owns no pending release, and a `gh` call only once a
         hold has lapsed — an in-force hold IS the rate limit.
 
+        Also where the hold STOPS: past `RED_PARK_AFTER_SECONDS` the release asks the
+        user instead (2026-09-29 spec §3).
+
         docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
         """
-        from . import ci, evidence, github
+        from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
         # release script and the production checkout, both facts about this repository.
@@ -7065,6 +7068,18 @@ the place to fix a red build."""
                 if wo.get("retry_after") is not None and not int(
                         wo.get("dispatch_attempts") or 0):
                     store.hold_dispatch(wo_id, until=None)
+                continue
+            # §3's threshold, HERE: this tick is the only step that visits a release
+            # already held in `pending`, so `ops.defer_red_release`'s check — which runs
+            # only when a worker delivers — can never fire for one. `_say_base_is_red`
+            # below is what writes RED_HOLD_EVENT, so on the FIRST red tick there is no
+            # clock yet and nothing parks; and a parked order is `needs_review`, which
+            # the `statuses=("pending",)` selection above stops returning.
+            first = ops.first_red_hold(store, wo_id)
+            if first is not None and db.now() - first >= self.RED_PARK_AFTER_SECONDS:
+                ops.park_red_release(store, wo_id, {
+                    "base": base, "head_sha": red.head_sha, "workflow": red.workflow,
+                    "run_id": red.run_id, "run_url": getattr(red, "run_url", "") or ""})
                 continue
             until = max(float(wo.get("retry_after") or 0),
                         db.now() + self.RED_HOLD_SECONDS)
