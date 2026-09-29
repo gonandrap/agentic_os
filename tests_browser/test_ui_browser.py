@@ -390,6 +390,24 @@ def test_dashboard_refreshes_without_reloading_the_page(page, server):
     )
 
 
+def test_the_fleet_brake_from_the_dashboard(page, server):
+    """Pause from the form, the banner appears (and on other pages), resume lifts it."""
+    page.goto(server)
+    assert page.locator(".brake").count() == 0
+    page.fill("form[action='/fleet/pause'] input[name='reason']", "browser brake")
+    page.click("form[action='/fleet/pause'] button")
+    banner = page.locator(".brake")
+    assert "FLEET PAUSED" in banner.inner_text()
+    assert "browser brake" in banner.inner_text()
+    assert page.locator("form[action='/fleet/pause']").count() == 0
+    page.goto(f"{server}/inbox")
+    assert "FLEET PAUSED" in page.locator(".brake").inner_text()
+    page.click("form[action='/fleet/resume'] button")
+    assert page.url.endswith("/inbox")
+    assert page.locator(".brake").count() == 0
+    assert ops.os_status()["fleet"]["paused"] is False
+
+
 def test_live_sync_updates_state_but_keeps_the_half_typed_order(page, server, project):
     page.goto(server)
     form = "form[action='/wo/create']"
@@ -970,17 +988,34 @@ def _shot_clip(page, clip, name):
 
 
 def _backdate_spans(store, order_id, stamps):
-    """Put an order's spans and its creation on the clock — oldest first.
+    """Put an order's spans, its `status` events and its creation on the clock — oldest
+    first.
 
     The store stamps `db.now()` and there is no back-dating API, so a history that
     happened forty hours ago says so afterwards with SQL: nothing sleeps
     (tests/test_time_in_state.py's `backdate`).
+
+    THE EVENTS MOVE WITH THE SPANS. `set_status` writes both at one moment, and
+    `_backfill_wo_spans` reads a `status` event newer than the newest span as a gap to
+    replay (spec §2d2 of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md).
+    Backdating only the spans leaves five events stamped now against spans forty hours
+    old — a shape no real order has — and the next store the server opens replays every
+    one of them.
     """
     ids = [r["id"] for r in store.conn.execute(
         "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (order_id,))]
     assert len(ids) == len(stamps), (ids, stamps)
     for span_id, ts in zip(ids, stamps):
         store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?", (ts, span_id))
+    # The first span is the creation, which no transition supplies and no event records,
+    # so the events line up with the stamps from the second on.
+    events = [r["id"] for r in store.conn.execute(
+        "SELECT id FROM wo_events WHERE wo_id=? AND kind='status' ORDER BY id",
+        (order_id,))]
+    assert len(events) <= len(stamps) - 1, (events, stamps)
+    for event_id, ts in zip(events, stamps[1:]):
+        store.conn.execute("UPDATE wo_events SET ts=? WHERE id=?", (ts, event_id))
     store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
                        (stamps[0], order_id))
     store.conn.execute("UPDATE feature_orders SET created_at=? WHERE id=?",

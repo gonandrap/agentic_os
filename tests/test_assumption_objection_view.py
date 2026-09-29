@@ -338,6 +338,39 @@ def test_a_panel_hold_with_no_round_recorded_gets_no_link(client, project):
     assert "#round-" not in raw.split('id="validation"')[0]
 
 
+def test_a_confirm_spent_hold_reads_current_and_points_at_no_round(project):
+    """§8 row 8 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+    an-assumption-for-ever.md: `jarvis wo show` prints the CURRENT sentence — the question
+    is no longer open — and adds NO `jarvis validation show` pointer, because the pointer
+    belongs to `panel_gave_up` and this hold is about a spent Neo question, not a round."""
+    from jarvis import autoreview
+
+    store = ProjectStore(project)
+    wo = store.create_work_order(title="an order whose confirmation was dropped",
+                                 description="d")
+    aid = store.add_assumption(wo["id"], "the exporter handles the empty case")
+    store.set_status(wo["id"], "needs_review")
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_CONFIRM_SPENT,
+                     "reason": "assumption #1 is yours — the OS asked Neo to confirm its "
+                               "early reading (question 920) and that question is no "
+                               "longer open",
+                     "assumption_id": aid, "n": 1})
+    row = ops.assumptions_with_rulings(store, wo["id"])[0]
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))
+    store.close()
+
+    readable = cli._readable_autoreview(
+        {"id": wo["id"], "auto_review": state, "assumptions": [row]})
+
+    (line,) = readable["assumptions"]
+    assert "question 920" in line and "no longer open" in line
+    assert "not waiting on a review" not in line
+    assert "jarvis validation show" not in line
+    assert "question 920" in readable["auto_review"]
+    assert "jarvis validation show" not in readable["auto_review"]
+
+
 # -- one renderer, both surfaces --------------------------------------------------------
 
 

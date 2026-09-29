@@ -402,7 +402,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
 
 def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
-        started, project, fake_gh, parked, monkeypatch):
+        started, project, fake_gh, parked, monkeypatch, local_base):
     """SPEC 2026-09-27 §7 TEST 19: the carry's extra reads happen on a `sha_moved` tick and
     on no other. A green, up-to-date pull request whose verdict covers its head pays the
     base budget, no `gh api` commit walk and no local diff — so the price of the feature is
@@ -430,6 +430,8 @@ def test_the_carry_costs_nothing_until_the_head_has_actually_moved(
     store.close_validation_round(row["id"], "passed", "")
     fake_gh.set_pr(PR, "OPEN", mergeable="MERGEABLE", base_ref="main", checks=GREEN,
                    merge_state="CLEAN", head_oid=judged, base_oid=judged)
+    # Up to date: the checkout agrees the head carries the base (spec 2026-09-28 §3.2).
+    local_base.update({"tip": judged, "contains": {judged}})
     poll(started, store)                 # the merge is proposed on this one
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
@@ -1008,3 +1010,45 @@ def test_a_pending_legacy_status_is_not_red(started, project, fake_gh, reviewing
     poll(started, store)
 
     assert not store.queued_messages(reviewing["id"])
+
+
+# -- §2b: the poll records the head it already read -------------------------------------
+
+HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+MOVED = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def test_the_poll_records_the_head_it_already_read(started, project, fake_gh, reviewing):
+    """Spec §2b. The head is read on every poll and was thrown away; `parked_reason`
+    needs it locally, and no new network call may be made for it."""
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=HEAD)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(reviewing["id"])
+    assert row["pr_head_oid"] == HEAD
+    assert float(row["pr_head_seen_at"]) > 0
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=MOVED)
+    poll(started, store)
+
+    assert store.get_work_order(reviewing["id"])["pr_head_oid"] == MOVED
+
+
+def test_an_unchanged_head_is_not_rewritten_every_tick(started, project, fake_gh,
+                                                       reviewing):
+    """The budget of the poll's common case is NO WRITE, and a cache that re-wrote an
+    unchanged sha would bump `updated_at` on every parked order every two minutes."""
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=HEAD)
+    store = ProjectStore(project)
+    poll(started, store)
+    seen = float(store.get_work_order(reviewing["id"])["pr_head_seen_at"])
+
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+    poll(started, store)
+    store.conn.set_trace_callback(None)
+
+    assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
+    assert float(store.get_work_order(reviewing["id"])["pr_head_seen_at"]) == seen

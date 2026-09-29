@@ -217,3 +217,23 @@ def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
         log.debug("not asking whether %r is an ancestor of %r", ancestor, descendant)
         return False
     return _git(repo, "merge-base", "--is-ancestor", ancestor, descendant) is not None
+
+
+def tip(repo: Path, ref: str) -> str:
+    """What commit is `ref` at, locally, right now? `""` when git cannot say.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1.
+    THE BASE TIP IS THE FACT NOTHING IN THE OS READ FRESH: `pr.base_oid` is GitHub's own
+    cached `baseRefOid`, which lagged the real tip of `main` by three commits and 5.3
+    hours on the measured incident (issue #837, gate 308). A reading of the ref the caller
+    has just fetched cannot lag anything.
+
+    Needed as a function of its own because `is_ancestor` refuses a ref name for its
+    `ancestor` argument — `SHA_RE` — so "is the base's tip in this head" has nothing to
+    ask with until the ref is resolved to a commit.
+    """
+    if not REF_RE.match(ref or ""):
+        log.debug("not resolving %r in %s", ref, repo)
+        return ""
+    out = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    return (out or "").strip()

@@ -333,6 +333,8 @@ def test_generating_names_the_time_nothing_has_been_written_since(write_transcri
     assert payload["now"] is None
     assert "nothing has been written since" in payload["note"]
     assert live.clock(1010.0) in payload["note"]
+    # Spec §1: the silence is named, not merely reported.
+    assert payload["note"].startswith("awaiting the model")
 
 
 def test_no_transcript_is_absent_and_never_zero(write_transcript):

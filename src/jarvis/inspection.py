@@ -105,10 +105,17 @@ TTL_5M = 300.0
 TTL_1H = 3600.0
 
 #: Tools whose span is the lead agent WAITING rather than working: it has dispatched
-#: something and is blocked on the result with no API call in flight. Only `TaskOutput`
-#: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
-#: wait it defers is exactly what `TaskOutput` later collects.
+#: something and is blocked on the result with no API call in flight. ALWAYS a wait,
+#: backgrounded or not — `TaskOutput` exists to collect a result.
 JOIN_TOOLS = ("TaskOutput",)
+
+#: Tools whose span is the lead DELEGATING and then waiting for the result. A foreground
+#: call blocks the lead until the subagent returns; only `run_in_background: true` makes
+#: `Agent` return immediately, and that is what `TaskOutput` later collects. Counting a
+#: foreground delegation as a tool the lead RAN is what made `jarvis inspect` report
+#: "blocked on a subagent 0%" for every delegation the fleet has ever made (issue #845,
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1).
+DELEGATION_TOOLS = ("Agent", "Task")
 
 #: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
 #: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
@@ -480,6 +487,10 @@ class ToolSpan:
     #: facts about the same key and a reader acts on them differently.
     params_truncated: list[str] = field(default_factory=list)
     params_dropped: list[str] = field(default_factory=list)
+    #: `run_in_background: true` on the call that opened this span. Read from the RAW
+    #: `tool_use` input, never from `params`: those are redacted strings capped by
+    #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
+    backgrounded: bool = False
 
     @property
     def finished(self) -> bool:
@@ -491,7 +502,9 @@ class ToolSpan:
 
     @property
     def is_join(self) -> bool:
-        return self.name in JOIN_TOOLS
+        if self.name in JOIN_TOOLS:
+            return True
+        return self.name in DELEGATION_TOOLS and not self.backgrounded
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "tool_id": self.tool_id, "started": self.started,
@@ -559,10 +572,20 @@ class Turn:
     seq: int
     started: float
     ended: float
+    #: Which transcript turn of that ONE OS turn this is, 1-based. Two transcript turns
+    #: on one `wo_turns.seq` is the normal compaction shape, not an error — spec
+    #: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.
+    part: int = 1
     #: The last thing the token accounting can see inside this turn — its last API call
     #: or finished tool span. `ended` runs on to the NEXT turn's prompt; what lies
     #: between the two is `idle`, and on a parked work order it is most of the turn.
     active_ended: float = 0.0
+    #: When this turn's LAST INPUT ROW landed with no assistant row after it — a request
+    #: in flight whose first content block has not completed. Zero once one has. Spec
+    #: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §1:
+    #: Claude Code appends an assistant row only when a block COMPLETES, so the absence
+    #: of one is not evidence that nothing was bought.
+    awaiting_since: float = 0.0
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
@@ -643,6 +666,11 @@ class Turn:
         return bool(self.calls)
 
     @property
+    def awaiting(self) -> bool:
+        """A request is in flight and no content block has completed — spec §1."""
+        return bool(self.awaiting_since)
+
+    @property
     def generating(self) -> float:
         """The remainder, but only where an API call vouches for it.
 
@@ -690,7 +718,8 @@ class Turn:
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "seq": self.seq, "started": self.started, "ended": self.ended,
+            "seq": self.seq, "part": self.part,
+            "started": self.started, "ended": self.ended,
             "wall": round(self.wall, 2),
             # BOTH CLOCKS, ALWAYS, and the wall one first: it is the honest answer to
             # "how long did this take in the real world" and deleting it was never on
@@ -705,6 +734,9 @@ class Turn:
             # to be inferred from `api_calls == 0`: every renderer has to say it first
             # and loudest, and an inference is what four layers got wrong (issue 227).
             "observed": self.observed,
+            # ADDITIVE, and no key above reads them — spec §1, the rule `subagents` was
+            # added under. `observed is False` alone is what four surfaces misread.
+            "awaiting": self.awaiting, "awaiting_since": self.awaiting_since,
             "share": {k: round(v, 4) for k, v in self.share().items()},
             "context_peak": self.context_peak,
             "api_calls": len(self.calls), "tool_calls": len(self.spans),
@@ -802,6 +834,10 @@ class Anatomy:
     #: fallback invents a parent the record does not name (issue 227), so an unattached
     #: subagent says it is unattached (spec §4b, decided on wo-5f4d8611 q687).
     unattached_subagents: list[SubagentAnatomy] = field(default_factory=list)
+    #: `wo_turns.seq` values the caller passed that no transcript turn bound to — the
+    #: `/compact` turn, whose prompt row compaction rewrites away. Reported rather than
+    #: dropped (spec 2026-09-27 §3), and empty for a caller that passed no `turn_starts`.
+    unmatched_os_turns: list[int] = field(default_factory=list)
     #: Every hold on the WHOLE work order (`holds.held`), including any falling outside
     #: the turns below. Kept whole rather than only as the per-turn slices, because a
     #: hold still running past the last turn is the live one, and it is the answer to
@@ -940,6 +976,8 @@ class Anatomy:
             # the caps are: silence here would read as "there were none deeper".
             "unattached_subagents": [s.as_dict()
                                      for s in self.unattached_subagents],
+            # ADDITIVE, empty unless the caller bound the numbering (spec 2026-09-27 §3).
+            "unmatched_os_turns": list(self.unmatched_os_turns),
             "subagent_depth_read": SUBAGENT_DEPTH_READ,
         }
 
@@ -960,7 +998,11 @@ def _detail_of(payload: Any, limit: int) -> str:
     """
     if not isinstance(payload, dict):
         return ""
-    for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
+    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name, and the
+    # only field that says WHAT hung when that call runs away (issue #845, spec §2c —
+    # which assumed `pattern` covered it; the tool does not use that name).
+    for key in ("description", "command", "task_id", "file_path", "pattern",
+                "substring_pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return _first_line(redact_param(value), limit)
@@ -1067,9 +1109,13 @@ def read_transcript(path: Path | str,
                 saw_assistant = False
                 param_spent = 0
             open_turn.triggers.append(prompt)
+            # Spec §1: the input is in, the answer is not.
+            open_turn.awaiting_since = ts
             continue
         if row.get("type") == "assistant":
             saw_assistant = True
+            if open_turn is not None:
+                open_turn.awaiting_since = 0.0
         for block in usage_mod.blocks_of(row, "tool_use"):
             tool_id = str(block.get("id") or "")
             if not tool_id:
@@ -1081,7 +1127,11 @@ def read_transcript(path: Path | str,
                             detail=_detail_of(block.get("input"),
                                               cfg.quote_chars),
                             params=params, params_truncated=truncated,
-                            params_dropped=dropped)
+                            params_dropped=dropped,
+                            # The RAW block, the same read `background._scan_calls` does
+                            # and for the same reason (spec §1).
+                            backgrounded=bool((block.get("input") or {}).get(
+                                "run_in_background")))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -1091,6 +1141,9 @@ def read_transcript(path: Path | str,
             span = pending.pop(str(block.get("tool_use_id") or ""), None)
             if span is not None:
                 span.ended = ts
+            # Spec §1: a result is an input too — the model is answering again.
+            if open_turn is not None:
+                open_turn.awaiting_since = ts
 
     return turns, _subagent_labels(Path(path))
 
@@ -1129,10 +1182,52 @@ def classify_writes(calls: Sequence[usage_mod.Call], floor: int,
     return writes
 
 
+#: How far AFTER a transcript turn's first row an OS turn may have started and still be
+#: its turn. The turn file is written first — measured offset on wo-dbea82cf is 3-4s
+#: (07:36:18 vs 07:36:22) — so this covers the OPPOSITE skew only. A measurement of write
+#: ordering, not a project's judgement about what is expensive: it does not belong in the
+#: catalog (spec 2026-09-27 §3).
+TURN_BIND_TOLERANCE_SECONDS = 5.0
+
+
+def turn_name(seq: int) -> str:
+    """"turn 7", or "an unrecorded turn" for the 0 of a turn the OS never minted.
+
+    ONE FORMATTER for every surface that prints a number this module bound. Never -1:
+    `project_store.NO_TURN` belongs to `wo_alarms` and this module imports no store.
+    """
+    return f"turn {seq}" if seq else "an unrecorded turn"
+
+
+def _bind_turns(turns: Sequence[Turn],
+                turn_starts: Sequence[tuple[int, float]]) -> list[int]:
+    """Number the transcript's turns with the OS's own `wo_turns.seq` — spec §3.
+
+    Empty `turn_starts` is 1..N, byte for byte what every caller that cannot see the
+    record got before. Returns the OS turns nothing bound to.
+    """
+    if not turn_starts:
+        for seq, turn in enumerate(turns, start=1):
+            turn.seq, turn.part = seq, 1
+        return []
+    ordered = sorted(turn_starts, key=lambda pair: pair[1])
+    matched: set[int] = set()
+    parts: dict[int, int] = {}
+    for turn in turns:
+        cutoff = turn.started + TURN_BIND_TOLERANCE_SECONDS
+        bound = [seq for seq, started in ordered if started <= cutoff]
+        turn.seq = bound[-1] if bound else 0
+        parts[turn.seq] = parts.get(turn.seq, 0) + 1
+        turn.part = parts[turn.seq]
+        matched.add(turn.seq)
+    return [seq for seq, _ in ordered if seq not in matched]
+
+
 def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None,
-                 spans: Sequence[Hold] = ()) -> Anatomy:
+                 spans: Sequence[Hold] = (),
+                 turn_starts: Sequence[tuple[int, float]] = ()) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
 
     Segments are read in path order and their turns concatenated by start time, then
@@ -1145,6 +1240,11 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     from a test, a `--json` consumer and the daemon alike. Left empty the report is the
     one it was before — every turn `active == wall`, which is the honest reading for a
     caller that cannot see the record rather than a claim that nothing held it.
+
+    `turn_starts` is `(wo_turns.seq, wo_turns.started_at)` and is passed in for that same
+    reason. Left empty the turns are numbered 1..N as they always were; passed, they
+    carry the OS's own numbers, so an alarm and `jarvis inspect` stop naming one turn two
+    different ways (spec 2026-09-27 §3).
     """
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
@@ -1161,8 +1261,7 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
         turns.extend(found)
         anatomy.subagent_labels.update(labels)
     turns.sort(key=lambda t: t.started)
-    for seq, turn in enumerate(turns, start=1):
-        turn.seq = seq
+    anatomy.unmatched_os_turns = _bind_turns(turns, turn_starts)
     anatomy.turns = turns
 
     calls = usage_mod.session_calls(session_id, index=index)
@@ -1270,6 +1369,31 @@ def _read_subagent(path: Path, cfg: InspectConfig,
         deeper=len(_subagent_transcripts(path)))
 
 
+def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
+                       *, since: float = 0.0) -> tuple[SubagentAnatomy, ToolSpan] | None:
+    """The first (subagent, span) whose LAST span is an unfinished tool call older than
+    `older_than` seconds. `None` when every subagent is working normally.
+
+    THIS NAMES THE SUBAGENT IT FOUND AND CLAIMS NO PARENTAGE. It scans the session's
+    anatomies and does not assert that the one it returns is the child of any particular
+    delegation span — an `Agent` span carries a `description` and no task id, so the
+    record does not say. `since` keeps a previous turn's leftovers out by requiring the
+    hung span to have started at or after that moment; it is a time WINDOW and not an
+    attribution, which is why `_attach_subagents` still refuses a timestamp fallback
+    (the issue-227 rule: a REPORT names a parent only where the record does — spec §2b).
+
+    "Last span" is the thing the subagent is doing right now. An unfinished span EARLIER
+    in its transcript is a killed call it already moved past, not a hang.
+    """
+    for sub in subs:
+        span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
+        if span is None or span.finished or span.started < since:
+            continue
+        if now - span.started >= older_than:
+            return sub, span
+    return None
+
+
 def _names(span: ToolSpan, task_id: str) -> bool:
     """Whether this span names that subagent — `detail` or any reported parameter.
 
@@ -1317,7 +1441,15 @@ def _name_joins(turns: Sequence[Turn], labels: dict[str, str]) -> None:
 
 TURN_ALARM, JOIN_ALARM, WRITE_ALARM = "long-turn", "long-join", "big-rewrite"
 #: The one alarm here whose finding is that NOTHING was spent — see `ALARM_KINDS`.
+#: NEVER RAISED LIVE since spec §2: its evidence was the absence of a transcript row, and
+#: the absence is what that spec proves unreliable. Kept so historical rows still render.
 STALL_ALARM = "stalled-turn"
+
+#: A request in flight past `alarm_awaiting_minutes` with no completed content block.
+SLOW_RESPONSE_ALARM = "slow-model-response"
+
+#: Kinds that are a NOTE, not an interruption: recorded, rendered, never escalated.
+INFORMATIONAL_KINDS = frozenset({SLOW_RESPONSE_ALARM})
 
 #: THE AGGREGATE PAIR, and the only kinds in this module that are not about one turn:
 #: `alarms()` never raises them and cannot. They are a PROJECT's re-write tax over a
@@ -1358,8 +1490,12 @@ ALARM_KINDS = {
     # THE ODD ONE OUT, deliberately: the other three say money is going out and this one
     # says none is. It is the opposite finding to the `going-in-circles` health probe,
     # which says effort is being RE-spent — here the work never started (issue 227).
-    STALL_ALARM: "a turn open with no API call ever made — nothing is being billed",
-    JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
+    STALL_ALARM: "a turn that was open with no API call ever made — nothing was being "
+                 "billed (historical: nothing raises this now, spec of 2026-09-27)",
+    SLOW_RESPONSE_ALARM: "a request has been in flight this long with no completed "
+                         "content block — the model is answering slowly",
+    JOIN_ALARM: "a wait that is costing more than it buys — a `TaskOutput` open past "
+                "the cache TTL, or a delegation whose subagent has a tool call hung",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
     # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
     # reader of the legend cannot take them for another reading of `big-rewrite`.
@@ -1418,6 +1554,16 @@ def _spend_so_far(turn: Turn, now: float | None) -> str:
     spend = turn.usage
     return (f"{made}, the last one {when}, {spend.total_tokens:,} tokens for "
             f"${spend.list_cost_usd:.2f} so far")
+
+
+def awaiting_note(turn: Turn) -> str:
+    """"awaiting the model since 21:32 (request in flight, no block completed)".
+
+    ONE FORMATTER FOR EVERY SURFACE — spec §1. Five layers each invented their own
+    sentence for the absence of an assistant row and all five said it meant a stall.
+    """
+    since = datetime.fromtimestamp(turn.awaiting_since).strftime("%H:%M")
+    return f"awaiting the model since {since} (request in flight, no block completed)"
 
 
 def held_note(wall: float, holding: dict[str, float]) -> str:
@@ -1489,24 +1635,51 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
     raised: list[Alarm] = []
     hint = f" — `jarvis inspect {wo_id}`" if wo_id else ""
 
-    # THE TWO DURATION ALARMS ARE EXCLUSIVE, and which one applies is decided by the
-    # cost record rather than by the clock. A turn that has made no API call has bought
-    # nothing, so `long-turn`'s claim — that it is still being billed — would be false;
-    # the finding is the silence itself, and it is raised sooner.
-    if not turn.observed:
-        if active >= cfg.alarm_stalled_minutes * 60:
-            raised.append(Alarm(STALL_ALARM, (
-                f"this turn has been open {int(active // 60)} minutes"
-                f"{held_note(wall, holding)} and has made no API call at all — the work "
-                f"never started, and nothing has been spent on it{hint}")))
-    elif active >= cfg.alarm_turn_minutes * 60:
+    # `stalled-turn` IS NEVER RAISED LIVE (spec §2 branch 2): its evidence was the
+    # absence of an assistant row, and that absence is what the spec proves unreliable —
+    # Claude Code appends one only when a content block COMPLETES. A genuinely hung turn
+    # is still caught by `worker_session.TURN_STALL_SECONDS`, which judges the PROCESS.
+    if turn.observed and active >= cfg.alarm_turn_minutes * 60:
         raised.append(Alarm(TURN_ALARM, (
             f"this turn has been running {int(active // 60)} minutes"
             f"{held_note(wall, holding)} and is still being billed "
             f"({_spend_so_far(turn, now)}){hint}")))
+    # INDEPENDENT OF THE ONE ABOVE, not exclusive with it: `awaiting_since` is set on
+    # every `tool_result` row, so a healthy billed turn 27 calls deep is awaiting at the
+    # sampling moment and an `elif` here would make `long-turn` unraisable. The old
+    # exclusivity was between `stalled-turn` and `long-turn` — two claims about MONEY,
+    # only one of which can be true. This is a claim about a WAIT, and orthogonal.
+    if turn.awaiting:
+        wait = (now - turn.awaiting_since) if now else 0.0
+        awaited = max(0.0, wait - min(wait, sum(
+            h.overlap(turn.awaiting_since, turn.awaiting_since + wait, now)
+            for h in anatomy.holds)))
+        if awaited >= cfg.alarm_awaiting_minutes * 60:
+            raised.append(Alarm(SLOW_RESPONSE_ALARM, (
+                f"{awaiting_note(turn)} — {int(awaited // 60)} minutes"
+                f"{held_note(wall, holding)} with nothing completed yet; the model is "
+                f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if span.is_join and not span.finished and now and \
-                now - span.started >= cfg.alarm_join_seconds:
+        if not span.is_join or span.finished or not now:
+            continue
+        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b):
+        # at `alarm_join_seconds` the literal reading fires on 43 of the fleet's 272
+        # foreground delegations, nearly all of them real subagent work, and an alarm
+        # that fires on normal work is trained away — the standing argument above.
+        if span.name in DELEGATION_TOOLS:
+            found = hung_subagent_call(
+                [*turn.subagents, *anatomy.unattached_subagents], now,
+                cfg.alarm_subagent_tool_minutes * 60, since=span.started)
+            if found is None:
+                continue
+            sub, hung = found
+            called = f"{hung.name} ({hung.detail})" if hung.detail else hung.name
+            raised.append(Alarm(JOIN_ALARM, (
+                f"subagent {sub.label or sub.task_id} blocked "
+                f"{_hours(now - hung.started)} in {called} — long enough to lose the "
+                f"prompt cache, so the wait will be paid for twice{hint}")))
+            break
+        if now - span.started >= cfg.alarm_join_seconds:
             waited = int((now - span.started) // 60)
             raised.append(Alarm(JOIN_ALARM, (
                 f"blocked {waited}m waiting on {span.detail or span.tool_id} with no "
@@ -1530,7 +1703,8 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
                 now: float | None = None, dispatched: float,
                 root: Path | None = None,
                 index: dict[str, list[Path]] | None = None,
-                spans: Sequence[Hold] = ()) -> list[Alarm]:
+                spans: Sequence[Hold] = (),
+                turn_starts: Sequence[tuple[int, float]] = ()) -> list[Alarm]:
     """`alarms` for a session id — one transcript read, no paid call, nothing written.
 
     The session is read at the ALARM's write threshold rather than the report's: the only
@@ -1540,9 +1714,12 @@ def live_alarms(session_id: str, cfg: InspectConfig, *, wo_id: str = "",
     `spans` is the caller's `holds.held` for this work order. Passing none is the pre-hold
     behaviour and alarms on the wall clock, which is why `Daemon.check_burning_turns`
     always passes them: the default is what a caller without a store gets, not a policy.
+    `turn_starts` rides along the same way so an alarm names the OS's own turn number
+    (spec 2026-09-27 §3).
     """
     reading = replace(cfg, report_write_floor=cfg.alarm_write_tokens)
-    anatomy = read_session(session_id, reading, root=root, index=index, spans=spans)
+    anatomy = read_session(session_id, reading, root=root, index=index, spans=spans,
+                           turn_starts=turn_starts)
     return alarms(anatomy, cfg, wo_id=wo_id, now=now, dispatched=dispatched)
 
 
