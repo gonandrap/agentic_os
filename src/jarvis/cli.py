@@ -458,6 +458,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stop", help="stop the daemon")
 
+    sp = sub.add_parser(
+        "pause", help="stop the fleet starting turns (only allow-listed orders run)",
+        description="The user's brake (issue #843). No work order starts a turn — "
+                    "dispatch, paused-turn resume, message delivery, validation — "
+                    "unless it is allow-listed. Turns in flight finish; nothing is "
+                    "killed. Re-running replaces the allow-list.")
+    sp.add_argument("--allow", default="",
+                    help="comma-separated work/feature order ids that may keep running")
+    sp.add_argument("--reason", default="", help="why, shown on every held order")
+
+    sp = sub.add_parser(
+        "resume", help="let orders through a pause, or lift it with --all")
+    sp.add_argument("order_ids", nargs="*", help="work/feature order ids to let through")
+    sp.add_argument("--all", action="store_true", dest="everything",
+                    help="lift the pause for the whole fleet")
+
     sp = sub.add_parser("status", help="whole-OS status; flags what needs your attention")
     sp.add_argument("--attention", action="store_true", help="only show attention items")
 
@@ -1390,6 +1406,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_pause(args: argparse.Namespace) -> int:
+    from . import ops
+    allow = [i.strip() for i in args.allow.split(",") if i.strip()]
+    _print(ops.pause_fleet(reason=args.reason, allow=allow), args.json)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    from . import ops
+    _print(ops.resume_fleet(args.order_ids, everything=args.everything), args.json)
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from . import ops
     st = ops.os_status()
@@ -1399,6 +1428,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     d = st["daemon"]
     print(f"Jarvis {'🟢 running' if d['running'] else '🔴 daemon stopped'}"
           + (f" (pid {d['pid']})" if d["pid"] else ""))
+    fl = st.get("fleet") or {}
+    if fl.get("paused"):
+        allowed = ", ".join(fl["allow"]) or "nothing"
+        print(f"⏸ FLEET PAUSED{' — ' + fl['reason'] if fl.get('reason') else ''} · "
+              f"allowed through: {allowed} · `jarvis resume <wo-id>` / `--all`")
+    elif fl.get("ramp"):
+        r = fl["ramp"]
+        print(f"↗ ramping up after the usage window reopened: at most {r['cap']} "
+              f"worker turn(s) in flight"
+              + (" (breaker tripped: the last window was spent again soon after "
+                 "reopening)" if r.get("tripped") else ""))
     if st["attention"]:
         print(f"\n⚠ NEEDS YOUR ATTENTION ({len(st['attention'])}):")
         for a in st["attention"]:
@@ -4338,6 +4378,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_start(args)
         if args.cmd == "stop":
             return cmd_stop(args)
+        if args.cmd == "pause":
+            return cmd_pause(args)
+        if args.cmd == "resume":
+            return cmd_resume(args)
         if args.cmd == "status":
             return cmd_status(args)
         if args.cmd == "doctor":
