@@ -12,7 +12,7 @@ from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import db
+from . import db, release
 from .paths import project_db_path
 
 # Work order lifecycle.
@@ -3589,6 +3589,24 @@ class ProjectStore:
             float(e["ts"]) > since
             for kind in ("finished", "abandoned", "pr_merged")
             for e in self.events_of_kind(wo_id, kind))
+
+    def release_red_park_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open red-base park on this release order, or None. `work_unlanded_open`'s
+        arithmetic over the other park (2026-09-29 spec §3).
+
+        Returns the PAYLOAD because `invariants.true_blockers` re-derives the attention
+        line from it — the run that broke the base, which is not something a constant can
+        carry. Closed by a re-delivery (`finished`), an abandonment or the release
+        settling, so a worker that delivers again is a new episode and does record.
+        """
+        parked = self.events_of_kind(wo_id, release.RED_PARK_EVENT)
+        if not parked:
+            return None
+        since = float(parked[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in ("finished", "abandoned", "release_completed")
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(parked[-1]["payload"], {})
 
     def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
         """How many events this work order has, unbounded, minus the kinds named.

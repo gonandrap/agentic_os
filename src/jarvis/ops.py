@@ -38,7 +38,9 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import budget, bus, config_version, db, fleet, health, invariants, observability, timeline
+from . import (budget, bus, config_version, db, fleet, health, invariants,
+               observability, release, timeline)
+from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
@@ -4148,6 +4150,129 @@ def park_unlanded(store: ProjectStore, wo: dict[str, Any],
     return "needs_review"
 
 
+def defer_red_release(store: ProjectStore, project_name: str,
+                      wo: dict[str, Any]) -> str | None:
+    """Hold a release order that delivered NO release while the base is unbuildable.
+
+    `park_unlanded`'s sibling, one state along: hold a work order that would otherwise
+    land, and SAY SO. The live case is wo-fc61d0cd — gate 310 approved, the staged
+    release running, `main` red under it (5a4e14d, #829) while it waited for CI. The
+    worker refused to ship an older green commit, which is correct, and the order settled
+    `needs_review`: a release seconds from shipping became a decision the user owed, and
+    the expedited fix sat on `main` unreleased until a human typed something. Returns the
+    status when it took the order, None to fall through to today's behaviour.
+
+    #807 already defers a release's DISPATCH while the base is red, but that step visits
+    `pending` rows only; an order that goes red MID-RUN is `running`, has spent its gate
+    approval, and has no path back. This is that path — and from here
+    `Daemon.hold_red_release` owns it unchanged, because `pending` with
+    `release_for_issues` in the metadata is exactly the population it selects.
+
+    **THE READING IS THE STORED ONE** (`CentralStore.base_health`, written per tick by
+    `Daemon.poll_default_branch`) and never a live `gh` call in the worker's finish turn:
+    a delivery's outcome must not depend on GitHub being reachable in that second, and
+    the OS has one rate-limited reader already.
+
+    **ONLY A FRESH GREEN READING PARKS ON THE USER** (Neo, question 1010). An absent,
+    unparseable or stale fact is not evidence that `main` is fine; the daemon's next tick
+    writes a real one, and re-parking costs one dispatch that a green base makes succeed.
+    The freshness test is `Daemon._base_red`'s verbatim.
+
+    **ANY release effect counts as delivered**, verified or not: a claim unverified only
+    because the restart has not happened yet must not be re-dispatched into a second run
+    of the release script.
+
+    docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §1
+    """
+    from .central_store import BASE_HEALTH_FRESH_SECONDS
+    from .daemon import Daemon
+
+    wo_id = str(wo["id"])
+    if not release.is_release_order(wo) or _release_effects(store, wo_id):
+        return None
+    fact = _stored_base_health(project_name)
+    checked = fact.get("checked_at")
+    fresh = (isinstance(checked, (int, float))
+             and time.time() - float(checked) <= BASE_HEALTH_FRESH_SECONDS)
+    if fresh and not fact.get("red"):
+        return None
+    first = _first_red_hold(store, wo_id)
+    if first is not None and db.now() - first >= Daemon.RED_PARK_AFTER_SECONDS:
+        return _park_red_release(store, wo_id, fact)
+    # `hold_dispatch` writes `retry_after` ONLY: `dispatch_attempts` is
+    # `release_dispatch_claim`'s ladder, and a deferral for a reason outside the order
+    # must not spend a launch. NO attention flag and no notification — a red base for a
+    # few minutes is ordinary, `_say_base_is_red`'s rule.
+    store.set_status(wo_id, "pending", trigger="release_red_base")
+    store.hold_dispatch(wo_id, until=db.now() + Daemon.RED_HOLD_SECONDS)
+    said = _red_base_said(fact)
+    # One event per BROKEN COMMIT, deduped on the head sha exactly as `_say_base_is_red`
+    # does: a code per condition is also a code per world (kn-7b122cd9).
+    if not any(db.from_json(e["payload"], {}).get("head_sha") == said["head_sha"]
+               for e in store.events_of_kind(wo_id, RED_DEFER_EVENT)):
+        store.add_event(wo_id, RED_DEFER_EVENT, {**said, "was": wo["status"]})
+    return "pending"
+
+
+def _stored_base_health(project_name: str) -> dict[str, Any]:
+    """The stored reading, or `{}` — which re-parks, exactly as a red one does."""
+    from .central_store import CentralStore
+
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — an unreadable fact is not a green base
+        return {}
+    try:
+        return central.base_health(project_name)
+    except Exception:  # noqa: BLE001 — ditto
+        return {}
+    finally:
+        central.close()
+
+
+def _red_base_said(fact: dict[str, Any]) -> dict[str, Any]:
+    """What the timeline carries about the run that is holding this release."""
+    base = str(fact.get("base") or "main")
+    head = str(fact.get("head_sha") or "")
+    workflow = str(fact.get("workflow") or "ci")
+    where = f" at {head[:10]}" if head else ""
+    return {"base": base, "head_sha": head, "workflow": workflow,
+            "run_url": str(fact.get("run_url") or ""),
+            "run_id": fact.get("run_id") or 0,
+            "detail": (f"{base} is not buildable{where} ({workflow}) — this release "
+                       f"delivered no release and waits for the base to go green")}
+
+
+def _first_red_hold(store: ProjectStore, wo_id: str) -> float | None:
+    """When this order was FIRST held on a red base, by either path — §3's one clock.
+
+    The pending-dispatch hold (#807, `Daemon.RED_HOLD_EVENT`) and the mid-run re-park
+    write different kinds and both count.
+    """
+    from .daemon import Daemon
+
+    stamps = [float(e["ts"])
+              for kind in (Daemon.RED_HOLD_EVENT, RED_DEFER_EVENT)
+              for e in store.events_of_kind(wo_id, kind)]
+    return min(stamps) if stamps else None
+
+
+def _park_red_release(store: ProjectStore, wo_id: str, fact: dict[str, Any]) -> str:
+    """Past the threshold the release stops waiting and asks the user (§3).
+
+    ONCE PER EPISODE, `park_unlanded`'s discipline and kn-7b122cd9's: the event and the
+    flag are written only while no park is open, so nothing renotifies.
+    """
+    if store.release_red_park_open(wo_id):
+        store.set_status(wo_id, "needs_review", trigger="release_red_repark")
+        return "needs_review"
+    said = _red_base_said(fact)
+    store.add_event(wo_id, RED_PARK_EVENT, said)
+    store.set_status(wo_id, "needs_review")
+    store.flag_attention(wo_id, invariants.release_base_red_blocker(said))
+    return "needs_review"
+
+
 def land_when_cleared(store: ProjectStore, wo: dict[str, Any],
                       pr_url: str | None = None, *,
                       panel_cleared: bool = False,
@@ -5132,8 +5257,14 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
+        # AFTER the `finished` event, so `refusal_answered` still dates correctly, and
+        # after the `abandon` branch: 2026-09-29 spec §1.
+        deferred = defer_red_release(store, name, fresh)
+        if deferred is not None:
+            return {"project": name, "wo_id": wo_id, "status": deferred,
+                    **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
-        if cfg is not None and cfg.enabled:
+        if validation_applies(cfg, fresh):
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
             # None means BOUNCED, and only here: with validation off no submission was
@@ -5149,7 +5280,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's — but a
             # BOUNCE is told to it rather than re-derived from the latest round, which
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
-            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced))
+            # A release order opened no round at all, so the join is TOLD rather than
+            # left to re-read one that was never opened (§2).
+            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
+                                       panel_cleared=release.is_release_order(fresh))
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -6396,8 +6530,23 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     parked in `needs_review` when it shipped do not, and deleting this would send them to
     the merge queue unjudged.
     """
-    return (cfg is not None and cfg.enabled
+    return (validation_applies(cfg, store.get_work_order(wo_id))
             and store.latest_validation_round(wo_id=wo_id) is None)
+
+
+def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
+    """Does a validation round open over THIS submission? One predicate, two call sites.
+
+    `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
+    and a RELEASE ORDER is never one of them: it authors no files and stages no tag, so
+    `evidence.nothing_to_judge` escalated it with "nothing to review" and
+    `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
+    post-condition a release owes already exists and is a machine check
+    (`Daemon.settle_shipped_releases`: a `jarvis-*` tag containing every payload commit
+    AND production running it), so a seat reading a release worker's prose adds nothing
+    to it (2026-09-29 spec §2).
+    """
+    return cfg is not None and cfg.enabled and not release.is_release_order(wo)
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -6424,11 +6573,13 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
+    # Told, not re-read: a release order opened no round here either (§2).
+    cleared = release.is_release_order(fresh)
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
     # did not — that omission was the drift `land_finished` exists to prevent.
-    return land_when_cleared(store, fresh)
+    return land_when_cleared(store, fresh, panel_cleared=cleared)
 
 
 def accept_assumption(store: ProjectStore, project_path: Path, wo: dict[str, Any],

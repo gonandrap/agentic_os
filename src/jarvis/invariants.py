@@ -504,6 +504,32 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: What a release order says when it stopped waiting for a red base and asked the user
+#: (2026-09-29 spec §3). NAMES THE RED RUN, not the release: the user is being asked
+#: about a build, and the release is waiting on it rather than on anything about itself.
+#:
+#: FREE OF ANY ELAPSED TIME, under PARKED_BLOCKER's rule — the hours are the THRESHOLD,
+#: which is a constant, and never a clock that ticks between two reconciles.
+RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}` failed at "
+                            "{sha} ({run_url}). The release is waiting on that build, "
+                            "not on anything about the release.")
+
+
+def release_base_red_blocker(said: dict[str, Any]) -> str:
+    """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote.
+
+    ONE renderer for both ends: `ops` flags it and this module re-derives it, or
+    INV-ATTENTION-REASON relabels the flag on the next tick (PR_CLOSED_BLOCKER's rule).
+    """
+    from .daemon import Daemon
+
+    return RELEASE_BASE_RED_BLOCKER.format(
+        base=said.get("base") or "main",
+        hours=Daemon.RED_PARK_AFTER_SECONDS // SECONDS_PER_HOUR,
+        workflow=said.get("workflow") or "ci", sha=str(said.get("head_sha") or "")[:10],
+        run_url=said.get("run_url") or "")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker — its
 #: message spent its retries, or its envelope ended in a terminal state that is not
 #: `delivered`. Nobody but the user can move it now, because the worker was never told.
@@ -767,6 +793,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
+    # on the status so no other work order pays the query; the ordinary re-park raises
+    # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
+    if wo["status"] == "needs_review":
+        park = store.release_red_park_open(wo["id"])
+        if park is not None:
+            blockers.append(release_base_red_blocker(park))
     # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or
     # both. Derived at ONE site from PR_REPAIR_BLOCKERS, in that tuple's order; see its
     # note for what being derived at two sites cost.

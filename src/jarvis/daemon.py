@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, worker_session)
+               notify, release, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -6898,10 +6898,11 @@ class Daemon:
                 continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
-    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
-    #: a column because it is a list that grows while the order waits, and because
-    #: nothing outside this file has a reason to query it.
-    RELEASE_BATCH_KEY = "release_for_issues"
+    #: fixes, and these are the ones it is shipping". The batch lives in `metadata`
+    #: rather than in a column because it is a list that grows while the order waits.
+    #: An ALIAS since 2026-09-29 spec §1 — `release.BATCH_KEY` is the literal's home now
+    #: that `ops` reads it too.
+    RELEASE_BATCH_KEY = release.BATCH_KEY
 
     #: What the release work order is told to do. It runs the ORDINARY release path —
     #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
@@ -6993,6 +6994,14 @@ the place to fix a red build."""
     #: Said once per BROKEN COMMIT on a release order held back by a red base
     #: (2026-09-27 spec §5.2).
     RED_HOLD_EVENT = "release_held_red_base"
+
+    #: How long `main` may stay red before a release order stops waiting and asks the
+    #: user. Measured from the FIRST red hold on that order, so the pending-dispatch hold
+    #: (#807) and the mid-run re-park (`ops.defer_red_release`) share one clock. Six
+    #: hours: a red `main` here is repaired by a work-order round trip, which is hours and
+    #: not minutes, and an hour would ask the user about a break the fleet was already
+    #: fixing (2026-09-29 spec §3).
+    RED_PARK_AFTER_SECONDS = 6 * 3600
 
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
