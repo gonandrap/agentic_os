@@ -480,6 +480,59 @@ def test_a_call_with_no_split_recorded_still_prices_at_the_floor(store):
     assert unit["os_cost_usd"] == pytest.approx(0.625, abs=0.01)
 
 
+# -- how big the OS's own inputs were --------------------------------------------------
+
+
+def test_the_largest_input_by_kind_appears_in_the_jarvis_half(store):
+    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis cost`
+    gains the largest input by kind. MAX and not a sum, and prompt + system prompt,
+    because what was sent to the model is both.
+    """
+    from jarvis import agent_usage
+
+    wo = store.create_work_order("an order with two OS calls", "")
+    _os_call(wo["id"], prompt_chars=20_000, system_prompt_chars=1_000)
+    agent_usage.record("panel_seat", project="proj_a", wo_id=wo["id"], label="premise",
+                       model="claude-opus-5",
+                       usage={"total_cost_usd": 0.01, "input": 10, "cache_write": 0,
+                              "cache_read": 0, "output": 0,
+                              "prompt_chars": 150_000, "system_prompt_chars": 2_000})
+
+    res = ops.cost_report("proj_a")
+    unit = next(u for u in res["units"] if u["id"] == wo["id"])
+
+    assert unit["os_max_prompt_chars"] == 152_000
+    by_kind = {k["kind"]: k for k in unit["os_by_kind"]}
+    assert by_kind["panel_seat"]["max_prompt_chars"] == 152_000
+    assert by_kind["neo_answer"]["max_prompt_chars"] == 21_000
+    assert res["totals"]["os_max_prompt_chars"] == 152_000
+
+
+def test_a_call_that_recorded_no_size_reports_zero_not_a_guess(store):
+    """Pre-measurement rows read 0, which means NOT MEASURED — never an empty prompt."""
+    wo = store.create_work_order("an order from before the sizes existed", "")
+    _os_call(wo["id"])
+
+    res = ops.cost_report("proj_a")
+    unit = next(u for u in res["units"] if u["id"] == wo["id"])
+
+    assert unit["os_max_prompt_chars"] == 0
+
+
+def test_the_cli_prints_the_largest_input_in_full(store, capsys):
+    """A plain character count with thousands separators, never abbreviated: this number
+    is quoted into bug reports and `152k` loses the fact."""
+    from jarvis import cli
+
+    wo = store.create_work_order("an order Neo answered at length", "")
+    _os_call(wo["id"], prompt_chars=150_000, system_prompt_chars=2_000)
+
+    assert cli.main(["cost", "proj_a"]) == 0
+
+    out = capsys.readouterr().out
+    assert "152,000 characters" in out
+
+
 def test_the_rollup_reports_the_write_split_across_both_halves(store, transcripts):
     """The footer's one job: "is anything still buying the one-hour write?".
 

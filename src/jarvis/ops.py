@@ -9561,6 +9561,7 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
     by_kind: dict[str, dict[str, Any]] = {}
     calls = failed = 0
     exact = 0.0
+    largest_input = 0
     for g in groups:
         u = _priced_group(usage_mod, g)
         total = total + u
@@ -9570,12 +9571,22 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         kind = g.get("kind") or "other"
         entry = by_kind.setdefault(kind, {"kind": kind, "label": agent_usage.describe(kind),
                                           "calls": 0, "cost_usd": 0.0,
-                                          "billed_input": 0, "output": 0})
+                                          "billed_input": 0, "output": 0,
+                                          "max_prompt_chars": 0})
         entry["calls"] += g.get("calls") or 0
         entry["cost_usd"] = round(entry["cost_usd"] + u.list_cost_usd, 4)
         entry["billed_input"] += u.billed_input
         entry["output"] += u.output
+        # The biggest TOTAL input any one call in the group sent — prompt plus system
+        # prompt, MAX and never a sum (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 is "not
+        # measured": every row written before the columns existed reads that way.
+        biggest = (g.get("max_prompt_chars") or 0) + (g.get("max_system_prompt_chars")
+                                                      or 0)
+        entry["max_prompt_chars"] = max(entry["max_prompt_chars"], biggest)
+        largest_input = max(largest_input, biggest)
     return {
+        f"{prefix}_max_prompt_chars": largest_input,
         f"{prefix}_calls": calls,
         f"{prefix}_failed_calls": failed,
         f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
@@ -9805,6 +9816,10 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
                 sum(u.get("os_recorded_cost_usd") or 0 for u in units), 2),
             "os_calls": sum(u.get("os_calls") or 0 for u in units),
             "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
+            # The biggest OS-side input on the whole report; MAX, not a sum (spec §3,
+            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+            "os_max_prompt_chars": max(
+                [u.get("os_max_prompt_chars") or 0 for u in units], default=0),
             "os_output": sum(u.get("os_output") or 0 for u in units),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(
@@ -10079,7 +10094,11 @@ def inspect_report(target: str, project: str | None = None, *,
                                            join_floor=cfg.report_join_floor))
         payload = anatomy.as_dict()
         payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
-                       status=wo["status"], kind=wo.get("kind") or "worker")
+                       status=wo["status"], kind=wo.get("kind") or "worker",
+                       # The biggest input Jarvis itself sent on this order's behalf
+                       # (spec §3,
+                       # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+                       largest_os_input=_largest_os_input(wo["id"]))
         return payload
 
     try:
@@ -10803,8 +10822,31 @@ def _os_calls_detail(wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
             "billed_input": u.billed_input,
             "api_calls": envelope.get("api_calls"),
             "context_peak": envelope.get("context_peak") or 0,
+            # How big the OS's own input to this call was (spec §3,
+            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 = not
+            # measured, which is what every row written before the columns existed says.
+            "prompt_chars": row["prompt_chars"],
+            "system_prompt_chars": row["system_prompt_chars"],
         })
     return out
+
+
+def _largest_os_input(wo_id: str) -> dict[str, Any] | None:
+    """The biggest OS-side input recorded for one work order, or None if none was.
+
+    None rather than a zero-sized row: a call recorded before the sizes were measured
+    reads 0, and reporting that as "the biggest input" would be a fabricated number
+    (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    """
+    sized = [r for r in _os_calls_detail(wo_id)
+             if (r["prompt_chars"] or 0) + (r["system_prompt_chars"] or 0)]
+    if not sized:
+        return None
+    biggest = max(sized, key=lambda r: r["prompt_chars"] + r["system_prompt_chars"])
+    return {"kind": biggest["kind"], "label": biggest["label"],
+            "model": biggest["model"], "prompt_chars": biggest["prompt_chars"],
+            "system_prompt_chars": biggest["system_prompt_chars"],
+            "ts": biggest["ts"]}
 
 
 def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
