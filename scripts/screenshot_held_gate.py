@@ -1,8 +1,12 @@
 """Screenshot what a work order held on an unargued gate now says about itself.
 
-Two surfaces, one defect: `/gates` used to file an `awaiting_case` row under "Decided"
-with no explanation, and the work-order page used to call the same park an unanswered
-permission prompt. `scripts/screenshot_health_surfaces.py` is the shape this copies.
+Two surfaces: `/gates` files an `awaiting_case` row under "Awaiting the worker's case",
+and the work-order page. Fix 2 of
+docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md stopped
+`gates.file_request` writing `waiting_input` for a held (`hold=True`) request — the
+command stays blocked, but nothing is owed by the user, so the order reads plain Running:
+no "Waiting on you" line, no attention flag. `scripts/screenshot_health_surfaces.py` is
+the shape this copies.
 
     uv run python scripts/screenshot_held_gate.py
 """
@@ -51,13 +55,15 @@ def seed() -> str:
         description="Release once PR 201 is merged and the suite is green.")
     _, path, _ = ops.find_work_order(wo["id"], "jarvis_os")
     pstore = ProjectStore(path)
+    pstore.set_status(wo["id"], "running")
     # The attempt, not the request: the worker ran it rather than asking, so the row is
     # recorded with the placeholder case and in front of nobody (gates.AWAITING_CASE).
+    # `hold=True`'s own road (gates.file_request, fix 2): no status write here — the
+    # order stays `running`, not `waiting_input`, because nothing is owed by the user.
     pstore.add_approval(wo["id"], kind="release", command="./scripts/" + "shipit.sh",
                         matched="ship" + "it",
                         justification=gates.NO_CASE_JUSTIFICATION,
                         status=gates.AWAITING_CASE)
-    pstore.set_status(wo["id"], "waiting_input")
     pstore.close()
     return wo["id"]
 
@@ -91,7 +97,11 @@ def shoot(wo_id: str) -> None:
             "height": panel["y"] + panel["height"] - head["y"] + 16})
 
         page.goto(f"http://127.0.0.1:{PORT}/wo/jarvis_os/{wo_id}")
-        card = page.locator("div.panel").first.bounding_box()
+        card = page.locator("div.panel").first
+        text = card.inner_text()
+        assert "running" in text, text
+        assert "Waiting on you" not in text, text
+        card = card.bounding_box()
         page.screenshot(path=SHOTS / "wo-held-gate.png", full_page=True, clip={
             "x": card["x"] - 8, "y": card["y"] - 8,
             "width": card["width"] + 16, "height": card["height"] + 16})

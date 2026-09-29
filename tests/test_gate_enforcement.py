@@ -248,8 +248,13 @@ def test_finish_refuses_while_a_request_is_open(worker, argue):
     with pytest.raises(ops.OpsError) as e:
         ops.finish(worker.wo["id"], "shipped it")
 
-    # Still parked on the gate, and nothing of the submission was written.
-    assert worker.store.get_work_order(worker.wo["id"])["status"] == "waiting_input"
+    # Still blocked by the gate, and nothing of the submission was written. The STATUS
+    # differs by road since fix 2 of
+    # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: an argued
+    # request is with a reviewer and parks the order; a held one is the worker's own
+    # move and parks nothing. `finish` is refused either way, which is the claim here.
+    assert worker.store.get_work_order(worker.wo["id"])["status"] == (
+        "waiting_input" if argue else "running")
     assert not worker.store.get_work_order(worker.wo["id"])["result_summary"]
     if argue:
         assert "End your turn" in str(e.value)

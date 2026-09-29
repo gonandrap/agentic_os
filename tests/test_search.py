@@ -86,6 +86,20 @@ def test_an_id_typed_in_full_is_a_jump(started):
     assert search.search(target)[0]["id"] == target
 
 
+def test_a_pasted_description_is_capped_and_still_finds_its_order(started):
+    """A user pasted a whole work-order description into the box: hundreds of words, one
+    unindexed LIKE per word per column, over a minute per search. Its first words are
+    the title, so the cap keeps the hit and drops the cost."""
+    from jarvis import db
+
+    wo_id = _wo("fix the login spinner", LOGIN)
+    paste = "fix the login spinner " + " ".join(f"filler{n}" for n in range(500))
+    words = db.search_words(paste)
+    assert len(words) == db.MAX_SEARCH_WORDS
+    assert db.search_words("spinner spinner login") == ["spinner", "login"]
+    assert [h["id"] for h in search.search(paste)] == [wo_id]
+
+
 def test_empty_query_returns_nothing(started):
     """A search verb is not a listing: no query means no answer, not everything."""
     _wo("fix the login spinner")
