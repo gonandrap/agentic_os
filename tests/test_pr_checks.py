@@ -1008,3 +1008,45 @@ def test_a_pending_legacy_status_is_not_red(started, project, fake_gh, reviewing
     poll(started, store)
 
     assert not store.queued_messages(reviewing["id"])
+
+
+# -- §2b: the poll records the head it already read -------------------------------------
+
+HEAD = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+MOVED = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def test_the_poll_records_the_head_it_already_read(started, project, fake_gh, reviewing):
+    """Spec §2b. The head is read on every poll and was thrown away; `parked_reason`
+    needs it locally, and no new network call may be made for it."""
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=HEAD)
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    row = store.get_work_order(reviewing["id"])
+    assert row["pr_head_oid"] == HEAD
+    assert float(row["pr_head_seen_at"]) > 0
+
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=MOVED)
+    poll(started, store)
+
+    assert store.get_work_order(reviewing["id"])["pr_head_oid"] == MOVED
+
+
+def test_an_unchanged_head_is_not_rewritten_every_tick(started, project, fake_gh,
+                                                       reviewing):
+    """The budget of the poll's common case is NO WRITE, and a cache that re-wrote an
+    unchanged sha would bump `updated_at` on every parked order every two minutes."""
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=HEAD)
+    store = ProjectStore(project)
+    poll(started, store)
+    seen = float(store.get_work_order(reviewing["id"])["pr_head_seen_at"])
+
+    sql: list[str] = []
+    store.conn.set_trace_callback(sql.append)
+    poll(started, store)
+    store.conn.set_trace_callback(None)
+
+    assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
+    assert float(store.get_work_order(reviewing["id"])["pr_head_seen_at"]) == seen

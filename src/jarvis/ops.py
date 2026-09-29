@@ -1235,7 +1235,14 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                           f"comes the OS abandons it unreviewed on the "
                           f"`gates.case_ttl_seconds` timer"}
     question = awaiting_neo(wo_id)
-    if question is not None:
+    # The worker's own escalated question on an order parked for review falls through to
+    # the status arm: the review is what the user owes. Spec §2a of
+    # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+    outranked = (question is not None
+                 and question["status"] in USER_HELD_Q_STATUSES
+                 and question["kind"] == "question"
+                 and wo["status"] == "needs_review")
+    if question is not None and not outranked:
         if question["status"] in USER_HELD_Q_STATUSES:
             return {"what": "neo_escalated", "stalled": False,
                     "detail": neo_question_blocker(question)}
@@ -1535,6 +1542,12 @@ TRIGGER_WINDOW = 120.0
 NO_ACTIVITY_NOTE = ("nothing has happened to this order on the record, so there is no "
                     "last activity to date — absent, not zero")
 SETTLED_NOTE = "this order has settled, so it has no current status age"
+#: Said when the open span and the order's `status` column disagree: the column is the
+#: status, and the span is history that stops short of it. No elapsed time in it — the
+#: sentence can become an `attention_reason`, which `ack_attention` stores verbatim.
+#: Spec §2d2 of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+SPANS_BEHIND_NOTE = "the recorded spans do not reach this order's current status"
 FO_APPROXIMATE_NOTE = ("approximate — a feature order keeps no event trail, so this is one "
                        "coarse span from its creation")
 #: What a renderer prints for a transition nothing was written about. Never a guess and
@@ -1767,8 +1780,14 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     order_id = wo_id or fo_id
     terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
     row_kind = ""
+    # The order's own row, for `wo` too now: its `status` column is the status, and the
+    # spans are a record that can stop short of it. Spec §2d2 of
+    # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+    row = (store.get_feature_order(order_id) if kind == "fo"
+           else store.get_work_order(order_id))
     if kind == "fo":
-        row_kind = str(store.get_feature_order(order_id).get("kind") or "feature")
+        row_kind = str(row.get("kind") or "feature")
+    column_status = str(row.get("status") or "")
 
     rows = store.state_spans(order_id)
     spans: list[Span] = []
@@ -1788,6 +1807,10 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
                           approximate=bool(row["approximate"])))
 
     open_span = spans[-1] if spans and spans[-1].left is None else None
+    # A span that disagrees with the column is not a present-tense claim: report the
+    # column, with no age at all rather than the stale span's.
+    behind = (open_span is not None and column_status
+              and open_span.status != column_status)
     activity_ts, activity_kind = _last_activity(store, kind, order_id)
     approximate = any(s.approximate for s in spans)
     notes: list[str] = []
@@ -1797,10 +1820,14 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
         notes.append(NO_ACTIVITY_NOTE)
     if spans and open_span is None:
         notes.append(SETTLED_NOTE)
+    if behind:
+        notes.append(SPANS_BEHIND_NOTE)
     return StateDurations(
         order_id=order_id, order_kind=kind, spans=tuple(spans),
-        current_status=open_span.status if open_span else "",
-        current_status_since=open_span.entered if open_span else None,
+        current_status=(column_status if behind
+                        else (open_span.status if open_span else "")),
+        current_status_since=(open_span.entered
+                              if open_span is not None and not behind else None),
         last_activity_ts=activity_ts if activity_kind else None,
         last_activity_kind=activity_kind, approximate=approximate,
         notes=tuple(notes), row_kind=row_kind, asof=now,
