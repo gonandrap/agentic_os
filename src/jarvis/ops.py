@@ -178,6 +178,68 @@ def _spawn_daemon(catalog_path: str, poll_interval: float) -> subprocess.Popen:
     )
 
 
+def fleet_summary(central: CentralStore) -> dict[str, Any]:
+    """The user's pause and the post-reopen ramp, for `jarvis status` (issue #843)."""
+    pause = fleet.load_pause(central)
+    ramp = fleet.ramp(central)
+    return {
+        "paused": pause is not None,
+        "since": pause.since if pause else None,
+        "reason": pause.reason if pause else "",
+        "allow": sorted(pause.allow) if pause else [],
+        "ramp": ({"since": ramp.since, "until": ramp.until, "cap": ramp.cap,
+                  "tripped": ramp.tripped} if ramp else None),
+    }
+
+
+def pause_fleet(reason: str = "", allow: list[str] | None = None) -> dict[str, Any]:
+    """`jarvis pause`: no work order starts a turn unless it is allow-listed.
+
+    Turns already in flight finish; nothing is killed and nothing is lost. Dispatch,
+    paused-turn resumes, message deliveries and validation rounds all wait, and each
+    waiting order says why. `jarvis resume <wo-id>` lets orders through one at a time;
+    `jarvis resume --all` lifts the pause.
+    """
+    central = CentralStore()
+    try:
+        ids = [_resolve_order_id(i) for i in (allow or [])]
+        pause = fleet.pause(central, reason=reason, allow=ids)
+        return {"paused": True, "since": pause.since, "reason": pause.reason,
+                "allow": sorted(pause.allow)}
+    finally:
+        central.close()
+
+
+def resume_fleet(order_ids: list[str] | None = None,
+                 everything: bool = False) -> dict[str, Any]:
+    """`jarvis resume`: let named orders through a pause, or lift it with `--all`."""
+    central = CentralStore()
+    try:
+        if everything:
+            fleet.unpause(central)
+            return {"paused": False}
+        if not order_ids:
+            raise OpsError("name the work orders to let through, or pass --all to lift "
+                           "the pause for the whole fleet")
+        try:
+            pause = fleet.allow(central, [_resolve_order_id(i) for i in order_ids])
+        except ValueError as e:
+            raise OpsError(str(e)) from e
+        return {"paused": True, "since": pause.since, "reason": pause.reason,
+                "allow": sorted(pause.allow)}
+    finally:
+        central.close()
+
+
+def _resolve_order_id(order_id: str) -> str:
+    """A work or feature order id that exists — a typo must not silently allow nothing."""
+    if order_id.startswith("fo-"):
+        find_feature_order(order_id)
+    else:
+        find_work_order(order_id)
+    return order_id
+
+
 def stop_os() -> dict[str, Any]:
     pid = daemon_running()
     if not pid:
@@ -450,7 +512,7 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
         try:
             _cat = catalog or resolve_catalog()
             mode_by_project = {ps.name: ps.worker.permission_mode for ps in _cat.projects}
-            fleet_state = fleet.current(_cat)
+            fleet_state = fleet.current(_cat, central=central)
         except (OpsError, CatalogError):
             mode_by_project = {}
             # `_cat` stays None and `_held_jobs` resolves the catalog itself, landing on
@@ -725,6 +787,9 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 "pid": pid,
                 "catalog": central.get_state("catalog_path"),
             },
+            # The user's brake and the reopen ramp (issue #843). Read straight off the
+            # central store so a paused fleet says so even when the catalog cannot load.
+            "fleet": fleet_summary(central),
             "ui": ui,
             "projects": projects,
             "attention": attention,

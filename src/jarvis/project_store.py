@@ -8,7 +8,7 @@ orders that own work orders in sets.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -2211,8 +2211,12 @@ class ProjectStore:
             return None
         return {"fo_id": parent, "planner_id": row["planner"], "n": int(row["n"])}
 
-    def claim_next_pending(self) -> dict[str, Any] | None:
+    def claim_next_pending(self, only: Collection[str] | None = None
+                           ) -> dict[str, Any] | None:
         """Atomically claim the oldest claimable pending order (pending -> dispatching).
+
+        `only`, when given, restricts the claim to those work order ids — the user's
+        pause allow-list (`fleet.FleetPause`, issue #843). Empty means claim nothing.
 
         Two things can make a pending work order unclaimable, and neither writes anything
         when it fires: the order is passed over and stays `pending`, because nothing about
@@ -2251,6 +2255,13 @@ class ProjectStore:
         always was.
         """
         marks = ",".join("?" for _ in ACTIVE_STATUSES)
+        only_ids: tuple[str, ...] = ()
+        only_clause = ""
+        if only is not None:
+            only_ids = tuple(only)
+            if not only_ids:
+                return None
+            only_clause = f"AND w.id IN ({','.join('?' for _ in only_ids)})"
         cur = self.conn.execute(
             f"""UPDATE work_orders SET status='dispatching', updated_at=?
                WHERE id = (SELECT w.id FROM work_orders w
@@ -2278,9 +2289,11 @@ class ProjectStore:
                                  JOIN assumptions a ON a.wo_id = f.plan_wo_id
                                  WHERE f.id = w.parent_id AND a.status = 'pending'
                              ))
+                             {only_clause}
                            ORDER BY w.created_at LIMIT 1)
                RETURNING *"""
-            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES),
+            , (db.now(), db.now(), DEPENDENCY_SATISFIED_STATUS, *ACTIVE_STATUSES,
+               *only_ids),
         )
         row = cur.fetchone()
         return dict(row) if row else None
