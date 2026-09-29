@@ -1267,7 +1267,7 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
     # renders the bare "pending" the surface would have printed anyway, rather than a
     # guess. Like the two above, it raises no attention: the window reopens and the slot
     # frees, neither of which is a decision anyone owes (`fleet.blocked`).
-    held = fleet.blocked() if fleet is not None else ""
+    held = fleet.blocked(wo["id"]) if fleet is not None else ""
     if held:
         return f"pending — {held}"
     return "pending"
@@ -1381,6 +1381,13 @@ def _retry_hold_note(wo: dict[str, Any], hold: dict[str, Any]) -> str | None:
     if cause == "project_cap":
         return (f"waiting for a free slot in this project ({hold.get('active')} of "
                 f"{hold.get('max_concurrent')} running)")
+    if cause == "fleet_paused":
+        return ("held: the fleet is paused by the user — `jarvis resume "
+                f"{wo['id']}` lets this order through")
+    if cause == "fleet_ramp":
+        return (f"waiting for the fleet to ramp back up after the usage window reopened "
+                f"({hold.get('in_flight')} of {hold.get('cap')} worker turns in flight "
+                f"until {clock(float(hold.get('until') or 0))})")
     if cause == "fleet_outage":
         # `fleet_hold_note` owns these words wherever it is gated to speak them; a second
         # source for one sentence is the drift this spec pays for elsewhere. Said here
