@@ -776,6 +776,33 @@ def test_the_packet_says_a_turn_cost_nothing_rather_than_leaving_it_to_be_inferr
     assert "1 API call costing" in packet
 
 
+def test_the_packet_never_calls_a_request_in_flight_a_stall(
+        started, monkeypatch, tmp_path):
+    """Spec §1: this is the line that fed the judge, and a kill remedy acting on it
+    would have destroyed 19 minutes of live generation."""
+    daemon = started()
+    root = tmp_path / "projects"
+    (root / "-proj").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+    wo = ops.create_work_order("proj_a", "the slow turn")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        # A prompt and nothing after it: the request has completed no block yet.
+        (root / "-proj" / f"{wo['id']}.jsonl").write_text(
+            json.dumps(_prompt_row(FIXED_TURN_AT,
+                                   "You are the worker agent for wo-1")) + "\n")
+        store.update_work_order(wo["id"], status="running", session_id=wo["id"])
+        packet = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                           CFG, daemon.catalog.projects[0].inspect)
+    finally:
+        store.close()
+
+    line = next(l for l in packet.splitlines() if l.startswith("- turn 1:"))
+    assert "NO API CALL" not in line and "cost nothing" not in line
+    assert "awaiting the model since" in line
+    assert "this is not a stall" in line
+
+
 #: A clock and a transcript that do not move, so the packet below is a literal rather
 #: than a description of one. `build_evidence`'s first section renders "N minute(s) ago"
 #: off `db.now`, which is why it is pinned rather than merely started from.
@@ -1072,13 +1099,18 @@ def test_the_supervisor_never_names_a_command_that_acts_on_a_work_order():
     named |= {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert not (named & forbidden), sorted(named & forbidden)
 
-    imported: list[str] = []
+    # `worker_session` is the machinery that LAUNCHES AND KILLS turns, and none of it
+    # belongs here. Its rate-limit fallback DELAY is the one exception: a number, no
+    # behaviour, and the same import `neo.drain_queue` takes for the same hold (spec
+    # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §2).
+    allowed = {"RATE_LIMIT_FALLBACK_DELAY"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported += [a.name for a in node.names]
-        elif isinstance(node, ast.ImportFrom):
-            imported += [a.name for a in node.names] + [node.module or ""]
-    assert not any("worker_session" in name.split(".") for name in imported), imported
+        names = ([a.name for a in node.names] if isinstance(node, ast.Import)
+                 else [a.name for a in node.names] + [node.module or ""]
+                 if isinstance(node, ast.ImportFrom) else [])
+        if any("worker_session" in name.split(".") for name in names):
+            assert isinstance(node, ast.ImportFrom), ast.dump(node)
+            assert {a.name for a in node.names} <= allowed, [a.name for a in node.names]
 
 
 def test_the_pin_would_catch_the_move_it_forbids():

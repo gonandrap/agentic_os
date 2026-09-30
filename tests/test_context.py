@@ -149,6 +149,19 @@ def test_a_relaunched_dispatch_turn_is_recorded_by_the_launch_side(dispatched):
     assert all(p is not None for p in _payloads(store, wo_id))
 
 
+def test_the_dispatch_turn_is_recorded_as_running_in_the_worktree(dispatched):
+    """Spec docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §4:
+    the seq-1 row was measured at the project root for two reasons at once — the
+    worktree does not exist yet, and the `wo` dict dispatch reads predates
+    `worker_session.start` writing `worktree`. Either alone puts the wrong cwd on the
+    row, so the memory walk is measured from the wrong directory."""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    row = _named(_payloads(store, wo_id)[0]["ingredients"], "memory_files")
+
+    assert row["detail"]["cwd"] == str(
+        dispatched["spec"].path / ".claude" / "worktrees" / wo_id)
+
+
 # -- 2. absent is never zero ----------------------------------------------------------
 
 

@@ -180,7 +180,7 @@ def test_a_forced_round_records_the_commit_the_round_before_it_could_not(
 
 
 def test_the_forced_round_is_what_finally_lets_the_pull_request_merge_itself(
-        fleet, project, fake_gh):
+        fleet, project, fake_gh, local_base):
     """The motivating outcome, and why stopping at the column would prove too little: the
     point is not that a commit was written down, it is that condition 4 can now be
     satisfied and the OS asks to merge."""
@@ -398,6 +398,68 @@ def test_the_round_is_numbered_and_counted_like_any_other(fleet, project, fake_g
 
     assert [r["round"] for r in store.validation_rounds(wo_id=wo["id"])] == [1, 2, 3]
     assert store.counted_validation_rounds(wo_id=wo["id"]) == 3
+
+
+# -- numbering, once the count and the number stop being the same integer -------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.1
+
+
+def test_an_uncounted_round_does_not_collide_with_the_next_ordinary_round(
+        fleet, project, fake_gh):
+    """The trap the round above names, from the other direction: an uncounted round
+    spends a NUMBER without spending the budget, so a submission that numbered itself
+    off the budget would be handed the rebind's settled row and park for ever."""
+    store, wo = parked(fleet, project)
+    artifact(fake_gh)
+    rebind = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2", round=2,
+                                         uncounted=True)
+    store.close_validation_round(rebind["id"], "passed", "")
+    assert store.counted_validation_rounds(wo_id=wo["id"]) == 1
+    assert store.numbered_validation_rounds(wo_id=wo["id"]) == 2
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == 1
+
+    row = ops.submit_for_validation(
+        store, project, store.get_work_order(wo["id"]), declared="ran the suite",
+        cfg=fleet.catalog.project("proj_a").validation)
+
+    assert int(row["round"]) == 3 and int(row["id"]) != int(rebind["id"])
+    assert row["outcome"] == "pending"
+    assert store.get_validation_round(int(rebind["id"]))["outcome"] == "passed"
+    judge(fleet, store, Panel("passed"))
+    assert store.get_work_order(wo["id"])["status"] != "validating"
+
+
+@pytest.mark.parametrize("outcome", ["pending", "failed", "void", "passed", "rejected",
+                                     "escalated"])
+def test_the_two_counters_agree_on_a_database_with_no_rebind_in_it(
+        fleet, project, fake_gh, outcome):
+    """The migration claim: every row written before the column existed reads
+    `uncounted=0`, so the new numbering formula returns exactly what the old one did."""
+    store, wo = parked(fleet, project, outcome="pending")
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if outcome != "pending":
+        store.close_validation_round(row["id"], outcome, "")
+
+    assert store.numbered_validation_rounds(wo_id=wo["id"]) == \
+        store.counted_validation_rounds(wo_id=wo["id"])
+    assert store.uncounted_validation_rounds(wo_id=wo["id"]) == 0
+
+
+def test_a_retried_submission_still_reuses_its_number(fleet, project, fake_gh):
+    """The idempotency, asserted against the new formula: a submission retried while its
+    round is still open re-derives the same number and reuses the row."""
+    store, wo = parked(fleet, project, outcome="pending")
+    artifact(fake_gh)
+    cfg = fleet.catalog.project("proj_a").validation
+    open_row = store.latest_validation_round(wo_id=wo["id"])
+
+    again = ops.submit_for_validation(store, project,
+                                      store.get_work_order(wo["id"]),
+                                      declared="ran the suite", cfg=cfg)
+
+    assert int(again["id"]) == int(open_row["id"]) and int(again["round"]) == 1
+    assert len(store.validation_rounds(wo_id=wo["id"])) == 1
+    assert store.numbered_validation_rounds(wo_id=wo["id"]) == 0
 
 
 def test_a_rejection_past_the_budget_comes_to_the_user_and_not_to_a_worker(

@@ -32,6 +32,9 @@ from jarvis.project_store import ProjectStore
 PR = "https://github.com/acme/proj/pull/7"
 JUDGED = "a1b2c3d4e5f6000000000000000000000000aaaa"
 PUSHED = "e4f5a6b7c8d9000000000000000000000000bbbb"
+#: The tip of `main` the judged commit already contains, and the one it does not.
+BASE_TIP = "b0b1b2b3b4b5000000000000000000000000cccc"
+BASE_MOVED = "c0c1c2c3c4c5000000000000000000000000dddd"
 
 
 def check(name: str, conclusion: str = "SUCCESS", status: str = "COMPLETED") -> dict:
@@ -234,6 +237,47 @@ def test_the_not_its_fault_clause_needs_the_same_workflow_red_on_this_branch():
     assert "not its fault" not in other.reason
     green = decide(rnd(), base_red=BASE_RED)
     assert "not its fault" not in green.reason
+
+
+BASE_BEHIND = automerge.BaseBehind(base="main", base_oid=BASE_MOVED)
+
+
+def test_a_base_that_moved_under_the_branch_holds_the_merge_and_names_the_commit():
+    """Spec 2026-09-28 §3.2: the seventh condition, and the fact `decide` had none of."""
+    assert decide(rnd(), base_behind=None).armed
+    held = decide(rnd(), base_behind=BASE_BEHIND)
+    assert not held.armed and held.code == automerge.HELD_BASE_MOVED
+    assert BASE_MOVED[:10] in held.reason and "main" in held.reason
+
+
+@pytest.mark.parametrize("over, code", [
+    ({"head_oid": PUSHED}, automerge.HELD_SHA_MOVED),
+    ({"checks": (check("unit (3.13)", "FAILURE"),)}, automerge.HELD_CHECKS_FAILED),
+    ({"checks": (check("unit (3.13)", "", status="IN_PROGRESS"),)},
+     automerge.HELD_CHECKS_RUNNING),
+    ({"checks": ()}, automerge.HELD_CHECKS_NONE),
+    ({"merge_state": "DIRTY"}, automerge.HELD_MERGE_STATE_UNCLEAN),
+])
+def test_a_moved_base_outranks_every_fact_about_the_pull_request(over, code):
+    """Spec §3.2's ordering: the catch-up moves the head, so any round spent on the head
+    this tick would be spent on a commit about to be replaced."""
+    assert decide(rnd(), pull=pr(**over)).code == code
+    assert decide(rnd(), pull=pr(**over),
+                  base_behind=BASE_BEHIND).code == automerge.HELD_BASE_MOVED
+
+
+def test_a_red_default_branch_outranks_a_moved_base():
+    """Spec §3.2: both are facts about the world and `base_red` stays first — nothing
+    catches a branch up onto a broken `main`."""
+    assert decide(rnd(), base_red=BASE_RED,
+                  base_behind=BASE_BEHIND).code == automerge.HELD_BASE_RED
+
+
+def test_the_counterfactual_never_hears_about_the_base():
+    """Spec §3.2: `only_the_head_moved` asks whether the DIFF is worth a round, and a
+    stale base is not a fact about that. Forwarding it would make a behind branch
+    permanently unre-judgeable once the catch-up cap is spent."""
+    assert automerge.only_the_head_moved(rnd(), WO, pr(head_oid=PUSHED), cfg())
 
 
 def test_no_two_conditions_share_a_hold_code():
@@ -455,6 +499,22 @@ def test_a_denial_records_and_notifies_and_raises_no_flag_of_its_own(started, pr
 
 
 @pytest.fixture()
+def apply_merge(project, local_base):
+    """`automerge.apply` with the local facts §3.1 reads, faked by the shared
+    `testing.local_base` fixture. The `project` fixture has no `origin`, so a real fetch
+    refuses fail-closed and nothing would ever merge.
+    """
+    state = local_base
+    state.update({"tip": BASE_TIP, "contains": {BASE_TIP}})
+
+    def run(store, wo, sha, approval, *, cwd=project, base_ref="main"):
+        return automerge.apply(store, wo, sha, approval, cwd=cwd, base_ref=base_ref)
+
+    run.state = state
+    return run
+
+
+@pytest.fixture()
 def granted(started, project):
     """A work order parked behind a pull request with an approved merge grant."""
     store = ProjectStore(project)
@@ -469,7 +529,7 @@ def granted(started, project):
     store.close()
 
 
-def test_a_dismissal_is_not_permission_to_merge(started, project):
+def test_a_dismissal_is_not_permission_to_merge(started, project, apply_merge):
     """THE HOLE THIS GUARD CLOSES. `usable_grant` clears a command on TWO statuses and
     only one is an authorisation: `dismissed` means the recogniser matched something that
     performs no privileged action. Nothing classifies into this kind, so a dismissal here
@@ -486,45 +546,46 @@ def test_a_dismissal_is_not_permission_to_merge(started, project):
     # The dismissal DOES clear the command generally — that is the documented behaviour.
     assert store.usable_grant(wo["id"], gates.AUTO_MERGE, command) is not None
     with pytest.raises(automerge.AutoMergeRefused, match="not approved"):
-        automerge.apply(store, store.get_work_order(wo["id"]), JUDGED,
+        apply_merge(store, store.get_work_order(wo["id"]), JUDGED,
                         store.get_approval(approval["id"]))
     store.close()
 
 
-def test_no_grant_at_all_merges_nothing(granted):
+def test_no_grant_at_all_merges_nothing(granted, apply_merge):
     store, wo, _ = granted
     with pytest.raises(automerge.AutoMergeRefused, match="no approved gate request"):
-        automerge.apply(store, wo, JUDGED, None)
+        apply_merge(store, wo, JUDGED, None)
 
 
-def test_a_grant_of_another_kind_merges_nothing(granted):
+def test_a_grant_of_another_kind_merges_nothing(granted, apply_merge):
     store, wo, approval = granted
     with pytest.raises(automerge.AutoMergeRefused, match="not a auto_merge"):
-        automerge.apply(store, wo, JUDGED, {**approval, "kind": "pr_merge"})
+        apply_merge(store, wo, JUDGED, {**approval, "kind": "pr_merge"})
 
 
-def test_a_verdict_with_no_judged_commit_merges_nothing(granted):
+def test_a_verdict_with_no_judged_commit_merges_nothing(granted, apply_merge):
     """`''` reaches here only through a bug, and it must refuse rather than run a merge
     with an empty `--match-head-commit`, which GitHub would read as no constraint."""
     store, wo, approval = granted
     with pytest.raises(automerge.AutoMergeRefused, match="no judged commit"):
-        automerge.apply(store, wo, "", approval)
+        apply_merge(store, wo, "", approval)
 
 
-def test_one_grant_buys_one_merge(granted, fake_gh):
+def test_one_grant_buys_one_merge(granted, fake_gh, apply_merge):
     """A grant is a receipt for landing ONE commit, not a budget. A retry after a failure
     needs a fresh review rather than a free second go at an irreversible act."""
     store, wo, approval = granted
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN",
                    head_oid=JUDGED)
 
-    automerge.apply(store, wo, JUDGED, approval)
+    apply_merge(store, wo, JUDGED, approval)
 
     with pytest.raises(automerge.AutoMergeRefused, match="no longer a live grant"):
-        automerge.apply(store, wo, JUDGED, store.get_approval(approval["id"]))
+        apply_merge(store, wo, JUDGED, store.get_approval(approval["id"]))
 
 
-def test_github_refuses_the_merge_when_the_head_moved_under_it(granted, fake_gh):
+def test_github_refuses_the_merge_when_the_head_moved_under_it(granted, fake_gh,
+                                                               apply_merge):
     """The millisecond window between the poll's view and the merge, closed at the SERVER.
     The fake refuses on `--match-head-commit` exactly as GitHub does, so this is testing
     the flag rather than testing the fake's willingness to merge."""
@@ -533,10 +594,11 @@ def test_github_refuses_the_merge_when_the_head_moved_under_it(granted, fake_gh)
                    head_oid=PUSHED)
 
     with pytest.raises(automerge.AutoMergeRefused, match="refused the merge"):
-        automerge.apply(store, wo, JUDGED, approval)
+        apply_merge(store, wo, JUDGED, approval)
 
 
-def test_a_merge_that_landed_is_not_a_failure_however_gh_exited(granted, fake_gh):
+def test_a_merge_that_landed_is_not_a_failure_however_gh_exited(granted, fake_gh,
+                                                                apply_merge):
     """**ISSUE #253, AT THE SEAM THAT BROKE.** `gh` exits non-zero AND the merge landed —
     that exact combination, which no test drove before and both live merges of 0.10.0
     produced. The command merges remotely and then tidies up locally; one exit status
@@ -551,14 +613,15 @@ def test_a_merge_that_landed_is_not_a_failure_however_gh_exited(granted, fake_gh
         "failed to delete local branch worktree-wo-1: cannot delete branch "
         "'worktree-wo-1' used by worktree at '/repo/.claude/worktrees/wo-1'")
 
-    merged = automerge.apply(store, wo, JUDGED, approval)
+    merged = apply_merge(store, wo, JUDGED, approval)
 
     assert merged["head_sha"] == JUDGED
     assert merged["after_merge_cause"] == automerge.CLEANUP
     assert "cannot delete branch" in merged["after_merge_error"]
 
 
-def test_a_merge_that_timed_out_is_not_called_a_cleanup_failure(granted, fake_gh):
+def test_a_merge_that_timed_out_is_not_called_a_cleanup_failure(granted, fake_gh,
+                                                                apply_merge):
     """THE OTHER LANDED SHAPE, and the reason the cause is carried rather than assumed.
 
     The command never FINISHED — GitHub computes the squash on the way, which is why
@@ -572,7 +635,7 @@ def test_a_merge_that_timed_out_is_not_called_a_cleanup_failure(granted, fake_gh
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
     fake_gh.hang_merge_after_landing()
 
-    merged = automerge.apply(store, wo, JUDGED, approval)
+    merged = apply_merge(store, wo, JUDGED, approval)
 
     assert merged["head_sha"] == JUDGED
     assert merged["after_merge_cause"] == automerge.UNFINISHED
@@ -580,7 +643,8 @@ def test_a_merge_that_timed_out_is_not_called_a_cleanup_failure(granted, fake_gh
     assert "cleanup" not in merged["after_merge_error"]
 
 
-def test_a_merge_github_really_refused_is_still_a_failure(granted, fake_gh):
+def test_a_merge_github_really_refused_is_still_a_failure(granted, fake_gh,
+                                                          apply_merge):
     """The other direction of the same read, and the reason it is a read rather than a
     shrug: the likeliest real failure is a `gh` with no write scope. The pull request is
     still OPEN afterwards, so this must raise exactly as it always did."""
@@ -589,10 +653,11 @@ def test_a_merge_github_really_refused_is_still_a_failure(granted, fake_gh):
     fake_gh.fail_merge("HTTP 403: Resource not accessible by integration")
 
     with pytest.raises(automerge.MergeFailed, match="403"):
-        automerge.apply(store, wo, JUDGED, approval)
+        apply_merge(store, wo, JUDGED, approval)
 
 
-def test_an_outcome_the_os_cannot_read_is_never_guessed_as_merged(granted, fake_gh):
+def test_an_outcome_the_os_cannot_read_is_never_guessed_as_merged(granted, fake_gh,
+                                                                  apply_merge):
     """`gh` failed twice and nothing knows what happened. Claiming the merge landed would
     complete a work order whose pull request is still open, which is the worse of the two
     errors — so it says the outcome is unknown, in those words, and the pull-request poll
@@ -601,11 +666,12 @@ def test_an_outcome_the_os_cannot_read_is_never_guessed_as_merged(granted, fake_
     fake_gh.fail_merge("HTTP 502: upstream timed out")   # ...and `pr view` finds no PR
 
     with pytest.raises(automerge.MergeFailed, match="unknown"):
-        automerge.apply(store, wo, JUDGED, approval)
+        apply_merge(store, wo, JUDGED, approval)
 
 
 def test_a_pull_request_on_another_repository_never_becomes_an_argument(granted,
-                                                                       fake_gh):
+                                                                       fake_gh,
+                                                                       apply_merge):
     """The URL is submitter-written and this is the one command in the OS that can change
     a repository, so it is checked before it becomes an argument — `github.checked_pr_url`
     is not skipped just because the poll already read the same column."""
@@ -613,15 +679,102 @@ def test_a_pull_request_on_another_repository_never_becomes_an_argument(granted,
 
     store, wo, approval = granted
     with pytest.raises(github.UntrustedPullRequest):
-        automerge.apply(store, {**wo, "pr_url": "--repo=someone/else"}, JUDGED, approval)
+        apply_merge(store, {**wo, "pr_url": "--repo=someone/else"}, JUDGED, approval)
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+# -- `apply`: the base it is about to land on (spec 2026-09-28 §3.1) -------------------
+
+
+def merges(fake_gh) -> list:
+    return [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
+
+
+def test_a_head_that_does_not_contain_the_current_base_tip_never_merges(
+        granted, fake_gh, apply_merge):
+    """§3.1, and gate 308's shape: `--match-head-commit` pins the HEAD, and the head had
+    not moved. The base had, and nothing before the merge asked."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    apply_merge.state["tip"] = BASE_MOVED        # `main` moved; the head predates it
+
+    with pytest.raises(automerge.StaleBase, match="main"):
+        apply_merge(store, wo, JUDGED, approval)
+
+    assert merges(fake_gh) == []
+
+
+def test_an_approved_grant_past_its_ttl_merges_nothing(granted, fake_gh, apply_merge):
+    """The TTL that ALREADY EXISTS — `gates.GRANT_TTL_SECONDS`, re-checked in
+    `usable_grant` — and spec 2026-09-28 §2 item (2) argues it would not have prevented
+    gate 308 (base moved 2.5 minutes after the verdict). It still bounds a grant nobody
+    spent: an hour-old approval is not permission to merge now."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    store.conn.execute("UPDATE approvals SET expires_at=? WHERE id=?",
+                       (db.now() - gates.GRANT_TTL_SECONDS, approval["id"]))
+
+    with pytest.raises(automerge.AutoMergeRefused, match="no longer a live grant"):
+        apply_merge(store, wo, JUDGED, store.get_approval(approval["id"]))
+
+    assert merges(fake_gh) == []
+    assert store.get_approval(approval["id"])["uses"] == 0
+
+
+def test_a_refused_stale_base_spends_no_grant_and_a_refused_merge_does(
+        granted, fake_gh, apply_merge):
+    """§3.1: the check sits before `gates.open_gate`, so nothing was attempted and the one
+    authorisation is untouched — a three-second network blip must not strand a green merge
+    behind a fresh Neo round trip. The other direction is pinned beside it."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    apply_merge.state["tip"] = BASE_MOVED
+
+    with pytest.raises(automerge.StaleBase):
+        apply_merge(store, wo, JUDGED, approval)
+
+    assert store.get_approval(approval["id"])["uses"] == 0
+    assert store.usable_grant(wo["id"], gates.AUTO_MERGE,
+                              approval["command"]) is not None
+
+    apply_merge.state["tip"] = BASE_TIP
+    fake_gh.fail_merge("HTTP 403: Resource not accessible by integration")
+    with pytest.raises(automerge.MergeFailed):
+        apply_merge(store, wo, JUDGED, approval)
+    assert store.get_approval(approval["id"])["uses"] == 1
+
+
+@pytest.mark.parametrize("kw", [{"cwd": None}, {"base_ref": ""}])
+def test_a_merge_that_cannot_prove_the_base_is_fresh_refuses(granted, fake_gh,
+                                                             apply_merge, kw):
+    """§3.1 fail-closed: no checkout, no proof, no merge. One production call site, and
+    it passes both."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    with pytest.raises(automerge.StaleBase):
+        apply_merge(store, wo, JUDGED, approval, **kw)
+    assert merges(fake_gh) == []
+
+
+@pytest.mark.parametrize("state", [{"tip": ""}, {"fetch": False}])
+def test_a_base_tip_git_cannot_answer_refuses_too(granted, fake_gh, apply_merge, state):
+    """§3.1: `branchproof.tip` is `""` when git cannot say, and a fetch that failed leaves
+    `origin/main` stale — neither is evidence that the base has not moved."""
+    store, wo, approval = granted
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+    apply_merge.state.update(state)
+
+    with pytest.raises(automerge.StaleBase):
+        apply_merge(store, wo, JUDGED, approval)
+    assert merges(fake_gh) == []
 
 
 # -- through the daemon: the per-project switch, and the push that invalidates ---------
 
 
 @pytest.fixture()
-def started(jarvis_home, fake_claude, catalog_file, project):
+def started(jarvis_home, fake_claude, catalog_file, project, local_base):
     ops.start_os(str(catalog_file), foreground=True)
     return Daemon(load_catalog(catalog_file))
 
@@ -925,12 +1078,14 @@ def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
     exactly a branch that never wrote the record. One branch proven is not two.
     """
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
-    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state="BEHIND")
+    # DIRTY and not BEHIND: a branch GitHub calls BEHIND holds on `base_moved` now, which
+    # is spec 2026-09-28 §3.2's ordering and a different condition from this one.
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state="DIRTY")
     poll(started, store)
-    assert "BEHIND" in ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
+    assert "DIRTY" in ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
 
     # Same commit, and now a check has gone red: `elif pr.failing:` owns this tick.
-    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, merge_state="BEHIND",
+    fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, merge_state="DIRTY",
                    checks=[check("unit (3.13)", "FAILURE"), check("evals")])
     poll(started, store)
 
@@ -938,7 +1093,7 @@ def test_a_red_build_refreshes_the_hold_too(started, project, fake_gh):
     assert [db.from_json(e["payload"], {})["code"] for e in held] == [
         automerge.HELD_MERGE_STATE_UNCLEAN, automerge.HELD_CHECKS_FAILED]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
-    assert "CI failed: unit (3.13)" in line and "BEHIND" not in line
+    assert "CI failed: unit (3.13)" in line and "DIRTY" not in line
     # The nudge went out and the merge did not: recording a hold claims nothing.
     assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
     assert store.list_approvals(wo["id"]) == []
@@ -960,8 +1115,9 @@ def test_a_pull_request_being_repaired_can_never_arm(pull):
 def test_a_changed_wording_under_one_code_is_still_a_changed_hold(started, project,
                                                                   fake_gh):
     """The half a code cannot carry: one condition, two values, two different things for
-    the user to do. `BEHIND` is a branch to update and `DIRTY` is a conflict to resolve,
-    so the dedupe keys on the sentence as well as the token.
+    the user to do. `DIRTY` is a conflict to resolve and `UNSTABLE` is a check GitHub does
+    not require, so the dedupe keys on the sentence as well as the token. (`BEHIND` was
+    this pair's first value until spec 2026-09-28 §3.2 gave it a condition of its own.)
 
     AND BACK TO THE FIRST IS A THIRD ROW (issue #782): the dedupe is against the NEWEST
     hold for the commit, not every past one, so the reason on screen is the one holding
@@ -969,17 +1125,17 @@ def test_a_changed_wording_under_one_code_is_still_a_changed_hold(started, proje
     `ops.automerge_state` sent the user to resolve a conflict that no longer existed.
     """
     store, wo = arm(started, project, auto_merge=True, judged=JUDGED)
-    for state in ("BEHIND", "DIRTY", "BEHIND"):
+    for state in ("DIRTY", "UNSTABLE", "DIRTY"):
         fake_gh.set_pr(PR, "OPEN", head_oid=JUDGED, checks=GREEN, merge_state=state)
         poll(started, store)
 
     held = store.events_of_kind(wo["id"], "automerge_held")
     assert [db.from_json(e["payload"], {})["reason"] for e in held] == [
-        "GitHub reports the merge state as BEHIND, not CLEAN",
         "GitHub reports the merge state as DIRTY, not CLEAN",
-        "GitHub reports the merge state as BEHIND, not CLEAN"]
+        "GitHub reports the merge state as UNSTABLE, not CLEAN",
+        "GitHub reports the merge state as DIRTY, not CLEAN"]
     line = ops.automerge_state(store, store.get_work_order(wo["id"]))["line"]
-    assert "BEHIND" in line and "DIRTY" not in line
+    assert "DIRTY" in line and "UNSTABLE" not in line
 
 
 def test_a_worktree_round_binds_nothing_and_so_merges_nothing(started, project,
@@ -1775,6 +1931,193 @@ def test_the_blocker_is_re_derivable_and_is_not_relabelled(started, project, fak
         invariants.AUTOMERGE_DENIED_BLOCKER
 
 
+# -- a hold is a claim about NOW, and the round it was written at decides ---------------
+#
+# docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+# merging.md. Measured on wo-659be188: `held — round 3 is waiting for CI` while the order
+# was at round 5, CI green, status `needs_review`. Both halves false, and nothing can ever
+# write a newer hold — `Daemon.auto_merge` returns before `decide` for an order that left
+# `waiting_pr_merge`, so the last hold written stays the rendered one for ever.
+
+
+def a_hold(store, wo_id: str, code: str, *, round_n: int, head_sha: str = JUDGED,
+           reason: str = "round 1 is waiting for CI") -> None:
+    """One `automerge_held` event, exactly as `Daemon._note_automerge_held` writes it."""
+    store.add_event(wo_id, "automerge_held", {
+        "code": code, "reason": reason, "judged_sha": JUDGED, "head_sha": head_sha,
+        "round": round_n})
+
+
+def open_round(store, wo_id: str, outcome: str = "") -> int:
+    """A fresh round, settled only when an outcome is named. Returns its number."""
+    row = store.open_validation_round(wo_id=wo_id, fingerprint="fp2")
+    store.set_validation_head(row["id"], JUDGED)
+    if outcome:
+        store.close_validation_round(row["id"], outcome, "")
+    return int(row["round"])
+
+
+def test_a_hold_from_a_round_a_later_one_overtook_is_not_read_as_live(started, project):
+    """A round number is the freshness key: round N's hold says nothing about round N+1."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
+    later = open_round(store, wo["id"])
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["stale"] is True
+    assert "held" not in state["line"]
+    assert "round 1" in state["line"] and f"round {later}" in state["line"]
+
+
+def test_an_order_awaiting_a_person_shows_no_live_merge_hold(started, project):
+    """wo-659be188's shape. The mechanism is not running over this order at all, so the
+    line makes no claim about the merge — and the payload SURVIVES the marking, because
+    `ops.force_validation_state` branches on its `code`."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_CHECKS_RUNNING, round_n=1)
+    store.set_status(wo["id"], "needs_review")
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["line"] == "not parked for merge: needs_review"
+    assert state["code"] == automerge.HELD_CHECKS_RUNNING
+    assert state["judged_sha"] == JUDGED and state["round"] == 1
+
+
+def test_a_hold_at_the_current_round_on_a_parked_order_is_unchanged(started, project,
+                                                                   fake_gh):
+    """THE REGRESSION THE DEDUPE FIX PROTECTS. A true, current hold is still the line."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=[check("unit", "FAILURE")], merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(started, store)
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["code"] == automerge.HELD_CHECKS_FAILED
+    assert "stale" not in state
+    assert state["line"].startswith("held — ")
+
+
+def test_two_rounds_at_one_head_with_the_same_reason_both_record_a_hold(
+        started, project, fake_gh):
+    """WITHOUT THIS THE READ-SIDE FIX INVERTS ITSELF. Nine poll-reachable codes carry no
+    round number in their reason, so at an unmoved head the sentences are byte-identical
+    across rounds: round N+1's hold was deduped away, the stored payload still said N,
+    and the freshness check would then call a TRUE hold stale (kn-96f47efb)."""
+    store, wo = arm(started, project, auto_merge=True)
+    fake_gh.set_pr(PR, "OPEN", checks=[check("unit", "FAILURE")], merge_state="CLEAN",
+                   head_oid=JUDGED)
+    poll(started, store)
+    current = open_round(store, wo["id"], "passed")
+    poll(started, store)
+
+    holds = [db.from_json(e["payload"], {})
+             for e in store.events_of_kind(wo["id"], "automerge_held")]
+
+    assert len(holds) == 2
+    assert holds[-1]["round"] == current
+    assert holds[0]["reason"] == holds[-1]["reason"]
+
+
+def test_force_validation_state_keeps_a_fresh_diagnosis_and_offers_none_when_stale(
+        started, project, monkeypatch):
+    """The diagnosis is a sentence about which commit the head moved AWAY from. Built
+    from a stale hold it names a commit a later round has since judged — the exact class
+    of claim this spec removes, restated inside a button."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    # The control is only rendered where the panel is on, and the catalog FILE stays off in
+    # these fixtures (`arm`'s note) — patched AFTER the order is built, so `ops.finish`
+    # still leaves it parked rather than `validating`.
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    def control():
+        row = store.get_work_order(wo["id"])
+        return ops.force_validation_state(store, row, project="proj_a",
+                                          held=ops.automerge_state(store, row))
+
+    fresh = control()
+    assert JUDGED[:10] in fresh["diagnosis"] and PUSHED[:10] in fresh["diagnosis"]
+
+    open_round(store, wo["id"], "passed")   # settled, so the refusal is the one it was
+    stale = control()
+
+    assert stale["diagnosis"] == ""
+    assert (stale["can_force"], stale["refusal"]) == (fresh["can_force"],
+                                                      fresh["refusal"])
+
+
+def test_a_round_running_on_the_moved_head_is_not_a_stale_hold(started, project,
+                                                               monkeypatch):
+    """FRESHNESS IS JUDGED ONLY OUTSIDE THE STATUSES A FRESH HOLD CAN STILL ARRIVE IN.
+
+    One poll tick writes the `sha_moved` hold and then `_rejudge_moved_head` moves the
+    order to `validating`, so judging that status would call every such hold stale at
+    birth — and blank the re-judge diagnosis for the one population it was written for.
+    The round the OS opened on the moved head IS the answer to "why has this not merged".
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    open_round(store, wo["id"])              # the re-judge, still running
+    store.set_status(wo["id"], "validating")
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    row = store.get_work_order(wo["id"])
+    state = ops.automerge_state(store, row)
+
+    # Not stale, so the payload still feeds the control — but not live either: the line is
+    # the history sentence, per the user's follow-up.
+    assert "stale" not in state and state["line"].startswith("re-judging in round ")
+    diagnosis = ops.force_validation_state(store, row, project="proj_a",
+                                           held=state)["diagnosis"]
+    assert JUDGED[:10] in diagnosis and PUSHED[:10] in diagnosis
+
+
+def test_a_hold_on_an_order_being_re_judged_reads_as_history_not_as_now(started, project):
+    """The user's follow-up to this spec: while a round runs, the hold it superseded is
+    history. `held — <reason>` in the present tense says the order is stopped on that
+    reason when the answer is that the panel is judging it again (#786, #813)."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    state = ops.automerge_state(store, store.get_work_order(wo["id"]))
+
+    assert state["line"] == f"re-judging in round {running} (was held: the head moved)"
+    assert "held — " not in state["line"]
+    assert state["stale_because"] == "rejudging"
+    assert "stale" not in state
+
+
+def test_a_re_judging_hold_still_feeds_the_re_judge_control(started, project, monkeypatch):
+    """The marking must stay OFF `stale`: `force_validation_state` blanks its diagnosis on
+    that key, and the `sha_moved` population it exists for is exactly the one sitting in
+    `validating`."""
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED)
+    monkeypatch.setattr(ops, "validation_config", lambda project=None: cfg())
+
+    def control():
+        row = store.get_work_order(wo["id"])
+        return ops.force_validation_state(store, row, project="proj_a",
+                                          held=ops.automerge_state(store, row))
+
+    parked = control()
+    open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    rejudging = control()
+
+    assert JUDGED[:10] in rejudging["diagnosis"] and PUSHED[:10] in rejudging["diagnosis"]
+    assert rejudging["diagnosis"] == parked["diagnosis"]
+    # `can_force` moves for the STATUS rule and not for the marking: `validating` is not
+    # forceable, and that is the same sentence any validating order gets.
+    assert rejudging["can_force"] is False and "is validating" in rejudging["refusal"]
+
+
 # -- a carried head relaxes the sha condition and nothing else -------------------------
 # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §4 condition
 # (i), and Neo question 791 made it a requirement rather than a remark.
@@ -1799,20 +2142,23 @@ def test_a_carried_head_arms_only_when_every_other_condition_holds(over, armed, 
     assert decision.judged_sha == CARRIED
 
 
-def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
+def test_a_filed_request_whose_base_moved_is_withdrawn_and_the_branch_caught_up(
         started, project, fake_gh, monkeypatch):
-    """§7 TEST 13's OTHER HALF, and §5.2's rule: the catch-up runs BEFORE a grant exists
-    and never after one. The gate command string carries the judged sha, so moving the head
-    behind a live grant orphans a permission Neo already gave and silently asks for another.
+    """§5.2's rule — the catch-up runs BEFORE a grant exists and never after one — WITH
+    THE ONE EXCEPTION spec 2026-09-28 §3.6 carves out: a base that moved.
 
-    The base moves out from under an approved-and-filed pull request here — the ordinary
-    case on a busy `main` — and the OS leaves it alone."""
+    The request was filed against a base that no longer exists at that tip, so the CI
+    evidence in it describes nothing that would land. It is SUPERSEDED — never answered —
+    and the branch is caught up. Nothing is orphaned that could still have merged: the
+    command names the old sha, and `automerge.apply` refuses on the base anyway (§3.1)."""
     from jarvis import branchproof
 
     base1, base2 = "1" * 40, "2" * 40
     contained = {base1}
+    local = {"tip": base1}      # what the checkout says `origin/main` is at (§3.1)
     monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: True)
     monkeypatch.setattr(branchproof, "diff_fingerprint", lambda repo, base_ref, sha: "beef")
+    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: local["tip"])
     monkeypatch.setattr(branchproof, "is_ancestor",
                         lambda repo, ancestor, descendant: ancestor in contained)
     store, wo = arm(started, project, auto_merge=True)
@@ -1825,13 +2171,16 @@ def test_a_live_grant_stops_the_os_catching_the_branch_up_behind_it(
     # `main` moved: the pull request is now behind, and a grant for the judged sha stands.
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED,
                    base_oid=base2)
+    local["tip"] = base2
 
     poll(started, store)
 
-    assert fake_gh.updates == []
-    assert store.events_of_kind(wo["id"], invariants.PR_BASE_UPDATED_EVENT) == []
-    assert store.events_of_kind(wo["id"], ops.HEAD_CARRIED_EVENT) == []
-    assert len(store.list_approvals(wo["id"])) == 1
+    assert fake_gh.updates == [PR]
+    [filed] = store.list_approvals(wo["id"])
+    assert filed["status"] == "expired" and filed["closed_as"] == "superseded"
+    assert filed["decided_by"] == "os"
+    # Nothing merged, and no second request for the same old commit.
+    assert not [c for c in fake_gh.calls if c["argv"][:2] == ["pr", "merge"]]
 
 
 def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judged(
@@ -1852,3 +2201,63 @@ def test_no_carry_is_attempted_while_the_head_is_still_the_commit_that_was_judge
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["api", "--method"]
                 and "/commits/" in c["argv"][3]]
     assert len(store.list_approvals(wo["id"])) == 1
+
+
+def test_both_shapes_of_wo_show_say_a_superseded_hold_is_history_while_a_round_runs(
+        started, project, capsys):
+    """The CLI's two surfaces, from the one marked state — the user's follow-up to
+    docs/superpowers/specs/2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+    merging.md §5.
+
+    `--json` keeps the payload for tooling that reads the SHAs, so it has to carry the
+    MARKING (`stale_because`) beside them: without it a reader of the document has no way
+    to tell a live hold from a superseded one. The human row is `state["line"]` and
+    nothing else — collapsing to `state["reason"]` instead would print `held — <reason>`
+    in the present tense about a commit the running round has already moved past.
+    """
+    import json as _json
+
+    from jarvis import cli
+
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="round 1 passed on a1b2c3d4e5, the head is now e4f5a6b7c8")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+    history = (f"re-judging in round {running} (was held: round 1 passed on a1b2c3d4e5, "
+               f"the head is now e4f5a6b7c8)")
+
+    assert cli.main(["wo", "show", wo["id"], "--json"]) == 0
+    document = _json.loads(capsys.readouterr().out)
+
+    assert document["auto_merge"]["stale_because"] == "rejudging"
+    assert document["auto_merge"]["line"] == history
+
+    assert cli.main(["wo", "show", wo["id"]]) == 0
+    human = capsys.readouterr().out
+
+    assert history in human
+    assert "held — " not in human
+
+
+def test_the_round_line_beside_a_re_judging_hold_describes_the_round_and_no_hold(
+        started, project):
+    """AN AUDIT OF THE SIBLING SUMMARY LINE, asked for alongside the same follow-up.
+
+    `ops.round_line` does not read the merge hold at all, and it must not start: the open
+    round's line is the running round's standing, so a hold's wording appearing here —
+    the word `held` or the stored reason quoted from the payload — would be a second
+    surface making the present-tense claim §5 removed, on a line that cannot even say
+    which commit the hold was about.
+    """
+    store, wo = arm(started, project, auto_merge=True)
+    a_hold(store, wo["id"], automerge.HELD_SHA_MOVED, round_n=1, head_sha=PUSHED,
+           reason="the head moved under the pass")
+    running = open_round(store, wo["id"])
+    store.set_status(wo["id"], "validating")
+
+    line = ops.round_line(store.latest_validation_round(wo_id=wo["id"]))
+
+    assert line.startswith(f"round {running} · ")
+    assert "pending" in line
+    assert "held" not in line and "the head moved under the pass" not in line

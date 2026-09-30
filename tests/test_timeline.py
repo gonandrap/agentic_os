@@ -122,6 +122,20 @@ def test_a_merge_that_timed_out_is_not_described_as_a_cleanup():
     assert entry["detail"] == "the merge command did not complete: timeout"
 
 
+def test_a_merge_refused_because_the_base_moved_says_which_commit_moved():
+    """Spec 2026-09-28 §3.1: the OS refused before GitHub heard anything, so the sentence
+    has to name BOTH commits — the one a round passed on and the one the base is at —
+    because "the merge was refused" about an unmoved head is what gate 308's reviewer was
+    told and could not act on."""
+    entry = build_timeline({}, [ev("automerge_base_stale", 1.0, head_sha="fa85f88ccd0",
+                                   base="main", base_oid="37fe650fab0", round=2,
+                                   reason="the base moved")], [])[0]
+    assert entry["label"] == "Merge refused — the base moved under it"
+    assert "round 2 passed on fa85f88ccd" in entry["detail"]
+    assert "main is now at 37fe650fab" in entry["detail"]
+    assert "{" not in entry["label"] + entry["detail"]
+
+
 def test_messages_appear_as_prompt_and_reply():
     """Both directions are moments on the timeline; the words are the conversation's."""
     messages = [
@@ -573,7 +587,7 @@ def test_an_escalation_is_not_an_empty_speech_bubble():
 
 
 def test_every_alarm_status_has_a_reading_a_person_can_use():
-    """All seven, because the supervisor ships OFF and `raised` is therefore the common
+    """All eight, because the supervisor ships OFF and `raised` is therefore the common
     case — an example built from `acked` alone would grade the interesting one only.
     The ids are asserted too: they are what makes the line reachable rather than a
     count of things the reader cannot open."""
@@ -583,10 +597,10 @@ def test_every_alarm_status_has_a_reading_a_person_can_use():
     assert set(ALARM_STANDING) == set(ALARM_STATUSES)
     alarms = [{"id": f"al-{i}", "status": s} for i, s in enumerate(ALARM_STATUSES)]
     assert alarm_standing_line(alarms) == (
-        "7 (1 raised, 1 with the supervisor, 1 acked by the supervisor, "
-        "1 escalated to Neo, 1 a remedy proposed, 1 not reviewed, "
-        "1 supervisor failed) — "
-        "al-0, al-1, al-2, al-3, al-4, al-5, al-6")
+        "8 (1 raised, 1 a note, never escalated, 1 with the supervisor, "
+        "1 acked by the supervisor, 1 escalated to Neo, 1 a remedy proposed, "
+        "1 not reviewed, 1 supervisor failed) — "
+        "al-0, al-1, al-2, al-3, al-4, al-5, al-6, al-7")
     assert alarm_standing_line([{"id": "al-1a2b", "status": "acked"},
                                 {"id": "al-3c4d", "status": "escalated"}]) == (
         "2 (1 acked by the supervisor, 1 escalated to Neo) — al-1a2b, al-3c4d")
@@ -742,3 +756,94 @@ def test_a_carried_verdict_and_a_refused_carry_both_render_and_name_the_proof():
     assert "2 merge(s) of main" in carried["detail"]
     assert refused["label"] == "Verdict not carried — re-judging"
     assert "c2120424ba" in refused["detail"] and "resolved content" in refused["detail"]
+
+
+# -- a rebind: the round the OS's own merge costs nobody -------------------------------
+# spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5
+
+
+def test_the_two_rejudge_declines_are_told_apart_by_their_cause():
+    """One decline says the round budget is spent and offers `validation.max_rounds`;
+    the other is about a bound that never reads it. Same label, different news."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, budget = _describe("validation_rejudge_declined",
+                              {"head_sha": "bbbb1111bbbb2222", "round": 2,
+                               "cause": ops.REJUDGE_BUDGET_SPENT, "next_round": 3,
+                               "max_rounds": 3})
+    rebind_label, rebind = _describe("validation_rejudge_declined",
+                                     {"head_sha": "bbbb1111bbbb2222", "round": 2,
+                                      "cause": ops.REBIND_EXHAUSTED, "rebinds": 2,
+                                      "rebind_max": 2})
+
+    assert "round 3 of 3 would be the last" in budget
+    assert rebind_label == label
+    assert "re-judged this merge 2 time(s)" in rebind
+    assert "would be the last" not in rebind
+
+
+def test_a_rebind_reads_as_a_round_nobody_was_charged_for():
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    reason = ops.REBIND_FORCED_REASON.format(n=3, judged="aaaa1111aa",
+                                             head="bbbb1111bb", used=1,
+                                             max=ops.REBIND_MAX)
+    label, detail = _describe("validation_forced",
+                              {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": True,
+                               "reason": reason})
+
+    assert label.startswith("Validation forced by the OS")
+    assert "no round spent" in label
+    assert "does not count against validation.max_rounds" in detail
+
+
+# -- a rework the USER asked for: the second uncounted cause ---------------------------
+# Neo question 973, live case wo-299daf2e.
+
+
+def test_a_user_rework_round_reads_as_the_rework_the_user_asked_for():
+    """Not a rebind: nobody merged anything, so a line about a conflict resolution
+    would misdescribe the record — and no round was spent either way."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    reason = ops.USER_REWORK_FORCED_REASON.format(n=3, judged="aaaa1111aa",
+                                                  head="bbbb1111bb")
+    label, detail = _describe("validation_forced",
+                              {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": False,
+                               "cause": ops.USER_REWORK_CAUSE, "reason": reason})
+
+    assert label.startswith("Validation forced by the OS")
+    assert "no round spent" in label and "rework you asked for" in label
+    assert "does not count against validation.max_rounds" in detail
+
+
+def test_a_rejected_user_rework_round_says_no_round_was_spent():
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, detail = _describe("validation_rejected",
+                              {"round": 4, "of": 3, "budget_round": 4,
+                               "uncounted": True,
+                               "uncounted_cause": ops.USER_REWORK_CAUSE,
+                               "reason": "the rework misses the case"})
+    plain, _ = _describe("validation_rejected", {"round": 2, "reason": "no"})
+
+    assert "no round spent" in label and "rework you asked for" in label
+    assert detail == "the rework misses the case"
+    assert "no round spent" not in plain
+
+
+def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
+    """No surface may print a wrong sentence for a row written before the cause
+    existed: `rebind: true` and no `cause` is a rebind."""
+    from jarvis import ops
+    from jarvis.timeline import _describe
+
+    label, _ = _describe("validation_forced",
+                         {"round": 4, "by": ops.REJUDGE_BY_OS, "rebind": True,
+                          "reason": "x"})
+
+    assert "no round spent" in label and "rework you asked for" not in label

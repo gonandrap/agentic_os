@@ -196,6 +196,36 @@ def test_the_analyst_never_gets_the_workers_pr_title_rule(analyst_prompt):
     assert "[wo-" not in analyst_prompt
 
 
+def test_the_investigator_never_gets_the_workers_pull_request_contract(project, store):
+    """§5 of docs/superpowers/specs/2026-09-27-investigation-orders.md: assert on the
+    ABSENCE, with the worker beside it — the same assertion passes on a missing branch."""
+    from jarvis.dispatch import build_worker_prompt, feature_context
+
+    inv = store.create_feature_order("investigate wo-11111111", description="stuck",
+                                     kind="investigation",
+                                     metadata={ops.SUBJECT_KEY: "wo-11111111"})
+    wo = store.create_work_order(title="diagnose wo-11111111", description="stuck",
+                                 origin="jarvis", kind="investigator",
+                                 parent_id=inv["id"])
+    spec = ProjectSpec(name="proj_a", path=project, description="")
+    investigator = build_worker_prompt(wo, spec, None,
+                                       feature=feature_context(store, wo))
+    worker = build_worker_prompt({"id": "wo-1", "title": "t", "description": "d",
+                                  "kind": "worker"}, spec, None)
+
+    # Prohibition lines say "pull request" too, so read past them (kn-31f0f450).
+    body = "\n".join(line for line in investigator.splitlines()
+                     if not any(w in line.lower()
+                                for w in ("not", "never", " no ", "cannot", "refus",
+                                          "nothing")))
+    for contract in ("open a PR", "gh pr create", "--pr ", "[wo-",
+                     "Co-Authored-By"):
+        assert contract not in body, contract
+    assert "jarvis investigate verdict" in investigator
+    # The control: the worker contract DOES carry the lines this kind must not see.
+    assert "open a PR" in worker
+
+
 def test_a_manager_is_unaffected_by_the_feature_context_change(project, store):
     """`feature_context` grew a second kind; a manager must still receive its REAL
     children, not the analyst's empty list."""

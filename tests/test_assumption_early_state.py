@@ -125,6 +125,35 @@ def test_assumption_for_question_resolves_both_question_columns(project):
     assert store.get_assumption(aid)["neo_question_id"] == 11
 
 
+def test_clearing_the_confirmation_link_touches_nothing_else(project):
+    """§4.3 step 2 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-
+    hold-an-assumption-for-ever.md — the twin of `link_assumption_confirmation` above.
+
+    A verb of its own rather than `link_assumption_confirmation(aid, None)`: that
+    parameter is typed `int`, and a nullable overload would let the ASK path clear a link
+    by passing a falsy question id. The early reading and the status stay exactly as they
+    were — the next tick re-asks the CONFIRMATION, and nothing else is re-formed.
+    """
+    store = ProjectStore(project)
+    wo = store.create_work_order(title="o", description="")
+    aid = store.add_assumption(wo["id"], "a")
+    store.record_provisional(aid, verdict="accept", reason="standard", model="opus")
+    store.link_assumption_question(aid, 11)
+    store.link_assumption_confirmation(aid, 12)
+
+    store.clear_assumption_confirmation(aid)
+
+    row = store.get_assumption(aid)
+    assert row["confirm_question_id"] is None
+    assert store.assumption_for_question(12) is None
+    assert row["neo_question_id"] == 11
+    assert row["status"] == "pending"
+    assert row["provisional_verdict"] == "accept"
+    assert row["provisional_reason"] == "standard"
+    assert row["provisional_model"] == "opus"
+    assert row["provisional_ts"] is not None
+
+
 def test_outstanding_objections_is_neither_delivered_nor_withdrawn(project):
     """One query, two readers — §6.6 withdraws from this list and §7 waits on it."""
     store = ProjectStore(project)

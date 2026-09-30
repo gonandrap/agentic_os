@@ -55,7 +55,7 @@ def test_the_kind_column_carries_both_values_and_defaults_to_feature(store):
 
 def test_an_unknown_kind_is_refused(store):
     with pytest.raises(AssertionError):
-        store.create_feature_order("x", description="y", kind="investigation")
+        store.create_feature_order("x", description="y", kind="escalation")
 
 
 def test_an_improvement_order_is_absent_from_every_feature_listing(store):
@@ -125,7 +125,7 @@ def test_the_status_labels_are_kind_aware_and_leave_features_alone():
 
 def test_is_feature_order_id():
     pred = project_store.is_feature_order_id
-    assert pred("fo-abc") and pred("io-abc")
+    assert pred("fo-abc") and pred("io-abc") and pred("inv-abc")
     assert not pred("wo-abc")
     assert not pred("al-abc")
 

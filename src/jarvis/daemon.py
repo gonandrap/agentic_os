@@ -52,11 +52,12 @@ import signal
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, worker_session)
+               notify, release, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -65,6 +66,7 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_TERMINAL_STATUSES,
     MAX_MESSAGE_DELIVERY_ATTEMPTS,
@@ -234,6 +236,33 @@ REVIEW_FEEDBACK = """REVIEW FEEDBACK (round {n} of {max})
 
 Address this and then run `jarvis wo finish {wo_id} --summary "..." --evidence "..."`
 again. Re-submitting without changed code or new evidence will end the review."""
+
+#: THE SAME REJECTION ON A ROUND NOBODY WAS CHARGED FOR. "round 5 of 3" is false on a
+#: rebind — the row's number is past the budget and its own bound held it — and a
+#: submitter told it had spent a round it had not would ration itself against a budget
+#: that is untouched. Shaped on `ops.BOUNCE_FEEDBACK`, which already has to say that
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.4).
+REBIND_FEEDBACK = """REVIEW FEEDBACK (re-judgement {used} of {max}, no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The OS asked you to merge the base
+branch in, your resolution changed what this pull request contributes, and a seat has
+read it. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again."""
+
+#: THE SAME REJECTION ON THE ROUND A USER REJECTION BOUGHT. No round was spent here
+#: either, but nothing about a rebind is true of it: nobody merged anything, and there
+#: is no "re-judgement 1 of 2" — the bound is one free round per USER rejection, so a
+#: number out of two would name a cap that does not exist (Neo question 973, live case
+#: wo-299daf2e). The last sentence is the one the rebind wording does not need: the
+#: NEXT attempt is charged like any other.
+USER_REWORK_FEEDBACK = """REVIEW FEEDBACK (no round spent)
+{reason}
+
+This is not one of your {max_rounds} review rounds. The user rejected this on review and
+asked for the rework, so it was judged outside the budget. Fix what is above and run
+`jarvis wo finish {wo_id} --summary "..." --evidence "..."` again — that next round is a
+charged one."""
 
 #: THE SAME REJECTION, ADDRESSED TO A DIFFERENT JOB. A manager does not fix code — it
 #: files work orders that do — so the closing instruction cannot be the implementor's, and
@@ -459,6 +488,21 @@ def _landing_deferred(store: ProjectStore, wo_id: str) -> int | None:
     done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") if landed \
         else None
     return None if done == owed else int(owed)
+
+
+@dataclass(frozen=True)
+class CarryOutcome:
+    """What `Daemon._carry_catch_up` learned, which is three states and not two.
+
+    `carried` is the verdict now covering the live head — the caller re-decides on it.
+    `rebind` is the other answer worth having: proof (a) held and proof (b) did not, so
+    the merge the OS asked for resolved a conflict and the round that judges it must not
+    be charged to the worker's rework budget (spec
+    docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+    """
+
+    carried: bool
+    rebind: bool
 
 
 class Daemon:
@@ -742,6 +786,9 @@ class Daemon:
         state = fleet.read(self.catalog.os.max_in_flight, self._fleet_stores())
         if fleet.announce(self.central, state):
             log.warning("fleet held: %s", state.blocked())
+        # AFTER `announce`, which is what records a reopen: the ramp it starts has to be
+        # in force on the very tick the backlog comes due (issue #843).
+        fleet.attach(state, self.central)
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -786,7 +833,7 @@ class Daemon:
                 # waiting a whole poll interval for the next pass. With no envelope ever
                 # posted this is one indexed lookup that finds nothing.
                 self.deliver_envelopes(project, store)
-                self.deliver_messages(project, store)
+                self.deliver_messages(project, store, state)
                 # After delivery, not before: an envelope this round machine posted on
                 # an earlier tick is already on its way to the worker, so the work order
                 # it rejected has left `validating` and is not looked at again here.
@@ -903,7 +950,9 @@ class Daemon:
         # that raised on this tick is judged on the next one, which is the cadence §4
         # designs for — the sweep answers "is something wrong", the review answers
         # "does the user need to know".
-        self.health_tick()
+        # Carrying this tick's ONE fleet reading, the same value `validation_tick` gets
+        # and for the same reason: the account's window is a fleet fact, read once.
+        self.health_tick(state)
         # Last of the three, and never merged into the review: a proposal filed above
         # cannot be applied on the tick that filed it (its gate is `pending`), so the two
         # only ever meet across ticks — and that separation is what keeps the deciding
@@ -980,10 +1029,14 @@ class Daemon:
         leaves `pending` and nothing is written at all — the same nothing a
         dependency-blocked order costs, and why neither raises attention.
         """
+        # The user's pause is per order, so it narrows the CLAIM rather than stopping it:
+        # only allow-listed ids are claimable while the fleet is paused (issue #843).
+        only = (state.pause.allow if state is not None and state.pause is not None
+                else None)
         while store.count_active() < project.max_concurrent:
-            if state is not None and state.blocked():
+            if state is not None and (state.shut() or state.capacity_cause()):
                 return
-            wo = store.claim_next_pending()
+            wo = store.claim_next_pending(only=only)
             if wo is None:
                 return
             log.info("[%s] dispatching %s: %s", project.name, wo["id"], wo["title"])
@@ -1046,6 +1099,10 @@ class Daemon:
         than one loop over both kinds, because `list_feature_orders` filters kind
         POSITIVELY (§2.4 of the improvement-orders spec) and a shared loop would have to
         undo that. See §3.1.
+
+        An INVESTIGATION order gets a third one, identical in shape: one work order,
+        `kind='investigator'`, the `why` verbatim, and `pending` left last (§2.7 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md).
         """
         for fo in store.list_feature_orders(statuses=("pending",)):
             try:
@@ -1082,6 +1139,30 @@ class Daemon:
             store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
             store.set_feature_status(fo["id"], "planning")
             log.info("[%s] analysing %s: opened %s", project.name, fo["id"], wo["id"])
+
+        # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: a third
+        # sibling loop, for the same reason as the second — `list_feature_orders` filters
+        # kind POSITIVELY and a shared loop would have to undo that.
+        for fo in store.list_feature_orders(statuses=("pending",),
+                                            kind="investigation"):
+            try:
+                wo = store.create_work_order(
+                    title=f"Investigate: {fo['title']}"[:200],
+                    # The `why` verbatim; the investigator CONTRACT is composed at
+                    # dispatch (dispatch._investigator_prompt), as the analyst's is.
+                    description=fo["description"],
+                    origin="jarvis", kind="investigator", parent_id=fo["id"],
+                )
+            except Exception:  # noqa: BLE001 — one bad investigation must not stop the rest
+                log.exception("[%s] could not open an investigator for %s", project.name,
+                              fo["id"])
+                continue
+            store.update_feature_order(fo["id"], plan_wo_id=wo["id"])
+            # LAST, which is what makes a crashed tick re-file rather than strand an
+            # investigation with no investigator.
+            store.set_feature_status(fo["id"], "planning")
+            log.info("[%s] investigating %s: opened %s", project.name, fo["id"],
+                     wo["id"])
 
     def refresh_plan_specs(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Re-ask any plan review whose spec has been committed over. Thin, like its
@@ -1515,7 +1596,7 @@ class Daemon:
         """
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
-            held = state.blocked() if state is not None else ""
+            held = state.blocked(wo["id"]) if state is not None else ""
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # the user's own session; Jarvis does not drive it
             try:
@@ -1528,16 +1609,20 @@ class Daemon:
             # BELOW the filter above, so only an order that was going to be relaunched
             # on this pass is ever recorded — nothing else is being held.
             if held:
-                shut = state is not None and state.shut()
-                figures = {"in_flight": state.in_flight, "cap": state.cap}
-                if shut:
+                assert state is not None  # `held` is only ever set from a reading
+                cause = state.hold_cause(wo["id"]) or "fleet_cap"
+                figures: dict[str, Any] = {"in_flight": state.in_flight, "cap": state.cap}
+                if cause == "fleet_outage":
                     # Not relabelled a cap: `invariants.fleet_hold_note` owns the words
                     # for an outage (issue #714), and the event exists for the invariant
                     # suppression, which an outage hold needs exactly as a cap hold does.
                     figures["reopens_at"] = state.outage.reopens_at
-                self._record_retry_held(
-                    store, wo, pause,
-                    cause="fleet_outage" if shut else "fleet_cap", figures=figures)
+                elif cause == "fleet_ramp":
+                    figures.update(cap=state.ramp.cap, until=state.ramp.until,
+                                   since=state.ramp.since)
+                elif cause == "fleet_paused":
+                    figures["since"] = state.pause.since
+                self._record_retry_held(store, wo, pause, cause=cause, figures=figures)
                 continue
             takes_a_slot = resume_spends_slot(wo)
             if takes_a_slot and budget <= 0:
@@ -1547,7 +1632,19 @@ class Daemon:
                              "max_concurrent": project.max_concurrent})
                 continue
             try:
-                turn = worker_session.retry(store, project, wo, pause)
+                # COLD, AND LARGE: compact first (issue #843). A pause outlives the cache,
+                # so the plain relaunch re-writes the whole conversation at the
+                # cache-WRITE rate — 100-170k tokens a worker, all due on the same tick.
+                # `compact_then_resume` queues the relaunch as an ordinary message, so the
+                # pause is not erased and the delivery path sends it into the compacted,
+                # warm conversation on the tick after the compaction settles.
+                due = worker_session.resume_compaction_due(
+                    store, project, wo, pause, self.catalog.os.compact_min_context)
+                if due is not None:
+                    turn = worker_session.compact_then_resume(
+                        store, project, wo, pause, due)
+                else:
+                    turn = worker_session.retry(store, project, wo, pause)
             except budget_mod.BudgetExhausted as e:
                 # `NOT_RETRIED` already keeps this sweep off an order already parked in
                 # `budget_exhausted`; this is the order that ran out BETWEEN the last
@@ -1631,7 +1728,8 @@ class Daemon:
 
     # -- 3. message delivery ----------------------------------------------------------
 
-    def deliver_messages(self, project: ProjectSpec, store: ProjectStore) -> None:
+    def deliver_messages(self, project: ProjectSpec, store: ProjectStore,
+                         state: fleet.Fleet | None = None) -> None:
         """Send queued user messages into their work orders' conversations.
 
         No roster lookup any more, and no thread pool: a turn is a detached process, so
@@ -1693,13 +1791,22 @@ class Daemon:
         budget = project.max_concurrent - store.count_active()
         for wo_id, msgs in pending.items():
             wo = store.get_work_order(wo_id)
+            # UNDER THE FLEET TOO (issue #843). A delivery starts a turn exactly as a
+            # dispatch or a resume does, so the user's pause, the post-reopen ramp and
+            # the account-wide cap bind it the same way. Held, the messages stay queued.
+            held = state.blocked(wo_id) if state is not None else ""
+            if held:
+                log.debug("[%s] holding %s message(s) for %s: %s",
+                          project.name, len(msgs), wo_id, held)
+                continue
             if resume_spends_slot(wo):
                 if budget <= 0:
                     log.debug("[%s] holding %s message(s) for %s: all %s slots are full",
                               project.name, len(msgs), wo_id, project.max_concurrent)
                     continue
                 budget -= 1
-            self._deliver(project, store, wo, msgs)
+            if self._deliver(project, store, wo, msgs) and state is not None:
+                state.launched()
 
     def deliver_envelopes(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Route every queued envelope, oldest first (src/jarvis/bus.py).
@@ -1767,6 +1874,9 @@ class Daemon:
             wo_id = wo["id"]
             if wo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(wo_id):
+                continue  # the user paused the fleet; the panel spends on this too (#843)
             round_row = store.latest_validation_round(wo_id=wo_id)
             if round_row is None:  # pragma: no cover - the query selected on this round
                 continue
@@ -1882,6 +1992,34 @@ class Daemon:
                 return
             cfg = self._round_config(project, round_row)
             n, max_rounds = int(round_row["round"]), int(cfg.max_rounds)
+            # WHICH BUDGET THIS ROUND CAME OUT OF. A rebind's NUMBER can sit past
+            # `max_rounds` while its own bound has room, and routing on the number
+            # would send it to the user for being numbered 5 (spec
+            # 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+            # `rebinds` counts the round being settled, so `<` means "another one left".
+            #
+            # `pos` is the ORDINARY arm's budget position, and it is not `n` either: a
+            # rebind spends a row number without spending budget, so after one the rows
+            # run ahead of the budget and routing on `n` would escalate a submission
+            # with a round still in hand (and tell it "round 3 of 3"). Same counter
+            # `ops.rejudge_moved_head` budgets off — the round being settled is still
+            # open, so it is not in `COUNTED_VALIDATION_OUTCOMES` yet and adding it back
+            # is this `+ 1`.
+            uncounted = bool(round_row["uncounted"])
+            # WHICH EXEMPTION, not merely that there was one. A rework the USER asked
+            # for is bounded by the user's own rejections — one free round each — so a
+            # rejected one falls back to the ORDINARY rule and `REBIND_MAX` never reads
+            # it (Neo question 973, live case wo-299daf2e). An uncounted row with NO
+            # cause predates the column and could only have been a rebind, which is why
+            # the filter drops to unfiltered there.
+            cause = str(round_row["uncounted_cause"] or "")
+            as_rebind = uncounted and cause != ops.USER_REWORK_CAUSE
+            rebinds = store.uncounted_validation_rounds(
+                wo_id=wo_id, cause=cause or None) if as_rebind else 0
+            pos = store.counted_validation_rounds(wo_id=wo_id) + (
+                0 if str(round_row["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES
+                else 1)
+            goes_back = (rebinds < ops.REBIND_MAX) if as_rebind else (pos < max_rounds)
             packet = evidence_mod.collect_work_order(
                 project.path, wo, declared=str(round_row["evidence"] or ""),
                 diff_chars=cfg.diff_chars, spec=specs.spec_of(store, wo),
@@ -2057,14 +2195,16 @@ class Daemon:
                                      "outcome": "passed"})
                 log.info("[%s] %s passed review in round %d -> %s",
                          project.name, wo_id, n, status)
-            elif outcome == "rejected" and n < max_rounds:
+            elif outcome == "rejected" and goes_back:
                 # The inadmissible follow-ups ride along HERE and nowhere else: a stale
                 # docstring or a missing test costs nothing in a session that is going
                 # back anyway, and is not a tracker item (`ops.follow_up_feedback`).
                 self._reject(store, wo, round_id, n, max_rounds, reason,
-                             note=ops.follow_up_feedback(follow_ups))
+                             note=ops.follow_up_feedback(follow_ups), budget_round=pos,
+                             rebind=(rebinds, ops.REBIND_MAX) if as_rebind else None,
+                             uncounted_cause=cause)
                 log.info("[%s] %s rejected in round %d of %d",
-                         project.name, wo_id, n, max_rounds)
+                         project.name, wo_id, n if uncounted else pos, max_rounds)
             elif outcome == "rejected":
                 # The last round it had, and it was refused. Sending feedback now would
                 # ask for a resubmission there is no round left to judge — and the loop
@@ -2159,7 +2299,9 @@ class Daemon:
 
     @staticmethod
     def _reject(store: ProjectStore, wo: dict, round_id: int, n: int, max_rounds: int,
-                reason: str, *, note: str = "") -> None:
+                reason: str, *, note: str = "", budget_round: int | None = None,
+                rebind: tuple[int, int] | None = None,
+                uncounted_cause: str = "") -> None:
         """Close the round and send the feedback back — OVER THE BUS, never directly.
 
         The round machine does not call `queue_message` and never names a work order as
@@ -2172,18 +2314,53 @@ class Daemon:
         panel's verdict; the findings that were not admissible as tracker issues are an
         aside to whoever is fixing this, and writing them into the outcome would restate
         on every surface that prints a round.
+
+        `rebind` is `(used, ops.REBIND_MAX)` and swaps the wording for `REBIND_FEEDBACK`:
+        the round was not charged to the submitter, so it may not be told it was (spec
+        2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.4).
+
+        `uncounted_cause` is the round's OWN exemption and it picks the wording: a round
+        a USER rejection bought is not a rebind and may not be described as one — no
+        merge, and no "re-judgement 1 of 2" cap (Neo question 973). It rides on the
+        event too, so every surface can tell the two uncounted causes apart.
+
+        `budget_round` is this round's BUDGET POSITION, which after a rebind is behind
+        its row number, and it is what the ordinary feedback names — a submitter told
+        "round 3 of 3" on its second charged round would ration itself out of a round it
+        still has (same spec §4.4).
+
+        `"round"` in the event stays the ROW NUMBER: `holds.py` correlates it with
+        `validation_submitted`'s, and a budget position there leaves the VALIDATION hold
+        open for ever. The position rides beside it as `budget_round`.
         """
+        from . import ops
+
         wo_id = wo["id"]
+        rework = uncounted_cause == ops.USER_REWORK_CAUSE
         store.close_validation_round(round_id, "rejected", reason)
-        store.add_event(wo_id, "validation_rejected",
-                        {"round": n, "round_id": round_id, "of": max_rounds})
+        used, of = rebind or (0, max_rounds)
+        pos = n if budget_round is None else budget_round
+        # `of` is the bound this round was actually held by, so no surface prints
+        # "round 5 of 3" (spec 2026-09-27 §4.4).
+        event: dict[str, Any] = {"round": n, "round_id": round_id, "of": of,
+                                 "budget_round": pos}
+        if rebind is not None or rework:
+            event["uncounted"] = True
+        if uncounted_cause:
+            event["uncounted_cause"] = uncounted_cause
+        store.add_event(wo_id, "validation_rejected", event)
+        if rework:
+            text = USER_REWORK_FEEDBACK.format(max_rounds=max_rounds,
+                                               reason=reason + note, wo_id=wo_id)
+        elif rebind is not None:
+            text = REBIND_FEEDBACK.format(used=used, max=of, max_rounds=max_rounds,
+                                          reason=reason + note, wo_id=wo_id)
+        else:
+            text = REVIEW_FEEDBACK.format(n=pos, max=max_rounds, reason=reason + note,
+                                          wo_id=wo_id)
         bus.post(store, subject=bus.Subject(wo_id=wo_id),
                  from_role="reviewer", to_role="implementor",
-                 payload=bus.ReviewFeedback(
-                     round=n, outcome="rejected",
-                     reason=REVIEW_FEEDBACK.format(n=n, max=max_rounds,
-                                                   reason=reason + note,
-                                                   wo_id=wo_id)))
+                 payload=bus.ReviewFeedback(round=n, outcome="rejected", reason=text))
 
     @staticmethod
     def _void(store: ProjectStore, wo: dict, round_id: int, n: int,
@@ -2469,6 +2646,9 @@ class Daemon:
             fo_id = fo["id"]
             if fo_id in self.validating:
                 continue  # its round is in flight; a second tick must not start another
+            if state is not None and state.pause is not None \
+                    and not state.pause.allows(fo_id):
+                continue  # the user paused the fleet (#843)
             round_row = store.latest_validation_round(fo_id=fo_id)
             if round_row is None:
                 # In `validating` with no round at all: nothing this machine can judge.
@@ -2878,7 +3058,8 @@ class Daemon:
         return True
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                 msgs: list[dict[str, Any]]) -> None:
+                 msgs: list[dict[str, Any]]) -> bool:
+        """True when a turn was launched — the delivery itself, or a compaction first."""
         ids = [m["id"] for m in msgs]
         anchor = ids[0]  # the ASK this turn is charged to — see the note below
         # COMPACT FIRST IF THE CACHE HAS GONE. The messages stay QUEUED — nothing about
@@ -2886,7 +3067,7 @@ class Daemon:
         # that is both summarised and warm again. Deliberately before the `delivering`
         # event, so the record does not claim a delivery that a compaction preempted.
         if self._compacted_first(project, store, wo):
-            return
+            return True
         # WHY THE LAST TURN STALLED, CARRIED INTO THIS ONE. A resume of a work order
         # whose last turn died on a background job used to re-enter the identical turn
         # shape knowing nothing, and the worker backgrounded and signed off again —
@@ -2915,7 +3096,7 @@ class Daemon:
             # user raising the budget is exactly what sends them. `delivery_hold` keeps
             # the next tick from re-attempting, so this runs once per exhaustion.
             budget_mod.escalate(store, wo, e.exhausted)
-            return
+            return False
         except claude_cli.ClaudeCliError as e:
             # THE USER'S WORDS ARE NOT THE OS'S TO DROP. Held, with the attempt spent,
             # and only surfaced once the retries are genuinely gone — spec
@@ -2932,7 +3113,7 @@ class Daemon:
                     f"a message could not be delivered to this work order after "
                     f"{MAX_MESSAGE_DELIVERY_ATTEMPTS} attempts — the worker never "
                     f"received it: {e}")
-            return
+            return False
         # Every message in the turn is delivered, not just the one the turn row names:
         # a message left `queued` here would be re-sent on the next tick, so the worker
         # would read it twice and pay a second boundary for the privilege.
@@ -2947,6 +3128,7 @@ class Daemon:
         if wo["status"] != "running":
             store.set_status(wo["id"], "running")
             store.clear_attention(wo["id"])
+        return True
 
     # -- 5. Neo (answer worker questions) --------------------------------------------
 
@@ -3735,19 +3917,25 @@ class Daemon:
                 and p.path.is_dir()
                 and self.tick_count % p.supervisor.health_every_ticks == 1]
 
-    def health_tick(self) -> None:
+    def health_tick(self, state: fleet.Fleet | None = None) -> None:
         """Kick a sweep when a unit is due and none is running.
 
         Modelled on `supervisor_tick`, including the guard: a sweep still in flight must
         never have a second one queued behind it, because the candidate list would be
         computed against state the first one is still writing. With no project swept it
         opens no store and reads no row.
+
+        `state` is the tick's ONE `fleet` reading, passed in for the reason
+        `validation_tick` takes it: the account's window is read once per tick, and a
+        sweep that bought a refusal per project would learn the same fact per project.
+        It is threaded into `_health_sweep`, which runs on the health thread — nothing
+        is opened here.
         """
         due = self._health_projects()
         if not due or self.health_sweeping:
             return
         self.health_sweeping = True
-        future = self.health_pool.submit(self._health_sweep, due)
+        future = self.health_pool.submit(self._health_sweep, due, state)
         future.add_done_callback(lambda f: setattr(self, "health_sweeping", False))
 
     def _health_candidates(self, pstore: ProjectStore,
@@ -3790,8 +3978,14 @@ class Daemon:
         out.sort(key=lambda c: c[0])
         return out
 
-    def _health_sweep(self, projects: list[ProjectSpec]) -> None:
-        """Sweep each project's due units, capped (on the health thread)."""
+    def _health_sweep(self, projects: list[ProjectSpec],
+                      state: fleet.Fleet | None = None) -> None:
+        """Sweep each project's due units, capped (on the health thread).
+
+        TWO HOLDS ARE READ BEFORE ANY CALL IS BOUGHT, one per account and one per
+        project — a recorded hold that nobody reads is just a quieter retry storm (spec
+        docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
+        """
         from . import supervisor as supervisor_mod
         from .neo_store import NeoStore
 
@@ -3801,6 +3995,16 @@ class Daemon:
                 cfg = project.supervisor
                 pstore = ProjectStore(project.path)
                 try:
+                    if state is not None and state.shut():
+                        self._hold_sweep_for_outage(project, pstore, state)
+                        continue
+                    hold = pstore.health_sweep_hold()
+                    if hold is not None:
+                        # Nothing is swept, no candidates are derived, no row is
+                        # written: the hold row that exists is the record.
+                        log.debug("[%s] health sweep held until %s: %s",
+                                  project.name, hold[0], hold[1])
+                        continue
                     for _, subject, trigger in self._health_candidates(
                             pstore, cfg)[:cfg.health_max_units_per_tick]:
                         supervisor_mod.review_health(
@@ -3812,6 +4016,30 @@ class Daemon:
                     pstore.close()
         finally:
             neo_store.close()
+
+    @staticmethod
+    def _hold_sweep_for_outage(project: ProjectSpec, pstore: ProjectStore,
+                               state: fleet.Fleet) -> None:
+        """Write down that the ACCOUNT's window — not this project — is why nobody swept.
+
+        ONCE PER WINDOW, not once per tick, and deduped on the MOMENT: at a 5s tick a
+        three-hour window would otherwise write two thousand identical rows per project.
+        `_hold_rounds_for_outage`'s rule verbatim.
+
+        RECORDED rather than merely skipped (kn-22ba6087): this row is the only place the
+        account fact becomes readable to a per-project invariant, which cannot see the
+        fleet object at all.
+        """
+        reopens = state.outage.reopens_at  # type: ignore[union-attr]
+        hold = pstore.health_sweep_hold()
+        if hold is not None and hold[0] >= reopens:
+            return
+        pstore.record_health_review(
+            "account", "", fingerprint="", trigger="account-window", outcome="held",
+            detail=state.outage.message[:500],  # type: ignore[union-attr]
+            reopens_at=reopens)
+        log.info("[%s] health sweep held by the account's usage window until %s",
+                 project.name, reopens)
 
     # -- 6b. the scheduler: work orders nobody typed ---------------------------------------
 
@@ -3984,7 +4212,9 @@ class Daemon:
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
                     body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
-                    level="warning", wo_id=v.wo_id, source="invariants",
+                    # The violation's OWN level: most are `warning`, and one that must
+                    # not arrive beside a stale attention flag says `critical`.
+                    level=v.level, wo_id=v.wo_id, source="invariants",
                 )
 
     # -- 2 & 6. turns, settlement, and injected sessions ---------------------------------------------------
@@ -4032,7 +4262,10 @@ class Daemon:
                     # What the OS was itself holding this order for, so a threshold
                     # judges the time it could work rather than the time that passed.
                     # Two indexed reads, no model — `holds.held`.
-                    spans=holds.held(store, wo["id"], now=now))
+                    spans=holds.held(store, wo["id"], now=now),
+                    # Spec 2026-09-27 §3: the alarm and `jarvis inspect` name one turn
+                    # the same way.
+                    turn_starts=store.turn_starts(wo["id"]))
             except OSError:
                 continue  # a transcript Jarvis cannot read is not a work order in trouble
             seen = [db.from_json(e["payload"], {}) or {}
@@ -4044,7 +4277,12 @@ class Daemon:
                 # `alarm_id` is purely additive to a payload whose other three keys are
                 # what `already` above matches on. Move the dedupe onto `wo_alarms` and
                 # this re-raises every tick for the life of the turn.
-                row = store.add_alarm(wo["id"], alarm.kind, turn["seq"], alarm.reason)
+                # Spec of 2026-09-27 §2: a note, not an interruption.
+                row = store.add_alarm(
+                    wo["id"], alarm.kind, turn["seq"], alarm.reason,
+                    status=("informational"
+                            if alarm.kind in inspection.INFORMATIONAL_KINDS
+                            else "raised"))
                 store.add_event(wo["id"], "cost_alarm",
                                 {"kind": alarm.kind, "seq": turn["seq"],
                                  "reason": alarm.reason, "alarm_id": row["id"]})
@@ -4052,8 +4290,12 @@ class Daemon:
             # Every alarm goes on the timeline; only the first reaches the attention
             # line, because `alarms` returns them most-actionable first and a flag can
             # carry one sentence.
-            if fresh and not wo["needs_attention"]:
-                store.flag_attention(wo["id"], fresh[0].reason)
+            # AFTER the loop above, so an informational kind still gets its row, its
+            # event and its dedupe memory — it is only kept off the attention line.
+            interrupting = [a for a in fresh
+                            if a.kind not in inspection.INFORMATIONAL_KINDS]
+            if interrupting and not wo["needs_attention"]:
+                store.flag_attention(wo["id"], interrupting[0].reason)
 
     def check_rewrite_tax(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Raise a project's STANDING re-write tax, split by the cause that produced it.
@@ -4228,7 +4470,7 @@ class Daemon:
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
-        from .invariants import awaiting_neo, something_is_out, true_blockers
+        from .invariants import something_is_out, true_blockers, user_facing_wait
 
         # OUT OF MONEY, asked before the turn is looked at but AFTER the round machine's
         # claim below. The budget governs the order's WHOLE bill, so what spends the last
@@ -4420,10 +4662,18 @@ class Daemon:
                 # and this ran a tick later and completed the order it had just held.
                 # A gate-only `pr_url` comes here too, and lands `completed`.
                 ops_mod.land_finished(store, fresh)
-        elif store.pending_approvals(wo["id"]) or awaiting_neo(wo["id"]):
+        elif wo.get("kind") != "manager" and something_is_out(store, wo["id"]):
             # Parked on the delegate — a privileged-action gate awaiting a verdict, or a
             # question awaiting an answer. Either way the worker was TOLD to end its turn
             # and wait, so an idle worker here is compliance, not abandonment.
+            #
+            # THE WHOLE PREDICATE, and a manager is excluded from it: `something_is_out`
+            # adds `held_approvals`, which is what keeps an idle worker holding an
+            # unargued gate out of the `else` below and off the user's list (fix 2 of
+            # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md), and
+            # the exclusion is what keeps the manager branch below reachable exactly as
+            # before. The WRITE stays conditional on the wait being outward-facing: a
+            # held request is the worker's own move, so it parks nothing.
             #
             # The question half was missing, and the `else` below caught those instead:
             # a `jarvis wo ask` whose answer had not landed by the time the turn settled
@@ -4431,7 +4681,8 @@ class Daemon:
             # the user, for a worker doing exactly what the contract asks of it (GitHub
             # issue 100). Only the tightness of the Neo drain loop kept that rare; a
             # slow or disabled Neo makes it every `wo ask`.
-            if fresh["status"] != "waiting_input":
+            if (user_facing_wait(store, wo["id"])
+                    and fresh["status"] != "waiting_input"):
                 store.set_status(wo["id"], "waiting_input")
         elif wo.get("kind") == "manager":
             # A project manager order is idle BY DESIGN: it acts on a message and ends
@@ -4464,21 +4715,22 @@ class Daemon:
             feature = store.get_feature_order(parent) if parent else None
             if feature and feature["status"] in FO_TERMINAL_STATUSES:
                 self._close_feature_manager(store, str(parent))
-            elif something_is_out(store, wo["id"]):
+            elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
                 # say the opposite — nothing to act on — about an order waiting for a
                 # verdict: muted, out of FEATURED_STATUSES, and refused a nudge.
                 #
-                # NOT LEFT TO THE BRANCH ORDER ABOVE, which is two thirds of the same
-                # question and looks like all of it. That `elif` reads `pending_approvals`
-                # and misses `awaiting_case` — a gate request the worker filed by running
-                # the command before arguing it, which `gates.file_request` parks here
-                # just the same. Under the old code missing it cost nothing, because this
-                # branch's write was `waiting_input` either way; since issue #264 it is a
-                # rewrite, so the predicate has to be the whole one. `something_is_out` is
-                # that predicate, shared with `invariants.end_wait_if_nothing_is_out` so
-                # the two cannot drift (kn-4ea33fe6).
+                # THE BRANCH ABOVE NOW COVERS THE REST, and a manager is excluded from it
+                # on purpose so this one stays reachable: `something_is_out` there is the
+                # whole predicate, including `awaiting_case`. What is left here is the
+                # narrower question — is somebody ELSE holding this — because a HELD gate
+                # request is the manager's own move and is owed by nobody. A manager
+                # holding only one falls through to `idle`, which is the truthful label:
+                # its feature is what wakes it. Fix 2 of
+                # docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+                # `user_facing_wait` lives beside `something_is_out` so the pair cannot
+                # drift (kn-4ea33fe6).
                 pass
             elif fresh["status"] != "idle":
                 store.set_status(wo["id"], "idle")
@@ -4835,6 +5087,14 @@ class Daemon:
             except Exception:  # noqa: BLE001 — never let one work order stall the rest
                 log.exception("[%s] polling %s failed", project.name, wo["id"])
                 continue
+            # THE HEAD, CACHED. Spec §2b of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
+            # `invariants.parked_reason` runs per order per tick and may not go to the
+            # network, and this poll already holds the answer. Written only when it
+            # MOVED, so the green common case keeps its no-write budget.
+            if pr.head_oid and pr.head_oid != str(wo.get("pr_head_oid") or ""):
+                store.update_work_order(wo["id"], pr_head_oid=pr.head_oid,
+                                        pr_head_seen_at=db.now())
             try:
                 if pr.merged:
                     # THE ROUND FIRST, if one is open: the pull request has landed, so
@@ -5107,7 +5367,7 @@ class Daemon:
         not be merged must leave the work order exactly where it was, and "exactly where
         it was" is the behaviour the whole feature is an optimisation over.
         """
-        from . import automerge, ops
+        from . import automerge, branchproof, ops
 
         cfg = project.validation
         if not (cfg.enabled and cfg.auto_merge):
@@ -5129,11 +5389,20 @@ class Daemon:
         # §2.4). Nothing is poked when it clears: the next poll re-decides from scratch.
         hold = store.plan_hold(wo)
         plan_assumptions = str((hold or {}).get("planner_id") or "")
+        # Spec 2026-09-28 §3.2. NO FETCH PER TICK, and `pr.base_oid` on purpose. That read
+        # is wrong in BOTH directions: it UNDER-reports while GitHub's cache lags, and it
+        # OVER-reports for ever on a checkout that does not have `pr.base_oid` at all
+        # (ancestry unanswerable reads as behind). So this hold is a cheap early stop and
+        # never the safety property. The safety property is the pair that fetches — the
+        # pre-propose catch-up and `automerge.apply`'s precondition — and no merge reaches
+        # GitHub without passing the second.
+        base_behind = (automerge.BaseBehind(base=pr.base_ref, base_oid=pr.base_oid)
+                       if ops.catch_up_needed(pr, repo=project.path) else None)
         decision = automerge.decide(
             round_row, wo, pr, cfg,
             validated_head=store.validated_head(round_row),
             pending_assumptions=pending, plan_assumptions=plan_assumptions,
-            base_red=base_red)
+            base_red=base_red, base_behind=base_behind)
         if not decision.armed:
             # A CATCH-UP WITH THE BASE COSTS NO ROUND (spec
             # docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md
@@ -5141,28 +5410,83 @@ class Daemon:
             # event describing a stall that lasted microseconds, and before the re-judge,
             # so the round machine never sees a head that moved for a reason no seat needs
             # to read. A refused carry falls through to both, untouched.
-            if (not record_only and decision.code == automerge.HELD_SHA_MOVED
-                    and self._carry_catch_up(project, store, wo, pr, decision)):
+            outcome = CarryOutcome(False, False)
+            if not record_only and decision.code == automerge.HELD_SHA_MOVED:
+                outcome = self._carry_catch_up(project, store, wo, pr, decision)
+            if outcome.carried:
                 round_row = store.latest_validation_round(wo_id=wo_id)
                 decision = automerge.decide(
                     round_row, wo, pr, cfg,
                     validated_head=store.validated_head(round_row),
                     pending_assumptions=pending, plan_assumptions=plan_assumptions)
+            if not decision.armed and not record_only \
+                    and decision.code == automerge.HELD_BASE_MOVED:
+                # THE HOLD IS WHERE THE CATCH-UP HANGS NOW (spec 2026-09-28 §3.2, §3.6):
+                # the base fact outranks every condition below it, so the armed path can
+                # no longer be reached while the branch is behind. Both ways of being
+                # behind arrive here — GitHub's own `BEHIND`, and the ancestry answer it
+                # reports CLEAN for. The hold is written from the OUTCOME rather than
+                # from `decision`, so it says which guard refused.
+                caught = self._catch_up_with_base(project, store, wo, pr)
+                if caught.outcome == ops.CATCH_UP_NOT_NEEDED:
+                    # THE FETCHED READ WINS, AND NOT DECIDING HERE WOULD STALL FOR EVER.
+                    # The pre-`decide` fact is unfetched, so a checkout that does not have
+                    # `pr.base_oid` at all cannot answer the ancestry question and reads as
+                    # BEHIND on every tick (`ops.catch_up_needed`) — a persistent
+                    # OVER-report, not the transient under-report §3.2 assumed. Returning
+                    # on it held a mergeable pull request for ever, silently.
+                    #
+                    # AND THE CHEAP FACT IS DROPPED WITH IT: §3.6's supersede below reads
+                    # it, so leaving it set withdraws a healthy pending request.
+                    base_behind = None
+                    log.debug("[%s] %s: the fetched base contradicts the poll's reading "
+                              "— base_oid %s, behind=%s, and the head already contains "
+                              "the tip; deciding without it", project.name, wo_id,
+                              str(getattr(pr, "base_oid", "") or "")[:10] or "unknown",
+                              bool(getattr(pr, "behind", False)))
+                    decision = automerge.decide(
+                        round_row, wo, pr, cfg,
+                        validated_head=store.validated_head(round_row),
+                        pending_assumptions=pending, plan_assumptions=plan_assumptions,
+                        base_red=base_red)
+                else:
+                    # A PENDING REQUEST IS WITHDRAWN (spec §3.6): it was filed against a
+                    # base that has moved, so its CI evidence no longer describes what the
+                    # merge would land on. Superseded, never answered — and its command
+                    # names the old sha, so the catch-up orphans nothing that could still
+                    # have landed (§3.1). AFTER the outcome, so a base that turned out not
+                    # to have moved withdraws nothing.
+                    #
+                    # A FETCHED BASE FACT OR NONE AT ALL, and a deferral is retried rather
+                    # than withdrawn (spec 2026-09-28 §3.6 / Amendment E).
+                    moved = bool(caught.base_tip) and ops.catch_up_needed(
+                        pr, repo=project.path, base_tip=caught.base_tip)
+                    judged = store.validated_head(round_row) or ""
+                    filed = (store.latest_approval_for(
+                        wo_id, automerge.GATE_KIND,
+                        automerge.merge_command(str(wo.get("pr_url") or ""), judged))
+                        if judged else None)
+                    if (moved and caught.outcome != ops.CATCH_UP_DEFERRED
+                            and filed is not None
+                            and filed["status"] in ("pending", "awaiting_case")):
+                        self._supersede_stale_request(store, filed, pr,
+                                                      base_tip=caught.base_tip)
+                    # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                    self._note_automerge_held(
+                        store, wo_id,
+                        automerge.held_base_moved(caught, pr, caught.base_tip))
+                    return
             if not decision.armed:
                 self._note_automerge_held(store, wo_id, decision)
-                if (not record_only
-                        and decision.code == automerge.HELD_MERGE_STATE_UNCLEAN
-                        and str(getattr(pr, "merge_state", "") or "").upper() == "BEHIND"):
-                    # GitHub said BEHIND outright — the rarer half of §5.1, and the only
-                    # one `decide` can see. The commoner one reports CLEAN and is caught
-                    # on the armed path below, by ancestry.
-                    self._catch_up_with_base(project, store, wo, pr)
-                    return
                 if (not record_only and decision.code == automerge.HELD_SHA_MOVED
                         and automerge.only_the_head_moved(
                             round_row, wo, pr, cfg, pending_assumptions=pending,
                             plan_assumptions=plan_assumptions)):
-                    self._rejudge_moved_head(project, store, wo, decision)
+                    # `rebind` is the carry's reading of the two proofs, and the guard
+                    # above still holds it: a rebind is free of the round budget, not
+                    # of five seats (spec 2026-09-27 §4.2).
+                    self._rejudge_moved_head(project, store, wo, decision,
+                                             rebind=outcome.rebind)
                 return
         if record_only:
             return          # unreachable: a repairing pull request cannot arm, see above
@@ -5176,10 +5500,25 @@ class Daemon:
             # live grant would orphan a permission Neo already gave and silently ask for
             # another. A head the OS moved is not decided on this tick: the next one
             # re-reads it, waits out its CI and carries the verdict across (§3).
-            caught_up = self._catch_up_with_base(project, store, wo, pr)
-            if caught_up.head_oid != pr.head_oid:
+            #
+            # ANYTHING BUT "NOT NEEDED" HOLDS (spec 2026-09-28 §3.4). The old test was
+            # `caught_up.head_oid != pr.head_oid`, which read a guard's refusal as "already
+            # up to date" and fell through to `propose` — gate 308's defect.
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            if caught.outcome != ops.CATCH_UP_NOT_NEEDED:
+                # The FETCHED tip, never `pr.base_oid` — spec 2026-09-28 §3.1.
+                self._note_automerge_held(
+                    store, wo_id,
+                    automerge.held_base_moved(caught, pr, caught.base_tip))
                 return
         if approval is not None and approval["status"] != "approved":
+            # A PENDING REQUEST WHOSE BASE HAS MOVED IS SUPERSEDED, NEVER ANSWERED (spec
+            # 2026-09-28 §3.6): the CI evidence in it no longer describes what the merge
+            # would land on, so nothing is authorised and nothing is refused.
+            if (approval["status"] in ("pending", "awaiting_case")
+                    and base_behind is not None):
+                self._supersede_stale_request(store, approval, pr)
+                return
             # Filed and not granted: pending with Neo, escalated to the user, denied,
             # expired. Every one of those is somebody's business and none of them is
             # this loop's — and `propose` would refuse anyway, after opening a NeoStore
@@ -5201,7 +5540,9 @@ class Daemon:
                 automerge.propose(store, neo_store, project.name, wo, decision,
                                   # Whole, with each conclusion — spec 2026-09-24 fix 2.
                                   checks=pr.checks,
-                                  protection=self._protection_fact(project, pr))
+                                  protection=self._protection_fact(project, pr),
+                                  # The base it was filed against — spec 2026-09-28 §3.5.
+                                  pr=pr)
             finally:
                 neo_store.close()
             return
@@ -5210,7 +5551,23 @@ class Daemon:
         # `automerge.attempts` for why spec §8's counter would enforce nothing.
         try:
             merged = automerge.apply(store, wo, decision.judged_sha, approval,
-                                     cwd=project.path)
+                                     cwd=project.path, base_ref=pr.base_ref)
+        except automerge.StaleBase as exc:
+            # THE BASE MOVED UNDER THE JUDGED COMMIT (spec 2026-09-28 §3.1). News, unlike
+            # its parent: recorded once per (head, base tip) and answered with a catch-up.
+            # No grant was spent — the check ran before `gates.open_gate`.
+            log.info("[%s] auto-merge of %s refused: %s", project.name, wo_id, exc)
+            tip = branchproof.tip(project.path, f"origin/{pr.base_ref}")
+            if tip not in ops.stale_base_bases(store, wo_id, decision.judged_sha):
+                store.add_event(wo_id, ops.MERGE_BASE_STALE_EVENT, {
+                    "head_sha": decision.judged_sha, "base": pr.base_ref,
+                    "base_oid": tip, "round": decision.round_n,
+                    "approval_id": approval["id"],
+                    "reason": str(exc), "pr_url": wo.get("pr_url")})
+            caught = self._catch_up_with_base(project, store, wo, pr)
+            self._note_automerge_held(store, wo_id,
+                                      automerge.held_base_moved(caught, pr, tip))
+            return
         except automerge.MergeFailed as exc:
             # It reached GitHub and GitHub said no. Counted, recorded and — once per
             # commit — reported.
@@ -5476,16 +5833,44 @@ class Daemon:
         `autoreview`, which is pure by contract; `ops._unreachable_asks` is the read-side
         twin for the surfaces.
         """
+        return self._question_liveness(neo_store, assumptions)[0]
+
+    def _question_liveness(self, neo_store: Any,
+                           assumptions: list[dict]) -> tuple[set[int], set[int]]:
+        """`(dead, open)` for every question these rows link to. ONE READ PER LINK.
+
+        Two facts off one row, because they are read on the same tick by two gates and a
+        second pass over `neo.db` would buy nothing (2026-09-28 spec §6). They are
+        DIFFERENT predicates and deliberately not each other's complement:
+
+        * DEAD is `status == 'failed'` and nothing else — the retry ladder is spent, so
+          the link is an outage rather than a question in flight, and the pass asks again
+          (2026-09-26 spec §4, and `_unreachable_question_ids` above is this half);
+        * OPEN is `neo_store.NEO_HELD_Q_STATUSES` — Neo still holds it. `escalated` and
+          `answered` are NOT open: Neo is finished either way, and an escalated
+          confirmation is a decision handed back to the user. What `decide_confirm` tells
+          `confirming` from `confirm_spent` with.
+        """
+        from .neo_store import NEO_HELD_Q_STATUSES
+
         dead: set[int] = set()
+        live: set[int] = set()
+        seen: set[int] = set()
         for a in assumptions:
             for column in ("neo_question_id", "confirm_question_id"):
                 qid = int(a.get(column) or 0)
-                if not qid or qid in dead:
+                if not qid or qid in seen:
                     continue
+                seen.add(qid)
                 q = neo_store.get(qid)
-                if q and str(q["status"] or "") == "failed":
+                if q is None:
+                    continue
+                status = str(q["status"] or "")
+                if status == "failed":
                     dead.add(qid)
-        return dead
+                if status in NEO_HELD_Q_STATUSES:
+                    live.add(qid)
+        return dead, live
 
     def _review_assumptions_of(self, project: ProjectSpec, store: ProjectStore,
                                neo_store: Any, wo: dict, cfg: Any,
@@ -5518,8 +5903,13 @@ class Daemon:
         round_n = int((latest or {}).get("round") or 0)
         round_reason = str((latest or {}).get("reason") or "")
         answered = ops.refusal_answered(store, wo["id"])
+        # ...and WHICH unanswered refusal this is. Spec §2c of
+        # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+        # Read once per list for `answered`'s reason, and only when there is a hold to
+        # word — an answered refusal cannot reach the sentence.
+        undeclared = not answered and invariants_mod.undeclared_delivery(store, wo)
         objecting = bool(store.outstanding_objections(wo["id"]))
-        dead_questions = self._unreachable_question_ids(neo_store, assumptions)
+        dead_questions, open_questions = self._question_liveness(neo_store, assumptions)
         packet = None
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
@@ -5532,7 +5922,11 @@ class Daemon:
                         a, wo, cfg, round_outcome=outcome, round_n=round_n,
                         round_reason=round_reason, refusal_answered=answered,
                         objections_outstanding=objecting,
-                        unreachable_question_ids=dead_questions, stakes=stakes_verdict)
+                        unreachable_question_ids=dead_questions,
+                        # 2026-09-28 spec §6: is Neo still holding the confirmation?
+                        confirmation_open=int(a.get("confirm_question_id") or 0)
+                        in open_questions,
+                        stakes=stakes_verdict)
 
                 decision = self._stakes_reviewed(project, store, wo, cfg, a,
                                                  confirm(), confirm)
@@ -5560,6 +5954,7 @@ class Daemon:
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
                             round_reason=round_reason,
                             refusal_answered=answered,
+                            undeclared_delivery=undeclared,
                             unreachable_question_ids=dead_questions,
                             stakes=stakes_verdict)
 
@@ -5818,6 +6213,13 @@ class Daemon:
         call, and once, against freshly read state, to justify the settle it came back
         to do. Only the second one is guarding anything irreversible.
 
+        **THE ONLY PLACE THAT THROWS AWAY A RULING THE OS PAID FOR, so it is also the
+        only place that can say the link to the question is spent** (2026-09-28 spec §4,
+        issue #833). A CONFIRMATION dropped for a transient reason clears
+        `confirm_question_id` and supersedes the question, and the next parked tick
+        confirms against the final delivered diff; every other reason means the row is the
+        user's and stays linked.
+
         A ruling that does not accept is NOT an inbox row. The work order is already on
         the user's attention list carrying "assumptions pending review" — the state it was
         in before the OS asked and the state it stays in — and a second announcement of an
@@ -5920,6 +6322,7 @@ class Daemon:
             round_n=int((latest or {}).get("round") or 0),
             round_reason=str((latest or {}).get("reason") or ""),
             refusal_answered=ops.refusal_answered(pstore, wo["id"]),
+            undeclared_delivery=invariants_mod.undeclared_delivery(pstore, wo),
             # On a CONFIRMATION the question being delivered is not the one condition 6
             # would trip on: `neo_question_id` still points at the early question, so
             # that is the id to exclude, or every confirmed assumption would be dropped
@@ -5933,18 +6336,46 @@ class Daemon:
             # None, which is the regex, which is what decided the ask under both.
             stakes=self._settle_stakes(project, wo, numbered))
         if not still.armed:
-            # Escalated rather than left `answered`: the assumption is the user's again,
-            # and `/neo` and `jarvis neo list` have to say so — the same re-mark the
-            # non-acceptance branch above does, for the same reason. The hold event is
-            # what puts the WHY on the work order, where `ops.autoreview_state` renders
-            # it as the one `⚙ auto-review:` line.
-            neo_store.mark(q["id"], "escalated", reason=still.reason)
+            # A CONFIRMATION DROPPED FOR A TRANSIENT REASON IS ASKED AGAIN — issue #833
+            # and docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-
+            # an-assumption-for-ever.md §4. Every code in `TRANSIENT_DROPS` is a fact that
+            # clears with the user doing nothing and says nothing about whose decision
+            # this is, so leaving the link set held the assumption for the life of the
+            # work order: pending for the user, and suppressed from their attention list
+            # as a confirmation in flight. Everything else means the row is THEIRS and
+            # stays linked (§4.2) — re-asking would lobby them once per reconcile tick.
+            retry = confirming and still.code in autoreview.TRANSIENT_DROPS
+            if not retry:
+                # Escalated rather than left `answered`: the assumption is the user's
+                # again, and `/neo` and `jarvis neo list` have to say so — the same
+                # re-mark the non-acceptance branch above does, for the same reason. The
+                # hold event is what puts the WHY on the work order, where
+                # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
+                neo_store.mark(q["id"], "escalated", reason=still.reason)
             self._note_autoreview_held(pstore, wo["id"], still, settling=True)
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": still.reason, "stakes": ruling.stakes,
                 "model": ruling.model, "neo_question_id": q["id"],
                 "overridden": False, "dropped": still.code})
+            if retry:
+                # §4.3, IN THIS ORDER and after the record of the drop is complete. NOT
+                # `mark(escalated)`: `escalated` means the user must answer, and after the
+                # clear below nobody can. A ruling that reached here was already recorded
+                # `answered` by `neo.drain_queue`, so `supersede`'s OPEN_Q_STATUSES guard
+                # makes this a no-op on that path and a real close on any other — either
+                # way the row is off `ops._neo_attention`, which is what §4.3 requires.
+                # SUPERSEDE FIRST: clearing the link makes the question unresolvable
+                # through `assumption_for_question`, and
+                # `invariants._stale_assumption_question` deliberately leaves an
+                # unresolvable row alone — so an `escalated` question plus a cleared link
+                # would sit in `ops._neo_attention` for ever.
+                neo_store.supersede(
+                    q["id"],
+                    f"SUPERSEDED — the OS dropped its own ruling: {still.reason}. A "
+                    f"fresh confirmation will be asked against the delivered result.",
+                    still.reason)
+                pstore.clear_assumption_confirmation(assumption["id"])
             log.info("auto-review dropped its ruling on assumption #%s of %s: %s",
                      numbered.get("n"), wo["id"], still.reason)
             return
@@ -6053,12 +6484,21 @@ class Daemon:
                  "accept" if ruling.accept else "object", ruling.reason)
 
     def _carry_catch_up(self, project: ProjectSpec, store: ProjectStore, wo: dict,
-                        pr: Any, decision: Any) -> bool:
+                        pr: Any, decision: Any) -> CarryOutcome:
         """Prove this head added no unjudged commit, and carry the verdict onto it.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §3.4.
-        True when the verdict now covers the live head, so the caller may re-decide on the
-        same tick. False is the ordinary answer and writes nothing but the refusal.
+        `carried` when the verdict now covers the live head, so the caller may re-decide
+        on the same tick. Not carried is the ordinary answer and writes nothing but the
+        refusal.
+
+        `rebind` is the SECOND answer, for the case the predecessor spec left open: the
+        merge the OS asked for resolved a conflict, so proof (b) fails on content nobody
+        judged and the round that reads it is the OS's own doing (spec
+        docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.2).
+        The chain is walked on that branch ONLY when `ops.rebind_possible` says a rebind
+        could be opened — the walk is up to `ci.CHAIN_LIMIT` `gh api` calls on a pull
+        request polled every couple of minutes, and no other tick may pay it.
 
         `_rejudge_moved_head`'s division of labour: the `gh` and the `git` are here, the
         rule is `ops.carry_merge_chain`, and NAMING THE PROOF THAT FAILED is this method's
@@ -6077,21 +6517,22 @@ class Daemon:
         waiting for it would defer the carry into exactly the window where a round gets
         spent. Whether the pull request merges is still `decide`'s six conditions, re-asked.
         """
-        from . import branchproof, ci, github, ops
+        from . import branchproof, ops
 
         judged = str(getattr(decision, "judged_sha", "") or "")
         head = str(getattr(decision, "head_sha", "") or "")
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
         if not judged or not head or head == judged or not base or not pr_url:
-            return False
+            return CarryOutcome(False, False)
 
-        def refuse(proof: str, detail: str, chain: tuple[str, ...] = ()) -> bool:
+        def refuse(proof: str, detail: str,
+                   chain: tuple[str, ...] = ()) -> CarryOutcome:
             if ops.record_carry_refusal(store, wo, judged=judged, head_sha=head,
                                         proof=proof, detail=detail, chain=chain):
                 log.info("[%s] %s: not carrying round %s onto %s — %s", project.name,
                          wo["id"], getattr(decision, "round_n", 0), head[:10], detail)
-            return False
+            return CarryOutcome(False, False)
 
         pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
         if not branchproof.fetch(project.path, base, pull_ref):
@@ -6105,20 +6546,35 @@ class Daemon:
                           "the diff this branch adds on top of its merge base could not "
                           "be computed locally")
         if before != after:
-            return refuse(ops.PROOF_PATCH_ID,
-                          f"the diff on {head[:10]} is not the diff round "
-                          f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
-                          f"content nobody judged")
-        try:
-            chain = ci.base_merge_chain(pr_url, judged, head, base_ref=base,
-                                        cwd=project.path)
-        except github.GitHubError as exc:
-            return refuse(ops.PROOF_READ,
-                          f"GitHub would not say what {head[:10]} merged ({exc})")
-        except Exception:  # noqa: BLE001 — a parked pull request stays parked
-            log.exception("[%s] could not read the chain behind %s", project.name,
-                          wo["id"])
-            return False
+            # THE REFUSAL IS UNCHANGED, `(head, proof)` dedupe and all: the diff really
+            # did change and it is still said once. What follows it is the rebind
+            # question — asked cheaply first, walked only if it could be answered yes
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.2).
+            refuse(ops.PROOF_PATCH_ID,
+                   f"the diff on {head[:10]} is not the diff round "
+                   f"{getattr(decision, 'round_n', 0)} read, so the merge resolved "
+                   f"content nobody judged")
+            if not ops.rebind_possible(store, wo, head=head, project=project.name,
+                                       cfg=project.validation):
+                return CarryOutcome(False, False)
+            def unreadable(exc: Exception) -> CarryOutcome:
+                log.info("[%s] %s: GitHub would not say what %s merged (%s)",
+                         project.name, wo["id"], head[:10], exc)
+                return CarryOutcome(False, False)
+
+            chain, failed = self._merge_chain(project, wo, pr_url=pr_url, judged=judged,
+                                              head=head, base=base,
+                                              github_error=unreadable)
+            if failed is not None:
+                return failed
+            return CarryOutcome(False, bool(chain))
+        chain, failed = self._merge_chain(
+            project, wo, pr_url=pr_url, judged=judged, head=head, base=base,
+            github_error=lambda exc: refuse(
+                ops.PROOF_READ,
+                f"GitHub would not say what {head[:10]} merged ({exc})"))
+        if failed is not None:
+            return failed
         if not chain:
             return refuse(ops.PROOF_CHAIN,
                           f"{head[:10]} is not {judged[:10]} plus merges of {base} or "
@@ -6136,11 +6592,38 @@ class Daemon:
         log.info("[%s] %s: round %s passed on %s and now covers %s — %d merge(s), %d of "
                  "%s, no round spent", project.name, wo["id"], carried["round"],
                  judged[:10], head[:10], len(chain), len(bases), base)
-        return True
+        return CarryOutcome(True, False)
+
+    @staticmethod
+    def _merge_chain(project: ProjectSpec, wo: dict, *, pr_url: str, judged: str,
+                     head: str, base: str,
+                     github_error: Callable[[Exception], CarryOutcome],
+                     ) -> tuple[tuple[tuple[str, str, bool], ...] | None,
+                                CarryOutcome | None]:
+        """Walk `ci.base_merge_chain`, or say why it could not be walked.
+
+        `(chain, None)` on success and `(None, outcome)` on failure — ONE copy of the
+        walk for `_carry_catch_up`'s two branches, which asked GitHub the same question
+        and differed only in what a `GitHubError` means. That is `github_error`'s job:
+        the rebind branch has already written its refusal and only logs, the main path
+        refuses with `ops.PROOF_READ`. Anything else is a parked pull request staying
+        parked, which is the same answer on both.
+        """
+        from . import ci, github
+
+        try:
+            return ci.base_merge_chain(pr_url, judged, head, base_ref=base,
+                                       cwd=project.path), None
+        except github.GitHubError as exc:
+            return None, github_error(exc)
+        except Exception:  # noqa: BLE001 — a parked pull request stays parked
+            log.exception("[%s] could not read the chain behind %s", project.name,
+                          wo["id"])
+            return None, CarryOutcome(False, False)
 
     def _catch_up_with_base(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                             pr: Any) -> Any:
-        """Merge the base into this branch, when it is behind. Returns the head to decide on.
+        """Merge the base into this branch, when it is behind. Returns an `ops.CatchUp`.
 
         docs/superpowers/specs/2026-09-27-a-catch-up-with-main-costs-no-round.md §5. The
         OS's own gate reviewer refuses a merge whose CI ran against a base behind `main`,
@@ -6148,10 +6631,24 @@ class Daemon:
         exactly that reason — so the move is compulsory and the OS may as well make it,
         now that §3's carry means it costs no round.
 
-        **RETURNS THE RE-READ `PullRequest`**, `heal_inherited_failure`'s contract and for
-        its reason: the caller must decide against the head the update produced, not the
-        one it replaced. The pull request it was given comes back unchanged whenever
-        nothing happened, which is the ordinary answer.
+        **IT RETURNS AN OUTCOME AND NOT A PULL REQUEST** (spec 2026-09-28 §3.4, issue
+        #837). The old return type could not tell "already up to date" from "behind and I
+        could not fix it this tick", so the caller's `head_oid` comparison read every
+        refusal as up to date and fell straight through to `automerge.propose` — which is
+        how gate 308 asked Neo to merge a commit that did not contain `main`'s tip.
+        `CatchUp.pr` is the pull request to decide against: the one it was given, unchanged
+        unless the update ran (`heal_inherited_failure`'s contract, for its reason).
+
+        **THE BASE TIP IS READ LOCALLY, AFTER THE FETCH, AND IT IS THE KEY** (Amendment B).
+        `pr.base_oid` is GitHub's cached `baseRefOid`; on the measured incident it lagged
+        the real tip of `main` by three commits and 5.3 hours, so the ancestry test said
+        "up to date" and `ops.base_heal_spent` was keyed on a commit that was not the base.
+        Every one of the three now uses the freshly-read tip.
+
+        The guard order differs from §3.4's table in one place, and deliberately: "not
+        needed" is judged BEFORE the two spending guards. Keyed on the fresh tip, a branch
+        that is already up to date must never read as `EXHAUSTED` — that outcome never
+        clears on its own and would park a mergeable pull request for ever.
 
         **THE SEVEN GUARDS ARE §5.3 AND EVERY ONE OF THEM DEFERS RATHER THAN DROPS.** In
         order, cheapest first: a turn in flight or an undelivered message (never move the
@@ -6173,25 +6670,36 @@ class Daemon:
         wo_id = wo["id"]
         base = str(getattr(pr, "base_ref", "") or "")
         pr_url = str(wo.get("pr_url") or "")
-        base_oid = str(getattr(pr, "base_oid", "") or "")
         if not base or not pr_url:
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               "the work order records no pull request or no base branch")
         if (worker_session.busy(store, wo_id) or store.queued_messages(wo_id)
                 or store.validation_round_open(wo_id)):
             log.debug("[%s] %s is in flight — catching up with %s deferred",
                       project.name, wo_id, base)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_DEFERRED,
+                               "the turn, message or validation round in flight")
+        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
+        if not branchproof.fetch(project.path, base, pull_ref):
+            # logged there, with the refs it asked for
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the checkout could not fetch `{base}`")
+        base_oid = branchproof.tip(project.path, f"origin/{base}")
+        # Every return from here down carries the FETCHED tip — the caller's reasons quote
+        # it and never `pr.base_oid` (spec 2026-09-28 §3.1).
+        if not ops.catch_up_needed(pr, repo=project.path, base_tip=base_oid):
+            return ops.CatchUp(pr, ops.CATCH_UP_NOT_NEEDED, "", base_tip=base_oid)
         if base_oid and ops.base_heal_spent(store, wo_id, base_oid):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"this branch has already been rebuilt against "
+                               f"{base_oid[:10]} once", base_tip=base_oid)
         if ops.catch_up_attempts(store, wo_id) >= ops.CATCH_UP_MAX:
             log.debug("[%s] %s has been caught up with %s %d times — leaving it held",
                       project.name, wo_id, base, ops.CATCH_UP_MAX)
-            return pr
-        pull_ref = f"refs/pull/{pr_url.rsplit('/', 1)[-1]}/head"
-        if not branchproof.fetch(project.path, base, pull_ref):
-            return pr           # logged there, with the refs it asked for
-        if not ops.catch_up_needed(pr, repo=project.path):
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_EXHAUSTED,
+                               f"it has already been caught up {ops.CATCH_UP_MAX} time(s),"
+                               f" which is the cap ({ops.CATCH_UP_MAX})",
+                               base_tip=base_oid)
 
         # GUARD 6, and it is `heal_inherited_failure`'s review-round-1 note: `pr` was read
         # at the top of the poll, and a worker turn can end and push in the meantime. The
@@ -6202,13 +6710,16 @@ class Daemon:
         except github.GitHubError as e:
             log.debug("[%s] could not re-read %s before catching it up: %s",
                       project.name, pr_url, e)
-            return pr
+            return ops.CatchUp(pr, ops.CATCH_UP_FAILED,
+                               f"the OS could not re-read the pull request: {e.reason}",
+                               base_tip=base_oid)
         judged = ProjectStore.validated_head(
             store.latest_validation_round(wo_id=wo_id)) or ""
         head_before = fresh.head_oid
         if not head_before or head_before != judged:
-            return fresh
-        base_oid = fresh.base_oid or base_oid
+            return ops.CatchUp(fresh, ops.CATCH_UP_DEFERRED,
+                               "the push that moved the head off the judged commit",
+                               base_tip=base_oid)
         try:
             ci.update_branch(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6217,7 +6728,7 @@ class Daemon:
             ops.record_base_update_failed(store, wo, base=base, base_sha=base_oid,
                                           reason=e.reason,
                                           cause=ops.BASE_UPDATE_BEHIND)
-            return fresh
+            return ops.CatchUp(fresh, ops.CATCH_UP_FAILED, e.reason, base_tip=base_oid)
         try:
             fresh = github.pr_view(pr_url, cwd=project.path)
         except github.GitHubError as e:
@@ -6232,10 +6743,10 @@ class Daemon:
         log.info("[%s] %s was behind %s (%s) — caught it up, %s is now %s",
                  project.name, pr_url, base, base_oid[:10], head_before[:10],
                  fresh.head_oid[:10])
-        return fresh
+        return ops.CatchUp(fresh, ops.CATCH_UP_DONE, "", base_tip=base_oid)
 
     def _rejudge_moved_head(self, project: ProjectSpec, store: ProjectStore,
-                            wo: dict, decision: Any) -> None:
+                            wo: dict, decision: Any, *, rebind: bool = False) -> None:
         """Re-open a round on a head the OS's own repair loop moved. Usually: nothing.
 
         The policy is `ops.rejudge_moved_head` and lives there, testable without a
@@ -6250,16 +6761,24 @@ class Daemon:
 
         try:
             out = ops.rejudge_moved_head(store, project.path, wo, project=project.name,
-                                         cfg=project.validation, decision=decision)
+                                         cfg=project.validation, decision=decision,
+                                         rebind=rebind)
         except Exception:  # noqa: BLE001 — a parked pull request stays parked
             log.exception("[%s] could not re-judge %s", project.name, wo["id"])
             return
         if out is None:
             return
         if out["declined"]:
-            log.info("[%s] %s: the head moved to %s and round %s would be the last — "
-                     "leaving it for the user", project.name, wo["id"],
-                     out["head_sha"][:10], out["next_round"])
+            # Two causes, two sentences: `next_round` is on the budget decline only
+            # (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.3).
+            if out.get("cause") == ops.REBIND_EXHAUSTED:
+                log.info("[%s] %s: the head moved to %s and the OS has re-judged this "
+                         "merge %s time(s) — leaving it for the user", project.name,
+                         wo["id"], out["head_sha"][:10], out["rebinds"])
+            else:
+                log.info("[%s] %s: the head moved to %s and round %s would be the "
+                         "last — leaving it for the user", project.name, wo["id"],
+                         out["head_sha"][:10], out["next_round"])
         else:
             log.info("[%s] %s: the head moved from %s to %s — re-judging it as round %s",
                      project.name, wo["id"], out["judged_sha"][:10],
@@ -6287,6 +6806,45 @@ class Daemon:
                      pr.base_ref, exc)
             protection = automerge.PROTECTION_UNREADABLE
         return automerge.protection_fact(protection, pr.base_ref)
+
+    def _supersede_stale_request(self, store: ProjectStore, approval: dict,
+                                 pr: Any, *, base_tip: str = "") -> None:
+        """Close a pending merge request whose base has moved. Spec 2026-09-28 §3.6.
+
+        `base_tip` is a tip read LOCALLY, after a fetch, and the reason names a commit
+        only when one is passed: `pr.base_oid` is the cached read this whole spec
+        establishes is untrustworthy, so it is never quoted. `approval["base_oid"]` still
+        is — that one is a recorded fact about the request.
+
+        NEVER A VERDICT: nothing is authorised and nothing is refused, because the CI
+        evidence in the request stopped describing what the merge would land on. The
+        command string stays blocked, so the next tick catches the branch up and files a
+        fresh request on the new commit.
+
+        `supersede_approval` is a NO-OP on anything already decided, which is what makes
+        the race safe: Neo can answer between the read and the write, and then
+        `automerge.apply`'s precondition is what stops the merge instead. A Neo question
+        that was already answered returns False from `supersede` for the same reason —
+        `gates.open_gate` is the precedent.
+        """
+        from .neo_store import NeoStore
+
+        base = str(getattr(pr, "base_ref", "") or "the base")
+        moved = f" to {base_tip[:10]}" if base_tip else ""
+        reason = (f"`{base}` has moved{moved} "
+                  f"since this request was filed against "
+                  f"{str(approval['base_oid'] or '')[:10] or 'an unrecorded base'}; the "
+                  f"CI evidence in it no longer describes what this merge would land on. "
+                  f"Nothing is authorised and nothing is refused — the OS catches the "
+                  f"branch up and files a fresh request on the new commit.")
+        store.supersede_approval(approval["id"], reason)
+        if approval["neo_question_id"]:
+            neo_store = NeoStore()
+            try:
+                neo_store.supersede(approval["neo_question_id"],
+                                    f"SUPERSEDED — `{base}` moved", reason)
+            finally:
+                neo_store.close()
 
     def _note_automerge_held(self, store: ProjectStore, wo_id: str,
                              decision: Any) -> None:
@@ -6330,6 +6888,15 @@ class Daemon:
           from `PR_POLL_STATUSES` reaches the poll (issue #224), so this would otherwise
           fire on every `needs_review` order with a green pull request and tell the user
           the automatic merge declined something it was never asked about.
+
+        **THE ROUND IS PART OF THE KEY**, `_note_autoreview_held`'s medicine for
+        `panel_gave_up` (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-
+        merging.md §4). Nine poll-reachable codes carry no round number in their reason, so
+        at an unmoved head round N+1's sentence is byte-identical to round N's: without the
+        round it writes nothing, the stored payload still says N, and
+        `ops._automerge_hold_is_stale` then declares a TRUE hold stale (kn-96f47efb). The
+        bound this dedupe exists for is kept — `decide` is deterministic given state, and
+        the round changes only when a round opens.
         """
         from . import automerge
 
@@ -6337,11 +6904,12 @@ class Daemon:
                              automerge.HELD_STATUS):    # `auto_merge` returns before here
             return
         key = (str(decision.head_sha or ""), str(decision.code or ""),
-               str(decision.reason or ""))
+               str(decision.reason or ""), int(decision.round_n or 0))
         if not _hold_is_news(store, wo_id, "automerge_held", key,
                              lambda p: (str(p.get("head_sha") or ""),
                                         str(p.get("code") or ""),
-                                        str(p.get("reason") or ""))):
+                                        str(p.get("reason") or ""),
+                                        int(p.get("round") or 0))):
             return
         store.add_event(wo_id, "automerge_held", {
             "code": decision.code, "reason": decision.reason,
@@ -6807,10 +7375,11 @@ class Daemon:
                 continue
 
     #: The key under a work order's `metadata` that says "this order exists to ship
-    #: fixes, and these are the ones it is shipping". The batch lives HERE rather than in
-    #: a column because it is a list that grows while the order waits, and because
-    #: nothing outside this file has a reason to query it.
-    RELEASE_BATCH_KEY = "release_for_issues"
+    #: fixes, and these are the ones it is shipping". The batch lives in `metadata`
+    #: rather than in a column because it is a list that grows while the order waits.
+    #: An ALIAS since 2026-09-29 spec §1 — `release.BATCH_KEY` is the literal's home now
+    #: that `ops` reads it too.
+    RELEASE_BATCH_KEY = release.BATCH_KEY
 
     #: What the release work order is told to do. It runs the ORDINARY release path —
     #: `scripts/shipit.sh --stage`, through the gate, exactly as a human-filed release
@@ -6903,6 +7472,14 @@ the place to fix a red build."""
     #: (2026-09-27 spec §5.2).
     RED_HOLD_EVENT = "release_held_red_base"
 
+    #: How long `main` may stay red before a release order stops waiting and asks the
+    #: user. Measured from the FIRST red hold on that order, so the pending-dispatch hold
+    #: (#807) and the mid-run re-park (`ops.defer_red_release`) share one clock. Six
+    #: hours: a red `main` here is repaired by a work-order round trip, which is hours and
+    #: not minutes, and an hour would ask the user about a break the fleet was already
+    #: fixing (2026-09-29 spec §3).
+    RED_PARK_AFTER_SECONDS = 6 * 3600
+
     def hold_red_release(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Keep a pending release order out of dispatch while the base branch is red.
 
@@ -6924,9 +7501,12 @@ the place to fix a red build."""
         indexed listing when it owns no pending release, and a `gh` call only once a
         hold has lapsed — an in-force hold IS the rate limit.
 
+        Also where the hold STOPS: past `RED_PARK_AFTER_SECONDS` the release asks the
+        user instead (2026-09-29 spec §3).
+
         docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5
         """
-        from . import ci, evidence, github
+        from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
         # release script and the production checkout, both facts about this repository.
@@ -6965,6 +7545,18 @@ the place to fix a red build."""
                 if wo.get("retry_after") is not None and not int(
                         wo.get("dispatch_attempts") or 0):
                     store.hold_dispatch(wo_id, until=None)
+                continue
+            # §3's threshold, HERE: this tick is the only step that visits a release
+            # already held in `pending`, so `ops.defer_red_release`'s check — which runs
+            # only when a worker delivers — can never fire for one. `_say_base_is_red`
+            # below is what writes RED_HOLD_EVENT, so on the FIRST red tick there is no
+            # clock yet and nothing parks; and a parked order is `needs_review`, which
+            # the `statuses=("pending",)` selection above stops returning.
+            first = ops.first_red_hold(store, wo_id)
+            if first is not None and db.now() - first >= self.RED_PARK_AFTER_SECONDS:
+                ops.park_red_release(store, wo_id, {
+                    "base": base, "head_sha": red.head_sha, "workflow": red.workflow,
+                    "run_id": red.run_id, "run_url": getattr(red, "run_url", "") or ""})
                 continue
             until = max(float(wo.get("retry_after") or 0),
                         db.now() + self.RED_HOLD_SECONDS)

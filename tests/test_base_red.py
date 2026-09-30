@@ -497,7 +497,7 @@ def test_a_fresh_red_fact_pauses_a_parked_merge(started, spec, project, fake_gh)
     assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
 
 
-def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh):
+def test_a_stale_reading_never_pauses_a_merge(started, spec, project, fake_gh, local_base):
     """A `gh` that stopped answering must not pause the fleet's merges for ever on a
     fact nobody can confirm."""
     opt_in(started)
@@ -540,7 +540,7 @@ def test_the_stored_fact_is_read_once_per_project_per_poll(started, spec, projec
         assert db.from_json(held[-1]["payload"], {})["code"] == automerge.HELD_BASE_RED
 
 
-def test_an_absent_fact_never_pauses_a_merge(started, spec, project, fake_gh):
+def test_an_absent_fact_never_pauses_a_merge(started, spec, project, fake_gh, local_base):
     opt_in(started)
     store, wo = parked(project)
     fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
@@ -550,7 +550,7 @@ def test_an_absent_fact_never_pauses_a_merge(started, spec, project, fake_gh):
     assert len(store.list_approvals(wo["id"])) == 1
 
 
-def test_the_pause_is_a_pause_and_not_a_stall(started, spec, project, fake_gh):
+def test_the_pause_is_a_pause_and_not_a_stall(started, spec, project, fake_gh, local_base):
     """END TO END, §Tests item 5: a parked order held on a red `main`, `main` goes
     green, and the merge proceeds. A held merge that never resumed would be the same
     stall wearing a better label."""

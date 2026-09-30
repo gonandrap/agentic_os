@@ -751,7 +751,7 @@ def test_the_sweep_decides_and_does_not_act(started, catalog_file, fake_claude, 
 def test_health_reviews_outcomes_are_a_declared_vocabulary(store):
     from jarvis.project_store import HEALTH_OUTCOMES
 
-    assert set(HEALTH_OUTCOMES) == {"clear", "findings", "failed"}
+    assert set(HEALTH_OUTCOMES) == {"clear", "findings", "failed", "held"}
     with pytest.raises(AssertionError):
         store.record_health_review("work_order", "wo-1", fingerprint="fp",
                                    trigger="first-look", outcome="fine-i-guess")
@@ -993,3 +993,212 @@ def test_a_sweep_still_failing_now_is_reported_however_old_the_run_started(store
 
     assert list(check_health_sweep_produces_judgements(store)), (
         "still failing is still news, however long it has been true")
+
+
+# -- a usage limit is not a failed sweep -------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md. The account
+# refusing a call is neither a judgement nor a defect, and recording it as `failed` bought
+# the refusal again every interval for the whole window — then alarmed about it.
+
+
+class _MovedNow:
+    """`db.now` moved for the body of a `with`, and nothing else touched."""
+
+    def __init__(self, at: float) -> None:
+        self.at, self.was = at, db.now
+
+    def __enter__(self):
+        import jarvis.db
+
+        jarvis.db.now = lambda: self.at
+        return self
+
+    def __exit__(self, *exc):
+        import jarvis.db
+
+        jarvis.db.now = self.was
+
+
+def _held(store) -> list[dict]:
+    return [r for r in store.recent_health_reviews(100) if r["outcome"] == "held"]
+
+
+def test_a_refused_sweep_is_held_and_not_recorded_as_a_failure(
+        started, catalog_file, store, clock, fake_claude):
+    """The ordering in `review_health` is the whole fix: `UsageLimitError` is a
+    `ClaudeCliError` subclass, so caught after its base it is dead code."""
+    _enable(catalog_file)
+    wo_id = _wo(store, status="running")
+    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+
+    _sweep(started(), clock)
+
+    (row,) = store.recent_health_reviews(10)
+    assert row["outcome"] == "held"
+    assert row["reopens_at"] > db.now()
+    assert "session limit" in row["detail"]
+    assert "could not be reached" not in row["detail"], (
+        "the sweep WAS reached — the account refused it")
+    assert _findings(store) == []
+    assert [e for e in store.list_events(wo_id) if e["kind"] == "health_reviewed"] == []
+    assert not store.get_work_order(wo_id)["needs_attention"]
+
+
+def test_a_live_hold_buys_no_second_refusal_and_expires_by_the_clock(
+        started, catalog_file, store, clock, fake_claude):
+    """A recorded hold nobody reads is a quieter retry storm."""
+    _enable(catalog_file)
+    _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
+    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+    daemon = started()
+
+    _sweep(daemon, clock)
+    refused = len(_health_calls(fake_claude))
+    assert refused == 1
+
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == refused, "the window is still shut"
+    assert len(store.recent_health_reviews(10)) == 1, "one hold, not one per tick"
+
+    # The first tick after the window reopens sweeps again. Nothing un-holds anything.
+    fake_claude.health_recover()
+    clock.advance(minutes=60 * 25)
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == refused + 1
+    assert store.recent_health_reviews(1)[0]["outcome"] == "clear"
+
+
+def test_a_held_row_is_not_an_attempt_and_does_not_floor_the_next_look(store):
+    """Half of the fix: a refusal bought no model call, so flooring the next real look
+    on it would make one refused tick cost a whole interval of watching."""
+    wo_id = _wo(store, status="running")
+    store.record_health_review("work_order", wo_id, fingerprint="fp",
+                               trigger="first-look", outcome="held",
+                               detail="You've hit your session limit · resets 2:10am",
+                               reopens_at=db.now() + 3600)
+
+    assert store.last_health_attempt_ts("work_order", wo_id) is None
+    assert store.last_health_review("work_order", wo_id) is None
+    created = db.now() - 10 * 60 * 60
+    assert due(None, "fp", CFG, db.now(), created,
+               last_attempt=store.last_health_attempt_ts("work_order", wo_id)) \
+        == "first-look"
+    # ...where a `failed` row still floors it: that one DID spend money (issue #216).
+    store.record_health_review("work_order", wo_id, fingerprint="fp",
+                               trigger="first-look", outcome="failed", detail="boom")
+    assert store.last_health_attempt_ts("work_order", wo_id) is not None
+
+
+def test_the_hold_is_project_wide_and_only_while_it_lasts(store):
+    """The account's window is not a property of a work order."""
+    assert store.health_sweep_hold() is None
+    store.record_health_review("work_order", "wo-1", fingerprint="fp",
+                               trigger="first-look", outcome="held",
+                               detail="spent", reopens_at=db.now() + 600)
+
+    hold = store.health_sweep_hold()
+    assert hold is not None and hold[1] == "spent"
+    assert hold[0] > db.now()
+
+    # A judgement about another unit does not lift the account's window.
+    store.record_health_review("feature_order", "fo-1", fingerprint="fp",
+                               trigger="stale", outcome="clear")
+    assert store.health_sweep_hold() is not None
+
+    with _MovedNow(db.now() + 601):
+        assert store.health_sweep_hold() is None
+
+
+def test_held_rows_never_trip_the_mute_canary_and_never_rescue_a_failure_run(store):
+    """Held rows are filtered out BEFORE the last ten are taken: ten holds cannot trip
+    it, and one hold in the middle of a genuine run does not reset that run either."""
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    for i in range(HEALTH_SWEEP_FAILURE_RUN):
+        store.record_health_review("work_order", f"wo-{i}", fingerprint="fp",
+                                   trigger="first-look", outcome="held",
+                                   detail="spent", reopens_at=db.now() - 1)
+    assert list(check_health_sweep_produces_judgements(store)) == []
+
+    _force_failures(store, 5)
+    store.record_health_review("work_order", "wo-x", fingerprint="fp",
+                               trigger="first-look", outcome="held", detail="spent",
+                               reopens_at=db.now() - 1)
+    _force_failures(store, 5)
+    (violation,) = list(check_health_sweep_produces_judgements(store))
+    assert violation.invariant == "INV-HEALTH-SWEEP-MUTE"
+    assert "FAILED" in violation.detail
+    assert "hold, not a failure" in violation.detail
+
+
+def test_a_live_hold_keeps_the_mute_canary_silent(store):
+    """The check claims the sweep IS SPENDING model calls. During a hold it spends
+    none."""
+    from jarvis.invariants import (
+        HEALTH_SWEEP_FAILURE_RUN,
+        check_health_sweep_produces_judgements,
+    )
+
+    _force_failures(store, HEALTH_SWEEP_FAILURE_RUN)
+    assert list(check_health_sweep_produces_judgements(store))
+
+    store.record_health_review("account", "", fingerprint="", trigger="account-window",
+                               outcome="held", detail="spent",
+                               reopens_at=db.now() + 3600)
+    assert list(check_health_sweep_produces_judgements(store)) == []
+
+
+def test_a_shut_account_records_one_hold_per_window_and_sweeps_nothing(
+        started, catalog_file, store, clock, fake_claude):
+    """Deduped on the MOMENT, not on the tick: at a 5s tick a three-hour window would
+    otherwise write two thousand identical rows per project."""
+    from jarvis import fleet
+
+    _enable(catalog_file)
+    _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
+    daemon = started()
+    shut = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
+                                          reopens_at=db.now() + 3600,
+                                          message="You've hit your session limit"))
+
+    for _ in range(20):
+        daemon.tick_count = 1
+        daemon._health_sweep(daemon._health_projects(), shut)
+
+    account = [r for r in _held(store) if r["subject_kind"] == "account"]
+    assert len(account) == 1, "one row per window, not one per tick"
+    assert account[0]["reopens_at"] == shut.outage.reopens_at
+    assert account[0]["trigger"] == "account-window"
+    assert _health_calls(fake_claude) == [], "nothing was swept"
+
+    later = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
+                                           reopens_at=shut.outage.reopens_at + 3600,
+                                           message="still spent"))
+    daemon.tick_count = 1
+    daemon._health_sweep(daemon._health_projects(), later)
+    assert len([r for r in _held(store) if r["subject_kind"] == "account"]) == 2
+
+
+def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
+        started, catalog_file, store, clock):
+    """`health_tick` threads the tick's one `fleet` reading through, and opens no store
+    itself — the promise in its docstring."""
+    from jarvis import fleet
+
+    _enable(catalog_file)
+    daemon = started()
+    seen = {}
+    daemon._health_sweep = lambda projects, state=None: seen.update(state=state)
+    shut = fleet.Fleet(3, 0, fleet.Outage(project="proj_a", wo_id="wo-1",
+                                          reopens_at=db.now() + 3600, message="spent"))
+
+    daemon.tick_count = 1
+    daemon.health_tick(shut)
+    deadline = time.monotonic() + 10
+    while daemon.health_sweeping and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen["state"] is shut

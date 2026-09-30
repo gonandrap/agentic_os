@@ -334,6 +334,24 @@ def test_a_high_stakes_assumption_mid_run_is_never_asked_about_at_all(started):
     assert held["code"] == autoreview.HELD_HIGH_STAKES
 
 
+def test_the_early_pass_never_touches_a_confirmation_link(started):
+    """§10.5 of docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-
+    assumption-for-ever.md: the regression guard that §4's clear and §6's split live on
+    the CONFIRMATION path alone. The early pass files no confirmation, so it can produce
+    neither new code and has no link to clear."""
+    store, wo = running(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+
+    ask(started, store)
+    drain(started)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["provisional_verdict"] == "accept"
+    assert row["confirm_question_id"] is None
+    codes = [e["code"] for e in events(store, wo["id"], "autoreview_held")]
+    assert autoreview.HELD_CONFIRM_SPENT not in codes
+    assert autoreview.HELD_ROUND_OPEN not in codes
+
+
 def test_a_project_that_has_not_opted_in_is_never_judged_early(started):
     store, wo = running(started, auto_review=False)
 

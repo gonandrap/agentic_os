@@ -727,6 +727,20 @@ elif "-p" in argv and "--resume" not in argv:
         # nothing, and every "no alarm was raised" assertion passes for the wrong reason.
         # Claimed on the CHECKLIST, which only a sweep's system prompt carries.
         if "# The symptom checklist" in system:
+            # THE USAGE LIMIT, on the sweep's own call: the result-JSON shape
+            # `claude_cli.usage_limit` parses, so the test drives the REAL classifier
+            # into a real `UsageLimitError` (spec
+            # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md).
+            if os.environ.get("FAKE_HEALTH_REFUSE"):
+                reset = os.environ.get("FAKE_CLAUDE_LIMIT_RESET",
+                                       "11:50pm (America/Los_Angeles)")
+                print(json.dumps({
+                    "type": "result", "subtype": "success", "is_error": True,
+                    "num_turns": 1, "total_cost_usd": 0, "duration_api_ms": 0,
+                    "terminal_reason": "api_error", "api_error_status": 429,
+                    "result": "You've hit your session limit · resets " + reset,
+                }))
+                sys.exit(1)
             if "FORCE_HEALTH_FAIL" in prompt:
                 sys.stderr.write("health sweep failed (test-forced)\n"); sys.exit(1)
             if "FORCE_HEALTH_GARBAGE" in prompt:
@@ -2151,6 +2165,21 @@ def fake_claude(tmp_path, monkeypatch):
             monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
             monkeypatch.setenv("FAKE_CLAUDE_TURN", "rate_limit")
 
+        def health_rate_limited(self, reset: str = "11:50pm (America/Los_Angeles)"
+                                ) -> None:
+            """Refuse every subsequent HEALTH SWEEP for the usage limit.
+
+            `turns_rate_limited`'s sibling on the other call the OS makes: a sweep is a
+            `claude -p` with no session, so the turn path's refusal never reaches it.
+            Emits the same result-JSON shape, so the test drives the real classifier.
+            """
+            monkeypatch.setenv("FAKE_HEALTH_REFUSE", "1")
+            monkeypatch.setenv("FAKE_CLAUDE_LIMIT_RESET", reset)
+
+        def health_recover(self) -> None:
+            """Reopen the window — what the sweep is waiting for."""
+            monkeypatch.delenv("FAKE_HEALTH_REFUSE", raising=False)
+
         def turns_api_error(self, status: int = 500) -> None:
             """Break every subsequent turn with an API error, AFTER it has run.
 
@@ -2402,6 +2431,41 @@ def signin(tmp_path, monkeypatch):
     return sign_in
 
 
+#: The commit `origin/<base>` is at, for every fixture that fakes the local checkout.
+FIXTURE_BASE_TIP = "ba5e11d000000000000000000000000000000f00"
+
+
+@pytest.fixture()
+def local_base(monkeypatch):
+    """What the local checkout answers about the base. Returns the state, to be changed.
+
+    Spec docs/superpowers/specs/2026-09-28-a-merge-checks-the-base-it-lands-on.md §3.1:
+    a merge re-reads `origin/<base>` and refuses if the judged head does not contain it.
+    The `project` fixture has no `origin`, so real git refuses and NOTHING would ever
+    merge in a test — this is the fresh, up-to-date base that used to be implied.
+
+    THE ONE FAKE OF `branchproof` FOR THE WHOLE SUITE — every test that needs the local
+    checkout's answers builds on this rather than re-patching the three functions.
+    `contains` is what the judged head carries: empty is a branch behind its base, which
+    is the incident's shape. `base_ancestors` is proof (a) item 6's other question — was
+    this a BASE merge — and None means yes to all of them.
+    """
+    from . import branchproof
+
+    state = {"fetch": True, "tip": FIXTURE_BASE_TIP, "contains": {FIXTURE_BASE_TIP},
+             "base_ancestors": None}
+
+    def is_ancestor(repo, ancestor, descendant):
+        if str(descendant).startswith("origin/"):
+            return state["base_ancestors"] is None or ancestor in state["base_ancestors"]
+        return ancestor in state["contains"]
+
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: state["fetch"])
+    monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
+    monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
+    return state
+
+
 @pytest.fixture()
 def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
@@ -2471,6 +2535,55 @@ def a_finding(key: str = "first-turn-reads", **overrides: Any) -> dict[str, Any]
     }
     finding.update(overrides)
     return finding
+
+
+def a_verdict(classification: str = "GAP", subject: str = "wo-11111111",
+              **overrides: Any) -> dict[str, Any]:
+    """One verdict `verdicts.parse_verdict` accepts, for any classification.
+
+    §2.4 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the payload is
+    classification-dependent, so the helper carries EXACTLY the fields that
+    classification requires and none it forbids — a test that wants a rejection adds or
+    breaks one field and nothing else drags the document down with it.
+
+    Shared with the ops tests rather than re-declared per file, for `a_report`'s reason.
+    """
+    doc: dict[str, Any] = {
+        "subject": subject,
+        "classification": classification,
+        "gap_class": "stale-hold",
+        "root_cause": (f"The panel's give-up hold on {subject} is written once and never "
+                       f"re-derived, so the order stays parked after the cause clears."),
+        "evidence": [
+            {"source": f"jarvis wo show {subject}",
+             "quote": "validating — the panel gave up after 3 rounds (round 3, 6h ago)"},
+        ],
+    }
+    if classification == "GAP":
+        doc["proposed_fix"] = {
+            "title": "a stale panel hold parks an order after its cause has cleared",
+            "description": ("The hold the panel writes when it gives up is never "
+                            "re-derived, so an order whose pull request has since been "
+                            "updated stays parked for ever. Re-derive it on the "
+                            "reconcile tick that reads the pull request."),
+            "expected": "the hold clears on the next tick once the pull request moves",
+            "actual": "the order stays parked until a human runs `jarvis wo done`",
+            "priority": "high",
+            "detector": ("a reconciler invariant over state: an order in `validating` "
+                         "whose hold names a commit that is no longer the pull request's "
+                         "head"),
+            "remedy": "unblock",
+        }
+    elif classification == "WAITING_ON_USER":
+        doc["user_owes"] = f"assumption as-4 on {subject} is still pending review"
+    elif classification == "TRANSIENT":
+        doc["unsticks"] = {"what": "the reconciler re-reads the pull request and clears "
+                                   "the hold",
+                           "when": "next reconcile tick, within two minutes"}
+    elif classification == "ALREADY_TRACKED":
+        doc["duplicate_of"] = "#790"
+    doc.update(overrides)
+    return doc
 
 
 def a_report(**overrides: Any) -> dict[str, Any]:
