@@ -31,6 +31,13 @@
   <div class="row">
     <span class="mono" style="width: 16px; color: {{ colour }};">{{ meta.get(t.status, {}).get('icon', '•') }}</span>
     <span class="grow">{{ t.label }}
+      {# The wall figure rides INSIDE the label's `grow` span, where the held-now sentence
+         below already lives: a sibling after the duration would eat the fixed columns and
+         shove duration, entries and the bar out of alignment on exactly the rows a reader
+         is comparing. #}
+      {%- if t.held_seconds and not (current and states.held_now) %}
+      <span class="sub">({{ t.held_human }} held by {{ held_phrase(held_by) }},
+        {{ t.seconds_human }} wall)</span>{% endif %}
       {%- if current %}
       {# TWO FIGURES, LABELLED DIFFERENTLY. Equal numbers are the common case, and one
          number shown twice reads as a bug (spec §7). While a hold is OPEN the line says
@@ -46,13 +53,10 @@
         {%- else %}nothing on the record for {{ fmt_dur(states.last_activity_age) }}
         {%- endif %}</span>{% endif %}{% endif %}</span>
     {# The duration column is ACTIVE once a hold touched this status; wall moves into the
-       parenthesis beside it and is never dropped. A status never held renders exactly as
-       it did before holds were read at all. #}
+       parenthesis beside the label and is never dropped. A status never held renders
+       exactly as it did before holds were read at all. #}
     <span class="mono" style="width: 70px; text-align: right;">
       {{- fmt_dur(t.active_seconds) if t.held_seconds else fmt_dur(t.seconds) }}</span>
-    {%- if t.held_seconds and not (current and states.held_now) %}
-    <span class="sub">({{ t.held_human }} held by {{ held_phrase(held_by) }},
-      {{ t.seconds_human }} wall)</span>{% endif %}
     <span class="mono" style="width: 80px; text-align: right;">{{ t.entries }}
       {{- ' entry' if t.entries == 1 else ' entries' }}</span>
     {# GEOMETRY STAYS WALL (spec §4): the width is `t.share`, as before, because the bar
