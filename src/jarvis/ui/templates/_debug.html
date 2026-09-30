@@ -22,6 +22,27 @@
 {% if text %}<div class="sub" style="padding: 10px 16px; color: var(--ink-2);">{{ text }}</div>{% endif %}
 {% endmacro %}
 
+{# WHICH READING ANSWERED — spec §4 of docs/specs/2026-09-27-order-autopsy-durability.md.
+   A sealed reading and a fresh one must never disagree on the same order, and a
+   disagreement nobody can attribute is one nobody can fix. Every sentence is a key of
+   `autopsy.anatomy_for`'s provenance; this macro words none of them, and a sealed-floor
+   warning is rendered as a WARNING because a short list under a lower floor reads as
+   "there were none". #}
+{% macro provenance(p) %}
+{% if p %}
+<div class="panel" style="margin-bottom: 10px;">
+  <div class="row">
+    <span class="kv" style="width: 90px;">{{ p.source }}</span>
+    <span class="grow sub">{{ p.note }}</span>
+  </div>
+  {% if p.level_note %}<div class="row"><span class="grow sub">{{ p.level_note }}</span></div>{% endif %}
+  {% if p.floor_note %}
+  <div class="row"><span class="st tone-warn wrap"><span class="i">⚠</span>{{ p.floor_note }}</span></div>
+  {% endif %}
+</div>
+{% endif %}
+{% endmacro %}
+
 {# The per-turn partition bar. Widths come STRAIGHT off `share`, which `inspection`
    already rounded — the template's only arithmetic is the CSS percentage, and the glyph
    legend is `part_short`, the same keys `jarvis inspect` prints (spec §4c). #}

@@ -810,7 +810,9 @@ def test_the_investigator_prompt_is_a_fourth_branch_and_not_the_worker_contract(
     assert "open a PR" not in body and "pull request" not in body.lower()
     # The controls: the worker IS told to open one and to finish, and the analyst is its
     # own branch.
-    assert "open a PR" in worker and "jarvis wo finish" in worker
+    # `--pr `, not "open a PR": that prose rides in `git_briefing`/--append-system-prompt
+    # (kn-dfdab9f8) and is no longer in the prompt positional.
+    assert "--pr " in worker and "jarvis wo finish" in worker
     assert "jarvis io report" in analyst and "jarvis investigate verdict" not in analyst
 
 

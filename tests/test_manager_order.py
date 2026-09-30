@@ -423,13 +423,16 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     for c in store.feature_children(fo_id):
         assert c["id"] in prompt
     assert "will not open a pull request" in prompt
-    assert "open a PR" not in prompt
+    # `--pr `, not "open a PR": the commit/PR prose rides in
+    # `git_briefing`/--append-system-prompt (kn-dfdab9f8), not the prompt positional.
+    assert "--pr " not in prompt
     assert f"jarvis wo finish {manager['id']}" not in prompt
     assert f"--parent {fo_id}" in prompt, "the one way it can file remediation work"
 
     worker_prompt = dispatch.build_worker_prompt(child, spec)
 
-    assert "open a PR" in worker_prompt
+    # Same substitution as above (kn-dfdab9f8).
+    assert "--pr " in worker_prompt
     assert f"jarvis wo finish {child['id']}" in worker_prompt
 
 

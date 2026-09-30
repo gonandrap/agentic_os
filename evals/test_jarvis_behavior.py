@@ -214,15 +214,24 @@ def test_prompt_contract(fleet, fake_claude):
     d = fleet["daemon"]
     wo = ops.create_work_order("proj_a", "upgrade deps", description="careful please")
     d.tick()
-    prompt = fake_claude.wait_calls(
-        lambda c: "--session-id" in c["argv"])[0]["argv"][-1]
+    argv = fake_claude.wait_calls(lambda c: "--session-id" in c["argv"])[0]["argv"]
+    prompt = argv[-1]
     for must in ("upgrade deps", "careful please", f"jarvis wo assume {wo['id']}",
                  f"jarvis wo ask {wo['id']}", f"jarvis wo finish {wo['id']}",
-                 "never bump major versions", "Never push to main",
+                 "never bump major versions",
                  # the knowledge base must arrive as something the worker can query,
                  # not only as whatever happened to fit in the prompt
                  "jarvis learn search", "jarvis learn show <id>"):
         assert must in prompt, f"contract element missing: {must}"
+    # kn-dfdab9f8: the git rules are stated once, in the briefing that rides in
+    # --append-system-prompt, so asserting them on the prompt positional alone would
+    # measure a composition no worker is ever spawned with.
+    assert "--append-system-prompt" in argv, (
+        "spawn carries no --append-system-prompt: the git briefing never reaches the worker")
+    briefing = argv[argv.index("--append-system-prompt") + 1]
+    assert "Never commit to or push the default branch" in briefing, (
+        "contract element missing from --append-system-prompt: "
+        "Never commit to or push the default branch")
 
 
 # -- 3. feedback routing --------------------------------------------------------------

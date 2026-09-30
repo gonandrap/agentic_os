@@ -59,7 +59,11 @@ from .paths import project_state_dir
 # long work runs in the BACKGROUND and the lead polls it every 3-4 minutes, because the
 # foreground wait the contract used to prescribe cost ~$52 over 25 work orders (issue
 # 868). The prescription is prose in the core contract, so it has to reach every repo.
-TEMPLATE_VERSION = 13
+# v14 = pass a reference, never a payload (spec 2026-09-26-bounded-model-inputs.md §5):
+# a PreToolUse check now refuses an oversized `jarvis wo send` / `wo assume` body, a
+# question over 4000 chars and a `$(git diff …)` substitution, so every managed repo's
+# contract has to say what to pass instead before a worker is refused.
+TEMPLATE_VERSION = 14
 ASSETS = Path(__file__).parent / "assets"
 
 

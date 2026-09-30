@@ -361,7 +361,7 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     itself. `pstore` is optional only so a caller without one degrades to the old lines
     rather than raising inside an evidence packet.
     """
-    from . import holds, inspection, ops
+    from . import autopsy, holds, inspection, ops
 
     session_id = wo.get("session_id") or ""
     if not session_id:
@@ -370,15 +370,24 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     # Spec 2026-09-27 §3: the OS's own turn numbers, degrading to 1..N without a store.
     turn_starts = pstore.turn_starts(wo["id"]) if pstore is not None else []
     try:
-        anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans,
-                                          turn_starts=turn_starts,
-                                          cold_prefix_floor=ops.cold_prefix_floor())
+        # Spec 2026-09-27 §4: through the chokepoint, off the full store row this is
+        # already called with, so a settled order's evidence outlives its transcript.
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, inspect_cfg, spans=spans, turn_starts=turn_starts,
+            cold_prefix_floor=ops.cold_prefix_floor())
     except OSError:
         return ["(the session transcript could not be read)"]
     if not anatomy.found:
         return ["(no transcript found for this session)"]
 
     lines = []
+    # ONLY when a seal answered (Neo q1080): the derived case is what this packet has
+    # always said, and it is byte-pinned. Said FIRST, like `stalled` below and for its
+    # reason — it changes what every number after it means.
+    if provenance["source"] == autopsy.SEALED:
+        lines.append(f"- {provenance['note']} {provenance['level_note']}"
+                     + (f" {provenance['floor_note']}" if provenance["floor_note"]
+                        else ""))
     for turn in anatomy.turns:
         # THE COST IS AN INPUT, NOT AN INFERENCE FROM THE DURATION (issue 227). The
         # per-turn record already existed and no layer read it, so a 65-minute turn that

@@ -25,9 +25,10 @@
     "knowledge_inject_limit": 8,
     "knowledge_digest_limit": 40,
     "knowledge_digest_chars": 4000,
-    "$comment_concision": "How terse the OS holds its workers. `summary_max_words` caps `jarvis wo finish --summary`; a longer one is refused by the PreToolUse hook and costs the worker a turn. 0 switches the refusal off. Per project too: put a `concision` block on the project and it inherits the rest. See docs/superpowers/specs/2026-09-19-concision-enforced.md.",
+    "$comment_concision": "How terse the OS holds its workers. `summary_max_words` caps `jarvis wo finish --summary`; a longer one is refused by the PreToolUse hook and costs the worker a turn. 0 switches the refusal off. `message_max_chars` does the same for a `jarvis wo send` / `wo assume` body, which goes whole into a worker's next turn: over the cap it is refused and the worker is told to pass a reference (a PR URL, a commit SHA, a path with a line range). Per project too: put a `concision` block on the project and it inherits the rest. See docs/superpowers/specs/2026-09-19-concision-enforced.md and 2026-09-26-bounded-model-inputs.md.",
   "concision": {
-    "summary_max_words": 120
+    "summary_max_words": 120,
+    "message_max_chars": 6000
   },
   "neo": {
       "$comment": "Neo answers worker questions on your behalf; review its answers in the UI's neo tab",

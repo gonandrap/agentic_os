@@ -441,6 +441,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
+# panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
+# 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
+# legitimate OS question (a plan). 12,000 chars of diff puts the whole rendered question
+# at ~17-18K chars (~6.6K tokens at the 0.384 tokens/char rate cited above) — a plan's
+# order of magnitude, on a call that is UNCACHED and PER ASSUMPTION rather than a
+# five-seat shared prefix, which is why 150000 does not transfer. Spec § 2:
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
+
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
 # PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
@@ -505,6 +515,7 @@ class ValidationConfig:
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -582,6 +593,10 @@ class ConcisionConfig:
     """
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo
+    #: send` / `wo assume` payload refusal off for the project (§5 of
+    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -1497,6 +1512,9 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
+    if confirm_diff_chars < 1:
+        raise _err(f"{where}.confirm_diff_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -1518,6 +1536,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
+        confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
@@ -1644,7 +1663,13 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
     if 0 < words < 20:
         raise _err(f"{where}.summary_max_words of {words} leaves no summary that can "
                    f"pass; use 0 to switch the cap off")
-    return ConcisionConfig(summary_max_words=words)
+    chars = int(raw.get("message_max_chars", base.message_max_chars))
+    if chars < 0:
+        raise _err(f"{where}.message_max_chars must be 0 (off) or more, got {chars}")
+    if 0 < chars < 1000:
+        raise _err(f"{where}.message_max_chars of {chars} leaves no message that can "
+                   f"pass; use 0 to switch the cap off")
+    return ConcisionConfig(summary_max_words=words, message_max_chars=chars)
 
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,
