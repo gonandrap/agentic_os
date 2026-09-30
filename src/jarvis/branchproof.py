@@ -54,8 +54,14 @@ def _env() -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1", "GCM_INTERACTIVE": "never"}
 
 
-def _git(repo: Path, *args: str, stdin: str | None = None) -> str | None:
-    """`git -C repo args`, or None on any failure. Never raises."""
+def run(repo: Path, *args: str, stdin: str | None = None) -> str | None:
+    """`git -C repo args`, or None on any failure. Never raises.
+
+    PUBLIC because `harvest` runs on the daemon's tick and needs exactly this one's two
+    properties — the timeout and the non-interactive `_env()` — rather than a fourth copy
+    of the `subprocess.run` block (spec docs/specs/2026-09-30-harvesting-a-dead-turn.md
+    §2). `_git` stays as the in-module alias so no existing call site changes.
+    """
     try:
         proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                               text=True, errors="replace", timeout=GIT_TIMEOUT,
@@ -68,6 +74,10 @@ def _git(repo: Path, *args: str, stdin: str | None = None) -> str | None:
                   proc.stderr.strip()[:200])
         return None
     return proc.stdout
+
+
+#: The in-module name, unchanged: every existing call site reads `_git`.
+_git = run
 
 
 def _git_bytes(repo: Path, *args: str) -> bytes | None:

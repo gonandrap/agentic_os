@@ -98,6 +98,12 @@ STATUS_LABEL = {
 }
 
 
+#: What the OS read off disk when a turn died without writing a result. A SIGNAL kind and
+#: deliberately not in `DEBUG_KINDS`: it is the only statement about the WORK that a
+#: failed turn leaves behind (spec docs/specs/2026-09-30-harvesting-a-dead-turn.md §5).
+TURN_HARVESTED = "turn_harvested"
+
+
 def event_level(kind: str) -> str:
     """"debug" for plumbing, "signal" for anything the user should see by default.
 
@@ -225,6 +231,25 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
                 "the prompt goes out once the conversation is summarised")
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    if kind == TURN_HARVESTED:
+        # §5 of docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+        if p.get("empty"):
+            return ("Nothing to harvest",
+                    "the worktree was clean and the turn said nothing")
+        authored = p.get("authored") or {}
+        commits = int(authored.get("commits") or 0)
+        dirty = list(authored.get("dirty") or ())
+        parts = []
+        if commits:
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {p['checkpoint']}"
+                            if p.get("checkpoint") else " left uncommitted"))
+        if p.get("said"):
+            parts.append("its last message")
+        return "Harvested what the turn left behind", ", ".join(parts)
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
     # about the WORK went wrong — the transport did, either by refusing the turn (the
     # usage window) or by dropping it (the API) — and the OS puts itself right. What the
