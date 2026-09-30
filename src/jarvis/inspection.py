@@ -1104,8 +1104,10 @@ def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
     text = _prompt_text(row)
     if not text.strip():
         return None
-    return Prompt(ts=ts, kind=_trigger_kind(text), quote=_first_line(text, limit),
-                  source=source)
+    # REDACTED BEFORE IT IS CUT, as `_detail_of` is: the quote is sealed, so an
+    # unredacted one outlives the transcript (autopsy durability spec §3).
+    return Prompt(ts=ts, kind=_trigger_kind(text),
+                  quote=_first_line(redact_param(text), limit), source=source)
 
 
 def _subagent_labels(path: Path) -> dict[str, str]:
