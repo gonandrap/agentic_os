@@ -788,7 +788,7 @@ def create_app() -> FastAPI:
     # are one tier and the layering runs downward only. The five buckets' wording is READ
     # from where `jarvis inspect` prints it rather than re-worded here — a legend that says
     # one thing in the terminal and another on the page is one the reader learns to ignore.
-    from ..cli import PART_LABELS, PART_SHORT
+    from ..cli import PART_LABELS, PART_SHORT, _held_phrase
 
     templates = Jinja2Templates(directory=str(TEMPLATES))
     templates.env.globals.update(
@@ -853,6 +853,10 @@ def create_app() -> FastAPI:
         # CLI prints the identical words (spec §6, §7).
         approximate_note=ops.FO_APPROXIMATE_NOTE,
         no_trigger_phrase=ops.NO_TRIGGER_PHRASE,
+        # "a fleet usage limit and 2 others" — the CLI's own sentence, imported rather
+        # than spelled in Jinja: the page and `jarvis wo show` must not be able to name
+        # a hold's cause two ways (spec §3).
+        held_phrase=_held_phrase,
     )
 
     def render(request: Request, template: str, active: str = "dashboard",

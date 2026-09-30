@@ -26,6 +26,7 @@ log = logging.getLogger("jarvis.ops")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import landing
+    from .holds import Hold
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
@@ -1712,6 +1713,11 @@ class StateDurations:
     #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
     #: are the same document.
     asof: float = 0.0
+    #: Every interval `holds` says the order was not permitted to run. The `Hold` objects
+    #: and not pre-computed seconds, because neither this dataclass nor `Hold` bakes in a
+    #: `now`. Spec §1 of
+    #: docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    holds: tuple[Hold, ...] = ()
 
     def label(self, status: str) -> str:
         if self.order_kind == "fo":
@@ -1726,15 +1732,52 @@ class StateDurations:
             end = self.spans[-1].left
         lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
 
+        # Spec §1: the subtraction is the READER's, per span, off the holds this reading
+        # already carries.
+        from . import holds as holds_mod
+
+        def held_in(start: float, end: float) -> float:
+            return sum(h.overlap(start, end, now) for h in self.holds)
+
+        def held_of(span: Span) -> float:
+            return held_in(span.entered, now if span.left is None else span.left)
+
+        total_held = held_in(self.spans[0].entered, end) if self.spans else 0.0
+        lifetime_active = max(0.0, lifetime - total_held)
+
         def share(seconds: float) -> float:
             return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        # Spec §4: `share` stays wall over wall, because the Gantt's offsets are wall
+        # positions; `active_share` is the active basis, internally consistent on its own.
+        def active_share(seconds: float) -> float:
+            return round(seconds / lifetime_active, 4) if lifetime_active else 0.0
+
+        def by_cause(windows: Sequence[tuple[float, float]]) -> list[dict[str, Any]]:
+            """Biggest cause first — summed per window, so a re-entered status counts each
+            of its own spans and nothing between them (spec §2)."""
+            totals: dict[str, float] = {}
+            for start, stop in windows:
+                for cause, seconds in holds_mod.by_cause(self.holds, start, stop,
+                                                         now=now).items():
+                    totals[cause] = totals.get(cause, 0.0) + seconds
+            return [{"cause": cause, "phrase": holds_mod.HOLD_CAUSES.get(cause, cause),
+                     "seconds": round(seconds, 2), "seconds_human": ago_phrase(seconds)}
+                    for cause, seconds in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+        def basis(seconds: float, held: float) -> dict[str, Any]:
+            active = max(0.0, seconds - held)
+            return {"held_seconds": round(held, 2), "held_human": ago_phrase(held),
+                    "active_seconds": round(active, 2),
+                    "active_human": ago_phrase(active),
+                    "active_share": active_share(active)}
 
         spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
                   "left": s.left, "open": s.left is None,
                   "seconds": round(s.seconds(now), 2),
                   "seconds_human": ago_phrase(s.seconds(now)),
                   "share": share(s.seconds(now)), "trigger": s.trigger,
-                  "approximate": s.approximate}
+                  "approximate": s.approximate, **basis(s.seconds(now), held_of(s))}
                  for s in self.spans]
         totals = []
         for status in order:
@@ -1742,13 +1785,27 @@ class StateDurations:
             if not mine:
                 continue
             seconds = round(sum(s.seconds(now) for s in mine), 2)
+            # Summed per span and never over a synthetic window: a status entered twice
+            # must not claim a hold that sits between its entries (spec §2).
+            held = sum(held_of(s) for s in mine)
             totals.append({"status": status, "label": self.label(status),
                            "seconds": seconds, "seconds_human": ago_phrase(seconds),
-                           "entries": len(mine), "share": share(seconds)})
+                           "entries": len(mine), "share": share(seconds),
+                           **basis(seconds, held),
+                           "held_by": by_cause([(s.entered,
+                                                 now if s.left is None else s.left)
+                                                for s in mine])})
         age = (round(now - self.current_status_since, 2)
                if self.current_status_since is not None else None)
         idle = (round(max(0.0, now - self.last_activity_ts), 2)
                 if self.last_activity_ts is not None else None)
+        # The current status' own hold, and the open one if there is one: `None` and never
+        # a zero-filled dict, because a missing figure is not a zero (issue #227).
+        since = self.current_status_since
+        status_held = round(held_in(since, now), 2) if since is not None else None
+        active_age = (None if age is None or status_held is None
+                      else round(max(0.0, age - status_held), 2))
+        open_hold = ([h for h in self.holds if h.open] or [None])[-1]
         return {
             "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
             "approximate": self.approximate,
@@ -1764,6 +1821,21 @@ class StateDurations:
             "last_activity_age": idle,
             "last_activity_age_human": None if idle is None else ago_phrase(idle),
             "notes": list(self.notes),
+            "lifetime_held_seconds": round(total_held, 2),
+            "lifetime_active_seconds": round(lifetime_active, 2),
+            "lifetime_active_human": ago_phrase(lifetime_active),
+            "current_status_held_seconds": status_held,
+            "current_status_active_age": active_age,
+            "current_status_active_age_human": (None if active_age is None
+                                                else ago_phrase(active_age)),
+            "held_now": (None if open_hold is None else {
+                "cause": open_hold.cause, "phrase": open_hold.phrase,
+                "since": open_hold.started,
+                "seconds": round(open_hold.finish(now) - open_hold.started, 2),
+                "seconds_human": ago_phrase(open_hold.finish(now)
+                                            - open_hold.started)}),
+            "current_status_held_by": ([] if since is None
+                                       else by_cause([(since, now)])),
         }
 
 
@@ -1850,6 +1922,24 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     return found
 
 
+def _family_of(store: ProjectStore, fo_id: str) -> list[str]:
+    """Every work order a feature is made of: its children, its planner, its manager.
+
+    ONE walk, read by both `_last_activity` and `state_durations`' holds, so the two can
+    never disagree about what a feature is (spec §1 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    and trap 3 of kn-b7591ab3: never `carrier_for_feature`).
+    """
+    family = [c["id"] for c in store.feature_children(fo_id)]
+    fo = store.get_feature_order(fo_id)
+    if fo.get("plan_wo_id"):
+        family.append(str(fo["plan_wo_id"]))
+    manager = store.manager_work_order(fo_id)
+    if manager:
+        family.append(str(manager["id"]))
+    return family
+
+
 def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
     """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
 
@@ -1860,14 +1950,8 @@ def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float
     if kind == "wo":
         found = _activity_of(store, order_id)
     else:
-        family = [c["id"] for c in store.feature_children(order_id)]
-        fo = store.get_feature_order(order_id)
-        if fo.get("plan_wo_id"):
-            family.append(str(fo["plan_wo_id"]))
-        manager = store.manager_work_order(order_id)
-        if manager:
-            family.append(str(manager["id"]))
-        found = [seen for child in family for seen in _activity_of(store, child)]
+        found = [seen for child in _family_of(store, order_id)
+                 for seen in _activity_of(store, child)]
         row = store.conn.execute(
             "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
         if row and row[0] is not None:
@@ -1889,9 +1973,15 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     """
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    from . import holds as holds_mod
+
     now = time.time() if now is None else now
     kind = "wo" if wo_id else "fo"
     order_id = wo_id or fo_id
+    # THE READER SUBTRACTS, not its five callers: an optional `spans=` would reproduce
+    # issue 887 for every caller that forgot to opt in (spec §1).
+    episodes = (holds_mod.held(store, order_id, now=now) if kind == "wo"
+                else holds_mod.held_family(store, _family_of(store, order_id), now=now))
     terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
     row_kind = ""
     # The order's own row, for `wo` too now: its `status` column is the status, and the
@@ -1944,7 +2034,7 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
                               if open_span is not None and not behind else None),
         last_activity_ts=activity_ts if activity_kind else None,
         last_activity_kind=activity_kind, approximate=approximate,
-        notes=tuple(notes), row_kind=row_kind, asof=now,
+        notes=tuple(notes), row_kind=row_kind, asof=now, holds=tuple(episodes),
     )
 
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,

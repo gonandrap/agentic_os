@@ -492,8 +492,11 @@
        of the reader lives above the tabs (spec §7). #}
     <button role="tab" data-panel="tab-states" aria-selected="false"
             aria-controls="tab-states">Time in state
+      {# ACTIVE, falling back to wall: a badge reading 5.4h on an order that was let work
+         45m is the headline complaint of issue 887 (spec §3). #}
       {%- if states.current_status_age_human %}
-      <span class="n">{{ states.current_status_age_human }}</span>{% endif %}</button>
+      <span class="n">{{ states.current_status_active_age_human
+                         or states.current_status_age_human }}</span>{% endif %}</button>
   </div>
 
 <section class="tabpanel on" id="tab-conversation" role="tabpanel">
