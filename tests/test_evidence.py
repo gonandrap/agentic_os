@@ -445,8 +445,12 @@ def test_only_the_round_machine_collects_evidence():
     names = {".evidence", "jarvis.evidence"}
     importers = [p.name for p in sorted(src.glob("*.py"))
                  if p.name != "evidence.py" and _imports(p) & names]
-    assert importers == ["daemon.py", "landing.py", "ops.py", "validation.py"]
+    assert importers == ["autoreview.py", "daemon.py", "landing.py", "ops.py",
+                         "validation.py"]
     assert "collect_work_order" not in (src / "landing.py").read_text()
+    # `autoreview` is `landing`'s case: it TRIMS a packet the daemon collected, reusing
+    # `_sections` and `_truncate` so there is one file-boundary truncator and not two.
+    assert "collect_work_order" not in (src / "autoreview.py").read_text()
 
 
 # ------------------------------------------------- the per-file digest map (file_shas)

@@ -441,6 +441,16 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
+# panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
+# 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
+# legitimate OS question (a plan). 12,000 chars of diff puts the whole rendered question
+# at ~17-18K chars (~6.6K tokens at the 0.384 tokens/char rate cited above) — a plan's
+# order of magnitude, on a call that is UNCACHED and PER ASSUMPTION rather than a
+# five-seat shared prefix, which is why 150000 does not transfer. Spec § 2:
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
+
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
 # PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
@@ -505,6 +515,7 @@ class ValidationConfig:
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -852,19 +863,19 @@ class ObservabilityConfig:
     (`_parse_observability`), and a per-order override on `work_orders.observability`
     beats both — precedence resolved in one place, `observability.level_for`.
 
-    `off` GATES EXACTLY ONE WRITE: §5's per-turn ingredient row on
-    `wo_turns.context_json`. It does NOT disable `jarvis watch`, `jarvis inspect`,
+    `off` GATES TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json` and
+    the sealed autopsy (§5 of docs/specs/2026-09-27-order-autopsy-durability.md). So `off`
+    stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
-    `off` is that the order has no context ledger and `jarvis wo context` says it was
-    not recorded.
+    `off` is that the order has no context ledger and no sealed autopsy, and `jarvis wo
+    context` says it was not recorded.
 
-    THE LEVEL CONTROLS ONLY THAT ROW. The full autopsy of an order — every turn, its
-    tools, its token classes, its context total, delta, peak and composition — is
-    shown for every order at every level, because §§3, 4, 6 and 7 derive it at read
-    time from the transcript and not from anything Jarvis collected. So `full` records
-    exactly what `normal` does and the two collapse; the level exists for the config
-    surface to grow into (Neo 814).
+    `full` DIFFERS FROM `normal` BY EXACTLY ONE THING: the tool parameters a `full` seal
+    retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
+    itself — every turn, its tools, its token classes, its context total, delta, peak and
+    composition — is derived at read time from the transcript (§§3, 4, 6, 7) and so is
+    shown for every order at every level, `off` included.
     """
 
     level: str = DEFAULT_OBSERVABILITY_LEVEL
@@ -1501,6 +1512,9 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
+    if confirm_diff_chars < 1:
+        raise _err(f"{where}.confirm_diff_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -1522,6 +1536,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
+        confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
