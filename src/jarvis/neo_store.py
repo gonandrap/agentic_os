@@ -119,6 +119,16 @@ MAX_ANSWER_ATTEMPTS = 3
 #: hand. Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
 UNREACHABLE_PREFIX = "neo could not be reached: "
 
+
+class QuestionTooLargeError(ValueError):
+    """`ask` refused to persist a question past the ceiling. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+    A `ValueError` subclass so every existing handler still catches it, NAMED so the
+    `jarvis wo ask` path can render it as one loud line: a worker told the size, the
+    ceiling and the setting can shorten and retry, and a traceback tells it nothing.
+    """
+
 #: How long a question held back by a transport failure waits before it may be claimed
 #: again, indexed by how many attempts it has already spent.
 #:
@@ -240,6 +250,23 @@ class NeoStore:
     def ask(self, project: str, wo_id: str, question: str, context: str = "",
             kind: str = "question") -> dict[str, Any]:
         assert kind in Q_KINDS, kind
+        # REFUSE, never trim, and never persist: a question is stored before it is ever
+        # sent, so the store is the last place that can refuse one, and a trimmed
+        # question would be answered as if it were the question asked (Neo, q1078,
+        # option A). The SAME ceiling as the transport's rather than a second setting:
+        # it is a backstop, not the binding limit, and one number cannot fall out of
+        # step with itself. Spec §4:
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        from . import claude_cli
+
+        size = len(question) + len(context)
+        ceiling = claude_cli.MAX_OS_PROMPT_CHARS
+        if size > ceiling:
+            # Numbers only — no fragment of the question: this reaches the inbox.
+            raise QuestionTooLargeError(
+                f"refused to store a {kind}: question + context is {size} chars, over "
+                f"the {ceiling}-char ceiling (os.max_os_prompt_chars) — shorten it and "
+                f"ask again, referencing what you would have pasted")
         cur = self.conn.execute(
             "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
             "VALUES (?,?,?,?,?,?)",
