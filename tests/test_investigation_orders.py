@@ -14,12 +14,18 @@ exists to protect, in the spec's own order of how much they matter:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
+# The stuck sweep's fixtures and back-dating helpers, shared rather than redeclared: what
+# the sweep files is what this file is about.
+from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
+                               stuck_os)
 
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
 from jarvis.catalog import load_catalog
+from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
 
@@ -890,3 +896,134 @@ def test_the_investigator_prompt_demands_a_gap_class_and_shows_the_registry(
     assert "mechanical" in lowered and "self-heal" in lowered
     # The control: the worker's prompt carries none of it.
     assert "gap_class" not in _prompt(store, "worker", project_spec)
+
+
+# -- the caller the seam was built for: §§3, 5 and 6 of
+# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+# The fixtures are the stuck sweep's own, imported rather than redeclared.
+
+
+def _opened(project_name: str | None = None) -> list[dict]:
+    return ops.list_investigation_orders(project_name, include_settled=True)
+
+
+def _settle(store, inv_id: str, hours_ago: float) -> None:
+    """One investigation settled `hours_ago` — the cooldown's clock (§6b)."""
+    store.set_feature_status(inv_id, "completed")
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - hours_ago * HOUR, inv_id))
+    store.conn.commit()
+
+
+def test_stuck_order_gets_exactly_one_investigation(stuck_os):
+    """§5 end to end, and §6a: the second sweep spends no attempt to learn it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    assert opened[0]["kind"] == "investigation" and opened[0]["origin"] == "fleet_health"
+    assert ops.live_investigation("proj_a", wo["id"]) == opened[0]["id"]
+    assert ops.show_investigation_order(opened[0]["id"])["subject"] == wo["id"]
+
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+
+def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
+    """§6b: the cooldown AND the fingerprint, and either one alone refuses."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "parked and staying parked")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    daemon.stuck_tick(None)
+    first = _opened("proj_a")[0]["id"]
+
+    # Past the 720-minute cooldown with nothing about the situation changed.
+    _settle(store, first, hours_ago=13)
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    # The situation HAS changed, but the cooldown has not run: "it moved" and "it is
+    # better" are not the same claim.
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - 13 * HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 2
+
+
+def test_daily_cap_holds_fleet_wide(jarvis_home, project, tmp_path):
+    """§6c: four a day across the whole fleet, and the cap cuts the LEAST overdue."""
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project)},
+                                   {"name": "proj_b", "path": str(other)}],
+                        name="stuck-two.json")
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+    overdue = {}
+    try:
+        for name, hours in (("proj_a", (9, 8, 7)), ("proj_b", (6, 5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+                overdue[wo["id"]] = h
+
+        Daemon(load_catalog(cat)).stuck_tick(None)
+
+        opened = _opened()
+        assert len(opened) == 4
+        subjects = {ops.show_investigation_order(i["id"])["subject"] for i in opened}
+        assert subjects == set(sorted(overdue, key=lambda i: -overdue[i])[:4])
+    finally:
+        for store in stores.values():
+            store.close()
+
+
+def test_an_investigation_is_never_a_subject(stuck_os):
+    """§6's third layer: the SWEEP skips it, and `ops` still refuses it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    subject = ops.create_work_order("proj_a", "the order being diagnosed")
+    inv = ops.create_investigation_order("proj_a", subject["id"], why=WHY)
+    investigator = store.create_work_order(
+        title=f"investigate {subject['id']}", kind="investigator", parent_id=inv["id"])
+    park_order(store, investigator["id"], "waiting_input", hours=20)
+
+    daemon.stuck_tick(None)
+
+    assert [i["id"] for i in _opened("proj_a")] == [inv["id"]]
+    with pytest.raises(ops.OpsError, match="investigator"):
+        ops.create_investigation_order("proj_a", investigator["id"], why=WHY)
+
+
+def test_a_user_owed_order_is_investigated(stuck_os):
+    """§3: an order that reads as the user's is swept on exactly the same terms."""
+    from jarvis import invariants
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the review could not be satisfied")
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute(
+        "UPDATE work_orders SET needs_attention=1, attention_reason=? WHERE id=?",
+        (invariants.VALIDATION_STUCK_BLOCKER, wo["id"]))
+    store.conn.commit()
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    why = opened[0]["description"]
+    for question in ("Is the blocker true, current and correctly worded?",
+                     "Is it the user's call, or is it the OS failing to decide?",
+                     "Does the user have the reason and the link they need to decide?"):
+        assert question in why

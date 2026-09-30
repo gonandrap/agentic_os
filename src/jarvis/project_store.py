@@ -254,7 +254,13 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 # (src/jarvis/schedule.py), and it is here for `neo`'s reason turned up a notch — it is
 # the only origin where not even a model decided to file this, a clock did, so "why am I
 # paying for this work order" is unanswerable without it.
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule")
+# `fleet_health` earns its place on `schedule`'s grounds turned up once more: NOT EVEN A
+# MODEL decided to file this one — arithmetic over time in state did
+# (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md §5) —
+# so "why am I paying for this" is unanswerable without it. Deliberately NOT in
+# `UNGOVERNED_ORIGINS`: the investigator is dispatched with a full briefing like any child.
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule",
+              "fleet_health")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user, never received
 # the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
@@ -1112,6 +1118,14 @@ CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
+-- What `count_feature_orders` counts: the fleet-health sweep's daily cap asks "how many
+-- investigations did arithmetic file today", every sweep, and the listing it would
+-- otherwise filter in Python walks every investigation the project has ever had
+-- (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md §6c).
+-- `kind` is deliberately NOT in it, though the query names it: that column arrives through
+-- ADDED_COLUMNS, so a live database would run this statement before it existed.
+CREATE INDEX IF NOT EXISTS idx_fo_origin_created
+    ON feature_orders(origin, created_at);
 CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_state ON envelopes(state, id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, subject_fo_id);
@@ -2861,6 +2875,17 @@ class ProjectStore:
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def count_feature_orders(self, kind: str, origin: str, since: float) -> int:
+        """How many of one kind and origin were created since `since`.
+
+        A COUNT rather than `list_feature_orders` filtered in Python, for
+        `feature_status_counts`' reason: the listing walks every row of that kind the
+        project has ever had, and this runs every sweep (spec §6c).
+        """
+        return int(self.conn.execute(
+            "SELECT COUNT(*) n FROM feature_orders WHERE kind=? AND origin=? "
+            "AND created_at >= ?", (kind, origin, float(since))).fetchone()["n"])
 
     def feature_status_counts(self, kind: str | None = "feature") -> dict[str, int]:
         """How many feature orders sit in each status. Counted in SQL, like

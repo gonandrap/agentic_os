@@ -8263,10 +8263,18 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 #: because both of this order's refusals are about the subject (§2.7).
 SUBJECT_KEY = "subject"
 
+#: `feature_orders.metadata` key: `stuck.fingerprint` of the situation this investigation
+#: was opened on, which is the cooldown's memory (§6b of
+#: docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md). On
+#: the row beside `SUBJECT_KEY` rather than in a table of its own, for the reason that key
+#: is there: one more key is no migration, and `jarvis investigate show` can render it.
+STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
+
 
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
-                               origin: str = "jarvis") -> dict[str, Any]:
+                               origin: str = "jarvis",
+                               fingerprint: str = "") -> dict[str, Any]:
     """Open an investigation into one stuck order. Nothing runs here.
 
     A thin `ops` function holding all the logic, because the CLI is not its main caller:
@@ -8303,7 +8311,7 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
             f"{subject} is an {kind} — an investigation never investigates the "
             f"diagnostician. Investigate the subject it was opened on instead."
         )
-    live = _live_investigation(project_name, subject)
+    live = live_investigation(project_name, subject)
     if live:
         raise OpsError(
             f"{live} is already investigating {subject} — `jarvis investigate show "
@@ -8315,7 +8323,8 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
         return store.create_feature_order(
             title=f"investigate {subject}: {title}"[:200], description=why,
             origin=origin, kind="investigation",
-            metadata={SUBJECT_KEY: subject},
+            metadata={SUBJECT_KEY: subject,
+                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {})},
             # The family is this order plus its one investigator, so the family
             # arithmetic is already correct — `create_improvement_order`'s reasoning. The
             # fallback is NOT "no ceiling": the caller is a daemon loop, not a human
@@ -8343,8 +8352,15 @@ def _subject_identity(subject: str,
     return name, str(wo["title"]), str(wo.get("kind") or "worker")
 
 
-def _live_investigation(project_name: str, subject: str) -> str:
-    """The id of the non-terminal investigation already on this subject, or `""`."""
+def live_investigation(project_name: str, subject: str) -> str:
+    """The id of the non-terminal investigation already on this subject, or `""`.
+
+    PUBLIC because the fleet-health sweep asks it BEFORE attempting a creation (§6a): an
+    exception per already-investigated order per sweep is a log the operator learns to
+    ignore, and it is indistinguishable from a real failure on the run row. The refusal
+    inside `create_investigation_order` stays exactly as it is — it is the floor for every
+    other caller.
+    """
     paths = registered_project_paths()
     store = ProjectStore(paths[project_name])
     try:
@@ -8356,6 +8372,31 @@ def _live_investigation(project_name: str, subject: str) -> str:
     finally:
         store.close()
     return ""
+
+
+#: The name every caller before §6a used. Kept as an alias rather than renamed at the call
+#: sites: the two are one function and a second spelling must not become a second body.
+_live_investigation = live_investigation
+
+
+def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] | None:
+    """The newest investigation of ANY status on this subject that carries a fingerprint.
+
+    What the cooldown is read from (§6b). Any status, because a SETTLED one is exactly the
+    case the cooldown is about — `live_investigation` answers the other one.
+    """
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=None, kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject \
+                    and metadata.get(STUCK_FINGERPRINT_KEY):
+                return {**row, STUCK_FINGERPRINT_KEY: str(
+                    metadata[STUCK_FINGERPRINT_KEY])}
+    finally:
+        store.close()
+    return None
 
 
 def list_investigation_orders(project_name: str | None = None,
