@@ -118,6 +118,13 @@ def _write(write: inspection.Write) -> dict[str, Any]:
             "ttl": write.ttl}
 
 
+def _boundary(boundary: usage_mod.Boundary) -> dict[str, Any]:
+    # Spec §3: the census expires with the transcript, so it is sealed (holds are not).
+    return {"ts": boundary.ts, "cause": boundary.cause,
+            "cache_write": boundary.cache_write, "cache_read": boundary.cache_read,
+            "gap": boundary.gap}
+
+
 def _prompt(prompt: inspection.Prompt) -> dict[str, Any]:
     return {"ts": prompt.ts, "kind": prompt.kind, "quote": prompt.quote,
             "source": prompt.source}
@@ -221,6 +228,8 @@ def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
         "join_floor": anatomy.join_floor,
         "unmatched_os_turns": list(anatomy.unmatched_os_turns),
         "writes": [_write(w) for w in anatomy.writes],
+        # Classified ONCE over the session and attributed per turn on the way back in.
+        "boundaries": [_boundary(b) for b in anatomy.boundaries],
         "unattached_subagents": [_subagent(s) for s in anatomy.unattached_subagents],
         "turns": [_turn(t) for t in anatomy.turns],
     }
@@ -315,6 +324,13 @@ def _read_write(row: dict[str, Any]) -> inspection.Write:
                             ttl=row.get("ttl", inspection.TTL_5M))
 
 
+def _read_boundary(row: dict[str, Any]) -> usage_mod.Boundary:
+    return usage_mod.Boundary(ts=row["ts"], cause=row["cause"],
+                              cache_write=row.get("cache_write", 0),
+                              cache_read=row.get("cache_read", 0),
+                              gap=row.get("gap", 0.0))
+
+
 def _read_turn(row: dict[str, Any]) -> inspection.Turn:
     return inspection.Turn(
         seq=row["seq"], started=row["started"], ended=row["ended"],
@@ -355,11 +371,14 @@ def from_seal(payload: dict[str, Any], *,
                                inspection.DEFAULT_INSPECT_REPORT_JOIN_FLOOR),
         turns=[_read_turn(t) for t in payload.get("turns") or []],
         writes=[_read_write(w) for w in payload.get("writes") or []],
+        boundaries=[_read_boundary(b) for b in payload.get("boundaries") or []],
         unattached_subagents=[_read_subagent(s)
                               for s in payload.get("unattached_subagents") or []],
         unmatched_os_turns=list(payload.get("unmatched_os_turns") or []),
         holds=list(spans))
     inspection._attach_holds(anatomy.turns, anatomy.holds)
+    # Spec §3: the sealed census, back in the turn that paid for each boundary.
+    inspection._attach_boundaries(anatomy.turns, anatomy.boundaries)
     return anatomy
 
 
@@ -399,7 +418,8 @@ def seal(project: str, path: Path, order: dict[str, Any], *,
         anatomy = (inspection.read_session(
                        session, cfg,
                        index=index if index is not None else usage_mod.index_sessions(),
-                       spans=spans, turn_starts=store.turn_starts(order["id"]))
+                       spans=spans, turn_starts=store.turn_starts(order["id"]),
+                       cold_prefix_floor=ops.cold_prefix_floor())
                    if session
                    else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,

@@ -141,6 +141,65 @@ def test_every_api_call_of_every_turn_survives_the_seal(real_session):
     assert back.rewrite_excess() == real_session.rewrite_excess()
 
 
+def test_the_boundary_census_is_sealed_and_attributed_back_to_its_turns(real_session):
+    """The census expires with the transcript, so it is SEALED — the opposite treatment to
+    `holds`, which live in the OS's own database and are re-attached live. Unsealed, every
+    boundary, context and rewrite figure of a rehydrated reading reads zero.
+    """
+    assert len(real_session.boundaries) >= 1
+
+    sealed = autopsy.to_seal(real_session, level="normal")
+    back = autopsy.from_seal(sealed, spans=[])
+
+    def rows(a):
+        return [(b.ts, b.cause, b.cache_write, b.cache_read, b.gap) for b in a.boundaries]
+
+    assert rows(back) == rows(real_session)
+    # Attributed to the SAME turns, not merely carried at the session level.
+    assert [len(t.boundaries) for t in back.turns] == \
+        [len(t.boundaries) for t in real_session.turns]
+    assert [[b.cause for b in t.boundaries] for t in back.turns] == \
+        [[b.cause for b in t.boundaries] for t in real_session.turns]
+    assert back.rewrite() == real_session.rewrite()
+    assert [t.usage.as_dict() for t in back.turns] == \
+        [t.usage.as_dict() for t in real_session.turns]
+
+
+def test_a_payload_with_no_census_rehydrates_to_an_empty_one(real_session):
+    """The ROUND TRIP is what carries the census: a payload sealed before this key existed
+    must read as "not measured" rather than raise. No seal exists in the wild (§3 ships
+    dark), which is why `PAYLOAD_VERSION` stays 1."""
+    sealed = autopsy.to_seal(real_session, level="normal")
+    assert sealed["boundaries"]
+    sealed.pop("boundaries")
+
+    back = autopsy.from_seal(sealed, spans=[])
+
+    assert back.boundaries == []
+    assert all(t.boundaries == [] for t in back.turns)
+    assert back.rewrite()["boundaries"] == 0
+
+
+def test_a_seal_reads_at_the_same_cold_prefix_floor_as_every_other_reader(
+        store, spec, write_transcript, monkeypatch):
+    """Read at a lower floor than `jarvis inspect` reads at and a sealed boundary says
+    `undecided` where the live reading decided it — the same floor `supervisor` passes."""
+    from jarvis import ops
+
+    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
+    wo = settled_with_a_session(store, write_transcript, "sess-floor")
+    monkeypatch.setattr(ops, "cold_prefix_floor", lambda *a, **k: 4_242)
+    seen = {}
+    real = inspection.read_session
+    monkeypatch.setattr(inspection, "read_session",
+                        lambda *a, **k: (seen.update(k), real(*a, **k))[1])
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
+
+    assert seen["cold_prefix_floor"] == 4_242
+    assert store.get_work_order(wo["id"])["autopsy_json"]
+
+
 def test_the_three_measured_writes_survive_the_seal_by_cause(real_session):
     """`tests/test_inspection.py:82`'s three, and the causes are the whole point: two of
     them are ~180k tokens each, look identical on a bill and have different fixes."""
@@ -249,13 +308,29 @@ def test_the_call_cap_carries_the_folded_remainder_as_numbers(write_transcript):
     assert autopsy.TURN_CALL_LIMIT == 200
     assert len(sealed["calls"]) == 200 and fold["count"] == 5
     assert len(back.turns[0].calls) == 200, "nothing invented to stand in for a fold"
-    # All four of the figures a fold would otherwise falsify, reconciled.
-    assert (back.turns[0].usage + usage_of_fold(fold)).as_dict() == turn.usage.as_dict()
+    # All four of the figures a fold would otherwise falsify, reconciled. The ADDITIVE
+    # token keys by sum; `rewrite_excess` is max(0, sum(cache_write) - context_peak) and
+    # is NOT additive, so it reconciles by its own definition from the fold's numbers.
+    combined = back.turns[0].usage + usage_of_fold(fold)
+    live = turn.usage.as_dict()
+    additive = ("messages", "input", "cache_write", "cache_read", "output",
+                "cache_1h", "cache_5m", "billed_input", "cached_input", "total_tokens")
+    assert {k: combined.as_dict()[k] for k in additive} == {k: live[k] for k in additive}
     assert max(back.turns[0].context_peak, fold["context_peak"]) == turn.context_peak
     ttl = back.cache_ttl()
     assert {k: ttl[k] + fold["cache_ttl"][k] for k in ttl} == a.cache_ttl()
     written = sum(c.cache_write for c in back.turns[0].calls) + fold["cache_write"]
     assert max(0, written - turn.context_peak) == a.rewrite_excess()
+    assert written - turn.context_peak == live["rewrite_excess"] > 0
+    # And therefore the dollar figure derived from it, which the fold's numbers restate.
+    restated = usage.Usage(
+        messages=combined.messages, input=combined.input,
+        cache_write=combined.cache_write, cache_read=combined.cache_read,
+        output=combined.output, context_peak=turn.context_peak,
+        rewrite_excess=max(0, written - turn.context_peak),
+        cache_1h=combined.cache_1h, cache_5m=combined.cache_5m,
+        cost_by_model=dict(combined.cost_by_model))
+    assert round(restated.rewrite_cost_usd, 2) == live["rewrite_cost_usd"]
 
 
 def test_the_subagent_cap_says_how_many_were_not_sealed(write_transcript):
