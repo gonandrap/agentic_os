@@ -296,7 +296,8 @@
       <p class="sub">It last said: “{{ harvest.said }}”</p>
       {% endif %}
       {% if harvest.unpushed %}
-      <p class="sub">{{ harvest.unpushed }} commit(s) not pushed to
+      <p class="sub">{{ harvest.unpushed }}
+        commit{{ '' if harvest.unpushed == 1 else 's' }} not pushed to
         <code>{{ harvest.upstream }}</code>.</p>
       {% endif %}
       {% if harvest.pr_url %}

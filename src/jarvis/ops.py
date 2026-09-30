@@ -1274,8 +1274,10 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
     else:
         parts = []
         if commits:
+            # PLAIN PROSE, no markdown: this one string is rendered by the HTML page as
+            # well as by the terminal, and the page has no markdown (spec §5).
             parts.append(f"{commits} commit{'s' if commits != 1 else ''} on "
-                         f"`{authored.get('branch') or 'its branch'}`")
+                         f"{authored.get('branch') or 'its branch'}")
         if dirty:
             parts.append(f"{len(dirty)} uncommitted file"
                          f"{'s' if len(dirty) != 1 else ''}"
