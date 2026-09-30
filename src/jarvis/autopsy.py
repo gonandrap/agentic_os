@@ -46,6 +46,7 @@ user's ruling rather than a trade-off.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -516,3 +517,182 @@ def adopts_fresh_reading(sealed: dict[str, Any],
         return False
     was, now = _counts(sealed), _fresh_counts(fresh)
     return all(now[key] >= was[key] for key in was)
+
+
+# -- the read chokepoint ---------------------------------------------------------------
+#
+# THE AUTHORITY SPLIT, and it is a rule rather than a remark (spec §2): the BILL is the
+# authority for MONEY, because it prefers the result envelope via `ops._turn_usage`; the
+# AUTOPSY is the authority for the CLOCK and for context, because it is transcript
+# arithmetic. They already disagree on real orders and the bill already discloses that it
+# does — a later "fix" that makes them agree breaks one of the two.
+
+DERIVED, SEALED = "derived", "sealed"
+
+#: The three levels as three DIFFERENT sentences. `full` is unreachable until §6 and the
+#: rendering carries it anyway: hard-coding two is what makes "no params" ambiguous one
+#: level down. These describe the LEVEL a seal was taken at, which is a different question
+#: from what §6 says about an EMPTY `params`.
+_LEVEL_NOTES = {
+    UNKNOWN: ("this autopsy was sealed before the level was recorded, so what it kept is "
+              "not stated on it"),
+    NORMAL: ("sealed at level `normal`: turn boundaries, API calls, span detail and the "
+             "subagent shape, and no tool parameters at all"),
+    FULL: ("sealed at level `full`: tool parameters and nested subagents kept verbatim, "
+           "redacted"),
+}
+
+#: Rule (b) at the state that is neither a reading nor a seal: no session was ever
+#: recorded, so there is nothing to read and nothing was frozen.
+NOT_RECORDED_NOTE = ("no session id on this order and no sealed autopsy: its clock is "
+                     "NOT RECORDED, which is not the same claim as zero")
+
+#: Asked below a sealed floor with the transcript gone, the seal answers at ITS floors and
+#: says what that costs. TWO DIFFERENT BLINDNESSES, so two sentences: the writes were cut
+#: at seal time by `classify_writes` and are genuinely absent, while the spans are all
+#: there and only the cheapest of a long turn were FOLDED — `Anatomy.joins()` filters at
+#: render. One sentence for both would overstate the join half, which is the same defect
+#: as understating it.
+_FLOOR_LEAD = ("the transcript is gone, so this reading is the SEALED one, reported at "
+               "the floors it can speak for rather than the ones asked for:")
+_FLOOR_WRITE_NOTE = ("its writes were filtered at seal time at a write floor of "
+                     "{write:,} tokens, so it holds NONE below that and the list below "
+                     "is no evidence there were none.")
+_FLOOR_JOIN_NOTE = ("the cheapest spans of a long turn are folded into `spans_folded` at "
+                    "seal time, so below the sealed join floor of {join:.0f}s a folded "
+                    "span is missing from the list rather than absent from the session.")
+
+#: Derived while a seal EXISTS. Rule (a) is about attribution, and "derived" alone cannot
+#: be told from an order that never had a seal at all.
+_DERIVED_BELOW_NOTE = ("derived from the session transcript at a write floor of "
+                       "{write:,} tokens and a join floor of {join:.0f}s BECAUSE that is "
+                       "below this order's seal, taken at {sealed_write:,} tokens and "
+                       "{sealed_join:.0f}s — the seal was passed over, not missing")
+
+
+def autopsy_level_note(level: str) -> str:
+    """What a seal taken at `level` kept — three states, three sentences."""
+    return _LEVEL_NOTES.get(level, _LEVEL_NOTES[UNKNOWN])
+
+
+def _at_floors(sealed: dict[str, Any], spans: Sequence[inspection.Hold],
+               write: Any, join: Any) -> inspection.Anatomy:
+    """One stored payload back, reported at the floors it can actually speak for.
+
+    The requested floors are carried VERBATIM and never coerced: rule (a) is equality of
+    the rendered payload, and an `int` floor answered as a `float` is a disagreement.
+    """
+    anatomy = from_seal(sealed, spans=spans)
+    was_write = sealed.get("write_floor") or anatomy.write_floor
+    was_join = sealed.get("join_floor") or anatomy.join_floor
+    # Filtered DOWN only: a seal taken at 20000 holds no write below 20000, so a lower
+    # request is answered at the SEALED floor and `floor_note` says so.
+    if write >= was_write:
+        anatomy.write_floor = write
+        anatomy.writes = [w for w in anatomy.writes if w.written >= write]
+    else:
+        anatomy.write_floor = was_write
+    anatomy.join_floor = join if join >= was_join else was_join
+    return anatomy
+
+
+def _when(at: float | None) -> str:
+    return f" ({time.strftime('%Y-%m-%d %H:%M', time.localtime(at))})" if at else ""
+
+
+def _keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {k for v in value.values() for k in _keys(v)}
+    if isinstance(value, list):
+        return {k for v in value for k in _keys(v)}
+    return set()
+
+
+def _provenance(source: str, *, anatomy: inspection.Anatomy,
+                sealed: dict[str, Any] | None, floor_note: str = "",
+                note: str = "") -> dict[str, Any]:
+    """Which reading answered, as sentences — the renderers compose none of their own."""
+    level = level_of(sealed) if sealed is not None else UNKNOWN
+    at = sealed.get("sealed_at") if sealed is not None else None
+    if not note:
+        note = (f"read from this order's SEALED autopsy{_when(at)} at a write floor of "
+                f"{anatomy.write_floor:,} tokens and a join floor of "
+                f"{anatomy.join_floor:.0f}s — the transcript was not read"
+                if source == SEALED else
+                f"derived from the session transcript at a write floor of "
+                f"{anatomy.write_floor:,} tokens and a join floor of "
+                f"{anatomy.join_floor:.0f}s")
+    return {"source": source, "sealed_at": at, "level": level,
+            "level_note": autopsy_level_note(level) if sealed is not None else "",
+            "write_floor": anatomy.write_floor, "join_floor": anatomy.join_floor,
+            # Whether the reading carries tool parameters at all: a derived one does, a
+            # seal only at `full` (§6).
+            "params": source == DERIVED or "params" in _keys(sealed or {}),
+            "floor_note": floor_note, "note": note}
+
+
+def anatomy_for(wo: dict[str, Any], cfg: Any, *,
+                spans: Sequence[inspection.Hold],
+                index: dict[str, list[Path]] | None = None,
+                live: bool = False,
+                turn_starts: Sequence[tuple[int, float]] = (),
+                cold_prefix_floor: int | None = None
+                ) -> tuple[inspection.Anatomy, dict[str, Any]]:
+    """This order's anatomy, and which reading answered — §4's ONE chokepoint.
+
+    Prefers the seal, because the transcript it was taken from expires and the seal does
+    not. Beside it comes the provenance every surface PRINTS: a disagreement nobody can
+    attribute is a disagreement nobody can fix, which is the operational half of rule (a).
+
+    THE FLOORS DECIDE WHETHER THE SEAL CAN ANSWER AT ALL. Asked for a floor at or above
+    the sealed one the seal answers, with its writes filtered down to what was asked.
+    Asked for one BELOW it the transcript answers while it exists; once it is gone the
+    seal answers at ITS floors and `floor_note` names them, because a short list handed
+    back under a lower floor reads as "there were none".
+
+    `live=True` reads the transcript anyway — `bill.build(..., live=True)`'s parameter and
+    its justification, the thing a test comparing a seal against a fresh reading needs.
+
+    `turn_starts` and `cold_prefix_floor` widen the signature §4 states, deliberately:
+    dropped, every caller loses the OS's own turn numbering (spec 2026-09-27 §3) and the
+    boundary split falls back to UNDECIDED. It lives HERE and not in `ops` because
+    `supervisor` calls it and imports only `claude_cli` and `structured`, below `ops`.
+    """
+    session = str(wo.get("session_id") or "")
+    write, join = cfg.report_write_floor, cfg.report_join_floor
+    sealed = None if live else unseal(wo)
+
+    def derive() -> inspection.Anatomy:
+        return inspection.read_session(session, cfg, index=index, spans=spans,
+                                       turn_starts=turn_starts,
+                                       cold_prefix_floor=cold_prefix_floor)
+
+    if sealed is not None:
+        was_write = sealed.get("write_floor") or write
+        was_join = sealed.get("join_floor") or join
+        write_below, join_below = write < was_write, join < was_join
+        if (write_below or join_below) and session:
+            fresh = derive()
+            if fresh.found:
+                return fresh, _provenance(
+                    DERIVED, anatomy=fresh, sealed=sealed,
+                    note=_DERIVED_BELOW_NOTE.format(
+                        write=fresh.write_floor, join=fresh.join_floor,
+                        sealed_write=was_write, sealed_join=was_join))
+        anatomy = _at_floors(sealed, spans, write, join)
+        parts = ([_FLOOR_WRITE_NOTE.format(write=anatomy.write_floor)]
+                 if write_below else [])
+        if join_below:
+            parts.append(_FLOOR_JOIN_NOTE.format(join=anatomy.join_floor))
+        return anatomy, _provenance(
+            SEALED, anatomy=anatomy, sealed=sealed,
+            floor_note=" ".join([_FLOOR_LEAD, *parts]) if parts else "")
+    if session:
+        fresh = derive()
+        return fresh, _provenance(DERIVED, anatomy=fresh, sealed=None)
+    # Rule (b)'s third state: no session, no seal, nothing to read — and never a zero
+    # (issue #227). `inspect_report`'s own no-session path, kept through the chokepoint.
+    anatomy = inspection.Anatomy(session_id="", holds=list(spans), write_floor=write,
+                                 join_floor=join)
+    return anatomy, _provenance(DERIVED, anatomy=anatomy, sealed=None,
+                                note=f"{NOT_RECORDED_NOTE} — nothing to read")

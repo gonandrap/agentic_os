@@ -11,6 +11,7 @@
 {{ ui.failed(context) }}
 {% if context.payload %}
 {% set c = context.payload %}
+{{ ui.provenance(c.provenance) }}
 {% if not c.recorded %}{{ ui.note(c.note) }}{% endif %}
 {% for turn in c.turns %}
 <div class="panel" style="margin-bottom: 10px;">
