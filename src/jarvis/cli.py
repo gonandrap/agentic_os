@@ -2129,7 +2129,8 @@ def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
     if not provenance:
         return
     print(f"  reading: {provenance['note']}")
-    for sentence in (provenance["level_note"], provenance["floor_note"]):
+    for sentence in (provenance["level_note"], provenance["params_note"],
+                     provenance["floor_note"]):
         if sentence:
             print(f"           {sentence}")
 

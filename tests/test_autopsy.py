@@ -7,9 +7,10 @@ after it settled would otherwise report a clock that got shorter as the evidence
 Two claims are tested here and nothing else, because nothing else reads a seal yet (§3
 ships dark). First, the FUNCTION-LEVEL ROUND TRIP: `from_seal(to_seal(a))` renders the
 same `as_dict` the live `Anatomy` renders, which is what makes a seal a substitute for the
-transcript rather than a summary of it. Second, THE CAPS: a seal is bounded, and every
-fold carries numbers that reconcile against the uncapped reading — announcing a key is not
-proving a cap.
+transcript rather than a summary of it. At `full` that holds with NOTHING excluded, tool
+`params` included, which is §6; at `normal` the params are the one thing the payload does
+not carry at all. Second, THE CAPS: a seal is bounded, and every fold carries numbers that
+reconcile against the uncapped reading — announcing a key is not proving a cap.
 
 The round trip is pinned on the committed fixture session (`tests/test_inspection.py`'s
 `real_session`) because its three cache writes and two joins were measured from the
@@ -25,17 +26,21 @@ import json
 
 import pytest
 
-from jarvis import autopsy, catalog, holds, inspection, usage
+from jarvis import autopsy, catalog, cli, db, holds, inspection, usage
 from jarvis.daemon import Daemon
 
 from tests.test_cost_report import registered, store  # noqa: F401
 from tests.test_inspection import (  # noqa: F401
     FIXTURE_ROOT,
     FIXTURE_SESSION,
+    TASK,
     assistant_row,
+    parent_rows,
     prompt_row,
     real_session,
+    sub_rows,
     tool_rows,
+    write_meta,
     write_transcript,
 )
 
@@ -45,9 +50,9 @@ PARAM_KEYS = ("params", "params_truncated", "params_dropped")
 def without_params(value):
     """The same payload with every parameter key gone, at any depth.
 
-    §3: tool parameters belong to the `full` level, which is section 6's — so the round
-    trip is asserted over everything EXCEPT them rather than over a fixture whose params
-    have been cleared, which would pass against a `to_seal` that dropped nothing.
+    §6: tool parameters are sealed at `full` and at NO other level, so a `normal` round
+    trip is asserted over everything EXCEPT them — the live reading always has them. The
+    `full` round trip strips nothing: that is section 6's acceptance criterion.
     """
     if isinstance(value, dict):
         return {k: without_params(v) for k, v in value.items() if k not in PARAM_KEYS}
@@ -99,8 +104,52 @@ def test_a_sealed_reading_renders_exactly_what_the_live_one_rendered(real_sessio
 
     assert without_params(back.as_dict()) == without_params(real_session.as_dict())
     assert back.found is True
-    # The seal must NOT carry the parameters — at EITHER level, this child.
+    # §6: a `normal` seal carries no parameters, so they are the round trip's exclusion.
     assert "params" not in keys_of(sealed)
+
+
+def test_a_sealed_reading_at_full_renders_exactly_what_the_live_one_rendered(
+        real_session):
+    """§6's acceptance criterion: at `full` the round trip strips NOTHING — the tool
+    parameters are in the payload and come back byte for byte, so `as_dict` is identical
+    with no `without_params` anywhere.
+    """
+    sealed = autopsy.to_seal(real_session, level="full")
+
+    assert autopsy.from_seal(sealed, spans=[]).as_dict() == real_session.as_dict()
+    # Not vacuous: the parameters really are populated in the SEALED payload.
+    first = sealed["turns"][0]["spans"][0]
+    assert first["detail"] == "List repo structure"
+    assert first["params"] == {"description": "List repo structure"}
+
+
+def test_a_normal_seal_carries_no_parameter_key_at_all(real_session):
+    """§6: at `normal` the payload holds NO `params` key rather than an empty one, which
+    is what makes the level's own sentence the answer to an empty reading."""
+    at_normal = keys_of(autopsy.to_seal(real_session, level="normal"))
+    at_full = keys_of(autopsy.to_seal(real_session, level="full"))
+
+    assert not (at_normal & set(PARAM_KEYS))
+    assert set(PARAM_KEYS) <= at_full
+
+
+def test_sealing_the_committed_session_at_full_changes_none_of_its_pinned_numbers(
+        real_session):
+    """§6: `full` adds retained content and moves no measurement. The eleven numbers are
+    the committed session's, asserted against the REHYDRATED anatomy."""
+    back = autopsy.from_seal(autopsy.to_seal(real_session, level="full"), spans=[])
+    part = back.partition()
+
+    assert round(part["wall"]) == 1886
+    assert round(part["blocked"]) == 582
+    assert round(part["tools"]) == 52
+    assert len(back.turns) == 3
+    assert [len(t.spans) for t in back.turns] == [46, 26, 9]
+    assert [len(t.calls) for t in back.turns] == [32, 26, 10]
+    assert len(back.spans) == 81
+    assert sum(len(t.calls) for t in back.turns) == 68
+    assert len(back.writes) == 3
+    assert sum(len(t.subagents) for t in back.turns) == 0
 
 
 def test_the_holds_are_not_sealed_and_have_to_be_handed_back_in(monkeypatch):
@@ -418,14 +467,14 @@ def test_the_payload_ceiling_drops_in_the_order_the_spec_states(write_transcript
                                                            + a.turns[0].blocked)
 
 
-# -- the redaction battery, over a `normal` seal (§3, §6's cases) ----------------------
+# -- the redaction battery, over a seal at EITHER level (§3, §6's cases) ---------------
 #
-# Triggers (`Prompt.quote`) and span detail are user-authored text and both ARE sealed
-# here, so §6's battery runs over the seal too. `params` are NOT sealed at either level in
-# this child, so the pair shape `_credential_pair` catches — a credential-NAMED dict key
-# holding a credential-SHAPED value — is unreachable from a seal and is not asserted here:
-# it would pass against a payload that carried nothing. Its ASSIGNMENT form, the same
-# named key inside a sealed string, is.
+# Triggers (`Prompt.quote`) and span detail are user-authored text and both ARE sealed at
+# either level, so §6's battery runs over both. `params` are sealed at `full`, so the pair
+# shape `_credential_pair` catches — a credential-NAMED dict key holding a credential-
+# SHAPED value — is reachable from a seal now and IS asserted, below, along with the
+# nested-leaf case. Its ASSIGNMENT form, the same named key inside a sealed string, is
+# what the `normal` half of the battery can reach.
 
 
 def leaky_session(write_transcript, name: str, secret: str, *,
@@ -437,7 +486,12 @@ def leaky_session(write_transcript, name: str, secret: str, *,
     ])
 
 
-def test_a_secret_in_a_bash_command_never_reaches_a_normal_seal(write_transcript):
+LEVELS = ("normal", "full")
+
+
+@pytest.mark.parametrize("level", LEVELS)
+def test_a_secret_in_a_bash_command_never_reaches_a_seal_at_either_level(
+        write_transcript, level):
     """§6's case over the seal: an undescribed `Bash` call puts the command line in
     `ToolSpan.detail`, which IS sealed, so a token there is sealed too unless redaction
     ran before the value was stored."""
@@ -447,38 +501,45 @@ def test_a_secret_in_a_bash_command_never_reaches_a_normal_seal(write_transcript
         command=f'curl -H "Authorization: Bearer {secret}" https://x',
         prompt="You are the worker agent for wo-1"))
 
-    sealed = autopsy.to_seal(a, level="normal")
+    sealed = autopsy.to_seal(a, level=level)
+    span = sealed["turns"][0]["spans"][0]
 
     assert secret not in json.dumps(sealed)
-    assert "<redacted: an Authorization header value>" in \
-        sealed["turns"][0]["spans"][0]["detail"]
+    assert "<redacted: an Authorization header value>" in span["detail"]
+    if level == "full":
+        assert "<redacted: an Authorization header value>" in span["params"]["command"]
 
 
-def test_a_credential_named_key_in_a_command_never_reaches_a_normal_seal(
-        write_transcript):
-    """The named-key case in the only form a seal can carry it: an assignment inside a
-    string, not a `params` pair. `params` are section 6's and are sealed at neither level
-    here."""
+@pytest.mark.parametrize("level", LEVELS)
+def test_a_credential_named_key_in_a_command_never_reaches_a_seal_at_either_level(
+        write_transcript, level):
+    """The named-key case in both forms a seal can carry it: an assignment inside a sealed
+    string at either level, and the `params` pair itself once `full` seals them."""
     secret = "hunter2000abc"
     a = inspection.read_session(leaky_session(
         write_transcript, "seal-leaky-key", secret,
         command=f"DB_PASSWORD={secret} ./deploy.sh",
         prompt="You are the worker agent for wo-1"))
 
-    sealed = autopsy.to_seal(a, level="normal")
+    sealed = autopsy.to_seal(a, level=level)
+    span = sealed["turns"][0]["spans"][0]
 
     assert secret not in json.dumps(sealed)
-    assert inspection.CREDENTIAL_VALUE_MARKER in sealed["turns"][0]["spans"][0]["detail"]
-    assert "params" not in keys_of(sealed)
+    assert inspection.CREDENTIAL_VALUE_MARKER in span["detail"]
+    if level == "full":
+        assert inspection.CREDENTIAL_VALUE_MARKER in span["params"]["command"]
+    else:
+        assert "params" not in keys_of(sealed)
 
 
+@pytest.mark.parametrize("level", LEVELS)
 @pytest.mark.parametrize("secret, prompt", [
     ("ghp_A1b2C3d4E5f6G7h8I9j0",
      "push it with GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0 when the tests pass"),
     ("hunter2000abc", "the staging box takes DB_PASSWORD=hunter2000abc"),
 ])
-def test_a_secret_a_user_typed_never_reaches_a_normal_seal(write_transcript, secret,
-                                                           prompt):
+def test_a_secret_a_user_typed_never_reaches_a_seal_at_either_level(
+        write_transcript, secret, prompt, level):
     """A trigger quote is whatever the user or Jarvis typed, so it carries both of §6's
     cases — and a seal outlives the transcript it was read from, so an unredacted quote is
     a credential the OS keeps for ever in its own database."""
@@ -487,7 +548,7 @@ def test_a_secret_a_user_typed_never_reaches_a_normal_seal(write_transcript, sec
         command="gh pr list", prompt=prompt))
     assert a.turns[0].triggers[0].quote
 
-    sealed = autopsy.to_seal(a, level="normal")
+    sealed = autopsy.to_seal(a, level=level)
 
     assert secret not in json.dumps(sealed)
     assert inspection.CREDENTIAL_VALUE_MARKER in \
@@ -503,7 +564,9 @@ CUTTABLE_SECRET = "a1b2c3d4e5f6g7h8i9j0"
 CUT_HEAD = CUTTABLE_SECRET[:5]
 
 
-def test_a_sealed_detail_is_redacted_before_it_is_truncated(write_transcript):
+@pytest.mark.parametrize("level", LEVELS)
+def test_a_sealed_detail_is_redacted_before_it_is_truncated_at_either_level(
+        write_transcript, level):
     """Order, in the seal: truncating first would cut the assignment short and seal the
     HEAD of the credential. A cut marker is a cosmetic loss; half a secret is not."""
     command = f"DB_PASSWORD={CUTTABLE_SECRET} ./deploy.sh"
@@ -512,14 +575,19 @@ def test_a_sealed_detail_is_redacted_before_it_is_truncated(write_transcript):
                       command=command, prompt="You are the worker agent for wo-1"),
         catalog.InspectConfig(quote_chars=len("DB_PASSWORD=") + len(CUT_HEAD)))
 
-    sealed = autopsy.to_seal(a, level="normal")
+    sealed = autopsy.to_seal(a, level=level)
+    span = sealed["turns"][0]["spans"][0]
 
     assert CUT_HEAD not in json.dumps(sealed)
     # The marker's own head is what the cut lands in, which is the cosmetic loss.
-    assert sealed["turns"][0]["spans"][0]["detail"].startswith("DB_PASSWORD=<red")
+    assert span["detail"].startswith("DB_PASSWORD=<red")
+    if level == "full":
+        assert inspection.CREDENTIAL_VALUE_MARKER in span["params"]["command"]
 
 
-def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped(write_transcript):
+@pytest.mark.parametrize("level", LEVELS)
+def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped_at_either_level(
+        write_transcript, level):
     """The same order on the other sealed string: the quote cap must never leave the head
     of a credential standing where the whole value would have been replaced."""
     prompt = f"DB_PASSWORD={CUTTABLE_SECRET} is what staging takes"
@@ -528,10 +596,244 @@ def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped(write_transcript
                       command="gh pr list", prompt=prompt),
         catalog.InspectConfig(quote_chars=len("DB_PASSWORD=") + len(CUT_HEAD)))
 
-    sealed = autopsy.to_seal(a, level="normal")
+    sealed = autopsy.to_seal(a, level=level)
 
     assert CUT_HEAD not in json.dumps(sealed)
     assert sealed["turns"][0]["triggers"][0]["quote"].startswith("DB_PASSWORD=<red")
+
+
+# -- the two cases only `params` can carry, reachable from a seal at `full` (§6) --------
+
+
+def test_a_credential_named_param_key_is_replaced_whole_in_a_full_seal(write_transcript):
+    """The pair shape `inspection._credential_pair` catches: a credential-NAMED dict key
+    holding a credential-SHAPED value. No sealed string carries it — only `params` do — so
+    this case was unreachable from a seal until `full` sealed them."""
+    session = write_transcript("seal-pair", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash",
+                   {"command": "./deploy.sh", "password": "hunter2000abc"}),
+    ])
+    a = inspection.read_session(session)
+
+    sealed = autopsy.to_seal(a, level="full")
+
+    assert "hunter2000abc" not in json.dumps(sealed)
+    assert sealed["turns"][0]["spans"][0]["params"]["password"] == \
+        inspection.CREDENTIAL_VALUE_MARKER
+
+
+def test_a_secret_in_a_nested_edit_never_reaches_a_full_seal(write_transcript):
+    """`test_a_secret_in_a_nested_edit_never_reaches_the_payload`'s case over the seal: a
+    `MultiEdit` input is a list of dicts, so the credential is a LEAF that neither
+    assignment regex sees after `json.dumps`."""
+    token = "ghp_A1b2C3d4E5f6G7h8I9j0"
+    session = write_transcript("seal-nested-edit", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "MultiEdit",
+                   {"file_path": "x",
+                    "edits": [{"old_string": "a", "new_string": f"GH_TOKEN={token}"}]}),
+    ])
+    a = inspection.read_session(session)
+
+    sealed = autopsy.to_seal(a, level="full")
+
+    assert token not in json.dumps(sealed)
+    assert inspection.CREDENTIAL_VALUE_MARKER in \
+        sealed["turns"][0]["spans"][0]["params"]["edits"]
+
+
+def test_a_sealed_param_value_is_redacted_before_it_is_truncated(write_transcript):
+    """The order claim on a sealed PARAM, where `ParamCaps.per_value` is 500 and is not
+    configurable: the cut is built to land FIVE characters into the secret, so cutting
+    first would seal `CUT_HEAD` — which the credential SHAPE no longer matches, making a
+    later redaction incapable of removing it."""
+    caps = inspection.PARAM_CAPS
+    head, assign, tail = "echo ", " DB_PASSWORD=", " ./deploy.sh"
+    filler = "x" * (caps.per_value - len(head) - len(assign) - len(CUT_HEAD))
+    command = head + filler + assign + CUTTABLE_SECRET + tail
+    assert len(command) > caps.per_value, "the cut must really happen"
+    assert command[:caps.per_value] == head + filler + assign + CUT_HEAD
+    a = inspection.read_session(write_transcript("seal-cut-param", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"description": "deploy", "command": command}),
+    ]))
+
+    sealed = autopsy.to_seal(a, level="full")
+    span = sealed["turns"][0]["spans"][0]
+
+    assert CUT_HEAD not in json.dumps(sealed)
+    assert "DB_PASSWORD=<red" in span["params"]["command"]
+    assert "command" in span["params_truncated"]
+
+
+def test_a_sealed_param_dropped_for_the_turn_budget_is_announced_and_leaks_nothing(
+        write_transcript):
+    """The other order claim: redact BEFORE cap. Once a turn has spent `per_turn` the
+    later span's keys are DROPPED, and the seal must say which — a payload that drops
+    silently is not reproducible, and the value must never have carried the secret."""
+    caps = inspection.PARAM_CAPS
+    rows = [prompt_row(0, "You are the worker agent for wo-1")]
+    for i in range(caps.per_turn // caps.per_span):
+        rows += tool_rows(1 + i, 2 + i, f"t{i}", "Bash",
+                          {f"k{j}": "c" * (caps.per_span // 4) for j in range(4)})
+    rows += tool_rows(500, 501, "t-last", "Bash",
+                      {"description": "deploy",
+                       "command": "DB_PASSWORD=hunter2000abc ./deploy.sh"})
+    a = inspection.read_session(write_transcript("seal-burn", rows))
+
+    sealed = autopsy.to_seal(a, level="full")
+    last = sealed["turns"][0]["spans"][-1]
+
+    assert "hunter2000abc" not in json.dumps(sealed)
+    assert last["params"] == {}
+    assert last["params_dropped"] == ["description", "command"]
+
+
+# -- nested subagents at `full`, and the field a rehydration must not lose (§6) ---------
+
+
+def test_a_nested_subagent_s_params_survive_the_round_trip_at_full(write_transcript,
+                                                                  tmp_path):
+    """§6's other half: nested subagent anatomies WITH their params. The nesting is
+    recursive, so the level has to reach a subagent's own spans and not only the lead's."""
+    session = write_transcript("nested-full", parent_rows(),
+                              subagents={f"agent-{TASK}": sub_rows(1100, write=25_000)})
+    write_meta(tmp_path, session, TASK, "explorer")
+    a = inspection.read_session(session)
+
+    sealed = autopsy.to_seal(a, level="full")
+
+    assert sealed["turns"][0]["subagents"][0]["turns"][0]["spans"][0]["params"] == \
+        {"pattern": "needle"}
+    assert autopsy.from_seal(sealed, spans=[]).as_dict() == a.as_dict()
+
+
+def test_a_secret_in_a_nested_subagent_s_params_never_reaches_a_full_seal(
+        write_transcript, tmp_path):
+    """The nesting is REDACTED and not copied: the secret lives only in the subagent's own
+    span params, which is a place the lead's sealed strings can never speak for."""
+    secret = "sk-live-0ff1ce9a7b3c2d"
+    session = write_transcript("nested-leak", parent_rows(), subagents={
+        f"agent-{TASK}": [
+            prompt_row(1100, "do the thing", sdk=False),
+            *tool_rows(1101, 1102, "s-t1", "Bash",
+                       {"description": "call the API",
+                        "command": f'curl -H "Authorization: Bearer {secret}" https://x'}),
+        ]})
+    write_meta(tmp_path, session, TASK, "explorer")
+    a = inspection.read_session(session)
+    sub_span = a.turns[0].subagents[0].turns[0].spans[0]
+    assert sub_span.detail == "call the API", "the secret is only in the params"
+
+    sealed = autopsy.to_seal(a, level="full")
+
+    assert secret not in json.dumps(sealed)
+    assert "<redacted: an Authorization header value>" in \
+        sealed["turns"][0]["subagents"][0]["turns"][0]["spans"][0]["params"]["command"]
+
+
+def test_a_backgrounded_delegation_span_is_still_backgrounded_after_the_seal(
+        write_transcript):
+    """Neo 1124: `backgrounded` is sealed at EVERY level because `ToolSpan.is_join`
+    derives from it. Without the field a backgrounded `Agent` rehydrates as a join and
+    `Turn.blocked` counts seconds the live reading never did."""
+    a = inspection.read_session(write_transcript("backgrounded", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 100, "bg", "Agent",
+                   {"description": "d", "run_in_background": True}),
+        *tool_rows(101, 150, "fg", "Agent", {"description": "d"}),
+    ]))
+    live = a.turns[0]
+    bg, fg = live.spans
+    assert (bg.backgrounded, bg.is_join) == (True, False)
+    assert (fg.backgrounded, fg.is_join) == (False, True)
+
+    back = autopsy.from_seal(autopsy.to_seal(a, level="normal"), spans=[]).turns[0]
+
+    sealed_bg, sealed_fg = back.spans
+    assert (sealed_bg.backgrounded, sealed_bg.is_join) == (True, False)
+    assert (sealed_fg.backgrounded, sealed_fg.is_join) == (False, True)
+    assert back.blocked == live.blocked
+
+
+def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_transcript,
+                                                                     monkeypatch):
+    """§6 activates rungs 1 and 2 of section 3's ceiling: at `full` the parameters are the
+    FIRST thing given up, the lead's before the subagents'."""
+    rows = [prompt_row(0, "You are the worker agent for wo-1")]
+    rows += tool_rows(10, 20, "tool0", "Agent", {"task_id": "sub0"})
+    rows += [r for i in range(30)
+             for r in tool_rows(30 + i * 5, 32 + i * 5, f"b{i}", "Bash",
+                                {"description": f"reading file number {i}"})]
+    rows.append(assistant_row(400, "m-last", write=900))
+    session = write_transcript("fat-full", rows, subagents={
+        "agent-sub0": [prompt_row(11, "go")]
+        + [r for i in range(20)
+           for r in tool_rows(12 + i, 12.5 + i, f"s{i}", "Bash",
+                              {"description": f"subagent read {i}"})]
+        + [assistant_row(40, "s-last", write=300)]})
+    a = inspection.read_session(session)
+
+    # `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes.
+    whole = len(db.to_json(autopsy.to_seal(a, level="full")))
+    monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", whole - 1)
+    once = autopsy.to_seal(a, level="full")
+
+    assert once["dropped_for_size"] == ["params"]
+    assert not (keys_of(once["turns"][0]["spans"][0]) & set(PARAM_KEYS))
+    assert once["turns"][0]["subagents"][0]["turns"][0]["spans"][0]["params"]
+
+    # The ceiling is checked BEFORE `dropped_for_size` is added, so the announcement's own
+    # bytes are not part of what the next rung is measured against.
+    unannounced = {k: v for k, v in once.items() if k != "dropped_for_size"}
+    monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", len(db.to_json(unannounced)) - 1)
+    twice = autopsy.to_seal(a, level="full")
+
+    assert twice["dropped_for_size"][:2] == ["params", "subagent_params"]
+    assert not (keys_of(twice["turns"][0]["subagents"][0]) & set(PARAM_KEYS))
+
+
+# -- the empty-params sentence, three states and one renderer (§6) ----------------------
+
+
+def test_an_empty_params_at_normal_says_the_level_did_not_record_them():
+    note = autopsy.params_note(autopsy.NORMAL, False)
+
+    assert "not recorded at this level" in note
+
+
+def test_an_empty_params_at_full_says_the_order_ran_no_tools():
+    note = autopsy.params_note(autopsy.FULL, False)
+
+    assert "ran no tools" in note
+
+
+def test_an_empty_params_on_a_seal_predating_the_level_is_a_third_state():
+    """The ambiguity §6 exists to close must not come back as a default: three levels,
+    three DIFFERENT claims, and nothing to say when there ARE parameters."""
+    notes = [autopsy.params_note(level, False)
+             for level in (autopsy.NORMAL, autopsy.FULL, autopsy.UNKNOWN)]
+
+    assert len(set(notes)) == 3
+    assert all(notes)
+    assert "not recorded at this level" not in notes[2]
+    assert "ran no tools" not in notes[2]
+    assert autopsy.params_note(autopsy.FULL, True) == ""
+
+
+def test_the_provenance_carries_the_sentence_and_the_renderer_prints_it(real_session,
+                                                                       capsys):
+    """The renderer composes NOTHING: the sentence it prints is the payload's own."""
+    sealed = autopsy.to_seal(real_session, level="normal")
+    sealed["sealed_at"] = 5.0
+    provenance = autopsy._provenance(autopsy.SEALED, anatomy=real_session, sealed=sealed)
+
+    assert provenance["params_note"] == autopsy.params_note(autopsy.NORMAL, False)
+
+    cli._print_autopsy_provenance(provenance)
+
+    assert provenance["params_note"] in capsys.readouterr().out
 
 
 # -- the daemon step, and the level that gates it ---------------------------------------
