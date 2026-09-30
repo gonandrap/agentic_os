@@ -24,7 +24,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import cli, inspection, ops, uilog, usage  # noqa: E402
+from jarvis import autopsy, cli, inspection, ops, uilog, usage  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
@@ -249,6 +249,56 @@ def test_one_unreadable_block_leaves_the_other_three_standing(client, dispatched
     assert "RuntimeError" in page.text and "kaboom" in page.text
 
 
+# -- 3b. the two derivations this page renders, after the 2026-09-28 spec -------------
+
+
+def test_a_hold_the_round_ended_renders_closed_on_the_debug_page(client, project):
+    """The dashboard end of §2d1. wo-3615faf7 read "still held" 11.7h after the round
+    that ended the hold passed, because the synthesised transport hold was closed only by
+    a resubmission. Spec §2d1 of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md."""
+    from jarvis import db
+    from jarvis.holds import HOLD_CAUSES, PAUSE_USAGE_LIMIT
+    from jarvis.project_store import VALIDATION_HELD_CAUSE
+
+    wo = ops.create_work_order("proj_a", "held, then judged")
+    store = ProjectStore(project)
+    try:
+        held_at = db.now() - 7200
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": 1, "cause": VALIDATION_HELD_CAUSE}, ts=held_at)
+        store.add_event(wo["id"], "validation_passed", {"round": 1}, ts=held_at + 3600)
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}/debug")
+
+    assert page.status_code == 200
+    assert HOLD_CAUSES[PAUSE_USAGE_LIMIT] in page.text
+    assert "still held" not in page.text
+
+
+def test_the_work_order_page_says_the_spans_stop_short_of_the_status(client, project):
+    """The dashboard end of §2d2's belt: `_states.html` renders `states.notes`, so the
+    page says the record stops short instead of presenting a stale span as the present
+    tense. A reader that silently believed the gap is why nobody noticed for 20.7h."""
+    wo = ops.create_work_order("proj_a", "the gapped one")
+    store = ProjectStore(project)
+    try:
+        store.set_status(wo["id"], "waiting_input")
+        store.conn.execute("UPDATE work_orders SET status='needs_review' WHERE id=?",
+                           (wo["id"],))
+        store.conn.commit()
+    finally:
+        store.close()
+
+    page = client.get(f"/wo/proj_a/{wo['id']}")
+
+    assert page.status_code == 200
+    # Jinja-escaped, as every OS sentence on this page is: the note has an apostrophe.
+    assert ops.SPANS_BEHIND_NOTE.replace("'", "&#39;") in page.text
+
+
 # -- 4. absent is never zero (issue #227) ---------------------------------------------
 
 def test_an_order_with_no_session_says_so_instead_of_reporting_zeroes(client):
@@ -263,6 +313,9 @@ def test_an_order_with_no_session_says_so_instead_of_reporting_zeroes(client):
     assert "no transcript" in page.text                # the anatomy's `found: false`
     assert ops.NOT_RECORDED in page.text               # the ledger's forward-only note
     assert "0 turns" not in page.text and "0 tokens" not in page.text
+    # §4 of 2026-09-27: and the page says WHICH reading gave that answer — rendered above
+    # the `found` short-circuit, so it is visible in the one case it matters.
+    assert page.text.count(autopsy.NOT_RECORDED_NOTE) >= 2  # anatomy AND the ledger
 
 
 def test_an_order_predating_the_context_ledger_renders_the_forward_only_note(
@@ -276,6 +329,29 @@ def test_an_order_predating_the_context_ledger_renders_the_forward_only_note(
     assert page.status_code == 200
     assert ops.NOT_RECORDED in page.text
     assert ops.TURN_NOT_RECORDED in page.text
+    # An unsealed order's ledger says it was DERIVED: the forward-only note is about the
+    # ledger, the provenance is about the reading, and the two absences are not one.
+    assert "derived from the session transcript" in page.text
+
+
+def test_a_sealed_order_says_on_the_page_that_it_was_read_from_its_seal(
+        client, dispatched, transcripts):
+    """§4: every surface PRINTS which reading answered. The transcript is deleted here,
+    which is the case the seal exists for — the page still shows the anatomy."""
+    from jarvis import autopsy
+
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"), assistant_row(at + 2, "m1", write=60_000)])
+    name, path, _row = ops.find_work_order(wo_id)
+    autopsy.seal(name, path, store.get_work_order(wo_id))
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug")
+
+    assert page.status_code == 200
+    assert "SEALED autopsy" in page.text
+    assert autopsy.autopsy_level_note(autopsy.NORMAL) in page.text
 
 
 # -- 5. the JSON the poll reads -------------------------------------------------------

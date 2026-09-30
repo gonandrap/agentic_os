@@ -281,6 +281,23 @@ def _block(label: str, read, *args, **kwargs) -> dict:
                           "will raise it in `jarvis inbox` on its next tick.")}
 
 
+def _fix_filed_notice(filed: str) -> str:
+    """What the fix POST just did, rebuilt from its `?filed=` — `ops` owns every word.
+
+    AN APPROVAL ID, A `pending-<id>`, OR A BOUNDED FLAG, and anything else renders NOTHING:
+    a note built from the query string reads as the OS speaking about what happened to an
+    order (spec §11, and `ops.fix_filed_notice`'s docstring for why that matters even when
+    autoescaped). The pending shape is parsed as the prefix plus an INTEGER — `isdigit`, so
+    `pending-abc` and `pending--1` are not ids and render nothing.
+    """
+    if filed.isdigit():
+        return ops.fix_filed_notice(int(filed))
+    if filed.startswith(ops.FIX_PENDING_PREFIX):
+        rest = filed[len(ops.FIX_PENDING_PREFIX):]
+        return ops.fix_pending_notice(int(rest)) if rest.isdigit() else ""
+    return ops.fix_flag_notice(filed) or ""
+
+
 def _rel_url(request: Request) -> str:
     """Path plus query — `?error=…` is often the whole story of a failed click."""
     q = request.url.query
@@ -381,6 +398,44 @@ def alarm_badge() -> int | None:
                     if a["live"]}) or None
     except Exception:  # noqa: BLE001 — see docstring
         return None
+
+
+def _order_href(order_id: str) -> str | None:
+    """Where an allow-listed order's page is, or None when it no longer resolves."""
+    try:
+        if order_id.startswith("fo-"):
+            pname, _, _ = ops.find_feature_order(order_id)
+            return f"/fo/{pname}/{order_id}"
+        pname, _, _ = ops.find_work_order(order_id)
+        return f"/wo/{pname}/{order_id}"
+    except ops.OpsError:
+        return None
+
+
+def brake_state() -> dict | None:
+    """The user's brake (`jarvis pause`) and the post-reopen ramp, for the banner every
+    page carries — or None when neither is in force.
+
+    `ops.fleet_summary`, the dict `jarvis status` prints its "⏸ FLEET PAUSED" line from,
+    so the page and the terminal read one record (issue #843). Never raises, like the nav
+    badges: a banner must not be the reason a page 500s.
+    """
+    try:
+        central = CentralStore()
+        try:
+            fl = ops.fleet_summary(central)
+        finally:
+            central.close()
+    except Exception:  # noqa: BLE001 — see docstring
+        return None
+    if not fl["paused"] and not fl["ramp"]:
+        return None
+    fl["since_text"] = invariants.clock(fl["since"]) if fl.get("since") else ""
+    fl["allowed"] = [{"id": i, "href": _order_href(i)} for i in fl["allow"]]
+    if fl["ramp"]:
+        fl["ramp"] = {**fl["ramp"], "since_text": invariants.clock(fl["ramp"]["since"]),
+                      "until_text": invariants.clock(fl["ramp"]["until"])}
+    return fl
 
 
 def _decorate_question(q: dict) -> dict:
@@ -774,6 +829,9 @@ def create_app() -> FastAPI:
         # "a worker turn may be in flight right now", so the page can withhold the
         # `claude --resume` invitation rather than put a second driver on one session.
         active_statuses=ACTIVE_STATUSES,
+        # The statuses the user's brake can hold — where a "let this order through"
+        # button means something. The daemon's own list, not a page-local guess.
+        fleet_held_statuses=invariants.FLEET_HELD_STATUSES,
         instance=instance_badge(),
         fmt_tok=fmt_tok, fmt_dur=fmt_dur, fmt_ts=fmt_ts,
         # The bill's two explanations, taken from the module that computes the numbers
@@ -811,6 +869,7 @@ def create_app() -> FastAPI:
                             + c.get("unreviewed", 0)) or None
         ctx["gate_badge"] = gate_badge()
         ctx["alarm_badge"] = alarm_badge()
+        ctx["brake"] = brake_state()
         return templates.TemplateResponse(request, template, ctx,
                                           status_code=status_code)
 
@@ -943,6 +1002,14 @@ def create_app() -> FastAPI:
                  "status_label": feature_status_label("improvement", row["status"])}
                 for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
                                                      kind="improvement")]
+            # A third kind beside them, on the same rule and for the same reason (§2.9 of
+            # docs/superpowers/specs/2026-09-27-investigation-orders.md): `planning` here
+            # reads `investigating`, and only LIVE ones are worth a line.
+            investigations = [
+                {**row,
+                 "status_label": feature_status_label("investigation", row["status"])}
+                for row in store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind="investigation")]
             fo_counts = store.feature_status_counts()
             wos = store.list_work_orders(statuses=statuses, include_hidden=show_hidden)
             # Inside the store's lifetime: the label reads the dependencies' own rows.
@@ -986,6 +1053,7 @@ def create_app() -> FastAPI:
                       hidden_count=hidden_count, settled=settled, revealed=revealed,
                       features=features, fo_settled=fo_settled,
                       improvements=improvements,
+                      investigations=investigations,
                       issue_board=issue_board,
                       fo_revealed=fo_revealed)
 
@@ -1089,6 +1157,25 @@ def create_app() -> FastAPI:
         return render(request, "improvement_order.html", io=detail,
                       project=detail["project"], error=error)
 
+    @app.get("/inv/{name}/{inv_id}", response_class=HTMLResponse)
+    def investigation_order(request: Request, name: str, inv_id: str, error: str = ""):
+        """An investigation's page — §2.9 of
+        docs/superpowers/specs/2026-09-27-investigation-orders.md.
+
+        The classification and the subject first, then the root cause, the evidence and
+        what was filed: a diagnosis is only readable next to what it was quoted from.
+        Everything comes off `ops.show_investigation_order` — a second resolution here
+        would make the page and `jarvis investigate show` two answers to one question.
+        NO POST action: there is nothing to decide, which is the visible difference from
+        the improvement-order page above.
+        """
+        try:
+            detail = ops.show_investigation_order(inv_id, name)
+        except ops.OpsError as e:
+            return render(request, "error.html", message=str(e))
+        return render(request, "investigation_order.html", inv=detail,
+                      project=detail["project"], error=error)
+
     @app.post("/io/{name}/{io_id}/review")
     def review_findings(name: str, io_id: str, key: str = Form(...),
                         decision: str = Form(...), reason: str = Form("")):
@@ -1123,7 +1210,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = ""):
+                   forced: str = "", retried: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1180,6 +1267,15 @@ def create_app() -> FastAPI:
             forced_lines = ops.forced_round_notice(
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
+            # The retry control, and the note a press just left — §7b of
+            # docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
+            # order that is not `failed`, so no control renders there at all. The notice
+            # is REBUILT from an id this order's own record knows: a number the query
+            # string invented states no fact.
+            retry = ops.retry_state(store, wo)
+            retried_line = (ops.retry_queued_notice(int(retried))
+                            if retried.isdigit()
+                            and any(m["id"] == int(retried) for m in messages) else "")
             # And the same for the assumption review, on the same rule — and for the
             # same reason one authority along: None keeps the line off the page for
             # every order the mechanism never looked at.
@@ -1223,6 +1319,7 @@ def create_app() -> FastAPI:
                       merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
+                      retry=retry, retried_line=retried_line,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
@@ -1234,7 +1331,7 @@ def create_app() -> FastAPI:
                       turn_lines=turn_lines_by_message(bill))
 
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
-    def work_order_debug(request: Request, name: str, wo_id: str):
+    def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
         """"Show me all of the above on one page" — spec §7 of
         docs/specs/2026-09-24-order-observability.md.
 
@@ -1255,6 +1352,11 @@ def create_app() -> FastAPI:
         return render(
             request, "debug.html", project=pname, wo=wo,
             diagnosis=_block("the diagnosis", ops.diagnose, wo_id, pname),
+            # §11, under the diagnosis it acts on. `confirm=False`: OPENING A PAGE MUST
+            # WRITE NOTHING — no grant, no Neo question, no event. Only the POST below
+            # confirms, and what it carries back is an id or a bounded flag, never text.
+            fix=_block("the fix", ops.fix, wo_id, pname),
+            fix_filed=_fix_filed_notice(filed),
             live=_block("the live snapshot", ops.live_report, wo_id, pname),
             anatomy=_block("the anatomy", ops.inspect_report, wo_id, pname),
             context=_block("the context ledger", ops.context_report, wo_id, pname))
@@ -1687,6 +1789,59 @@ def create_app() -> FastAPI:
         ops.resume_in_auto(wo_id, project_name=name)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
+    @app.post("/wo/{name}/{wo_id}/fix")
+    def fix_wo(name: str, wo_id: str):
+        """`jarvis wo fix --confirm` from the debugging page — the SAME `ops.fix`, so the
+        two surfaces cannot come to disagree about what is offered or what it touches.
+
+        IT FILES AND NOTHING MORE: `ops.fix` proposes a `self_heal` grant a reviewer
+        decides, and `Daemon.remedy_tick` applies an approved one. This route adds no
+        authority and AUTHORS NO TEXT — `?filed=` carries the gate request's NUMBER, the
+        way `validation/force` carries a round, and `ops.fix_filed_notice` rebuilds the
+        sentence on the page.
+
+        NOTHING FILED CARRIES NO ID: an unreachable Neo with no request redirects with the
+        bounded flag `unreachable`, and one that left a PENDING request carries its number
+        as `pending-<id>` — a request the user can answer themselves, which is the one thing
+        that gets them unstuck. A payload that proposed nothing redirects with no query at
+        all, so the page cannot claim a request exists. An `ops.OpsError` adds nothing
+        either — the GET re-reads `ops.fix` and `_block` renders that same refusal in place.
+        """
+        back = f"/wo/{name}/{wo_id}/debug"
+        try:
+            out = ops.fix(wo_id, name, confirm=True)
+        except ops.OpsError:
+            return RedirectResponse(f"{back}#block-fix", status_code=303)
+        filed = out["filed"] or {}
+        if filed.get("unreachable"):
+            held = filed.get("approval")
+            tag = (f"{ops.FIX_PENDING_PREFIX}{int(held)}" if held else "unreachable")
+            return RedirectResponse(f"{back}?filed={tag}#block-fix", status_code=303)
+        approval = filed.get("approval")
+        if not approval:
+            return RedirectResponse(f"{back}#block-fix", status_code=303)
+        return RedirectResponse(f"{back}?filed={int(approval)}#block-fix",
+                                status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/retry")
+    def retry_wo(name: str, wo_id: str, message: str = Form("")):
+        """`jarvis wo retry` from the work-order page — the SAME `ops.retry`, so the two
+        surfaces cannot come to disagree about which orders may be relaunched.
+
+        `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
+        rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
+        docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        """
+        back = f"/wo/{name}/{wo_id}"
+        try:
+            out = ops.retry(wo_id, message=message.strip() or None, project_name=name,
+                            relay=True)
+        except ops.OpsError as e:
+            return RedirectResponse(
+                f"{back}?{urlencode({'error': str(e)}, quote_via=quote)}#retry",
+                status_code=303)
+        return RedirectResponse(f"{back}?retried={out['msg_id']}#retry", status_code=303)
+
     @app.post("/wo/{name}/{wo_id}/validation/force")
     def force_validation(name: str, wo_id: str, reason: str = Form(...)):
         """`jarvis validation force` from the dashboard — the SAME `ops` call, so the two
@@ -1889,6 +2044,41 @@ def create_app() -> FastAPI:
                 f"{back}{sep}{urlencode({'error': str(e)}, quote_via=quote)}",
                 status_code=303)
         return RedirectResponse(back, status_code=303)
+
+    # -- the brake: `jarvis pause` / `jarvis resume` (issue #843) ------------------------
+
+    @app.post("/fleet/pause")
+    def pause_fleet(reason: str = Form(""), next: str = Form("")):
+        """`jarvis pause`, from the dashboard. Refuses a second press while paused rather
+        than calling through: re-pausing REPLACES the allow-list, and a form on a page
+        rendered before someone else paused would silently throw it away."""
+        central = CentralStore()
+        try:
+            current = fleet.load_pause(central)
+        finally:
+            central.close()
+        if current is not None:
+            return RedirectResponse(_same_site_back(
+                next, "/", quote("the fleet is already paused — nothing changed")),
+                status_code=303)
+        ops.pause_fleet(reason=reason.strip())
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
+
+    @app.post("/fleet/resume")
+    def resume_fleet(next: str = Form("")):
+        """`jarvis resume --all`: lift the pause for the whole fleet."""
+        ops.resume_fleet(everything=True)
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
+
+    @app.post("/fleet/allow")
+    def allow_through(order_id: str = Form(...), next: str = Form("")):
+        """`jarvis resume <wo-id>`: let one order through the pause."""
+        try:
+            ops.resume_fleet([order_id.strip()])
+        except ops.OpsError as e:
+            return RedirectResponse(_same_site_back(next, "/", quote(str(e))),
+                                    status_code=303)
+        return RedirectResponse(_same_site_back(next, "/"), status_code=303)
 
     @app.post("/inbox/ack")
     def ack(inbox_id: str = Form("")):

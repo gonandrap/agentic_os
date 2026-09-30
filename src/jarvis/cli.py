@@ -645,7 +645,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
 
     c.add_argument("--observability", choices=["off", "normal", "full"],
-                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). The three levels: "
+                        "`off` — no per-turn context ledger and no sealed autopsy. It does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page: those read files that already exist, so the autopsy READING — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level. What `off` stops is the autopsy being SEALED, so that reading survives only as long as Claude Code keeps the transcript. "
+                        "`normal` — the default: the per-turn context ledger, and the autopsy sealed onto the order when it settles. "
+                        "`full` — that, plus the detail a `full` seal retains: verbatim tool parameters and nested subagent anatomies")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -679,7 +682,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    m = wo.add_parser("send", help="send feedback to the worker handling a work order")
+    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
+                                   "on a failed order this also revives the session; "
+                                   "`wo retry` is the named form")
     m.add_argument("wo_id")
     m.add_argument("message")
     m.add_argument("--project")
@@ -786,11 +792,39 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
 
+    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
+                                     "the named form of `wo send`'s revive. Nothing "
+                                     "automatic: a turn that died with no result is "
+                                     "never replayed by the OS")
+    rt.add_argument("wo_id")
+    rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
+                                      "own relaunch note, unattributed")
+    rt.add_argument("--project")
+
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
                                    "commands that would be accepted right now")
     wy.add_argument("wo_id")
     wy.add_argument("--project")
+
+    fx = wo.add_parser("fix", help="clear the blocker `jarvis wo why` just named: the OS "
+                                   "matches it against the remedies it has, and says what "
+                                   "one of them would do. Nothing is done without "
+                                   "--confirm, and a confirmed fix is filed for a "
+                                   "reviewer to approve before the OS acts")
+    fx.add_argument("wo_id")
+    fx.add_argument("--project")
+    fx.add_argument("--remedy", help="name the remedy instead of letting the blocker "
+                                     "choose it — `file_work_order` is reachable only "
+                                     "this way, and only with --argument")
+    fx.add_argument("--argument", help="what the remedy is asked to do: the message a "
+                                      "nudge carries, or the title and brief of the work "
+                                      "order `file_work_order` files")
+    fx.add_argument("--confirm", action="store_true",
+                    help="file it. A reviewer decides, and the OS acts only after the "
+                         "gate opens")
+    fx.add_argument("--json", action="store_true")
 
     # feature orders -------------------------------------------------------------------
     # Parallel to `wo` on purpose: a user who knows the work-order surface should not
@@ -966,6 +1000,56 @@ def build_parser() -> argparse.ArgumentParser:
 
     for i in io.choices.values():
         i.add_argument("--json", action="store_true", help="machine-readable output")
+
+    # investigation orders ---------------------------------------------------------------
+    # Beside the improvement order, the surface it is a pair with: `io` wants the cause
+    # argued and files nothing until the user decides; an investigation settles itself.
+    # §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    inv = sub.add_parser(
+        "investigate",
+        help="investigation orders: diagnose one stuck order read-only and classify it",
+    ).add_subparsers(dest="inv_cmd", required=True)
+
+    v = inv.add_parser("create", help="open an investigation into one stuck order (the "
+                                      "default: `jarvis investigate <subject>`)")
+    v.add_argument("subject", help="the wo-/fo-/io- id that is not progressing")
+    v.add_argument("--why", required=True,
+                   help="what you saw. Required: the investigator's first reader is a "
+                        "fresh session with no memory of the conversation that produced "
+                        "it")
+    v.add_argument("--project", help="whose project the subject is in (default: resolved "
+                                     "from the subject id)")
+    v.add_argument("--origin", default="jarvis", choices=["jarvis", "ui", "manual"])
+    v.add_argument("--budget", metavar="USD",
+                   help="cap the whole order — it and its investigator — at N dollars. "
+                        "Omit for the catalog's `investigation_budget_usd`, which is NOT "
+                        "no ceiling: the caller here is usually a daemon loop")
+
+    v = inv.add_parser("list", help="investigations and where each one stands")
+    v.add_argument("project", nargs="?")
+    v.add_argument("--all", action="store_true", help="include settled ones")
+
+    v = inv.add_parser("show", help="one investigation: the classification and the "
+                                    "subject, then the root cause and the evidence")
+    v.add_argument("inv_id")
+    v.add_argument("--project")
+
+    v = inv.add_parser("cancel", help="stop an investigation and its investigator")
+    v.add_argument("inv_id")
+    v.add_argument("--project")
+
+    v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
+                                       "investigator's terminal action, and what settles "
+                                       "the order")
+    v.add_argument("inv_id")
+    v.add_argument("--from-file", required=True, dest="from_file", metavar="PATH",
+                   help="the verdict, as JSON. A file rather than an argument on purpose: "
+                        "a verdict is full of repo paths and quoted log lines, which is "
+                        "exactly what trips the privileged-action classifier")
+    v.add_argument("--project")
+
+    for v in inv.choices.values():
+        v.add_argument("--json", action="store_true", help="machine-readable output")
 
     # gates (privileged-action approvals) ------------------------------------------------
     ga = sub.add_parser(
@@ -1670,8 +1754,13 @@ def _print_os_calls(res: dict) -> None:
               f"{_tok(r['billed_input']):>8} {_tok(r['output']):>7}  {r['model'][:28]}"
               f"{'' if r['ok'] else '  (failed)'}")
     for kind in unit.get("os_by_kind") or []:
+        # The largest input only where one was measured (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md): 0 means the rows
+        # predate the columns, and printing it would read as an empty prompt.
+        biggest = kind.get("max_input_chars") or 0
+        size = f", largest input {biggest:,} characters" if biggest else ""
         print(f"  {kind['label']}: {kind['calls']} call"
-              f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}")
+              f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}{size}")
 
 
 def _print_subprocess_calls(res: dict) -> None:
@@ -2043,6 +2132,21 @@ def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
             print(f"               ({note})")
 
 
+def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
+    """Which reading answered — spec §4 of 2026-09-27-order-autopsy-durability.md.
+
+    COMPOSES NOTHING. The sentence, the level sentence and the sealed-floor warning are
+    all keys of the payload `autopsy.anatomy_for` returned, for `ago_phrase`'s reason: a
+    renderer that words one of them is one the dashboard will disagree with.
+    """
+    if not provenance:
+        return
+    print(f"  reading: {provenance['note']}")
+    for sentence in (provenance["level_note"], provenance["floor_note"]):
+        if sentence:
+            print(f"           {sentence}")
+
+
 def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
                    params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
@@ -2055,6 +2159,20 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
 
     head = f"{unit['wo_id']} — {unit['title']}"
     print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
+    # Before the transcript check: an OS-side input was measured when the call was made
+    # and does not depend on a transcript surviving. Omitted, never zeroed, when nothing
+    # measured one (spec §3,
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    biggest = unit.get("largest_os_input")
+    if biggest:
+        print(f"  biggest input jarvis sent — {biggest['kind']} "
+              f"{biggest['label']}: {biggest['prompt_chars']:,} characters of prompt, "
+              f"{biggest['system_prompt_chars']:,} of system prompt "
+              f"({biggest['model'] or 'model not recorded'})")
+    # ABOVE the transcript check, in `largest_os_input`'s position and for its reason:
+    # which reading answered is exactly what a reader needs when nothing was found, and
+    # a provenance line below the early return is invisible in the one case it matters.
+    _print_autopsy_provenance(unit.get("provenance"))
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -2070,6 +2188,23 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
     print(f"  re-written {_tok(unit['rewrite_excess'])} tokens · cache writes bought at "
           f"5m {_tok(ttl['cache_5m'])}, 1h {_tok(ttl['cache_1h'])}"
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
+    # A `--json`-only field nobody can see is half a fix (spec of 2026-09-29 §3). The
+    # unclassified form replaces the pair rather than printing "0 expired", which would
+    # read as a finding the reading cannot support.
+    rewrite = unit.get("rewrite") or {}
+    if rewrite.get("boundaries"):
+        if rewrite.get("undecided_boundaries"):
+            split = (f"{rewrite['compact_boundaries']} compacted, "
+                     f"{rewrite['undecided_boundaries']} unclassified "
+                     "(no os.cold_prefix_floor)")
+        else:
+            prefix = (rewrite["boundaries"] - rewrite["ttl_boundaries"]
+                      - rewrite["compact_boundaries"])
+            split = (f"{prefix} prefix, "
+                     f"{rewrite['ttl_boundaries']} expired, "
+                     f"{rewrite['compact_boundaries']} compacted")
+        print(f"  boundaries {rewrite['boundaries']} — {split} · re-written "
+              f"{_tok(rewrite['tokens'])} of {_tok(rewrite['cache_write'])} written")
 
     print()
     # The legend for the bars below, keyed off the same dict they are drawn from — a
@@ -2278,6 +2413,27 @@ def _normalise_issues(argv: list[str]) -> list[str]:
     if len(argv) > 1 and argv[1] in (*ISSUES_SUBCOMMANDS, "-h", "--help"):
         return argv
     return [argv[0], "list", *argv[1:]]
+
+
+#: The `investigate` sub-verbs — a CLOSED set, and that is the whole disambiguation:
+#: `jarvis investigate <subject>` takes a bare subject while every other spelling takes a
+#: sub-verb, so the second word is a sub-verb when it is one of these and a SUBJECT
+#: otherwise. A subject is always a `wo-`/`fo-`/`io-` id and can therefore never collide
+#: with one of these four words.
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict")
+
+
+def _normalise_investigate(argv: list[str]) -> list[str]:
+    """Insert the implicit `create` so `jarvis investigate <subject> --why …` parses.
+
+    `_normalise_alarms`' mechanism and its argparse reason: a subparser group IS the
+    positional, so a bare subject beside it would be read as an invalid sub-verb.
+    """
+    if not argv or argv[0] != "investigate":
+        return argv
+    if len(argv) > 1 and argv[1] in (*INVESTIGATE_SUBCOMMANDS, "-h", "--help"):
+        return argv
+    return [argv[0], "create", *argv[1:]]
 
 
 def cmd_issues_start(args: argparse.Namespace) -> int:
@@ -2566,6 +2722,14 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['os_calls']} call{'s' if totals['os_calls'] != 1 else ''} "
               f"(Neo answering, panel seats, digests), "
               f"{_tok(totals['os_billed_input'])} in, {_tok(totals['os_output'])} out")
+        # In full, never abbreviated: this is the number a reader quotes when asking why
+        # a call was that big (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Absent rather
+        # than a zero when nothing recorded a size.
+        if totals.get("os_max_input_chars"):
+            print(f"                largest input "
+                  f"{totals['os_max_input_chars']:,} characters "
+                  f"(prompt + system prompt, of one call)")
     if totals.get("subproc_calls"):
         print(f"  subprocesses  ~${totals['subproc_cost_usd']:.2f} — "
               f"{totals['subproc_calls']} claude "
@@ -2662,6 +2826,9 @@ def _print_context(res: dict[str, Any]) -> None:
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
     (spec docs/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
+    # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
+    # the one who most needs to know which reading was consulted.
+    _print_autopsy_provenance(res.get("provenance"))
     if not res["recorded"]:
         print(f"\n  {res['note']}")
         return
@@ -2940,12 +3107,24 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "retry":
+        # `relay=True` as `send` does: `ops.user_authorship` decides whether this process
+        # is a surface the human reaches, and `ops.retry` drops it for its own note.
+        _print(ops.retry(args.wo_id, message=args.message,
+                         project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
             _print(diagnosis, True)
         else:
             _print_diagnosis(diagnosis)
+    elif args.wo_cmd == "fix":
+        proposal = ops.fix(args.wo_id, project_name=args.project, remedy=args.remedy,
+                           argument=args.argument, confirm=args.confirm)
+        if args.json:
+            _print(proposal, True)
+        else:
+            _print_fix(proposal)
     return 0
 
 
@@ -2995,6 +3174,8 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         for episode in held["episodes"]:
             mark = " (still held)" if episode["open"] else ""
             print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    # Where `_diagnose_holds`' reading surfaces, so its provenance belongs here.
+    _print_autopsy_provenance(held.get("provenance"))
     residual = held["unexplained"]
     if residual["seconds"] is None:
         print(f"  unexplained: none measurable — {residual['note']}")
@@ -3022,6 +3203,44 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         print(f"  {command['command']}\n      {command['why']}")
     for refusal in d["refusals"]:
         print(f"  not offered: {refusal}")
+
+
+def _print_fix(f: dict[str, Any]) -> None:
+    """`jarvis wo fix` for a person — A RENDERER AND NOTHING ELSE, `_print_diagnosis`'s rule.
+
+    Every sentence below is `ops.fix`'s: the blocker, the note, the remedy's own `headline`
+    and `blast`, what confirming does, the verdict on a filed one. Nothing is derived here
+    and nothing is re-worded — a terminal reader and a `--json` consumer are looking at one
+    reading of one record.
+
+    There is no empty list to print, ever: `remedy`, `proposal`, `your_move` and `filed`
+    are each a value or None, and a None prints nothing at all while `note` says why in
+    words (issue #227).
+    """
+    print(f"{f['wo_id']} — {f['title']}  ({f['project']})")
+    print(f"  {f['status']}")
+    print(f"\nwaiting on: {f['blocker']['what']} — {f['blocker']['detail']}")
+    print(f"\n{f['note']}")
+
+    proposal = f["proposal"]
+    if proposal:
+        print(f"\nthe `{proposal['remedy']}` remedy on {proposal['subject']}:")
+        print(f"  what it does: {proposal['headline']}")
+        print(f"  what it touches, and what it cannot undo: {proposal['blast']}")
+        print(f"  what it is asked to do: {proposal['argument']}")
+        print(f"  {proposal['approving']}")
+
+    move = f["your_move"]
+    if move:
+        print(f"\n  {move['detail']}\n      {move['note']}")
+
+    filed = f["filed"]
+    if filed:
+        print(f"\n{filed['note']}")
+        if filed["question"]:
+            print(f"  Neo question {filed['question']} carries it to a reviewer")
+        if filed["unreachable"]:
+            print(f"  {filed['reason']}")
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
@@ -3275,6 +3494,87 @@ def cmd_io(args: argparse.Namespace) -> int:
         else:
             amount = None if args.clear else _parse_budget_amount(args.amount)
             _print(ops.set_feature_budget(args.io_id, amount, args.project), args.json)
+
+    return 0
+
+
+def cmd_investigate(args: argparse.Namespace) -> int:
+    """`jarvis investigate …` — A THIN WRAPPER HOLDING NO LOGIC.
+
+    §2.7 of docs/superpowers/specs/2026-09-27-investigation-orders.md: every verb calls
+    the matching `ops` function and formats what comes back, because the companion
+    fleet-health order calls those same functions directly from the daemon and must never
+    shell out to `jarvis`. A rule written here would be a rule that caller does not have.
+
+    Statuses and icons are the feature order's, as `jarvis io` reuses them: the statuses
+    ARE `FO_STATUSES`; only the labels differ, and those come from
+    `project_store.feature_status_label`.
+    """
+    from . import ops, verdicts
+
+    if args.inv_cmd == "create":
+        inv = ops.create_investigation_order(args.project, args.subject, args.why,
+                                             budget_usd=_budget_arg(args),
+                                             origin=args.origin)
+        _print({"created": inv["id"], "subject": args.subject,
+                "status": inv["status"],
+                **({"budget_usd": inv["budget_usd"]} if inv.get("budget_usd") else {}),
+                "note": "it reads the record and settles itself — a GAP files an "
+                        "expedited bug after a duplicate check"}, args.json)
+
+    elif args.inv_cmd == "list":
+        rows = ops.list_investigation_orders(args.project, include_settled=args.all)
+        if args.json:
+            _print(rows, True)
+        elif not rows:
+            print("no investigations")
+        else:
+            for row in rows:
+                icon = FO_ICON.get(row["status"], "•")
+                att = " ⚠" if row["needs_attention"] else ""
+                print(f"{icon} {row['id']} [{row['project']}] {row['title']} "
+                      f"({row['status_label']}, {_age(row['created_at'])}){att}")
+
+    elif args.inv_cmd == "show":
+        detail = ops.show_investigation_order(args.inv_id, args.project)
+        detail["budget"] = ops.feature_order_budget(args.inv_id, detail["project"])
+        if args.json:
+            _print(detail, True)
+        else:
+            # THE CLASSIFICATION AND THE SUBJECT FIRST (§2.9), then the argument.
+            print(f"{FO_ICON.get(detail['status'], '•')} {detail['id']} "
+                  f"[{detail['project']}] {detail['status_label']}")
+            print(f"\n{detail['classification'] or 'no verdict yet'} — "
+                  f"{detail['subject']}")
+            print(f"\n{detail['why']}\n")
+            if detail["attention_reason"]:
+                print(f"⚠ {detail['attention_reason']}\n")
+            if detail["budget"]["budget_usd"]:
+                b = detail["budget"]
+                print(f"budget: ${b['spent_usd']:.2f} of ${b['budget_usd']:.2f}")
+            if detail["investigator"]:
+                i = detail["investigator"]
+                print(f"investigator: {i['id']} ({i['status']})")
+            if detail["alarms"]:
+                print(f"alarms: {ops.alarm_standing_line(detail['alarms'])}")
+            if detail["verdict"]:
+                print()
+                for line in verdicts.render_verdict(detail["verdict"]):
+                    print(line)
+
+    elif args.inv_cmd == "cancel":
+        _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
+
+    elif args.inv_cmd == "verdict":
+        path = Path(args.from_file)
+        if not path.is_file():
+            raise ops.OpsError(f"no such verdict file: {path}")
+        try:
+            doc = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise ops.OpsError(f"{path} is not valid JSON: {e}") from e
+        _print(ops.submit_verdict(args.inv_id, doc, project_name=args.project),
+               args.json)
 
     return 0
 
@@ -4361,8 +4661,8 @@ def cmd_ui(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    argv = _normalise_issues(
-        _normalise_alarms(list(sys.argv[1:] if argv is None else argv)))
+    argv = _normalise_investigate(_normalise_issues(
+        _normalise_alarms(list(sys.argv[1:] if argv is None else argv))))
     # accept --json anywhere, not only before the subcommand
     as_json = "--json" in argv
     args = build_parser().parse_args([a for a in argv if a != "--json"])
@@ -4409,6 +4709,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_fo(args)
         if args.cmd == "io":
             return cmd_io(args)
+        if args.cmd == "investigate":
+            return cmd_investigate(args)
         if args.cmd == "gate":
             return cmd_gate(args)
         if args.cmd == "rules":

@@ -6,6 +6,7 @@
 <noscript><meta http-equiv="refresh" content="{{ refresh }}"></noscript>
 {% endblock %}
 {% block content %}
+{% import "_brake.html" as brake_ui %}
 
 <div id="live-top">
 
@@ -116,6 +117,7 @@
         {% if wo.pause %}
           <div class="sub">⏳ {{ wo.pause }}</div>
         {% endif %}
+        {{ brake_ui.let_through(brake, wo, '/') }}
         {% if wo.blocked_by %}
           <div class="sub">⊘ blocked by:
             {% for b in wo.blocked_by %}<a class="mono"
@@ -135,6 +137,20 @@
 </div>
 
 </div><!-- /live-top -->
+
+{# The brake, from here as from `jarvis pause`. Outside every live region, like the
+   forms below: a poll must not clobber a half-typed reason. While paused the banner at
+   the top carries "Resume all" instead. #}
+{% if not (brake and brake.paused) %}
+<h2>Fleet brake</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <form method="post" action="/fleet/pause" style="display: flex; gap: 10px;">
+    <input type="text" name="reason" aria-label="why the fleet is paused"
+           placeholder="why (optional) — shown on every page while paused">
+    <button type="submit" class="danger" title="`jarvis pause`: no work order starts a turn — dispatch, relaunch, message delivery, validation — until you let it through or resume. Turns in flight finish; nothing is killed or lost.">Pause fleet</button>
+  </form>
+</div>
+{% endif %}
 
 <h2>New work order</h2>
 <div class="panel" style="padding: 14px 16px;">
@@ -204,7 +220,7 @@
    a half-typed order. */
 (function () {
   var REFRESH_MS = {{ refresh }} * 1000;
-  var REGIONS = ["live-chrome", "live-top", "live-bottom"];
+  var REGIONS = ["live-chrome", "live-brake", "live-top", "live-bottom"];
   var timer = null;
 
   function swap(fresh, current) {

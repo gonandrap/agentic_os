@@ -90,7 +90,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 TRANSCRIPT_ROOT_ENV = "JARVIS_TRANSCRIPT_ROOT"
 
@@ -237,6 +237,9 @@ class Usage:
     #: compacted across. The rest moved the prefix.
     boundaries_ttl: int = 0
     boundaries_compact: int = 0
+    #: Boundaries whose TTL-vs-prefix split was left OPEN — the caller had no
+    #: `os.cold_prefix_floor`. Counted in `resume_boundaries` and in no write bucket.
+    boundaries_undecided: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -281,6 +284,8 @@ class Usage:
                                    + other.rewrite_compact_write),
             boundaries_ttl=self.boundaries_ttl + other.boundaries_ttl,
             boundaries_compact=self.boundaries_compact + other.boundaries_compact,
+            boundaries_undecided=(self.boundaries_undecided
+                                  + other.boundaries_undecided),
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -366,6 +371,7 @@ class Usage:
             "rewrite_ttl_excess": self.rewrite_ttl_excess,
             "boundaries_ttl": self.boundaries_ttl,
             "boundaries_compact": self.boundaries_compact,
+            "boundaries_undecided": self.boundaries_undecided,
             "rewrite_compact_write": self.rewrite_compact_write,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
@@ -713,6 +719,80 @@ def calls_of(path: Path | str) -> list[Call]:
     ]
 
 
+#: Why one cache boundary happened. `UNDECIDED` is the TTL-vs-prefix split left OPEN
+#: because the caller could not reach `os.cold_prefix_floor` — it is never produced when a
+#: floor was passed, and it is not a fourth cause.
+BOUNDARY_COMPACTED = "compacted"
+BOUNDARY_TTL = "ttl"
+BOUNDARY_PREFIX = "prefix"
+BOUNDARY_UNDECIDED = "undecided"
+
+
+@dataclass
+class Boundary:
+    """One place a conversation was re-written, and what re-wrote it."""
+
+    ts: float          # the call that paid for it
+    cause: str
+    cache_write: int   # that call's own write
+    cache_read: int
+    gap: float         # seconds since the previous call, 0.0 for the first
+
+
+def classify_boundaries(calls: Sequence[Call], *, compactions: Sequence[float] = (),
+                        cold_prefix_floor: int | None = None) -> list[Boundary]:
+    """Every cold boundary in a run of calls, with the cause each is attributed to.
+
+    THE OS'S ONE IMPLEMENTATION of "a cache read that went backwards is a boundary, and
+    here is what caused it". Lifted out of `_usage_of` so every surface that needs the
+    judgement reads the same one rather than restating it — `inspection.Turn.usage`
+    reported a structural zero on every turn of every order for want of it (issue #867).
+
+    ONE RUN OF CALLS, and the caller decides what a run is. `_usage_of` passes ONE FILE:
+    `session_calls` concatenates every segment of a session, so a session-wide run sees
+    an extra boundary between the last call of segment 1 and the first of segment 2 where
+    a per-file run sees none.
+
+    `cold_prefix_floor=None` yields `BOUNDARY_UNDECIDED` for anything the TTL test would
+    have decided. Rules 1 and 2 need no floor, so a boundary is still COUNTED and a
+    compacted one still LABELLED; the split is left open rather than guessed, for the
+    reason stated where the threshold is not defaulted (see `TTL_BREAK_EVEN` above).
+    """
+    found: list[Boundary] = []
+    previous_read: int | None = None
+    previous_ts: float | None = None
+    for call in calls:
+        read = call.cache_read
+        ts = call.ts or None
+        # A turn boundary shows up as the cache going BACKWARDS: this call read less
+        # of the prefix than the one before it did. Counting the drops rather than
+        # thresholding the write size keeps this free of magic numbers, and it lands
+        # on exactly (turns - 1) for every work order measured.
+        if previous_read is not None and read < previous_read:
+            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
+            gap = (ts - previous_ts) if (ts and previous_ts) else None
+            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
+                       and cold_prefix_floor is not None
+                       and read <= cold_prefix_floor)
+            # Tested FIRST: a compacted boundary reads the static head seconds after
+            # the summary landed, which is indistinguishable from a prefix miss by the
+            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
+            if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
+                cause = BOUNDARY_COMPACTED
+            elif expired:
+                cause = BOUNDARY_TTL
+            elif cold_prefix_floor is None:
+                cause = BOUNDARY_UNDECIDED
+            else:
+                cause = BOUNDARY_PREFIX
+            found.append(Boundary(ts=call.ts, cause=cause,
+                                  cache_write=call.cache_write, cache_read=read,
+                                  gap=gap or 0.0))
+        previous_read = read
+        previous_ts = ts
+    return found
+
+
 def session_calls(session_id: str, root: Path | None = None,
                   index: dict[str, list[Path]] | None = None) -> list[Call]:
     """The LEAD agent's API calls for one session, across every segment of it.
@@ -819,8 +899,7 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
         return Usage()
     compactions = compaction_stamps(path)
     usage = Usage(messages=len(messages))
-    previous_read: int | None = None
-    previous_ts: float | None = None
+    calls: list[Call] = []
     for message in messages:
         model = message.get("model") or ""
         ts = message.get("ts") or None
@@ -842,29 +921,8 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
                             ("cache_1h", hour), ("cache_5m", five)):
             counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
-        # A turn boundary shows up as the cache going BACKWARDS: this call read less
-        # of the prefix than the one before it did. Counting the drops rather than
-        # thresholding the write size keeps this free of magic numbers, and it lands
-        # on exactly (turns - 1) for every work order measured.
-        if previous_read is not None and read < previous_read:
-            usage.resume_boundaries += 1
-            # Expired, or the prefix moved: findings/2026-08-30-where-the-800-dollars-went.md
-            gap = (ts - previous_ts) if (ts and previous_ts) else None
-            expired = (gap is not None and gap >= WRITE_TTL_SECONDS
-                       and read <= cold_prefix_floor)
-            # Tested FIRST: a compacted boundary reads the static head seconds after
-            # the summary landed, which is indistinguishable from a prefix miss by the
-            # gap-and-read test alone. See `Usage.rewrite_compact_write`.
-            if ts and previous_ts and any(previous_ts < c <= ts for c in compactions):
-                usage.rewrite_compact_write += write
-                usage.boundaries_compact += 1
-            elif expired:
-                usage.rewrite_ttl_write += write
-                usage.boundaries_ttl += 1
-            else:
-                usage.rewrite_prefix_write += write
-        previous_read = read
-        previous_ts = ts
+        calls.append(Call(ts=ts or 0.0, model=model, input=plain, cache_write=write,
+                          cache_read=read, output=out, cache_1h=hour, cache_5m=five))
         # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
         # most accurate this estimate can be made without the CLI's own figure.
         classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
@@ -875,8 +933,36 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
         cost = sum(classes.values())
         if cost:
             usage.cost_by_model[model] = usage.cost_by_model.get(model, 0.0) + cost
+    # ONE FILE at a time, which is what keeps this an exact refactor: a session-wide run
+    # would see a boundary between two segments where this walk sees none
+    # (`classify_boundaries`' own note). `read_session` calls this per path.
+    fold_boundaries(usage, classify_boundaries(
+        calls, compactions=compactions, cold_prefix_floor=cold_prefix_floor))
     usage.rewrite_excess = max(0, usage.cache_write - usage.context_peak)
     return usage
+
+
+def fold_boundaries(usage: Usage, boundaries: Sequence[Boundary]) -> None:
+    """Add a classified run of boundaries into a `Usage`'s six boundary fields.
+
+    Beside the classifier rather than in each caller: `_usage_of` and
+    `inspection.Turn.usage` fill the same keys, and two spellings of the fold is how one
+    key comes to mean two things on two surfaces. An `UNDECIDED` boundary lands in
+    `resume_boundaries` and in NO write bucket — `rewrite_ttl_share` then returns None,
+    which the renderers are already required not to print as 0%.
+    """
+    for boundary in boundaries:
+        usage.resume_boundaries += 1
+        if boundary.cause == BOUNDARY_COMPACTED:
+            usage.rewrite_compact_write += boundary.cache_write
+            usage.boundaries_compact += 1
+        elif boundary.cause == BOUNDARY_TTL:
+            usage.rewrite_ttl_write += boundary.cache_write
+            usage.boundaries_ttl += 1
+        elif boundary.cause == BOUNDARY_UNDECIDED:
+            usage.boundaries_undecided += 1
+        else:
+            usage.rewrite_prefix_write += boundary.cache_write
 
 
 def priced(model: str, *, input: int = 0, cache_write: int = 0, cache_read: int = 0,

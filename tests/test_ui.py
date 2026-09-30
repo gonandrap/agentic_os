@@ -2001,6 +2001,105 @@ def test_the_project_page_lists_improvement_orders_without_expanding_findings(im
     assert "before touching the dispatch path" not in page
 
 
+# -- investigation orders ------------------------------------------------------------
+#
+# §2.9 of docs/superpowers/specs/2026-09-27-investigation-orders.md: the page leads with
+# the classification and the subject, then the root cause, the evidence and what was
+# filed. NO POST action — there is nothing to decide, and that absence is what "the order
+# settles itself" looks like on a screen.
+
+
+@pytest.fixture()
+def investigation(client, project):
+    """A settled investigation with a WAITING_ON_USER verdict on it."""
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order(
+        "proj_a", subject,
+        "wo-x has been `validating` for six hours with no turn in flight.")
+    store = ProjectStore(project)
+    try:
+        investigator = store.create_work_order(f"investigate {subject}",
+                                               kind="investigator",
+                                               parent_id=inv["id"], status="running")
+        store.update_feature_order(inv["id"], plan_wo_id=investigator["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+    return client, ops.show_investigation_order(inv["id"]), investigator, subject
+
+
+def test_the_investigation_page_leads_with_the_classification_and_the_subject(
+        investigation):
+    client, inv, investigator, subject = investigation
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+
+    assert "WAITING_ON_USER" in page
+    assert subject in page
+    assert "is written once and never" in page          # the root cause
+    assert "the panel gave up after 3 rounds" in page   # the evidence quote
+    assert html.escape(f"jarvis wo show {subject}") in page   # its source
+    assert "as-4" in page                               # what the user owes
+    assert f"/wo/proj_a/{investigator['id']}" in page
+    # Nothing to decide: the difference from the improvement-order page. The base
+    # layout's search box is a GET, so the assertion is about POSTs.
+    assert 'method="post"' not in page
+
+
+def test_the_investigation_page_says_what_was_filed(client, project):
+    from jarvis.testing import a_verdict
+
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "it has not moved in 6h.")
+    store = ProjectStore(project)
+    try:
+        child = store.create_work_order("investigate it", kind="investigator",
+                                        parent_id=inv["id"])
+        store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+        store.set_feature_status(inv["id"], "planning")
+    finally:
+        store.close()
+    out = ops.submit_verdict(inv["id"], a_verdict("ALREADY_TRACKED", subject=subject))
+
+    page = client.get(f"/inv/proj_a/{inv['id']}").text
+    assert "ALREADY_TRACKED" in page
+    assert "#790" in page          # the duplicate it matched
+    assert out["filed"] is None
+
+
+def test_an_unknown_investigation_says_so_instead_of_failing(client):
+    page = client.get("/inv/proj_a/inv-nosuchid")
+    assert page.status_code == 200
+    assert "inv-nosuchid" in page.text
+
+
+def test_the_project_page_lists_live_investigations_beside_the_other_kinds(client,
+                                                                          project):
+    store = ProjectStore(project)
+    try:
+        subject = store.create_work_order("ship the CSV export")["id"]
+    finally:
+        store.close()
+    inv = ops.create_investigation_order("proj_a", subject, "no turn in six hours.")
+
+    page = client.get("/project/proj_a").text
+
+    assert page.count(f"/inv/proj_a/{inv['id']}") == 1
+    assert "Investigations" in page
+    assert subject in page   # the subject is what the line is about
+
+
 def _settle_feature(project, title, status):
     """A feature order in a terminal status, with no ceremony about how it got there."""
     fo = ops.create_feature_order("proj_a", title, description="the whole ask, at "
@@ -2909,3 +3008,116 @@ def test_the_feature_order_page_never_grows_a_work_order_review_form(client, pro
     assert "Validation" in page and "the plan cannot be judged" in page
     assert "/wo/proj_a/" not in page.split(">Validation<")[1]
     assert "over the panel's objection" not in html.unescape(" ".join(page.split()))
+
+
+def test_the_open_span_says_when_it_last_moved(client, daemon, project):
+    """Fix 4's span line: "still in it" is true but is not the live fact.
+
+    Spec: docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md.
+    """
+    wo = ops.create_work_order("proj_a", "risky change")
+    daemon.tick()
+    store = ProjectStore(project)
+    try:
+        store.add_event(wo["id"], "turn_ended")
+    finally:
+        store.close()
+
+    page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
+    assert "still in it · active" in html.unescape(page)
+
+
+# -- the retry control -----------------------------------------------------------------
+# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+
+#: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
+#: the timeline or the conversation, which also talk about retries (kn-d51713af).
+RETRY_HEADING = "Retry this work order"
+
+
+def _page(client, wo_id: str, query: str = "") -> str:
+    return html.unescape(" ".join(client.get(f"/wo/proj_a/{wo_id}{query}").text.split()))
+
+
+def _died(daemon, project, session: bool = True) -> dict:
+    """A work order whose worker died without delivering — with or without a session."""
+    wo = ops.create_work_order("proj_a", "died without delivering")
+    if session:
+        daemon.tick()
+    store = ProjectStore(project)
+    try:
+        if session:
+            store.set_status(wo["id"], "failed")
+        else:
+            store.release_dispatch_claim(wo["id"], "worker turn never started",
+                                         max_attempts=1)
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_the_retry_control_is_on_a_failed_order_and_on_no_other(client, daemon, project):
+    """`ops.retry_state`'s None convention: no control at all where the mechanism does
+    not apply, rather than a permanently disabled box on every page."""
+    dead = _died(daemon, project)
+    live = ops.create_work_order("proj_a", "still going")
+    daemon.tick()
+
+    assert RETRY_HEADING in _page(client, dead["id"])
+    assert RETRY_HEADING not in _page(client, live["id"])
+
+
+def test_the_no_session_refusal_renders_above_a_disabled_box(client, daemon, project):
+    wo = _died(daemon, project, session=False)
+
+    page = _page(client, wo["id"])
+
+    assert "no session to relaunch" in page
+    # Above the control it governs, and the control is shut.
+    assert page.index("no session to relaunch") < page.index('name="message"')
+    assert page.count("disabled") >= 2
+
+
+def test_pressing_retry_queues_the_message_and_says_so(client, daemon, project):
+    wo = _died(daemon, project)
+
+    response = client.post(f"/wo/proj_a/{wo['id']}/retry", data={"message": ""})
+
+    store = ProjectStore(project)
+    try:
+        msgs = store.list_messages(wo["id"])
+    finally:
+        store.close()
+    assert msgs[0]["content"] == ops.RETRY_NOTE and msgs[0]["source"] == "retry"
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        f"/wo/proj_a/{wo['id']}?retried={msgs[0]['id']}#retry")
+    assert ops.retry_queued_notice(msgs[0]["id"]) in _page(
+        client, wo["id"], f"?retried={msgs[0]['id']}")
+
+
+def test_a_refused_press_flashes_the_refusal_and_claims_nothing(client, daemon, project):
+    wo = _died(daemon, project, session=False)
+
+    response = client.post(f"/wo/proj_a/{wo['id']}/retry", data={"message": ""})
+
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    assert "#retry" in response.headers["location"]
+    store = ProjectStore(project)
+    try:
+        assert store.list_messages(wo["id"]) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("crafted", ["999999", "nonsense", "-1"])
+def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted):
+    """The notice is rebuilt from an id the record knows, never carried as text —
+    `fix_filed_notice`'s rule. An unparsable or unknown one renders no claim."""
+    wo = _died(daemon, project)
+
+    page = _page(client, wo["id"], f"?retried={crafted}")
+
+    assert RETRY_HEADING in page
+    assert "jarvisd launches the turn" not in page

@@ -309,6 +309,33 @@ SHA_MOVED_BLOCKER = ("the panel's verdict names an older commit and no rounds ar
                      "(`jarvis validation force`), or give it another round "
                      "(`validation.max_rounds`) and the OS re-judges it itself")
 
+#: The OTHER `sha_moved` stall that reaches the user, and the reason it needs its own
+#: sentence: the OS asked for the merge, re-judged its resolution `ops.REBIND_MAX` times
+#: and the panel still refuses it. `SHA_MOVED_BLOCKER` above would offer
+#: `validation.max_rounds`, which the rebind arm never reads — advice that does nothing
+#: (spec docs/superpowers/specs/2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round.md §4.5).
+#: "twice" is `ops.REBIND_MAX`, spelled out here rather than imported: this module is
+#: below `ops` in the import order, and the bound is a constant of the design.
+REBIND_EXHAUSTED_BLOCKER = ("the OS re-judged the merge it asked for twice and the "
+                            "panel still refuses it — read the review and decide: "
+                            "merge it yourself, or send the worker back")
+
+#: THE THIRD SENTENCE IN THIS FAMILY, and the one that names the LIVE cause: the rework
+#: the user asked for when they rejected on review was judged — outside the budget, as
+#: Neo's ruling on question 973 requires — and the panel refused it with no counted
+#: round left. `VALIDATION_STUCK_BLOCKER` would say only "the review could not be
+#: satisfied", which hides that this round was the user's own ask; the two `sha_moved`
+#: sentences above describe a merge nobody judged, which is the opposite of what
+#: happened here.
+#:
+#: Re-derived from the round by `user_rework_refused` for kn-089de524's reason: a flag
+#: `Daemon._escalate` writes is rewritten by INV-ATTENTION-REASON on the next tick
+#: unless `true_blockers` can derive it.
+USER_REWORK_REFUSED_BLOCKER = ("the rework you asked for was judged and the panel "
+                               "refused it, and no rounds are left — read the review "
+                               "and decide: accept it, send the worker back with "
+                               "another round (`validation.max_rounds`), or close it")
+
 #: What a work order says when the reviewer REFUSED the automatic merge of the commit the
 #: panel accepted — spec 2026-09-24 fix 4b. Nothing else will ever move that order:
 #: `automerge.propose` does not re-ask for a commit whose grant was refused, and the inbox
@@ -458,6 +485,11 @@ class Violation:
     repaired: bool = False
     repair: str = ""
     context: dict[str, Any] = field(default_factory=dict)
+    #: How loudly the notification arrives. `warning` for every violation that predates
+    #: this field, so it is additive; a checker that must not land beside a stale
+    #: attention flag says `critical` (spec
+    #: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
+    level: str = "warning"
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -504,6 +536,32 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
 #: reason must be re-derivable by `true_blockers` or the next tick relabels it.
 DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 
+#: What a release order says when it stopped waiting for a red base and asked the user
+#: (2026-09-29 spec §3). NAMES THE RED RUN, not the release: the user is being asked
+#: about a build, and the release is waiting on it rather than on anything about itself.
+#:
+#: FREE OF ANY ELAPSED TIME, under PARKED_BLOCKER's rule — the hours are the THRESHOLD,
+#: which is a constant, and never a clock that ticks between two reconciles.
+RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}` failed at "
+                            "{sha} ({run_url}). The release is waiting on that build, "
+                            "not on anything about the release.")
+
+
+def release_base_red_blocker(said: dict[str, Any]) -> str:
+    """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote.
+
+    ONE renderer for both ends: `ops` flags it and this module re-derives it, or
+    INV-ATTENTION-REASON relabels the flag on the next tick (PR_CLOSED_BLOCKER's rule).
+    """
+    from .daemon import Daemon
+
+    return RELEASE_BASE_RED_BLOCKER.format(
+        base=said.get("base") or "main",
+        hours=Daemon.RED_PARK_AFTER_SECONDS // SECONDS_PER_HOUR,
+        workflow=said.get("workflow") or "ci", sha=str(said.get("head_sha") or "")[:10],
+        run_url=said.get("run_url") or "")
+
+
 #: §9: the objection the OS sent about an assumption died on the way to the worker — its
 #: message spent its retries, or its envelope ended in a terminal state that is not
 #: `delivered`. Nobody but the user can move it now, because the worker was never told.
@@ -530,8 +588,36 @@ def rejudge_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
     Derived, never stored. `ops.rejudge_moved_head` writes the decline;
     INV-ATTENTION-MISSING puts the flag up from here, which is the path that honours
     `acknowledged_blockers` (kn-089de524).
+
+    A decline caused by `ops.REBIND_EXHAUSTED` is NOT one of these — that one is
+    `rebind_exhausted` below, and the remedy this one names would do nothing for it.
     """
-    declined = store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+    return _parked_on_a_decline(store, wo, rebind=False)
+
+
+def rebind_exhausted(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """The same question about the OTHER decline: the OS re-judged the merge it asked
+    for `ops.REBIND_MAX` times and the panel still refuses it.
+
+    A separate derivation because the remedy is different and `SHA_MOVED_BLOCKER`'s is
+    then FALSE: it offers `validation.max_rounds`, and the rebind arm never reads it
+    (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.5).
+    """
+    return _parked_on_a_decline(store, wo, rebind=True)
+
+
+def _parked_on_a_decline(store: ProjectStore, wo: dict[str, Any], *,
+                         rebind: bool) -> bool:
+    """The three facts both derivations above share, read for one `cause` only.
+
+    The decline dedupe is per head across both causes, so one head carries one decline
+    with one cause and the two can never both fire (spec §4.5).
+    """
+    from . import ops as ops_mod
+
+    declined = [e for e in store.events_of_kind(wo["id"], REJUDGE_DECLINED_EVENT)
+                if (str(db.from_json(e["payload"], {}).get("cause") or "")
+                    == ops_mod.REBIND_EXHAUSTED) is rebind]
     if not declined:
         return False
     held = store.events_of_kind(wo["id"], "automerge_held")
@@ -649,16 +735,47 @@ def objection_undeliverable(store: ProjectStore, a: dict[str, Any]) -> bool:
     return str(env.get("state") or "") in ("undeliverable", "handled_by_router")
 
 
+def _confirmation_is_open(question_id: int) -> bool:
+    """Is Neo still holding this confirmation question? Cross-DB and best-effort.
+
+    `awaiting_neo`'s precedent below and `ops._unreachable_asks`', including the failure
+    direction: an unreadable `neo.db`, or a link that resolves to nothing, must fail
+    TOWARD the user — so this answers False and the blocker appears. One row read per
+    pending assumption that carries a link, on an order already in `needs_review`.
+    """
+    from .neo_store import NEO_HELD_Q_STATUSES, NeoStore
+
+    try:
+        neo = NeoStore()
+        try:
+            q = neo.get(question_id)
+        finally:
+            neo.close()
+    except Exception:  # noqa: BLE001 — see docstring: never take a caller down with us
+        return False
+    return bool(q) and str(q["status"] or "") in NEO_HELD_Q_STATUSES
+
+
 def _os_is_confirming(a: dict[str, Any]) -> bool:
     """Is the OS's own confirmation pass (§7) holding this assumption, not the user?
 
     Two rows, and in both the user owes nothing: an accepted one is being confirmed
     against the diff, and an objected-and-DELIVERED one is waiting on the WORKER to
     answer. An objection still in flight is neither, so it is not here.
+
+    **`accept` IS NOT ENOUGH ON ITS OWN** (2026-09-28 spec §7, issue #833). The column is
+    written once and never cleared, so it could not tell a confirmation in flight from one
+    dropped in February — and the rows in that spec's §1.1 were suppressed from the
+    attention list for hours while the user could not close them either. A link that is
+    NOT there is a confirmation still to come, or one §4 cleared to re-ask, and suppresses
+    as it always did; a link to a question Neo has finished with does not.
+
+    The `object` branch is untouched: it is about a delivered objection and the worker.
     """
     verdict = str(a.get("provisional_verdict") or "")
     if verdict == "accept":
-        return True
+        qid = int(a.get("confirm_question_id") or 0)
+        return not qid or _confirmation_is_open(qid)
     return verdict == "object" and bool(a.get("objection_delivered_ts"))
 
 
@@ -767,6 +884,13 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
+    # on the status so no other work order pays the query; the ordinary re-park raises
+    # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
+    if wo["status"] == "needs_review":
+        park = store.release_red_park_open(wo["id"])
+        if park is not None:
+            blockers.append(release_base_red_blocker(park))
     # A PULL REQUEST THE OS TRIED TO REPAIR AND COULD NOT — conflicts, a red build, or
     # both. Derived at ONE site from PR_REPAIR_BLOCKERS, in that tuple's order; see its
     # note for what being derived at two sites cost.
@@ -802,6 +926,10 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # other work order pays for the two reads.
     if wo["status"] == "waiting_pr_merge" and rejudge_exhausted(store, wo):
         blockers.append(SHA_MOVED_BLOCKER)
+    # THE SAME STALL WITH THE OTHER CAUSE, and the two cannot both fire: the decline
+    # dedupe is per head across both (spec 2026-09-27 §4.5).
+    if wo["status"] == "waiting_pr_merge" and rebind_exhausted(store, wo):
+        blockers.append(REBIND_EXHAUSTED_BLOCKER)
     # A MERGE THE REVIEWER REFUSED. Nothing re-asks for that commit, so the order would
     # otherwise sit parked for ever with nothing owed by anyone (spec 2026-09-24 fix 4b).
     # Gated on the status for the same reason as the branch above, and ordered after it
@@ -839,8 +967,12 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         #    dropping the give-up because a decision is also open is the silent
         #    relabelling kn-78346a2d names — dropping it FOR GOOD, because accepting the
         #    assumption lands the work order and nothing re-derives it afterwards.
+        #    ONE OF TWO SENTENCES: a give-up on a round a USER rejection bought names
+        #    that cause instead (spec 2026-09-27 §5, Neo question 973).
         elif validation_escalated(store, wo):
-            blockers.append(VALIDATION_STUCK_BLOCKER)
+            blockers.append(USER_REWORK_REFUSED_BLOCKER
+                            if user_rework_refused(store, wo)
+                            else VALIDATION_STUCK_BLOCKER)
         # 3. The landing refused to complete it over code that is on nothing but its own
         #    branch (`ops.park_unlanded`, GitHub issue #232). Above the idle line and
         #    not merged into it, because they are opposite facts about the same status:
@@ -945,6 +1077,147 @@ def _parked_minutes(store: ProjectStore) -> tuple[bool, int]:
     return bool(cfg.enabled), int(cfg.alarm_parked_minutes)
 
 
+def judged_heads(store: ProjectStore, wo_id: str) -> set[str]:
+    """Every commit of this work order the OS has already judged, or seen land.
+
+    Two rows and no network: `ProjectStore.validated_head` of the LATEST round (the
+    existing documented predicate, which already prefers `carried_head_sha` — reading the
+    columns here instead would be a second home for the rule), and the `head_oid` of the
+    newest `pr_merged` event.
+
+    EMPTY IS NEVER A MEMBER. Pre-0.10.0 rounds recorded no commit (kn-48dadcce) and an
+    order polled before `pr_head_oid` shipped has none either; reading "" as equal would
+    turn "nothing was recorded" into "it matches".
+    """
+    from .project_store import ProjectStore as _Store
+
+    merged = store.events_of_kind(wo_id, "pr_merged")
+    heads = {
+        _Store.validated_head(store.latest_validation_round(wo_id=wo_id)) or "",
+        str((db.from_json(merged[-1]["payload"], {}) or {}).get("head_oid") or "")
+        if merged else "",
+    }
+    return heads - {""}
+
+
+def _head_already_judged(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is the head the poll last saw one of `judged_heads`? Spec §2b."""
+    current = str(wo.get("pr_head_oid") or "")
+    return bool(current) and current in judged_heads(store, wo["id"])
+
+
+#: `wo_alarms.kind` for §2c's detector, and the statuses it is asked about — the ones a
+#: refusal can leave an order parked in. A terminal order has nothing left to declare.
+UNDECLARED_DELIVERY_KIND = "undeclared_delivery"
+UNDECLARED_DELIVERY_STATUSES = ("needs_review", "waiting_pr_merge", "waiting_input")
+
+#: What the OS asks the worker to do about an undeclared delivery. The FINDING's words,
+#: which the supervisor's judge reads and a gate reviewer rules on.
+UNDECLARED_DELIVERY_REASON = (
+    "the user refused an assumption on this work order and the worker has pushed "
+    "commits since without running `jarvis wo finish`, so nothing has declared them and "
+    "the panel has nothing it may judge")
+
+
+def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Has this worker pushed past a refusal without declaring it? Spec §2c of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    `ops.refusal_answered` is CALLED rather than re-derived, and it stays finish-only:
+    the finish is the declaration, and widening it would let the panel judge a submission
+    nobody declared. This is the detector the OS lacked, so that an unanswered refusal
+    with commits behind it self-heals into a nudge instead of parking on the user for
+    ever.
+
+    Head movement is the observation, and it reuses §2b's column — so no network read of
+    its own. An EMPTY head is never movement: "" is "not recorded".
+    """
+    from .ops import refusal_answered
+
+    current = str(wo.get("pr_head_oid") or "")
+    if not current or refusal_answered(store, wo["id"]):
+        return False
+    judged = judged_heads(store, wo["id"])
+    return bool(judged) and current not in judged
+
+
+def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
+    """INV-UNDECLARED-DELIVERY — raise the finding; the supervisor decides what to do.
+
+    A FINDING, NEVER AN ALARM: `add_alarm`'s one call site is fenced by
+    `Daemon.check_burning_turns`' `(kind, seq)` dedupe and this is not on that path.
+    Nothing here acts on a work order — the supervisor's judge reaches
+    `remedies.propose(..., "nudge")`, which files a gate request, and only a live grant
+    lets `remedies.apply` say anything to a worker.
+
+    Raised ONCE per order while the condition stands: a finding per reconcile tick would
+    fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
+    exists to prevent one queue along.
+    """
+    # `add_finding` is not one of the proxy's blocked mutators, so the checker skips the
+    # write itself and still REPORTS — `check_neo_escalations_are_live`'s shape.
+    readonly = getattr(store, "readonly", False)
+    for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
+        if not undeclared_delivery(store, wo):
+            continue
+        if any(a["kind"] == UNDECLARED_DELIVERY_KIND for a in store.alarms_of(wo["id"])):
+            continue
+        if not readonly:
+            store.add_finding(wo["id"], kind=UNDECLARED_DELIVERY_KIND,
+                              reason=UNDECLARED_DELIVERY_REASON, source="invariant")
+        yield Violation(
+            invariant="INV-UNDECLARED-DELIVERY",
+            wo_id=wo["id"],
+            detail=UNDECLARED_DELIVERY_REASON,
+            repaired=not readonly,
+            repair=("would raise " if readonly else "raised ")
+                   + "a finding for the supervisor to judge",
+        )
+
+
+def check_spans_reach_the_status(store: ProjectStore) -> Iterator[Violation]:
+    """INV-SPAN-BEHIND — a status write with no span is repaired where it is found.
+
+    Spec §2d2 of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md. The
+    fix is at the writer and `_backfill_wo_spans` now fills gaps, but neither can heal
+    this shape: a status written round `set_status` leaves no `status` event to replay,
+    so the disagreement between the span tail and `work_orders.status` is the only
+    evidence there is. The repair is one `approximate` span at the order's `updated_at`,
+    which is the only time the record holds for a write that recorded none.
+
+    Repairs on the daemon tick rather than behind `--repair`, for
+    `check_neo_escalations_are_live`' reason: appending a span creates nothing,
+    authorises nothing and moves no order.
+    """
+    readonly = getattr(store, "readonly", False)
+    # Hidden too: hiding takes an order out of the listings, not out of the record
+    # `jarvis inspect` and the dashboard bill against.
+    for wo in store.list_work_orders(include_hidden=True):
+        spans = store.state_spans(wo["id"])
+        tail = str(spans[-1]["to_status"]) if spans else ""
+        status = str(wo["status"] or "")
+        # No spans at all is `_backfill_wo_spans`' case, not this one.
+        if not spans or tail == status:
+            continue
+        if not readonly:
+            # Never BEFORE the span it follows: `state_spans` orders by ts, so a repair
+            # stamped earlier than the tail would reorder the history it is mending.
+            at = max(float(wo["updated_at"] or db.now()), float(spans[-1]["ts"]))
+            store._record_span(wo["id"], "wo", tail, status, trigger="repair",
+                               ts=at, approximate=True)
+        yield Violation(
+            invariant="INV-SPAN-BEHIND",
+            wo_id=wo["id"],
+            detail=(f"the recorded spans stop at {tail!r} while this order's status "
+                    f"column says {status!r}"),
+            repaired=not readonly,
+            repair=("would append " if readonly else "appended ")
+                   + "an approximate span at the order's last update",
+            context={"tail": tail, "status": status},
+        )
+
+
 def parked_reason(store: ProjectStore, wo: dict[str, Any],
                   now: float | None = None) -> str | None:
     """Why nothing is going to happen to this work order — or None if something is.
@@ -1008,7 +1281,14 @@ def parked_reason(store: ProjectStore, wo: dict[str, Any],
             # reporting it sent the user to `jarvis wo send` against a worker whose pull
             # request was already green (issue #705 defect 3). The instruction and the
             # check were written against each other.
-            and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES):
+            and store.turn_opened_by(turn) not in PR_REPAIR_SOURCES
+            # ...OR THE HEAD IS ONE THE OS HAS ALREADY JUDGED OR SEEN LAND. Spec §2b of
+            # docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md:
+            # the allowlist above answers "why was this turn opened" and is being asked
+            # "is anything undelivered", so every new OS-opened turn kind was a new false
+            # blocker. This asks the question that cannot go stale, and it stays local —
+            # `rejudge_exhausted` is the precedent.
+            and not _head_already_judged(store, wo)):
         return STALE_FINISH_BLOCKER
     # A `needs_review` order with no stale finish is doing exactly what that status says,
     # and is already flagged for it. A second line on every review the user has not got
@@ -1025,6 +1305,21 @@ def validation_escalated(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """
     latest = store.latest_validation_round(wo_id=wo["id"])
     return bool(latest and latest["outcome"] == "escalated")
+
+
+def user_rework_refused(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Was the give-up above the panel refusing the rework the USER asked for?
+
+    The same latest-round rule as `validation_escalated`, read one column further: a
+    round carrying `ops.USER_REWORK_CAUSE` is one a user rejection bought, and a
+    rejection of it with the counted budget spent is a different piece of news from the
+    ordinary give-up (Neo question 973, live case wo-299daf2e).
+    """
+    from . import ops as ops_mod
+
+    latest = store.latest_validation_round(wo_id=wo["id"])
+    return bool(latest and latest["outcome"] == "escalated"
+                and str(latest["uncounted_cause"] or "") == ops_mod.USER_REWORK_CAUSE)
 
 
 def dead_dependencies(store: ProjectStore, wo: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1560,13 +1855,32 @@ def something_is_out(store: ProjectStore, wo_id: str) -> bool:
 
     `held_approvals` counts as out, and it is the clause a caller inheriting this from
     `settle_work_order`'s `pending_approvals` check would drop. Nobody is REVIEWING a
-    held request, so it is not "with a reviewer" — but the work order is not free either:
-    `gates.file_request` parks it in `waiting_input` down BOTH its roads, the OS refuses
-    it on the `gates.case_ttl_seconds` timer, and until then the worker is waiting for a
-    verdict exactly as it would be for an argued one.
+    held request, so it is not "with a reviewer" — and it parks NOTHING: since fix 2 of
+    docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md `gates.file_request`
+    writes `waiting_input` only down the PENDING road. The work order is still out all the
+    same: the command is blocked, the `gates.case_ttl_seconds` clock is running, and the
+    only thing that can close the request is the worker's own next command.
+
+    WHAT IS OUT, not who is waited on — `user_facing_wait` below is the other question,
+    and the pair lives here together so the two cannot drift.
     """
     return bool(store.pending_approvals(wo_id) or store.held_approvals(wo_id)
                 or awaiting_neo(wo_id))
+
+
+def user_facing_wait(store: ProjectStore, wo_id: str) -> bool:
+    """Is somebody ELSE holding this work order — a reviewer, or Neo?
+
+    The narrower half of the pair above, and the discriminator for the one status that
+    says "Waiting on you". A HELD gate request is excluded on purpose: it is the
+    WORKER's move, its only exit is the worker's own next command, and nothing about it
+    is owed by the user — which is the whole of fix 2.
+
+    Beside `something_is_out` rather than in a caller, because the two are read against
+    each other: `settle_work_order` asks this one before writing a status and that one
+    before deciding a manager is free (kn-4ea33fe6).
+    """
+    return bool(store.pending_approvals(wo_id) or awaiting_neo(wo_id))
 
 
 def end_wait_if_nothing_is_out(store: ProjectStore, wo_id: str) -> bool:
@@ -2121,7 +2435,7 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
     try:
         held = [q for q in neo.list_questions(statuses=USER_HELD_Q_STATUSES)
                 if q["kind"] in ("approval", "plan", "alarm", "triage",
-                                 "assumption")]
+                                 "assumption", "question")]
         # `triage` is the one kind whose subject is not a row in THIS database — it is a
         # central backlog item, and the question carries no work order at all (issue
         # #240). So ownership cannot be read off the project store the way the other
@@ -2140,7 +2454,8 @@ def check_neo_escalations_are_live(store: ProjectStore) -> Iterator[Violation]:
                     "plan": _stale_plan_question,
                     "alarm": _stale_alarm_question,
                     "triage": _stale_triage_question,
-                    "assumption": _stale_assumption_question}[q["kind"]](store, q)
+                    "assumption": _stale_assumption_question,
+                    "question": _stale_worker_question}[q["kind"]](store, q)
             if moot is None:
                 continue
             answer, why = moot
@@ -2236,6 +2551,44 @@ def _stale_assumption_question(store: ProjectStore,
         return None
     return (f"SUPERSEDED — assumption {assumption['id']} is {assumption['status']}",
             f"assumption {assumption['id']} was already {assumption['status']}")
+
+
+def _stale_worker_question(store: ProjectStore,
+                           q: dict[str, Any]) -> tuple[str, str] | None:
+    """(answer, why) if this worker question is moot, else None. Spec §2a of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    The one kind with NO subject pointer at all — `jarvis wo ask` writes a question and
+    nothing in any store points back at it — so the five siblings' shape, reading the
+    subject's current state, cannot be written here. The timeline carries the fact
+    instead: the user REVIEWED a delivery made after the question was asked, and settled
+    it that way.
+
+    Both halves are needed and neither is enough. A `finished` alone is the WORKER's act
+    rather than the user's answer (Neo's ruling), and a `reviewed` alone could be a
+    verdict on a delivery older than the question. The `reviewed` event is the user's
+    verdict and nothing else: `ops.review_work_order` is its only writer, and the
+    autoreview path settles assumptions without one — so a machine verdict can never
+    supersede a question here.
+
+    A MISSING ROW IS LEFT ALONE, as in all five siblings: the checks run per project
+    against an OS-wide `neo.db`, so a work order this project does not know is skipped.
+    """
+    if not _is_work_order(store, q["wo_id"]):
+        return None
+    asked = float(q["ts"])
+    reviews = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "reviewed")
+               if float(e["ts"]) > asked]
+    if not reviews:
+        return None
+    delivered = [float(e["ts"]) for e in store.events_of_kind(q["wo_id"], "finished")
+                 if asked < float(e["ts"]) < max(reviews)]
+    if not delivered:
+        return None
+    return ("SUPERSEDED — the user reviewed a delivery made after this question was "
+            "asked",
+            f"the user reviewed work order {q['wo_id']} after it was asked, on a "
+            f"delivery newer than the question")
 
 
 def _stale_triage_question(store: ProjectStore,
@@ -2713,7 +3066,15 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
     Silent on a project that has never swept: the sweep ships disabled, and no rows is
     not a run of failures.
     """
-    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN)
+    if store.health_sweep_hold() is not None:
+        # The check claims the sweep IS SPENDING model calls right now. During a
+        # usage-limit hold it is spending none.
+        return
+    # HELD ROWS ARE FILTERED OUT BEFORE THE LAST TEN ARE TAKEN, not skipped in the loop.
+    # Two consequences, both wanted: ten holds can never trip it, and a hold in the
+    # middle of a genuine failure run does not RESET that run either — a window that
+    # interrupted a broken prompt did not fix the prompt.
+    recent = store.recent_health_reviews(HEALTH_SWEEP_FAILURE_RUN, include_held=False)
     if len(recent) < HEALTH_SWEEP_FAILURE_RUN:
         return
     if any(r["outcome"] != "failed" for r in recent):
@@ -2723,11 +3084,159 @@ def check_health_sweep_produces_judgements(store: ProjectStore) -> Iterator[Viol
         return
     yield Violation(
         invariant="INV-HEALTH-SWEEP-MUTE",
-        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all failed, so the "
-                f"sweep is spending model calls and producing no judgement. Most recent "
+        # FAILING, never held: the word "held" is reserved for the usage-limit rows, so
+        # the two are never confused in an inbox line.
+        detail=(f"the last {HEALTH_SWEEP_FAILURE_RUN} health sweeps all FAILED (the "
+                f"account's usage window is a hold, not a failure), so the sweep is "
+                f"spending model calls and producing no judgement. Most recent "
                 f"reason: {str(recent[0]['detail'] or '(none recorded)')[:200]}"),
         context={"failures": HEALTH_SWEEP_FAILURE_RUN,
                  "last_detail": str(recent[0]["detail"] or "")[:500]},
+    )
+
+
+#: How long the OS's own sweep may produce no judgement before the user is told. Six
+#: missed sweeps at the shipped 30-minute floor: long enough that a transport blip, a
+#: daemon restart or one capped tick cannot trip it, short enough that a sweep switched
+#: off by a bad edit is reported the same working day. Time inside a live usage-limit
+#: hold does not count against it.
+OS_HEALTH_SWEEP_DARK_MINUTES = 180
+
+
+def _live_catalog() -> Any:
+    """The registered catalog, or None. `_validation_timeout`'s rule: best-effort, and
+    an invariant must never be the thing that raises."""
+    try:
+        from .ops import resolve_catalog
+
+        return resolve_catalog()
+    except Exception:  # noqa: BLE001 — no catalog, an unreadable one, a moved path
+        return None
+
+
+def _os_owning_project(store: ProjectStore) -> Any:
+    """This store's `ProjectSpec` if it is the project that runs the OS, else None.
+
+    Derived, NEVER hardcoded: `schedule.os_owner` over the live catalog, compared on the
+    RESOLVED PATH rather than on a name, because a store knows its directory and not
+    what the catalog calls it.
+    """
+    from . import schedule
+
+    catalog = _live_catalog()
+    if catalog is None:
+        return None
+    try:
+        # §5: no fallback — an arbitrary first-in-catalog project is not the OS.
+        owner = schedule.os_owner(((p.name, p.path) for p in catalog.projects),
+                                  fallback=False)
+        if owner is None:
+            return None
+        spec = catalog.project(owner)
+        if Path(spec.path).resolve() != Path(store.project_path).resolve():
+            return None
+        return spec
+    except Exception:  # noqa: BLE001 — same rule: never the thing that raises
+        return None
+
+
+def _health_hold_seconds(store: ProjectStore, since: float, until: float) -> float:
+    """How much of `[since, until]` the account's usage window was shut for.
+
+    Summed from the `held` rows' `[ts, reopens_at]` intervals — the same active-clock
+    shape the duration alarms use. Overlapping windows are merged so a per-unit hold and
+    the account's own hold are not counted twice.
+    """
+    spans = []
+    for row in store.conn.execute(
+            "SELECT ts, reopens_at FROM health_reviews WHERE outcome='held' "
+            "AND reopens_at > ? ORDER BY ts", (since,)).fetchall():
+        start = max(float(row["ts"] or 0.0), since)
+        end = min(float(row["reopens_at"] or 0.0), until)
+        if end > start:
+            spans.append((start, end))
+    total, edge = 0.0, since
+    for start, end in spans:
+        start = max(start, edge)
+        if end > start:
+            total += end - start
+            edge = end
+    return total
+
+
+def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
+    """INV-OS-HEALTH-SWEEP-DARK — the OS's own health sweep must never be dark.
+
+    USER RULE, 2026-09-28 (kn-7312c7de): the project that runs the OS must ALWAYS have
+    the sweep on and producing judgements. Nothing enforced it, and two things worked
+    against it — `supervisor.health_enabled` ships False, and `jarvis config set` reached
+    both switches like any other key. §4 refuses the write; this is the liveness half,
+    because a catalog edited by hand bypasses `ops` entirely.
+
+    RUNS ONLY ON THE OS-OWNING PROJECT. INV-HEALTH-SWEEP-MUTE answers "is this project's
+    sweep broken" for every project; this answers "is the OS's own sweep alive" for one,
+    and it is deliberately loud where that one says nothing (its docstring's "silent on a
+    project that has never swept" is correct for an ordinary project and is exactly the
+    blind spot here).
+
+    NOT repairable: re-enabling the sweep would be the OS editing the user's catalog, and
+    a failing sweep's cause is not derivable from state. The detail names WHICH of the
+    three causes it is, because they have three different fixes.
+
+    Time inside a usage-limit hold does not count: a sweep that is silent only because
+    the account was is not dark (spec
+    docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
+    """
+    spec = _os_owning_project(store)
+    if spec is None:
+        return
+    name = spec.name
+    supervisor = getattr(spec, "supervisor", None)
+    for key, on in (("supervisor.enabled", getattr(supervisor, "enabled", False)),
+                    ("supervisor.health_enabled",
+                     getattr(supervisor, "health_enabled", False))):
+        if not on:
+            yield Violation(
+                invariant="INV-OS-HEALTH-SWEEP-DARK",
+                detail=(f"the OS's own health sweep is DISABLED ({key}=false) and must "
+                        f"not be — {name} runs the OS itself, and its sweep must always "
+                        f"be on and producing judgements (user rule, 2026-09-28)"),
+                level="critical", context={"project": name, "cause": "disabled",
+                                           "key": key},
+            )
+            return
+
+    now = db.now()
+    window = OS_HEALTH_SWEEP_DARK_MINUTES * 60
+    judged = store.conn.execute(
+        "SELECT ts FROM health_reviews WHERE outcome IN ('clear','findings') "
+        "ORDER BY ts DESC, id DESC LIMIT 1").fetchone()
+    # With no judgement ever recorded the clock starts at the window's own edge: the
+    # check then fires as soon as a full window has passed with the account awake, which
+    # is what "enabled but never scheduled" looks like from the outside.
+    since = float(judged["ts"]) if judged else now - window
+    dark = (now - since) - _health_hold_seconds(store, since, now)
+    if dark < window:
+        return
+
+    minutes = int(dark / 60)
+    newest = store.recent_health_reviews(1, include_held=False)
+    if newest and newest[0]["outcome"] == "failed":
+        detail = (f"the OS's own health sweep has produced no judgement for {minutes}m; "
+                  f"the newest sweep FAILED: "
+                  f"{str(newest[0]['detail'] or '(none recorded)')[:200]}")
+        cause = "failing"
+    elif judged is None and not newest:
+        detail = ("the OS's own health sweep is enabled but has never run — no sweep "
+                  "has been scheduled")
+        cause = "not-scheduled"
+    else:
+        detail = (f"the OS's own health sweep has produced no judgement for {minutes}m, "
+                  f"and {name} runs the OS itself")
+        cause = "silent"
+    yield Violation(
+        invariant="INV-OS-HEALTH-SWEEP-DARK", detail=detail, level="critical",
+        context={"project": name, "cause": cause, "dark_minutes": minutes},
     )
 
 
@@ -3876,6 +4385,9 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
                                    # is unaffected by the order it runs in
     check_health_sweep_produces_judgements,  # ditto: a pure read of the sweep ledger,
                                    # repairing nothing and read by nothing else
+    check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing,
+                                   # and a liveness check that runs hourly is a liveness
+                                   # check with an hour of blind spot
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing
@@ -3894,6 +4406,10 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_proposed_remedies_are_live,  # after the flag checks: it RAISES a flag, and one
                                    # raised before them is read as phantom attention on
                                    # an alarm `true_blockers` cannot re-derive
+    check_undeclared_delivery,     # order-free: it raises a FINDING and touches no flag
+                                   # and no status, so nothing else here reads its output
+    check_spans_reach_the_status,  # order-free: it appends a span and changes no status,
+                                   # and nothing else here reads `wo_state_spans`
     check_envelopes_move,          # last: it delivers, and delivery changes work orders
     check_no_lost_feedback,        # ...and after it, because that delivery is what
                                    # marks an envelope undeliverable in the first place

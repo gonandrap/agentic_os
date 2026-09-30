@@ -155,6 +155,42 @@ DEFAULT_AUTOCOMPACT_WINDOW = 400_000
 DEFAULT_BUDGET_USD: float | None = None
 DEFAULT_FEATURE_BUDGET_USD: float | None = None
 
+# THE ONE NON-None SHIPPED BUDGET, and §2.8 of
+# docs/superpowers/specs/2026-09-27-investigation-orders.md is why: an investigation's
+# caller is a daemon loop, not a human typing, so an uncapped default is an uncapped loop.
+# An investigation reads records and quotes lines — it should cost cents, and one that
+# costs more than the order it is diagnosing is not worth having.
+#
+# A named constant so the figure is a ONE-LINE edit. PENDING CONFIRMATION: no measurement
+# picked it, the nearest datum being `jarvis cost` on the improvement orders run in this
+# checkout (§7.1).
+DEFAULT_INVESTIGATION_BUDGET_USD: float | None = 2.00
+
+# Cheap by default for the same reason: a diagnosis is reading and quoting, not design.
+# An ALIAS rather than a pinned id, unlike DEFAULT_MODEL: "whatever is currently cheap in
+# that tier" is the intent here, and pinning it would freeze the price.
+DEFAULT_INVESTIGATION_MODEL = "sonnet"
+DEFAULT_INVESTIGATION_EFFORT = "low"
+
+# A CEILING ON ONE MCP TOOL CALL, in milliseconds, read by Claude Code itself from
+# `MCP_TOOL_TIMEOUT` in the worker's environment (issue #845: Serena's
+# `search_for_pattern` backtracked catastrophically and burned 18m50s of CPU on one call
+# that never returned — nothing bounded it, and it ended when the work order did).
+#
+# FIVE MINUTES, and the figure is the OS's existing cost boundary rather than a new one:
+# it is the 5-minute prompt-cache TTL `claude_cli.PROMPT_CACHE_5M_ENV` buys and what
+# `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` is set to. A call that outlives the cache has
+# already cost the conversation a re-write; letting it run further buys nothing. Every
+# legitimate Serena/context7 call in this fleet's transcripts is sub-minute.
+#
+# A catalog setting and not a literal because a project with a genuinely slow MCP server
+# must be able to RAISE it — which is also why `dispatch` sets it in its `env.update`
+# block rather than in `assets/settings.base.json`, where the catalog cannot reach.
+DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS = 300_000
+# Under a second is a typo — it would make every MCP call in the project fail — and it
+# arrives through `jarvis config set`, so it is refused where the message can name the key.
+WORKER_MCP_TOOL_TIMEOUT_MS_MIN = 1000
+
 
 def _parse_budget(raw: dict[str, Any], key: str, where: str,
                   default: float | None) -> float | None:
@@ -364,9 +400,19 @@ class WorkerDefaults:
     # None = no ceiling, which is the default everywhere. See DEFAULT_BUDGET_USD.
     budget_usd: float | None = DEFAULT_BUDGET_USD
     feature_budget_usd: float | None = DEFAULT_FEATURE_BUDGET_USD
+    # An INVESTIGATION order's family (the order plus its one investigator), and the model
+    # and effort its investigator runs on. Non-None by design — see
+    # DEFAULT_INVESTIGATION_BUDGET_USD and §2.8 of
+    # docs/superpowers/specs/2026-09-27-investigation-orders.md.
+    investigation_budget_usd: float | None = DEFAULT_INVESTIGATION_BUDGET_USD
+    investigation_model: str | None = DEFAULT_INVESTIGATION_MODEL
+    investigation_effort: str | None = DEFAULT_INVESTIGATION_EFFORT
     # Whether the lead must delegate file edits to its crew. §7 of
     # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md
     require_crew: bool = True
+    # What one MCP tool call may take, in milliseconds — see
+    # DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS and issue #845.
+    mcp_tool_timeout_ms: int = DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS
 
 
 # The validation panel's default roster: every seat in the vocabulary. Unlike Neo's
@@ -401,6 +447,16 @@ DEFAULT_VALIDATION_DIFF_CHARS = 150000
 # project because that is what the user asked for on this key. Spec §3:
 # docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
 DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
+
+# Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
+# panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
+# 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
+# legitimate OS question (a plan). 12,000 chars of diff puts the whole rendered question
+# at ~17-18K chars (~6.6K tokens at the 0.384 tokens/char rate cited above) — a plan's
+# order of magnitude, on a call that is UNCACHED and PER ASSUMPTION rather than a
+# five-seat shared prefix, which is why 150000 does not transfer. Spec § 2:
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
@@ -467,6 +523,7 @@ class ValidationConfig:
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
     decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
+    confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -544,6 +601,10 @@ class ConcisionConfig:
     """
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo
+    #: send` / `wo assume` payload refusal off for the project (§5 of
+    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -628,6 +689,21 @@ DEFAULT_INSPECT_ALARM_AWAITING_MINUTES = 60
 #: waiting on its own subagent — which is the order's own choice and the one wait the
 #: user's ruling explicitly kept on the books.
 DEFAULT_INSPECT_ALARM_JOIN_SECONDS = 300
+
+#: A subagent's last tool call still unfinished after this long — the evidence that turns
+#: an open foreground delegation from "a subagent is working" into "something is hung"
+#: (issue #845). FIVE MINUTES, and the number is not free-standing: it is the same
+#: boundary as `DEFAULT_INSPECT_ALARM_JOIN_SECONDS` above and the same as the
+#: `MCP_TOOL_TIMEOUT` every worker is launched with, so the OS holds ONE opinion about
+#: how long a single tool call may take. The issue asked for "well before 60 min" —
+#: `alarm_turn_minutes`, the only thing that would eventually have fired — and this is
+#: twelve times earlier than that. No legitimate Serena or context7 call in this fleet's
+#: transcripts takes a minute; the hang in #845 took nineteen.
+#:
+#: IN MINUTES, not seconds, because every other "how long may this run" setting on
+#: `InspectConfig` is in minutes; `alarm_join_seconds` is in seconds because it is a
+#: cache TTL and not a judgement about work.
+DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES = 5
 
 #: One call re-sending this much of the conversation. p95 of the largest re-write per work
 #: order (the median is 130,519), so it fires on 5% — about $1.88 at Opus list prices in a
@@ -763,6 +839,7 @@ class InspectConfig:
     alarm_stalled_minutes: int = DEFAULT_INSPECT_ALARM_STALLED_MINUTES
     alarm_awaiting_minutes: int = DEFAULT_INSPECT_ALARM_AWAITING_MINUTES
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
+    alarm_subagent_tool_minutes: int = DEFAULT_INSPECT_ALARM_SUBAGENT_TOOL_MINUTES
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
     alarm_rewrite_window_days: int = DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS
@@ -794,19 +871,19 @@ class ObservabilityConfig:
     (`_parse_observability`), and a per-order override on `work_orders.observability`
     beats both — precedence resolved in one place, `observability.level_for`.
 
-    `off` GATES EXACTLY ONE WRITE: §5's per-turn ingredient row on
-    `wo_turns.context_json`. It does NOT disable `jarvis watch`, `jarvis inspect`,
+    `off` GATES TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json` and
+    the sealed autopsy (§5 of docs/specs/2026-09-27-order-autopsy-durability.md). So `off`
+    stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
-    `off` is that the order has no context ledger and `jarvis wo context` says it was
-    not recorded.
+    `off` is that the order has no context ledger and no sealed autopsy, and `jarvis wo
+    context` says it was not recorded.
 
-    THE LEVEL CONTROLS ONLY THAT ROW. The full autopsy of an order — every turn, its
-    tools, its token classes, its context total, delta, peak and composition — is
-    shown for every order at every level, because §§3, 4, 6 and 7 derive it at read
-    time from the transcript and not from anything Jarvis collected. So `full` records
-    exactly what `normal` does and the two collapse; the level exists for the config
-    surface to grow into (Neo 814).
+    `full` DIFFERS FROM `normal` BY EXACTLY ONE THING: the tool parameters a `full` seal
+    retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
+    itself — every turn, its tools, its token classes, its context total, delta, peak and
+    composition — is derived at read time from the transcript (§§3, 4, 6, 7) and so is
+    shown for every order at every level, `off` included.
     """
 
     level: str = DEFAULT_OBSERVABILITY_LEVEL
@@ -1447,6 +1524,9 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         raw.get("decision_record_chars", base.decision_record_chars))
     if decision_record_chars < 1:
         raise _err(f"{where}.decision_record_chars must be >= 1")
+    confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
+    if confirm_diff_chars < 1:
+        raise _err(f"{where}.confirm_diff_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -1469,6 +1549,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
         decision_record_chars=decision_record_chars,
+        confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
@@ -1521,6 +1602,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                            base.alarm_awaiting_minutes)),
         alarm_join_seconds=int(raw.get("alarm_join_seconds",
                                        base.alarm_join_seconds)),
+        alarm_subagent_tool_minutes=int(raw.get("alarm_subagent_tool_minutes",
+                                                base.alarm_subagent_tool_minutes)),
         alarm_write_tokens=int(raw.get("alarm_write_tokens",
                                        base.alarm_write_tokens)),
         alarm_parked_minutes=int(raw.get("alarm_parked_minutes",
@@ -1593,7 +1676,13 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
     if 0 < words < 20:
         raise _err(f"{where}.summary_max_words of {words} leaves no summary that can "
                    f"pass; use 0 to switch the cap off")
-    return ConcisionConfig(summary_max_words=words)
+    chars = int(raw.get("message_max_chars", base.message_max_chars))
+    if chars < 0:
+        raise _err(f"{where}.message_max_chars must be 0 (off) or more, got {chars}")
+    if 0 < chars < 1000:
+        raise _err(f"{where}.message_max_chars of {chars} leaves no message that can "
+                   f"pass; use 0 to switch the cap off")
+    return ConcisionConfig(summary_max_words=words, message_max_chars=chars)
 
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,
@@ -1973,6 +2062,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if not isinstance(require_crew, bool):
             raise _err(f"project {name}: worker.require_crew must be true or false, "
                        f"got {require_crew!r}")
+        mcp_timeout = int(w.get("mcp_tool_timeout_ms",
+                                DEFAULT_WORKER_MCP_TOOL_TIMEOUT_MS))
+        if mcp_timeout < WORKER_MCP_TOOL_TIMEOUT_MS_MIN:
+            raise _err(f"project {name}: worker.mcp_tool_timeout_ms must be >= "
+                       f"{WORKER_MCP_TOOL_TIMEOUT_MS_MIN} (milliseconds — a ceiling "
+                       f"under a second would fail every MCP call), got {mcp_timeout}")
         worker = WorkerDefaults(
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
@@ -1988,7 +2083,16 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             feature_budget_usd=_parse_budget(
                 w, "feature_budget_usd", f"project {name}: worker.feature_budget_usd",
                 os_cfg.default_feature_budget_usd),
+            investigation_budget_usd=_parse_budget(
+                w, "investigation_budget_usd",
+                f"project {name}: worker.investigation_budget_usd",
+                DEFAULT_INVESTIGATION_BUDGET_USD),
+            investigation_model=w.get("investigation_model",
+                                      DEFAULT_INVESTIGATION_MODEL),
+            investigation_effort=w.get("investigation_effort",
+                                       DEFAULT_INVESTIGATION_EFFORT),
             require_crew=require_crew,
+            mcp_tool_timeout_ms=mcp_timeout,
         )
         try:
             gate_cfg = GateConfig.parse(p.get("gates"))

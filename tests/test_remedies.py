@@ -127,6 +127,85 @@ def test_the_first_three_shipped_remedies_are_pinned_by_name_and_order():
                                                                  "feature_order"}
 
 
+def _waiting_on_slugs() -> set[str]:
+    """Every `what` slug `ops.waiting_on` can answer, read off its AST.
+
+    OFF THE SOURCE AND NOT OFF A LIST HERE, `test_the_acting_calls_stay_inside_the_handlers`'
+    reason one function along: a copy of the vocabulary in the test file is green the day
+    the function's answers and the copy diverge, which is exactly the day a `covers` entry
+    starts pointing at a slug nobody answers. The `{"what": wo["status"]}` arm is not a
+    literal and its statuses are added by hand — the only dynamic arm, checked by the
+    assertion below that every literal arm is still found.
+    """
+    import ast
+    from pathlib import Path
+
+    from jarvis import ops as ops_mod
+
+    tree = ast.parse(Path(ops_mod.__file__).read_text())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "waiting_on")
+    slugs = {v.value for node in ast.walk(fn) if isinstance(node, ast.Dict)
+             for k, v in zip(node.keys, node.values)
+             if isinstance(k, ast.Constant) and k.value == "what"
+             and isinstance(v, ast.Constant) and isinstance(v.value, str)}
+    assert {"prompt", "pending", "gate_held", "signin"} <= slugs, slugs
+    return slugs | {"completed", "cancelled", "failed", "waiting_pr_merge",
+                    "needs_review"}
+
+
+def test_every_covers_slug_is_a_real_blocker_and_no_two_remedies_claim_one():
+    """`covers` is the mapping `ops.FIX_MATCHES` used to be, moved ON to the remedy (Neo
+    q839). A slug nothing answers means a remedy nothing can reach, and a slug with two
+    owners is a registry defect rather than a choice `ops.fix` may make."""
+    real = _waiting_on_slugs()
+    claimed: dict[str, str] = {}
+    for remedy in remedies.REMEDIES.values():
+        assert isinstance(remedy.covers, tuple)
+        for slug in remedy.covers:
+            assert slug in real, f"{remedy.id} covers {slug}, which nothing answers"
+            assert slug not in claimed, f"{slug} claimed by {claimed[slug]} and {remedy.id}"
+            claimed[slug] = remedy.id
+    assert claimed == {"prompt": "nudge", "pending": "unblock"}
+    # The empty tuple is a decision and not an omission: it writes code, clears no blocker
+    # mechanically, and stays reachable only by being named.
+    assert remedies.REMEDIES["file_work_order"].covers == ()
+
+
+def test_resolve_answers_a_code_match_and_none_for_an_unclaimed_slug():
+    """`resolve` is `covering`'s replacement (the user's design addition, superseding Neo
+    q839's table-free lookup with the same one-lookup-function seam fo-69ba1cc4's data
+    rows will back): a `RemedyMatch` naming the primitive, empty `params`, `source=="code"`
+    — and still None for anything unclaimed."""
+    nudge = remedies.resolve("prompt")
+    assert nudge == remedies.RemedyMatch(remedy="nudge", params={}, source="code")
+    unblock = remedies.resolve("pending")
+    assert unblock == remedies.RemedyMatch(remedy="unblock", params={}, source="code")
+    assert remedies.resolve("gate_held") is None
+    assert remedies.resolve("a-slug-shipped-next-year") is None
+
+
+def test_resolve_raises_when_two_remedies_claim_the_same_slug(monkeypatch):
+    """Paired with the green registry above: the guard is asserted to BITE, or the test
+    that says the registry is clean is grading nothing."""
+    clash = remedies.Remedy(**{**vars(remedies.REMEDIES["file_work_order"]),
+                               "covers": ("prompt",)})
+    monkeypatch.setitem(remedies.REMEDIES, "file_work_order", clash)
+    with pytest.raises(ValueError, match="prompt"):
+        remedies.resolve("prompt")
+
+
+def test_resolve_raises_when_a_row_names_a_primitive_absent_from_remedies(monkeypatch):
+    """The row/primitive split, ahead of fo-69ba1cc4's data rows actually arriving: a slug
+    that resolves to an id `REMEDIES` does not have is a malformed rule and must not come
+    back as a usable `RemedyMatch` — that would fail later, further from the cause."""
+    ghost = remedies.Remedy(**{**vars(remedies.REMEDIES["unblock"]),
+                               "id": "no-such-primitive", "covers": ("pending",)})
+    monkeypatch.setitem(remedies.REMEDIES, "unblock", ghost)
+    with pytest.raises(ValueError, match="no-such-primitive"):
+        remedies.resolve("pending")
+
+
 def test_the_catalog_refuses_a_remedy_the_os_does_not_have(tmp_path):
     """An unknown id is a `CatalogError` naming the known ones, `GateConfig.parse`'s rule
     — a typo must not silently leave a permission unset. Paired with the id that IS
@@ -359,6 +438,58 @@ def test_an_armed_remedy_files_one_request_and_leaves_the_work_order_alone(
         store.close()
 
 
+# -- 3b. a finding raised by an INVARIANT travels the same intake -----------------------
+
+
+def test_an_invariant_finding_carries_an_undeclared_delivery_to_the_nudge(
+        started, catalog_file, project, fake_claude):
+    """Spec §2c of
+    docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
+
+    STARTS AT `invariants.check_project`, not at a hand-written alarm row: the promise is
+    that a worker which pushed past a refusal without finishing gets NUDGED, and the only
+    thing that can prove it is the whole path — the detector raises a `source='invariant'`
+    finding, the supervisor's real intake claims and judges it, and the judge's `nudge`
+    reaches `remedies.propose`. A test that filed the finding and called `propose` itself
+    grades `propose`, which §5 already grades.
+    """
+    from jarvis import invariants
+    from test_invariants import DELIVERED, PUSHED, _refused_then_pushed
+
+    _arm(catalog_file, "nudge")
+    daemon = started()
+    store = ProjectStore(project)
+    try:
+        wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED,
+                                  description="FORCE_SUPERVISOR_PROPOSE")
+        raised = [v for v in invariants.check_project(store)
+                  if v.invariant == "INV-UNDECLARED-DELIVERY"]
+        assert [v.wo_id for v in raised] == [wo["id"]]
+        (finding,) = [a for a in store.alarms_of(wo["id"])
+                      if a["kind"] == "undeclared_delivery"]
+        assert finding["source"] == "invariant"
+        assert finding["status"] == "raised"
+    finally:
+        store.close()
+
+    _drain(daemon)
+    assert len(_supervisor_calls(fake_claude)) == 1
+
+    alarm = _alarm(wo["id"])
+    assert alarm["status"] == "proposed"
+    assert alarm["remedy"] == "nudge"
+
+    (approval,) = _approvals(wo["id"])
+    assert approval["kind"] == "self_heal"
+    assert approval["status"] == "pending"
+    assert approval["command"].startswith(f"heal {alarm['id']}: nudge {wo['id']}")
+
+    questions = [q for q in _neo_questions()
+                 if q["kind"] == "approval" and q["wo_id"] == wo["id"]]
+    assert len(questions) == 1
+    assert questions[0]["id"] == approval["neo_question_id"]
+
+
 # -- 4. the acting calls stay inside the handlers ---------------------------------------
 
 
@@ -547,7 +678,8 @@ def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
         alarm = store.get_alarm(alarm["id"])
 
         assert remedies.REMEDIES["nudge"].apply(
-            store, central, "proj_a", store.get_feature_order(fo_id), alarm)
+            store, central, "proj_a", store.get_feature_order(fo_id),
+            remedies.Intent.from_alarm(store, alarm))
         (queued,) = store.queued_messages(carrier["id"])
         assert queued["source"] == "supervisor"
         assert "where are you?" in queued["content"]
@@ -556,7 +688,8 @@ def test_a_feature_subject_is_nudged_through_its_carrier(started, catalog_file):
         assert store.carrier_for_feature("fo-nosuchthing") is None
         with pytest.raises(remedies.RemedyRefused, match="fo-nosuchthing"):
             remedies.REMEDIES["nudge"].apply(
-                store, central, "proj_a", {"id": "fo-nosuchthing"}, orphan)
+                store, central, "proj_a", {"id": "fo-nosuchthing"},
+                remedies.Intent.from_alarm(store, orphan))
         assert len(store.queued_messages(carrier["id"])) == 1
     finally:
         central.close()

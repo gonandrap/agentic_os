@@ -105,10 +105,17 @@ TTL_5M = 300.0
 TTL_1H = 3600.0
 
 #: Tools whose span is the lead agent WAITING rather than working: it has dispatched
-#: something and is blocked on the result with no API call in flight. Only `TaskOutput`
-#: today — `Agent` itself returns immediately when the subagent is backgrounded, and the
-#: wait it defers is exactly what `TaskOutput` later collects.
+#: something and is blocked on the result with no API call in flight. ALWAYS a wait,
+#: backgrounded or not — `TaskOutput` exists to collect a result.
 JOIN_TOOLS = ("TaskOutput",)
+
+#: Tools whose span is the lead DELEGATING and then waiting for the result. A foreground
+#: call blocks the lead until the subagent returns; only `run_in_background: true` makes
+#: `Agent` return immediately, and that is what `TaskOutput` later collects. Counting a
+#: foreground delegation as a tool the lead RAN is what made `jarvis inspect` report
+#: "blocked on a subagent 0%" for every delegation the fleet has ever made (issue #845,
+#: docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md §1).
+DELEGATION_TOOLS = ("Agent", "Task")
 
 #: Tools whose span NAMES a subagent, and the only evidence a subagent is attached on
 #: (spec §4b). `Agent` spawns it and `TaskOutput` collects it; a subagent no span names
@@ -480,6 +487,10 @@ class ToolSpan:
     #: facts about the same key and a reader acts on them differently.
     params_truncated: list[str] = field(default_factory=list)
     params_dropped: list[str] = field(default_factory=list)
+    #: `run_in_background: true` on the call that opened this span. Read from the RAW
+    #: `tool_use` input, never from `params`: those are redacted strings capped by
+    #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
+    backgrounded: bool = False
 
     @property
     def finished(self) -> bool:
@@ -491,7 +502,9 @@ class ToolSpan:
 
     @property
     def is_join(self) -> bool:
-        return self.name in JOIN_TOOLS
+        if self.name in JOIN_TOOLS:
+            return True
+        return self.name in DELEGATION_TOOLS and not self.backgrounded
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "tool_id": self.tool_id, "started": self.started,
@@ -576,6 +589,10 @@ class Turn:
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
+    #: The cold boundaries that fell in THIS turn, classified once over the whole session
+    #: and attributed here (`_attach_boundaries`). Classifying per turn would open every
+    #: turn with a boundary it did not necessarily have — spec of 2026-09-29, Neo q1048.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The intervals of THIS turn the OS's own record says it was held (`holds.held`),
     #: already clipped to it. Empty when nothing held it, and empty for a reading taken
     #: without a store — a report that cannot see the record must say a turn was held
@@ -689,12 +706,28 @@ class Turn:
 
     @property
     def usage(self) -> usage_mod.Usage:
+        """This turn's tokens, priced — AND classified, which `priced` cannot do.
+
+        `usage.priced` deliberately classifies nothing (it prices counts a caller already
+        holds), so summing it left every boundary and context key of every turn at zero
+        while the turn's own `cache_write` ran to six figures (issue #867). The three
+        properties below are filled from what this turn actually has: its own boundaries,
+        its own calls, and `context_peak` — the SAME number `as_dict` emits at the top
+        level, which is the point of filling it here.
+        """
         total = usage_mod.Usage()
         for call in self.calls:
             total = total + usage_mod.priced(
                 call.model, messages=1, input=call.input,
                 cache_write=call.cache_write, cache_read=call.cache_read,
                 output=call.output, cache_1h=call.cache_1h, cache_5m=call.cache_5m)
+        total.context_peak = self.context_peak
+        # `usage`'s definition at this grain, the arithmetic `Anatomy.rewrite_excess`
+        # already does for the session: in a perfectly cached turn every token is written
+        # once, so what was written above the largest context reached was sent twice.
+        total.rewrite_excess = max(
+            0, sum(c.cache_write for c in self.calls) - self.context_peak)
+        usage_mod.fold_boundaries(total, self.boundaries)
         return total
 
     def share(self) -> dict[str, float]:
@@ -807,6 +840,11 @@ class Anatomy:
     found: bool = False
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
+    #: Every cold boundary in the session, classified ONCE (`usage.classify_boundaries`)
+    #: and also attributed to the turn each fell in. Not `writes`: that list answers
+    #: "which large writes should this report show, and why" and is cut by
+    #: `report_write_floor`, where a boundary census has no threshold at all.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The thresholds this reading was taken at, carried so every rendering of it can
     #: state them. A report that shows "3 large writes" without saying what large meant
     #: is not reproducible, and these are per-project settings (`catalog.InspectConfig`).
@@ -933,6 +971,42 @@ class Anatomy:
         peak = max((t.context_peak for t in self.turns), default=0)
         return max(0, written - peak)
 
+    def rewrite(self) -> dict[str, int | None]:
+        """The session's re-write total, keyed to `jarvis cost`'s own `rewrite` block.
+
+        Same keys as `bill._worker_extras`' wherever the field means the same thing, so
+        the two payloads can be laid side by side — which is what #867's reporter could
+        not do. Summed from the boundaries `read_session` classified and the calls already
+        in hand: nothing is re-read and nothing is re-classified.
+
+        NO `list_usd` and no `ttl_share`. `jarvis cost` is the money surface; a second
+        dollar figure here invites two answers to one question, and the share is a ratio
+        of the numbers below.
+
+        `undecided_boundaries` is why this is safe to read with an unknown floor:
+        `ttl_write` and `prefix_write` at 0 beside a non-zero one of these is "not
+        measured", never "no TTL expiry".
+        """
+        def count(cause: str) -> int:
+            return sum(1 for b in self.boundaries if b.cause == cause)
+
+        def written(cause: str) -> int:
+            return sum(b.cache_write for b in self.boundaries if b.cause == cause)
+
+        return {
+            "boundaries": len(self.boundaries),
+            "ttl_boundaries": count(usage_mod.BOUNDARY_TTL),
+            "compact_boundaries": count(usage_mod.BOUNDARY_COMPACTED),
+            "undecided_boundaries": count(usage_mod.BOUNDARY_UNDECIDED),
+            "ttl_write": written(usage_mod.BOUNDARY_TTL),
+            "prefix_write": written(usage_mod.BOUNDARY_PREFIX),
+            "compact_write": written(usage_mod.BOUNDARY_COMPACTED),
+            "cache_write": sum(c.cache_write for t in self.turns for c in t.calls),
+            # CALLED, not recomputed, so the top-level `rewrite_excess` key and this one
+            # cannot drift.
+            "tokens": self.rewrite_excess(),
+        }
+
     def as_dict(self) -> dict[str, Any]:
         part = self.partition()
         wall = part["wall"] or 1.0
@@ -954,6 +1028,9 @@ class Anatomy:
             "hold_causes": HOLD_CAUSES,
             "context_peak": max((t.context_peak for t in self.turns), default=0),
             "rewrite_excess": self.rewrite_excess(),
+            # ADDITIVE, and the session-level figure #846 needs: `rewrite_excess` above
+            # stays the same number, and `rewrite["tokens"]` IS it.
+            "rewrite": self.rewrite(),
             "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
@@ -985,7 +1062,11 @@ def _detail_of(payload: Any, limit: int) -> str:
     """
     if not isinstance(payload, dict):
         return ""
-    for key in ("description", "command", "task_id", "file_path", "pattern", "skill"):
+    # `substring_pattern` is Serena `search_for_pattern`'s own parameter name, and the
+    # only field that says WHAT hung when that call runs away (issue #845, spec §2c —
+    # which assumed `pattern` covered it; the tool does not use that name).
+    for key in ("description", "command", "task_id", "file_path", "pattern",
+                "substring_pattern", "skill"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             return _first_line(redact_param(value), limit)
@@ -1023,8 +1104,10 @@ def _prompt_of(row: dict[str, Any], ts: float, limit: int) -> Prompt | None:
     text = _prompt_text(row)
     if not text.strip():
         return None
-    return Prompt(ts=ts, kind=_trigger_kind(text), quote=_first_line(text, limit),
-                  source=source)
+    # REDACTED BEFORE IT IS CUT, as `_detail_of` is: the quote is sealed, so an
+    # unredacted one outlives the transcript (autopsy durability spec §3).
+    return Prompt(ts=ts, kind=_trigger_kind(text),
+                  quote=_first_line(redact_param(text), limit), source=source)
 
 
 def _subagent_labels(path: Path) -> dict[str, str]:
@@ -1110,7 +1193,11 @@ def read_transcript(path: Path | str,
                             detail=_detail_of(block.get("input"),
                                               cfg.quote_chars),
                             params=params, params_truncated=truncated,
-                            params_dropped=dropped)
+                            params_dropped=dropped,
+                            # The RAW block, the same read `background._scan_calls` does
+                            # and for the same reason (spec §1).
+                            backgrounded=bool((block.get("input") or {}).get(
+                                "run_in_background")))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.
@@ -1206,7 +1293,8 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None,
                  spans: Sequence[Hold] = (),
-                 turn_starts: Sequence[tuple[int, float]] = ()) -> Anatomy:
+                 turn_starts: Sequence[tuple[int, float]] = (),
+                 cold_prefix_floor: int | None = None) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
 
     Segments are read in path order and their turns concatenated by start time, then
@@ -1224,6 +1312,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     reason. Left empty the turns are numbered 1..N as they always were; passed, they
     carry the OS's own numbers, so an alarm and `jarvis inspect` stop naming one turn two
     different ways (spec 2026-09-27 §3).
+
+    `cold_prefix_floor` is `os.cold_prefix_floor` and is passed in for the same reason,
+    best-effort: left out, boundaries are still counted and a compacted one still
+    labelled, and the TTL-vs-prefix split of the rest is reported as UNDECIDED rather
+    than guessed (`usage.classify_boundaries`). Required here would mean `jarvis inspect`
+    failing over a moved catalog, which is exactly when someone needs it.
     """
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
@@ -1248,6 +1342,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                    for c in usage_mod.compaction_stamps(path)]
     anatomy.writes = classify_writes(calls, cfg.report_write_floor,
                                      sorted(compactions))
+    # ONCE over the whole session, then attributed — Neo q1048. Classified per turn,
+    # every turn would open with a boundary it did not necessarily have and the per-turn
+    # counts would not sum to the session's.
+    anatomy.boundaries = usage_mod.classify_boundaries(
+        calls, compactions=sorted(compactions), cold_prefix_floor=cold_prefix_floor)
+    _attach_boundaries(turns, anatomy.boundaries)
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagent_labels)
@@ -1307,23 +1407,42 @@ def _close_turns(turns: Sequence[Turn]) -> None:
                                                           or turn.ended)
 
 
-def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
-    """Put each API call in the turn that was running when it landed.
+def _turn_at(ordered: Sequence[Turn], ts: float) -> Turn | None:
+    """Which turn was running when something landed, or None if nothing had started.
 
     The same last-turn-started-by-then rule the bill uses (`bill._turn_locator`), so the
     two accountings cut the session at identical points and a reader can lay one beside
-    the other.
+    the other. ONE locator for the calls and the boundaries: two spellings of "which turn
+    was this in" is how two numbers on one payload come to disagree.
+
+    `ordered` must be sorted by `started` — the loop stops at the first turn that had not.
     """
+    home: Turn | None = None
+    for turn in ordered:
+        if turn.started <= ts:
+            home = turn
+        else:
+            break
+    return home
+
+
+def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
+    """Put each API call in the turn that was running when it landed."""
     ordered = sorted(turns, key=lambda t: t.started)
     for call in calls:
-        home: Turn | None = None
-        for turn in ordered:
-            if turn.started <= call.ts:
-                home = turn
-            else:
-                break
+        home = _turn_at(ordered, call.ts)
         if home is not None:
             home.calls.append(call)
+
+
+def _attach_boundaries(turns: Sequence[Turn],
+                       boundaries: Iterable[usage_mod.Boundary]) -> None:
+    """Put each classified boundary in the turn that was running when it was paid for."""
+    ordered = sorted(turns, key=lambda t: t.started)
+    for boundary in boundaries:
+        home = _turn_at(ordered, boundary.ts)
+        if home is not None:
+            home.boundaries.append(boundary)
 
 
 def _read_subagent(path: Path, cfg: InspectConfig,
@@ -1346,6 +1465,31 @@ def _read_subagent(path: Path, cfg: InspectConfig,
         writes=classify_writes(calls, cfg.report_write_floor,
                                sorted(usage_mod.compaction_stamps(path))),
         deeper=len(_subagent_transcripts(path)))
+
+
+def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
+                       *, since: float = 0.0) -> tuple[SubagentAnatomy, ToolSpan] | None:
+    """The first (subagent, span) whose LAST span is an unfinished tool call older than
+    `older_than` seconds. `None` when every subagent is working normally.
+
+    THIS NAMES THE SUBAGENT IT FOUND AND CLAIMS NO PARENTAGE. It scans the session's
+    anatomies and does not assert that the one it returns is the child of any particular
+    delegation span — an `Agent` span carries a `description` and no task id, so the
+    record does not say. `since` keeps a previous turn's leftovers out by requiring the
+    hung span to have started at or after that moment; it is a time WINDOW and not an
+    attribution, which is why `_attach_subagents` still refuses a timestamp fallback
+    (the issue-227 rule: a REPORT names a parent only where the record does — spec §2b).
+
+    "Last span" is the thing the subagent is doing right now. An unfinished span EARLIER
+    in its transcript is a killed call it already moved past, not a hang.
+    """
+    for sub in subs:
+        span = next((t.spans[-1] for t in reversed(sub.turns) if t.spans), None)
+        if span is None or span.finished or span.started < since:
+            continue
+        if now - span.started >= older_than:
+            return sub, span
+    return None
 
 
 def _names(span: ToolSpan, task_id: str) -> bool:
@@ -1448,7 +1592,8 @@ ALARM_KINDS = {
                  "billed (historical: nothing raises this now, spec of 2026-09-27)",
     SLOW_RESPONSE_ALARM: "a request has been in flight this long with no completed "
                          "content block — the model is answering slowly",
-    JOIN_ALARM: "a join open past the cache TTL — the wait is paid for twice",
+    JOIN_ALARM: "a wait that is costing more than it buys — a `TaskOutput` open past "
+                "the cache TTL, or a delegation whose subagent has a tool call hung",
     WRITE_ALARM: "the conversation sent again, at the cache-write rate",
     # The two aggregate kinds. Worded as a share of a PROJECT rather than of a turn, so a
     # reader of the legend cannot take them for another reading of `big-rewrite`.
@@ -1613,8 +1758,26 @@ def alarms(anatomy: Anatomy, cfg: InspectConfig, wo_id: str = "",
                 f"{held_note(wall, holding)} with nothing completed yet; the model is "
                 f"answering slowly, and this is not a stall{hint}")))
     for span in turn.spans:
-        if span.is_join and not span.finished and now and \
-                now - span.started >= cfg.alarm_join_seconds:
+        if not span.is_join or span.finished or not now:
+            continue
+        # A DELEGATION is judged on HANG EVIDENCE and never on elapsed wait (spec §2b):
+        # at `alarm_join_seconds` the literal reading fires on 43 of the fleet's 272
+        # foreground delegations, nearly all of them real subagent work, and an alarm
+        # that fires on normal work is trained away — the standing argument above.
+        if span.name in DELEGATION_TOOLS:
+            found = hung_subagent_call(
+                [*turn.subagents, *anatomy.unattached_subagents], now,
+                cfg.alarm_subagent_tool_minutes * 60, since=span.started)
+            if found is None:
+                continue
+            sub, hung = found
+            called = f"{hung.name} ({hung.detail})" if hung.detail else hung.name
+            raised.append(Alarm(JOIN_ALARM, (
+                f"subagent {sub.label or sub.task_id} blocked "
+                f"{_hours(now - hung.started)} in {called} — long enough to lose the "
+                f"prompt cache, so the wait will be paid for twice{hint}")))
+            break
+        if now - span.started >= cfg.alarm_join_seconds:
             waited = int((now - span.started) // 60)
             raised.append(Alarm(JOIN_ALARM, (
                 f"blocked {waited}m waiting on {span.detail or span.tool_id} with no "

@@ -137,7 +137,7 @@ def parse_report(raw: Any) -> dict[str, Any]:
         findings.append({
             "key": key,
             **fields,
-            "evidence": _parse_evidence(key, entry.get("evidence"), problems),
+            "evidence": parse_evidence(key, entry.get("evidence"), problems),
             "proposed_orders": _parse_orders(key, entry.get("proposed_orders"),
                                              problems),
         })
@@ -169,9 +169,13 @@ def _field_problems(key: str, name: str, value: str) -> list[str]:
     return []
 
 
-def _parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, str]]:
+def parse_evidence(key: str, raw: Any, problems: list[str]) -> list[dict[str, str]]:
     """The quoted record behind a finding. Every message locates the finding by key AND
-    the entry by its 1-based index, because that is how the analyst finds it again."""
+    the entry by its 1-based index, because that is how the analyst finds it again.
+
+    PUBLIC because `verdicts.py` imports it — §2.4 of
+    docs/superpowers/specs/2026-09-27-investigation-orders.md: two leaves, one dependency
+    edge, one definition of what a quote is."""
     if not isinstance(raw, list) or not raw:
         problems.append(
             f"finding {key!r}: `evidence` must be a non-empty list — a finding with "

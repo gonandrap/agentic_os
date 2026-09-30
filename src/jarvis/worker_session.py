@@ -338,10 +338,18 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
     store.update_work_order(wo_id, session_id=session_id, worktree=wo_id)
+    row = {**wo, "session_id": session_id, "worktree": wo_id}
+    # RE-DECIDED FROM THE FILESYSTEM, `retry`'s way, because a work order can reach
+    # dispatch a second time carrying both: `ops.defer_red_release` re-parks a release to
+    # `pending` with its session and worktree intact (2026-09-29 spec §5). `--session-id`
+    # on a session that exists is refused by the CLI and `--worktree` asks for a
+    # directory that is already there. Byte-identical for an ordinary first dispatch.
+    started = _conversation_started(project, row)
+    tree = worktree_path(project, row)
     briefing: dict[str, Any] = {}
-    turn = _launch(store, project, {**wo, "session_id": session_id, "worktree": wo_id},
-                   prompt, kind="dispatch", resume=False, worktree=wo_id,
-                   cwd=project.path, briefing_out=briefing)
+    turn = _launch(store, project, row, prompt, kind="dispatch", resume=started,
+                   worktree=None if tree else wo_id, cwd=tree or project.path,
+                   briefing_out=briefing)
     return turn, briefing
 
 
@@ -411,10 +419,34 @@ def turn_context(turn: dict[str, Any] | None) -> int:
     return int(envelope.get("context_peak") or 0) if isinstance(envelope, dict) else 0
 
 
+def measured_context(store: ProjectStore, wo_id: str) -> int:
+    """The conversation's size as last MEASURED: the newest turn that recorded one.
+
+    Not the latest turn's own figure. A turn that ended without a result — killed, reaped
+    as dead, refused before it reached the model — records none, and reading its 0 as
+    "small" re-sent a 126k conversation cold (issue #856, a turn killed in a fleet stop).
+    A turn records only its own peak, so the newest measured one is the best lower bound
+    on what the next prompt will carry.
+    """
+    for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
+        context = turn_context(turn)
+        if context:
+            return context
+    return 0
+
+
 def compaction_due(store: ProjectStore, wo: dict[str, Any],
                    min_context: int | None,
-                   now: float | None = None) -> Compaction | None:
+                   now: float | None = None,
+                   pause: "TurnPause | None" = None) -> Compaction | None:
     """Should the OS compact before this work order's next prompt goes out?
+
+    ONE PREDICATE FOR BOTH SHAPES. `pause` is the relaunch of a turn the transport lost
+    (issue #843, once `resume_compaction_due`): the boundary is then the PAUSED turn
+    rather than the latest one, and the caller owns the pause —
+    `ops._resume_after_budget` builds a synthetic one that is not on record at all, so
+    it is never re-read here. Two exported predicates is what let a caller pick neither
+    (spec 2026-09-29-one-compaction-decision-on-every-relaunch.md §3.2).
 
     THE EXCLUSIONS, and each is the answer to a way this could cost more than it saves:
 
@@ -434,36 +466,78 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     * The conversation is under the floor. Below it the summary's own output tokens
       cost more than the re-write they replace — measured, see
       `catalog.DEFAULT_COMPACT_MIN_CONTEXT`.
-    * The last turn is PAUSED. Two reasons, either enough. The relaunch tells the
-      worker "the conversation above is intact and is where you left off" (`_nudge`),
-      which a compaction would make false. And the pause is re-derived from the LATEST
-      turn every time it is read (`turn_pause`), so a compact turn behind a paused one
-      ERASES the pause — the relaunch it was waiting for never comes and the order
-      stalls for good. `Daemon.retry_paused_turns` never asks this question at all, and
-      `delivery_hold` holds the delivery for a RESUMABLE pause — but a non-resumable
-      one is not a hold by design, so the delivery path does reach here with a pause
-      outstanding, and this is the test that stops it.
+    * The last turn is paused AND RESUMABLE. That pause is `Daemon.retry_paused_turns`'
+      business and `compaction_due(..., pause=…)` is how it asks — compacting here
+      would make `_nudge`'s "the conversation above is intact" false, and a compact turn
+      behind a paused one ERASES the pause (`turn_pause` re-derives it from the LATEST
+      turn), so the relaunch it waited for never comes. A NON-resumable pause has neither
+      problem: no relaunch is coming, so no nudge will lie and there is no pause anyone
+      is waiting on. `delivery_hold` holds the delivery for a resumable pause — but the
+      decision must not depend on the caller having checked.
     """
     if min_context is None:
         return None
-    turn = store.latest_turn(wo["id"])
-    if turn is None or turn["kind"] == COMPACT_TURN or turn["state"] == "running":
+    turn = pause.turn if pause is not None else store.latest_turn(wo["id"])
+    if turn is None or turn["kind"] == COMPACT_TURN:
         return None
-    ended = turn.get("ended_at")
+    if pause is None and turn["state"] == "running":
+        return None
+    # The paused turn is anchored on `started_at` when it never ended: a turn refused
+    # before it ran records no end, and the pause is the proof it is over.
+    ended = (turn.get("ended_at") or turn["started_at"] if pause is not None
+             else turn.get("ended_at"))
     if not ended:
         return None
     age = (time.time() if now is None else now) - ended
     if age < usage.WRITE_TTL_SECONDS:
         return None
-    context = turn_context(turn)
+    context = measured_context(store, wo["id"])
     if context < min_context:
         return None
     # Last, because it is the only one that costs a second query — and `turn_pause`
     # answers None for every turn that did not fail, so the streak count behind it is
     # only ever reached by a turn that is genuinely paused.
-    if turn["state"] == "failed" and turn_pause(store, wo["id"]) is not None:
-        return None
+    if pause is None and turn["state"] == "failed":
+        held = turn_pause(store, wo["id"])
+        if held is not None and held.resumable:
+            return None
     return Compaction(age=age, context=context)
+
+
+def compact_before_relaunch(store: ProjectStore, project: ProjectSpec,
+                            wo: dict[str, Any], min_context: int | None, *,
+                            pause: "TurnPause | None" = None,
+                            queue: str | None = None,
+                            now: float | None = None,
+                            queued_out: dict[str, Any] | None = None,
+                            ) -> dict[str, Any] | None:
+    """The ONE compaction decision, for every path that relaunches a conversation.
+
+    Returns the compaction turn when it launched one — and then the caller must NOT
+    launch its own turn on this tick — or None, and the caller proceeds exactly as it
+    did before. `pause` is a relaunch of a lost turn, `queue` is a prompt that goes out
+    behind the compaction as a message; they are mutually exclusive.
+
+    DECISION AND ACTION IN ONE FUNCTION, ON PURPOSE. A caller that can ask the predicate
+    and ignore the answer is the defect this exists to remove: the decision used to be
+    opt-in, and three relaunch paths never took it (spec §1.5). `tests/
+    test_relaunch_paths.py` enforces the other half — every launch site reaches here.
+
+    IT RAISES, IT DOES NOT SWALLOW. The three callers have three different and correct
+    policies (`Daemon._compacted_first` swallows everything, `retry_paused_turns`
+    escalates `BudgetExhausted`, `ops._resume_after_budget` reports), and a shared
+    swallow would silently delete the budget escalation.
+    """
+    assert pause is None or queue is None, "a relaunch is either a pause or a prompt"
+    due = compaction_due(store, wo, min_context, now=now, pause=pause)
+    if due is None:
+        return None
+    if pause is not None:
+        return compact_then_resume(store, project, wo, pause, due)
+    if queue is not None:
+        return _compact_after_queueing(store, project, wo, queue, due,
+                                       queued_out=queued_out)
+    return compact(store, project, wo, due)
 
 
 def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
@@ -486,41 +560,11 @@ def compact(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
 
 
 #: The source a relaunch queued behind a compaction carries (`compact_then_resume`).
-RESUME_SOURCE = "jarvis"
-
-
-def resume_compaction_due(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
-                          pause: "TurnPause", min_context: int | None,
-                          now: float | None = None) -> Compaction | None:
-    """Should a PAUSED turn's relaunch go out behind a compaction? (issue #843)
-
-    `compaction_due` refuses every paused turn, for two reasons it states: the relaunch
-    nudge claims the conversation is intact, and a compact turn behind a paused one
-    erases the pause. `compact_then_resume` answers both — the relaunch is QUEUED as an
-    ordinary message before the compaction starts, and it says the conversation was
-    compacted — so the one question left is the cost one, answered exactly as
-    `compaction_due` answers it: the cache has expired (always true after a usage-limit
-    window, which lasts hours) and the conversation is over the floor.
-
-    Never for a paused compaction (re-send the `/compact` itself), and the size is the
-    last turn that MEASURED one — a turn refused before it reached the model records
-    none. A measured size over the floor is also the proof that there is a conversation
-    to summarise: an opening turn refused before it ran measured nothing.
-    """
-    if min_context is None or pause.turn["kind"] == COMPACT_TURN:
-        return None
-    ended = pause.turn.get("ended_at") or pause.turn["started_at"]
-    age = (time.time() if now is None else now) - ended
-    if age < usage.WRITE_TTL_SECONDS:
-        return None
-    context = 0
-    for turn in store.recent_turns(wo["id"], limit=MAX_RATE_LIMIT_RETRIES + 4):
-        context = turn_context(turn)
-        if context:
-            break
-    if context < min_context:
-        return None
-    return Compaction(age=age, context=context)
+#: NOT `queue_message`'s default `"jarvis"`: `ops._resume_after_budget` distinguishes a
+#: queued relaunch from an ordinary `wo send` on this value alone (spec
+#: docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md §3.5).
+#: In `timeline.UNAUTHORED_SOURCES` — nobody decided it.
+RESUME_SOURCE = "relaunch"
 
 
 def compact_then_resume(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
@@ -541,7 +585,43 @@ def compact_then_resume(store: ProjectStore, project: ProjectSpec, wo: dict[str,
         "retried_seq": turn["seq"], "msg_id": msg_id, "reason": pause.reason,
         "context": due.context, "idle_seconds": round(due.age),
     })
-    return compact(store, project, wo, due)
+    return _compact_or_withdraw(store, project, wo, due, msg_id)
+
+
+def _compact_after_queueing(store: ProjectStore, project: ProjectSpec,
+                            wo: dict[str, Any], prompt: str, due: Compaction,
+                            queued_out: dict[str, Any] | None = None,
+                            ) -> dict[str, Any]:
+    """Queue a prompt that was about to be LAUNCHED, then compact in front of it.
+
+    The dispatch-resume path (spec §3.6): a work order can reach dispatch a second time
+    with its session intact, and then the dispatch prompt is an ordinary message into an
+    existing conversation. `queued_out` hands the message id back the way `_launch` hands
+    back a briefing — `dispatch_work_order` records it on the event that replaces
+    `dispatched`.
+    """
+    msg_id = store.queue_message(wo["id"], prompt, source=RESUME_SOURCE)
+    if queued_out is not None:
+        queued_out["msg_id"] = msg_id
+    # No event of its own: `compact` writes `compacting`, and the caller writes what it
+    # did INSTEAD of launching — `dispatch_deferred_for_compaction` carries this msg_id.
+    return _compact_or_withdraw(store, project, wo, due, msg_id)
+
+
+def _compact_or_withdraw(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
+                         due: Compaction, msg_id: int) -> dict[str, Any]:
+    """Compact, and take the queued relaunch back if the compaction cannot launch.
+
+    QUEUE-FIRST STAYS: erasing the pause before the relaunch is queued is the stall
+    issue #843 exists to prevent. This is the other half — a queued relaunch left behind
+    by a compaction that never ran goes out later behind a second one, which is two
+    relaunches of one lost turn (spec §2, §3.3).
+    """
+    try:
+        return compact(store, project, wo, due)
+    except Exception:
+        store.mark_message(msg_id, "failed")
+        raise
 
 
 def _record_compaction(store: ProjectStore, project_name: str, wo_id: str,
@@ -1324,6 +1404,21 @@ def _nudge_after_compaction(pause: TurnPause) -> str:
     would have cost more than the summary. The worker is told so, and told to trust the
     disk over its memory of details the summary may have dropped.
     """
+    # THE BUDGET IS NOT THE TRANSPORT, `_nudge`'s rule, and the budget-raise resume is a
+    # caller of this one since spec 2026-09-29 §3.5: the work DID cause this stop, and
+    # the sentence below about the transport would be a false account of it.
+    if pause.reason == PAUSE_BUDGET:
+        return (
+            "[Jarvis] Your previous turn was cut short because this work order reached "
+            "its spending budget. The user has since raised it, so you may continue. "
+            "While it waited, the conversation's prompt cache expired, so the OS "
+            "COMPACTED it: the summary above stands in for the earlier transcript. "
+            "Nothing you did on disk was lost. Continue from where the summary says "
+            "you were and finish that turn. Do not start again; re-check the state on "
+            "disk (git status, git log, the files you were editing) before redoing "
+            "anything the summary may not mention. The new budget is not unlimited, so "
+            "prefer finishing what is in flight over widening scope."
+        )
     what = ("Claude's usage limit was reached" if pause.reason == PAUSE_USAGE_LIMIT
             else "the Claude API failed" if pause.reason == PAUSE_TRANSIENT
             else "the work order was paused")

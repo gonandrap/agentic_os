@@ -19,6 +19,9 @@
 </div>
 
 {% for u in a.units %}
+{# ABOVE the `found` short-circuit, `cli._print_anatomy`'s rule: which reading answered is
+   exactly what a reader needs when nothing was found. #}
+{{ ui.provenance(u.provenance) }}
 {% if not u.found %}
 {# The same answer `jarvis cost` and `cli._print_anatomy` give, in their words: Claude
    Code prunes transcripts on its own schedule, and an unmeasurable clock is not a zero

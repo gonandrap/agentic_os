@@ -118,6 +118,25 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
     # --append-system-prompt (tests/test_stable_prefix.py holds the two together).
     settings["includeGitInstructions"] = False
 
+    # ONE COPY OF THE PROJECT'S CLAUDE.md reaches the worker. Its worktree is inside the
+    # project, so the CLI loads the branch's copy AND the main checkout's — ~11k
+    # duplicated tokens in every request's prefix, and two instruction sets that may
+    # disagree. The worktree path is PREDICTED, not checked: this file is written before
+    # the spawn whose `--worktree` flag creates it. Spec docs/superpowers/specs/
+    # 2026-09-29-one-copy-of-the-projects-claude-md.md §3.
+    # BOTH SPELLINGS of the root when a catalog path runs through a symlink: an entry
+    # naming a file the CLI did not load is inert, a missing one leaves the duplicate.
+    resolved = project.path.resolve() if project.path.exists() else project.path
+    excludes = [str(p) for p in (settings.get("claudeMdExcludes") or [])]
+    for path in hooks.claude_md_excludes(
+            resolved, resolved / ".claude" / "worktrees" / wo["id"]):
+        rel = path.relative_to(resolved)
+        for root in dict.fromkeys((resolved, project.path)):
+            if str(root / rel) not in excludes:
+                excludes.append(str(root / rel))
+    if excludes:
+        settings["claudeMdExcludes"] = excludes
+
     env = dict(settings.get("env") or {})
     env.update({
         "JARVIS_WO_ID": wo["id"],
@@ -150,6 +169,12 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
         # parse there would be a 39% tax on a ~155ms hook process.
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
+        # The character cap on a `jarvis wo send` / `wo assume` body, enforced by
+        # `hooks.payload_reference_decision` (§5 of docs/superpowers/specs/
+        # 2026-09-26-bounded-model-inputs.md). Env for the same reason as the cap above
+        # it: the check runs on EVERY Bash command and a catalog parse there would be a
+        # 39% tax on a ~155ms hook process.
+        concision.MESSAGE_CAP_ENV: str(project.concision.message_max_chars),
         # The standing worker instructions, for the `SubagentStart` hook to re-inject:
         # a subagent inherits none of its parent's `--append-system-prompt`. Resolved
         # exactly as `worker_session.briefing` resolves it, so the subagent is told what
@@ -169,6 +194,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # settings file must not be able to disagree. §3 of docs/superpowers/specs/
         # 2026-09-23-the-crew-a-worker-must-use.md.
         claude_cli.TURN_TRANSPORT_ENV: claude_cli.TRANSPORT_HEADLESS,
+        # WHAT ONE MCP TOOL CALL MAY TAKE, read by Claude Code itself (issue #845:
+        # nothing bounded the 18m50s Serena call that never returned). Set HERE and not
+        # in `settings.base.json`, because this `env.update` beats both the asset and the
+        # project's `settings_overrides` — a project that needs longer raises the catalog
+        # setting, and a value the asset carried could not be overridden from there. A
+        # STRING like every value in this dict: Claude Code's `env` is a
+        # `Record<string,string>` and an integer risks the CLI rejecting the whole file.
+        "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
         # Whether the lead must delegate its file edits to the crew (§7 of that spec).
         # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
         # write and must not parse the catalog to decide it has nothing to do.
@@ -287,13 +320,16 @@ def feature_context(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] |
     independently (§1.3 of the improvement-orders spec). Same key so the manager path is
     untouched.
     """
-    if wo.get("kind") not in ("manager", "analyst") or not wo.get("parent_id"):
+    if (wo.get("kind") not in ("manager", "analyst", "investigator")
+            or not wo.get("parent_id")):
         return None
     try:
         fo = store.get_feature_order(wo["parent_id"])
     except KeyError:
         return None  # a briefing is not the place to raise on a deleted parent
-    if wo.get("kind") == "analyst":
+    if wo.get("kind") in ("analyst", "investigator"):
+        # Neither has children: an improvement order and an investigation are one row plus
+        # one session, so the query would always answer an empty list.
         return {"fo": fo, "children": []}
     return {"fo": fo, "children": store.feature_children(fo["id"])}
 
@@ -304,7 +340,7 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                         feature: dict[str, Any] | None = None) -> str:
     """What the worker is told, composed from the work order and its project.
 
-    Four kinds of work order get four shapes. A WORKER opens with the minimum — its
+    Five kinds of work order get five shapes. A WORKER opens with the minimum — its
     identity, the work order, a compressed contract of only the load-bearing
     invariants — plus an index of the full briefings it can fetch on demand with
     `jarvis brief <section>` (single-sourced in `worker_brief`, so the CLI and this
@@ -314,8 +350,11 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     be an instruction to do something it must not do. An ANALYST is the same case for the
     same reason (§3.1 of the improvement-orders spec): falling through to the worker
     contract would tell it to open a pull request, which is the one thing it must never
-    do. The surfaces around the contract — the pre-approval marker and the knowledge
-    index — are identical for all four.
+    do. An INVESTIGATOR is the analyst's case again and one step stricter (§2.3 of
+    docs/superpowers/specs/2026-09-27-investigation-orders.md): its no-write rule is
+    enforced by two hooks, so the worker contract's pull-request lines would be an
+    instruction its own tool calls refuse. The surfaces around the contract — the
+    pre-approval marker and the knowledge index — are identical for all five.
     """
     if wo.get("kind") == "planner":
         return _planner_prompt(wo, project, knowledge)
@@ -323,6 +362,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         return _manager_prompt(wo, project, knowledge, feature)
     if wo.get("kind") == "analyst":
         return _analyst_prompt(wo, project, knowledge, feature)
+    if wo.get("kind") == "investigator":
+        return _investigator_prompt(wo, project, knowledge, feature)
     from . import wiring, worker_brief
     from .gates import KINDS
 
@@ -829,6 +870,193 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(_common_briefing(parts, wo, project, knowledge))
 
 
+def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
+                         knowledge: KnowledgeBrief | None = None,
+                         feature: dict[str, Any] | None = None) -> str:
+    """The briefing for an investigation order's investigator — §2.3 of
+    docs/superpowers/specs/2026-09-27-investigation-orders.md.
+
+    STATIC like `_analyst_prompt`, for its reason (no spec, so `specs.install_agent` is
+    never called), and it ends with `_common_briefing` so it inherits the knowledge index
+    and the Serena-before-grep navigation ranking — it reads records and code for a living.
+    No planning seats, again for `_analyst_prompt`'s reason.
+
+    ONE THING HERE IS NOT PROSE, and it is the difference from every prompt above:
+    `hooks.investigator_write_decision` and `hooks.investigator_bash_decision` refuse this
+    session's writes and its mutating shell commands. So these lines describe a wall the
+    session will hit rather than a rule it is asked to keep — which is why the prompt names
+    `verdict.json` with that exact spelling (the one path the write hook exempts) and names
+    the four permitted `jarvis` mutations exactly.
+    """
+    from . import db, gaps, verdicts
+    from .ops import SUBJECT_KEY  # lazy: ops imports dispatch
+
+    inv_id = wo.get("parent_id") or "?"
+    fo = (feature or {}).get("fo") or {}
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    subject = str(metadata.get(SUBJECT_KEY) or "")
+    read_subject = (f"jarvis fo show {subject}" if subject.startswith(("fo-", "io-"))
+                    else f"jarvis wo show {subject}")
+    parts = [
+        f"You are the INVESTIGATOR for Jarvis investigation `{inv_id}` in project "
+        f"`{project.name}`, running as work order `{wo['id']}`.",
+        "",
+        f"# The subject: {subject or '(named in the symptom below)'}",
+        "",
+        wo.get("description") or "(no further description — the title is the ask)",
+        "",
+        "# Your job: diagnose ONE subject and classify it",
+        f"You READ. You change nothing — no file, no commit, no pull request, nothing "
+        f"filed. That is not a request: two PreToolUse hooks refuse your writes and your "
+        f"mutating shell commands, so a session that tries to fix what it found spends "
+        f"its turns being denied. Your output is a VERDICT about "
+        f"{subject or 'the subject'} and nothing else.",
+        "",
+        "# Read the evidence through the CLI, never the databases",
+        "Every record you need has a verb. Do not open a SQLite file, and do not read "
+        "state under `.jarvis/` by hand:",
+        f"- `{read_subject}` — the subject itself: its timeline, messages and assumptions",
+        "- `jarvis validation show <wo-id|fo-id>` — every panel round, seat verdict and "
+        "the commit each judged",
+        "- `jarvis inspect <wo-id|fo-id>` — where the time went, turn by turn",
+        "- `jarvis cost <project|wo-id|fo-id>` — what it cost, split worker vs Jarvis",
+        "- `jarvis alarms [project]` — turns the OS raised while they burned",
+        "- `jarvis gate list --pending` / `jarvis gate show <id>` — a privileged action "
+        "waiting on somebody",
+        "- `jarvis neo list` / `jarvis neo show <qid>` — a question that may never have "
+        "been delivered",
+        "- `jarvis doctor [project]` — the OS's own post-conditions",
+        "- `jarvis search \"<words>\"` / `jarvis issues [project]` — settled records, and "
+        "what the fleet keeps hitting",
+        "- `gh pr view <url>` / `gh pr diff <url>` — the PR, its checks and its diff",
+        "- `git log|show|diff` — the branch, and what landed on it",
+        "",
+        "# Quote your evidence, verbatim",
+        "A root cause asserted without a verbatim line — from a timeline, an `inspect` "
+        "reading, a validation transcript, a diff — is an opinion, not a diagnosis. "
+        "Paraphrase is not a quote. Copy the line as it is printed, name the command that "
+        f"printed it, and keep it over {verdicts.MIN_QUOTE_CHARS} characters, which the "
+        f"validator enforces — under that it is a fragment nobody can find again.",
+        "",
+        "# The four classifications",
+        "A classification is a decision about THE SUBJECT, not about the codebase in "
+        "general. Exactly one:",
+        "- **GAP** — the OS is missing a mechanism, and the subject is stuck because of "
+        "it. Name the bug to file in `proposed_fix`. THE OS FILES IT, expedited, after "
+        "its own duplicate search — which is why you do not file it and cannot.",
+        "- **WAITING_ON_USER** — nothing is broken; a person owes a decision. Name it BY "
+        "ID in `user_owes`: the assumption, the gate, the Neo question. This is the ONE "
+        "classification that spends the user's attention.",
+        "- **TRANSIENT** — it clears itself. Say in `unsticks` WHAT mechanism clears it "
+        "and WHEN. \"It will sort itself out\" with no mechanism is not this "
+        "classification.",
+        "- **ALREADY_TRACKED** — the cause is already on the tracker or already has a live "
+        "order. Put the issue (`#790` or its URL) or the order id in `duplicate_of`.",
+        "",
+        "# Name the gap class — required on all four",
+        gaps.render_registry(),
+        "",
+        "",
+        "# A GAP also owes a detector and a remedy",
+        "`proposed_fix.detector`: the predicate over STATE that would have recognised "
+        "this — a reconciler invariant or a `jarvis doctor` check, MECHANICAL, no model "
+        "call. `proposed_fix.remedy`: which existing remedy id makes the next occurrence "
+        "self-heal, or the word `none` with the reason it is unsafe to automate. Both are "
+        "the fix order's acceptance criteria: a fix that turns the symptom green and "
+        "leaves the OS blind is refused.",
+        "",
+        "# The verdict",
+        f"Write it to `verdict.json` in your worktree root — that filename exactly, it is "
+        f"the one path you are permitted to write — and submit it with the command below, "
+        f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
+        f"settles this work order for you. `--from-file` and not inline flags, because "
+        f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "
+        f"verdict is full of repo paths and quoted log lines.",
+        "",
+        f"    jarvis investigate verdict {inv_id} --from-file verdict.json",
+        "",
+        "```json",
+        "{",
+        f'  "subject": "{subject or "wo-…"}",',
+        '  "classification": "GAP",',
+        '  "gap_class": "stale-hold",   // a registry slug, or a new well-formed one',
+        '  "root_cause": "one paragraph, in mechanism terms",',
+        '  "evidence": [',
+        f'    {{"source": "{read_subject}", "quote": "the verbatim line"}}',
+        "  ],",
+        '  "proposed_fix": {          // GAP only, and all seven fields',
+        '    "title": "what the bug report is titled",',
+        '    "description": "the brief, standing alone",',
+        '    "expected": "what should happen",',
+        '    "actual": "what happens",',
+        '    "priority": "high",',
+        '    "detector": "the state predicate that recognises it, in mechanism terms",',
+        '    "remedy": "an existing remedy id, or none with the reason"',
+        "  },",
+        '  "user_owes": "…",          // WAITING_ON_USER only, naming an id',
+        '  "unsticks": {"what": "…", "when": "…"},   // TRANSIENT only',
+        '  "duplicate_of": "#790"     // ALREADY_TRACKED only',
+        "}",
+        "```",
+        "",
+        "`subject`, `classification`, `gap_class`, `root_cause` and at least one "
+        "`evidence` entry are "
+        "required for all four. CARRY ONLY YOUR CLASSIFICATION'S FIELD: the validator "
+        "refuses a GAP with no `proposed_fix`, and a TRANSIENT that also says the user "
+        "owes something. It names every problem at once, so one revision fixes all of "
+        "them. Comments are not JSON — the `//` notes above are for you, not for the file.",
+        "",
+        "# Bounded inputs",
+        f"- Never paste a diff, a transcript or a log into the verdict: cite the command "
+        f"and quote the decisive line. Over {verdicts.MAX_VERDICT_CHARS} characters the "
+        f"whole document is refused.",
+        "- One subject, one root cause, one classification. A symptom with two independent "
+        "causes is an improvement order, and belongs in the verdict as that recommendation.",
+        "",
+        "# What you may run",
+        "Reads: `git log|show|diff|status|blame`, `gh pr view|diff|checks`, "
+        "`gh issue view|list`, `gh run view|list`, every `jarvis … show|list` verb, and "
+        "`cat`/`grep`/`jq`. Serena's read-only tools are wired for code navigation and "
+        "are faster than grep.",
+        "Writes — EXACTLY four, and nothing else is permitted:",
+        f"- `jarvis wo ask {wo['id']} \"<question>\"`",
+        f"- `jarvis wo assume {wo['id']} \"<call you made with no doubt>\"`",
+        f"- `jarvis learn add \"...\" --project {project.name}`",
+        f"- `jarvis investigate verdict {inv_id} --from-file verdict.json`",
+        "**`jarvis bug report` and `jarvis issues start` are refused for this kind**, and "
+        "deliberately: the OS files a GAP itself after a duplicate search, and a filing "
+        "route around that check is how one cause gets two issues. So a bug you hit in "
+        "Jarvis OS ITSELF while investigating — even one unrelated to your subject — "
+        "cannot be filed from here and does not use your `report-jarvis-bug` skill. Put it "
+        "in the verdict: in `proposed_fix` if it IS the root cause, and in `root_cause`'s "
+        "last sentence if it is not.",
+        "",
+        "# Operating contract",
+        f"- **Neo is your first responder. Any doubt goes to it.** `jarvis wo ask "
+        f"{wo['id']} \"<your question>\"`, then END YOUR TURN; the answer arrives as your "
+        f"next user turn, usually within a minute. The trigger is DOUBT, not importance.",
+        f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
+        f"Record every one, including the small ones.",
+        "- Work only inside your worktree (you start in it).",
+        *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
+           f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
+           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+        f"- The OS knowledge base is the ONLY memory that survives you: "
+        f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
+        "",
+        "# What the outside world sees",
+        "The work order record IS this conversation, as far as anyone else is concerned. "
+        "The last message of every turn you take is captured verbatim into it, and the "
+        "user decides from that record — they will never open this session. End every "
+        "turn with the complete answer: what you found, what you could not read, what you "
+        "are unsure about, and absolute paths.",
+        "",
+        "Work autonomously toward a submitted verdict. User feedback may arrive as new "
+        "user turns; treat it as authoritative.",
+    ]
+    return "\n".join(_common_briefing(parts, wo, project, knowledge))
+
+
 def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
                     knowledge: KnowledgeBrief | None = None,
                     feature: dict[str, Any] | None = None) -> str:
@@ -1023,6 +1251,25 @@ def _gate_briefing(wo: dict[str, Any], project: ProjectSpec) -> list[str]:
         wo["id"], enabled=tuple(project.gates.enabled)).splitlines()
 
 
+def resolved_choices(project: ProjectSpec, wo: dict[str, Any]) -> dict[str, Any]:
+    """The model and effort this work order runs on — PER KIND, then per project.
+
+    The work order's own values win (`jarvis wo create --model`), then the kind's, then
+    the project's. Only one kind has its own today: an INVESTIGATOR reads records and
+    quotes lines, so it runs cheap at low effort — §2.8 of
+    docs/superpowers/specs/2026-09-27-investigation-orders.md.
+
+    A function rather than two lines inline, so a kind's choice is resolved in ONE place
+    and `jarvis wo show` reports what was actually used.
+    """
+    by_kind = {"investigator": (project.worker.investigation_model,
+                                project.worker.investigation_effort)}
+    model, effort = by_kind.get(wo.get("kind") or "worker",
+                                (project.worker.model, project.worker.effort))
+    return {"model": wo.get("model") or model,
+            "effort": wo.get("effort") or effort}
+
+
 def dispatch_work_order(
     store: ProjectStore,
     central: CentralStore,
@@ -1052,8 +1299,7 @@ def dispatch_work_order(
     # Resolved onto the row before the turn is launched, so every later turn rebuilds the
     # same briefing from the record rather than re-reading a catalog that may have moved.
     resolved = {
-        "model": wo.get("model") or project.worker.model,
-        "effort": wo.get("effort") or project.worker.effort,
+        **resolved_choices(project, wo),
         "permission_mode": wo.get("permission_mode") or project.worker.permission_mode,
         # Which configuration this ran under. NULL until the ledger holds a version —
         # "before the console existed", never version 1 (config-console design §5).
@@ -1068,7 +1314,19 @@ def dispatch_work_order(
     wo = store.get_work_order(wo["id"])
 
     try:
-        turn, briefing = worker_session.start(store, project, wo, prompt)
+        # COMPACT FIRST IF THIS IS A SECOND DISPATCH INTO A COLD CONVERSATION. A work
+        # order can reach here with its session intact (`ops.defer_red_release` re-parks
+        # a running release order to `pending`), and `worker_session.start` would then
+        # resume it and re-write the whole transcript. No "is this a re-dispatch" guard:
+        # `compaction_due` returns None with no turn on record, so an opening dispatch is
+        # byte-identical to before (spec §3.6 of
+        # docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+        queued: dict[str, Any] = {}
+        compacted = worker_session.compact_before_relaunch(
+            store, project, wo, cfg.compact_min_context, queue=prompt,
+            queued_out=queued)
+        if compacted is None:
+            turn, briefing = worker_session.start(store, project, wo, prompt)
     except budget.BudgetExhausted as e:
         # Spent before it ever ran a turn — its feature had nothing left to lend it, or
         # the panel and Neo spent the order's own budget on an earlier round. Not a
@@ -1101,6 +1359,19 @@ def dispatch_work_order(
             )
         raise
 
+    if compacted is not None:
+        # NO WORKER PROMPT HAS BEEN SENT: it is the queued message, and delivery puts it
+        # into the summarised conversation on the tick after the compaction settles. So
+        # no `dispatched` event and no seq-1 context ledger — there is no dispatch turn,
+        # and `_launch` recorded the compaction's own row. The claimed-but-no-turn state
+        # `settle_work_order` fails on is not reachable: the compaction IS a live turn.
+        store.clear_dispatch_attempts(wo["id"])
+        store.set_status(wo["id"], "running")
+        store.add_event(wo["id"], "dispatch_deferred_for_compaction", {
+            "turn": compacted["seq"], "msg_id": queued.get("msg_id"), **resolved})
+        central.touch_project(project.name)
+        return store.get_work_order(wo["id"])
+
     # THE CONTEXT LEDGER for the seq-1 dispatch turn, and only that one: Neo's ruling on
     # question 681 partitions the writers so no row is written twice, and this is the only
     # site holding the `KnowledgeBrief` the knowledge block is measured from
@@ -1109,7 +1380,10 @@ def dispatch_work_order(
     # file, and a measurement must not have side effects. Spec docs/specs/
     # 2026-09-24-order-observability.md §5.
     if turn["seq"] == 1:
-        context.record(store, project, wo, turn, briefing, knowledge=knowledge)
+        # `worktree` is written by `start` above, AFTER the row this `wo` was read from —
+        # spec 2026-09-29-one-copy-of-the-projects-claude-md §4 defect (b).
+        context.record(store, project, {**wo, "worktree": wo["id"]}, turn, briefing,
+                       knowledge=knowledge)
     store.clear_dispatch_attempts(wo["id"])
     store.set_status(wo["id"], "running")
     store.add_event(wo["id"], "dispatched", {

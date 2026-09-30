@@ -149,6 +149,19 @@ def test_a_relaunched_dispatch_turn_is_recorded_by_the_launch_side(dispatched):
     assert all(p is not None for p in _payloads(store, wo_id))
 
 
+def test_the_dispatch_turn_is_recorded_as_running_in_the_worktree(dispatched):
+    """Spec docs/superpowers/specs/2026-09-29-one-copy-of-the-projects-claude-md.md §4:
+    the seq-1 row was measured at the project root for two reasons at once — the
+    worktree does not exist yet, and the `wo` dict dispatch reads predates
+    `worker_session.start` writing `worktree`. Either alone puts the wrong cwd on the
+    row, so the memory walk is measured from the wrong directory."""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    row = _named(_payloads(store, wo_id)[0]["ingredients"], "memory_files")
+
+    assert row["detail"]["cwd"] == str(
+        dispatched["spec"].path / ".claude" / "worktrees" / wo_id)
+
+
 # -- 2. absent is never zero ----------------------------------------------------------
 
 
@@ -462,9 +475,10 @@ def test_the_column_is_a_plain_text_blob_the_store_can_read_back(dispatched):
 
 # -- 8. the gate: who turns the write off ----------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. The gate governs THIS write and
-# nothing else: `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page are
-# arithmetic over files that already exist and are never gated.
+# §10 of docs/specs/2026-09-24-order-observability.md, and §5 of
+# docs/specs/2026-09-27-order-autopsy-durability.md: the gate governs THIS write and the
+# sealed autopsy, and no read — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the
+# debug page are arithmetic over files that already exist and are never gated.
 
 
 def _obs(level=None):
@@ -511,9 +525,9 @@ def test_an_unrecognised_stored_level_falls_back_to_the_config():
     assert observability.level_for({"observability": "verbose"}, None) == "normal"
 
 
-def test_only_off_stops_the_write_and_full_is_not_a_third_behaviour():
-    """`full` records exactly what `normal` does — §10 lets this child say so rather than
-    invent a difference."""
+def test_off_stops_the_context_row_and_both_other_levels_write_it():
+    """`off` stops the context row; `full` and `normal` both write it, and they differ only
+    in what a `full` autopsy retains (§6 of the autopsy-durability spec)."""
     from jarvis import observability
 
     assert observability.records_context({"observability": "off"}, _obs()) is False
@@ -610,12 +624,14 @@ def test_jarvis_wo_create_stamps_the_level_on_the_order(jarvis_home, fake_claude
         store.close()
 
 
-def test_both_surfaces_say_the_autopsy_is_not_gated():
-    """Neo 814: the level governs one row, and BOTH surfaces must say so in one phrase.
+def test_both_surfaces_say_the_autopsy_reading_is_shown_at_every_level():
+    """Neo 814 and §5 of docs/specs/2026-09-27-order-autopsy-durability.md: no level gates
+    a READ, and both surfaces must say so in one phrase.
 
-    §§3, 4, 6 and 7 derive the autopsy at read time, so it is unconditional. A user who
-    reads `--help` and a developer who reads the config class have to learn the same fact
-    from the same words — hence one pinned phrase, not two spellings of it.
+    §§3, 4, 6 and 7 derive the autopsy at read time, so the reading is shown at every level
+    — `off` included. What `off` withholds is the SEAL that makes that reading outlive the
+    transcript. A user who reads `--help` and a developer who reads the config class have to
+    learn the same fact from the same words, hence one pinned phrase and not two spellings.
 
     Whitespace is collapsed on both sides: the phrase is the fact, where a docstring or a
     help string happens to wrap is not, and a reflow must not fail this test.
@@ -646,3 +662,67 @@ def _subparsers(parser):
     (action,) = [a for a in parser._actions
                  if isinstance(a, argparse._SubParsersAction)]
     return action
+
+
+def _level_lines(help_text):
+    """The `--observability` help as one description per level, keyed by level.
+
+    Segmented on each level's own marker and never on newlines: argparse reflows a help
+    string, so where it breaks a line is not where the reader's line is.
+    """
+    flat = " ".join(help_text.split())
+    marks = sorted((flat.index(f"`{level}` —"), level)
+                   for level in ("off", "normal", "full"))
+    return {level: flat[start:(marks[i + 1][0] if i + 1 < len(marks) else len(flat))
+                        ].strip()
+            for i, (start, level) in enumerate(marks)}
+
+
+def test_every_observability_setting_reaches_the_config_console_and_full_reads_apart(
+        tmp_path):
+    """`config_version.resolve` is reflective, so every `ObservabilityConfig` field is a
+    `jarvis config set` key with no edit to the console — this fails if the level goes back
+    to being a module constant. And §5 gave `full` a meaning, so the one surface that
+    describes the levels must not describe it in `normal`'s words.
+
+    Both key forms count: a field that is itself a dataclass is flattened to its leaves, and
+    the prefix form still has to produce at least one key, so a block that resolved to
+    nothing cannot pass on the strength of its own name.
+    """
+    from jarvis import config_version
+    from jarvis.catalog import ObservabilityConfig, parse_catalog
+    from jarvis.cli import build_parser
+
+    cat = parse_catalog({"os": {}, "projects": [{"name": "p", "path": str(tmp_path)}]})
+    resolved = config_version.resolve(cat)
+
+    for field_name in vars(ObservabilityConfig()):
+        for path in (f"os.observability.{field_name}",
+                     f"projects.p.observability.{field_name}"):
+            leaves = [k for k in resolved if k.startswith(f"{path}.")]
+            assert path in resolved or leaves, field_name
+
+    lines = _level_lines(_observability_help(build_parser()))
+
+    assert set(lines) == {"off", "normal", "full"}
+    assert lines["full"] != lines["normal"]
+    assert "sealed" in lines["off"] or "SEALED" in lines["off"]
+
+
+def test_section_10_of_the_spec_tells_full_and_normal_apart():
+    """§5 of docs/specs/2026-09-27-order-autopsy-durability.md gave `full` a meaning, so the
+    section that described the two levels as collapsing may no longer say so: it names both
+    and names the content a `full` seal retains. Whitespace is collapsed before matching so
+    a reflow cannot fail it."""
+    from pathlib import Path
+
+    spec = (Path(__file__).resolve().parents[1] /
+            "docs/specs/2026-09-24-order-observability.md").read_text()
+    section = " ".join(spec.split("## 10.", 1)[1].split("## 11.", 1)[0].split())
+
+    assert "`full`" in section and "`normal`" in section
+    assert "params" in section or "tool parameters" in section
+    assert "subagent" in section
+    for claim in ("collapse", "identical", "exactly what `normal` does",
+                  "the same as `normal`"):
+        assert claim not in section, claim

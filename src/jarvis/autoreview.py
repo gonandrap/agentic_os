@@ -148,6 +148,18 @@ HELD_STATUS = "status"
 HELD_SETTLED = "settled"
 HELD_PANEL_GAVE_UP = "panel_gave_up"
 HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
+
+#: The two sentences that code renders, and which one depends on whether anything moved.
+#: Spec §2c of
+#: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md: the
+#: first is FALSE on wo-dbea82cf, where the worker pushed three commits and never ran
+#: `jarvis wo finish`. Neither carries a count, a sha or an elapsed time — `ack_attention`
+#: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
+REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
+                             "worker has not delivered again since")
+REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
+                             "worker has pushed commits since without running `jarvis "
+                             "wo finish` — the OS has asked it to declare them")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 #: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
@@ -176,6 +188,32 @@ HELD_OBJECTED = "objected"
 HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
+
+#: docs/superpowers/specs/2026-09-28-a-dropped-confirmation-must-not-hold-an-assumption-
+#: for-ever.md §5 and §6. `round_open` is `decide_confirm`'s alone — the confirmation
+#: judges the DELIVERED RESULT, so a round the panel has not finished may be about to send
+#: that result back (§5.2, and the ASK pass keeps its licence to arm on a pending round).
+#: `confirm_spent` is `confirming` SPLIT: one code with a conditional suppression would
+#: make `daemon._holds_not_recorded`'s answer depend on state it cannot see. The live one
+#: stays suppressed, the spent one is VISIBLE — it is the user's, and nothing else on the
+#: record says so.
+HELD_ROUND_OPEN = "round_open"
+HELD_CONFIRM_SPENT = "confirm_spent"
+
+#: WHICH DROPPED CONFIRMATION MAY BE ASKED AGAIN — the settle site's allowlist (§4.1). A
+#: code is here when the drop is a fact that can clear with the user doing nothing AND
+#: says nothing about whether the assumption is theirs to decide. An ALLOWLIST, not
+#: "everything but the three that stay": a blocklist admits a new code the day somebody
+#: writes a new hold, and this set governs whether the OS spends another model call.
+#: `settled` (no reader — the drop site returns earlier) and `evidence_secret` (a
+#: statement that the row is the user's, and a second chance to copy a secret into the
+#: question store) were examined and refused.
+TRANSIENT_DROPS = frozenset({HELD_STATUS, HELD_REFUSAL_UNANSWERED,
+                             HELD_OBJECTION_IN_FLIGHT})
+
+#: A round's outcome that means the panel has NOT finished with it. `pending` is the
+#: column's default on an open round and `''` is a row that never got one.
+_UNRESOLVED_OUTCOMES = ("", "pending")
 
 #: THE STATUS EACH PASS ACTS IN, and the conditions below read these rather than a literal
 #: of their own (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6).
@@ -793,7 +831,7 @@ def _stakes_hold(n: int, verdict: Stakes, fields: dict[str, Any]) -> Decision:
 
 def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
            round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-           refusal_answered: bool = True,
+           refusal_answered: bool = True, undeclared_delivery: bool = False,
            asked_question_id: int = 0,
            unreachable_question_ids: Collection[int] = (),
            stakes: Stakes | None = None) -> Decision:
@@ -877,8 +915,8 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:
@@ -904,6 +942,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                    refusal_answered: bool = True,
                    objections_outstanding: bool = False,
                    unreachable_question_ids: Collection[int] = (),
+                   confirmation_open: bool = True,
                    stakes: Stakes | None = None) -> Decision:
     """May the OS CONFIRM this early verdict now, at delivery? PURE, like `decide`.
 
@@ -920,7 +959,16 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
       `object` approved NOTHING, so there is nothing to confirm and no question is asked
       on one: the user decides it, with the objection in front of them.
     * `confirm_question_id` already set — the confirmation is out. **THIS, AND NOT
-      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.**
+      CONDITION 6, IS WHAT KEEPS ONE QUESTION PER ASSUMPTION PER PASS HERE.** It splits
+      in two on `confirmation_open` (2026-09-28 spec §6): a question Neo still holds is
+      `confirming`, the pass working and suppressed; one that is no longer open is
+      `confirm_spent`, the row the user owes a decision on with nothing else saying so.
+    * A VALIDATION ROUND THE PANEL HAS NOT FINISHED — `round_open`, this function's
+      alone. The ask pass may arm on a pending round (`decide`'s docstring) because it
+      judges a sentence the worker wrote; this one interpolates the DIFF, and a round
+      still open means that diff may be about to be sent back (2026-09-28 spec §5.2).
+      A `round_n` of 0 is no round at all and does NOT hold: a project with validation
+      off behaves exactly as it did.
     * an objection still in flight on the work order — §6.6 has not withdrawn it yet.
       Means NOT YET and costs nothing: retried next tick. Without it the two passes race
       on one assumption, one settling it while the other has a message to the worker in
@@ -928,7 +976,15 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
     `unreachable_question_ids` covers `confirm_question_id` as well as condition 6, and it
     means what it means in `decide`: the id is a question nobody will ever answer, so a
-    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4).
+    dead confirmation is re-asked rather than held for ever (2026-09-26 spec §4). It is
+    checked BEFORE `confirmation_open`, so a `failed` question is asked again rather than
+    reported as spent — an outage is not a decision.
+
+    `confirmation_open` is the caller's fact, derived the way `unreachable_question_ids`
+    is (`Daemon._question_liveness`) because this function is pure: open means the
+    question's status is one of `neo_store.NEO_HELD_Q_STATUSES`. `escalated` and
+    `answered` are NOT open — Neo is finished with it either way. The default is True, so
+    every existing caller keeps today's behaviour.
 
     **`asked_question_id` IS PASSED ON PURPOSE**, and it is the escape hatch `decide`'s
     own docstring documents for condition 6. `neo_question_id` points at the EARLY
@@ -950,9 +1006,23 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      **fields)
     confirming = int(assumption.get("confirm_question_id") or 0)
     if confirming and confirming not in unreachable_question_ids:
+        if not confirmation_open:
+            # 2026-09-28 spec §6: the question id is in the PROSE because the dashboard's
+            # link is driven by `os_ruling.neo_question_id` and a hold payload has none.
+            return _held(HELD_CONFIRM_SPENT,
+                         f"assumption #{n} is yours — the OS asked Neo to confirm its "
+                         f"early reading (question {confirming}) and that question is no "
+                         f"longer open", **fields)
         return _held(HELD_CONFIRMING,
                      f"assumption #{n} is already with Neo to confirm "
                      f"(question {confirming})", **fields)
+    if round_n > 0 and str(round_outcome or "").lower() in _UNRESOLVED_OUTCOMES:
+        # 2026-09-28 spec §5.1. The round rides on the decision: it is part of the
+        # dedupe key, so the NEXT round's hold is written too.
+        return _held(HELD_ROUND_OPEN,
+                     f"the validation panel has not finished round {round_n} — the "
+                     f"result this confirms against may be about to be sent back",
+                     round=round_n, **fields)
     if objections_outstanding:
         return _held(HELD_OBJECTION_IN_FLIGHT,
                      "an objection on this work order has not reached the worker or "
@@ -973,7 +1043,7 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
 
 def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                  round_outcome: str = "", round_n: int = 0, round_reason: str = "",
-                 refusal_answered: bool = True,
+                 refusal_answered: bool = True, undeclared_delivery: bool = False,
                  asked_question_id: int | None = None,
                  unreachable_question_ids: Collection[int] = (),
                  stakes: Stakes | None = None) -> Decision:
@@ -1040,8 +1110,8 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                               "for you", fields)
     if not refusal_answered:
         return _held(HELD_REFUSAL_UNANSWERED,
-                     "you refused an assumption on this work order and the worker has "
-                     "not delivered again since", **fields)
+                     REFUSAL_UNDECLARED_REASON if undeclared_delivery
+                     else REFUSAL_UNANSWERED_REASON, **fields)
     asked = int(assumption.get("neo_question_id") or 0)
     if asked and asked != int(asked_question_id or 0) \
             and asked not in unreachable_question_ids:
@@ -1505,8 +1575,158 @@ def _ruling_question(project: str, wo: dict[str, Any], assumption: dict[str, Any
     ])
 
 
+#: How many dropped paths the truncation marker NAMES. The COUNT is always exact — spec
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2.
+CONFIRM_DROPPED_FILES_SHOWN = 10
+
+#: The per-field cuts this question makes, named instead of spelled inline — the limit
+#: discipline of `gates.build_request_question` (spec § 2).
+CONFIRM_DESCRIPTION_CHARS = 2000
+CONFIRM_SUMMARY_CHARS = 1500
+
+#: `supervisor.build_evidence`'s closing sentence, reused verbatim for the same purpose.
+CANNOT_SEE = "Escalate rather than judge on what you cannot see."
+
+#: The two `EvidencePacket.source` values, whose `head` means different things.
+SOURCE_WORKTREE = "worktree"
+SOURCE_PULL_REQUEST = "pull_request"
+
+
+@dataclass(frozen=True)
+class ConfirmEvidence:
+    """The delivered change as ONE confirmation question carries it.
+
+    The packet trimmed to `validation.confirm_diff_chars`, plus what the trim removed:
+    a diff the reviewer is not told was cut is how it confirms a change it never saw.
+
+    `full_chars` is the length of the diff the COLLECTION handed over, and
+    `collect_truncated` says that collection was itself bounded — so the total is not
+    knowable and the marker must not state one (Neo, question 945).
+    """
+
+    stat: str = ""
+    diff: str = ""
+    files: tuple[str, ...] = ()
+    diff_truncated: bool = False
+    dropped_files: tuple[str, ...] = ()
+    pr_url: str = ""
+    source: str = ""
+    head: str = ""
+    full_chars: int = 0
+    collect_truncated: bool = False
+    #: The collection bound, carried so the marker can name it without this module
+    #: holding a number the daemon owns.
+    collect_limit: int = 0
+
+    def what_changed(self) -> str:
+        """The EXACT `# What changed` block `_confirm_question` interpolates.
+
+        ONE renderer, called twice — by the question and by the daemon's
+        `decide_evidence` call — so the text scanned and the text sent cannot drift:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2, every byte that is
+        persisted or sent has been through the net.
+        """
+        return _what_changed(self)
+
+
+def confirm_evidence(packet: Any, assumption: dict[str, Any], limit: int, *,
+                     collect_limit: int = 0) -> ConfirmEvidence:
+    """Trim one collected packet for one assumption. PURE — no git, no store, no model.
+
+    **THE HUNKS THE ASSUMPTION NAMES GO FIRST.** An assumption that mentions a path is
+    confirmed against that path, and spending the budget in diff order drops exactly the
+    file the question is about. Where it names none the collection's order stands.
+
+    `None` is the collector having failed or there being nothing, and it answers an empty
+    instance: AN EMPTY DIFF STILL ASKS (`Daemon._confirmation_evidence`).
+    """
+    from . import evidence
+
+    if packet is None:
+        return ConfirmEvidence(collect_limit=collect_limit)
+    files = tuple(packet.files or ())
+    full = str(packet.diff or "")
+    content = str(assumption.get("content") or "").lower()
+    named: list[str] = []
+    rest: list[str] = []
+    for new, old, text in evidence._sections(full):
+        path = new or old
+        (named if path in files and _names_path(content, path) else rest).append(text)
+    kept, cut, dropped = evidence._truncate(
+        "".join(named + rest) if named else full, limit, files)
+    return ConfirmEvidence(
+        stat=str(packet.stat or ""), diff=kept, files=files,
+        diff_truncated=bool(cut or packet.diff_truncated),
+        dropped_files=tuple(dict.fromkeys(tuple(packet.dropped_files or ())
+                                          + tuple(dropped))),
+        pr_url=str(packet.pr_url or ""), source=str(packet.source or ""),
+        head=str(packet.head or ""), full_chars=len(full),
+        collect_truncated=bool(packet.diff_truncated), collect_limit=collect_limit)
+
+
+def _names_path(content: str, path: str) -> bool:
+    """Does this text name that file — by its full path or by its basename?"""
+    lower = path.lower()
+    return lower in content or lower.rsplit("/", 1)[-1] in content
+
+
+def _truncation_marker(ev: ConfirmEvidence) -> str:
+    """What was cut, in one line: the kept size, the TOTAL, the count and the names."""
+    total = (f"more than {ev.collect_limit:,}" if ev.collect_truncated
+             else f"{ev.full_chars:,}")
+    shown = ev.dropped_files[:CONFIRM_DROPPED_FILES_SHOWN]
+    more = len(ev.dropped_files) - len(shown)
+    named = ", ".join(shown) + (f", and {more} more" if more else "")
+    which = (f"{len(ev.dropped_files)} file(s) not shown: {named}" if shown
+             else "no whole file dropped")
+    return (f"[diff truncated — {len(ev.diff):,} of {total} chars; {which}; "
+            f"full diff: {ev.pr_url or '(no pull request)'}]")
+
+
+def _reference(ev: ConfirmEvidence) -> str:
+    """The reference, which rides truncated or not (Neo, question 753).
+
+    A sha as a sha and a branch as a branch: `head` is a HEAD sha on the worktree path
+    and GitHub's `headRefName` on the pull-request path (evidence.py's field comment).
+    """
+    if ev.head and ev.source == SOURCE_WORKTREE:
+        head = f"head sha: {ev.head}"
+    elif ev.head and ev.source == SOURCE_PULL_REQUEST:
+        head = f"head branch: {ev.head}"
+    else:
+        head = "head: (unknown)"
+    return f"pull request: {ev.pr_url or '(none)'}\n{head}"
+
+
+def _what_changed(ev: ConfirmEvidence) -> str:
+    """The full stat, the full file list, the kept hunks, what was cut, the reference."""
+    from . import provenance
+
+    stat = (provenance.borrowed_block(provenance.Borrowed(
+        label="the `git diff --stat` of the delivered change", whose="git",
+        # FULL: the stat is what a reviewer reads when no hunk survived the budget.
+        text=ev.stat, limit=len(ev.stat))) if ev.stat else "(no files reported)")
+    paths = "\n".join(f"  {f}" for f in ev.files)
+    listing = ("changed files, all of them — this list is never truncated:\n"
+               + provenance.borrowed_block(provenance.Borrowed(
+                   label="the changed-file list of the delivered change", whose="git",
+                   # FULL: evidence.py's rule 3 — `files` is truncated at no limit.
+                   text=paths, limit=len(paths))) if ev.files
+               else "changed files: (none reported)")
+    diff = (provenance.borrowed_block(provenance.Borrowed(
+        label="the delivered diff", whose="the worker of this work order",
+        # Bounded upstream by `confirm_diff_chars` at a FILE BOUNDARY: a blind character
+        # limit here would re-cut it mid-hunk.
+        text=ev.diff, limit=len(ev.diff))) if ev.diff else "(no diff)")
+    parts = ["# What changed", stat, listing, diff]
+    if ev.diff_truncated:
+        parts += [f"{_truncation_marker(ev)}\n{CANNOT_SEE}"]
+    parts.append(_reference(ev))
+    return "\n\n".join(parts)
+
+
 def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, Any],
-                      siblings: list[dict[str, Any]], stat: str, diff: str,
+                      siblings: list[dict[str, Any]], ev: ConfirmEvidence,
                       record: str = "") -> str:
     """What the reviewer reads at DELIVERY. Everything the early pass could not have.
 
@@ -1517,7 +1737,8 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
       reviewer is being asked to confirm a READING, not to rule from scratch, and one
       formed with no diff in front of it is evidence rather than authority — saying so is
       what stops the earlier line being read as a decision already taken.
-    * **the diff stat and the diff** (already truncated by `evidence.collect_work_order`),
+    * **the diff stat and the diff** (trimmed by `confirm_evidence` to
+      `validation.confirm_diff_chars`, with a marker naming what was cut),
       and the result summary. This is the fact that did not exist when the assumption was
       an intention, and confirming without it would be the cheap design Neo refused.
       **`decide_evidence` HAS ALREADY PASSED BOTH**, because `neo.ask` persists
@@ -1546,10 +1767,10 @@ def _confirm_question(project: str, wo: dict[str, Any], assumption: dict[str, An
         f"{assumption.get('provisional_reason') or '(no reason recorded)'}\n"
         f"That reading had NO diff and NO result summary in front of it. You do.",
         f"# The work order it was recorded against\n{wo.get('title') or '(untitled)'}\n"
-        f"{(wo.get('description') or '')[:2000]}",
+        f"{(wo.get('description') or '')[:CONFIRM_DESCRIPTION_CHARS]}",
         f"# What the worker says it delivered\n"
-        f"{(wo.get('result_summary') or '(nothing recorded)')[:1500]}",
-        f"# What changed\n{stat or '(no files reported)'}\n\n{diff or '(no diff)'}",
+        f"{(wo.get('result_summary') or '(nothing recorded)')[:CONFIRM_SUMMARY_CHARS]}",
+        _what_changed(ev),
         f"# The work order's other assumptions, for context only — do not rule on these\n"
         f"{others}",
         _record_block(record),
@@ -1572,7 +1793,7 @@ def _record_chars(cfg: Any) -> int:
 
 def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
                          assumption: dict[str, Any], siblings: list[dict[str, Any]],
-                         *, stat: str = "", diff: str = "",
+                         *, evidence: ConfirmEvidence | None = None,
                          cfg: Any = None) -> dict[str, Any]:
     """Put ONE already-judged assumption back to Neo at delivery. Returns the question.
 
@@ -1591,7 +1812,8 @@ def propose_confirmation(store: Any, neo: Any, project: str, wo: dict[str, Any],
     (kn-4edb0eb7).
     """
     question = neo.ask(project, wo["id"],
-                       _confirm_question(project, wo, assumption, siblings, stat, diff,
+                       _confirm_question(project, wo, assumption, siblings,
+                                         evidence or ConfirmEvidence(),
                                          decision_record(
                                              store, neo, wo["id"], siblings, assumption,
                                              chars=_record_chars(cfg))),

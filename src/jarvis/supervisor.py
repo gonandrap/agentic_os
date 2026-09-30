@@ -14,6 +14,7 @@ persona (`tests/test_supervisor.py`). `remedies.py` acts, and only under a grant
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from . import claude_cli, structured
@@ -309,8 +310,9 @@ def _what_it_is(wo: dict[str, Any]) -> str:
     """What KIND of session is burning, in the judge's words.
 
     Every alarm is raised against a `work_orders` row (`Daemon.check_burning_turns` walks
-    the running ones), but `WO_KINDS` has four members: two belong to a FEATURE order and
-    one to an IMPROVEMENT order, so "a work order" alone hides the thing that most
+    the running ones), but `WO_KINDS` has five members: two belong to a FEATURE order, one
+    to an IMPROVEMENT order and one to an INVESTIGATION, so "a work order" alone hides the
+    thing that most
     changes what normal looks like. A planner reading a whole codebase for an hour is
     doing its job; a worker doing the same on a one-file fix is not. Reported as evidence
     rather than instructed in the persona, because a judge told to weigh something it
@@ -327,6 +329,16 @@ def _what_it_is(wo: dict[str, Any]) -> str:
                 f"records through the CLI to diagnose a root cause, so it is expected "
                 f"to be read-heavy; a long GENERATING stretch, or any sign of it "
                 f"editing product code, is not")
+    if kind == "investigator":
+        # §2.2 of docs/superpowers/specs/2026-09-27-investigation-orders.md, and it says
+        # the sharper thing: its writes are REFUSED by a hook, so a long stretch of
+        # retried denied tool calls is the abnormality — not the reading.
+        owns = f" of investigation {parent}" if parent else ""
+        return (f"the INVESTIGATOR{owns} — one read-only session diagnosing one stuck "
+                f"order through the CLI, so it is expected to be read-heavy and to end "
+                f"in a verdict; a long GENERATING stretch, or a run of DENIED tool calls "
+                f"it keeps retrying (its writes and mutating commands are refused by a "
+                f"hook), is not")
     if kind == "planner":
         return (f"the PLANNER{belongs} — one session reading the codebase to decompose "
                 f"a single ask into work orders, so it is expected to be long and "
@@ -349,7 +361,7 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     itself. `pstore` is optional only so a caller without one degrades to the old lines
     rather than raising inside an evidence packet.
     """
-    from . import holds, inspection
+    from . import autopsy, holds, inspection, ops
 
     session_id = wo.get("session_id") or ""
     if not session_id:
@@ -358,14 +370,24 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     # Spec 2026-09-27 §3: the OS's own turn numbers, degrading to 1..N without a store.
     turn_starts = pstore.turn_starts(wo["id"]) if pstore is not None else []
     try:
-        anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans,
-                                          turn_starts=turn_starts)
+        # Spec 2026-09-27 §4: through the chokepoint, off the full store row this is
+        # already called with, so a settled order's evidence outlives its transcript.
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, inspect_cfg, spans=spans, turn_starts=turn_starts,
+            cold_prefix_floor=ops.cold_prefix_floor())
     except OSError:
         return ["(the session transcript could not be read)"]
     if not anatomy.found:
         return ["(no transcript found for this session)"]
 
     lines = []
+    # ONLY when a seal answered (Neo q1080): the derived case is what this packet has
+    # always said, and it is byte-pinned. Said FIRST, like `stalled` below and for its
+    # reason — it changes what every number after it means.
+    if provenance["source"] == autopsy.SEALED:
+        lines.append(f"- {provenance['note']} {provenance['level_note']}"
+                     + (f" {provenance['floor_note']}" if provenance["floor_note"]
+                        else ""))
     for turn in anatomy.turns:
         # THE COST IS AN INPUT, NOT AN INFERENCE FROM THE DURATION (issue 227). The
         # per-turn record already existed and no layer read it, so a 65-minute turn that
@@ -914,6 +936,20 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
                 "health", project=project, wo_id=carrier["id"], label=trigger,
                 model=cfg.model, record=record),
         )
+    except claude_cli.UsageLimitError as exc:
+        # BEFORE the generic outage below, and the ordering is the fix: a spent window
+        # is not a transport fault and must not be recorded as a broken sweep
+        # (issue #235's lesson, kn-96bc2417; `neo.drain_queue` src/jarvis/neo.py:418).
+        from .worker_session import RATE_LIMIT_FALLBACK_DELAY
+
+        reopens = exc.limit.reset_at or (time.time() + RATE_LIMIT_FALLBACK_DELAY)
+        pstore.record_health_review(kind, subject_id, fingerprint=fingerprint,
+                                    trigger=trigger, outcome="held",
+                                    detail=_clip(exc.limit.message, cfg.reason_chars),
+                                    reopens_at=reopens)
+        log.info("[%s] health sweep of %s held until the usage window reopens",
+                 project, subject_id)
+        return {**_nothing_found(exc.limit.message), "raised": [], "outcome": "held"}
     except claude_cli.ClaudeCliError as exc:
         # `on_invalid` does NOT cover this: `ClaudeCliError` propagates untouched by
         # design (kn-9b18a8eb), and without this the sweep raises out of the daemon's

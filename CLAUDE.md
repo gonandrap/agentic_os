@@ -48,6 +48,7 @@ jarvis pause [--allow <wo-id,...>] [--reason "…"]   # THE BRAKE. No work order
                                            # flight finish; nothing is killed or lost.
                                            # Reach for this, never `systemctl stop` plus
                                            # kill, when spend is out of control.
+                                           # The dashboard has the same controls.
 jarvis resume <wo-id...> | --all           # let named orders through a pause (one at a
                                            # time serialises spend), or lift it. After a
                                            # usage window reopens the OS ramps back by
@@ -145,6 +146,18 @@ jarvis io review <id> [--accept <key>] [--reject <key>] [--feedback "why"] [--ac
 jarvis io cancel <id>                      # stops the order and its analyst. Orders
                                            # already filed from accepted findings stay:
                                            # those were your decision.
+jarvis investigate <wo-id|fo-id|io-id> --why "what you saw"
+                                           # an INVESTIGATION order: one order is not
+                                           # moving and you want the cause. A read-only
+                                           # session reads the record and NEVER writes
+                                           # code — a hook refuses every write and every
+                                           # mutating command. It SETTLES ITSELF, unlike
+                                           # `io`, with one of four verdicts: GAP (files
+                                           # an EXPEDITED bug after a duplicate check, so
+                                           # the fix ships a release), WAITING_ON_USER
+                                           # (the only one that asks for you), TRANSIENT,
+                                           # ALREADY_TRACKED. One live per subject.
+jarvis investigate list / show <inv-id> / cancel <inv-id>
 jarvis backlog promote <id> --as feature   # intake -> feature order, not a work order
 jarvis wo list [project] / show <id> / send <id> "msg" / cancel <id>
 jarvis wo review <id> [--reject] [--feedback "why"]   # feedback teaches Neo; on
@@ -233,6 +246,26 @@ jarvis wo resume-auto <id>                 # what is this work order ACTUALLY wa
                                            # that were waiting correctly and re-sent
                                            # their whole conversation. `--force` sends
                                            # it anyway.
+jarvis wo retry <id> [--message "…"]       # RELAUNCH A FAILED ORDER in its own session,
+                                           # from where its worker died — the named form
+                                           # of the revive `wo send` has always done as a
+                                           # side effect. `--message` is optional: empty
+                                           # sends the OS's own relaunch note, which asks
+                                           # the worker where it got to rather than
+                                           # telling it. `failed` ONLY — a delivered order
+                                           # has `validation force` and `wo review`, a
+                                           # live one has a worker to talk to, and one
+                                           # that failed before ever opening a
+                                           # conversation is refused: there is no session
+                                           # to resume. It writes no status, so the order
+                                           # stays `failed` — and stays flagged — until
+                                           # jarvisd launches the turn. Pending
+                                           # assumptions do NOT block it and are NOT
+                                           # buried: they stay on `jarvis wo review`.
+                                           # NOT AUTOMATIC: a turn that died with no
+                                           # result is never replayed by the OS, only by
+                                           # the user. Same control on the work order's
+                                           # dashboard page.
 jarvis wo inject <session-id>              # hand the user's OWN Claude session to Jarvis.
                                            # Jarvis never adopts a session it finds: one
                                            # the user started is theirs. Injecting only

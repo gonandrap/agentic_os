@@ -602,6 +602,17 @@ def test_os_owner_falls_back_to_one_project_and_always_the_same_one(tmp_path):
     assert schedule.os_owner([]) is None
 
 
+def test_fallback_false_never_picks_an_arbitrary_project(tmp_path):
+    """"Which project IS the OS" has no arbitrary answer: §4, §5."""
+    from pathlib import Path
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    assert schedule.os_owner([("a", a), ("b", b)], fallback=False) is None
+    pkg_root = Path(schedule.__file__).resolve().parents[2]
+    assert schedule.os_owner([("a", a), ("mine", pkg_root)], fallback=False) == "mine"
+
+
 def test_the_daily_run_repairs():
     """Ruled on, not a default: the daemon already applies these repairs every reconcile
     tick, so a daily run that repairs does nothing the OS would not have done anyway

@@ -62,7 +62,7 @@ def fts_query(term: str) -> str:
     instead of as FTS5 syntax — see
     docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §5.
     """
-    words = [w for w in (term or "").split() if any(c.isalnum() for c in w)]
+    words = db.cap_words([w for w in (term or "").split() if any(c.isalnum() for c in w)])
     return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
@@ -225,6 +225,11 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     cache_write INTEGER NOT NULL DEFAULT 0,
     cache_read INTEGER NOT NULL DEFAULT 0,
     output INTEGER NOT NULL DEFAULT 0,
+    -- How big the OS's own input to this call was, in characters. Measurement only,
+    -- nothing is capped: spec §3,
+    -- docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    system_prompt_chars INTEGER NOT NULL DEFAULT 0,
     usage_json TEXT
 );
 -- What the OS believes is a privileged action, and what it has LEARNED is not.
@@ -476,6 +481,11 @@ ADDED_COLUMNS = {
         # from the transcript. '' on every pre-existing row, which reads as "not
         # recorded" — those calls keep their totals and simply cannot be expanded.
         "session_id": "TEXT NOT NULL DEFAULT ''",
+        # How big the call's own input was (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 on a
+        # pre-existing row means NOT MEASURED, never "an empty prompt".
+        "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
+        "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -908,7 +918,7 @@ class CentralStore:
         Catches what stemming splits apart, and keeps the empty term meaning
         "everything" — the read `jarvis learn list` and the dashboard rely on.
         """
-        words = [w for w in (term or "").split() if w] or [""]
+        words = db.cap_words([w for w in (term or "").split() if w]) or [""]
         score = " + ".join(
             "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
             for _ in words)
@@ -1694,7 +1704,8 @@ class CentralStore:
     def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
                        label: str = "", model: str = "", question_id: int | None = None,
                        ok: bool = True, session_id: str = "",
-                       usage: dict[str, Any] | None = None) -> int:
+                       usage: dict[str, Any] | None = None,
+                       prompt_chars: int = 0, system_prompt_chars: int = 0) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
         `usage` is a `claude_cli.derive_turn_usage` envelope, or None for a call that
@@ -1707,12 +1718,14 @@ class CentralStore:
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,
-                                        cache_write, cache_read, output, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        cache_write, cache_read, output,
+                                        prompt_chars, system_prompt_chars, usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
              session_id,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
+             prompt_chars, system_prompt_chars,
              db.to_json(usage) if usage else None),
         )
         return int(cur.lastrowid or 0)
@@ -1767,6 +1780,13 @@ class CentralStore:
         2026-08-22-the-five-minute-write-everywhere.md). `json_extract` returns NULL both
         for a row with no envelope and for one whose envelope predates the field, and
         COALESCE folds both into the same honest zero: no split known, floor rate.
+
+        `max_input_chars` is the largest TOTAL input one call in the group sent: that
+        call's prompt plus that call's system prompt, maximised per row and never two
+        separate maxima added, which would report a size no call ever sent. MAX and not
+        SUM because the question is which call had the biggest input, and a sum of prompt
+        sizes is a meaningless number (spec §3,
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
@@ -1775,6 +1795,7 @@ class CentralStore:
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
+                       MAX(prompt_chars + system_prompt_chars) AS max_input_chars,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
                            AS cache_1h,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))

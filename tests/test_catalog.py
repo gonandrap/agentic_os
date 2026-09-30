@@ -341,9 +341,25 @@ def test_a_project_inherits_the_fleet_stakes_classifier_and_may_override_it():
     assert over.stakes_classifier == "classifier"
 
 
-@pytest.mark.parametrize("key",
-                         ["timeout", "max_rounds", "diff_chars",
-                          "decision_record_chars"])
+def test_the_confirmation_pass_has_its_own_diff_budget_and_never_reads_the_panels():
+    """Two numbers, no shared name, no shared reader: spec
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2."""
+    v = parse_catalog({"projects": []}).os.validation
+    assert v.confirm_diff_chars == 12000
+    assert v.diff_chars == 150000
+
+    [over] = projects_validation({"confirm_diff_chars": 9000},
+                                 {"validation": {"confirm_diff_chars": 500}})
+    assert over.confirm_diff_chars == 500
+    assert over.diff_chars == 150000
+
+    with pytest.raises(CatalogError,
+                       match="os.validation.confirm_diff_chars must be >= 1"):
+        validation_of({"confirm_diff_chars": 0})
+
+
+@pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars",
+                                 "confirm_diff_chars", "decision_record_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
     panel handed nothing, which the design says must never be asked to judge. Zero
