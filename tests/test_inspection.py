@@ -1192,6 +1192,46 @@ def test_a_work_order_with_no_session_reports_no_transcript(started):
     assert unit["found"] is False and unit["turns"] == []
 
 
+def test_inspect_names_the_biggest_os_side_input_for_the_order(started, capsys):
+    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis
+    inspect` names the biggest OS-side input for the order it is inspecting."""
+    from jarvis import agent_usage, cli
+
+    wo = ops.create_work_order("proj_a", "an order Neo answered twice")
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo["id"], label="question",
+                       model="claude-opus-5",
+                       usage={"output": 1, "prompt_chars": 8_000,
+                              "system_prompt_chars": 500})
+    agent_usage.record("panel_seat", project="proj_a", wo_id=wo["id"], label="premise",
+                       model="claude-opus-5",
+                       usage={"output": 1, "prompt_chars": 140_000,
+                              "system_prompt_chars": 2_000})
+
+    (unit,) = ops.inspect_report(wo["id"])["units"]
+
+    biggest = unit["largest_os_input"]
+    assert biggest["kind"] == "panel_seat" and biggest["label"] == "premise"
+    assert (biggest["prompt_chars"], biggest["system_prompt_chars"]) == (140_000, 2_000)
+
+    cli._print_anatomy(unit, InspectConfig().report_write_floor)
+    out = capsys.readouterr().out
+    assert "140,000" in out and "2,000" in out and "premise" in out
+
+
+def test_an_order_whose_os_calls_measured_nothing_names_none(started):
+    """NEVER a fabricated number: a call recorded before the columns existed reads 0,
+    and 0 is not a size."""
+    from jarvis import agent_usage
+
+    wo = ops.create_work_order("proj_a", "an order from before the sizes existed")
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo["id"], label="question",
+                       model="claude-opus-5", usage={"output": 1})
+
+    (unit,) = ops.inspect_report(wo["id"])["units"]
+
+    assert unit["largest_os_input"] is None
+
+
 def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         started, monkeypatch, tmp_path):
     """The live half. The reconciler already ticks and `jarvis status` already has an
