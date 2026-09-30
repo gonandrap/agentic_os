@@ -64,6 +64,7 @@ from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
+from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
@@ -3312,8 +3313,10 @@ class Daemon:
                 pstore.close()
 
     @staticmethod
-    def prompt_refusal_payload(call: str,
-                               error: claude_cli.PromptTooLargeError) -> dict[str, Any]:
+    def prompt_refusal_payload(
+            call: str,
+            error: claude_cli.PromptTooLargeError | QuestionTooLargeError,
+    ) -> dict[str, Any]:
         """What a refusal is allowed to say about itself. Spec §4:
         docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
 
@@ -3321,15 +3324,25 @@ class Daemon:
         prompt. This payload becomes an inbox row the user reads and the digest model
         is then sent, which is one of the places this feature exists to keep the
         payload out of.
+
+        ONE renderer for both refusals: the transport measures prompt + system prompt,
+        `neo_store.ask` measures question + context, and those two ARE the prompt the
+        refused call would have been built from. `total` is the combined size in both
+        cases.
         """
-        return {"call": call, "prompt_chars": error.prompt_chars,
-                "system_prompt_chars": error.system_prompt_chars,
-                "total": error.prompt_chars + error.system_prompt_chars,
+        prompt_chars = int(getattr(error, "prompt_chars", 0)
+                           or getattr(error, "question_chars", 0))
+        system_prompt_chars = int(getattr(error, "system_prompt_chars", 0)
+                                  or getattr(error, "context_chars", 0))
+        return {"call": call, "prompt_chars": prompt_chars,
+                "system_prompt_chars": system_prompt_chars,
+                "total": prompt_chars + system_prompt_chars,
                 "ceiling": error.ceiling, "setting": "os.max_os_prompt_chars"}
 
     def _note_prompt_refusal(self, central: CentralStore, store: ProjectStore,
                              project: str, wo_id: str, call: str,
-                             error: claude_cli.PromptTooLargeError) -> dict[str, Any]:
+                             error: claude_cli.PromptTooLargeError
+                             | QuestionTooLargeError) -> dict[str, Any]:
         """The OS refused its own prompt. Say so ONCE, durably, and flag the order.
 
         The event is what makes the flag survive a reconcile tick: `flag_attention`
@@ -3357,6 +3370,29 @@ class Daemon:
             wo_id=wo_id)
         store.flag_attention(wo_id, invariants.os_prompt_refused_blocker(said))
         return said
+
+    def _note_confirmation_refused(self, project: ProjectSpec, store: ProjectStore,
+                                   wo: dict, assumption: dict,
+                                   error: QuestionTooLargeError) -> None:
+        """A confirmation question the store would not hold. ONCE, then log and move on.
+
+        ONCE IS THE WHOLE GUARD. `autoreview.propose_confirmation` asks before it links,
+        so the assumption stays pending with a NULL `confirm_question_id` and this pass
+        reaches the same row on every reconcile tick — an unguarded write would put a
+        critical row in the inbox every few seconds for ever. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        """
+        if store.os_prompt_refusal_open(wo["id"]) is not None:
+            log.info("[%s] %s: assumption #%s is still too large to confirm: %s",
+                     project.name, wo["id"], assumption.get("n"), error)
+            return
+        central = CentralStore()          # thread-local, as `_validation_refused` opens
+        try:
+            self._note_prompt_refusal(
+                central, store, project.name, wo["id"],
+                f"assumption #{assumption.get('n')} confirmation", error)
+        finally:
+            central.close()
 
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
@@ -6125,9 +6161,17 @@ class Daemon:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
-                autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
-                                                assumptions, stat=packet[0],
-                                                diff=packet[1])
+                try:
+                    autoreview.propose_confirmation(store, neo_store, project.name, wo,
+                                                    a, assumptions, stat=packet[0],
+                                                    diff=packet[1])
+                except QuestionTooLargeError as e:
+                    # The store refused to hold the question, so nothing was asked and
+                    # nothing was linked. Say so and carry on to the next assumption:
+                    # the outer handler would abandon this work order's whole pass over
+                    # one row. Spec §4:
+                    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+                    self._note_confirmation_refused(project, store, wo, a, e)
                 continue
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,

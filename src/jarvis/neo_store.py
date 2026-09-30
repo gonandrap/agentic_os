@@ -127,7 +127,20 @@ class QuestionTooLargeError(ValueError):
     A `ValueError` subclass so every existing handler still catches it, NAMED so the
     `jarvis wo ask` path can render it as one loud line: a worker told the size, the
     ceiling and the setting can shorten and retry, and a traceback tells it nothing.
+
+    The sizes ride as `question_chars` / `context_chars` / `ceiling` and NOT as `limit`,
+    `claude_cli.PromptTooLargeError`'s rule: `seats._run_seat` does
+    `refused=getattr(e, "limit", None)` and an int there poisons a `UsageLimit`.
+    `Daemon.prompt_refusal_payload` renders both refusals from these.
     """
+
+    def __init__(self, message: str, *, question_chars: int, context_chars: int,
+                 ceiling: int) -> None:
+        super().__init__(message)
+        self.question_chars = question_chars
+        self.context_chars = context_chars
+        self.ceiling = ceiling
+
 
 #: How long a question held back by a transport failure waits before it may be claimed
 #: again, indexed by how many attempts it has already spent.
@@ -266,7 +279,9 @@ class NeoStore:
             raise QuestionTooLargeError(
                 f"refused to store a {kind}: question + context is {size} chars, over "
                 f"the {ceiling}-char ceiling (os.max_os_prompt_chars) — shorten it and "
-                f"ask again, referencing what you would have pasted")
+                f"ask again, referencing what you would have pasted",
+                question_chars=len(question), context_chars=len(context),
+                ceiling=ceiling)
         cur = self.conn.execute(
             "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
             "VALUES (?,?,?,?,?,?)",

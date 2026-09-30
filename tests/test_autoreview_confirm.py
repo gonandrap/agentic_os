@@ -952,3 +952,98 @@ def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     assert d.code == autoreview.HELD_EVIDENCE_SECRET
     assert d.assumption_id == 3 and d.n == 2
     assert SECRET_VALUE not in d.reason
+
+
+# -- the question the store refuses to hold ---------------------------------------------
+
+#: Planted in the oversized diff, so the refusal really is about text carrying it.
+#: Nothing the user reads may repeat it. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DIFF_MARKER = "PASTED-DIFF-MARKER-7b2d"
+
+
+def _huge_diff() -> tuple[str, str]:
+    """A delivered diff past `claude_cli.MAX_OS_PROMPT_CHARS` — the shape of this bug.
+
+    `_confirm_question` interpolates the diff WHOLE, so a large landed change is all it
+    takes; no ceiling has to be lowered to reach the refusal.
+    """
+    from jarvis import claude_cli
+
+    line = f"+    rows.append(render_row(record))  # {DIFF_MARKER}\n"
+    body = line * (claude_cli.MAX_OS_PROMPT_CHARS // len(line) + 1_000)
+    return " render.py | 1 +\n 1 file changed, 1 insertion(+)\n", (
+        "diff --git a/render.py b/render.py\n--- a/render.py\n+++ b/render.py\n"
+        "@@ -1,1 +1,1 @@\n" + body)
+
+
+def _refusals(store, wo_id: str) -> list[dict]:
+    from jarvis.project_store import OS_PROMPT_REFUSED_EVENT
+
+    return events(store, wo_id, OS_PROMPT_REFUSED_EVENT)
+
+
+def _refusal_inbox(wo_id: str) -> list[dict]:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return [r for r in central.unacked_inbox()
+                if r["wo_id"] == wo_id and "too large" in r["title"]]
+    finally:
+        central.close()
+
+
+def _oversized_confirmation(started, monkeypatch):
+    """A parked order whose confirmation question is past the ceiling. TICKS TWICE.
+
+    Twice is the whole point: `propose_confirmation` asks BEFORE it links, so the
+    assumption is still pending with a NULL `confirm_question_id` and every later tick
+    arrives here again.
+    """
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *_huge_diff())
+    provisional(store, wo)
+
+    ask(started, store)
+    ask(started, store)
+    return store, wo
+
+
+def test_a_confirmation_too_large_to_store_does_not_take_the_tick_down(
+        started, monkeypatch):
+    """`neo_store.ask` refuses before it persists, and the refusal is a `ValueError`
+    nothing on this path used to catch — so it escaped the per-assumption loop and took
+    the whole reconcile tick with it."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending"
+    assert row["confirm_question_id"] is None
+    assert questions() == [], "an oversized question was persisted after all"
+
+
+def test_the_confirmation_refusal_is_written_down_exactly_once(started, monkeypatch):
+    """THE ONCE-GUARD. This loop runs on every reconcile tick, so an unguarded write
+    would put a critical row in the inbox every few seconds for ever."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    assert len(_refusals(store, wo["id"])) == 1
+    rows = _refusal_inbox(wo["id"])
+    assert len(rows) == 1 and rows[0]["level"] == "critical"
+
+
+def test_the_confirmation_refusal_repeats_no_byte_of_the_question(started, monkeypatch):
+    """NUMBERS AND IDENTIFIERS ONLY, on every surface the user reads."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    (said,) = _refusals(store, wo["id"])
+    assert said["total"] > said["ceiling"], (
+        "nothing was over the ceiling, so the rule below is vacuous")
+    (row,) = _refusal_inbox(wo["id"])
+    assert "os.max_os_prompt_chars" in row["body"]
+    assert DIFF_MARKER not in row["title"]
+    assert DIFF_MARKER not in row["body"]
+    fresh = store.get_work_order(wo["id"])
+    assert DIFF_MARKER not in str(fresh["attention_reason"])
+    assert "os.max_os_prompt_chars" in str(fresh["attention_reason"])

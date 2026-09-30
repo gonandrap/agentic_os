@@ -1604,3 +1604,58 @@ def test_the_feature_give_up_notification_reaches_the_central_inbox(fleet):
     assert rows[0]["title"] == VALIDATION_ESCALATED_TITLE.format(unit=fo_id, n=1)
     assert "nothing has changed on the default branch" in rows[0]["body"]
     assert (rows[0]["level"], rows[0]["project"]) == ("warning", "proj_a")
+
+
+# -- the prompt ceiling: a feature round refused, not retried ---------------------------
+
+
+def _feature_refusal(chars: int = 500_000) -> claude_cli.PromptTooLargeError:
+    """The transport's refusal as `Daemon._validate_feature` receives it."""
+    return claude_cli.PromptTooLargeError(
+        f"refused a validation call: prompt {chars} chars + system prompt 0 chars "
+        f"= {chars}, over the 400000-char ceiling (os.max_os_prompt_chars)",
+        prompt_chars=chars, system_prompt_chars=0, ceiling=400_000)
+
+
+def test_a_refused_feature_round_escalates_once_and_burns_no_outage_retry(fleet):
+    """`Daemon._feature_refused`, BEHAVIOURALLY — `tests/test_prompt_ceiling.py` pins
+    only the order of its two `except` clauses.
+
+    Four drains is past the whole three-attempt outage budget, which the work-order
+    twin's test uses for the same reason: a refusal that took the retry path would have
+    spent every attempt by the last of them.
+    """
+    from jarvis.central_store import CentralStore
+
+    fleet.reconfigure(max_rounds=1)
+    validator = Validator(_feature_refusal())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one")
+        fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+
+        fleet.drain(ticks=4)
+
+        assert len(validator.calls) == 1, "a deterministic refusal was retried"
+        transport = [e for e in ops.feature_events_of_kind(store, fo_id,
+                                                           "validation_failed")
+                     if json.loads(e["payload"]).get("cause") == "transport"]
+        assert transport == [], "a refusal spent a retryable outage attempt"
+        refused = ops.feature_events_of_kind(store, fo_id, "os_prompt_refused")
+        assert len(refused) == 1
+    finally:
+        store.close()
+
+    central = CentralStore()
+    try:
+        rows = [i for i in central.unacked_inbox() if "too large" in i["title"]]
+    finally:
+        central.close()
+    assert len(rows) == 1
+    assert rows[0]["level"] == "critical"
+    # The FEATURE id and no `wo_id`: naming the manager would point every sink at a
+    # session rather than at the rounds (`_feature_refused`).
+    assert fo_id in rows[0]["title"] and rows[0]["wo_id"] is None
+    assert "os.max_os_prompt_chars" in rows[0]["body"]
