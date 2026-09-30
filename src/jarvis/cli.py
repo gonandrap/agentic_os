@@ -2153,6 +2153,23 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
     print(f"  re-written {_tok(unit['rewrite_excess'])} tokens · cache writes bought at "
           f"5m {_tok(ttl['cache_5m'])}, 1h {_tok(ttl['cache_1h'])}"
           + (f", unknown {_tok(ttl['unknown'])}" if ttl["unknown"] else ""))
+    # A `--json`-only field nobody can see is half a fix (spec of 2026-09-29 §3). The
+    # unclassified form replaces the pair rather than printing "0 expired", which would
+    # read as a finding the reading cannot support.
+    rewrite = unit.get("rewrite") or {}
+    if rewrite.get("boundaries"):
+        if rewrite.get("undecided_boundaries"):
+            split = (f"{rewrite['compact_boundaries']} compacted, "
+                     f"{rewrite['undecided_boundaries']} unclassified "
+                     "(no os.cold_prefix_floor)")
+        else:
+            prefix = (rewrite["boundaries"] - rewrite["ttl_boundaries"]
+                      - rewrite["compact_boundaries"])
+            split = (f"{prefix} prefix, "
+                     f"{rewrite['ttl_boundaries']} expired, "
+                     f"{rewrite['compact_boundaries']} compacted")
+        print(f"  boundaries {rewrite['boundaries']} — {split} · re-written "
+              f"{_tok(rewrite['tokens'])} of {_tok(rewrite['cache_write'])} written")
 
     print()
     # The legend for the bars below, keyed off the same dict they are drawn from — a
