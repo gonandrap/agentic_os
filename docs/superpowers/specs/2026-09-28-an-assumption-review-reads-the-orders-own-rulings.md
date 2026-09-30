@@ -138,6 +138,24 @@ Going silent is the failure this whole spec is about: a reviewer that cannot tel
 prior decisions" from "prior decisions I was not shown" must escalate, and would be right
 to.
 
+**THE ROW BOUND IS AN OMISSION TOO, AND THE SAME LINE STATES IT.** `answered_questions`
+is a `LIMIT` query, so rows it cuts never enter the items list and a record that fits
+comfortably under the character cap would otherwise print no omission line at all while
+older rulings were withheld — the same silence, one step earlier. `autoreview._ANSWERED_ROWS
+= 200` is the row bound and the call asks for `_ANSWERED_ROWS + 1`: the extra row is how
+the overflow becomes visible. Over the bound, the list is trimmed and the remainder joins
+the same count, ONE line whatever the cause:
+
+```
+  (… at least 1 older item omitted — the record is capped at 6000 characters and 200 answered questions)
+```
+
+"at least" is used **only** where the query cut rows: one row past the bound proves there
+are more without saying how many, and claiming the cap evicted rows the query never
+returned would be false. This is not a second policy — the character cap binds first at any
+sane `decision_record_chars`; the row bound exists so a very old order does not pull
+thousands of rows into memory.
+
 ### 4. Cited ids go in verbatim, exempt from the cap
 
 **ONLY the assumption being ruled on is scanned. Siblings are not.** The user's ruling on
@@ -167,6 +185,11 @@ a different problem.
 
 Resolution rules, each testable:
 
+* **Id on this work order and `status == 'answered'`, but outside the rows the record
+  fetched** (§3's `_ANSWERED_ROWS` bound): rendered IN FULL, exactly as a row from the
+  fetch. The fetched set is not the definition of "answered" — the row's own `status` is.
+  Calling an answered ruling `not answered` is #832 on the very path this feature exists
+  for, because the persona escalates on that line.
 * **Id not in the answered set but on this work order** (still open, or failed): rendered
   `Q887 (cited by the assumption; asked on this order, not answered)`. A pending question
   is not authority, and saying it is pending is what stops the reviewer treating silence as
@@ -181,7 +204,7 @@ Resolution rules, each testable:
 
 Resolution needs a single-question lookup by id scoped to the work order; `NeoStore.get`
 already exists (used by `neo_store.review`, :558) and returns the row with `wo_id`, so the
-three cases above are decided on the returned row's `wo_id` and `status` with no new query.
+four cases above are decided on the returned row's `wo_id` and `status` with no new query.
 
 ### 5. Filtering: the secret net only
 
@@ -286,13 +309,17 @@ answers, and it is the block whose absence produced the escalation.
 2. With more items than the cap allows: the newest survive, the oldest are absent, and the
    omission line is present and LAST. Plus a smaller `chars` evicting more, and the catalog
    tests for the key — `decision_record_chars: 0` refused, a project inheriting the fleet
-   value.
+   value. Plus short items the cap evicts, counted EXACTLY and with no "at least"; and
+   rows past `_ANSWERED_ROWS` (monkeypatched small) producing that one omission line with
+   the "at least" count even though the character cap dropped nothing.
 3. An assumption whose `content` says `Neo question 887` puts Q887's full answer in the
    packet even when the cap would otherwise have evicted it, and places it first. Plus one
    case each for a cited id that is unanswered, one on another work order, and one that
    does not exist — asserting the three distinct lines from §4, and that the other-order
    question's TEXT is absent. Plus one that a sibling citing an id contributes no citation
-   line while the ruled row's citation is still first.
+   line while the ruled row's citation is still first. Plus a cited id ANSWERED but outside
+   the fetched rows (`FakeNeo(window=…)`), asserting its full answer text is present and
+   `not answered` absent anywhere in the packet.
 4. A `kind='assumption'` row whose `question` is a 5000-char packet: its question text
    never appears in a newly built packet, and the row is present as a one-liner naming the
    sibling number.
@@ -304,7 +331,10 @@ answers, and it is the block whose absence produced the escalation.
 6. A sibling assumption settled by the user with `decided_reason` set reaches the packet
    with that reason; one settled by `neo` is rendered as Neo's, not the user's.
 7. Both `propose` and `propose_confirmation` produce a packet containing the section
-   header, with no daemon and no model call.
+   header, with no daemon and no model call. And both with a real
+   `catalog.ValidationConfig(decision_record_chars=200)`: the packet is cut at the
+   PROJECT's value, not at `DEFAULT_VALIDATION_DECISION_RECORD_CHARS` — the `cfg=cfg`
+   threading is otherwise only ever exercised with `cfg=None`.
 
 ## Not in scope
 

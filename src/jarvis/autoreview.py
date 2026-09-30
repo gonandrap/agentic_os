@@ -103,6 +103,12 @@ _CITED_QUESTION_RE = re.compile(
 #: `content` naming six question ids is a different problem.
 _CITED_LIMIT = 5
 
+#: How many answered rows the record PULLS (spec §3). Not a second policy: the character
+#: cap binds first at any sane `decision_record_chars`, and this only stops a very old
+#: order loading thousands of rows into memory. Rows it cuts are counted in the same
+#: omission line, so no ruling is ever withheld in silence.
+_ANSWERED_ROWS = 200
+
 #: `assumptions.decided_by` for a verdict this module reached. Spelled through
 #: `project_store.ASSUMPTION_DECIDER_OS` at its call sites; named here for
 #: `automerge.GATE_KIND`'s reason.
@@ -1243,7 +1249,10 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
     `catalog.DEFAULT_VALIDATION_DECISION_RECORD_CHARS` is the fleet answer it falls back to
     when the project names nothing.
     """
-    answered = list(neo.answered_questions(wo_id) or [])
+    # One row past the bound is how the overflow becomes VISIBLE rather than silent (§3).
+    answered = list(neo.answered_questions(wo_id, limit=_ANSWERED_ROWS + 1) or [])
+    cut_by_rows = max(0, len(answered) - _ANSWERED_ROWS)
+    answered = answered[:_ANSWERED_ROWS]
     n_by_question = {}
     for s in siblings:
         for column in ("neo_question_id", "confirm_question_id"):
@@ -1272,12 +1281,19 @@ def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, A
     lines = [*head, *kept]
     if not lines:
         return ""
-    if dropped:
+    if dropped or cut_by_rows:
         # An omission stated, and LAST (kn-1485b845). Going silent is the failure this
         # whole spec is about: a reviewer that cannot tell "no prior decisions" from
-        # "decisions I was not shown" must escalate, and would be right to.
-        lines.append(f"  (… {dropped} older items omitted — the record is capped at "
-                     f"{chars} characters)")
+        # "decisions I was not shown" must escalate, and would be right to. ONE line
+        # whatever the cause — the character cap or the row bound — and "at least" only
+        # where it is true: the query returned one row past the bound, so how many older
+        # rulings it cut is not known here.
+        why = f"the record is capped at {chars} characters"
+        if cut_by_rows:
+            why += f" and {_ANSWERED_ROWS} answered questions"
+        omitted = dropped + cut_by_rows
+        lines.append(f"  (… {'at least ' if cut_by_rows else ''}{omitted} older "
+                     f"item{'' if omitted == 1 else 's'} omitted — {why})")
     return "\n".join(lines)
 
 
@@ -1305,14 +1321,21 @@ def _cited_question_ids(assumption: dict[str, Any] | None) -> list[int]:
 
 def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,
                 n_by_question: dict[int, Any]) -> str:
-    """One cited id, resolved. Answered here it goes in whole; otherwise it is NAMED.
+    """One cited id, resolved. An ANSWERED ruling goes in whole; otherwise it is NAMED.
 
-    The three unresolved cases are distinct facts and each is stated rather than swallowed
-    (§4). A pending question is not authority, and saying it is pending is what stops the
-    reviewer reading silence as a ruling. A question on ANOTHER work order is not quoted at
-    all: its text has not been through this order's evidence gates, and a worker citing it
-    does not make it this order's record. One that never existed is a fact about the
-    assumption being ruled on.
+    `answered` is the row when the record's own fetch returned it, and it is NOT the only
+    way a row can be answered: the fetch is bounded (`_ANSWERED_ROWS`), so an older ruling
+    arrives here as `None` and its `status` is read off the single-row lookup instead. That
+    row is rendered in full exactly like one from the fetch — calling an answered ruling
+    "not answered" reproduces #832 on the path this feature exists for, because the persona
+    escalates on that line.
+
+    The three remaining unresolved cases are distinct facts and each is stated rather than
+    swallowed (§4). A pending question is not authority, and saying it is pending is what
+    stops the reviewer reading silence as a ruling. A question on ANOTHER work order is not
+    quoted at all: its text has not been through this order's evidence gates, and a worker
+    citing it does not make it this order's record. One that never existed is a fact about
+    the assumption being ruled on.
     """
     cited = "(cited by the assumption"
     if answered is not None:
@@ -1322,6 +1345,8 @@ def _cited_item(neo: Any, wo_id: str, qid: int, answered: dict[str, Any] | None,
         return f"  Q{qid} {cited}; no such question)"
     if str(row.get("wo_id") or "") != wo_id:
         return f"  Q{qid} {cited}; belongs to another work order — not shown)"
+    if str(row.get("status") or "") == "answered":
+        return _question_item(row, n_by_question, cited=True, truncate=False)
     return f"  Q{qid} {cited}; asked on this order, not answered)"
 
 

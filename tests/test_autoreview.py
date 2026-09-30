@@ -1694,14 +1694,24 @@ def qrow(**over) -> dict:
 
 class FakeNeo:
     """`answered_questions` and `get`, the two reads the record makes. Rows are given
-    newest-first, as the query returns them; `others` exist but are not answered here."""
+    newest-first, as the query returns them; `others` exist but are not answered here.
 
-    def __init__(self, *rows: dict, others: tuple[dict, ...] = ()):
+    `window` is a HARD bound on the query independent of the `limit` the caller asks for:
+    whatever the caller's row bound, a cited ruling can fall outside the rows it got back,
+    and that case is the one that used to read as `not answered`."""
+
+    def __init__(self, *rows: dict, others: tuple[dict, ...] = (),
+                 window: int | None = None):
         self.rows = list(rows)
         self.all = {r["id"]: r for r in (*rows, *others)}
         self.asked: list[str] = []
+        self.window = window
+        self.limits: list[int] = []
 
     def answered_questions(self, wo_id: str, limit: int = 20) -> list[dict]:
+        self.limits.append(limit)
+        if self.window is not None:
+            limit = min(limit, self.window)
         return [r for r in self.rows
                 if r["wo_id"] == wo_id and r["status"] == "answered"][:limit]
 
@@ -1730,10 +1740,11 @@ class FakeStore:
 
 
 def record(*rows: dict, messages: tuple[dict, ...] = (), siblings=None,
-           others: tuple[dict, ...] = (), ruling_on=None) -> str:
+           others: tuple[dict, ...] = (), ruling_on=None, window: int | None = None,
+           **kw) -> str:
     return autoreview.decision_record(
-        FakeStore(*messages), FakeNeo(*rows, others=others), "wo-1",
-        [assumption()] if siblings is None else siblings, assumption=ruling_on)
+        FakeStore(*messages), FakeNeo(*rows, others=others, window=window), "wo-1",
+        [assumption()] if siblings is None else siblings, assumption=ruling_on, **kw)
 
 
 def test_an_answered_question_reaches_the_packet_with_its_id_and_who_answered():
@@ -1802,6 +1813,47 @@ def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
 
     assert long_answer in out, "the cited answer was truncated or evicted"
     assert out.index("Q887") < out.index("Q900")
+
+
+def test_a_cited_question_answered_outside_the_query_window_is_shown_in_full():
+    """§4. An ANSWERED ruling the row bound cut out of `answered_questions` used to be
+    rendered `not answered`, and the persona escalates on that line — #832 reproduced on
+    the exact path this feature exists for. The row's own `status` decides."""
+    cited = qrow(id=887, ts=1.0, answer="the user said: keep the shim")
+    newer = [qrow(id=900 - i, ts=500.0 - i, answer=f"ruling {i}") for i in range(3)]
+    cites = assumption(content="per Neo question 887, kept the shim")
+    out = record(*newer, cited, siblings=[cites], ruling_on=cites, window=3)
+
+    assert "not answered" not in out
+    assert "  Q887 (cited by the assumption) [answered by neo]" in out
+    assert "the user said: keep the shim" in out
+
+
+def test_short_items_the_cap_evicts_are_counted_exactly():
+    """The omission line names the count the CAP evicted, with no hedge: the cap is a
+    number this code knows."""
+    rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(5)]
+    out = record(*rows, siblings=[], chars=200)
+
+    last = out.strip().splitlines()[-1]
+    assert "at least" not in last
+    assert "older items omitted" in last and "capped at 200 characters" in last
+    kept = [ln for ln in out.splitlines() if "answered by" in ln]
+    assert f"{5 - len(kept)} older items omitted" in last
+
+
+def test_rows_the_row_bound_cut_are_counted_in_the_same_omission_line(monkeypatch):
+    """§3. Rows the query's LIMIT cut never enter `items`, so a record that FITS under the
+    character cap used to print no omission line at all — the "no prior decisions" versus
+    "decisions I was not shown" silence kn-1485b845 forbids. One line, every cause."""
+    monkeypatch.setattr(autoreview, "_ANSWERED_ROWS", 3)
+    rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(6)]
+    out = record(*rows, siblings=[])
+
+    lines = out.strip().splitlines()
+    assert "ruling 3" not in out
+    assert len([ln for ln in lines if "omitted" in ln]) == 1
+    assert "at least 1 older item" in lines[-1], lines[-1]
 
 
 @pytest.mark.parametrize("cite", ["Neo question 887", "question 887", "Q887", "Neo 887"])
@@ -1972,6 +2024,28 @@ def test_propose_builds_the_section_with_no_daemon_and_no_model_call():
     # After the sibling list, before the closing answer instructions.
     assert packet.index("do not rule on these") < packet.index(RECORD_HEADER)
     assert packet.index(RECORD_HEADER) < packet.index("Answer with `escalate`")
+
+
+def test_the_projects_own_cap_reaches_the_packet_both_passes_build():
+    """§3/§7. `cfg=cfg` is threaded from the daemon so the bound the reviewer reads is the
+    bound the PROJECT set; with only the `cfg=None` path covered, a per-project value could
+    stop arriving and every test still pass."""
+    rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i}") for i in range(5)]
+    tight = ValidationConfig(decision_record_chars=200)
+
+    for build in (
+        lambda neo_: autoreview.propose(FakeStore(), neo_, "p", WO, assumption(),
+                                        [assumption()], cfg=tight),
+        lambda neo_: autoreview.propose_confirmation(FakeStore(), neo_, "p", WO,
+                                                     assumption(), [assumption()],
+                                                     cfg=tight),
+    ):
+        neo_ = FakeNeo(*rows)
+        build(neo_)
+        (packet,) = neo_.asked
+        assert "capped at 200 characters" in packet
+        assert str(autoreview.DEFAULT_VALIDATION_DECISION_RECORD_CHARS) not in packet
+        assert "ruling 4" not in packet
 
 
 def test_answered_questions_is_newest_first_and_keeps_every_kind(started):
