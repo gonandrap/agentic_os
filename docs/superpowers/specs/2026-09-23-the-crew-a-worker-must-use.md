@@ -106,7 +106,21 @@ already behaves (`JARVIS_WO_ID` is the same test in `hooks._subagent_start`).
 `test_transport_value_comes_from_claude_cli_constant`,
 `test_background_spawn_declares_background_transport`.
 
-## 4. Backgrounding is refused at the tool call
+## 4. Backgrounding is refused at the tool call, BY DEFAULT
+
+**AMENDED IN PLACE** by
+docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md (issue 868),
+which inverts this section for three named command shapes and one seat call and leaves it
+standing for everything else. §1 above is untouched: the class this closed — a job
+abandoned at turn end, issue #575, 62 hours on wo-d81fcc15 — is still closed.
+
+Backgrounding is refused BY DEFAULT. The exceptions are the shapes whose FOREGROUND call
+is now refused instead, because a call that blocks past the 5-minute prompt cache re-sends
+the whole conversation at the 1.25x write rate: a whole-suite test run, a CI watcher (`gh
+run watch`, `gh pr checks --watch`), a sleep or poll loop, and a foreground
+`jarvis-implementer` or `jarvis-spec-writer` call. Those must be backgrounded and POLLED
+every 3-4 minutes, and what makes that safe is the Stop guard
+(`hooks.uncollected_task_turn_block`): no turn may END with a task uncollected.
 
 **What it does.** Denies the call that starts a job the turn cannot outlive.
 
@@ -125,10 +139,14 @@ Not matched, and this is the whole difficulty of (b): `&&`, `&>`, `&>>`, `2>&1`,
 a quoted string or a comment. The matcher works on the command with quoted spans masked, and
 `&` counts only as a trailing statement terminator.
 
-Deny text states the correction and the reason in one line: re-run in the foreground, because
-this turn is one `claude -p` and ending it kills the job — nothing will wake you. The worker
-fixes it inside the same turn, so the correction costs zero turns rather than the one
-wo-dd8668fa's re-send costs.
+Deny text states the correction and the reason in one line, and the correction SPLITS
+(2026-09-29 amendment): "re-run in the foreground" is no longer the universal one. For a
+job nobody polls for — a server, a `nohup` script, a `setsid` anything — it stands: this
+turn is one `claude -p` and ending it kills the job, nothing will wake you. For the three
+long shapes the correction is the opposite: background it and poll it with
+`BashOutput`/`TaskOutput` every 3-4 minutes, never blocking one call past 240 seconds.
+Either way the worker fixes it inside the same turn, so the correction costs zero turns
+rather than the one wo-dd8668fa's re-send costs.
 
 Subagent calls are covered for free: PreToolUse fires on them under the parent session.
 
@@ -141,6 +159,10 @@ Subagent calls are covered for free: PreToolUse fires on them under the parent s
 `test_allowed_when_transport_is_background`,
 `test_no_op_without_transport_env`,
 `test_subagent_call_denied_too`.
+
+The carve-out and the Stop guard are proved in the same file and in
+`tests/test_uncollected_task_block.py`:
+docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
 
 ## 5. The crew: two agent types an ordinary worker must use
 
