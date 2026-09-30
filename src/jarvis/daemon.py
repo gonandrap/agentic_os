@@ -1638,13 +1638,9 @@ class Daemon:
                 # `compact_then_resume` queues the relaunch as an ordinary message, so the
                 # pause is not erased and the delivery path sends it into the compacted,
                 # warm conversation on the tick after the compaction settles.
-                due = worker_session.resume_compaction_due(
-                    store, project, wo, pause, self.catalog.os.compact_min_context)
-                if due is not None:
-                    turn = worker_session.compact_then_resume(
-                        store, project, wo, pause, due)
-                else:
-                    turn = worker_session.retry(store, project, wo, pause)
+                turn = worker_session.compact_before_relaunch(
+                    store, project, wo, self.catalog.os.compact_min_context,
+                    pause=pause) or worker_session.retry(store, project, wo, pause)
             except budget_mod.BudgetExhausted as e:
                 # `NOT_RETRIED` already keeps this sweep off an order already parked in
                 # `budget_exhausted`; this is the order that ran out BETWEEN the last
@@ -3042,19 +3038,19 @@ class Daemon:
         did before this shipped.
         """
         try:
-            due = worker_session.compaction_due(
-                store, wo, self.catalog.os.compact_min_context)
-            if due is None:
+            turn = worker_session.compact_before_relaunch(
+                store, project, wo, self.catalog.os.compact_min_context)
+            if turn is None:
                 return False
-            turn = worker_session.compact(store, project, wo, due)
         except budget_mod.BudgetExhausted:
             return False  # `_deliver` raises and escalates on the same call; let it
         except Exception:  # noqa: BLE001 — a saving must never cost a delivery
             log.exception("[%s] could not compact %s before its next prompt",
                           project.name, wo["id"])
             return False
-        log.info("[%s] compacting %s before its next prompt (turn %s): %s",
-                 project.name, wo["id"], turn["seq"], due.why)
+        # The reason is on the `compacting` event `worker_session.compact` wrote.
+        log.info("[%s] compacting %s before its next prompt (turn %s)",
+                 project.name, wo["id"], turn["seq"])
         return True
 
     def _deliver(self, project: ProjectSpec, store: ProjectStore, wo: dict,
