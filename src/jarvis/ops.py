@@ -10931,21 +10931,18 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
         entry = by_kind.setdefault(kind, {"kind": kind, "label": agent_usage.describe(kind),
                                           "calls": 0, "cost_usd": 0.0,
                                           "billed_input": 0, "output": 0,
-                                          "max_prompt_chars": 0})
+                                          "max_input_chars": 0})
         entry["calls"] += g.get("calls") or 0
         entry["cost_usd"] = round(entry["cost_usd"] + u.list_cost_usd, 4)
         entry["billed_input"] += u.billed_input
         entry["output"] += u.output
-        # The biggest TOTAL input any one call in the group sent — prompt plus system
-        # prompt, MAX and never a sum (spec §3,
-        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 is "not
-        # measured": every row written before the columns existed reads that way.
-        biggest = (g.get("max_prompt_chars") or 0) + (g.get("max_system_prompt_chars")
-                                                      or 0)
-        entry["max_prompt_chars"] = max(entry["max_prompt_chars"], biggest)
+        # A MAX of one call's TOTAL input, prompt plus system prompt, where 0 means NOT
+        # MEASURED (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+        biggest = g.get("max_input_chars") or 0
+        entry["max_input_chars"] = max(entry["max_input_chars"], biggest)
         largest_input = max(largest_input, biggest)
     return {
-        f"{prefix}_max_prompt_chars": largest_input,
+        f"{prefix}_max_input_chars": largest_input,
         f"{prefix}_calls": calls,
         f"{prefix}_failed_calls": failed,
         f"{prefix}_cost_usd": round(total.list_cost_usd, 4),
@@ -11177,8 +11174,8 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "os_billed_input": sum(u.get("os_billed_input") or 0 for u in units),
             # The biggest OS-side input on the whole report; MAX, not a sum (spec §3,
             # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
-            "os_max_prompt_chars": max(
-                [u.get("os_max_prompt_chars") or 0 for u in units], default=0),
+            "os_max_input_chars": max(
+                [u.get("os_max_input_chars") or 0 for u in units], default=0),
             "os_output": sum(u.get("os_output") or 0 for u in units),
             "subproc_cost_usd": subproc_cost,
             "subproc_recorded_cost_usd": round(

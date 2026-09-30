@@ -1781,8 +1781,11 @@ class CentralStore:
         for a row with no envelope and for one whose envelope predates the field, and
         COALESCE folds both into the same honest zero: no split known, floor rate.
 
-        The input sizes are MAX, not SUM: the question is which call had the biggest
-        input, and a sum of prompt sizes is a meaningless number (spec §3,
+        `max_input_chars` is the largest TOTAL input one call in the group sent: that
+        call's prompt plus that call's system prompt, maximised per row and never two
+        separate maxima added, which would report a size no call ever sent. MAX and not
+        SUM because the question is which call had the biggest input, and a sum of prompt
+        sizes is a meaningless number (spec §3,
         docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
         """
         clause = "WHERE project=?" if project else ""
@@ -1792,8 +1795,7 @@ class CentralStore:
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
-                       MAX(prompt_chars) AS max_prompt_chars,
-                       MAX(system_prompt_chars) AS max_system_prompt_chars,
+                       MAX(prompt_chars + system_prompt_chars) AS max_input_chars,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
                            AS cache_1h,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))

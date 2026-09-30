@@ -1723,7 +1723,7 @@ def _print_os_calls(res: dict) -> None:
         # The largest input only where one was measured (spec §3,
         # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md): 0 means the rows
         # predate the columns, and printing it would read as an empty prompt.
-        biggest = kind.get("max_prompt_chars") or 0
+        biggest = kind.get("max_input_chars") or 0
         size = f", largest input {biggest:,} characters" if biggest else ""
         print(f"  {kind['label']}: {kind['calls']} call"
               f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}{size}")
@@ -2656,9 +2656,9 @@ def cmd_cost(args: argparse.Namespace) -> int:
         # a call was that big (spec §3,
         # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Absent rather
         # than a zero when nothing recorded a size.
-        if totals.get("os_max_prompt_chars"):
+        if totals.get("os_max_input_chars"):
             print(f"                largest input "
-                  f"{totals['os_max_prompt_chars']:,} characters "
+                  f"{totals['os_max_input_chars']:,} characters "
                   f"(prompt + system prompt, of one call)")
     if totals.get("subproc_calls"):
         print(f"  subprocesses  ~${totals['subproc_cost_usd']:.2f} — "

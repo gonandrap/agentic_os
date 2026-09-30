@@ -501,11 +501,39 @@ def test_the_largest_input_by_kind_appears_in_the_jarvis_half(store):
     res = ops.cost_report("proj_a")
     unit = next(u for u in res["units"] if u["id"] == wo["id"])
 
-    assert unit["os_max_prompt_chars"] == 152_000
+    assert unit["os_max_input_chars"] == 152_000
     by_kind = {k["kind"]: k for k in unit["os_by_kind"]}
-    assert by_kind["panel_seat"]["max_prompt_chars"] == 152_000
-    assert by_kind["neo_answer"]["max_prompt_chars"] == 21_000
-    assert res["totals"]["os_max_prompt_chars"] == 152_000
+    assert by_kind["panel_seat"]["max_input_chars"] == 152_000
+    assert by_kind["neo_answer"]["max_input_chars"] == 21_000
+    assert res["totals"]["os_max_input_chars"] == 152_000
+
+
+def test_the_largest_input_is_a_total_one_call_really_sent(store):
+    """The reported figure belongs to ONE call: two maxima added describe no call.
+
+    Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md. Two panel seats
+    in the same SQL group (same work order, kind, label and model) with mirrored sizes:
+    150,000 + 2,000 and 3,000 + 40,000. The answer is 152,000; 190,000 would be the
+    biggest prompt of one call plus the biggest system prompt of another.
+    """
+    from jarvis import agent_usage
+
+    wo = store.create_work_order("an order with two panel seats", "")
+    for prompt, system in ((150_000, 2_000), (3_000, 40_000)):
+        agent_usage.record("panel_seat", project="proj_a", wo_id=wo["id"],
+                           label="premise", model="claude-opus-5",
+                           usage={"total_cost_usd": 0.01, "input": 10, "cache_write": 0,
+                                  "cache_read": 0, "output": 0,
+                                  "prompt_chars": prompt,
+                                  "system_prompt_chars": system})
+
+    res = ops.cost_report("proj_a")
+    unit = next(u for u in res["units"] if u["id"] == wo["id"])
+    by_kind = {k["kind"]: k for k in unit["os_by_kind"]}
+
+    assert by_kind["panel_seat"]["max_input_chars"] == 152_000
+    assert unit["os_max_input_chars"] == 152_000
+    assert res["totals"]["os_max_input_chars"] == 152_000
 
 
 def test_a_call_that_recorded_no_size_reports_zero_not_a_guess(store):
@@ -516,7 +544,7 @@ def test_a_call_that_recorded_no_size_reports_zero_not_a_guess(store):
     res = ops.cost_report("proj_a")
     unit = next(u for u in res["units"] if u["id"] == wo["id"])
 
-    assert unit["os_max_prompt_chars"] == 0
+    assert unit["os_max_input_chars"] == 0
 
 
 def test_the_cli_prints_the_largest_input_in_full(store, capsys):
