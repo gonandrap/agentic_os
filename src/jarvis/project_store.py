@@ -839,6 +839,10 @@ CREATE TABLE IF NOT EXISTS violation_reports (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL,
     seen INTEGER NOT NULL DEFAULT 1,
+    -- Also in ADDED_COLUMNS, where the reasoning is: a `critical` report is one
+    -- attention item for as long as it stands (Neo 1084).
+    level TEXT NOT NULL DEFAULT 'warning',
+    detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (invariant, wo_id)
 );
 CREATE TABLE IF NOT EXISTS assumptions (
@@ -1581,6 +1585,14 @@ ADDED_COLUMNS = {
     # envelope still queued, which is the honest answer in both cases.
     "envelopes": {
         "delivered_msg_id": "INTEGER",
+    },
+    # HOW LOUD THE VIOLATION IS, and what it said. Kept on the report because the report
+    # is the dedupe: a `critical` one raises ONE attention item for as long as it stands
+    # (Neo 1084), and `ops.os_status` cannot ask the checker again — it reads state. Every
+    # row written before this reads `warning`, which is what they all were.
+    "violation_reports": {
+        "level": "TEXT NOT NULL DEFAULT 'warning'",
+        "detail": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -4313,12 +4325,17 @@ class ProjectStore:
 
     # -- invariant violation reports -------------------------------------------
 
-    def open_violation_report(self, invariant: str, wo_id: str | None = None) -> bool:
+    def open_violation_report(self, invariant: str, wo_id: str | None = None,
+                              level: str = "warning", detail: str = "") -> bool:
         """Note that this violation is standing. True the FIRST time it is seen.
 
         The caller announces on True and says nothing on False — `invariants.py` rule 3,
         made durable. `seen` and `last_seen` are the audit trail that a per-tick inbox
         row would otherwise have been.
+
+        `level` and `detail` are kept for a READER rather than for the announcement:
+        `standing_violations` is what puts a critical one on the attention list, and the
+        row is the dedupe that makes it one item (Neo 1084).
         """
         key = (invariant, wo_id or "")
         now = db.now()
@@ -4327,13 +4344,22 @@ class ProjectStore:
         ).fetchone()
         if row is None:
             self.conn.execute(
-                "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen)"
-                " VALUES (?,?,?,?)", (*key, now, now))
+                "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen,"
+                " level, detail) VALUES (?,?,?,?,?,?)",
+                (*key, now, now, level, detail))
             return True
         self.conn.execute(
-            "UPDATE violation_reports SET last_seen=?, seen=seen+1"
-            " WHERE invariant=? AND wo_id=?", (now, *key))
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?"
+            " WHERE invariant=? AND wo_id=?", (now, level, detail, *key))
         return False
+
+    def standing_violations(self, level: str = "") -> list[dict[str, Any]]:
+        """Reports still standing, optionally only those at one level. Neo 1084's read."""
+        clause = " WHERE level=?" if level else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM violation_reports{clause} ORDER BY first_seen",
+            (level,) if level else ()).fetchall()
+        return db.rows_to_dicts(rows)
 
     def close_violation_reports(
             self, standing: Iterable[tuple[str, str | None]]) -> list[tuple[str, str]]:

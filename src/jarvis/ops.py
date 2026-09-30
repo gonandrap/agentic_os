@@ -701,6 +701,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
                     })
+                # A STANDING CRITICAL VIOLATION IS AN ATTENTION ITEM — Neo 1084. Until
+                # this, a violation reached the inbox and nothing else, and `healthy`
+                # below is computed from attention alone: `jarvis status` read HEALTHY
+                # over a critical post-condition that was false. ONE item for as long as
+                # it stands, because the report row is the dedupe (`open_violation_report`)
+                # and `close_violation_reports` is what takes it away again.
+                for report in store.standing_violations(level="critical"):
+                    attention.append({
+                        "project": p["name"], "wo_id": report["wo_id"] or None,
+                        "title": f"OS invariant violated: {report['invariant']}",
+                        "status": "invariant", "invariant": report["invariant"],
+                        "reason": report["detail"] or report["invariant"],
+                        "decide": f"jarvis doctor {p['name']}",
+                    })
                 mode = mode_by_project.get(p["name"])
                 if mode and worker_stalls_on_prompts(mode):
                     attention.append({
@@ -8399,6 +8413,128 @@ def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] 
     return None
 
 
+def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
+               window: bool = False,
+               stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
+
+    `Daemon._stuck_candidates` and `stuck_report` both call it, so a duration or a
+    threshold is computed in exactly one place. `stuck_only` is what the sweep passes: the
+    surfaces want every row, the tick wants the over-threshold ones and must not pay for
+    the detail of the rest.
+
+    `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
+    candidate (`health_sweep_hold`'s own docstring).
+    """
+    from . import holds, stuck
+    from .health import observer_kinds
+    from .project_store import FO_ID_PREFIXES, UNGOVERNED_ORIGINS
+    from .worker_session import PAUSE_USAGE_LIMIT
+
+    thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
+    scanned, out = 0, []
+    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue  # the user's own session — `_health_candidates`' rule
+        # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
+        # too, and the refusal must not be how the sweep learns it (§6).
+        if wo.get("kind") in ("investigation", "investigator") \
+                or str(wo.get("parent_id") or "").startswith(
+                    f'{FO_ID_PREFIXES["investigation"]}-'):
+            continue
+        scanned += 1
+        durations = state_durations(pstore, wo_id=wo["id"], now=now)
+        if durations.current_status_since is None:
+            continue  # no present-tense claim to judge — `state_durations`' own rule
+        spans = holds.held(pstore, wo["id"], now=now)
+        since = durations.current_status_since
+        usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        verdict = stuck.assess(
+            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            discounted, thresholds, cfg.fallback_minutes * 60.0,
+            excluded_cause=(PAUSE_USAGE_LIMIT
+                            if window or any(h.open for h in usage) else ""))
+        if stuck_only and not verdict.stuck:
+            continue
+        blocker = true_blockers(pstore, wo, now=now)
+        out.append({
+            "project": project_name, "wo": wo, "verdict": verdict,
+            "blocker": blocker[0] if blocker else "nothing the record can name",
+            "status_label": invariants.status_label(pstore, wo),
+            "since": since, "activity": durations.last_activity_ts or since,
+            "discounted": discounted,
+            "seconds_in_status": now - since,
+            "seconds_since_activity": now - (durations.last_activity_ts or since),
+            "events": pstore.count_events(wo["id"], exclude=observer_kinds()),
+        })
+    return scanned, out
+
+
+def stuck_report(project_name: str | None = None,
+                 now: float | None = None) -> list[dict[str, Any]]:
+    """Every open order and how the sweep judges it. §7: ONE reader, two renderers.
+
+    `jarvis stuck` and `/stuck` both read this and neither computes a duration or a
+    threshold — `jarvis wo why`'s rule. Pure and write-free, most overdue first, and
+    ONLY the projects `fleet_health.enabled` covers, so what it shows is what the sweep
+    would act on rather than arithmetic nobody will ever apply.
+    """
+    from . import stuck
+
+    now = time.time() if now is None else now
+    catalog = resolve_catalog()
+    paths = registered_project_paths()
+    rows: list[dict[str, Any]] = []
+    for spec in catalog.projects:
+        if not spec.fleet_health.enabled or spec.name not in paths:
+            continue
+        if project_name and spec.name != project_name:
+            continue
+        pstore = ProjectStore(paths[spec.name])
+        try:
+            _scanned, judged = stuck_scan(
+                pstore, spec.name, spec.fleet_health, now,
+                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+        finally:
+            pstore.close()
+        for row in judged:
+            wo, verdict = row["wo"], row["verdict"]
+            rows.append({
+                "id": wo["id"], "project": spec.name, "title": wo["title"],
+                "status": wo["status"], "status_label": row["status_label"],
+                "seconds_in_status": row["seconds_in_status"],
+                "seconds_since_activity": row["seconds_since_activity"],
+                "discounted_seconds": row["discounted"],
+                "active_seconds": verdict.active_seconds,
+                "threshold_seconds": verdict.threshold_seconds,
+                "clock": verdict.clock, "stuck": verdict.stuck,
+                "excluded": verdict.excluded, "reason": verdict.reason,
+                "blocker": row["blocker"],
+                "fingerprint": stuck.fingerprint(str(wo["status"]), row["since"],
+                                                 row["blocker"], row["events"]),
+                "investigation": _stuck_investigation(spec.name, wo["id"]),
+            })
+    rows.sort(key=lambda r: r["threshold_seconds"] - r["active_seconds"])
+    return rows
+
+
+def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
+    """The live or last investigation of this subject, with its verdict when settled."""
+    live = live_investigation(project_name, wo_id)
+    last = last_stuck_investigation(project_name, wo_id)
+    row = None
+    if live:
+        _n, _p, row = find_feature_order(live, project_name)
+    elif last is not None:
+        row = last
+    if row is None:
+        return None
+    plan = db.from_json(row.get("plan"), {}) or {}
+    return {"id": row["id"], "status": row["status"],
+            "classification": str(plan.get("classification") or "")}
+
+
 def list_investigation_orders(project_name: str | None = None,
                               include_settled: bool = False) -> list[dict[str, Any]]:
     """`jarvis investigate list`. The feature-order listing with the other kind asked
@@ -8559,6 +8695,17 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
+        # …AND ON THE SUBJECT'S OWN TIMELINE (§7): the line above is the INVESTIGATOR's
+        # work order, which nobody reading the stuck order will open. `KeyError` like the
+        # `plan_wo_id` reads below, since a subject can be deleted under it.
+        if subject and not is_feature_order_id(subject):
+            try:
+                store.add_event(subject, "investigation_verdict", {
+                    "investigation": inv_id, "classification": classification,
+                    "filed": (verdict.get("filed") or {}).get("issue_url"),
+                })
+            except (KeyError, sqlite3.IntegrityError):
+                pass  # not this project's work order any more
         investigator_open = False
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {

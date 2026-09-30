@@ -1417,3 +1417,93 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
     assert not reported[0].repaired
     assert reported[0].repair.startswith("would raise")
     assert store.alarms_of(wo["id"]) == []
+
+
+# -- INV-STUCK-SWEEP-DARK: the stuck sweep's own failures are a first-class alarm -------
+#
+# §8 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+
+def _sweep_run(tmp_path, project, **row) -> None:
+    """A registered catalog at `fleet_health`'s shipped defaults, plus one run row."""
+    import json
+
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+    from jarvis.daemon import Daemon
+
+    path = tmp_path / "stuck-catalog.json"
+    path.write_text(json.dumps({
+        "os": {"notifications": {"sinks": ["log"]}},
+        "projects": [{"name": "proj_a", "path": str(project), "description": "test"}],
+    }))
+    central = CentralStore()
+    try:
+        central.set_state("catalog_path", str(path))
+        if row:
+            central.set_state(Daemon.STUCK_RUN_KEY, db.to_json(
+                {"ts": time.time(), "scanned": 0, "candidates": 0, "opened": 0,
+                 "skipped": {}, "excluded": "", "error": "", **row}))
+    finally:
+        central.close()
+
+
+def _stuck_dark() -> list:
+    return [v for v in invariants.check_os() if v.invariant == "INV-STUCK-SWEEP-DARK"]
+
+
+def test_sweep_error_raises_the_invariant_once(jarvis_home, tmp_path, project):
+    """§8: the run row carries the error, and the row is what the check reads."""
+    _sweep_run(tmp_path, project, error="OperationalError: database is locked")
+
+    (violation,) = _stuck_dark()
+    assert violation.level == "critical" and not violation.repaired
+    assert violation.context["cause"] == "failing"
+    assert "database is locked" in violation.detail
+    # The STATE, not an event: a second read of the same row says the same thing.
+    assert [v.context["cause"] for v in _stuck_dark()] == ["failing"]
+
+    _sweep_run(tmp_path, project, error="")
+    assert _stuck_dark() == []
+
+
+def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project):
+    """§8: 180 minutes is six sweep intervals, so one capped tick cannot trip it."""
+    _sweep_run(tmp_path, project, ts=time.time() - 181 * 60)
+
+    (violation,) = _stuck_dark()
+    assert violation.context["cause"] == "dark"
+    assert invariants.STUCK_SWEEP_DARK_MINUTES == 180
+
+    _sweep_run(tmp_path, project, ts=time.time() - 179 * 60)
+    assert _stuck_dark() == []
+
+
+# -- Neo 1084: a standing critical violation is ONE attention item ----------------------
+
+
+def test_a_standing_critical_violation_reaches_the_attention_list(
+        jarvis_home, project, catalog_file, monkeypatch):
+    """Neo 1084: `jarvis status` read HEALTHY over a standing critical violation."""
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    ops.start_os(str(catalog_file), foreground=True)
+    wo = ops.create_work_order("proj_a", "the subject")
+    violation = invariants.Violation(
+        invariant="INV-TEST-CRITICAL", detail="a standing break", level="critical",
+        wo_id=wo["id"])
+    monkeypatch.setattr(invariants, "check_project", lambda *a, **k: [violation])
+    catalog = load_catalog(catalog_file)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        daemon.check_invariants(catalog.projects[0], store)
+        daemon.check_invariants(catalog.projects[0], store)  # ONE item, not one per tick
+    finally:
+        store.close()
+
+    status = ops.os_status(catalog)
+    items = [i for i in status["attention"] if i.get("invariant") == "INV-TEST-CRITICAL"]
+    assert len(items) == 1
+    assert items[0]["reason"] == "a standing break"
+    assert status["attention"] == items, "nothing else is asking, so this is why"
+    assert not status["healthy"]

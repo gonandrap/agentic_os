@@ -1027,3 +1027,29 @@ def test_a_user_owed_order_is_investigated(stuck_os):
                      "Is it the user's call, or is it the OS failing to decide?",
                      "Does the user have the reason and the link they need to decide?"):
         assert question in why
+
+
+def test_verdict_reaches_the_subject_timeline(started, store):
+    """§7: the verdict lands where the reader of the STUCK order will see it, and the
+    kind is an observer kind so looking cannot move the cooldown's fingerprint."""
+    from jarvis import health, stuck
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+
+    def fp() -> str:
+        return stuck.fingerprint("validating", 0.0, "a blocker", store.count_events(
+            subject, exclude=health.observer_kinds()))
+
+    before = fp()
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    events = [e for e in store.list_events(subject)
+              if e["kind"] == "investigation_verdict"]
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["classification"] == "TRANSIENT"
+    assert payload["investigation"] == inv["id"]
+    assert "investigation_verdict" in health.observer_kinds()
+    assert fp() == before

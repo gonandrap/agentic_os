@@ -865,6 +865,11 @@ DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES = 720
 #: themselves (§6c). Neo 1073.
 DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 4
 
+#: Ticks between sweeps of one project — 30 minutes at the default 5s `poll_interval`.
+#: A CATALOG CONFIG AND NOT A MODULE CONSTANT, per Neo 1086, which overrides §5: the user
+#: has turned down the module-constant precedent before and prefers a per-project config.
+DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 360
+
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
 #: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
 #: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
@@ -896,6 +901,8 @@ class FleetHealthConfig:
     fallback_minutes: int = DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES
     cooldown_minutes: int = DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
     max_per_day: int = DEFAULT_FLEET_HEALTH_MAX_PER_DAY
+    #: Neo 1086: how often this project is swept, per project rather than a constant.
+    sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -1720,6 +1727,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         fallback_minutes=int(raw.get("fallback_minutes", base.fallback_minutes)),
         cooldown_minutes=int(raw.get("cooldown_minutes", base.cooldown_minutes)),
         max_per_day=int(raw.get("max_per_day", base.max_per_day)),
+        sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":

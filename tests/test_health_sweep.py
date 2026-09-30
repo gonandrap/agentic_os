@@ -1349,3 +1349,44 @@ def test_assess_is_pure():
     forbidden = {"ops", "daemon", "claude_cli", "time"}
     assert not names & forbidden, sorted(names & forbidden)
     assert not [n for n in names if n.endswith("_store")], sorted(names)
+
+
+def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
+    """Neo 1086 OVERRIDES §5: the cadence is a per-project catalog config, default 360."""
+    import jarvis.catalog as catalog_mod
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+
+    assert catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS == 360
+    cat = load_catalog(stuck_catalog(
+        tmp_path, [{"name": "proj_a", "path": str(project),
+                    "fleet_health": {"sweep_every_ticks": 12}}],
+        name="stuck-cadence.json"))
+    assert cat.os.fleet_health.sweep_every_ticks == 360
+    cfg = cat.projects[0].fleet_health
+    assert cfg.sweep_every_ticks == 12
+    assert cfg.cooldown_minutes == catalog_mod.DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+
+    daemon = Daemon(cat)
+    assert daemon.stuck_cadence() == 12
+
+    def due(tick: int) -> list:
+        daemon.tick_count = tick
+        return [p.name for p in daemon.stuck_due_projects()]
+
+    assert due(1) == ["proj_a"]
+    assert due(2) == [], "not due again until its own 12 ticks have passed"
+    assert due(13) == ["proj_a"]
+
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    finally:
+        store.close()
+    daemon.stuck_tick(None)
+    central = CentralStore()
+    try:
+        assert db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})["scanned"] == 1
+    finally:
+        central.close()

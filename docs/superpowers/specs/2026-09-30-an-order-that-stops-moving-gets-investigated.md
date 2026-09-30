@@ -239,10 +239,13 @@ makes model calls; this one makes none — its whole cost is indexed reads — s
 inline, on `schedule_tick`'s pattern (src/jarvis/daemon.py:856). No `health_sweeping`
 flag, no done-callback, no thread-local store question.
 
-**Cadence: `STUCK_SWEEP_EVERY_TICKS = 360`** — 30 minutes at the default 5s
-`poll_interval` (src/jarvis/daemon.py:508). Its own cadence, like every pass in that
-constants block, and not catalog-configurable, on `PR_POLL_EVERY_TICKS`' stated rule
-(src/jarvis/daemon.py:101): a knob nobody will tune is a knob that can be wrong. Why 30
+**Cadence: `fleet_health.sweep_every_ticks`, default 360** — 30 minutes at the default 5s
+`poll_interval` (src/jarvis/daemon.py:508). **Neo 1086 OVERRIDES this section's original
+module constant**: the cadence is a per-project catalog config, resolved like every other
+`fleet_health` field, because the user has turned down the module-constant precedent before
+and prefers a config per project. `Daemon.stuck_cadence()` is the FINEST cadence any
+enabled project asked for — that is what `tick()` gates on — and `Daemon._stuck_due` is
+what keeps a coarser project on the number it asked for. Why 30
 minutes: the tightest threshold that governs a spend is 120 minutes, so 30 minutes of
 slop is at most 4% late on the earliest possible dispatch, and invisible against a
 2-hour symptom. Why not every tick: the pass costs one `ops.state_durations` per open
@@ -420,7 +423,9 @@ Two causes, named because they have two different fixes:
 
 * `failing` — the newest run carries an `error`. Detail quotes it, clipped.
 * `dark` — `fleet_health` is enabled for at least one project and the newest run is older
-  than `STUCK_SWEEP_DARK_MINUTES = 180`, or there has never been one. 180 is
+  than `STUCK_SWEEP_DARK_MINUTES = 180`, or there has never been one AND THE DAEMON IS UP
+  — a stopped daemon sweeps nothing by construction and `jarvis status` already says so,
+  so firing there would report a fresh install as broken. 180 is
   `OS_HEALTH_SWEEP_DARK_MINUTES`' value (src/jarvis/invariants.py:3103) and its
   reasoning holds here: six sweep intervals, so a daemon restart or one capped tick
   cannot trip it, and a sweep switched off by a bad edit is named the same working day.
@@ -489,3 +494,23 @@ Extend existing files. Every assertion named; the fixtures are `jarvis.testing`'
 * **Unverified number:** `dispatching` at 30 minutes and `fallback_minutes` at 240 are
   mine, not Neo's, and no measurement backs them. They are marked as such in the table
   and are the two most likely to want changing after a week of run rows.
+
+### 12. A standing critical violation is an attention item — Neo 1084
+
+**General invariant plumbing, NOT §8's alarm.** §8 adds a `critical` violation and would
+have inherited a defect that predates it: a violation reached the inbox and the work
+order's timeline and NOTHING ELSE, while `ops.os_status` (src/jarvis/ops.py:806) computes
+`healthy` from the attention list alone. So `jarvis status` read HEALTHY over a critical
+post-condition that was false — INV-STUCK-SWEEP-DARK included.
+
+The fix, scoped to `level="critical"` only:
+
+* `violation_reports` carries the violation's `level` and `detail`
+  (`ProjectStore.open_violation_report`, `ADDED_COLUMNS`). Kept for a READER, not for the
+  announcement: `os_status` reads state and cannot ask the checker again.
+* `ProjectStore.standing_violations(level="critical")` is that read, and
+  `os_status` appends ONE attention item per row — the report row IS the dedupe, so a
+  violation standing for a thousand ticks is one item, and `close_violation_reports` on a
+  sweep tick is what takes it away.
+* `warning` violations are unchanged: they reach the inbox exactly as before. Promoting
+  every violation would spend the attention budget the rollup rules protect.

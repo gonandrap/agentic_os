@@ -3025,3 +3025,35 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
 
     page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
     assert "still in it · active" in html.unescape(page)
+
+
+def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
+    """§7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    investigated.md: one reader, two renderers, and neither computes a number."""
+    from test_health_sweep import park_order
+
+    from jarvis import cli
+
+    wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
+    store = ProjectStore(project)
+    try:
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    finally:
+        store.close()
+
+    rows = ops.stuck_report()
+    (row,) = [r for r in rows if r["id"] == wo["id"]]
+    assert row["stuck"] and row["status"] == "waiting_pr_merge"
+    assert row["threshold_seconds"] == 180 * 60 and row["excluded"] == ""
+
+    assert cli.main(["stuck", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+
+    # The clocks move between the two reads; everything the renderers DECIDE from does not.
+    moving = ("seconds_in_status", "seconds_since_activity", "active_seconds")
+    assert set(printed[0]) == set(row)
+    assert [{k: v for k, v in r.items() if k not in moving} for r in printed] == \
+           [{k: v for k, v in r.items() if k not in moving} for r in rows]
+
+    page = " ".join(client.get("/stuck").text.split())
+    assert wo["id"] in page and "jarvis rules list" in page

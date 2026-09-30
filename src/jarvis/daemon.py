@@ -107,13 +107,10 @@ SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
 
-#: Sweep for orders that have stopped moving every N ticks — 30 minutes at the default 5s
-#: interval, and not catalog-configurable on the rule above. The tightest threshold that
-#: governs a spend is 120 minutes, so 30 minutes of slop is at most 4% late on the earliest
-#: possible dispatch and invisible against a 2-hour symptom. Not every tick because the
-#: pass costs one `ops.state_durations` and one `holds.held` per open order per project —
-#: `PR_POLL_EVERY_TICKS`-class work, and 12x cheaper per hour than that poll already is.
-STUCK_SWEEP_EVERY_TICKS = 360
+#: How often orders that have stopped moving are swept is `fleet_health.sweep_every_ticks`
+#: — A PER-PROJECT CATALOG CONFIG AND NOT A CONSTANT HERE, per Neo 1086, which overrides §5
+#: of the spec and the `PR_POLL_EVERY_TICKS` rule above. The shipped 360 (30 minutes at the
+#: default 5s interval) lives in `catalog.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS`.
 
 #: Which work orders' pull requests get asked about. EVERY STATUS WHERE A PULL REQUEST
 #: CAN SIT WITH NOBODY MOVING IT — issue #224: `waiting_pr_merge` alone left a work order
@@ -521,6 +518,9 @@ class Daemon:
         self.stores: dict[str, ProjectStore] = {}
         self.stop_requested = False
         self.tick_count = 0
+        #: Tick each project was last swept for stuck orders on — Neo 1086's per-project
+        #: cadence, which a single modulus cannot honour once two projects disagree.
+        self.stuck_swept: dict[str, int] = {}
         # Neo drains its queue on ONE thread: answering in FIFO order back-to-back
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
@@ -964,8 +964,10 @@ class Daemon:
         # Immediately after it, sharing that reading, and INLINE: this pass makes no model
         # call, so it needs no pool (§5 of docs/superpowers/specs/2026-09-30-an-order-that-
         # stops-moving-gets-investigated.md).
-        if self.tick_count % STUCK_SWEEP_EVERY_TICKS == 1:
-            self.stuck_tick(state)
+        if self.tick_count % self.stuck_cadence() == 1:
+            due = self.stuck_due_projects()
+            if due:
+                self.stuck_tick(state, projects=due)
         # Last of the three, and never merged into the review: a proposal filed above
         # cannot be applied on the tick that filed it (its gate is `pending`), so the two
         # only ever meet across ticks — and that separation is what keeps the deciding
@@ -4087,7 +4089,17 @@ class Daemon:
     #: `CentralStore.set_base_health`'s precedent for a fleet-shaped fact (§8).
     STUCK_RUN_KEY = "stuck_sweep_run"
 
-    def stuck_tick(self, state: fleet.Fleet | None = None) -> None:
+    def stuck_cadence(self) -> int:
+        """Ticks between two entries into `stuck_tick` — the FINEST cadence any enabled
+        project asked for (Neo 1086). Each project is then swept on its own, below."""
+        from .catalog import DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+
+        asked = [p.fleet_health.sweep_every_ticks for p in self.catalog.projects
+                 if p.fleet_health.enabled]
+        return min(asked) if asked else DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+
+    def stuck_tick(self, state: fleet.Fleet | None = None,
+                   projects: list[ProjectSpec] | None = None) -> None:
         """Investigate every open order past its per-status threshold, capped and cooled.
 
         ON THE MAIN THREAD, no pool: `health_tick` needs `self.health_pool` because a sweep
@@ -4101,8 +4113,9 @@ class Daemon:
         broken project must not stop the rest (`fleet.read`'s per-order rule) and because a
         sweep that wrote nothing is indistinguishable from one that never ran (§8).
         """
-        projects = [p for p in self.catalog.projects
-                    if p.fleet_health.enabled and p.path.is_dir()]
+        projects = projects if projects is not None else [
+            p for p in self.catalog.projects
+            if p.fleet_health.enabled and p.path.is_dir()]
         if not projects:
             return
         now = db.now()
@@ -4135,6 +4148,26 @@ class Daemon:
         run["error"] = "; ".join(errors)[:500]
         self.central.set_state(self.STUCK_RUN_KEY, db.to_json(run))
 
+    def stuck_due_projects(self) -> list[ProjectSpec]:
+        """Which projects this tick may sweep — each on its OWN `sweep_every_ticks`.
+
+        Neo 1086's cadence is per project, so `stuck_cadence` is the finest of them and
+        this is what keeps a coarser project on the number it asked for. Called from
+        `tick()` alone: `stuck_tick` given no projects sweeps every enabled one, which is
+        what a direct call (a test, `jarvis doctor`) means by asking for a sweep.
+        """
+        due = []
+        for project in self.catalog.projects:
+            if not (project.fleet_health.enabled and project.path.is_dir()):
+                continue
+            last = self.stuck_swept.get(project.name)
+            if last is not None \
+                    and self.tick_count - last < project.fleet_health.sweep_every_ticks:
+                continue
+            self.stuck_swept[project.name] = self.tick_count
+            due.append(project)
+        return due
+
     @staticmethod
     def _stuck_exclusion(state: fleet.Fleet | None) -> str:
         """The fleet-wide hold that stops the sweep FILING, or `""`. §2, Neo 1074.
@@ -4160,52 +4193,19 @@ class Daemon:
 
         The expensive step of the tick and the last one: one `ops.state_durations` and one
         `holds.held` per open order, all of them indexed reads.
+
+        THE DERIVATION ITSELF IS `ops.stuck_scan` — shared with `ops.stuck_report`, so the
+        surfaces and the spend decision can never disagree about a duration (§7).
         """
-        from . import ops, stuck
-        from .health import observer_kinds
-        from .project_store import FO_ID_PREFIXES
-        from .worker_session import PAUSE_USAGE_LIMIT
+        from . import ops
 
         pstore = self.store_for(project)
-        cfg = project.fleet_health
         # PROJECT-WIDE, read once rather than once per candidate — `health_sweep_hold`'s
         # own docstring — and the fleet half beside it, per §2.1.
         window = bool(pstore.health_sweep_hold()) or (state is not None and state.shut())
-        out: list[dict[str, Any]] = []
-        for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
-            if wo["origin"] in UNGOVERNED_ORIGINS:
-                continue  # the user's own session — `_health_candidates`' rule
-            # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
-            # too, and the refusal must not be how the sweep learns it (§6).
-            if wo.get("kind") in ("investigation", "investigator") \
-                    or str(wo.get("parent_id") or "").startswith(
-                        f'{FO_ID_PREFIXES["investigation"]}-'):
-                continue
-            run["scanned"] += 1
-            durations = ops.state_durations(pstore, wo_id=wo["id"], now=now)
-            if durations.current_status_since is None:
-                continue  # no present-tense claim to judge — `state_durations`' own rule
-            spans = holds.held(pstore, wo["id"], now=now)
-            since = durations.current_status_since
-            usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
-            verdict = stuck.assess(
-                str(wo["status"]), now - since,
-                now - (durations.last_activity_ts or since),
-                holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0),
-                {s: cfg.threshold_seconds(s) for s in cfg.thresholds},
-                cfg.fallback_minutes * 60.0,
-                excluded_cause=(PAUSE_USAGE_LIMIT
-                                if window or any(h.open for h in usage) else ""))
-            if not verdict.stuck:
-                continue
-            blocker = invariants_mod.true_blockers(pstore, wo, now=now)
-            out.append({
-                "project": project.name, "wo": wo, "verdict": verdict,
-                "blocker": blocker[0] if blocker else "nothing the record can name",
-                "status_label": invariants_mod.status_label(pstore, wo),
-                "since": since, "activity": durations.last_activity_ts or since,
-                "events": pstore.count_events(wo["id"], exclude=observer_kinds()),
-            })
+        scanned, out = ops.stuck_scan(pstore, project.name, project.fleet_health, now,
+                                      window=window)
+        run["scanned"] += scanned
         return out
 
     def _open_investigations(self, candidates: list[dict[str, Any]], opened_today: int,
@@ -4419,7 +4419,10 @@ class Daemon:
                          f"{wo_id}: " if wo_id else "", invariant)
 
         for v in violations:
-            if not store.open_violation_report(v.invariant, v.wo_id):
+            # `level` and `detail` ride along so a standing CRITICAL one can reach the
+            # attention list from state alone — Neo 1084, `ops.os_status`.
+            if not store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+                                               detail=v.detail):
                 continue
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
