@@ -392,9 +392,9 @@ class Compaction:
 
     #: Seconds since the previous turn ENDED, which is a LOWER bound on the age of the
     #: cache entry: the entry was last touched by that turn's final API call, which is
-    #: strictly earlier than the moment its process exited. Bounding it from below is
-    #: what lets this be decided without reading the transcript — the error is always in
-    #: the direction of compacting LESS often than the bill would justify.
+    #: strictly earlier than the moment its process exited. A lower bound is the safe
+    #: way round: the error is always in the direction of compacting LESS often than the
+    #: bill would justify.
     age: float
     #: The conversation's size as measured, or None when it could not be read at all
     #: (`measured_context`, issue #885). None is UNKNOWN and never 0: nothing may
@@ -437,10 +437,10 @@ def measured_context(store: ProjectStore, wo_id: str) -> int | None:
     every turn on record read 0, and the relaunch re-wrote 181,342 tokens cold while
     three other orders the same minute compacted correctly.
 
-    0 AND None ARE DIFFERENT ANSWERS, and the split is Neo's ruling on question 1097: a
-    readable transcript with nothing billed, and a work order with no session at all,
-    are both genuinely EMPTY and must not compact. Only a transcript that could not be
-    read is unknown.
+    0 AND None ARE DIFFERENT ANSWERS, and the split is Neo's ruling on questions 1097
+    and 1127: a readable transcript with nothing billed, a work order with no session at
+    all, and a session id with no transcript file are all genuinely EMPTY and must not
+    compact. Only a transcript that exists and cannot be read is UNKNOWN.
     """
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
         context = turn_context(turn)
@@ -456,6 +456,12 @@ def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
     synthetic and unbilled rows dropped, so the error row that ended the turn is not in
     this — but a trailing call can still carry no context (output only), and that is not
     a size either.
+
+    NO FILE ON DISK IS 0, never UNKNOWN (Neo question 1127): `--resume` reads that same
+    transcript, so with no file there is no conversation to compact and UNKNOWN could
+    only launch a compaction that must fail with `No conversation found with session ID`
+    — the regression `tests/test_rate_limit_retry.py::
+    test_a_clock_time_reset_comes_due_without_the_error_being_rewritten` caught.
     """
     session_id = store.get_work_order(wo_id).get("session_id")
     if not session_id:
@@ -463,7 +469,7 @@ def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
     try:
         index = usage.index_sessions()
         if session_id not in index:
-            return None
+            return 0
         calls = usage.session_calls(session_id, index=index)
     except OSError:
         return None

@@ -532,6 +532,20 @@ def test_a_readable_transcript_with_nothing_billed_is_empty_not_unknown(
         store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
 
 
+def test_a_corrupt_transcript_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """A file that exists and holds no parseable line is EMPTY, not UNKNOWN: `calls_of`
+    swallows the per-line ValueError, so it yields no call and the size reads 0."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], []).write_text("{not json at all\nalso not json\n")
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
 def test_a_work_order_with_no_session_is_empty_not_unknown(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
     """No session id is no conversation to resume — there is nothing to summarise."""
@@ -546,13 +560,32 @@ def test_a_work_order_with_no_session_is_empty_not_unknown(
         pause=worker_session.turn_pause(store, wo["id"])) is None
 
 
+def test_a_session_id_with_no_transcript_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """Neo 1127: `--resume` reads the same file, so no file is no conversation to
+    compact — UNKNOWN there could only launch a compaction that must fail."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])      # and no transcript for its session
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
 def test_an_unreadable_transcript_compacts_and_records_no_size(
         fleet, fake_claude, settle_turns, monkeypatch, transcripts):
     """UNKNOWN is the one case that compacts under the floor — and it must not write a
     figure the OS never measured onto the record."""
     store = fleet["store"]
     wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
-    _forget_measured_contexts(store, wo["id"])      # and no transcript for its session
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], [_billed_row(181_342)])   # exists, and won't read
+
+    def unreadable(*a, **kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(usage, "session_calls", unreadable)
 
     assert worker_session.measured_context(store, wo["id"]) is None
     pause = worker_session.turn_pause(store, wo["id"])
