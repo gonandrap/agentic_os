@@ -1891,22 +1891,20 @@ def _diagnose_clock(store: ProjectStore, wo_id: str, now: float) -> dict[str, An
 def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
                     project: str, now: float) -> dict[str, Any]:
     """Every episode the record says held this order, plus the honest residual."""
+    from . import autopsy
     from . import holds as holds_mod
-    from . import inspection
 
     episodes = holds_mod.held(store, wo["id"], now=now)
     by_cause = {cause: round(seconds, 2) for cause, seconds
                 in holds_mod.by_cause(episodes, float("-inf"), now, now=now).items()}
-    session = str(wo.get("session_id") or "")
-    # Exactly `inspect_report`'s inner `unit()` shape, and it takes the SAME two
-    # arguments for the same reason: `read_session` has never opened the OS's database,
-    # so the spans are passed in. The walk itself is not touched here — this report reads
-    # one number off it (Neo, question 680).
-    anatomy = (inspection.read_session(session, inspect_config(project),
-                                       spans=list(episodes),
-                                       turn_starts=store.turn_starts(wo["id"]))
-               if session else None)
-    if anatomy is not None and anatomy.found:
+    # Exactly `inspect_report`'s inner `unit()` shape, and through §4's chokepoint for
+    # the same reason: one definition of "this order's anatomy", preferring the seal and
+    # saying which reading answered. The walk itself is not touched here — this report
+    # reads one number off it (Neo, question 680).
+    anatomy, provenance = autopsy.anatomy_for(
+        wo, inspect_config(project), spans=list(episodes),
+        turn_starts=store.turn_starts(wo["id"]))
+    if anatomy.found:
         unexplained = {"seconds": round(anatomy.unexplained, 2),
                        "seconds_human": ago_phrase(anatomy.unexplained),
                        "residual": True, "note": UNEXPLAINED_NOTE}
@@ -1919,7 +1917,8 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
             for h in episodes]
     return {"episodes": rows, "by_cause": by_cause,
             "open": next((r for r in reversed(rows) if r["open"]), None),
-            "unexplained": unexplained}
+            # Beside the one figure it attributes: which reading the residual came from.
+            "unexplained": unexplained, "provenance": provenance}
 
 
 def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
@@ -12050,7 +12049,7 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import holds, inspection
+    from . import autopsy, holds
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -12080,16 +12079,15 @@ def inspect_report(target: str, project: str | None = None, *,
         # The OS's own record of what it was holding this order for, so the report can
         # state both clocks and name the difference (`holds`). Two indexed reads.
         spans = holds.held(store, wo["id"])
-        # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
-        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
-                                           turn_starts=store.turn_starts(wo["id"]),
-                                           cold_prefix_floor=floor)
-                   if session
-                   else inspection.Anatomy(session_id="", holds=list(spans),
-                                           write_floor=cfg.report_write_floor,
-                                           join_floor=cfg.report_join_floor))
+        # Spec 2026-09-27 §4: the ONE chokepoint, which prefers the seal and says which
+        # reading answered. Per UNIT and never one key on the report: a feature's planner
+        # and each of its children have a seal each (Neo q1080).
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=spans, index=index,
+            turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
-        payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
+        payload.update(provenance=provenance,
+                       wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",
                        # The biggest input Jarvis itself sent on this order's behalf
                        # (spec §3,
@@ -12207,8 +12205,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     binds every transcript turn to a `wo_turns.seq` (spec 2026-09-27 §3) — so this join
     is no longer a workaround for a sequence that meant something else.
     """
+    from . import autopsy, inspection
     from . import context as context_mod
-    from . import inspection
     from . import usage as usage_mod
 
     name, path, wo = find_work_order(wo_id, project)
@@ -12220,13 +12218,12 @@ def context_report(wo_id: str, project: str | None = None, *,
         session = wo.get("session_id") or ""
         cfg = inspect_config(name)
         # Spec 2026-09-27 §3: the same rows this report already read, reused to bind
-        # inspect's numbering to `wo_turns.seq`.
-        anatomy = (inspection.read_session(
-                       session, cfg, index=usage_mod.index_sessions(),
-                       turn_starts=[(int(r["seq"]), float(r["started_at"]))
-                                    for r in rows],
-                       cold_prefix_floor=cold_prefix_floor())
-                   if session else None)
+        # inspect's numbering to `wo_turns.seq`. §4: through the chokepoint, and `spans=[]`
+        # because this report has never read the holds and states no hold-derived figure.
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=[], index=usage_mod.index_sessions(),
+            turn_starts=[(int(r["seq"]), float(r["started_at"])) for r in rows],
+            cold_prefix_floor=cold_prefix_floor())
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "
                            f"(it has {len(rows)}: "
@@ -12266,6 +12263,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     return {
         "wo_id": wo["id"], "project": name, "title": wo["title"],
         "recorded": bool(recorded),
+        # Which reading the residual and the prefix joins above came from (§4).
+        "provenance": provenance,
         "note": "" if recorded else NOT_RECORDED,
         "turns": [t for t in out if turn is None or t["seq"] == turn],
     }

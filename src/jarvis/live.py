@@ -658,8 +658,12 @@ class Reader:
     def _note(self, state: str, now: float, stale: float | None) -> str:
         """The frame's sentence, composed once — see `Live.note`."""
         if state == NO_TRANSCRIPT:
+            # Spec 2026-09-27 §7: this reader falls back to NO seal — it is a byte cursor
+            # over one file and persistence here is forbidden — so it names the command
+            # that CAN answer from one instead.
             return (f"no transcript on disk for session {self.session_id or '(none)'} "
-                    "— nothing can be read")
+                    "— nothing can be read live; `jarvis inspect` can still answer from "
+                    "a sealed autopsy if this order has one")
         silence = (f"nothing has been written since {clock(self._last_ts)}"
                    f" ({_secs(stale)} ago)" if self._last_ts
                    else "nothing has been written to this transcript at all")

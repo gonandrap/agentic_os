@@ -2119,6 +2119,21 @@ def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
             print(f"               ({note})")
 
 
+def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
+    """Which reading answered — spec §4 of 2026-09-27-order-autopsy-durability.md.
+
+    COMPOSES NOTHING. The sentence, the level sentence and the sealed-floor warning are
+    all keys of the payload `autopsy.anatomy_for` returned, for `ago_phrase`'s reason: a
+    renderer that words one of them is one the dashboard will disagree with.
+    """
+    if not provenance:
+        return
+    print(f"  reading: {provenance['note']}")
+    for sentence in (provenance["level_note"], provenance["floor_note"]):
+        if sentence:
+            print(f"           {sentence}")
+
+
 def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
                    params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
@@ -2141,6 +2156,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
               f"{biggest['label']}: {biggest['prompt_chars']:,} characters of prompt, "
               f"{biggest['system_prompt_chars']:,} of system prompt "
               f"({biggest['model'] or 'model not recorded'})")
+    # ABOVE the transcript check, in `largest_os_input`'s position and for its reason:
+    # which reading answered is exactly what a reader needs when nothing was found, and
+    # a provenance line below the early return is invisible in the one case it matters.
+    _print_autopsy_provenance(unit.get("provenance"))
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -2794,6 +2813,9 @@ def _print_context(res: dict[str, Any]) -> None:
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
     (spec docs/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
+    # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
+    # the one who most needs to know which reading was consulted.
+    _print_autopsy_provenance(res.get("provenance"))
     if not res["recorded"]:
         print(f"\n  {res['note']}")
         return
@@ -3134,6 +3156,8 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         for episode in held["episodes"]:
             mark = " (still held)" if episode["open"] else ""
             print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    # Where `_diagnose_holds`' reading surfaces, so its provenance belongs here.
+    _print_autopsy_provenance(held.get("provenance"))
     residual = held["unexplained"]
     if residual["seconds"] is None:
         print(f"  unexplained: none measurable — {residual['note']}")

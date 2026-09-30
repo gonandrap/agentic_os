@@ -704,6 +704,21 @@ def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
     assert "the whole session's running total" in printed
 
 
+def test_the_bills_provenance_renderer_is_not_the_autopsys(store, wo, capsys):
+    """TWO FUNCTIONS, TWO NAMES. `read_session` exists twice across two modules and cost
+    §4 of 2026-09-27-order-autopsy-durability.md a whole AST pin; a second
+    `_print_provenance` inside ONE module would be that trap with no pin at all, because
+    Python would simply bind the later definition over this one.
+    """
+    from jarvis import cli
+
+    cli._print_provenance({"sealed_at": 1_000.0, "gaps": [], "complete": True})
+    printed = capsys.readouterr().out
+
+    assert "sealed when this order settled" in printed
+    assert cli._print_provenance is not cli._print_autopsy_provenance
+
+
 def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
         store, wo, transcripts, tmp_path):
     """The other way a bill gets smaller, and it must not pass for a correction.
