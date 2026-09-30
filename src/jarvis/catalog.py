@@ -395,6 +395,13 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# Characters of DECISION RECORD one assumption-review packet may carry — the order's own
+# answered questions, the user's messages and their rulings on sibling assumptions. Newest
+# first, and what it evicts is stated in the packet rather than dropped silently. Per
+# project because that is what the user asked for on this key. Spec §3:
+# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
+DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
+
 # How many follow-up findings ONE ORDER may file, across every round it is judged in.
 #
 # PER ORDER SINCE wo-3619e6e4, and that is the whole of what went wrong: applied per
@@ -459,6 +466,7 @@ class ValidationConfig:
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
@@ -1427,6 +1435,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    decision_record_chars = int(
+        raw.get("decision_record_chars", base.decision_record_chars))
+    if decision_record_chars < 1:
+        raise _err(f"{where}.decision_record_chars must be >= 1")
     stakes_classifier = str(
         raw.get("stakes_classifier", base.stakes_classifier) or "regex")
     if stakes_classifier not in STAKES_CLASSIFIER_MODES:
@@ -1448,6 +1460,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
+        decision_record_chars=decision_record_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),

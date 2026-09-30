@@ -1756,14 +1756,27 @@ def test_the_record_is_capped_newest_first_and_says_what_it_dropped():
     assert "older items omitted" in last and "6000 characters" in last
 
 
+def test_a_smaller_per_project_cap_evicts_more():
+    """The cap is a per-project catalog key (`validation.decision_record_chars`), so the
+    bound one project's reviewer reads is the bound that project set."""
+    rows = [qrow(id=900 - i, ts=100.0 - i, answer=f"ruling {i} " + "x" * 800)
+            for i in range(12)]
+    tight = autoreview.decision_record(FakeStore(), FakeNeo(*rows), "wo-1", [],
+                                       chars=2000)
+
+    assert "ruling 0" in tight
+    assert "ruling 2" not in tight
+    assert "capped at 2000 characters" in tight.strip().splitlines()[-1]
+
+
 def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
     """Test 3. Q900 escalated naming a question id it could not see. That row is the one
     item most likely to be why the packet exists, so the cap does not reach it."""
     long_answer = "the user said: " + "y" * 3000
     cited = qrow(id=887, ts=1.0, answer=long_answer)
     fillers = [qrow(id=900 - i, ts=500.0 - i, answer="z" * 900) for i in range(10)]
-    out = record(*fillers, cited,
-                 siblings=[assumption(content="per Neo question 887, kept the shim")])
+    cites = assumption(content="per Neo question 887, kept the shim")
+    out = record(*fillers, cited, siblings=[cites], ruling_on=cites)
 
     assert long_answer in out, "the cited answer was truncated or evicted"
     assert out.index("Q887") < out.index("Q900")
@@ -1771,16 +1784,16 @@ def test_a_cited_question_is_placed_first_in_full_and_never_evicted():
 
 @pytest.mark.parametrize("cite", ["Neo question 887", "question 887", "Q887", "Neo 887"])
 def test_every_field_spelling_of_a_question_id_is_recognised(cite):
-    out = record(siblings=[assumption(content=f"decided this because {cite} said so")],
+    cites = assumption(content=f"decided this because {cite} said so")
+    out = record(siblings=[cites], ruling_on=cites,
                  others=(qrow(id=887, status="queued", answer=None),))
 
     assert "Q887 (cited by the assumption; asked on this order, not answered)" in out
 
 
-def test_the_citation_budget_is_spent_on_the_assumption_being_ruled_on_first():
-    """THE BUDGET ORDER, and the case the feature exists for: Q900 cited an id in its OWN
-    text. Five siblings citing five ids between them must not spend the five-citation
-    budget before the row under review gets to name one."""
+def test_only_the_assumption_being_ruled_on_contributes_citations():
+    """The user's ruling on the recorded assumption: each order cites its OWN questions,
+    not its siblings'. A sibling naming an id is that sibling's business."""
     ruling_on = assumption(id=20, n=6, content="per Q906, kept the shim")
     siblings = [assumption(id=i, n=i, content=f"decided per Q{900 + i}")
                 for i in range(1, 6)] + [ruling_on]
@@ -1792,15 +1805,15 @@ def test_the_citation_budget_is_spent_on_the_assumption_being_ruled_on_first():
     cited = [line for line in out.splitlines() if "cited by the assumption" in line]
     assert cited[0].startswith("  Q906 (cited by the assumption)")
     assert "the user said: keep the shim" in cited[0]
-    # The cut fell on a SIBLING's citation, not on the row being ruled on.
-    assert len(cited) == autoreview._CITED_LIMIT   # noqa: SLF001
+    assert len(cited) == 1
     assert "Q905" not in out
 
 
 def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
     """Content from a different order has not been through this order's evidence gates,
     and a worker citing it does not make it this order's record."""
-    out = record(siblings=[assumption(content="as Q887 decided")],
+    cites = assumption(content="as Q887 decided")
+    out = record(siblings=[cites], ruling_on=cites,
                  others=(qrow(id=887, wo_id="wo-9", answer="quoted elsewhere"),))
 
     assert ("Q887 (cited by the assumption; belongs to another work order — not shown)"
@@ -1811,7 +1824,8 @@ def test_a_cited_question_on_another_work_order_is_named_and_not_quoted():
 def test_a_cited_question_that_never_existed_is_stated_not_swallowed():
     """A worker citing a question id that was never asked is a fact about the assumption
     the reviewer is ruling on."""
-    out = record(siblings=[assumption(content="as Q887 decided")])
+    cites = assumption(content="as Q887 decided")
+    out = record(siblings=[cites], ruling_on=cites)
 
     assert "Q887 (cited by the assumption; no such question)" in out
 
@@ -1845,6 +1859,35 @@ def test_a_record_item_carrying_a_credential_is_withheld_not_dropped():
 
     assert "sk-live-4a9f8c2b7d1e" not in out
     assert "Q887 (withheld — carries a line assigning API_KEY)" in out
+
+
+def test_an_answer_whose_credential_is_on_a_later_line_is_still_withheld():
+    """The net sees the field as the user typed it. `_ASSIGNMENT_RE` anchors at the start
+    of a LINE, so normalising the whitespace before the net runs makes an assignment on
+    every line but the first invisible — the payload-vs-rendered-line defect one step
+    earlier."""
+    out = record(qrow(answer="Use this config:\npassword = hunter2-not-a-shape"))
+
+    assert "hunter2-not-a-shape" not in out
+    assert "Q887 (withheld — carries a line assigning password)" in out
+
+
+def test_a_user_message_whose_credential_is_on_a_later_line_is_still_withheld():
+    out = record(messages=({"ts": 1727500000.0, "body": "see below\nAPI_KEY=abc123xyz"},))
+
+    assert "abc123xyz" not in out
+    assert "(withheld — carries a line assigning API_KEY)" in out
+
+
+def test_a_user_ruling_whose_credential_is_on_a_later_line_is_still_withheld():
+    out = record(siblings=[
+        assumption(),
+        assumption(id=8, n=4, status="rejected", decided_by="",
+                   decided_reason="as agreed:\nDB_PASSWORD = s3cr3t-not-a-shape"),
+    ])
+
+    assert "s3cr3t-not-a-shape" not in out
+    assert "#4 rejected (withheld — carries a line assigning DB_PASSWORD)" in out
 
 
 def test_a_high_stakes_wording_in_a_settled_ruling_is_shown_in_full():

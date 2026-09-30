@@ -512,7 +512,7 @@ class NeoStore:
 
         `open_questions`' other half, and the two differences are both deliberate. The
         order is reversed because the caller caps the text it can carry
-        (`autoreview.DECISION_RECORD_CHARS`) and the newest ruling is the one that
+        (`validation.decision_record_chars`) and the newest ruling is the one that
         supersedes. And there is NO `kind` filter: that exclusion is load-bearing above
         because an open `approval` is a gate reported elsewhere, while here every row is a
         ruling on this order — an `approval` the user answered is exactly the authority a

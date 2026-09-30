@@ -66,9 +66,14 @@ of ruling #832 is about. The filtering that matters is on the RENDERING, §2.
 New pure-ish function in autoreview.py, immediately after `sibling_line`:
 
 ```python
-def decision_record(store: Any, neo: Any, wo_id: str,
-                    siblings: list[dict[str, Any]]) -> str:
+def decision_record(store: Any, neo: Any, wo_id: str, siblings: list[dict[str, Any]],
+                    assumption: dict[str, Any] | None = None, *,
+                    chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS) -> str:
 ```
+
+`assumption` is the row being ruled on — a parameter rather than a lookup in `siblings`
+because it is the only row whose citations are resolved (§4); `None` means no cited items
+at all. `chars` is the cap, per project (§3).
 
 Three sources, concatenated newest-first within each group, groups in this order:
 
@@ -111,17 +116,16 @@ dropped: a ruling whose subject cannot be located is still a ruling.
 
 ### 3. The cap, and stating the omission
 
-Module constant in autoreview.py, beside `QUESTION_KIND`:
+A **per-project catalog key**, `validation.decision_record_chars`, on the `diff_chars`
+precedent exactly: `catalog.DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000` is the fleet
+answer, a project naming the key keeps its own value and one that does not inherits the
+fleet's (field-level fallback in `_parse_validation`), and a value below 1 is refused
+loudly — a reviewer shown none of the order's own rulings is the defect this spec exists to
+fix. `decision_record` takes it as the `chars` keyword; `propose` and
+`propose_confirmation` take `cfg` and read it off the project's resolved `ValidationConfig`.
 
-```python
-#: Characters of decision record one packet may carry.
-DECISION_RECORD_CHARS = 6000
-```
-
-A constant, not a config key — `evidence.DEFAULT_DIFF_CHARS` (src/jarvis/evidence.py:92) and
-`neo.LEARNINGS_CHAR_BUDGET` (src/jarvis/neo.py:110) are the precedent for a prompt-size
-bound in this codebase, and a per-project knob on this one would be a setting nobody sets
-and every test has to pin.
+This reverses the draft's module constant. The user's ruling on the recorded assumption:
+"I prefer them to be catalog configs per project."
 
 Items are added newest-first until the next one would cross the cap. **When anything is
 dropped the block says so, as its LAST line**, per kn-1485b845: an omission stated, last.
@@ -135,6 +139,13 @@ prior decisions" from "prior decisions I was not shown" must escalate, and would
 to.
 
 ### 4. Cited ids go in verbatim, exempt from the cap
+
+**ONLY the assumption being ruled on is scanned. Siblings are not.** The user's ruling on
+the recorded assumption: "each order should cite its own questions, not siblings." A
+citation is authority the row under review named; a sibling's citation is that sibling's
+business, and it neither spends the citation budget nor pulls a question row in behind it.
+Siblings still reach the packet as context through `sibling_line` and their user rulings
+through the record's third group.
 
 When the assumption's own `content` names a question id, that Q&A is rendered with its
 question headline AND its full `answer` untruncated, placed FIRST, and never evicted. It is
@@ -151,8 +162,8 @@ _CITED_QUESTION_RE = re.compile(
 Matches every form seen in the field: `Neo question 887`, `question 887`, `Q887`,
 `Neo 887`. Bounded to 6 digits so a commit hash fragment or a line count cannot become an
 id. All matches are collected, deduplicated, and capped at 5 citations — a reviewer packet
-is not a place to paste a bibliography, and a `content` naming six question ids is a
-different problem.
+is not a place to paste a bibliography, and one row's `content` naming six question ids is
+a different problem.
 
 Resolution rules, each testable:
 
@@ -184,6 +195,17 @@ a classification line, same shape as `sibling_line`'s withholding:
 
 Withheld, never dropped silently: the marker names the SHAPE and never the value, which is
 the contract `secret_marker_text`'s docstring states.
+
+**THE NET SEES EACH FIELD AS THE USER TYPED IT — newlines included, untruncated.** Only the
+text that is RENDERED is whitespace-normalised and truncated. The rule is the anchor:
+`_ASSIGNMENT_RE` matches at the start of a LINE, so flattening the newlines first leaves
+every line but the first unanchored and a credential assignment on line two reaches both
+the model and the question row, while truncating first hides one past the limit. So
+`_netted` is handed the raw `answer`, `review_feedback`, question text, message `body` and
+`decided_reason`, and the rendered line separately — the same defect class as netting the rendered
+line instead of the payload, one step earlier. (The one exception is an
+`assumption`-kind row's question text: its headline is synthesised, not quoted, so the
+synthesised headline is what the net classifies.)
 
 **The high-stakes net (`high_stakes_marker`, :381) is NOT applied here**, and that is a
 deliberate departure from `sibling_line`. User ruling on Neo question 943, 2026-09-28,
@@ -236,10 +258,12 @@ def _confirm_question(project, wo, assumption, siblings, stat, diff,
 recorded)`, so a caller not yet teaching them one is merely unaware, never wrong, and the
 existing unit tests that call the builders directly keep passing.
 
-`propose` (:1318) and `propose_confirmation` (:1285) call
-`decision_record(store, neo, wo["id"], siblings)` and pass the result. Both already take
-`store` and `neo`; their callers in src/jarvis/daemon.py — `propose_confirmation` at :5555
-and `propose` at :5571 — already hold both stores and change not at all. That is why the
+`propose` and `propose_confirmation` call
+`decision_record(store, neo, wo["id"], siblings, assumption, chars=…)` and pass the result.
+Both already take `store` and `neo`, and both gain a `cfg: Any = None` keyword for the cap
+(§3). Their callers in src/jarvis/daemon.py — `propose_confirmation` at :5555 and `propose`
+at :5571 — already hold both stores and the project's resolved `ValidationConfig`, so each
+gains `cfg=cfg` and nothing else. That is why the
 block is built in `autoreview` rather than in the daemon: the daemon half of this module is
 the part that runs git and calls models, and a string assembled there would be one more
 argument threaded through `Daemon.auto_review` for no gain, with the rendering out of reach
@@ -259,18 +283,24 @@ answers, and it is the block whose absence produced the escalation.
 
 1. A question answered on the order appears in the packet WITH its `Q{id}`, and
    `answered by user` when `answered_by == 'user'`.
-2. With more items than `DECISION_RECORD_CHARS` allows: the newest survive, the oldest are
-   absent, and the omission line is present and LAST.
+2. With more items than the cap allows: the newest survive, the oldest are absent, and the
+   omission line is present and LAST. Plus a smaller `chars` evicting more, and the catalog
+   tests for the key — `decision_record_chars: 0` refused, a project inheriting the fleet
+   value.
 3. An assumption whose `content` says `Neo question 887` puts Q887's full answer in the
    packet even when the cap would otherwise have evicted it, and places it first. Plus one
    case each for a cited id that is unanswered, one on another work order, and one that
    does not exist — asserting the three distinct lines from §4, and that the other-order
-   question's TEXT is absent.
+   question's TEXT is absent. Plus one that a sibling citing an id contributes no citation
+   line while the ruled row's citation is still first.
 4. A `kind='assumption'` row whose `question` is a 5000-char packet: its question text
    never appears in a newly built packet, and the row is present as a one-liner naming the
    sibling number.
 5. An item carrying `API_KEY = "sk-live-…"`: the packet contains the withheld
    classification line, does not contain the value, and the item is not silently absent.
+   Once per netted field with the assignment on a LATER line — an answer, a user message, a
+   user ruling's `decided_reason` — asserting the value absent and the withheld line
+   present.
 6. A sibling assumption settled by the user with `decided_reason` set reaches the packet
    with that reason; one settled by `neo` is rendered as Neo's, not the user's.
 7. Both `propose` and `propose_confirmation` produce a packet containing the section
@@ -284,14 +314,14 @@ answers, and it is the block whose absence produced the escalation.
   `propose` asks one question per assumption for its whole life (:1323) and re-asking would
   be the OS lobbying.
 * **The pending-sibling withholding rule.** Unchanged, deliberately (§5).
-* **A config key for the cap.** §3.
+* **Resolving a sibling's citations.** Each order cites its own questions (§4).
 
 ## Uncertain
 
-* `DECISION_RECORD_CHARS = 6000` is a judgement, not a measurement. The packets already
+* The shipped `6000` is a judgement, not a measurement. The packets already
   carry up to 2000 chars of description and 150k of diff on the confirm pass, so 6000 is
   small beside the diff and large beside the assumption; if the cap line shows up on most
-  orders it is too small.
+  orders it is too small — and now a project can raise its own.
 * Whether group ORDER should be strict-newest-first ACROSS the three groups rather than
   grouped. Grouped is specified because `answered_by` and provenance differ per group and a
   merged stream would need a per-item source label to stay readable.
