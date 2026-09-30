@@ -124,6 +124,16 @@ def test_the_holds_are_not_sealed_and_have_to_be_handed_back_in(monkeypatch):
         without_params(a.as_dict()), "held, held_by and the partition are hold-derived"
 
 
+def test_a_rehydration_must_be_handed_the_holds_and_cannot_silently_default_to_none(
+        real_session):
+    """A forgotten `spans=` used to default to no holds, so a held order rehydrated with
+    `held` 0 and the wrong held/active partition and said nothing about it (§3). The
+    argument is required, so the omission is a `TypeError` at the call, not a false number.
+    """
+    with pytest.raises(TypeError):
+        autopsy.from_seal(autopsy.to_seal(real_session, level="normal"))
+
+
 def test_every_api_call_of_every_turn_survives_the_seal(real_session):
     """`Turn.as_dict` emits `api_calls: len(self.calls)` and a folded `usage`, and carries
     no calls — rehydrate from THAT and `observed` goes False on a turn that made 32 calls

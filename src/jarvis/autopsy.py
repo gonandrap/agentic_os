@@ -355,9 +355,11 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
 
 
 def from_seal(payload: dict[str, Any], *,
-              spans: Sequence[inspection.Hold] = ()) -> inspection.Anatomy:
+              spans: Sequence[inspection.Hold]) -> inspection.Anatomy:
     """A stored payload back as an `Anatomy`, ready to render through `as_dict`.
 
+    `spans` is REQUIRED — spec §3: defaulted to none, a forgotten argument rehydrates a
+    held order with `held` 0 and the wrong held/active partition, silently.
     `spans` is `holds.held` for the order, passed in exactly as `read_session` takes it
     and for the same reason: the holds live in the OS's own database, which never expires,
     so they are re-attached live rather than frozen.
@@ -454,7 +456,8 @@ def _upgrade_seal(project: str, path: Path, order: dict[str, Any],
     if (sealed.get("payload_v") or 1) >= PAYLOAD_VERSION:
         return None
     try:
-        fresh = to_seal(from_seal(sealed), level=level_of(sealed))
+        # Spec §3: the upgrade re-derives the payload only, so it attaches no live holds.
+        fresh = to_seal(from_seal(sealed, spans=[]), level=level_of(sealed))
         # The folds are numbers no rehydration can recover, so they come across verbatim.
         for old, new in zip(sealed.get("turns") or [], fresh["turns"]):
             for key in _FOLD_KEYS:
