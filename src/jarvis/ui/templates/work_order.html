@@ -267,6 +267,47 @@
   </form>
 </div>
 
+{# The one command that moves a dead order, and it is ABOVE THE TABS: an ask hidden
+   behind a tab is an ask that does not happen (§6 of the work-order-record spec).
+   Nothing here decides anything — `ops.retry_state` says whether the control exists at
+   all, `ops.retry_refusal` says why it is disabled in the words the CLI refuses with.
+   See docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b. #}
+{% if retry %}
+<h2 id="retry">Retry this work order</h2>
+<div class="panel">
+  {% if retried_line %}
+  <div class="row tone-ok">
+    <div class="grow">✓ {{ retried_line }}</div>
+  </div>
+  {% endif %}
+  <div class="row">
+    <div class="grow">
+      <form method="post" action="/wo/{{ project }}/{{ wo.id }}/retry">
+        <p class="sub">A retry relaunches the worker in this same session, from where it
+          died — nothing about the work was judged wrong. It writes no status and decides
+          nothing: the order stays failed, and flagged, until the turn goes out. The OS
+          never does this by itself — a turn that ended with no result is never replayed.</p>
+        {# Directly above the box it disables: a rule explained three paragraphs from
+           the control it governs is a rule the reader joins up for themselves. #}
+        {% if retry.refusal %}
+          <p class="sub">◌ This order cannot be retried: {{ retry.refusal }}</p>
+        {% endif %}
+        <textarea name="message" rows="2"
+                  placeholder="optional — what to tell the worker; empty sends the OS's own relaunch note"
+                  {{ 'disabled' if not retry.can_retry }}></textarea>
+        <button {{ 'disabled' if not retry.can_retry }}
+                title="Relaunch this work order's worker in its own session">
+          Retry this order</button>
+      </form>
+      {% if retry.assumptions %}
+      <p class="sub">{{ retry.assumptions }} assumption(s) here still await you, and a
+        retry buries none of them — <a href="#pending">review them</a>.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {# EVERY assumption, not just those still owed a decision: the timeline names them by
    number and says nothing else, so the number has to stay resolvable — §4 of
    docs/superpowers/specs/2026-08-23-the-work-order-record.md. #}
