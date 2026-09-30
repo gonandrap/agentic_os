@@ -1133,6 +1133,21 @@ def test_the_secret_net_reads_the_trimmed_text_and_not_the_collection(
     assert held_codes(store_b, wo_b["id"]) == [autoreview.HELD_EVIDENCE_SECRET]
 
 
+def test_a_failed_collection_still_asks_with_an_empty_evidence_block(started, monkeypatch):
+    """`Daemon._confirmation_evidence` returning `None` — collection failed — must still
+    ask, with no diff fabricated and no truncation claimed."""
+    store, wo = park(started, auto_review=True)
+    monkeypatch.setattr(Daemon, "_confirmation_evidence", lambda self, project, wo: None)
+    provisional(store, wo)
+
+    ask(started, store)
+
+    (confirmation,) = questions()
+    assert "diff --git" not in confirmation["question"]
+    assert "diff truncated" not in confirmation["question"]
+    assert "pull request: (none)\nhead: (unknown)" in confirmation["question"]
+
+
 def what_changed_section(question: str) -> str:
     """The question's `# What changed` block, heading to the next `# ` heading."""
     head = "# What changed"
