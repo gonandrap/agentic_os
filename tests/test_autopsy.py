@@ -20,6 +20,7 @@ with the answer.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -196,7 +197,6 @@ def test_a_seal_reads_at_the_same_cold_prefix_floor_as_every_other_reader(
     `undecided` where the live reading decided it — the same floor `supervisor` passes."""
     from jarvis import ops
 
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-floor")
     monkeypatch.setattr(ops, "cold_prefix_floor", lambda *a, **k: 4_242)
     seen = {}
@@ -534,12 +534,19 @@ def test_a_sealed_trigger_quote_is_redacted_before_it_is_capped(write_transcript
     assert sealed["turns"][0]["triggers"][0]["quote"].startswith("DB_PASSWORD=<red")
 
 
-# -- the daemon step, and the dark state it ships in -----------------------------------
+# -- the daemon step, and the level that gates it ---------------------------------------
 
 
 @pytest.fixture()
 def spec(registered):
     return catalog.ProjectSpec(name="proj_a", path=registered)
+
+
+def at_level(spec, level: str):
+    """The same project at one observability level — §5's gate is a REAL level, never a
+    patched predicate."""
+    return dataclasses.replace(
+        spec, observability=catalog.ObservabilityConfig(level=level))
 
 
 def settled_with_a_session(store, write_transcript, session: str) -> dict:
@@ -557,9 +564,8 @@ def test_the_daemon_seals_every_settled_order_and_only_once(store, spec,
                                                             write_transcript,
                                                             monkeypatch):
     """One place to get it right, and it catches the orders that settled before this
-    existed while their evidence is still on disk. The predicate is FORCED TRUE here: the
-    shipped one is False until the gate of section 5 lands."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
+    existed while their evidence is still on disk. The project names no level, so §5's
+    fleet default `normal` seals it."""
     wo = settled_with_a_session(store, write_transcript, "sess-tick")
     open_wo = store.create_work_order("still running", "")
     store.set_status(open_wo["id"], "running")
@@ -586,7 +592,6 @@ def test_an_order_whose_autopsy_raises_leaves_the_queue_with_an_error_payload(
         store, spec, write_transcript, monkeypatch):
     """Sealed EMPTY rather than left pending: one order that cannot be read must not park
     itself at the head of the queue and block every order behind it for ever."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     monkeypatch.setattr(autopsy, "seal", lambda *a, **k: 1 / 0)
     wo = settled_with_a_session(store, write_transcript, "sess-broken")
 
@@ -597,24 +602,67 @@ def test_an_order_whose_autopsy_raises_leaves_the_queue_with_an_error_payload(
     assert store.unsealed_autopsy_orders() == []
 
 
-def test_the_shipped_predicate_seals_nothing_for_anybody(store, spec, write_transcript):
-    """§3's ruling, and a test so the dark state cannot be undone by accident: no autopsy
-    is sealed fleet-wide ahead of the gate that governs it."""
-    wo = settled_with_a_session(store, write_transcript, "sess-dark")
+def test_a_project_at_level_off_has_no_autopsy_sealed_at_all(store, spec,
+                                                             write_transcript):
+    """§5: the gate is `level_for(...) != OFF`, so `off` is how a project declines and
+    nothing is frozen onto its orders."""
+    off = at_level(spec, "off")
+    wo = settled_with_a_session(store, write_transcript, "sess-off")
 
-    assert autopsy.records_autopsy(wo, spec.observability) is False
+    assert autopsy.records_autopsy(wo, off.observability) is False
 
-    Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), off, store)
 
     assert store.get_work_order(wo["id"])["autopsy_json"] is None
+    assert [o["id"] for o in store.unsealed_autopsy_orders()] == [wo["id"]]
+
+
+def test_a_project_at_level_normal_seals_and_the_payload_says_normal(store, spec,
+                                                                    write_transcript):
+    """§5: `normal` covers the autopsy, and the level the gate resolved is recorded as
+    `autopsy_level`."""
+    wo = settled_with_a_session(store, write_transcript, "sess-normal")
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "normal"), store)
+
+    payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
+    assert payload["autopsy_level"] == "normal"
+
+
+def test_a_project_at_level_full_seals_with_full_through_the_daemon(store, spec,
+                                                                   write_transcript):
+    """§5's pass-through, end to end: the resolved level is used TWICE, as the gate and as
+    `seal(level=...)`. Without the second use `full` ships dark while every test passes."""
+    wo = settled_with_a_session(store, write_transcript, "sess-full")
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "full"), store)
+
+    payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
+    assert payload["autopsy_level"] == "full"
+    assert autopsy.level_of(payload) == "full"
+
+
+def test_a_project_with_no_observability_block_is_still_sealed(store, spec,
+                                                               write_transcript):
+    """§5: where "opt in per project" and "the default is `normal`" collide, the DEFAULT
+    wins — a project never has to name a level before its orders are sealed."""
+    parsed = catalog.parse_catalog({"projects": [{"name": "proj_a", "path": "/tmp/a"}]})
+    silent = dataclasses.replace(spec, observability=parsed.projects[0].observability)
+    wo = settled_with_a_session(store, write_transcript, "sess-no-block")
+
+    assert silent.observability.level == "normal"
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), silent, store)
+
+    payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
+    assert payload["autopsy_level"] == "normal"
 
 
 def test_an_autopsy_still_answers_once_the_transcript_is_gone(store, spec,
                                                              write_transcript,
-                                                             monkeypatch, tmp_path):
+                                                             tmp_path):
     """The whole reason to seal: Claude Code prunes transcripts on its own schedule, and
     an order read afterwards must not report a shorter clock than it ran."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-pruned")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = autopsy.unseal(store.get_work_order(wo["id"]))
@@ -639,7 +687,6 @@ def test_an_old_payload_is_upgraded_from_itself_and_never_from_the_transcript(
     would overwrite good data with nothing, so an upgrade reads the stored payload ONLY.
     `autopsy_sealed_at` is preserved — when the order settled is not changed by
     re-deriving its payload — and `resealed_at` says the re-derivation happened."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-old")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     row = store.get_work_order(wo["id"])
@@ -658,9 +705,7 @@ def test_an_old_payload_is_upgraded_from_itself_and_never_from_the_transcript(
     assert json.loads(again["autopsy_json"])["payload_v"] == autopsy.PAYLOAD_VERSION
 
 
-def test_nothing_to_upgrade_leaves_the_seal_alone(store, spec, write_transcript,
-                                                  monkeypatch):
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
+def test_nothing_to_upgrade_leaves_the_seal_alone(store, spec, write_transcript):
     wo = settled_with_a_session(store, write_transcript, "sess-current")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     row = store.get_work_order(wo["id"])
@@ -701,7 +746,6 @@ def test_a_tick_re_seals_a_settled_order_whose_payload_predates_the_current_vers
     """The WRITER owns the re-seal end to end, on a second bounded queue in the same tick
     step, so a stale seal repairs itself instead of waiting for a reader. The transcript
     is DELETED before the tick: the upgrade reads the stored payload only."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-stale-tick")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     was = store.get_work_order(wo["id"])["autopsy_sealed_at"]
@@ -727,7 +771,6 @@ def test_a_tick_re_seals_a_payload_written_before_the_version_field_existed(
     """The reason the query COALESCEs: a payload frozen before `payload_v` was sealed has
     no such key, `json_extract` gives NULL, and NULL compares to nothing — so without it
     the oldest seals in the fleet are the ones that never repair."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-no-version")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
@@ -745,11 +788,9 @@ def test_a_tick_re_seals_a_payload_written_before_the_version_field_existed(
 
 
 def test_a_tick_writes_nothing_over_a_seal_that_is_already_current(store, spec,
-                                                                  write_transcript,
-                                                                  monkeypatch):
+                                                                  write_transcript):
     """An upgrade that returns None leaves the seal alone — not retried into a loop and
     not logged as a failure."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     wo = settled_with_a_session(store, write_transcript, "sess-current-tick")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = store.get_work_order(wo["id"])
@@ -761,19 +802,16 @@ def test_a_tick_writes_nothing_over_a_seal_that_is_already_current(store, spec,
     assert after["autopsy_sealed_at"] == before["autopsy_sealed_at"]
 
 
-def test_the_shipped_predicate_leaves_a_stale_seal_alone_too(store, spec,
-                                                             write_transcript,
-                                                             monkeypatch):
-    """The dark state covers BOTH queues: with the shipped predicate returning False no
-    stale seal is upgraded either."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
-    wo = settled_with_a_session(store, write_transcript, "sess-dark-stale")
+def test_a_project_at_level_off_leaves_a_stale_seal_unupgraded_too(store, spec,
+                                                                   write_transcript,
+                                                                   monkeypatch):
+    """§5's gate covers BOTH queues: at `off` a stale seal is not upgraded either."""
+    wo = settled_with_a_session(store, write_transcript, "sess-off-stale")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
     before = store.get_work_order(wo["id"])["autopsy_json"]
 
     monkeypatch.setattr(autopsy, "PAYLOAD_VERSION", autopsy.PAYLOAD_VERSION + 1)
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: False)
-    Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "off"), store)
 
     assert store.get_work_order(wo["id"])["autopsy_json"] == before
 
@@ -783,7 +821,6 @@ def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue
     """`json_extract` RAISES on malformed JSON, so one unparseable payload made the query
     throw and stalled the whole project's autopsy tick. It is simply not on the queue: the
     other stale order still comes back and the tick still upgrades it."""
-    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
     bad = settled_with_a_session(store, write_transcript, "sess-bad-json")
     good = settled_with_a_session(store, write_transcript, "sess-good-json")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
