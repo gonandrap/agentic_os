@@ -218,6 +218,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         return STATUS_LABEL.get(status, status or "Status changed"), ""
     if kind == "dispatched":
         return "Worker dispatched", p.get("worktree") or ""
+    if kind == "dispatch_deferred_for_compaction":
+        # The prompt is QUEUED, not sent: the audit trail is this, then `compacted`,
+        # then `message_delivered` (spec 2026-09-29 §3.6).
+        return ("Dispatch held behind a compaction",
+                "the prompt goes out once the conversation is summarised")
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
@@ -865,7 +870,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
 #: The third is `background.SOURCE`: the note a resume carries when the last turn ended
 #: on a background job the OS caught dying with it (§4 of
 #: docs/superpowers/specs/2026-09-22-a-dead-background-job-is-not-a-live-one.md).
-UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan"})
+#: The fourth is `worker_session.RESUME_SOURCE`: the relaunch queued behind a compaction
+#: (§3.5 of
+#: docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+UNAUTHORED_SOURCES = frozenset({"pr-conflict", "pr-checks", "background-orphan",
+                                "relaunch"})
 
 #: `remedies.MESSAGE_SOURCE`, spelled out here for the reason `ALARM_KINDS` is: this
 #: module is a leaf and opens nothing. A test pins the two equal. Deliberately NOT a

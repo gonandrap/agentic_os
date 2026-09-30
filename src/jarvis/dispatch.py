@@ -1308,7 +1308,19 @@ def dispatch_work_order(
     wo = store.get_work_order(wo["id"])
 
     try:
-        turn, briefing = worker_session.start(store, project, wo, prompt)
+        # COMPACT FIRST IF THIS IS A SECOND DISPATCH INTO A COLD CONVERSATION. A work
+        # order can reach here with its session intact (`ops.defer_red_release` re-parks
+        # a running release order to `pending`), and `worker_session.start` would then
+        # resume it and re-write the whole transcript. No "is this a re-dispatch" guard:
+        # `compaction_due` returns None with no turn on record, so an opening dispatch is
+        # byte-identical to before (spec §3.6 of
+        # docs/superpowers/specs/2026-09-29-one-compaction-decision-on-every-relaunch.md).
+        queued: dict[str, Any] = {}
+        compacted = worker_session.compact_before_relaunch(
+            store, project, wo, cfg.compact_min_context, queue=prompt,
+            queued_out=queued)
+        if compacted is None:
+            turn, briefing = worker_session.start(store, project, wo, prompt)
     except budget.BudgetExhausted as e:
         # Spent before it ever ran a turn — its feature had nothing left to lend it, or
         # the panel and Neo spent the order's own budget on an earlier round. Not a
@@ -1340,6 +1352,19 @@ def dispatch_work_order(
                 source="jarvisd",
             )
         raise
+
+    if compacted is not None:
+        # NO WORKER PROMPT HAS BEEN SENT: it is the queued message, and delivery puts it
+        # into the summarised conversation on the tick after the compaction settles. So
+        # no `dispatched` event and no seq-1 context ledger — there is no dispatch turn,
+        # and `_launch` recorded the compaction's own row. The claimed-but-no-turn state
+        # `settle_work_order` fails on is not reachable: the compaction IS a live turn.
+        store.clear_dispatch_attempts(wo["id"])
+        store.set_status(wo["id"], "running")
+        store.add_event(wo["id"], "dispatch_deferred_for_compaction", {
+            "turn": compacted["seq"], "msg_id": queued.get("msg_id"), **resolved})
+        central.touch_project(project.name)
+        return store.get_work_order(wo["id"])
 
     # THE CONTEXT LEDGER for the seq-1 dispatch turn, and only that one: Neo's ruling on
     # question 681 partitions the writers so no row is written twice, and this is the only

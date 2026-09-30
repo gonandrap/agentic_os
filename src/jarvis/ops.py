@@ -12795,7 +12795,8 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
         store.clear_attention(wo["id"])
         return True, "back on the dispatch queue"
     try:
-        spec = project_spec(resolve_catalog(), project_name)
+        catalog = resolve_catalog()
+        spec = project_spec(catalog, project_name)
     except OpsError as e:
         store.set_status(wo["id"], "pending")
         store.clear_attention(wo["id"])
@@ -12810,8 +12811,17 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
     )
     store.set_status(wo["id"], "running")
     store.clear_attention(wo["id"])
+    # A RELAUNCH THIS ORDER IS ALREADY HOLDING IS THE RESUME. It got here once before,
+    # compacted, and the queued relaunch is what `Daemon.deliver_messages` sends on the
+    # next tick — retrying now would put the same lost turn in front of the worker twice
+    # (spec 2026-09-29-one-compaction-decision-on-every-relaunch.md §3.5).
+    if any(m["source"] == worker_session.RESUME_SOURCE
+           for m in store.queued_messages(wo["id"])):
+        return True, "its queued relaunch goes out on the next tick"
     try:
-        fresh = worker_session.retry(store, spec, wo, pause)
+        turn_row = worker_session.compact_before_relaunch(
+            store, spec, wo, catalog.os.compact_min_context, pause=pause)
+        fresh = turn_row or worker_session.retry(store, spec, wo, pause)
     except budget.BudgetExhausted as e:
         budget.escalate(store, store.get_work_order(wo["id"]), e.exhausted)
         return False, "still has no headroom — it stopped again immediately"
@@ -12819,7 +12829,10 @@ def _resume_after_budget(store: ProjectStore, project_name: str,
         store.set_status(wo["id"], "pending")
         return False, f"budget raised, but the relaunch failed ({e})"
     store.add_event(wo["id"], "budget_resumed",
-                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"]})
+                    # The seq is the COMPACTION's when one won; without this the
+                    # timeline reads as if the worker resumed directly.
+                    {"budget_usd": wo.get("budget_usd"), "turn": fresh["seq"],
+                     "compacted": turn_row is not None})
     return True, f"resumed at turn {fresh['seq']}"
 
 
