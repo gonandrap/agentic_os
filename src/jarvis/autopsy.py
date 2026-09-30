@@ -37,11 +37,10 @@ a context peak, a TTL split and a cache-write total — the four figures `Turn.u
 misreport. `from_seal` never invents a synthetic call to stand in for a folded one: a
 fabricated row would read as an API call that happened.
 
-## It ships dark
+## What turns it on
 
-`records_autopsy` returns False for everybody. §5 of the spec above replaces its body with
-the real level check; until it lands this writer seals nothing fleet-wide, and that is the
-user's ruling rather than a trade-off.
+`records_autopsy` is the observability level: every order is sealed unless its project (or
+the order itself) is at `off`, which is §5 of the spec above and the user's ruling.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import db, inspection
+from . import db, inspection, observability
 from . import usage as usage_mod
 from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal keeps"
 
@@ -89,8 +88,8 @@ _FOLD_KEYS = ("spans_folded", "calls_folded", "subagents_folded")
 
 
 def records_autopsy(wo: dict[str, Any], cfg: Any) -> bool:
-    """Whether this order's autopsy is sealed at all — §3: it ships CLOSED, §5 opens it."""
-    return False
+    """Whether this order's autopsy is sealed at all — §5: every level but `off` seals."""
+    return observability.level_for(wo, cfg) != observability.OFF
 
 
 def level_of(payload: dict[str, Any]) -> str:

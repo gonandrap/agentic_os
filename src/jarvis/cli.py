@@ -645,7 +645,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
 
     c.add_argument("--observability", choices=["off", "normal", "full"],
-                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). The three levels: "
+                        "`off` — no per-turn context ledger and no sealed autopsy. It does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page: those read files that already exist, so the autopsy READING — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level. What `off` stops is the autopsy being SEALED, so that reading survives only as long as Claude Code keeps the transcript. "
+                        "`normal` — the default: the per-turn context ledger, and the autopsy sealed onto the order when it settles. "
+                        "`full` — that, plus the detail a `full` seal retains: verbatim tool parameters and nested subagent anatomies")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")

@@ -1029,18 +1029,23 @@ class Daemon:
         `autopsy.PAYLOAD_VERSION`. The WRITER owns re-sealing end to end, so a stale seal
         repairs itself on a tick rather than waiting for a reader to happen by.
 
-        Every order in BOTH queues is gated on `autopsy.records_autopsy`, which ships
-        False — so until the level gate of §5 lands this step seals nothing for anybody.
+        Every order in BOTH queues is gated on its observability level (§5): every level
+        but `off` seals. The level is resolved ONCE per order and used TWICE — as that gate
+        and as the level `seal` records — because without the second use `full` would seal
+        as `normal` and the level the user chose would never reach a payload. The stale
+        queue needs the gate only: an upgrade takes its level from the stored payload.
         """
-        from . import autopsy as autopsy_mod, db, usage
+        from . import autopsy as autopsy_mod, db, observability, usage
 
-        pending = [order for order in store.unsealed_autopsy_orders()
-                   if autopsy_mod.records_autopsy(order, project.observability)]
+        resolved = [(order, observability.level_for(order, project.observability))
+                    for order in store.unsealed_autopsy_orders()]
+        pending = [pair for pair in resolved if pair[1] != observability.OFF]
         if pending:
             index = usage.index_sessions()
-            for order in pending:
+            for order, level in pending:
                 try:
-                    autopsy_mod.seal(project.name, project.path, order, index=index)
+                    autopsy_mod.seal(project.name, project.path, order, index=index,
+                                     level=level)
                 except Exception:  # noqa: BLE001 — an autopsy must never stall the tick
                     log.exception("sealing the autopsy for %s failed", order["id"])
                     store.seal_autopsy(order["id"], db.to_json(
