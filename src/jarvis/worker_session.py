@@ -396,14 +396,18 @@ class Compaction:
     #: what lets this be decided without reading the transcript — the error is always in
     #: the direction of compacting LESS often than the bill would justify.
     age: float
-    #: The conversation's size, from the last turn's own usage envelope.
-    context: int
+    #: The conversation's size as measured, or None when it could not be read at all
+    #: (`measured_context`, issue #885). None is UNKNOWN and never 0: nothing may
+    #: record a size the OS did not measure.
+    context: int | None
 
     @property
     def why(self) -> str:
-        return (f"the prompt cache expired {int(self.age // 60)}m ago and the "
-                f"conversation is {self.context:,} tokens — re-sending it would cost "
-                f"more than summarising it")
+        size = (f"the conversation is {self.context:,} tokens"
+                if self.context is not None
+                else "the conversation's size could not be read")
+        return (f"the prompt cache expired {int(self.age // 60)}m ago and {size} — "
+                f"re-sending it would cost more than summarising it")
 
 
 def turn_context(turn: dict[str, Any] | None) -> int:
@@ -419,19 +423,53 @@ def turn_context(turn: dict[str, Any] | None) -> int:
     return int(envelope.get("context_peak") or 0) if isinstance(envelope, dict) else 0
 
 
-def measured_context(store: ProjectStore, wo_id: str) -> int:
-    """The conversation's size as last MEASURED: the newest turn that recorded one.
+def measured_context(store: ProjectStore, wo_id: str) -> int | None:
+    """The conversation's size as last MEASURED, or None when it is UNKNOWN.
 
     Not the latest turn's own figure. A turn that ended without a result — killed, reaped
     as dead, refused before it reached the model — records none, and reading its 0 as
     "small" re-sent a 126k conversation cold (issue #856, a turn killed in a fleet stop).
     A turn records only its own peak, so the newest measured one is the best lower bound
     on what the next prompt will carry.
+
+    WHEN NO TURN RECORDED ONE AT ALL the transcript still knows, and issue #885 is what
+    happens without that fallback: wo-d5626c53's only turn died on the usage limit, so
+    every turn on record read 0, and the relaunch re-wrote 181,342 tokens cold while
+    three other orders the same minute compacted correctly.
+
+    0 AND None ARE DIFFERENT ANSWERS, and the split is Neo's ruling on question 1097: a
+    readable transcript with nothing billed, and a work order with no session at all,
+    are both genuinely EMPTY and must not compact. Only a transcript that could not be
+    read is unknown.
     """
     for turn in store.recent_turns(wo_id, limit=MAX_RATE_LIMIT_RETRIES + 4):
         context = turn_context(turn)
         if context:
             return context
+    return _transcript_context(store, wo_id)
+
+
+def _transcript_context(store: ProjectStore, wo_id: str) -> int | None:
+    """The size of the last BILLED call in the session transcript (issue #885).
+
+    `usage.session_calls` is already the lead agent's calls in timestamp order with the
+    synthetic and unbilled rows dropped, so the error row that ended the turn is not in
+    this — but a trailing call can still carry no context (output only), and that is not
+    a size either.
+    """
+    session_id = store.get_work_order(wo_id).get("session_id")
+    if not session_id:
+        return 0
+    try:
+        index = usage.index_sessions()
+        if session_id not in index:
+            return None
+        calls = usage.session_calls(session_id, index=index)
+    except OSError:
+        return None
+    for call in reversed(calls):
+        if call.context:
+            return call.context
     return 0
 
 
@@ -463,9 +501,10 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
       it first — but the decision must not depend on the caller having checked.)
     * The gap is inside the write TTL. The entry is alive and the next prompt will READ
       it at a tenth of what compacting would cost.
-    * The conversation is under the floor. Below it the summary's own output tokens
-      cost more than the re-write they replace — measured, see
-      `catalog.DEFAULT_COMPACT_MIN_CONTEXT`.
+    * The conversation is under the floor, AND its size was measured. Below the floor
+      the summary's own output tokens cost more than the re-write they replace —
+      measured, see `catalog.DEFAULT_COMPACT_MIN_CONTEXT`. A size that could not be
+      read at all is not under it (issue #885).
     * The last turn is paused AND RESUMABLE. That pause is `Daemon.retry_paused_turns`'
       business and `compaction_due(..., pause=…)` is how it asks — compacting here
       would make `_nudge`'s "the conversation above is intact" false, and a compact turn
@@ -492,7 +531,10 @@ def compaction_due(store: ProjectStore, wo: dict[str, Any],
     if age < usage.WRITE_TTL_SECONDS:
         return None
     context = measured_context(store, wo["id"])
-    if context < min_context:
+    # An UNKNOWN size skips the floor rather than failing it: the floor exists to stop
+    # a small conversation paying for a summary, and there is no evidence of one here
+    # (issue #885). Every other exclusion above still applies.
+    if context is not None and context < min_context:
         return None
     # Last, because it is the only one that costs a second query — and `turn_pause`
     # answers None for every turn that did not fail, so the streak count behind it is
