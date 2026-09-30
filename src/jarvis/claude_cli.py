@@ -1583,6 +1583,10 @@ class HeadlessResult:
     #: the caller's `--model` may be an alias, and an OS call priced against the wrong
     #: family is a wrong number in the only report that says what Jarvis costs.
     model: str = ""
+    #: How big this call's own input was, in characters. Measurement only, no cap —
+    #: spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    prompt_chars: int = 0
+    system_prompt_chars: int = 0
 
 
 def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
@@ -1772,6 +1776,11 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     `evals/llm/test_navigation_judgment.py`, which measures whether a worker reaches for
     Serena); `settings` passes `--settings` for the same one. Spec:
     docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
+
+    THE INPUT IS MEASURED AND NOTHING IS CAPPED (spec §3,
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). A call that raises
+    `ClaudeCliError` produces no `HeadlessResult`, so its size is recorded NOWHERE —
+    a deliberate gap: there is no row for a call that never came back.
     """
     # FIRST, before any argument is built or any subprocess runs: a refused call spends
     # nothing (spec §2).
@@ -1783,6 +1792,10 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         _check_records_itself(records_itself)
     # THE PROMPT'S SECOND DOOR, spec §2:
     # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
+    # How big our own input was, kept whether or not the reply parses. Measurement only,
+    # no cap (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    prompt_chars = len(prompt)
+    system_prompt_chars = len(system_prompt or "")
     over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
     args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
                        "--no-session-persistence"]
@@ -1815,17 +1828,29 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     if not isinstance(data, dict):
         # Not JSON at all, or not an object: the text is still the answer (that is what
         # `run_headless` has always returned here), and there is nothing to account.
-        result = HeadlessResult(text=out, model=model or "")
+        result = HeadlessResult(text=out, model=model or "",
+                                prompt_chars=prompt_chars,
+                                system_prompt_chars=system_prompt_chars)
     else:
         served = [name for name in (data.get("modelUsage") or {})]
         result = HeadlessResult(
             text=data.get("result", ""),
             usage=derive_turn_usage(data),
+            prompt_chars=prompt_chars,
+            system_prompt_chars=system_prompt_chars,
             session_id=data.get("session_id") or "",
             # One key is the ordinary case; more than one means the call was served by
             # several models and no single name is honest, so the requested one stands.
             model=(served[0] if len(served) == 1 else "") or model or "",
         )
+    if result.usage is not None:
+        # Injected HERE rather than inside `derive_turn_usage`: a worker turn's envelope
+        # comes off a result JSON that cannot say how big the prompt was, and must not
+        # grow keys it cannot honestly fill. The seats, the panel and `worker_session`
+        # pass `usage=result.usage` to `agent_usage.record`, so without this the OS-side
+        # sizes would record as zero (spec §3).
+        result.usage["prompt_chars"] = prompt_chars
+        result.usage["system_prompt_chars"] = system_prompt_chars
     if not records_itself:
         _attribute_subprocess(result, record)
     return result

@@ -445,6 +445,29 @@ def test_only_db_write_transaction_opens_a_transaction():
         "docstring says what a deferred one costs")
 
 
+def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project):
+    """`list_approvals` answers the 200 NEWEST rows of every kind, so one kind's row can
+    fall out of the window behind ordinary gate traffic. This query is per kind and per
+    status, so it cannot."""
+    # Fixture commands stay non-commands: a real `gh pr merge …` literal here trips the
+    # privileged-action recogniser on every write of this file and gates the session.
+    store = ProjectStore(project)
+    wo = store.create_work_order("x")
+    wanted = store.add_approval(wo["id"], "self_heal", "fix wo-1", status="pending")
+    store.decide_approval(wanted["id"], "approved", "go on", "test")
+    for i in range(250):
+        other = store.add_approval(wo["id"], "other_kind", f"some command {i}",
+                                   status="pending")
+        store.decide_approval(other["id"], "approved", "go on", "test")
+
+    assert wanted["id"] not in [a["id"] for a in
+                               store.list_approvals(statuses=("approved",))]
+    found = store.approvals_of_kind("self_heal", "approved")
+    assert [a["id"] for a in found] == [wanted["id"]]
+    # One status only: the approved list never carries a pending row.
+    assert store.approvals_of_kind("self_heal", "pending") == []
+
+
 # -- the per-order observability override ----------------------------------------------
 #
 # §10 of docs/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:

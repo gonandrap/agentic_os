@@ -178,6 +178,48 @@ def test_the_central_database_from_the_live_release_upgrades_in_full(
     }
 
 
+def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path):
+    """`agent_calls` predates them, so `CREATE TABLE IF NOT EXISTS` is a no-op on a live
+    `os.db` and only `ADDED_COLUMNS` reaches one. Spec §3,
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+
+    0 on a pre-existing row means NOT MEASURED, never "an empty prompt".
+    """
+    path = tmp_path / "legacy-os.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
+    old.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts REAL NOT NULL, project TEXT NOT NULL DEFAULT '',
+                       wo_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                       label TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                       question_id INTEGER, ok INTEGER NOT NULL DEFAULT 1,
+                       cost_usd REAL, input INTEGER NOT NULL DEFAULT 0,
+                       cache_write INTEGER NOT NULL DEFAULT 0,
+                       cache_read INTEGER NOT NULL DEFAULT 0,
+                       output INTEGER NOT NULL DEFAULT 0, usage_json TEXT)""")
+    old.execute("INSERT INTO agent_calls (ts, kind, wo_id) VALUES (1.0, 'neo_answer',"
+                " 'wo-old')")
+    old.commit()
+    before = schema_of(old)
+    old.close()
+    assert "prompt_chars" not in before["agent_calls"]
+
+    store = CentralStore(path)         # the upgrade
+    try:
+        assert {"prompt_chars", "system_prompt_chars"} <= schema_of(
+            store.conn)["agent_calls"]
+        (legacy,) = store.agent_calls(wo_id="wo-old")
+        assert (legacy["prompt_chars"], legacy["system_prompt_chars"]) == (0, 0)
+        # and the upgraded table takes a measured write
+        store.add_agent_call("neo_answer", wo_id="wo-new", prompt_chars=12_000,
+                             system_prompt_chars=800)
+        (fresh,) = store.agent_calls(wo_id="wo-new")
+        assert (fresh["prompt_chars"], fresh["system_prompt_chars"]) == (12_000, 800)
+    finally:
+        store.close()
+
+
 def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp_path):
     """`schema_of` returns `{table: {columns}}`, so an index is invisible to every
     column comparison in this file — including the one directly above, which would pass

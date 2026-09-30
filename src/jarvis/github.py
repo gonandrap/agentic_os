@@ -63,7 +63,8 @@ GH_TIMEOUT = 30
 #: protection or merges a pull request, on a flag. The method is pinned as the second
 #: argument, so the allowlist entry itself says the call is a GET and the AST test can
 #: assert it (Neo question 601, condition 1).
-READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"), ("api", "--method"))
+READ_ONLY_VERBS = (("pr", "view"), ("pr", "diff"), ("pr", "list"),
+                   ("api", "--method"))
 
 #: The LOCAL git subcommands this module runs, held to the same standard by the same
 #: test. `origin_repo` shells out to git to learn which repository this checkout belongs
@@ -467,6 +468,42 @@ def pr_view(url: str, cwd: Path | None = None) -> PullRequest:
         # A nested object, so one `or {}` guard — spec §2.
         merge_commit_oid=str((payload.get("mergeCommit") or {}).get("oid") or ""),
     )
+
+
+def open_pull_request_for_branch(branch: str, cwd: Path | None = None) -> str:
+    """The OPEN pull request on `branch`, or "" when there is none. Raises `GitHubError`.
+
+    §1 of
+    docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md.
+    `ops.submit_plan`'s read, and the distinction it rests on is the one `GhUnavailable`
+    exists for: "" is a fact about the branch, while a raise says the OS could not ask.
+    A planner told "no pull request" when `gh` was simply missing would push a second one.
+
+    `--state open` only: a closed or merged pull request lands nothing, and the URL is
+    passed through `checked_pr_url` before any caller may hold it.
+    """
+    if not BRANCH_RE.match(branch or ""):
+        raise GitHubError(f"{branch!r} is not a branch this may ask about",
+                          GitHubError.URL_REFUSED)
+    stdout = _run(["pr", "list", "--head", branch, "--state", "open", "--json", "url"],
+                  url=branch, cwd=cwd,
+                  missing_hint="so Jarvis cannot confirm a planner's pull request")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        raise GitHubError(f"`gh pr list {branch}` returned no JSON ({stdout[:200]!r})",
+                          GitHubError.UNREADABLE) from e
+    if not isinstance(payload, list):
+        raise GitHubError(f"`gh pr list {branch}` returned no array ({payload!r})",
+                          GitHubError.UNREADABLE)
+    if not payload:
+        return ""
+    first = payload[0] if isinstance(payload[0], dict) else {}
+    url = str(first.get("url") or "")
+    if not url:
+        raise GitHubError(f"`gh pr list {branch}` reported no url ({payload!r})",
+                          GitHubError.UNREADABLE)
+    return checked_pr_url(url, cwd)
 
 
 #: A branch ref that may become a path segment. Anchored, and the first character is
