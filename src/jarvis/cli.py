@@ -1738,8 +1738,13 @@ def _print_os_calls(res: dict) -> None:
               f"{_tok(r['billed_input']):>8} {_tok(r['output']):>7}  {r['model'][:28]}"
               f"{'' if r['ok'] else '  (failed)'}")
     for kind in unit.get("os_by_kind") or []:
+        # The largest input only where one was measured (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md): 0 means the rows
+        # predate the columns, and printing it would read as an empty prompt.
+        biggest = kind.get("max_input_chars") or 0
+        size = f", largest input {biggest:,} characters" if biggest else ""
         print(f"  {kind['label']}: {kind['calls']} call"
-              f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}")
+              f"{'s' if kind['calls'] != 1 else ''}, ~${kind['cost_usd']:.2f}{size}")
 
 
 def _print_subprocess_calls(res: dict) -> None:
@@ -2123,6 +2128,16 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
 
     head = f"{unit['wo_id']} — {unit['title']}"
     print(f"{head}\n{'-' * min(len(head), RULE_WIDTH)}")
+    # Before the transcript check: an OS-side input was measured when the call was made
+    # and does not depend on a transcript surviving. Omitted, never zeroed, when nothing
+    # measured one (spec §3,
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    biggest = unit.get("largest_os_input")
+    if biggest:
+        print(f"  biggest input jarvis sent — {biggest['kind']} "
+              f"{biggest['label']}: {biggest['prompt_chars']:,} characters of prompt, "
+              f"{biggest['system_prompt_chars']:,} of system prompt "
+              f"({biggest['model'] or 'model not recorded'})")
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -2655,6 +2670,14 @@ def cmd_cost(args: argparse.Namespace) -> int:
               f"{totals['os_calls']} call{'s' if totals['os_calls'] != 1 else ''} "
               f"(Neo answering, panel seats, digests), "
               f"{_tok(totals['os_billed_input'])} in, {_tok(totals['os_output'])} out")
+        # In full, never abbreviated: this is the number a reader quotes when asking why
+        # a call was that big (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Absent rather
+        # than a zero when nothing recorded a size.
+        if totals.get("os_max_input_chars"):
+            print(f"                largest input "
+                  f"{totals['os_max_input_chars']:,} characters "
+                  f"(prompt + system prompt, of one call)")
     if totals.get("subproc_calls"):
         print(f"  subprocesses  ~${totals['subproc_cost_usd']:.2f} — "
               f"{totals['subproc_calls']} claude "
