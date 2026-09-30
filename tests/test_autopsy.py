@@ -135,7 +135,7 @@ def test_a_normal_seal_carries_no_parameter_key_at_all(real_session):
 
 def test_sealing_the_committed_session_at_full_changes_none_of_its_pinned_numbers(
         real_session):
-    """§6: `full` adds retained content and moves no measurement. The eleven numbers are
+    """§6: `full` adds retained content and moves no measurement. The ten numbers are
     the committed session's, asserted against the REHYDRATED anatomy."""
     back = autopsy.from_seal(autopsy.to_seal(real_session, level="full"), spans=[])
     part = back.partition()
@@ -757,23 +757,46 @@ def test_a_backgrounded_delegation_span_is_still_backgrounded_after_the_seal(
     assert back.blocked == live.blocked
 
 
-def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_transcript,
-                                                                     monkeypatch):
-    """§6 activates rungs 1 and 2 of section 3's ceiling: at `full` the parameters are the
-    FIRST thing given up, the lead's before the subagents'."""
+def fat_full_session(write_transcript, name: str):
+    """A session with params on the lead's spans AND a nested subagent's, fat enough that
+    the ceiling bites — the two params rungs and the sentence they force share it."""
     rows = [prompt_row(0, "You are the worker agent for wo-1")]
     rows += tool_rows(10, 20, "tool0", "Agent", {"task_id": "sub0"})
     rows += [r for i in range(30)
              for r in tool_rows(30 + i * 5, 32 + i * 5, f"b{i}", "Bash",
                                 {"description": f"reading file number {i}"})]
     rows.append(assistant_row(400, "m-last", write=900))
-    session = write_transcript("fat-full", rows, subagents={
+    session = write_transcript(name, rows, subagents={
         "agent-sub0": [prompt_row(11, "go")]
         + [r for i in range(20)
            for r in tool_rows(12 + i, 12.5 + i, f"s{i}", "Bash",
                               {"description": f"subagent read {i}"})]
         + [assistant_row(40, "s-last", write=300)]})
-    a = inspection.read_session(session)
+    return inspection.read_session(session)
+
+
+def params_dropped_seal(a, monkeypatch, *, rungs: int) -> dict:
+    """The same `full` seal after `rungs` of the ceiling's params rungs have bitten.
+
+    `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes, and the
+    second step measures the payload WITHOUT its own announcement.
+    """
+    whole = len(db.to_json(autopsy.to_seal(a, level="full")))
+    monkeypatch.setattr(autopsy, "PAYLOAD_CEILING", whole - 1)
+    payload = autopsy.to_seal(a, level="full")
+    if rungs > 1:
+        unannounced = {k: v for k, v in payload.items() if k != "dropped_for_size"}
+        monkeypatch.setattr(autopsy, "PAYLOAD_CEILING",
+                            len(db.to_json(unannounced)) - 1)
+        payload = autopsy.to_seal(a, level="full")
+    return payload
+
+
+def test_the_payload_ceiling_drops_the_two_params_rungs_first_at_full(write_transcript,
+                                                                     monkeypatch):
+    """§6 activates rungs 1 and 2 of section 3's ceiling: at `full` the parameters are the
+    FIRST thing given up, the lead's before the subagents'."""
+    a = fat_full_session(write_transcript, "fat-full")
 
     # `_fit` measures with `db.to_json`, so the ceiling is set in THOSE bytes.
     whole = len(db.to_json(autopsy.to_seal(a, level="full")))
@@ -822,6 +845,55 @@ def test_an_empty_params_on_a_seal_predating_the_level_is_a_third_state():
     assert autopsy.params_note(autopsy.FULL, True) == ""
 
 
+def test_a_full_seal_whose_params_the_ceiling_dropped_does_not_claim_it_ran_no_tools(
+        write_transcript, monkeypatch):
+    """The sentence would LIE: both params rungs went to fit the ceiling, so the payload
+    holds no `params` key anywhere about an order that ran tools by the dozen."""
+    a = fat_full_session(write_transcript, "fat-note")
+    twice = params_dropped_seal(a, monkeypatch, rungs=2)
+    assert twice["dropped_for_size"][:2] == ["params", "subagent_params"]
+    assert "params" not in keys_of(twice)
+
+    provenance = autopsy._provenance(autopsy.SEALED, anatomy=a, sealed=twice)
+
+    assert "ran no tools" not in provenance["params_note"]
+    assert "dropped to fit the payload ceiling" in provenance["params_note"]
+    assert "this SEAL" in provenance["params_note"]
+
+
+def test_only_the_lead_s_params_dropped_is_still_explained_though_some_remain(
+        write_transcript, monkeypatch):
+    """Rung 1 alone: the nested subagents keep theirs, so `any_params` is True and the
+    short-circuit would leave the lead's absence unexplained. The dropped case is decided
+    FIRST for exactly this."""
+    a = fat_full_session(write_transcript, "fat-note-one")
+    once = params_dropped_seal(a, monkeypatch, rungs=1)
+    assert once["dropped_for_size"] == ["params"]
+    assert "params" in keys_of(once), "the subagents still carry theirs"
+
+    provenance = autopsy._provenance(autopsy.SEALED, anatomy=a, sealed=once)
+
+    assert provenance["params"] is True
+    assert "dropped to fit the payload ceiling" in provenance["params_note"]
+    assert provenance["params_note"] == autopsy.params_note(autopsy.FULL, True,
+                                                            ["params"])
+
+
+def test_the_renderer_prints_the_dropped_for_size_sentence_too(write_transcript,
+                                                               monkeypatch, capsys):
+    """The case a wrong sentence damages most: the renderer composes none of this one
+    either."""
+    a = fat_full_session(write_transcript, "fat-render")
+    twice = params_dropped_seal(a, monkeypatch, rungs=2)
+    provenance = autopsy._provenance(autopsy.SEALED, anatomy=a, sealed=twice)
+
+    cli._print_autopsy_provenance(provenance)
+
+    out = capsys.readouterr().out
+    assert provenance["params_note"] in out
+    assert "ran no tools" not in out
+
+
 def test_the_provenance_carries_the_sentence_and_the_renderer_prints_it(real_session,
                                                                        capsys):
     """The renderer composes NOTHING: the sentence it prints is the payload's own."""
@@ -844,6 +916,11 @@ def spec(registered):
     return catalog.ProjectSpec(name="proj_a", path=registered)
 
 
+#: The lead's verbatim parameters on the daemon's session — §6's pass-through is only
+#: observable if there IS a parameter to find in `autopsy_json`.
+DAEMON_PARAMS = {"description": "list the tree", "command": "ls -la /tmp/proj"}
+
+
 def at_level(spec, level: str):
     """The same project at one observability level — §5's gate is a REAL level, never a
     patched predicate."""
@@ -851,12 +928,17 @@ def at_level(spec, level: str):
         spec, observability=catalog.ObservabilityConfig(level=level))
 
 
-def settled_with_a_session(store, write_transcript, session: str) -> dict:
+def settled_with_a_session(store, write_transcript, session: str,
+                           tools: bool = False) -> dict:
+    """One settled order with a transcript. `tools=True` adds a span carrying
+    `DAEMON_PARAMS`: the call counts other daemon tests pin stay at one without it."""
     wo = store.create_work_order("an order that finished", "")
     store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
                        (session, wo["id"]))
     store.conn.commit()
     write_transcript(session, [prompt_row(0, "You are the worker agent for wo-1"),
+                               *(tool_rows(2, 4, "t1", "Bash", DAEMON_PARAMS)
+                                 if tools else []),
                                assistant_row(10, "m1", write=30_000)])
     store.set_status(wo["id"], "completed")
     return store.get_work_order(wo["id"])
@@ -942,6 +1024,33 @@ def test_a_project_at_level_full_seals_with_full_through_the_daemon(store, spec,
     payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
     assert payload["autopsy_level"] == "full"
     assert autopsy.level_of(payload) == "full"
+
+
+def test_the_daemon_at_level_full_writes_the_verbatim_params_into_autopsy_json(
+        store, spec, write_transcript):
+    """§6 through §5's pass-through: the STORED payload is what a reader gets, so the
+    parameters have to survive the daemon step and not only `to_seal`."""
+    wo = settled_with_a_session(store, write_transcript, "sess-full-params",
+                                tools=True)
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "full"), store)
+
+    payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
+    assert "params" in keys_of(payload)
+    assert payload["turns"][0]["spans"][0]["params"] == DAEMON_PARAMS
+
+
+def test_the_daemon_at_level_normal_writes_no_params_key_into_autopsy_json_at_all(
+        store, spec, write_transcript):
+    """The other half of the same seam, over the same session with the same tool: at
+    `normal` there is no `params` key ANYWHERE, not an empty one."""
+    wo = settled_with_a_session(store, write_transcript, "sess-normal-params",
+                                tools=True)
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, "normal"), store)
+
+    payload = json.loads(store.get_work_order(wo["id"])["autopsy_json"])
+    assert not (keys_of(payload) & set(PARAM_KEYS))
 
 
 def test_a_project_with_no_observability_block_is_still_sealed(store, spec,

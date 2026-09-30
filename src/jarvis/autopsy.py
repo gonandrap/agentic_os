@@ -571,6 +571,22 @@ _PARAMS_NOTES = {
            "none to record"),
 }
 
+#: The FOURTH claim, and the one that outranks all three above (§6): the params were
+#: recorded at this level and then given up by the ceiling's rungs. Missing from this SEAL,
+#: never from this ORDER — which is the opposite of what `_PARAMS_NOTES[FULL]` would say.
+_PARAMS_DROPPED_NOTE = ("{which} tool parameters were recorded at this level and then "
+                        "dropped to fit the payload ceiling, so they are missing from "
+                        "this SEAL and not from this ORDER")
+
+#: Which rungs went, as the sentence's subject. Rung 1 is the lead's params, rung 2 the
+#: nested subagents' — and only rung 1 going is why the dropped case cannot wait behind
+#: `any_params`.
+_DROPPED_WHICH = {
+    ("params",): "the lead's",
+    ("subagent_params",): "the nested subagents'",
+    ("params", "subagent_params"): "the lead's and the nested subagents'",
+}
+
 #: Rule (b) at the state that is neither a reading nor a seal: no session was ever
 #: recorded, so there is nothing to read and nothing was frozen.
 NOT_RECORDED_NOTE = ("no session id on this order and no sealed autopsy: its clock is "
@@ -604,8 +620,17 @@ def autopsy_level_note(level: str) -> str:
     return _LEVEL_NOTES.get(level, _LEVEL_NOTES[UNKNOWN])
 
 
-def params_note(level: str, any_params: bool) -> str:
-    """What an EMPTY `params` means at this level — §6. Nothing, when there are any."""
+def params_note(level: str, any_params: bool,
+                dropped: Sequence[str] = ()) -> str:
+    """What an EMPTY `params` means at this level — §6. Nothing, when there are any.
+
+    The CEILING is answered first and before `any_params`: with only rung 1 gone the
+    subagents' params are still there, so a short-circuit would leave the lead's missing
+    ones unexplained, and at `full` with both gone the "ran no tools" sentence is false.
+    """
+    went = tuple(rung for rung in ("params", "subagent_params") if rung in dropped)
+    if went:
+        return _PARAMS_DROPPED_NOTE.format(which=_DROPPED_WHICH[went])
     if any_params:
         return ""
     return _PARAMS_NOTES.get(level, _PARAMS_NOTES[UNKNOWN])
@@ -666,7 +691,8 @@ def _provenance(source: str, *, anatomy: inspection.Anatomy,
             # seal only at `full` (§6).
             "params": any_params,
             # §6: what an EMPTY `params` means, which the level alone cannot say.
-            "params_note": params_note(level, any_params),
+            "params_note": params_note(level, any_params,
+                                       (sealed or {}).get("dropped_for_size") or ()),
             "floor_note": floor_note, "note": note}
 
 
