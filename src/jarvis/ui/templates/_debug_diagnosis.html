@@ -63,13 +63,15 @@
   </div>
   {% endfor %}
   {# THE RESIDUAL, labelled as one: idle the record does not account for, not a cause.
-     `seconds: None` is unmeasurable and never zero (issue #227). #}
+     `seconds: None` is unmeasurable and never zero (issue #227), and the provenance below
+     says which reading it came from. #}
   <div class="row">
     <span class="kv" style="width: 120px;">unexplained</span>
     <span class="grow sub">{{ d.holds.unexplained.note }}</span>
     <span class="kv mono">{{ d.holds.unexplained.seconds_human or 'none measurable' }}</span>
   </div>
 </div>
+{{ ui.provenance(d.holds.provenance) }}
 {% endif %}
 
 {% if d.os_calls.calls %}

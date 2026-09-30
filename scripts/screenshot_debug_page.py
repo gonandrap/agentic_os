@@ -30,6 +30,10 @@ SHOTS = REPO / "docs" / "screenshots"
 PORT = 8799
 SLUG = "-proj"
 SESSION = "sess-debug-demo"
+#: The same reading, sealed and then read with its transcript DELETED — §4 of
+#: docs/specs/2026-09-27-order-autopsy-durability.md. Shot beside the derived one because
+#: the provenance block is the only thing on the page that tells them apart.
+SEALED_SESSION = "sess-debug-sealed"
 TASK = "a7b62083-1111-2222-3333-444455556666"
 
 #: The clock every window and every transcript row is hung off, so the page shows recent
@@ -162,7 +166,31 @@ def ingredients(context, *, prompt_bytes: int, dirs_bytes: int,
     return rows
 
 
-def seed() -> tuple[str, str, str]:
+def seed_turns(store, context, wo_id: str) -> None:
+    """The three turn windows and their context payloads, for one order."""
+    for seq, (window, payload) in enumerate((
+            (T1, ingredients(context, prompt_bytes=18_400, dirs_bytes=800,
+                             knowledge=4_200)),
+            (T2, ingredients(context, prompt_bytes=19_100, dirs_bytes=5_400,
+                             knowledge=None)),
+            (T3, None)), start=1):
+        turn = store.create_turn(wo_id, kind="dispatch" if seq == 1 else "message",
+                                 prompt="p")
+        if window[1] is not None:
+            store.finish_turn(turn["id"], "done", result="ok", cost_usd=1.4, num_turns=6)
+        # The windows are rewritten directly because `create_turn` stamps `now` and the
+        # whole fixture is a session that ran half an hour ago. `context_report` joins
+        # cache writes to turns BY these timestamps, so they have to match the rows.
+        store.conn.execute(
+            "UPDATE wo_turns SET started_at=?, ended_at=?, context_json=? WHERE id=?",
+            (window[0], window[1],
+             json.dumps({"schema": context.SCHEMA, "ingredients": payload,
+                         "caps": context.caps(),
+                         "token_bytes": context.TOKEN_BYTES}) if payload else None,
+             turn["id"]))
+
+
+def seed() -> tuple[str, str, str, str]:
     from jarvis import context, ops
     from jarvis.central_store import CentralStore
     from jarvis.project_store import ProjectStore
@@ -185,30 +213,15 @@ def seed() -> tuple[str, str, str]:
     wo = ops.create_work_order(
         "jarvis_os", "the debugging view: the dashboard page and the JSON behind it")
     empty = ops.create_work_order("jarvis_os", "filed, never dispatched")
+    sealed = ops.create_work_order(
+        "jarvis_os", "the same order again, settled and sealed, transcript pruned")
     store = ProjectStore(project)
     try:
         store.update_work_order(wo["id"], session_id=SESSION, status="running")
-        for seq, (window, payload) in enumerate((
-                (T1, ingredients(context, prompt_bytes=18_400, dirs_bytes=800,
-                                 knowledge=4_200)),
-                (T2, ingredients(context, prompt_bytes=19_100, dirs_bytes=5_400,
-                                 knowledge=None)),
-                (T3, None)), start=1):
-            turn = store.create_turn(wo["id"], kind="dispatch" if seq == 1 else "message",
-                                     prompt="p")
-            if window[1] is not None:
-                store.finish_turn(turn["id"], "done", result="ok", cost_usd=1.4,
-                                  num_turns=6)
-            # The windows are rewritten directly because `create_turn` stamps `now` and the
-            # whole fixture is a session that ran half an hour ago. `context_report` joins
-            # cache writes to turns BY these timestamps, so they have to match the rows.
-            store.conn.execute(
-                "UPDATE wo_turns SET started_at=?, ended_at=?, context_json=? WHERE id=?",
-                (window[0], window[1],
-                 json.dumps({"schema": context.SCHEMA, "ingredients": payload,
-                             "caps": context.caps(),
-                             "token_bytes": context.TOKEN_BYTES}) if payload else None,
-                 turn["id"]))
+        store.update_work_order(sealed["id"], session_id=SEALED_SESSION,
+                                status="completed")
+        seed_turns(store, context, wo["id"])
+        seed_turns(store, context, sealed["id"])
         # Two holds the OS's own record explains, one of each shape the page renders: a
         # Neo question that was answered, and a gate still open right now.
         for kind, payload, at in (
@@ -236,7 +249,21 @@ def seed() -> tuple[str, str, str]:
         "".join(json.dumps(r) + "\n" for r in subagent_rows()))
     (subs / f"agent-{TASK}.meta.json").write_text(
         json.dumps({"agentType": "explorer", "description": "find the callers"}))
-    return "jarvis_os", wo["id"], empty["id"]
+
+    # The sealed order: the same rows, frozen onto the row, then the transcript PRUNED —
+    # which is the case the seal exists for and the only one where the two shots differ
+    # in what they can show at all.
+    from jarvis import autopsy
+
+    (root / SLUG / f"{SEALED_SESSION}.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in transcript_rows()))
+    store = ProjectStore(project)
+    try:
+        autopsy.seal("jarvis_os", project, store.get_work_order(sealed["id"]))
+    finally:
+        store.close()
+    (root / SLUG / f"{SEALED_SESSION}.jsonl").unlink()
+    return "jarvis_os", wo["id"], empty["id"], sealed["id"]
 
 
 def serve() -> None:
@@ -250,7 +277,7 @@ def serve() -> None:
 # -- the shots --------------------------------------------------------------------------
 
 
-def shoot(project: str, wo_id: str, empty_id: str) -> list[Path]:
+def shoot(project: str, wo_id: str, empty_id: str, sealed_id: str) -> list[Path]:
     from jarvis import ops
     from playwright.sync_api import sync_playwright
 
@@ -317,6 +344,20 @@ def shoot(project: str, wo_id: str, empty_id: str) -> list[Path]:
         page.goto(f"http://127.0.0.1:{PORT}/wo/{project}/{empty_id}/debug")
         page.wait_for_selector("#block-context")
         shot("debug_page_no_transcript.png")
+
+        # WHICH READING ANSWERED, as a pair. The same three blocks over the derived order
+        # above and over the sealed one whose transcript is gone: the numbers are the same
+        # reading and only the provenance block says so (spec §4 of 2026-09-27).
+        def blocks(target: str, label: str) -> None:
+            page.goto(f"http://127.0.0.1:{PORT}/wo/{project}/{target}/debug")
+            page.wait_for_selector("#block-anatomy")
+            for block in ("diagnosis", "anatomy", "context"):
+                name = f"debug_page_provenance_{label}_{block}.png"
+                page.locator(f"#block-{block}").screenshot(path=SHOTS / name)
+                out.append(SHOTS / name)
+
+        blocks(wo_id, "derived")
+        blocks(sealed_id, "sealed")
         browser.close()
     return out
 
@@ -350,7 +391,7 @@ def main() -> int:
     os.environ["JARVIS_TRANSCRIPT_ROOT"] = str(Path(tmp) / "claude-projects")
     os.environ.pop("JARVIS_WO_ID", None)
     sys.path.insert(0, str(REPO / "src"))
-    project, wo_id, empty_id = seed()
+    project, wo_id, empty_id, sealed_id = seed()
     # Refuse a port already in use rather than screenshotting somebody else's dashboard:
     # two copies of this script at once is how a run ends up half against one fixture and
     # half against another, and the PNGs would not say so.
@@ -360,7 +401,7 @@ def main() -> int:
                              f"script is running; nothing was captured")
     threading.Thread(target=serve, daemon=True).start()
     wait_for_server()
-    for path in shoot(project, wo_id, empty_id):
+    for path in shoot(project, wo_id, empty_id, sealed_id):
         print(f"{path}  {path.stat().st_size:,} bytes")
     return 0
 
