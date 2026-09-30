@@ -193,8 +193,14 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     A call with no work order (`wo_id=""`) is still recorded: it is OS overhead that
     belongs in the fleet total even though no single work order caused it.
     """
+    prompt_chars = system_prompt_chars = 0
     if isinstance(usage, claude_cli.HeadlessResult):
         model = model or usage.model
+        # How big the OS's own input was (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Off the dataclass
+        # here, off the envelope below — both are what a call site has to hand.
+        prompt_chars = usage.prompt_chars
+        system_prompt_chars = usage.system_prompt_chars
         # The session the CLI minted for this call, taken here because this is the last
         # place it exists: a one-shot `claude -p` returns it once and Jarvis keeps no
         # other handle on it. It is what lets an OS call be opened up per API call the
@@ -204,6 +210,9 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
         usage = usage.usage
     if usage is not None and not isinstance(usage, dict):
         usage = None
+    if isinstance(usage, dict) and not prompt_chars and not system_prompt_chars:
+        prompt_chars = int(usage.get("prompt_chars") or 0)
+        system_prompt_chars = int(usage.get("system_prompt_chars") or 0)
     own = store is None
     try:
         # `spend_db_path()` is None in every ordinary case, which is the daemon writing
@@ -212,7 +221,9 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
         store = store or CentralStore(spend_db_path())
         return store.add_agent_call(kind, project=project, wo_id=wo_id, label=label,
                                     model=model, question_id=question_id, ok=ok,
-                                    session_id=session_id, usage=usage)
+                                    session_id=session_id, usage=usage,
+                                    prompt_chars=prompt_chars,
+                                    system_prompt_chars=system_prompt_chars)
     except Exception:  # noqa: BLE001 — see the module docstring: never raise
         log.warning("could not record %s usage for %s", kind, wo_id or "the OS",
                     exc_info=True)

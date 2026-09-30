@@ -5206,6 +5206,20 @@ class ProjectStore:
         params.append(limit)
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
 
+    def approvals_of_kind(self, kind: str, status: str) -> list[dict[str, Any]]:
+        """Every approval of ONE kind at ONE status, newest first. Reads only.
+
+        `list_approvals` answers the 200 newest rows of EVERY kind, which is the wrong
+        read for a caller that must see all of one kind: ordinary gate traffic pushes a
+        rare kind's row out of that window, and the caller then sees nothing at all rather
+        than fewer rows. Scoped by kind in SQL, so the window cannot hide one.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM approvals WHERE kind=? AND status=? ORDER BY ts DESC, id DESC",
+            (kind, status),
+        ).fetchall()
+        return db.rows_to_dicts(rows)
+
     def pending_approvals(self, wo_id: str | None = None) -> list[dict[str, Any]]:
         """Requests still awaiting a verdict — from Neo or, once escalated, the user.
 

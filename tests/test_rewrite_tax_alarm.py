@@ -746,8 +746,9 @@ def test_the_remedy_files_the_fix_and_the_order_that_ships_it(started, store):
     idiom for ordering a two-step job in one go."""
     alarm, subject = _alarm_with(store, ARGUMENT)
 
-    result = remedies._apply_file_work_order(store, started.central, "proj_a",
-                                             subject, alarm)
+    result = remedies._apply_file_work_order(
+        store, started.central, "proj_a", subject,
+        remedies.Intent.from_alarm(store, alarm))
 
     filed = [w for w in store.list_work_orders() if w["id"] != subject["id"]]
     assert len(filed) == 2
@@ -776,7 +777,8 @@ def test_a_proposal_with_no_argument_is_refused_and_files_nothing(started, store
     before = len(store.list_work_orders())
 
     with pytest.raises(remedies.RemedyRefused):
-        remedies._apply_file_work_order(store, started.central, "proj_a", subject, alarm)
+        remedies._apply_file_work_order(store, started.central, "proj_a", subject,
+                                        remedies.Intent.from_alarm(store, alarm))
     assert len(store.list_work_orders()) == before
 
 
@@ -797,8 +799,9 @@ def test_a_ship_order_that_cannot_be_filed_is_reported_not_raised(started, store
         return real(*args, **kwargs)
 
     monkeypatch.setattr(ops, "create_work_order", flaky)
-    result = remedies._apply_file_work_order(store, started.central, "proj_a",
-                                             subject, alarm)
+    result = remedies._apply_file_work_order(
+        store, started.central, "proj_a", subject,
+        remedies.Intent.from_alarm(store, alarm))
 
     assert "could NOT be filed" in result
     assert "the project went away" in result
