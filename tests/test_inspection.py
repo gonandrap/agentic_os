@@ -2440,3 +2440,132 @@ def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
             (1, first["started_at"]), (2, second["started_at"])]
     finally:
         store.close()
+
+
+# -- a boundary is classified once, and every turn gets its own -------------------------
+#
+# Spec docs/superpowers/specs/2026-09-29-inspect-boundary-classification.md, issue #867:
+# `Turn.usage` summed `usage.priced()`, which classifies nothing, so every
+# classification key of every turn was structurally zero.
+
+COLD_FLOOR = 5_000
+
+
+def _compact_boundary_row(at: float, pre: int = 293_382, post: int = 4_697) -> dict:
+    return {"type": "system", "subtype": "compact_boundary", "timestamp": stamp(at),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post}}
+
+
+@pytest.fixture()
+def three_turns(write_transcript) -> str:
+    """Three turns: an ordinary one, one that COMPACTED, one that came back past the TTL.
+
+    One boundary per cause the session can have, in two different turns — which is the
+    only shape that can tell "attributed to its own turn" from "summed and smeared".
+    """
+    return write_transcript("s-boundaries", [
+        prompt_row(0.0, "dispatch"),
+        assistant_row(5.0, "a", write=200_000, read=0),
+        assistant_row(10.0, "b", write=3_000, read=200_000),
+        prompt_row(60.0, "keep going"),
+        assistant_row(65.0, "c", write=5_000, read=203_000),
+        _compact_boundary_row(70.0),
+        # Seconds after the summary landed: the static head, and by gap and read alone
+        # indistinguishable from a prefix miss.
+        assistant_row(90.0, "d", write=15_380, read=12_776),
+        prompt_row(600.0, "after the cache expired"),
+        assistant_row(605.0, "e", write=120_000, read=0),
+    ])
+
+
+def test_the_turn_that_compacted_reports_its_own_compacted_boundary(three_turns):
+    """#867's ask, and the only assertion in the issue that was ever about the fix."""
+    cfg = InspectConfig(report_write_floor=10_000)
+    anatomy = inspection.read_session(three_turns, cfg, cold_prefix_floor=COLD_FLOOR)
+
+    assert [t.usage.boundaries_compact for t in anatomy.turns] == [0, 1, 0]
+    assert anatomy.turns[1].usage.rewrite_compact_write == 15_380
+    # …and the same write, labelled by the other classifier, on the same turn.
+    compacted = [w for w in anatomy.writes if w.cause == inspection.COMPACTION]
+    assert [w.written for w in compacted] == [15_380]
+    assert anatomy.turns[1].started <= compacted[0].ts <= anatomy.turns[1].ended
+
+
+def test_a_turn_reports_the_boundary_that_fell_in_it_and_one_context_peak(three_turns):
+    """The per-turn `usage` block's keys were all structurally zero (spec §1.2), and
+    `context_peak` was emitted twice under one name with one of the two always 0."""
+    anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+
+    assert [t.usage.resume_boundaries for t in anatomy.turns] == [0, 1, 1]
+    assert [t.usage.boundaries_ttl for t in anatomy.turns] == [0, 0, 1]
+    assert anatomy.turns[2].usage.rewrite_ttl_write == 120_000
+    for turn in anatomy.turns:
+        payload = turn.as_dict()
+        assert payload["usage"]["context_peak"] == payload["context_peak"]
+    assert anatomy.turns[0].usage.rewrite_excess == 0
+
+
+def test_the_session_total_agrees_with_jarvis_cost_and_with_its_own_turns(three_turns):
+    """Two grains and a third surface, laid side by side — the rule
+    `test_the_cohort_script_classifies_boundaries_exactly_as_the_bill_does` already
+    enforces for `scripts/compaction_cohort.py`."""
+    anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+    block = anatomy.as_dict()["rewrite"]
+    theirs = usage.read_session(three_turns, COLD_FLOOR).total
+
+    for key, field in (("compact_write", "rewrite_compact_write"),
+                       ("ttl_write", "rewrite_ttl_write"),
+                       ("prefix_write", "rewrite_prefix_write"),
+                       ("cache_write", "cache_write")):
+        assert block[key] == getattr(theirs, field), key
+    assert (block["boundaries"], block["compact_boundaries"],
+            block["ttl_boundaries"], block["undecided_boundaries"]) == (2, 1, 1, 0)
+    assert block["tokens"] == anatomy.rewrite_excess()
+
+    summed = usage.Usage()
+    for turn in anatomy.turns:
+        summed = summed + turn.usage
+    assert summed.resume_boundaries == block["boundaries"]
+    assert summed.boundaries_compact == block["compact_boundaries"]
+    assert summed.rewrite_ttl_write == block["ttl_write"]
+    # `Usage.__add__` takes the MAX of `context_peak`, so summing turns yields the
+    # session's peak rather than a nonsense total.
+    assert summed.context_peak == anatomy.as_dict()["context_peak"]
+
+
+def test_an_unknown_floor_counts_every_boundary_and_guesses_no_cause(three_turns):
+    """`jarvis inspect` over a moved catalog must not fail and must not invent the
+    threshold (spec §4, rejected alternative 4). `UNDECIDED` is what that costs."""
+    known = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+    anatomy = inspection.read_session(three_turns)
+    block = anatomy.as_dict()["rewrite"]
+
+    assert block["boundaries"] == known.as_dict()["rewrite"]["boundaries"]
+    assert block["compact_boundaries"] == 1  # rule 2 needs no floor
+    assert block["ttl_write"] == 0 and block["prefix_write"] == 0
+    assert block["undecided_boundaries"] == block["boundaries"] - 1
+    # The turn whose only boundary was left open: nothing in any write bucket, so the
+    # share is `None` — "not measured", which a renderer must not print as 0%.
+    open_turn = anatomy.turns[2].usage
+    assert open_turn.boundaries_undecided == 1 and open_turn.resume_boundaries == 1
+    assert open_turn.rewrite_ttl_share is None
+
+
+def test_the_boundary_census_is_printed_and_not_only_in_the_json(three_turns, capsys):
+    """A `--json`-only field nobody can see is half a fix. With the split left open the
+    line says so instead of printing "0 expired", which would read as a finding."""
+    rendered(inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR))
+    assert "boundaries 2 — 0 prefix, 1 expired, 1 compacted" in capsys.readouterr().out
+
+    rendered(inspection.read_session(three_turns))
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if ln.strip().startswith("boundaries "))
+    assert "boundaries 2 — 1 compacted, 1 unclassified (no os.cold_prefix_floor)" in line
+    assert "expired" not in line and "prefix," not in line
+
+
+def test_the_cold_prefix_floor_is_none_when_no_catalog_can_be_reached(jarvis_home):
+    """`ops.inspect_config`'s guarantee: a report over files on disk must not fail
+    because a catalog has moved. Unlike it, this falls back to None and not a number."""
+    assert ops.cold_prefix_floor() is None

@@ -11280,6 +11280,25 @@ def inspect_config(project: str | None = None) -> Any:
         return InspectConfig()
 
 
+def cold_prefix_floor(project: str | None = None) -> int | None:
+    """`os.cold_prefix_floor` if a catalog can be reached, else None.
+
+    `ops.inspect_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved. Unlike it this falls back to
+    None and NOT to a number — `bill._cold_prefix_floor` has already settled that there is
+    no defensible default for this threshold, so a reader without a catalog is told the
+    boundary split was not measured (`usage.BOUNDARY_UNDECIDED`) rather than shown a
+    finding the configuration never produced.
+
+    `project` is accepted for `inspect_config`'s symmetry; the setting is an `os.*` one
+    and no project may override it (spec of 2026-09-29, rejected alternative 3).
+    """
+    try:
+        return resolve_catalog().os.cold_prefix_floor
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
 def inspect_config_at(project_path: Path) -> Any:
     """`inspect_config` for the project rooted at `project_path`.
 
@@ -11408,6 +11427,9 @@ def inspect_report(target: str, project: str | None = None, *,
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
+    # Resolved ONCE for the whole report, beside the index and best-effort for the same
+    # reason: an `os.*` setting, so it is the same value for every unit.
+    floor = cold_prefix_floor()
     # The catalog decides the floors and the flags override them for one invocation:
     # a project's setting is what the report means by "large" day to day, and `--writes
     # -over` is someone asking a different question of the same session once.
@@ -11433,7 +11455,8 @@ def inspect_report(target: str, project: str | None = None, *,
         spans = holds.held(store, wo["id"])
         # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
         anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
-                                           turn_starts=store.turn_starts(wo["id"]))
+                                           turn_starts=store.turn_starts(wo["id"]),
+                                           cold_prefix_floor=floor)
                    if session
                    else inspection.Anatomy(session_id="", holds=list(spans),
                                            write_floor=cfg.report_write_floor,
@@ -11570,7 +11593,8 @@ def context_report(wo_id: str, project: str | None = None, *,
         anatomy = (inspection.read_session(
                        session, cfg, index=usage_mod.index_sessions(),
                        turn_starts=[(int(r["seq"]), float(r["started_at"]))
-                                    for r in rows])
+                                    for r in rows],
+                       cold_prefix_floor=cold_prefix_floor())
                    if session else None)
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "

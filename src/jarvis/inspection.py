@@ -589,6 +589,10 @@ class Turn:
     triggers: list[Prompt] = field(default_factory=list)
     spans: list[ToolSpan] = field(default_factory=list)
     calls: list[usage_mod.Call] = field(default_factory=list)
+    #: The cold boundaries that fell in THIS turn, classified once over the whole session
+    #: and attributed here (`_attach_boundaries`). Classifying per turn would open every
+    #: turn with a boundary it did not necessarily have — spec of 2026-09-29, Neo q1048.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The intervals of THIS turn the OS's own record says it was held (`holds.held`),
     #: already clipped to it. Empty when nothing held it, and empty for a reading taken
     #: without a store — a report that cannot see the record must say a turn was held
@@ -702,12 +706,28 @@ class Turn:
 
     @property
     def usage(self) -> usage_mod.Usage:
+        """This turn's tokens, priced — AND classified, which `priced` cannot do.
+
+        `usage.priced` deliberately classifies nothing (it prices counts a caller already
+        holds), so summing it left every boundary and context key of every turn at zero
+        while the turn's own `cache_write` ran to six figures (issue #867). The three
+        properties below are filled from what this turn actually has: its own boundaries,
+        its own calls, and `context_peak` — the SAME number `as_dict` emits at the top
+        level, which is the point of filling it here.
+        """
         total = usage_mod.Usage()
         for call in self.calls:
             total = total + usage_mod.priced(
                 call.model, messages=1, input=call.input,
                 cache_write=call.cache_write, cache_read=call.cache_read,
                 output=call.output, cache_1h=call.cache_1h, cache_5m=call.cache_5m)
+        total.context_peak = self.context_peak
+        # `usage`'s definition at this grain, the arithmetic `Anatomy.rewrite_excess`
+        # already does for the session: in a perfectly cached turn every token is written
+        # once, so what was written above the largest context reached was sent twice.
+        total.rewrite_excess = max(
+            0, sum(c.cache_write for c in self.calls) - self.context_peak)
+        usage_mod.fold_boundaries(total, self.boundaries)
         return total
 
     def share(self) -> dict[str, float]:
@@ -820,6 +840,11 @@ class Anatomy:
     found: bool = False
     turns: list[Turn] = field(default_factory=list)
     writes: list[Write] = field(default_factory=list)
+    #: Every cold boundary in the session, classified ONCE (`usage.classify_boundaries`)
+    #: and also attributed to the turn each fell in. Not `writes`: that list answers
+    #: "which large writes should this report show, and why" and is cut by
+    #: `report_write_floor`, where a boundary census has no threshold at all.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
     #: The thresholds this reading was taken at, carried so every rendering of it can
     #: state them. A report that shows "3 large writes" without saying what large meant
     #: is not reproducible, and these are per-project settings (`catalog.InspectConfig`).
@@ -946,6 +971,42 @@ class Anatomy:
         peak = max((t.context_peak for t in self.turns), default=0)
         return max(0, written - peak)
 
+    def rewrite(self) -> dict[str, int | None]:
+        """The session's re-write total, keyed to `jarvis cost`'s own `rewrite` block.
+
+        Same keys as `bill._worker_extras`' wherever the field means the same thing, so
+        the two payloads can be laid side by side — which is what #867's reporter could
+        not do. Summed from the boundaries `read_session` classified and the calls already
+        in hand: nothing is re-read and nothing is re-classified.
+
+        NO `list_usd` and no `ttl_share`. `jarvis cost` is the money surface; a second
+        dollar figure here invites two answers to one question, and the share is a ratio
+        of the numbers below.
+
+        `undecided_boundaries` is why this is safe to read with an unknown floor:
+        `ttl_write` and `prefix_write` at 0 beside a non-zero one of these is "not
+        measured", never "no TTL expiry".
+        """
+        def count(cause: str) -> int:
+            return sum(1 for b in self.boundaries if b.cause == cause)
+
+        def written(cause: str) -> int:
+            return sum(b.cache_write for b in self.boundaries if b.cause == cause)
+
+        return {
+            "boundaries": len(self.boundaries),
+            "ttl_boundaries": count(usage_mod.BOUNDARY_TTL),
+            "compact_boundaries": count(usage_mod.BOUNDARY_COMPACTED),
+            "undecided_boundaries": count(usage_mod.BOUNDARY_UNDECIDED),
+            "ttl_write": written(usage_mod.BOUNDARY_TTL),
+            "prefix_write": written(usage_mod.BOUNDARY_PREFIX),
+            "compact_write": written(usage_mod.BOUNDARY_COMPACTED),
+            "cache_write": sum(c.cache_write for t in self.turns for c in t.calls),
+            # CALLED, not recomputed, so the top-level `rewrite_excess` key and this one
+            # cannot drift.
+            "tokens": self.rewrite_excess(),
+        }
+
     def as_dict(self) -> dict[str, Any]:
         part = self.partition()
         wall = part["wall"] or 1.0
@@ -967,6 +1028,9 @@ class Anatomy:
             "hold_causes": HOLD_CAUSES,
             "context_peak": max((t.context_peak for t in self.turns), default=0),
             "rewrite_excess": self.rewrite_excess(),
+            # ADDITIVE, and the session-level figure #846 needs: `rewrite_excess` above
+            # stays the same number, and `rewrite["tokens"]` IS it.
+            "rewrite": self.rewrite(),
             "cache_ttl": self.cache_ttl(),
             "turns": [t.as_dict() for t in self.turns],
             "writes": [w.as_dict() for w in self.writes],
@@ -1227,7 +1291,8 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                  root: Path | None = None,
                  index: dict[str, list[Path]] | None = None,
                  spans: Sequence[Hold] = (),
-                 turn_starts: Sequence[tuple[int, float]] = ()) -> Anatomy:
+                 turn_starts: Sequence[tuple[int, float]] = (),
+                 cold_prefix_floor: int | None = None) -> Anatomy:
     """Take one session apart, across every segment file it left behind.
 
     Segments are read in path order and their turns concatenated by start time, then
@@ -1245,6 +1310,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     reason. Left empty the turns are numbered 1..N as they always were; passed, they
     carry the OS's own numbers, so an alarm and `jarvis inspect` stop naming one turn two
     different ways (spec 2026-09-27 §3).
+
+    `cold_prefix_floor` is `os.cold_prefix_floor` and is passed in for the same reason,
+    best-effort: left out, boundaries are still counted and a compacted one still
+    labelled, and the TTL-vs-prefix split of the rest is reported as UNDECIDED rather
+    than guessed (`usage.classify_boundaries`). Required here would mean `jarvis inspect`
+    failing over a moved catalog, which is exactly when someone needs it.
     """
     cfg = cfg or InspectConfig()
     anatomy = Anatomy(session_id=session_id, write_floor=cfg.report_write_floor,
@@ -1269,6 +1340,12 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
                    for c in usage_mod.compaction_stamps(path)]
     anatomy.writes = classify_writes(calls, cfg.report_write_floor,
                                      sorted(compactions))
+    # ONCE over the whole session, then attributed — Neo q1048. Classified per turn,
+    # every turn would open with a boundary it did not necessarily have and the per-turn
+    # counts would not sum to the session's.
+    anatomy.boundaries = usage_mod.classify_boundaries(
+        calls, compactions=sorted(compactions), cold_prefix_floor=cold_prefix_floor)
+    _attach_boundaries(turns, anatomy.boundaries)
     _attach_calls(turns, calls)
     _close_turns(turns)
     _name_joins(turns, anatomy.subagent_labels)
@@ -1328,23 +1405,42 @@ def _close_turns(turns: Sequence[Turn]) -> None:
                                                           or turn.ended)
 
 
-def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
-    """Put each API call in the turn that was running when it landed.
+def _turn_at(ordered: Sequence[Turn], ts: float) -> Turn | None:
+    """Which turn was running when something landed, or None if nothing had started.
 
     The same last-turn-started-by-then rule the bill uses (`bill._turn_locator`), so the
     two accountings cut the session at identical points and a reader can lay one beside
-    the other.
+    the other. ONE locator for the calls and the boundaries: two spellings of "which turn
+    was this in" is how two numbers on one payload come to disagree.
+
+    `ordered` must be sorted by `started` — the loop stops at the first turn that had not.
     """
+    home: Turn | None = None
+    for turn in ordered:
+        if turn.started <= ts:
+            home = turn
+        else:
+            break
+    return home
+
+
+def _attach_calls(turns: Sequence[Turn], calls: Iterable[usage_mod.Call]) -> None:
+    """Put each API call in the turn that was running when it landed."""
     ordered = sorted(turns, key=lambda t: t.started)
     for call in calls:
-        home: Turn | None = None
-        for turn in ordered:
-            if turn.started <= call.ts:
-                home = turn
-            else:
-                break
+        home = _turn_at(ordered, call.ts)
         if home is not None:
             home.calls.append(call)
+
+
+def _attach_boundaries(turns: Sequence[Turn],
+                       boundaries: Iterable[usage_mod.Boundary]) -> None:
+    """Put each classified boundary in the turn that was running when it was paid for."""
+    ordered = sorted(turns, key=lambda t: t.started)
+    for boundary in boundaries:
+        home = _turn_at(ordered, boundary.ts)
+        if home is not None:
+            home.boundaries.append(boundary)
 
 
 def _read_subagent(path: Path, cfg: InspectConfig,
