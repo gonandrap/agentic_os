@@ -361,7 +361,7 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     itself. `pstore` is optional only so a caller without one degrades to the old lines
     rather than raising inside an evidence packet.
     """
-    from . import holds, inspection
+    from . import holds, inspection, ops
 
     session_id = wo.get("session_id") or ""
     if not session_id:
@@ -371,7 +371,8 @@ def _session_lines(wo: dict[str, Any], inspect_cfg: Any,
     turn_starts = pstore.turn_starts(wo["id"]) if pstore is not None else []
     try:
         anatomy = inspection.read_session(session_id, inspect_cfg, spans=spans,
-                                          turn_starts=turn_starts)
+                                          turn_starts=turn_starts,
+                                          cold_prefix_floor=ops.cold_prefix_floor())
     except OSError:
         return ["(the session transcript could not be read)"]
     if not anatomy.found:
