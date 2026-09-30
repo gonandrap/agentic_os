@@ -2469,7 +2469,10 @@ def _blocked_turn(write_transcript) -> str:
 
 def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
     """The fix, measured on the clock it is about: every gap is under `TTL_5M`, so no
-    write in the turn is a `TTL_EXPIRY` and no join is open long enough to alarm."""
+    write in the turn is a `TTL_EXPIRY` and no join is open long enough to alarm.
+
+    Pins the MEASUREMENT, not new code — `inspection` is unchanged — and it is issue
+    868's named acceptance criterion, so it stays green from arrival."""
     anatomy = inspection.read_session(_polled_turn(write_transcript))
     (turn,) = anatomy.turns
 
@@ -2483,7 +2486,10 @@ def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
 
 def test_the_same_twenty_minutes_as_one_join_still_produces_both(write_transcript):
     """The negative twin. Same wall clock, one blocking call: the conversation is
-    re-sent at the write rate and the OS raises the join alarm that says so."""
+    re-sent at the write rate and the OS raises the join alarm that says so.
+
+    Pins the MEASUREMENT of issue 868's fix, not new code: it is what stops the positive
+    twin proving only that its fixture is short."""
     anatomy = inspection.read_session(_blocked_turn(write_transcript))
 
     expiries = [w for w in anatomy.writes if w.cause == inspection.TTL_EXPIRY]

@@ -55,6 +55,12 @@ JOB_ID_PARAMS = ("bash_id", "shell_id", "task_id", "agent_id", "subagent_id")
 #: ships a version, and nothing fails when it does.
 RUNNING = "running"
 
+#: How the harness starts `toolUseResult` when the call FAILED or was refused — verified
+#: on a real denied `Bash` row. The FALLBACK only: the structured `is_error` flag is the
+#: primary signal, and this prefix is matched at the start and nowhere else, so prose
+#: mentioning an error cannot clear a launch.
+ERROR_PREFIX = "Error: "
+
 _TASK_ID = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
 _STATUS = re.compile(r"<status>\s*([^<\s]+)\s*</status>")
 
@@ -176,13 +182,16 @@ def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
     or none, so the launching `tool_use` id is the fallback: a launch with no reported id
     is TRACKED rather than silently dropped (§5 of
     docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+
+    A launch whose result is an ERROR is skipped: a `run_in_background` call a PreToolUse
+    hook refused started no process, so reporting it would block a turn for nothing.
     """
     result = row.get("toolUseResult")
     outcome = result if isinstance(result, dict) else {}
     job_id = str(outcome.get("backgroundTaskId") or "")
     for block in usage.blocks_of(row, "tool_result"):
         call_id = str(block.get("tool_use_id") or "")
-        if call_id in launched:
+        if call_id in launched and not _failed(block, result):
             params = launched[call_id]
             named = job_id or call_id
             jobs[named] = Job(named, str(params.get("command")
@@ -190,6 +199,21 @@ def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
         polled = polls.get(call_id)
         if polled and _says_stopped(_text_of(block.get("content")), outcome):
             collected.add(polled)
+
+
+def _failed(block: dict[str, Any], result: Any) -> bool:
+    """Whether this tool_result reports an ERROR — a refused or failed call.
+
+    Read the way the rest of this module reads the harness: the structured flag first
+    (`is_error` on the block, `is_error`/`isError` on `toolUseResult`), then `ERROR_PREFIX`
+    on the text as the fallback.
+    """
+    if block.get("is_error"):
+        return True
+    if isinstance(result, dict):
+        return bool(result.get("is_error") or result.get("isError"))
+    text = result if isinstance(result, str) else _text_of(block.get("content"))
+    return text.startswith(ERROR_PREFIX)
 
 
 def _says_stopped(text: str, outcome: dict[str, Any]) -> bool:

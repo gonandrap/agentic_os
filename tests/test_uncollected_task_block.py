@@ -29,6 +29,12 @@ SUITE = "uv run pytest tests/ -q"
 SESSION = "sess-stop"
 EVENT = "background_task_uncollected"
 
+#: How far into the past the fixture's turn starts. The guard bounds its scan with
+#: `until=time.time()`, so a turn stamped `now` puts the rows these tests write ON that
+#: bound: on CI the guard ran under 2 ms after `create_turn` and `+0.002` fell past
+#: `until`, so a collected job read as uncollected. Seconds of slack, not milliseconds.
+BACK_DATED = 60.0
+
 
 def _stamp(when: float) -> str:
     return datetime.fromtimestamp(when, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -68,6 +74,23 @@ def _poll(when: float, *, tool: str = "BashOutput", key: str = "bash_id",
     ]
 
 
+def _refused(when: float, *, call_id: str = "toolu_denied",
+             command: str = "./server.sh") -> list[dict]:
+    """A launch a PreToolUse hook REFUSED: `is_error` on the result, and `toolUseResult`
+    a string starting with the harness's `Error: ` (real shape, a denied Bash call)."""
+    return [
+        {"type": "assistant", "timestamp": _stamp(when),
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": call_id, "name": "Bash",
+              "input": {"command": command, "run_in_background": True}}]}},
+        {"type": "user", "timestamp": _stamp(when + 0.0001),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": call_id, "is_error": True,
+              "content": "Error: backgrounding is refused by default"}]},
+         "toolUseResult": "Error: backgrounding is refused by default"},
+    ]
+
+
 @pytest.fixture()
 def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
     """A running work order mid-turn, with a transcript this test writes by hand."""
@@ -75,7 +98,11 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
     store = ProjectStore(project)
     wo = store.create_work_order("run the suite")
     store.set_status(wo["id"], "running")
-    store.create_turn(wo["id"], kind="message", prompt="go")
+    turn = store.create_turn(wo["id"], kind="message", prompt="go")
+    # Back-dated because the guard scans up to `until=time.time()`: see BACK_DATED.
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (time.time() - BACK_DATED, turn["id"]))
+    store.conn.commit()
     env = {"JARVIS_WO_ID": wo["id"], "JARVIS_PROJECT": "proj_a",
            "JARVIS_PROJECT_PATH": str(project), "JARVIS_GATES": ALL_GATES.to_json()}
 
@@ -108,6 +135,17 @@ def worker(jarvis_home, fake_claude, catalog_file, project, tmp_path):
 
     yield Handle()
     store.close()
+
+
+def test_fixture_turn_is_back_dated(worker):
+    """The fixture's own post-condition: every row these tests write must be in the
+    past, because the guard bounds its scan with `until=time.time()`. A turn stamped
+    `now` split the `+0.001` launch from the `+0.002` poll on CI (under 2 ms) and read a
+    collected job as uncollected."""
+    started = worker.started()
+
+    assert time.time() - started >= BACK_DATED - 1
+    assert started + 0.001 < started + 0.002 < time.time()
 
 
 def test_turn_with_uncollected_bash_task_blocked(worker):
@@ -151,6 +189,21 @@ def test_collected_task_does_not_block(worker):
             ("a kill", [*_launch(started + 0.001), kill]),
             ("a notification", [*_launch(started + 0.001), notified])):
         assert worker.guard(rows) is None, label
+
+
+def test_refused_launch_does_not_block(worker):
+    """A launch `background_task_decision` DENIED started no process, so a turn ending
+    on it is ending on nothing. Blocking there would park a turn over a refusal the OS
+    itself wrote (§5 of
+    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md)."""
+    assert worker.guard(_refused(worker.started() + 0.001)) is None
+
+    # The successful launch beside it is still the finding.
+    blocked = worker.guard([*_refused(worker.started() + 0.001),
+                            *_launch(worker.started() + 0.002)])
+    assert blocked["decision"] == "block"
+    assert "toolu_denied" not in blocked["reason"]
+    assert "b51fl7bhe" in blocked["reason"]
 
 
 def test_stop_hook_active_does_not_block_twice(worker):

@@ -666,3 +666,42 @@ def test_the_note_is_spent_by_the_turn_it_was_written_for(fleet):
     store.finish_turn(later["id"], "done", result="ran it in the foreground")
 
     assert background.resume_note(store, store.get_work_order(wo["id"])) == ""
+
+
+def _refused_launch(when: float, call_id: str = "toolu_denied",
+                    command: str = "./server.sh") -> list[dict]:
+    """A launch a PreToolUse hook REFUSED. Real shape, off a denied Bash call:
+    `is_error` on the `tool_result` block and a `toolUseResult` string starting
+    `Error: `."""
+    return [
+        {"type": "assistant", "timestamp": _stamp(when),
+         "message": {"model": "claude-opus-5", "role": "assistant", "content": [
+             {"type": "tool_use", "id": call_id, "name": "Bash",
+              "input": {"command": command, "run_in_background": True}}]}},
+        {"type": "user", "timestamp": _stamp(when + 0.1),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": call_id, "is_error": True,
+              "content": "Error: backgrounding is refused by default"}]},
+         "toolUseResult": "Error: backgrounding is refused by default"},
+    ]
+
+
+def test_a_refused_launch_is_not_a_job(root):
+    """§5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:
+    `background_task_decision` denies `run_in_background` on anything but the three long
+    shapes. A refused call started no process, so tracking it would block a turn over
+    nothing."""
+    now = time.time()
+    _transcript(root, "sess-1", _refused_launch(now))
+
+    assert background.jobs_left_running("sess-1", since=now - 1, until=now + 60) == []
+
+
+def test_a_refused_launch_beside_a_real_one_leaves_the_real_one(root):
+    """The refusal must not swallow the finding next to it."""
+    now = time.time()
+    _transcript(root, "sess-1", [*_refused_launch(now), *_launch(now + 1)])
+
+    jobs = background.jobs_left_running("sess-1", since=now - 1, until=now + 60)
+
+    assert [j.job_id for j in jobs] == ["b51fl7bhe"]

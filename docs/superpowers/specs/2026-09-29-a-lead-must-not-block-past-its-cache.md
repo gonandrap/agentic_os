@@ -89,7 +89,7 @@ a 20-minute test run cost less than one ttl-expiry write.
 default; it is allowed ONLY for the shapes the new foreground rule refuses. Option B —
 backgrounding allowed generally for a headless turn — is rejected: it buys nothing the
 carve-out does not (the 28 measured shell writes are all three carved-out shapes) and it
-re-opens the orphan class §4 closed, because every OTHER background job is one nobody has
+re-opens the orphan class §4 of the 2026-09-23 spec closed, because every OTHER background job is one nobody has
 a reason to poll for.
 
 ### 3. The foreground refusal (PreToolUse)
@@ -210,7 +210,7 @@ new matcher reaches a live project only when its settings are rebuilt
 (`bootstrap.build_settings`, `dispatch._write_worker_settings` on every turn), and
 `bootstrap.settings_drift` is what reports a project still carrying the old one.
 
-**How it is proved.** §8.
+**How it is proved.** §9.
 
 ### 4. The carve-out in `background_task_decision`
 
@@ -239,7 +239,7 @@ Still refused, unchanged, with today's text: a backgrounded server, a `nohup` sc
 `setsid` anything, a `&`-terminated command that is not one of the three shapes. Those are
 jobs nobody polls for, and the orphan class is theirs.
 
-**How it is proved.** §8.
+**How it is proved.** §9.
 
 ### 5. The Stop guard
 
@@ -330,7 +330,7 @@ and `background.nudge`. The Stop hook prevents; the reaper catches what a hook c
 (a job started inside a script, or a seat's own shell). Prevention plus backstop, the same
 arrangement §2 of the 2026-09-23 spec argues for.
 
-**How it is proved.** §8.
+**How it is proved.** §9.
 
 ### 6. The brief and the standing instructions
 
@@ -371,7 +371,7 @@ FOREGROUND and wait for it, however long it takes."* It is the text a nudged wor
 first. Change that one clause to the poll rhythm; keep every other word, including the
 "nobody typed this message" attribution.
 
-**How it is proved.** §8.
+**How it is proved.** §9.
 
 ### 7. Section 4 of the 2026-09-23 spec, amended in place
 
@@ -379,12 +379,12 @@ first. Change that one clause to the poll rhythm; keep every other word, includi
 about the same hook is how the implementer of the next change picks the wrong rule.
 
 **Where.** `docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md`, §4 (lines
-108-142), edited in place — not deleted, and its §1 problem statement (issue #575,
+109-166 as edited), edited in place — not deleted, and its §1 problem statement (issue #575,
 wo-d81fcc15's 62 hours) stands untouched, because that class is still closed.
 
 §4 now reads: backgrounding is refused **by default**; the three shapes named in §3 of
 this document are refused in the FOREGROUND instead and must be backgrounded and polled;
-the Stop guard is what makes that safe. The deny-text paragraph (lines 127-130) loses "re-
+the Stop guard is what makes that safe. The deny-text paragraph (lines 142-149) loses "re-
 run in the foreground" as the universal correction and gains the split. The listed tests
 stay listed. §4 ends with a pointer:
 `docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md`.
@@ -464,16 +464,23 @@ a store, a turn row and a transcript file — from a pure payload-in/decision-ou
 - `test_missing_transcript_does_not_block` — no session id, no file, unreadable file.
 - `test_held_gate_request_block_still_wins`.
 - `test_block_writes_a_timeline_event`.
+- `test_refused_launch_does_not_block` — the denied launch, the other reader of the same
+  parser.
+- `test_fixture_turn_is_back_dated` — the fixture's own post-condition: the guard scans
+  up to `until=time.time()`, so its rows must be in the past, not on that bound.
 
 `tests/test_worker_brief.py` (extended): `test_core_contract_carries_the_poll_rhythm` (the
 bullet names background, 3-4 minutes, 240 seconds and "uncollected"),
 `test_core_contract_no_longer_says_re_run_in_the_foreground`,
 `test_standing_instructions_carry_the_carve_out`, `test_template_version_bumped`.
 
-`tests/test_one_shot_turn.py` (extended, where `background.py` is covered):
+`tests/test_background_orphan.py` (extended, where `background.py` is covered):
 `test_task_output_poll_collects_a_background_agent`,
 `test_launch_without_a_reported_task_id_is_still_tracked`,
-`test_resume_note_no_longer_prescribes_the_foreground`.
+`test_resume_note_no_longer_prescribes_the_foreground`,
+`test_a_refused_launch_is_not_a_job` and
+`test_a_refused_launch_beside_a_real_one_leaves_the_real_one` — a `run_in_background`
+call this hook DENIED started no process, so it is not a job and must not block a turn.
 
 `tests/test_inspection.py` (extended): `test_polled_turn_has_no_mid_turn_ttl_expiry` — a
 transcript fixture where a background task runs 20 minutes and the lead collects every 4
