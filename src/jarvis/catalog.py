@@ -441,6 +441,13 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# Characters of DECISION RECORD one assumption-review packet may carry — the order's own
+# answered questions, the user's messages and their rulings on sibling assumptions. Newest
+# first, and what it evicts is stated in the packet rather than dropped silently. Per
+# project because that is what the user asked for on this key. Spec §3:
+# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
+DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
+
 # Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
 # panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
 # 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
@@ -515,6 +522,7 @@ class ValidationConfig:
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
@@ -1512,6 +1520,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    decision_record_chars = int(
+        raw.get("decision_record_chars", base.decision_record_chars))
+    if decision_record_chars < 1:
+        raise _err(f"{where}.decision_record_chars must be >= 1")
     confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
     if confirm_diff_chars < 1:
         raise _err(f"{where}.confirm_diff_chars must be >= 1")
@@ -1536,6 +1548,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
+        decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.

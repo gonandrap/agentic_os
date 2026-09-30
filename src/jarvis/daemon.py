@@ -6036,7 +6036,7 @@ class Daemon:
                                                suppress=suppress)
                     continue
                 autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
-                                                assumptions, evidence=ce)
+                                                assumptions, evidence=ce, cfg=cfg)
                 continue
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
@@ -6052,7 +6052,7 @@ class Daemon:
                                            suppress=suppress)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
-                               early=early)
+                               early=early, cfg=cfg)
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
