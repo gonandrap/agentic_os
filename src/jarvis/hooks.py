@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -393,6 +394,16 @@ TOOL_MANAGED_PATHS_ENV = "JARVIS_TOOL_MANAGED_PATHS"
 #: grow without limit as the list does.
 MAX_TOOL_MANAGED_PATHS = 32
 
+#: The longest a single foreground call may block. Under `inspection.TTL_5M` (300s) with
+#: room for the call itself, so a lead polling on this rhythm never loses the cache.
+#: §3 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+MAX_FOREGROUND_SECONDS = 240
+
+#: The two crew seats whose median duration in the measured period exceeded the TTL. A
+#: short seat blocking for four minutes is cheap and refusing it would tax every
+#: delegation with a hook process.
+LONG_SEATS = ("jarvis-implementer", "jarvis-spec-writer")
+
 #: Everything the shell backgrounds a job with, other than a bare `&`. In COMMAND
 #: position only, so `grep -r nohup src/` is not a detached job.
 _BACKGROUNDING_WORD = re.compile(
@@ -457,12 +468,231 @@ def background_task_decision(payload: dict[str, Any],
     if not (tool_input.get("run_in_background")
             or backgrounds_through_shell(tool_input.get("command", ""))):
         return None
+    # §4 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:
+    # `long_foreground_decision` refuses this shape in the foreground, so backgrounding
+    # it IS the fix. Gated on the harness's own spelling, never on a shell `&`: a
+    # `&`-detached job has no id, so `BashOutput` cannot poll it and the Stop guard
+    # cannot see it — the orphan class §4 of the 2026-09-23 spec closed.
+    arm = long_shell_shape(tool_input.get("command", ""))
+    if tool_input.get("run_in_background") and arm:
+        return None
+    if arm:
+        # The SHAPE may be backgrounded and the `&` may not, so the correction is the
+        # rhythm and not the foreground: sending this one back to the foreground would
+        # point it at the call `long_foreground_decision` refuses next.
+        return _deny(
+            f"`&` is not the way to background this: a `&`-detached job has no id, so "
+            f"`BashOutput` cannot poll it and the Stop hook cannot see it. "
+            f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}"
+        )
     return _deny(
         "Re-run this in the FOREGROUND: this turn is one `claude -p` process, ending it "
         "kills whatever you left running, and nothing wakes you when a background job "
         "finishes. Wait for the command here instead — the fix costs you nothing but "
         "the wait, and there is no notification coming."
     )
+
+
+#: Shell words that open a compound statement, so the command after them is still in
+#: command position: `; do sleep 30; done`.
+_KEYWORDS = frozenset({"do", "then", "else", "elif", "{", "(", "!", "time"})
+
+#: `pytest` flags that take a SEPARATE value, so the value is not a positional path.
+#: `pytest -k expr tests/test_hooks.py` is a targeted run, and reading `expr` as a path
+#: would deny it.
+_PYTEST_VALUE_FLAGS = frozenset({
+    "-k", "-m", "-p", "-n", "-o", "-c", "-W", "-r", "--maxfail", "--deselect",
+    "--ignore", "--ignore-glob", "--rootdir", "--override-ini", "--durations",
+    "--log-level", "--timeout",
+})
+
+#: …and the flags that make `pytest` return at once without running anything.
+_PYTEST_NOT_A_RUN = frozenset({
+    "--collect-only", "--co", "--version", "--help", "-h", "--fixtures",
+    "--markers", "--collectonly",
+})
+
+_LOOP_KEYWORD = re.compile(r"\b(?:while|until)\b")
+_SLEEP_WORD = re.compile(r"\bsleep\b")
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd]?)$")
+_MULTIPLIER = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def _seconds(word: str) -> float | None:
+    found = _DURATION.match(word)
+    return (float(found.group(1)) * _MULTIPLIER[found.group(2)]) if found else None
+
+
+def _statements(masked: str) -> list[list[str]]:
+    """The masked command as word lists, one per statement, keywords stripped.
+
+    Command position is what every arm below tests, and a `;`, `|`, `&` or newline is
+    where the next one starts — the same reading `_BACKGROUNDING_WORD` does with a regex.
+    """
+    out: list[list[str]] = []
+    for part in re.split(r"[;&|()\n]", masked):
+        words = part.split()
+        while words and (words[0] in _KEYWORDS or "=" in words[0]):
+            words = words[1:]
+        if words:
+            out.append(words)
+    return out
+
+
+def _is_whole_suite(words: list[str]) -> bool:
+    """A `pytest` word in command position with no targeted path after it.
+
+    The three spellings the fleet uses. A directory argument, or no path at all, is a
+    whole-suite run; `::` anywhere, or paths that all end in `.py`, is targeted.
+    """
+    if words[:1] == ["pytest"]:
+        args = words[1:]
+    elif words[:3] == ["uv", "run", "pytest"]:
+        args = words[3:]
+    elif len(words) > 2 and words[0] in ("python", "python3") \
+            and words[1] == "-m" and words[2] == "pytest":
+        args = words[3:]
+    else:
+        return False
+    positional: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in _PYTEST_NOT_A_RUN:
+            return False
+        if arg.startswith("-"):
+            skip = arg in _PYTEST_VALUE_FLAGS
+            continue
+        positional.append(arg)
+    if any("::" in arg for arg in positional):
+        return False
+    return not (positional and all(arg.endswith(".py") for arg in positional))
+
+
+def long_shell_shape(command: str) -> str | None:
+    """Which long-running shape this command is, or None — `"suite"`, `"ci-watch"`,
+    `"sleep"`.
+
+    ONE MATCHER, TWO CALL SITES: `long_foreground_decision` refuses the shape in the
+    foreground and `background_task_decision` permits it backgrounded (§3a and §4 of
+    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md). A second
+    spelling of "long" would let a shape be refused in both positions, leaving a lead no
+    legal way to run it at all — kn-d4d5a967's rule applied to a matcher.
+
+    Reads `_mask_shell_text`, so a shape inside a quoted string or a comment is prose.
+    """
+    masked = _mask_shell_text(command)
+    statements = _statements(masked)
+    # A bound on a loop is not an unbounded wait, and refusing it would leave the lead no
+    # way to express "poll, but give up in time".
+    if statements and statements[0][:1] == ["timeout"] and len(statements[0]) > 1:
+        limit = _seconds(statements[0][1])
+        if limit is not None and limit <= MAX_FOREGROUND_SECONDS:
+            return None
+    for words in statements:
+        if _is_whole_suite(words):
+            return "suite"
+        if words[:3] == ["gh", "run", "watch"]:
+            return "ci-watch"
+        if words[:3] == ["gh", "pr", "checks"] and "--watch" in words:
+            return "ci-watch"
+    loop = _LOOP_KEYWORD.search(masked)
+    if loop and _SLEEP_WORD.search(masked, loop.end()):
+        return "sleep"  # the loop's wall clock is not bounded by its sleep argument
+    for words in statements:
+        if words[:1] == ["sleep"] and len(words) > 1:
+            waited = _seconds(words[1])
+            if waited is not None and waited > MAX_FOREGROUND_SECONDS:
+                return "sleep"
+    return None
+
+
+def long_seat_call(payload: dict[str, Any]) -> str | None:
+    """The seat this payload delegates to in the FOREGROUND, if it is a long one."""
+    if payload.get("tool_name") not in ("Agent", "Task"):
+        return None
+    tool_input = payload.get("tool_input") or {}
+    if tool_input.get("run_in_background"):
+        return None
+    seat = str(tool_input.get("subagent_type") or "")
+    return seat if seat in LONG_SEATS else None
+
+
+#: What each refused shape is told, keyed by the arm `long_shell_shape` returns. The
+#: suite text names the pinned rule FIRST and backgrounding second: kn-356c724b says a
+#: worker must not run the whole suite locally at all, and this must not read as
+#: permission to (§3a).
+_LONG_SHELL_ADVICE = {
+    "suite": (
+        "Run your targeted tests instead: the tests for what you changed are the "
+        "evidence, and the validation panel runs the suite on more interpreters than "
+        "you can. If this project's own standing instructions require a full run "
+        "before a pull request, background it — set `run_in_background: true` and "
+        "collect with `BashOutput` every 3-4 minutes until it reports finished."
+    ),
+    "ci-watch": (
+        "DO NOT WAIT FOR CI. Finish as soon as your targeted tests pass and the pull "
+        "request is open: the OS holds the validation round until GitHub has reported "
+        "and nothing is billed while it waits. If you must see the result in this turn, "
+        "background the watcher — `run_in_background: true`, then `BashOutput` every "
+        "3-4 minutes."
+    ),
+    "sleep": (
+        "Background the work and poll it instead: `run_in_background: true`, then "
+        f"`BashOutput` every 3-4 minutes. A single call may block up to "
+        f"{MAX_FOREGROUND_SECONDS} seconds — `sleep 200` is legal — and a loop is "
+        f"bounded by `timeout {MAX_FOREGROUND_SECONDS} …`, never by its sleep argument."
+    ),
+}
+
+#: The reason every arm carries, because the correction is worthless without it.
+_LONG_WHY = (
+    "Your prompt cache lives 5 minutes: a call more than 300 seconds after the previous "
+    "one re-sends this whole conversation at the 1.25x write rate, where a check-in "
+    "inside the window is a 0.1x read. Never end the turn with a task uncollected — the "
+    "Stop hook refuses it, and ending would kill the task."
+)
+
+
+def long_foreground_decision(payload: dict[str, Any],
+                             env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a foreground call whose wall clock is known to outlive the cache.
+
+    §3 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md,
+    issue 868: 85 mid-turn `ttl-expiry` re-writes over 25 work orders, 9.1M tokens, ~$52,
+    and the OS's own remedy (`worker_session.compact`) runs BETWEEN turns, where the gap
+    is not.
+
+    Conditional on the DECLARED transport for `background_task_decision`'s reason: under
+    `spawn_background` the notifications arrive, the gap is the supervisor's problem and
+    this rule has no subject.
+    """
+    if env.get(TURN_TRANSPORT_ENV) != TRANSPORT_HEADLESS:
+        return None
+    tool = payload.get("tool_name")
+    tool_input = payload.get("tool_input") or {}
+    if tool in ("Agent", "Task"):
+        seat = long_seat_call(payload)
+        if seat is None:
+            return None
+        return _deny(
+            f"Set `run_in_background: true` on this `{seat}` call and collect it with "
+            f"`TaskOutput` every 3-4 minutes. A foreground seat call is a JOIN: your "
+            f"turn is blocked for its whole duration, and this seat's median run "
+            f"outlasts the cache. {_LONG_WHY}"
+        )
+    if tool != "Bash":
+        return None
+    command = tool_input.get("command", "")
+    # Already backgrounded is what this rule ASKS for; §4 is where that is permitted.
+    if tool_input.get("run_in_background") or backgrounds_through_shell(command):
+        return None
+    arm = long_shell_shape(command)
+    if arm is None:
+        return None
+    return _deny(f"{_LONG_SHELL_ADVICE[arm]} {_LONG_WHY}")
 
 
 def crew_edit_decision(payload: dict[str, Any],
@@ -1538,6 +1768,73 @@ def held_request_turn_block(store: ProjectStore, wo_id: str, payload: dict[str, 
     }
 
 
+#: What a turn holding an uncollected background task is told. The correction first, the
+#: reason second, one exit — §5 of
+#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
+UNCOLLECTED_TASK_BLOCK = (
+    "You may not end this turn: background task(s) {labels} were started in it and "
+    "never collected, and ending here kills them — nothing wakes you and nobody reads "
+    "their output. Collect them now, in this turn: `BashOutput`/`TaskOutput` every 3-4 "
+    "minutes until each one reports finished, and `KillShell` anything you no longer "
+    "want. Each check-in is a cache READ; ending the turn and starting another is a "
+    "full re-write of this conversation. If a task is genuinely hung, kill it and say "
+    "so in your final message."
+)
+
+#: The timeline event the hold writes, so the record says why the turn was held.
+UNCOLLECTED_TASK_EVENT = "background_task_uncollected"
+
+
+def uncollected_task_turn_block(store: ProjectStore, wo_id: str,
+                                payload: dict[str, Any],
+                                env: dict[str, str]) -> dict[str, Any] | None:
+    """Stop: refuse to end a turn that still has an uncollected background task.
+
+    §5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md, and
+    it is what makes §4's carve-out safe: backgrounding the three long shapes is
+    permitted BECAUSE ending the turn on one is not. Shape copied from
+    `held_request_turn_block`, because the runtime offers exactly one mechanism for
+    holding a session at a turn boundary.
+
+    The evidence is the transcript and nothing else, through
+    `background.jobs_left_running` — one parser, two readers: `orphaned_in_turn` at reap
+    and this hook at Stop. Stop runs ONCE PER TURN, so importing `background` here is a
+    27ms-class cost on a boundary that already opens the store.
+
+    Where the transcript cannot answer — no session id, no file, an unreadable one — the
+    turn ends: a guard that blocked on missing evidence would trap a worker with no way
+    out. The reaper (`worker_session._reap`) is still the backstop for what a hook cannot
+    see.
+    """
+    from . import background
+    from .invariants import TERMINAL_STATUSES
+
+    # One continuation, not a loop: a task that is genuinely hung must not make the turn
+    # unendable.
+    if payload.get("stop_hook_active"):
+        return None
+    if store.get_work_order(wo_id)["status"] in TERMINAL_STATUSES:
+        return None
+    session_id = str(payload.get("session_id") or "")
+    raw = str(payload.get("transcript_path") or "")
+    turn = store.latest_turn(wo_id)
+    if not session_id or not raw or turn is None:
+        return None
+    try:
+        jobs = background.jobs_left_running(
+            session_id, since=turn["started_at"], until=time.time(),
+            index={session_id: [Path(raw)]})
+    except OSError:
+        return None
+    if not jobs:
+        return None
+    store.add_event(wo_id, UNCOLLECTED_TASK_EVENT, {
+        "session_id": session_id, "jobs": [job.job_id for job in jobs],
+    })
+    return {"decision": "block",
+            "reason": UNCOLLECTED_TASK_BLOCK.format(labels=background.labels(jobs))}
+
+
 def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     """PreToolUse auto-approvals that keep autonomous workers unattended:
 
@@ -1593,6 +1890,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:
             return overlong
+        # Immediately before the refusal below, and before the auto-allow, for the same
+        # ordering reason as the cap above (§3 of
+        # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+        blocking = long_foreground_decision(payload, env)
+        if blocking is not None:
+            return blocking
         # Before the auto-allow for the same reason as the cap above it (§4 of
         # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md).
         detached = background_task_decision(payload, env)
@@ -1608,6 +1911,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
+
+    # Its own branch for the same reason as `mcp__` below: a delegation enters no other
+    # block (§3 of
+    # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+    if tool in ("Agent", "Task"):
+        return long_foreground_decision(payload, env)
 
     # Its own branch: an `mcp__` tool name enters neither the Bash block above nor the
     # `Edit`/`Write` one below, so the refusal is unreachable anywhere else (§2.6 of
@@ -2539,6 +2848,12 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             blocked = held_request_turn_block(store, wo_id, payload, env)
             if blocked is not None:
                 return blocked
+            # AFTER it: a gate request unargued is the stricter finding and should be the
+            # one the worker reads (§5 of
+            # docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
+            uncollected = uncollected_task_turn_block(store, wo_id, payload, env)
+            if uncollected is not None:
+                return uncollected
 
         elif event == "SessionEnd":
             # Deliberately inert. Under the headless-turn transport this fires at the
