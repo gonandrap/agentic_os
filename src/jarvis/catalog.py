@@ -536,6 +536,10 @@ class ConcisionConfig:
     """
 
     summary_max_words: int = concision.DEFAULT_SUMMARY_MAX_WORDS
+    #: The same bargain one surface over: `message_max_chars` = 0 turns the `jarvis wo
+    #: send` / `wo assume` payload refusal off for the project (§5 of
+    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    message_max_chars: int = concision.DEFAULT_MESSAGE_MAX_CHARS
 
 
 # -- `jarvis inspect`: what counts as worth reporting, and what as worth interrupting for
@@ -1570,7 +1574,13 @@ def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
     if 0 < words < 20:
         raise _err(f"{where}.summary_max_words of {words} leaves no summary that can "
                    f"pass; use 0 to switch the cap off")
-    return ConcisionConfig(summary_max_words=words)
+    chars = int(raw.get("message_max_chars", base.message_max_chars))
+    if chars < 0:
+        raise _err(f"{where}.message_max_chars must be 0 (off) or more, got {chars}")
+    if 0 < chars < 1000:
+        raise _err(f"{where}.message_max_chars of {chars} leaves no message that can "
+                   f"pass; use 0 to switch the cap off")
+    return ConcisionConfig(summary_max_words=words, message_max_chars=chars)
 
 
 def _parse_bugs(raw: Any, base: BugsConfig | None = None,

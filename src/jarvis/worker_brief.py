@@ -106,9 +106,11 @@ def git_briefing(model: str | None = None) -> str:
     text is byte-identical for every turn of a given work order.
 
     Deliberately NOT a copy of the CLI's "commit only when the user asks": for a worker
-    the work order IS the ask, and the operating contract already tells it to commit and
-    open a PR. Copying that line verbatim would have the system prompt contradict the
-    contract.
+    the work order IS the ask. Copying that line verbatim would contradict the commit and
+    PR rules below — and THIS BLOCK IS NOW THE ONLY PLACE THOSE RULES ARE STATED. The
+    core operating contract used to restate them; that prose was cut to pay for the
+    pass-a-reference rule (Neo question 946), so a trim here removes them from the
+    worker's prompt altogether.
     """
     return "\n".join([
         "# Git",
@@ -210,10 +212,11 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
-        "all its reasoning is one read-only command away — see \"Full briefings on "
-        "demand\" below.",
-        "- Work only inside your assigned worktree (you start in it). Commit your "
-        "work and open a PR per this repo's conventions. Never push to main.",
+        "all its reasoning is one read-only command away — see the index below.",
+        # The commit/PR half of this bullet is gone from the CORE: `git_briefing` states
+        # both in every prompt, and the room bought the pass-a-reference rule below (Neo
+        # question 946). The full `contract` section still carries it.
+        "- Work only inside your assigned worktree (you start in it).",
         f"- **The PR title MUST start with `[{wo_id}] `** — e.g. "
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
@@ -277,12 +280,16 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"what the user and Neo decide from. The summary is the HEADLINE — capped "
         f"at {SUMMARY_MAX_WORDS} words, longer REFUSED — your final message is the "
         f"report, and where detail goes.",
+        # What to do when review feedback asks for more moved into `record_section`
+        # (Neo question 946): this bullet paid for the one below it, and nothing was lost.
         f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
-        f"finish: the tests, evals and checks you actually ran, and what they "
-        f"reported. The summary says what you built; the evidence says how you "
-        f"know it works, and it is read beside your diff. Review feedback may come "
-        f"back asking for more — do what it asks, then finish again with the "
-        f"fuller account.",
+        f"finish: the tests, evals and checks you ran, and what they reported. It says "
+        f"how you know it works, and review feedback may ask for more.",
+        f"- **Pass a REFERENCE, never a payload.** No diff, log, file or JSON dump in "
+        f"a `jarvis` command, message or question: pass a pull request URL, commit "
+        f"SHA, path with a line range, or the command that reproduces it. An "
+        f"oversized argument and a `$(git diff …)` are refused before the command "
+        f"runs.",
         # spec 2026-09-23-the-crew-a-worker-must-use.md SS6 — worker only; a planner
         # has its own team prose in `dispatch._planner_prompt`.
         *([
@@ -295,8 +302,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "work-order record (messages, assumptions, the finish summary), and REVIEW "
             "of what they hand back — it is a draft until you have read it.",
             "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
-            "route the change through `jarvis-implementer` rather than arguing with "
-            "the tool.",
+            "route it through `jarvis-implementer`.",
         ] if kind == "worker" else []),
     ]
     return lines
@@ -487,7 +493,9 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         f"says how you know it works, and it is read beside your diff by someone "
         f"who was not in this session and takes nothing on trust. \"Ran the "
         f"suite\" is not evidence; \"`uv run pytest tests/test_thing.py -q` — 412 "
-        f"passed, 0 failed, including the 6 new cases\" is.",
+        f"passed, 0 failed, including the 6 new cases\" is. Review feedback may come "
+        f"back asking for more — do what it asks, then finish again with the fuller "
+        f"account.",
         "",
         "RUN THE TARGETED TESTS, NOT THE WHOLE SUITE. The tests for what you changed "
         "belong in a worker turn; the full suite belongs to CI, which runs it on more "
@@ -630,6 +638,14 @@ def concision_section() -> str:
         "`open-a-pull-request` skill has it, and a `gh pr create` missing a "
         "section is denied "
         "(docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md).",
+        "",
+        "## Pass a REFERENCE, never a payload",
+        "A diff, a log, a file or a JSON dump never goes into a `jarvis` command, a "
+        "message or a question: pass a pull request URL, a commit SHA, a path with a "
+        "line range or the command that reproduces it, because whoever reads it can "
+        "run that and nobody needs it pasted — an oversized argument, and a `$(git "
+        "diff …)` substitution, are refused before the command runs "
+        "(docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).",
         "",
         "## Say each thing once, across the whole record",
         "The description, your questions, your messages and your finish summary "

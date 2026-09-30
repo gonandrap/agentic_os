@@ -144,6 +144,12 @@ did NOT do, and absolute paths. `--summary` is a one-line headline for that answ
 a substitute for it. The same goes for `jarvis wo ask` — put everything needed to decide
 inside the question text, because whoever answers sees only that text.
 
+Inside it, pass a REFERENCE and never a payload. A diff, a log, a file or a JSON dump does
+not belong in a `jarvis` command, a message or a question: pass a pull request URL, a
+commit SHA, a path with a line range (`src/thing.py:120-148`), or the command that
+reproduces it — whoever reads it can run that. An oversized argument, and a `$(git diff
+…)` substitution, are refused before the command runs.
+
 ## Interacting with the user
 
 The user may reply through Jarvis or the UI; those messages arrive as new user turns in

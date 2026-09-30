@@ -337,6 +337,70 @@ def finish_summary_decision(payload: dict[str, Any],
     )
 
 
+#: What to pass instead of the payload, spelled once: every refusal below has to leave the
+#: worker with a move, and "too long" leaves it splitting the paste in two.
+_INSTEAD = ("Pass a REFERENCE instead: a pull request URL, a commit SHA, a path with a "
+            "line range (`src/jarvis/hooks.py:825-871`), or the command that reproduces "
+            "it. Whoever reads this can run it; nobody needs it pasted.")
+
+
+def payload_reference_decision(payload: dict[str, Any],
+                               env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a `jarvis` command carrying a PAYLOAD where a reference belongs.
+
+    §5 of docs/superpowers/specs/2026-09-26-bounded-model-inputs.md. Three refusals, one
+    rule: an oversized `wo send` / `wo assume` body (which goes whole into the target
+    worker's next turn), a question over `sections.QUESTION_MAX_CHARS`, and any capped
+    argument carrying a command substitution of an unbounded producer, however short.
+
+    The substitution half is the only half `ops` cannot do at all: by the time
+    `ops.ask_question` sees the text, the shell has expanded `$(git diff)` into this
+    worker's own argv and context, so the flood is already paid for. The length half is
+    the SAME rule `ops` enforces, one layer earlier — not a second number.
+
+    Denies rather than truncating or rewriting, for `finish_summary_decision`'s reason:
+    the worker is the only party that knows which sentence was load-bearing, and a hook
+    that edited the argument would put words the worker never wrote onto the record.
+    """
+    if not env.get("JARVIS_WO_ID"):
+        return None  # interactive session — the user's own message is their business
+    command = (payload.get("tool_input") or {}).get("command", "")
+    # kn-21d73ac2: a check that yields nothing on text it cannot parse fails OPEN.
+    # §5 of docs/superpowers/specs/2026-09-26-bounded-model-inputs.md, round-1 review.
+    if concision.unparseable_jarvis_command(command):
+        return _deny(
+            "This `jarvis` command's quoting does not parse — an unbalanced quote. "
+            "Refused rather than guessed at: the OS cannot tell which words the shell "
+            "would build from it, and the shell would expand any substitution inside "
+            "it into THIS worker's context before `jarvis` saw a single argument.\n"
+            "  - Re-type it with the quotes balanced, then the payload rules apply to "
+            "it as normal.\n"
+            f"  - {_INSTEAD}"
+        )
+    for subcommand, producer in concision.unbounded_producers(command):
+        return _deny(
+            f"`{subcommand}` carries `$({producer} …)`. Refused before the command "
+            f"runs, and that timing is the point: the shell would expand that "
+            f"substitution into THIS worker's own context and argv before `jarvis` ever "
+            f"saw it, so the flood is paid for whatever the cap downstream then says.\n"
+            f"  - {_INSTEAD}"
+        )
+    cap = concision.message_cap(env)
+    for subcommand, kind, text in concision.jarvis_payload_args(command):
+        limit = cap if kind == "message" else concision.QUESTION_MAX_CHARS
+        if not limit or len(text) <= limit:
+            continue
+        return _deny(
+            f"This `{subcommand}` {kind} is {len(text)} characters; the cap is "
+            f"{limit}.\n"
+            f"  - {_INSTEAD}\n"
+            f"  - A diff, a log, a file or a JSON dump never belongs in a `jarvis` "
+            f"argument: it is read once by a model and paid for in every turn "
+            f"afterwards."
+        )
+    return None
+
+
 #: The transport declaration (`claude_cli.TURN_TRANSPORT_ENV` and its two values) and the
 #: crew keys, spelled rather than imported: `import jarvis.claude_cli` costs 56ms against
 #: this module's 27ms, and this hook runs on every Bash call and every file write.
@@ -863,6 +927,11 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         overlong = finish_summary_decision(payload, env)
         if overlong is not None:
             return overlong
+        # Before the auto-allow for the ordering reason the comment above gives: it waves
+        # every `jarvis …` through and would make this check unreachable.
+        pasted = payload_reference_decision(payload, env)
+        if pasted is not None:
+            return pasted
         # Before the auto-allow for the same reason as the cap above it (§4 of
         # docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md).
         detached = background_task_decision(payload, env)

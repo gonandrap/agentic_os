@@ -150,6 +150,12 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
         # parse there would be a 39% tax on a ~155ms hook process.
         "JARVIS_SUMMARY_MAX_WORDS": str(project.concision.summary_max_words),
+        # The character cap on a `jarvis wo send` / `wo assume` body, enforced by
+        # `hooks.payload_reference_decision` (§5 of docs/superpowers/specs/
+        # 2026-09-26-bounded-model-inputs.md). Env for the same reason as the cap above
+        # it: the check runs on EVERY Bash command and a catalog parse there would be a
+        # 39% tax on a ~155ms hook process.
+        concision.MESSAGE_CAP_ENV: str(project.concision.message_max_chars),
         # The standing worker instructions, for the `SubagentStart` hook to re-inject:
         # a subagent inherits none of its parent's `--append-system-prompt`. Resolved
         # exactly as `worker_session.briefing` resolves it, so the subagent is told what
