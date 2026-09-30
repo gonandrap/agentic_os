@@ -2608,16 +2608,23 @@ class ProjectStore:
 
         ITS OWN QUERY for the same reason `unsealed_autopsy_orders` is: a bill that cannot
         be computed must not stop an autopsy. The COALESCE is the idiom of
-        `budget._worker_row` and it is load-bearing twice over — a payload written before
-        `payload_v` existed has no such key, and `json_extract` on a non-JSON payload
-        yields NULL; both are version 1, and without the COALESCE both compare NULL and
-        are silently never upgraded.
+        `budget._worker_row` and it is load-bearing for one case: a payload written before
+        `payload_v` existed has no such key, so `json_extract` reads NULL, which is version
+        1 — and without the COALESCE it compares NULL and is silently never upgraded.
+
+        `json_extract` does NOT yield NULL on a non-JSON payload, it RAISES
+        `sqlite3.OperationalError: malformed JSON` — one such payload would stall the whole
+        project's autopsy tick. The `CASE WHEN json_valid(...)` guard, and not a bare
+        `json_valid(x) AND json_extract(x, ...)` (whose evaluation order SQLite does not
+        guarantee), keeps an unparseable payload off the queue entirely.
         """
         marks = ", ".join("?" for _ in TERMINAL_STATUSES)
         rows = self.conn.execute(
             f"SELECT * FROM work_orders WHERE status IN ({marks})"
             " AND autopsy_json IS NOT NULL"
-            " AND COALESCE(json_extract(autopsy_json, '$.payload_v'), 1) < ?"
+            " AND CASE WHEN json_valid(autopsy_json)"
+            "     THEN COALESCE(json_extract(autopsy_json, '$.payload_v'), 1) < ?"
+            "     ELSE 0 END"
             " ORDER BY updated_at LIMIT ?",
             (*TERMINAL_STATUSES, version, limit)).fetchall()
         return [dict(r) for r in rows]

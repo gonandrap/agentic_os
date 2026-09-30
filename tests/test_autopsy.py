@@ -766,3 +766,26 @@ def test_the_shipped_predicate_leaves_a_stale_seal_alone_too(store, spec,
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
 
     assert store.get_work_order(wo["id"])["autopsy_json"] == before
+
+
+def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue(
+        store, spec, write_transcript, monkeypatch):
+    """`json_extract` RAISES on malformed JSON, so one unparseable payload made the query
+    throw and stalled the whole project's autopsy tick. It is simply not on the queue: the
+    other stale order still comes back and the tick still upgrades it."""
+    monkeypatch.setattr(autopsy, "records_autopsy", lambda wo, cfg: True)
+    bad = settled_with_a_session(store, write_transcript, "sess-bad-json")
+    good = settled_with_a_session(store, write_transcript, "sess-good-json")
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
+    store.seal_autopsy(bad["id"], "not json")
+
+    monkeypatch.setattr(autopsy, "PAYLOAD_VERSION", autopsy.PAYLOAD_VERSION + 1)
+
+    assert [o["id"] for o in
+            store.stale_autopsy_orders(autopsy.PAYLOAD_VERSION)] == [good["id"]]
+
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)
+
+    assert json.loads(store.get_work_order(good["id"])["autopsy_json"])[
+        "payload_v"] == autopsy.PAYLOAD_VERSION
+    assert store.get_work_order(bad["id"])["autopsy_json"] == "not json"
