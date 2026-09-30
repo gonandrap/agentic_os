@@ -34,9 +34,17 @@ SOURCE = "background-orphan"
 #: knew the job was there and dealt with it, so nothing was abandoned.
 KILL_TOOL = "KillShell"
 
-#: The tool that polls one. Its result carries a status; anything other than `running`
-#: means the worker saw the job end inside the turn.
-POLL_TOOL = "BashOutput"
+#: The tools that poll one. Their result carries a status; anything other than `running`
+#: means the worker saw the job end inside the turn. `TaskOutput` collects a backgrounded
+#: `Agent`, which §5 of
+#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md makes a
+#: legal thing for a lead to have running.
+POLL_TOOL = ("BashOutput", "TaskOutput")
+
+#: Every parameter spelling a poll or a kill names its subject with. Read tolerantly for
+#: `RUNNING`'s reason — UNVERIFIED against a live `TaskOutput` call, kn-df5574d3 — and
+#: none of them is this module's to choose.
+JOB_ID_PARAMS = ("bash_id", "shell_id", "task_id", "agent_id", "subagent_id")
 
 #: The status a `<task-notification>` or a poll reports while the job is still going.
 #: Every other value is an ending of some kind — completed, failed, killed — and all of
@@ -148,14 +156,12 @@ def _scan_calls(row: dict[str, Any], launched: dict[str, dict[str, Any]],
             continue
         if params.get("run_in_background"):
             launched[call_id] = params
-        # Both spellings, because the parameter is `bash_id` on the poll and `shell_id`
-        # on the kill and neither is this module's to choose.
-        job_id = str(params.get("bash_id") or params.get("shell_id") or "")
+        job_id = next((str(params[key]) for key in JOB_ID_PARAMS if params.get(key)), "")
         if not job_id:
             continue
         if name == KILL_TOOL:
             collected.add(job_id)
-        elif name == POLL_TOOL:
+        elif name in POLL_TOOL:
             polls[call_id] = job_id
 
 
@@ -166,17 +172,21 @@ def _scan_results(row: dict[str, Any], launched: dict[str, dict[str, Any]],
 
     The id is read from `toolUseResult.backgroundTaskId` — structured, and the same
     field the harness writes for every background launch — rather than parsed out of the
-    English sentence beside it.
+    English sentence beside it. A background `Agent` may report its id under another key
+    or none, so the launching `tool_use` id is the fallback: a launch with no reported id
+    is TRACKED rather than silently dropped (§5 of
+    docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md).
     """
     result = row.get("toolUseResult")
     outcome = result if isinstance(result, dict) else {}
     job_id = str(outcome.get("backgroundTaskId") or "")
     for block in usage.blocks_of(row, "tool_result"):
         call_id = str(block.get("tool_use_id") or "")
-        if job_id and call_id in launched:
+        if call_id in launched:
             params = launched[call_id]
-            jobs[job_id] = Job(job_id, str(params.get("command")
-                                           or params.get("description") or ""))
+            named = job_id or call_id
+            jobs[named] = Job(named, str(params.get("command")
+                                         or params.get("description") or ""))
         polled = polls.get(call_id)
         if polled and _says_stopped(_text_of(block.get("content")), outcome):
             collected.add(polled)
@@ -277,8 +287,10 @@ def jobs_of(payload: dict[str, Any]) -> list[Job]:
 
 
 #: What the OS tells the worker on the way back in. Says the three things the last turn
-#: got wrong — the job is dead, a turn is one-shot, run it in the foreground — and says
-#: who is speaking, because the user did not write it (spec §4).
+#: got wrong — the job is dead, a turn is one-shot, poll it inside the turn — and says
+#: who is speaking, because the user did not write it (spec §4). The correction is the
+#: poll rhythm and no longer the foreground wait: §6c of
+#: docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md.
 RESUME_NOTE = """\
 [jarvis] Before anything else: your last turn ended while it still had a background job \
 running, so that job was killed with the turn and produced nothing. Dead: {jobs}. \
@@ -286,7 +298,8 @@ Nobody typed this message — the OS detected it when the turn ended.
 
 A turn is one `claude -p` process. NOTHING wakes you when a background job finishes, so \
 backgrounding a command and ending the turn is the same as not running it. Re-run it in \
-the FOREGROUND and wait for it, however long it takes, and do not end a turn saying you \
+the background and POLL it inside this turn — `BashOutput` / `TaskOutput` every 3-4 \
+minutes until it reports finished — and do not end a turn saying you \
 will report when a run lands."""
 
 

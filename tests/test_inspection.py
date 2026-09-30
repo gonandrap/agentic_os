@@ -2425,6 +2425,74 @@ def test_an_os_turn_with_no_transcript_turn_is_reported_not_dropped(write_transc
     assert anatomy.as_dict()["unmatched_os_turns"] == [2, 3]
 
 
+# -- the measurement of the fix: a polled turn against a blocked one -------------------
+#
+# §9 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md. The
+# pair is the point: without the negative twin the positive proves only that the fixture
+# is short.
+
+SUITE_RUN = {"command": "uv run pytest tests/ -q", "run_in_background": True}
+CHECK_INS = (260.0, 500.0, 740.0, 980.0, 1220.0)
+
+
+def _polled_turn(write_transcript) -> str:
+    """Twenty minutes of background suite, collected every four minutes."""
+    rows = [prompt_row(0, "You are the worker agent for wo-1"),
+            assistant_row(10, "m0", write=45_000),
+            *tool_rows(20, 20.2, "t-launch", "Bash", SUITE_RUN)]
+    for i, at in enumerate(CHECK_INS):
+        # Each check-in is inside `TTL_5M` of the previous call, so its own delta write
+        # is a PREFIX_MISS at worst and never an expiry, and the read is charged at 0.1x.
+        rows.append(assistant_row(at - 1, f"m{i + 1}", write=25_000, read=150_000))
+        rows.extend(tool_rows(at, at + 1.0, f"t{i}", "BashOutput",
+                              {"bash_id": "b51fl7bhe"}))
+    return write_transcript("polled", rows)
+
+
+def _blocked_turn(write_transcript) -> str:
+    """The same twenty minutes as ONE foreground join, and nothing collected."""
+    return write_transcript("blocked", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m0", write=45_000),
+        # No `tool_result`: the join is still open at `now`, which is the shape every one
+        # of the 85 measured re-writes had.
+        {"type": "assistant", "timestamp": stamp(20),
+         "message": {"id": "m1", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "tool_use", "id": "t-join",
+                                  "name": "TaskOutput",
+                                  "input": {"description": "the suite"}}]}},
+        assistant_row(1220, "m2", write=193_139, read=0),
+    ])
+
+
+def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
+    """The fix, measured on the clock it is about: every gap is under `TTL_5M`, so no
+    write in the turn is a `TTL_EXPIRY` and no join is open long enough to alarm."""
+    anatomy = inspection.read_session(_polled_turn(write_transcript))
+    (turn,) = anatomy.turns
+
+    inside = [w for w in anatomy.writes if w.ts >= turn.started]
+    assert inside, "the fixture wrote nothing, so it measures nothing"
+    assert [w.cause for w in inside if w.cause == inspection.TTL_EXPIRY] == []
+    assert max(w.gap for w in inside) <= inspection.TTL_5M
+    assert [a.kind for a in inspection.alarms(
+        anatomy, InspectConfig(), now=CHECK_INS[-1] + 2, dispatched=0.0)] == []
+
+
+def test_the_same_twenty_minutes_as_one_join_still_produces_both(write_transcript):
+    """The negative twin. Same wall clock, one blocking call: the conversation is
+    re-sent at the write rate and the OS raises the join alarm that says so."""
+    anatomy = inspection.read_session(_blocked_turn(write_transcript))
+
+    expiries = [w for w in anatomy.writes if w.cause == inspection.TTL_EXPIRY]
+    assert [w.written for w in expiries] == [193_139]
+    assert expiries[0].gap > inspection.TTL_5M
+    raised = inspection.alarms(anatomy, InspectConfig(), now=1221.0, dispatched=0.0)
+    assert inspection.JOIN_ALARM in [a.kind for a in raised]
+
+
 def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
     """`ProjectStore.turn_starts` is the only new read §3 needs: `(seq, started_at)`,
     in seq order, for `read_session(turn_starts=...)`."""

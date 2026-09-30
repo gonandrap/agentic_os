@@ -201,6 +201,80 @@ def test_a_poll_that_finds_it_still_running_does_not_clear_it(root):
         "sess-1", since=now - 1, until=now + 60)] == ["b51fl7bhe"]
 
 
+def test_task_output_poll_collects_a_background_agent(root):
+    """§5 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md:
+    a backgrounded `Agent` is now a legal thing for a lead to have running, so collecting
+    one has to clear it. `POLL_TOOL` is a tuple and the id parameter is read tolerantly
+    (`JOB_ID_PARAMS`), for `RUNNING`'s reason — kn-df5574d3."""
+    now = time.time()
+    launch = [
+        {"type": "assistant", "timestamp": _stamp(now),
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": "toolu_a", "name": "Agent",
+              "input": {"subagent_type": "jarvis-implementer",
+                        "description": "write the tests",
+                        "run_in_background": True}}]}},
+        {"type": "user", "timestamp": _stamp(now + 0.1),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_a",
+              "content": "Task running in background with ID: task_9c2."}]},
+         "toolUseResult": {"backgroundTaskId": "task_9c2"}},
+    ]
+    poll = [
+        {"type": "assistant", "timestamp": _stamp(now + 1),
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": "toolu_t", "name": "TaskOutput",
+              "input": {"task_id": "task_9c2"}}]}},
+        {"type": "user", "timestamp": _stamp(now + 1.1),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_t",
+              "content": "<status>completed</status>\nhanded back"}]}},
+    ]
+    _transcript(root, "sess-1", launch)
+    assert [j.job_id for j in background.jobs_left_running(
+        "sess-1", since=now - 1, until=now + 60)] == ["task_9c2"]
+
+    _transcript(root, "sess-2", [*launch, *poll])
+    assert background.jobs_left_running("sess-2", since=now - 1, until=now + 60) == []
+
+
+def test_launch_without_a_reported_task_id_is_still_tracked(root):
+    """A background `Agent` may report its id under another key or none. The launching
+    `tool_use` id is the fallback, so the launch is tracked rather than silently
+    dropped."""
+    now = time.time()
+    _transcript(root, "sess-1", [
+        {"type": "assistant", "timestamp": _stamp(now),
+         "message": {"role": "assistant", "content": [
+             {"type": "tool_use", "id": "toolu_a", "name": "Agent",
+              "input": {"subagent_type": "jarvis-spec-writer",
+                        "description": "write the spec", "run_in_background": True}}]}},
+        {"type": "user", "timestamp": _stamp(now + 0.1),
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_a",
+              "content": "Task started."}]},
+         "toolUseResult": {"stdout": "", "stderr": ""}},
+    ])
+
+    jobs = background.jobs_left_running("sess-1", since=now - 1, until=now + 60)
+
+    assert [(j.job_id, j.command) for j in jobs] == [("toolu_a", "write the spec")]
+
+
+def test_resume_note_no_longer_prescribes_the_foreground(fleet):
+    """§6c: the note is the third copy of the superseded sentence and the text a nudged
+    worker reads first. The rhythm replaces it; every other word stays, including the
+    "nobody typed this message" attribution."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+    note = background.resume_note(store, _orphaned(store, wo["id"]))
+
+    assert "in the FOREGROUND and wait" not in note
+    assert "BashOutput" in note and "3-4 minutes" in note
+    assert "Nobody typed this message" in note
+    assert "NOTHING wakes you" in note
+
+
 def test_a_previous_turns_job_belongs_to_that_turn(root):
     """`said_in_session`'s rule one reader along: a session outlives the turn that
     stalled in it, and a job the LAST turn abandoned is already on the record."""
@@ -448,7 +522,9 @@ def test_a_resume_carries_the_dead_job_into_the_next_turn(fleet, fake_claude,
     note = [m for m in store.list_messages(wo["id"])
             if m["source"] == background.SOURCE]
     assert len(note) == 1
-    assert "b51fl7bhe" in note[0]["content"] and "FOREGROUND" in note[0]["content"]
+    # `BashOutput` and not FOREGROUND since §6c of the 2026-09-29 spec: the correction
+    # is the poll rhythm, because the foreground wait was the $52.
+    assert "b51fl7bhe" in note[0]["content"] and "BashOutput" in note[0]["content"]
     assert note[0]["status"] == "delivered"
     # It reaches the worker in the SAME turn as the user's words, ahead of them.
     prompt = store.latest_turn(wo["id"])["prompt"]

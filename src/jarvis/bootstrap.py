@@ -55,7 +55,11 @@ from .paths import project_state_dir
 # v12 = the crew (spec 2026-09-23-the-crew-a-worker-must-use.md SS5, SS6): the lead
 # delegates spec writing to `jarvis-spec-writer` and code to `jarvis-implementer`. The
 # division of labour is prose in the core contract, so it has to reach every managed repo.
-TEMPLATE_VERSION = 12
+# v13 = the poll rhythm (spec 2026-09-29-a-lead-must-not-block-past-its-cache.md SS6):
+# long work runs in the BACKGROUND and the lead polls it every 3-4 minutes, because the
+# foreground wait the contract used to prescribe cost ~$52 over 25 work orders (issue
+# 868). The prescription is prose in the core contract, so it has to reach every repo.
+TEMPLATE_VERSION = 13
 ASSETS = Path(__file__).parent / "assets"
 
 
