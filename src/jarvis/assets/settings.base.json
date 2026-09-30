@@ -10,8 +10,8 @@
   "hooks": {
     "PreToolUse": [
       {
-        "$comment": "The two Serena names are both listed because a plugin install produces the long prefix and `claude mcp add serena` the short one; Jarvis configures no MCP server, so it cannot know which, and a matcher naming a tool that does not exist is inert. Named exactly and never `mcp__.*`: the hook is a ~155ms process per matched call and Serena's symbol tools are called constantly. Issue #845, docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md SS4.",
-        "matcher": "Bash|Edit|Write|NotebookEdit|mcp__serena__search_for_pattern|mcp__plugin_serena_serena__search_for_pattern",
+        "$comment": "The two Serena names are both listed because a plugin install produces the long prefix and `claude mcp add serena` the short one; Jarvis configures no MCP server, so it cannot know which, and a matcher naming a tool that does not exist is inert. Named exactly and never `mcp__.*`: the hook is a ~155ms process per matched call and Serena's symbol tools are called constantly. Issue #845, docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md SS4. `Agent` and `Task` are named for the opposite arithmetic and it holds: the fleet made 272 foreground delegations in the measured period, so ~155ms x 272 = 42 seconds of hook process against $33.5 of cache writes — delegation is rare and expensive where a symbol lookup is frequent and cheap. Issue 868, docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md SS3b.",
+        "matcher": "Bash|Edit|Write|NotebookEdit|Agent|Task|mcp__serena__search_for_pattern|mcp__plugin_serena_serena__search_for_pattern",
         "hooks": [
           { "type": "command", "command": "__JARVIS_HOOK_CMD__", "timeout": 30 }
         ]
