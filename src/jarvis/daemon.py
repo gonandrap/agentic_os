@@ -901,6 +901,9 @@ class Daemon:
                     # this tick — the evidence a bill is built from starts expiring the
                     # moment the work stops.
                     self.seal_bills(project, store)
+                    # Immediately after it: the same argument, about the same evidence —
+                    # transcripts that start expiring the moment the work stops (§3).
+                    self.seal_autopsies(project, store)
                     # Before the invariants, because it is a fact about work that is
                     # still RUNNING rather than about state that has settled.
                     self.check_burning_turns(project, store)
@@ -1011,6 +1014,48 @@ class Daemon:
                 store.seal_bill(feature["id"], db.to_json(
                     {"error": "this bill could not be computed when the order settled"}),
                     feature=True)
+
+    def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Freeze the ANATOMY of every settled order that has none yet — §3 of
+        docs/specs/2026-09-27-order-autopsy-durability.md.
+
+        Beside `seal_bills`, on the same cadence, for the same reason and with the same
+        three properties: a bounded batch, ONE hoisted `usage.index_sessions()` for it, and
+        an ERROR payload on exception rather than an offender parked at the head of the
+        queue for ever. Its queue is its own: a bill that cannot be computed must not stop
+        an autopsy, which is why `unsealed_autopsy_orders` is not `unsealed_terminal_orders`.
+
+        A SECOND bounded queue follows it in the same step: seals whose payload predates
+        `autopsy.PAYLOAD_VERSION`. The WRITER owns re-sealing end to end, so a stale seal
+        repairs itself on a tick rather than waiting for a reader to happen by.
+
+        Every order in BOTH queues is gated on `autopsy.records_autopsy`, which ships
+        False — so until the level gate of §5 lands this step seals nothing for anybody.
+        """
+        from . import autopsy as autopsy_mod, db, usage
+
+        pending = [order for order in store.unsealed_autopsy_orders()
+                   if autopsy_mod.records_autopsy(order, project.observability)]
+        if pending:
+            index = usage.index_sessions()
+            for order in pending:
+                try:
+                    autopsy_mod.seal(project.name, project.path, order, index=index)
+                except Exception:  # noqa: BLE001 — an autopsy must never stall the tick
+                    log.exception("sealing the autopsy for %s failed", order["id"])
+                    store.seal_autopsy(order["id"], db.to_json(
+                        {"error":
+                         "this autopsy could not be read when the order settled"}))
+        # No second `usage.index_sessions()` is hoisted for the queue below: an upgrade
+        # re-derives from the STORED payload and never touches a transcript.
+        for order in store.stale_autopsy_orders(autopsy_mod.PAYLOAD_VERSION):
+            if not autopsy_mod.records_autopsy(order, project.observability):
+                continue
+            sealed = autopsy_mod.unseal(order)
+            if sealed is None:  # an ERROR payload: there is nothing to re-derive from
+                continue
+            # None back means the old seal stands — not a failure, and nothing to retry.
+            autopsy_mod._upgrade_seal(project.name, project.path, order, sealed)
 
     # -- 4. dispatch -------------------------------------------------------------
 

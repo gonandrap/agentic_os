@@ -1224,6 +1224,17 @@ ADDED_COLUMNS = {
         # column existed — and those are costed live, with the shortfall named.
         "bill_json": "TEXT",
         "bill_sealed_at": "REAL",
+        # THE SEALED AUTOPSY (`autopsy.to_seal`), written once the order reaches a
+        # terminal status: where its time and its context went, turn by turn. Sealed for
+        # the same reason the bill is — it is read from Claude Code's session transcripts
+        # and the subagent files beside them, all of which Claude Code prunes on its own
+        # schedule, so an order inspected later reports a clock that got SHORTER as its
+        # evidence aged. NULL means not sealed yet: an open order, one that settled before
+        # this column existed, or one the observability level did not record (§3 of
+        # docs/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
+        # no `feature_orders` twin: a feature's autopsy is read by reading its children's.
+        "autopsy_json": "TEXT",
+        "autopsy_sealed_at": "REAL",
         # The configuration in force when this work order was DISPATCHED — the id of a
         # row in `os_config_versions`. Frozen there beside model/effort/permission_mode
         # and for the same reason (dispatch.py), and NULL carries the same honesty as
@@ -2561,6 +2572,54 @@ class ProjectStore:
         rows = self.conn.execute(
             f"SELECT * FROM work_orders WHERE status IN ({marks}) AND bill_json IS NULL"
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def seal_autopsy(self, order_id: str, payload_json: str, *,
+                     at: float | None = None) -> None:
+        """Freeze one work order's autopsy.
+
+        Written once at settle, and re-written only by `autopsy._upgrade_seal`. Pass `at`
+        to preserve the original seal time through such an upgrade: WHEN the order settled
+        has not changed just because the payload was re-derived.
+        """
+        self.update_work_order(order_id, autopsy_json=payload_json,
+                               autopsy_sealed_at=at or db.now())
+
+    def unsealed_autopsy_orders(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Settled orders with no autopsy on record yet — oldest first, so a backlog drains.
+
+        ITS OWN QUERY and not `unsealed_terminal_orders`, whose predicate is `bill_json IS
+        NULL`: sharing one would let a bill that cannot be computed stop autopsies too (§3
+        of docs/specs/2026-09-27-order-autopsy-durability.md).
+        """
+        marks = ", ".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status IN ({marks}) AND autopsy_json IS"
+            " NULL ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def stale_autopsy_orders(self, version: int,
+                             limit: int = 5) -> list[dict[str, Any]]:
+        """Settled orders whose sealed autopsy predates `version` — oldest first, bounded.
+
+        The other half of §3 of docs/specs/2026-09-27-order-autopsy-durability.md: the
+        WRITER re-seals, so a stale payload repairs itself on a tick instead of waiting
+        for a reader to happen by.
+
+        ITS OWN QUERY for the same reason `unsealed_autopsy_orders` is: a bill that cannot
+        be computed must not stop an autopsy. The COALESCE is the idiom of
+        `budget._worker_row` and it is load-bearing twice over — a payload written before
+        `payload_v` existed has no such key, and `json_extract` on a non-JSON payload
+        yields NULL; both are version 1, and without the COALESCE both compare NULL and
+        are silently never upgraded.
+        """
+        marks = ", ".join("?" for _ in TERMINAL_STATUSES)
+        rows = self.conn.execute(
+            f"SELECT * FROM work_orders WHERE status IN ({marks})"
+            " AND autopsy_json IS NOT NULL"
+            " AND COALESCE(json_extract(autopsy_json, '$.payload_v'), 1) < ?"
+            " ORDER BY updated_at LIMIT ?",
+            (*TERMINAL_STATUSES, version, limit)).fetchall()
         return [dict(r) for r in rows]
 
     def sealed_bills_since(self, since: float) -> list[dict[str, Any]]:
