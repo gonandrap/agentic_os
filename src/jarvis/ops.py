@@ -8703,6 +8703,74 @@ def _spec_branch(path: Path, planner_wo: dict[str, Any] | None) -> str:
     return branch or evidence.base_ref(path) or "the default branch"
 
 
+def _record_spec_pull_request(path: Path, fo_id: str,
+                              planner_wo: dict[str, Any] | None,
+                              design_doc: str) -> None:
+    """The planner's spec pull request, onto its own record — or refuse the submission.
+
+    §2-§5 of
+    docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md.
+    `work_orders.pr_url` had two writers and the `jarvis fo plan` route reached neither,
+    so every planner that committed a spec was refused by the trailing `finish()` with a
+    remedy (`--pr`) that is not a flag of the command it was printed to (issue #822).
+
+    NON-DECLARATIVE, exactly as `gates._record_pull_request` writes it: `pr_url_recorded`
+    with no `finished {pr_url}` behind it makes `routes_on_pull_request` false, so the
+    planner settles `completed` instead of parking in `waiting_pr_merge` and putting every
+    spec pull request in front of a validation panel (ruling 877). `source` distinguishes
+    the two writers on the record and is read by no router.
+
+    Called BEFORE the first write, so a submission defect costs a revision and nothing
+    else — `submit_plan`'s own rule, and the half-state kn-03b735b4 records is what
+    refusing at the tail produced.
+    """
+    from . import github
+
+    if not planner_wo:
+        return
+    store = ProjectStore(path)
+    try:
+        recorded = store.get_work_order(planner_wo["id"])
+        if recorded is None or recorded.get("pr_url"):
+            return
+        work = authorship(store, planner_wo)
+        if not work.produced:
+            return
+        branch = work.branch or _spec_branch(path, planner_wo)
+        try:
+            pr_url = github.open_pull_request_for_branch(branch, path)
+        except github.GhUnavailable as e:
+            raise OpsError(
+                f"{fo_id}'s plan was not stored: the `gh` CLI is not installed where the "
+                f"OS can reach it, so the planner's pull request cannot be confirmed. "
+                f"Resubmit once `gh` works.\n{e}"
+            ) from e
+        except github.GitHubError as e:
+            raise OpsError(
+                f"{fo_id}'s plan was not stored: the pull request on `{branch}` could "
+                f"not be confirmed — {e.reason}. Nothing is being abandoned; resubmit "
+                f"once `gh` works."
+            ) from e
+        if not pr_url:
+            raise OpsError(
+                f"{fo_id}'s planner has committed `{design_doc}` on `{branch}`, and "
+                f"there is no OPEN pull request on that branch — so the spec would stay "
+                f"on the branch and nothing would ever land it. Push the branch and open "
+                f"a pull request, then run `jarvis fo plan` again: the plan is not stored "
+                f"until this passes.\n"
+                f"  git push -u origin {branch} && gh pr create --fill\n"
+                f"If the spec has already merged, reset the branch onto `origin/main` — "
+                f"confirm the files diff empty against it first — rather than opening a "
+                f"second pull request."
+            )
+        store.update_work_order(planner_wo["id"], pr_url=pr_url)
+        store.add_event(planner_wo["id"], "pr_url_recorded",
+                        {"pr_url": pr_url, "feature_order": fo_id,
+                         "source": "plan_submit"})
+    finally:
+        store.close()
+
+
 def _ask_plan_review(name: str, fo: dict[str, Any], plan: dict[str, Any],
                      planner_id: str, source: str, why: str) -> dict[str, Any]:
     """Ask for a review of this plan, closing whichever review it replaces.
@@ -8797,6 +8865,10 @@ def submit_plan(fo_id: str, doc: Any,
             f"resubmit:\n  - " + "\n  - ".join(spec_problems)
         )
 
+    # §3: after the committed-copy check, which is what proves a commit exists and names
+    # the branch, and before the first write.
+    _record_spec_pull_request(path, fo_id, planner_wo, plan["design_doc"])
+
     # The planner is who Neo's question hangs off: it is a real work order, it is who
     # receives a rejection, and it is what `jarvis neo list` can link back to. A feature
     # order whose planner was deleted still submits — the question just names the feature
@@ -8826,11 +8898,41 @@ def submit_plan(fo_id: str, doc: Any,
     if fo.get("plan_wo_id"):
         # The planner has no more to say until the review lands, and a work order left
         # `running` with no turn in flight is what the reconciler calls idle.
-        out["planner"] = finish(
-            fo["plan_wo_id"],
-            f"submitted a plan for {fo_id}: {len(plan['children'])} work orders",
-        )
+        summary = f"submitted a plan for {fo_id}: {len(plan['children'])} work orders"
+        try:
+            out["planner"] = finish(fo["plan_wo_id"], summary)
+        except OpsError as e:
+            # docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md
+            out["warning"] = _planner_unsettled(path, fo_id, fo["plan_wo_id"],
+                                                summary, e)
     return out
+
+
+def _planner_unsettled(path: Path, fo_id: str, planner_id: str, summary: str,
+                       refusal: OpsError) -> str:
+    """The plan IS stored; only the planner could not settle. Ruling 903, issue #822.
+
+    ONLY `OpsError` reaches here — every other exception propagates, because an
+    `OpsError` is a refusal this module wrote and anything else is a defect nobody has
+    read. The refusal to expect is `finish`'s open-gate one (`gate_still_open`): planners
+    do file merge gates (kn-ae871d91). The class being closed is the shared exit code —
+    an `error:` over a command whose every write succeeded is what the reporter retried
+    three times, asking a fresh Neo review question each time.
+    """
+    store = ProjectStore(path)
+    try:
+        ids = [str(a["id"]) for a in store.open_approvals(planner_id)]
+    finally:
+        store.close()
+    blocker = (f"gate request{'s' if len(ids) > 1 else ''} {', '.join(ids)} still open"
+               if ids else "it could not be settled")
+    return (
+        f"{fo_id}'s plan IS stored and queued for review — nothing here needs "
+        f"resubmitting, and resubmitting would ask Neo a second time about the same "
+        f"plan. Only its planner {planner_id} is unsettled: {blocker}. Clear that, then "
+        f"settle the planner:\n"
+        f"    jarvis wo finish {planner_id} --summary \"{summary}\"\n\n{refusal}"
+    )
 
 
 def refresh_plan_spec(fo_id: str,
