@@ -1,0 +1,64 @@
+{% import "_debug.html" as ui %}
+{# 2. CLEARING IT — `ops.fix`, §11 of docs/specs/2026-09-24-order-observability.md, and it
+   sits directly under the diagnosis because it acts on the blocker §6 just named. It adds
+   no authority: the registry in `remedies.py` is closed, the allow-list ships off, and
+   the button files a `self_heal` gate request a reviewer decides — it never acts.
+   Rendered off the same keys `cli._print_fix` prints, and this block authors no sentence:
+   the note, the remedy's `headline` and `blast`, what confirming does and the verdict on
+   a filed one are all the payload's.
+
+   THERE IS NO EMPTY LIST HERE, EVER (issue #227): `proposal`, `your_move` and the filed
+   note are each a value or absent, an absent one renders nothing at all, and `note` says
+   why in words. No disabled button with wording of the page's own. #}
+<section id="block-fix">
+<h2>Clearing it</h2>
+{{ ui.failed(fix) }}
+{% if fix.payload %}
+{% set f = fix.payload %}
+<div class="panel">
+  {# What the press just did, in `ops.fix`'s own sentence — the gate request's number,
+     that a reviewer decides it, and that the OS acts only once the gate opens. Never
+     rendered as done, and never text a visitor supplied: the route rebuilds it from the
+     id the redirect carried (`ops.fix_filed_notice`). #}
+  {% if fix_filed %}
+  <div class="row tone-ok"><span class="st tone-ok wrap"><span class="i">✓</span>{{ fix_filed }}</span></div>
+  {% endif %}
+  {{ ui.note(f.note) }}
+  {% if f.proposal %}
+  <div class="row">
+    <span class="kv" style="width: 120px;">the remedy</span>
+    <span class="grow mono">{{ f.proposal.remedy }} on {{ f.proposal.subject }}</span>
+  </div>
+  <div class="row">
+    <span class="kv" style="width: 120px;">what it does</span>
+    <span class="grow">{{ f.proposal.headline }}</span>
+  </div>
+  <div class="row">
+    <span class="kv" style="width: 120px;">what it touches</span>
+    <span class="grow">{{ f.proposal.blast }}</span>
+  </div>
+  <div class="row">
+    <span class="kv" style="width: 120px;">asked to do</span>
+    <span class="grow">{{ f.proposal.argument }}</span>
+  </div>
+  <div class="row">
+    <div class="grow">
+      <p class="sub">{{ f.proposal.approving }}</p>
+      <form method="post" action="/wo/{{ project }}/{{ wo.id }}/fix">
+        <button title="File a gate request for this remedy — a reviewer decides it">
+          File this gate request</button>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+  {# A COMMAND FOR THE USER, labelled as one: what `remedies.py` excludes is not an act
+     the OS offers under another name. #}
+  {% if f.your_move %}
+  <div class="row">
+    <code style="width: 46%;">{{ f.your_move.detail }}</code>
+    <span class="grow sub">{{ f.your_move.note }}</span>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+</section>

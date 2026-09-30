@@ -792,6 +792,24 @@ def build_parser() -> argparse.ArgumentParser:
     wy.add_argument("wo_id")
     wy.add_argument("--project")
 
+    fx = wo.add_parser("fix", help="clear the blocker `jarvis wo why` just named: the OS "
+                                   "matches it against the remedies it has, and says what "
+                                   "one of them would do. Nothing is done without "
+                                   "--confirm, and a confirmed fix is filed for a "
+                                   "reviewer to approve before the OS acts")
+    fx.add_argument("wo_id")
+    fx.add_argument("--project")
+    fx.add_argument("--remedy", help="name the remedy instead of letting the blocker "
+                                     "choose it — `file_work_order` is reachable only "
+                                     "this way, and only with --argument")
+    fx.add_argument("--argument", help="what the remedy is asked to do: the message a "
+                                      "nudge carries, or the title and brief of the work "
+                                      "order `file_work_order` files")
+    fx.add_argument("--confirm", action="store_true",
+                    help="file it. A reviewer decides, and the OS acts only after the "
+                         "gate opens")
+    fx.add_argument("--json", action="store_true")
+
     # feature orders -------------------------------------------------------------------
     # Parallel to `wo` on purpose: a user who knows the work-order surface should not
     # have to learn a second grammar to use the one above it.
@@ -3040,6 +3058,13 @@ def cmd_wo(args: argparse.Namespace) -> int:
             _print(diagnosis, True)
         else:
             _print_diagnosis(diagnosis)
+    elif args.wo_cmd == "fix":
+        proposal = ops.fix(args.wo_id, project_name=args.project, remedy=args.remedy,
+                           argument=args.argument, confirm=args.confirm)
+        if args.json:
+            _print(proposal, True)
+        else:
+            _print_fix(proposal)
     return 0
 
 
@@ -3116,6 +3141,44 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         print(f"  {command['command']}\n      {command['why']}")
     for refusal in d["refusals"]:
         print(f"  not offered: {refusal}")
+
+
+def _print_fix(f: dict[str, Any]) -> None:
+    """`jarvis wo fix` for a person — A RENDERER AND NOTHING ELSE, `_print_diagnosis`'s rule.
+
+    Every sentence below is `ops.fix`'s: the blocker, the note, the remedy's own `headline`
+    and `blast`, what confirming does, the verdict on a filed one. Nothing is derived here
+    and nothing is re-worded — a terminal reader and a `--json` consumer are looking at one
+    reading of one record.
+
+    There is no empty list to print, ever: `remedy`, `proposal`, `your_move` and `filed`
+    are each a value or None, and a None prints nothing at all while `note` says why in
+    words (issue #227).
+    """
+    print(f"{f['wo_id']} — {f['title']}  ({f['project']})")
+    print(f"  {f['status']}")
+    print(f"\nwaiting on: {f['blocker']['what']} — {f['blocker']['detail']}")
+    print(f"\n{f['note']}")
+
+    proposal = f["proposal"]
+    if proposal:
+        print(f"\nthe `{proposal['remedy']}` remedy on {proposal['subject']}:")
+        print(f"  what it does: {proposal['headline']}")
+        print(f"  what it touches, and what it cannot undo: {proposal['blast']}")
+        print(f"  what it is asked to do: {proposal['argument']}")
+        print(f"  {proposal['approving']}")
+
+    move = f["your_move"]
+    if move:
+        print(f"\n  {move['detail']}\n      {move['note']}")
+
+    filed = f["filed"]
+    if filed:
+        print(f"\n{filed['note']}")
+        if filed["question"]:
+            print(f"  Neo question {filed['question']} carries it to a reviewer")
+        if filed["unreachable"]:
+            print(f"  {filed['reason']}")
 
 
 FO_ICON = {"pending": "⏳", "planning": "🧭", "plan_review": "👀", "executing": "🟢",
