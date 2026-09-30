@@ -76,16 +76,19 @@ def _start(fleet, wo_id: str, mode: str = "silent") -> None:
     worker_session.start(store, fleet["project"], store.get_work_order(wo_id), "go")
 
 
-def _dead_turn(fleet, wo_id: str, settle, said: str = "") -> dict:
+def _dead_turn(fleet, wo_id: str, settle, said: str = "", during=None) -> dict:
     """A real turn through the transport whose process wrote nothing at all.
 
     The REAP is what has to harvest — nothing here is called by hand. `said` is the
     worker's last words as the `Stop` hook recorded them, which is the only place they
-    exist for a turn that wrote no result.
+    exist for a turn that wrote no result. `during(turn)` runs after the launch and
+    before the reap: what the turn itself did, in the window the harvest reads (§2).
     """
     _start(fleet, wo_id)
     if said:
         fleet["store"].add_event(wo_id, "hook:Stop", {"last_assistant_message": said})
+    if during is not None:
+        during(fleet["store"].latest_turn(wo_id))
     assert settle(fleet["store"]), "the turn never settled"
     return fleet["store"].latest_turn(wo_id)
 
@@ -94,6 +97,20 @@ def _harvest_payload(store, wo_id: str) -> dict:
     events = store.events_of_kind(wo_id, timeline.TURN_HARVESTED)
     assert len(events) == 1, f"expected one harvest, got {len(events)}"
     return json.loads(events[0]["payload"])
+
+
+def _last_harvest_payload(store, wo_id: str) -> dict:
+    events = store.events_of_kind(wo_id, timeline.TURN_HARVESTED)
+    assert events, "no harvest was written"
+    return json.loads(events[-1]["payload"])
+
+
+def _turn_started(store, wo_id: str, seq: int) -> dict:
+    for event in store.events_of_kind(wo_id, "turn_started"):
+        payload = json.loads(event["payload"])
+        if payload.get("seq") == seq:
+            return payload
+    raise AssertionError(f"no turn_started for seq {seq}")
 
 
 # -- 1. what the reap reads off disk ---------------------------------------------------
@@ -113,7 +130,9 @@ def test_harvest_records_last_message_and_commits(fleet, settle_turns):
     assert payload["authored"]["branch"] == f"worktree-{wo['id']}"
     assert payload["authored"]["commits"] == 1
     assert payload["authored"]["dirty"] == []
-    assert payload["since"] in ("turn", "order")
+    # Committed BEFORE the launch, so `head..HEAD` is empty: the turn itself made none.
+    assert payload["since"] == "turn"
+    assert payload["turn_commits"] == []
     assert payload["unreadable"] == ""
     # §5: ONE render contract, and both surfaces read it.
     state = ops.harvest_state(fleet["store"], fleet["store"].get_work_order(wo["id"]))
@@ -122,6 +141,51 @@ def test_harvest_records_last_message_and_commits(fleet, settle_turns):
         f"/wo/proj_a/{wo['id']}")
     assert page.status_code == 200
     assert "What the OS saved from the last turn" in page.text
+
+
+def test_turn_commits_are_scoped_to_the_launch_sha(fleet, settle_turns):
+    """§2: `turn_started.head` scopes the reading to THIS turn, not the whole order."""
+    wo = _order(fleet, code="exporter")
+    wt = wo["worktree_path"]
+    head_before = _git(wt, "rev-parse", "HEAD").strip()
+
+    def commit_in_the_turn(_turn):
+        (wt / "csv_path.py").write_text("def csv_path():\n    return 3\n")
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-qm", "add csv_path")
+
+    turn = _dead_turn(fleet, wo["id"], settle_turns, during=commit_in_the_turn)
+    after = _git(wt, "rev-parse", "HEAD").strip()
+
+    assert _turn_started(fleet["store"], wo["id"], turn["seq"])["head"] == head_before
+    payload = _harvest_payload(fleet["store"], wo["id"])
+    assert payload["since"] == "turn"
+    assert len(payload["turn_commits"]) == 1
+    assert after.startswith(payload["turn_commits"][0])
+    # The whole branch is two commits; only one of them was made in the turn.
+    assert payload["authored"]["commits"] == 2
+
+
+def test_turn_commits_fall_back_to_the_order_span(fleet, settle_turns):
+    """§2: no `head` on the record — a turn launched before this shipped — so the span
+    is `base..HEAD` and the payload says `order` rather than guessing."""
+    wo = _order(fleet, code="exporter")
+    wt = wo["worktree_path"]
+    store = fleet["store"]
+
+    def commit_and_forget_the_head(turn):
+        (wt / "csv_path.py").write_text("def csv_path():\n    return 3\n")
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-qm", "add csv_path")
+        # `_head_at_launch` reads the LAST `turn_started` for the seq, so this one wins.
+        store.add_event(wo["id"], "turn_started", {"seq": turn["seq"]})
+
+    _dead_turn(fleet, wo["id"], settle_turns, during=commit_and_forget_the_head)
+
+    payload = _harvest_payload(store, wo["id"])
+    assert payload["since"] == "order"
+    assert len(payload["turn_commits"]) == 2
+    assert payload["authored"]["commits"] == 2
 
 
 def test_harvest_checkpoints_uncommitted_work(fleet, settle_turns):
@@ -235,6 +299,46 @@ def test_harvest_skips_checkpoint_during_rebase(fleet, settle_turns):
     assert "merge" in payload["checkpoint_skipped"]
     assert payload["authored"]["commits"] == 1
     assert payload["authored"]["dirty"] == ["halfway.py"]
+
+
+def test_refused_checkpoint_commit_is_recorded(fleet, settle_turns):
+    """§7: git refuses the commit — the fixed reason is recorded and the rest stands."""
+    wo = _order(fleet, code="exporter", dirty="halfway")
+    heads = fleet["path"] / ".git" / "refs" / "heads"
+    heads.chmod(0o500)  # no ref lock can be made here, so the commit cannot land
+    try:
+        _dead_turn(fleet, wo["id"], settle_turns, said="Half of the CSV path is written.")
+    finally:
+        heads.chmod(0o700)
+
+    payload = _harvest_payload(fleet["store"], wo["id"])
+    assert payload["checkpoint"] == ""
+    assert payload["checkpoint_skipped"] == (
+        "git refused the checkpoint commit — see the daemon log")
+    assert payload["said"] == "Half of the CSV path is written."
+    assert payload["authored"]["commits"] == 1
+    assert payload["authored"]["dirty"] == ["halfway.py"]
+    assert payload["empty"] is False
+
+
+def test_second_harvest_skips_an_already_checkpointed_head(fleet, settle_turns):
+    """§3: the trailer is the machine handle — a harvest that reads a HEAD already
+    carrying this turn's checkpoint never commits a second one."""
+    wo = _order(fleet, dirty="halfway")
+    wt = wo["worktree_path"]
+    store = fleet["store"]
+    turn = _dead_turn(fleet, wo["id"], settle_turns)
+    first = _harvest_payload(store, wo["id"])
+    assert first["checkpoint"]
+
+    (wt / "more.py").write_text("def more():\n    return 4\n")
+    head_before = _git(wt, "rev-parse", "HEAD").strip()
+    harvest.write(store, store.get_work_order(wo["id"]), turn, said="")
+
+    payload = _last_harvest_payload(store, wo["id"])
+    assert payload["checkpoint"] == ""
+    assert payload["checkpoint_skipped"] == "this turn was already checkpointed"
+    assert _git(wt, "rev-parse", "HEAD").strip() == head_before
 
 
 def test_no_worktree_records_unreadable(fleet, settle_turns):

@@ -128,7 +128,6 @@ def shoot(name: str, wo_id: str) -> Path:
         harvest = page.locator("h2#harvest")
         harvest.scroll_into_view_if_needed()
         page.wait_for_timeout(200)
-        top = harvest.bounding_box()
         # The retry panel is the point of the shot: the clip runs to the bottom of the
         # control, so the two are provably adjacent rather than two separate crops.
         button = page.locator("button", has_text="Retry this order").first
