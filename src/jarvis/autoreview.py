@@ -171,6 +171,15 @@ HELD_CONFIRMING = "confirming"
 HELD_OBJECTION_IN_FLIGHT = "objection_in_flight"
 HELD_EVIDENCE_SECRET = "evidence_secret"
 
+#: THE STATUS EACH PASS ACTS IN, and the conditions below read these rather than a literal
+#: of their own (2026-09-27-a-stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §6).
+#: `ops._panel_hold_is_stale` reads `REVIEW_PASS_STATUSES` to decide when a recorded
+#: `HELD_STATUS` has stopped being true — the order is now in a state a pass acts in — so
+#: the two surfaces share the pair structurally and no second list can drift from it.
+REVIEW_PASS_STATUS = "needs_review"
+EARLY_PASS_STATUS = "running"
+REVIEW_PASS_STATUSES = (REVIEW_PASS_STATUS, EARLY_PASS_STATUS)
+
 #: `provisional_verdict` values §5 writes and this module reads back. Spelled here so
 #: this module stays pure — `project_store.PROVISIONAL_VERDICTS` is the same two words
 #: and asserts them at the write.
@@ -845,7 +854,7 @@ def decide(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "this project has not given the OS permission to decide its "
                      "assumptions (`validation.auto_review`)")
     status = str(wo.get("status") or "")
-    if status != "needs_review":
+    if status != REVIEW_PASS_STATUS:
         return _held(HELD_STATUS,
                      f"the work order is {status or 'in no status'}, not waiting on a "
                      f"review")
@@ -1004,7 +1013,7 @@ def decide_early(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
                      "this project has not given the OS permission to decide its "
                      "assumptions (`validation.auto_review`)")
     status = str(wo.get("status") or "")
-    if status != "running":
+    if status != EARLY_PASS_STATUS:
         return _held(HELD_STATUS,
                      f"the work order is {status or 'in no status'}, not running — there "
                      f"is no worker to tell")

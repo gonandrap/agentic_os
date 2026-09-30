@@ -669,9 +669,10 @@ class Reader:
                     f"{_secs(now - span.started)}")
         if state == GENERATING:
             # THE BLIND SPOT, in the spec's own words: a row lands when a message
-            # completes, so a model mid-answer is invisible and the only honest report is
-            # the silence and its length.
-            return f"a turn is in flight and {silence}"
+            # completes, so a model mid-answer is invisible. The silence is now NAMED as
+            # well as reported — spec of 2026-09-27 §1, `inspection.awaiting_note`.
+            return (f"awaiting the model (request in flight, no block completed); "
+                    f"{silence}")
         if state == SETTLED:
             return ("this work order has settled — the last frame, not a live reading; "
                     + silence)

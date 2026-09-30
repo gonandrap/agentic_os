@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, invariants, ops, specs, uilog, wiring
+from .. import bill, fleet, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -33,6 +33,7 @@ from ..project_store import (
     validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
+from . import markdown
 
 TEMPLATES = Path(__file__).parent / "templates"
 
@@ -1012,13 +1013,64 @@ def create_app() -> FastAPI:
             states = ops.state_durations(store, fo_id=fo_id).as_dict()
         finally:
             store.close()
+        # EACH PLAN ROW'S FRAGMENT, RESOLVED SERVER-SIDE — §5(c). Jinja would need the
+        # number-or-substring matching rule spelled a second time in HTML, where it
+        # could be neither unit-tested nor reused by the CLI; `markdown.anchor_for` is
+        # the one resolver, here as on a child's own page.
+        doc = str((detail.get("plan") or {}).get("design_doc_content") or "")
+        child_anchors = {
+            c["key"]: markdown.anchor_for(doc, str(c.get("spec_section") or "")) or ""
+            for c in (detail.get("plan") or {}).get("children", [])
+            if c.get("spec_section")
+        }
         return render(request, "feature_order.html", fo=detail, project=detail["project"],
-                      states=states,
+                      states=states, child_anchors=child_anchors,
                       cap=ops.feature_order_budget(fo_id, detail["project"]),
                       # Already on `detail` for `jarvis fo show`; passed separately so
                       # the template reads the same name on both pages.
                       issues=detail["issues"],
                       validation=validation, error=error)
+
+    @app.get("/spec/{name}/{fo_id}", response_class=HTMLResponse)
+    def spec_page(request: Request, name: str, fo_id: str):
+        """THE FEATURE'S SPEC, RENDERED — §1 of
+        docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md.
+
+        Keyed on the FEATURE, never on a work order: a planner, a manager and nine
+        children would otherwise give one document ten URLs, and an anchor is only
+        useful if everyone links to the same one. A child's page gets a FRAGMENT into
+        this page, resolved when the link is built.
+
+        Three outcomes, all 200 and none a 500 — the document, a plan stored before the
+        OS snapshotted spec text, or a feature with no plan at all. `specs.plan_of`
+        returns `{}` for the last two, which is `specs.py`'s stated degradation contract.
+        """
+        paths = ops.registered_project_paths()
+        if name not in paths:
+            return render(request, "error.html",
+                          message=f"no project named {name!r} is registered")
+        store = ProjectStore(paths[name])
+        try:
+            plan = specs.plan_of(store, fo_id)
+            try:
+                fo = store.get_feature_order(fo_id)
+            except KeyError:
+                fo = {}
+        finally:
+            store.close()
+        content = str(plan.get("design_doc_content") or "")
+        repo_path = str(plan.get("design_doc") or "")
+        source = str(plan.get("design_doc_source") or "")
+        # The blob link only once it can be DERIVED, and never from a branch: a 404 on
+        # GitHub from a URL the OS assembled reads as the spec having been deleted (§6).
+        blob = (github.blob_url(paths[name], repo_path)
+                if content and repo_path and source and not source.startswith("branch ")
+                else None)
+        return render(request, "spec.html", project=name, fo_id=fo_id,
+                      title=str(fo.get("title") or ""),
+                      status=str(fo.get("status") or ""),
+                      repo_path=repo_path, source=source, blob_url=blob,
+                      body=markdown.render(content) if content else "")
 
     @app.get("/io/{name}/{io_id}", response_class=HTMLResponse)
     def improvement_order(request: Request, name: str, io_id: str, error: str = ""):
@@ -1142,6 +1194,10 @@ def create_app() -> FastAPI:
             # to the template: pasting it here would re-create the duplication the whole
             # change removed — the pointer is the point.
             spec = specs.spec_of(store, wo)
+            # WHERE THAT SPEC CAN BE READ — §5(a). A second, narrow projection:
+            # `spec_of` answers None for a planner by design and keeps doing so,
+            # and a planner's page is the case that had nothing at all.
+            spec_link = specs.spec_link(store, wo)
             # How long it has been where it is — the same document `jarvis wo show`
             # carries, rendered by `_states.html` (spec §7).
             states = ops.state_durations(store, wo_id=wo_id).as_dict()
@@ -1162,7 +1218,8 @@ def create_app() -> FastAPI:
                       seen=invariants.acknowledged(wo),
                       cap=cap,
                       pause=pause, waiting=waiting, status_label=label,
-                      validation=validation, spec=spec, auto_merge=auto_merge,
+                      validation=validation, spec=spec, spec_link=spec_link,
+                      auto_merge=auto_merge,
                       merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,

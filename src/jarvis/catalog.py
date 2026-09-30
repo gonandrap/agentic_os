@@ -610,6 +610,13 @@ DEFAULT_INSPECT_ALARM_TURN_MINUTES = 60
 #: fifteen minutes is still two orders of magnitude outside a slow start.
 DEFAULT_INSPECT_ALARM_STALLED_MINUTES = 15
 
+#: A request in flight this long with no completed content block — `slow-model-response`,
+#: docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §2.
+#: MEASURED: the event that produced the spec was 4,057 output tokens in 19 minutes at
+#: ~3.5 tok/s, so a threshold below the hour would re-raise the very case the spec exists
+#: to stop reporting. On the ACTIVE clock, like the two above it.
+DEFAULT_INSPECT_ALARM_AWAITING_MINUTES = 60
+
 #: A blocking join still open after this long. THE ONLY THRESHOLD HERE THAT IS PRINCIPLED
 #: RATHER THAN EMPIRICAL: it is the 5-minute cache TTL itself, past which the prefix is
 #: certainly cold and the wait will be paid for a second time as a re-write. Fires on 2%.
@@ -754,6 +761,7 @@ class InspectConfig:
     quote_chars: int = DEFAULT_INSPECT_QUOTE_CHARS
     alarm_turn_minutes: int = DEFAULT_INSPECT_ALARM_TURN_MINUTES
     alarm_stalled_minutes: int = DEFAULT_INSPECT_ALARM_STALLED_MINUTES
+    alarm_awaiting_minutes: int = DEFAULT_INSPECT_ALARM_AWAITING_MINUTES
     alarm_join_seconds: int = DEFAULT_INSPECT_ALARM_JOIN_SECONDS
     alarm_write_tokens: int = DEFAULT_INSPECT_ALARM_WRITE_TOKENS
     alarm_parked_minutes: int = DEFAULT_INSPECT_ALARM_PARKED_MINUTES
@@ -1509,6 +1517,8 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                                        base.alarm_turn_minutes)),
         alarm_stalled_minutes=int(raw.get("alarm_stalled_minutes",
                                           base.alarm_stalled_minutes)),
+        alarm_awaiting_minutes=int(raw.get("alarm_awaiting_minutes",
+                                           base.alarm_awaiting_minutes)),
         alarm_join_seconds=int(raw.get("alarm_join_seconds",
                                        base.alarm_join_seconds)),
         alarm_write_tokens=int(raw.get("alarm_write_tokens",

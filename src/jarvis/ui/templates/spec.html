@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}spec — {{ fo_id }} — Jarvis{% endblock %}
+{% block content %}
+{# THE FEATURE'S ONE ARTIFACT, READABLE — §1 of
+   docs/superpowers/specs/2026-09-28-a-feature-spec-you-can-open.md. The document
+   rendered is always the one the OS HOLDS, so it works before any pull request exists;
+   every other surface links here with a fragment rather than rendering a second copy. #}
+<h2>📄 {{ repo_path or 'the spec' }}</h2>
+<p class="sub">
+  <a href="/fo/{{ project }}/{{ fo_id }}">{{ fo_id }}</a>
+  {% if title %} — {{ title }}{% endif %}
+  · <a href="/project/{{ project }}">{{ project }}</a>
+</p>
+
+{% if body %}
+<p class="sub mono">
+  {# Verbatim, in `landing.committed_text`'s own words: re-wording them here would make
+     this page and the Neo question describe one snapshot two ways. And NEVER invented —
+     a plan stored before the OS recorded the revision says exactly that (§4). #}
+  {{ repo_path }} — {{ source if source else 'the revision this text came from was not recorded' }}
+  {% if blob_url %}· <a href="{{ blob_url }}">view on GitHub →</a>{% endif %}
+</p>
+<div class="panel" style="padding: 8px 20px 20px;">
+  {# THE ONLY `| safe` this page has, and `ui.markdown` is what licenses it: the whole
+     document is `html.escape`d BEFORE any tokenising, so the only markup here is markup
+     that module emitted. There is no sanitiser and nothing to bypass (§2). #}
+  {{ body | safe }}
+</div>
+{% elif repo_path %}
+<p class="kv">This plan was stored before the OS snapshotted spec text, so the document
+  itself is not held — only its path, <span class="mono">{{ repo_path }}</span>.</p>
+{% else %}
+<p class="kv">{{ fo_id }} is <strong>{{ status or 'not a feature order this project has' }}</strong>
+  and holds no spec: a feature's document is snapshotted when its planner submits a plan.</p>
+{% endif %}
+
+<p class="sub"><a href="/fo/{{ project }}/{{ fo_id }}">← back to the feature order</a></p>
+{% endblock %}
