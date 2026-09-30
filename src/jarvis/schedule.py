@@ -139,7 +139,7 @@ def job(job_id: str) -> ScheduledJob:
 # -- who owns the OS ---------------------------------------------------------------------
 
 
-def os_owner(projects: Iterable[tuple[str, Path]]) -> str | None:
+def os_owner(projects: Iterable[tuple[str, Path]], *, fallback: bool = True) -> str | None:
     """Which project runs the fleet-wide OS checks — exactly one, or none at all.
 
     The project whose directory contains the `jarvis` package that is RUNNING: in dev
@@ -150,7 +150,10 @@ def os_owner(projects: Iterable[tuple[str, Path]]) -> str | None:
     Falls back to the first project in catalog order when no project contains the
     install (a pip-installed OS driving projects that are not it). The fallback is
     arbitrary but it is DETERMINISTIC AND UNIQUE, which is the property that matters:
-    the checks still run somewhere, and they still run once.
+    the checks still run somewhere, and they still run once. It answers "who runs the
+    fleet checks" and NEVER "which project IS the OS" — an arbitrary project must not
+    be forced to run the OS's own health sweep, nor refused a config write. Callers
+    asking the second question pass `fallback=False` and get None.
     """
     pkg = Path(__file__).resolve().parent
     first: str | None = None
@@ -162,7 +165,7 @@ def os_owner(projects: Iterable[tuple[str, Path]]) -> str | None:
                 return name
         except (OSError, ValueError):   # unresolvable path: not the owner
             continue
-    return first
+    return first if fallback else None
 
 
 # -- the cadence -------------------------------------------------------------------------

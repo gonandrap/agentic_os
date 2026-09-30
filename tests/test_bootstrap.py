@@ -415,6 +415,32 @@ def test_an_untracked_operation_md_is_still_refreshed(project):
     assert f"template v{TEMPLATE_VERSION}" in op.read_text().split("\n", 1)[0]
 
 
+def test_the_template_does_not_prescribe_the_foreground_for_long_work(project):
+    """§6 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md,
+    on the fourth copy of the superseded sentence. OPERATION.md is what a worker reads if
+    it goes LOOKING, so a foreground wait left here contradicts the hook that refuses one
+    — and the v13 bump would ship the contradiction to every managed repo.
+
+    Pinned on the TEMPLATE, not the render, because the template is what an editor
+    touches next.
+    """
+    from jarvis.bootstrap import ASSETS
+
+    template = (ASSETS / "OPERATION.md.tmpl").read_text()
+
+    assert "runs in the *foreground* and you wait for it" not in template
+    assert "in the FOREGROUND and wait" not in template
+    for rhythm in ("run_in_background", "BashOutput", "3-4 minutes", "240 seconds",
+                   "uncollected"):
+        assert rhythm in template, rhythm
+    # Still true, and still there: nothing about backgrounding changes what starts the
+    # next turn, or what a turn ending on a promise costs.
+    assert "Exactly three things start your next turn" in template
+    assert "I'll pick this up when the background run finishes" in template
+    # …and the rendered contract carries it, which is the copy a worker reads.
+    assert "3-4 minutes" in _rendered_operation(project)
+
+
 def test_this_repos_committed_operation_md_matches_its_generator():
     """The drift that made issue 279: the committed contract sat at template v7 while
     the generator rendered v11, so every `jarvis start` rewrote it and nothing ever

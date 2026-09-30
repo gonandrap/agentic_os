@@ -53,7 +53,11 @@ PROJECT_PLACEHOLDER = "<project>"
 #: SS6), which passes the same test: a lead that does not know it has seats edits the tree
 #: itself, and the hook refuses the call — the confusion happens on the FIRST edit, before
 #: any section could be fetched.
-CORE_BUDGET_CHARS = 3800
+#: Raised again, by the same admission test, for the poll rhythm (spec
+#: 2026-09-29-a-lead-must-not-block-past-its-cache.md SS6a): a lead that does not know
+#: long work is BACKGROUNDED and polled hits the refusal on its first long call and pays
+#: a mid-turn cache re-write, both before any section could be fetched.
+CORE_BUDGET_CHARS = 3900
 
 
 # -- the git briefing, replacing Claude Code's own ---------------------------------------
@@ -263,12 +267,14 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             f"command (full protocol: `jarvis brief gates --wo {wo_id}`).",
         ] if gate_names else []),
         f"- **A turn is one-shot and NOTHING wakes you when a background job "
-        f"ends.** You are one `claude -p`, NOT an interactive session: the "
-        f"background-task notification you remember DOES NOT EXIST here, and "
-        f"ending the turn kills whatever you left running. Only a Neo answer, a "
-        f"gate verdict or a user message starts the next turn. Already backgrounded "
-        f"something? It is already lost — re-run it in the FOREGROUND and wait. "
-        f"Never end a turn saying you will be re-invoked when the run finishes.",
+        f"ends.** Long work — a whole-suite run, a CI watcher, a "
+        f"`jarvis-implementer` or `jarvis-spec-writer` seat — runs in the BACKGROUND "
+        f"(`run_in_background: true`); the FOREGROUND call is REFUSED. Collect it "
+        f"with `BashOutput`/`TaskOutput` every 3-4 minutes, never one call past 240 "
+        f"seconds: your prompt cache lives 5 minutes and a call after it re-sends "
+        f"this whole conversation. Nothing else may be backgrounded, and never END a "
+        f"turn with a task uncollected — the Stop hook refuses it — or claim you "
+        f"will be re-invoked.",
         f"- **Point, do not explain; say each thing ONCE.** A code comment is one "
         f"line citing the spec that explains it (`docs/superpowers/specs/`), not "
         f"the explanation. A PR body hints; the diff explains. Never restate what "
@@ -527,10 +533,21 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         "Exactly three things start your next turn — an answer to `jarvis wo ask`, "
         "a verdict on a gate you requested, a message the user sends you.",
         "",
-        "So work that outlasts one command runs in the FOREGROUND and you wait for "
-        "it, or you split it into pieces that each fit inside a turn. If it fits "
-        "in neither, say so and ask — a turn that ends on a question is a turn the "
-        "OS understands. A turn that ends on \"I'll pick this up when the "
+        "So work that outlasts one command runs in the BACKGROUND and you POLL it: "
+        "`run_in_background: true`, then `BashOutput` / `TaskOutput` every 3-4 "
+        "minutes until it reports finished, and no single call blocking longer than "
+        "240 seconds. The reason is the clock, not taste — your prompt cache lives "
+        "5 minutes, so a call more than 300 seconds after the previous one re-sends "
+        "this whole conversation at the 1.25x write rate, where a check-in inside "
+        "the window is a 0.1x read. This is the ONLY work that may be backgrounded: "
+        "a whole-suite test run, a CI watcher, a `jarvis-implementer` or "
+        "`jarvis-spec-writer` seat, a long wait. The FOREGROUND call is refused for "
+        "those and backgrounding anything else still is. You may also split it "
+        "into pieces that each fit inside a turn. If it fits in neither, say so and "
+        "ask — a turn that ends on a question is a turn the "
+        "OS understands. NEVER end a turn with a task uncollected: the Stop hook "
+        "refuses it, and ending kills the task. A turn that ends on \"I'll pick this "
+        "up when the "
         "background run finishes\" is the work order abandoned mid-task, and the "
         "user is flagged for it.",
     ]

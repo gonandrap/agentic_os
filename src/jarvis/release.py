@@ -71,6 +71,28 @@ log = logging.getLogger("jarvisd.release")
 UI_UNIT = "jarvis-ui.service"
 DAEMON_UNIT = "jarvis.service"
 
+#: The key under a release work order's `metadata` that says "this order exists to ship
+#: fixes, and these are the ones it is shipping". HERE rather than on `Daemon`, whose
+#: `RELEASE_BATCH_KEY` is now an alias: `ops` needs the predicate and importing `daemon`
+#: at module level would be a cycle (2026-09-29 spec §1).
+BATCH_KEY = "release_for_issues"
+
+#: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to
+#: wait for the base to go green (2026-09-29 spec §1).
+RED_DEFER_EVENT = "release_deferred_red_base"
+
+#: Said ONCE PER EPISODE when that wait runs past `Daemon.RED_PARK_AFTER_SECONDS` and the
+#: release asks the user instead (§3).
+RED_PARK_EVENT = "release_park_red_base"
+
+
+def is_release_order(wo: dict[str, Any]) -> bool:
+    """Is this work order a release the OS filed? The batch in `metadata` is the test."""
+    from . import db
+
+    meta = db.from_json(wo.get("metadata"), {}) or {}
+    return isinstance(meta.get(BATCH_KEY), list)
+
 #: Where `scripts/install_prod_service.sh` installs the two units. Overridable so the
 #: suite can point a check at a rendered unit with no systemd anywhere near it — the
 #: same seam the script's own `--unit-dir` gives its tests.

@@ -85,8 +85,12 @@ def _age_last_turn(store: ProjectStore, wo_id: str, seconds: float) -> None:
 def _big_context(store: ProjectStore, wo_id: str, tokens: int = BIG * 10) -> None:
     """Put a context on the last turn, the only input the floor test has."""
     turn = store.latest_turn(wo_id)
+    # `usage_v` or `ops._turn_usage` repairs the envelope from the result file on the
+    # next cost read and the synthetic size is gone.
     store.conn.execute("UPDATE wo_turns SET usage_json=? WHERE id=?",
-                       (json.dumps({"context_peak": tokens}), turn["id"]))
+                       (json.dumps({"context_peak": tokens,
+                                    "usage_v": claude_cli.USAGE_SCHEMA_VERSION}),
+                        turn["id"]))
 
 
 def _deliver(fleet, wo_id: str) -> None:
@@ -121,6 +125,35 @@ def test_a_cold_boundary_with_a_large_conversation_compacts_before_the_prompt(
     _deliver(fleet, wo["id"])
     assert _turns(store, wo["id"])[-1] == ("message", "please also do the other thing")
     assert not store.queued_messages(wo["id"])
+
+
+def test_a_turn_that_died_without_a_result_does_not_hide_the_conversation(
+        fleet, settle_turns):
+    """Issue #856: the last turn was killed (a fleet stop), so it measured no context.
+
+    Its 0 read as "small", and the next delivery re-sent a 126k conversation cold eight
+    hours later. The size is the newest turn that MEASURED one.
+    """
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    _big_context(store, wo["id"])
+    ops.send_message(wo["id"], "keep going")
+    _deliver(fleet, wo["id"])                      # warm: an ordinary second turn
+    assert _turns(store, wo["id"])[-1] == ("message", "keep going")
+    assert settle_turns(store)
+    killed = store.latest_turn(wo["id"])
+    store.conn.execute(
+        "UPDATE wo_turns SET state='failed', usage_json=NULL, error=? WHERE id=?",
+        ("the turn's process ended without writing a result", killed["id"]))
+    assert worker_session.turn_context(store.latest_turn(wo["id"])) == 0
+    ops.send_message(wo["id"], "you were interrupted — carry on")
+    _age_last_turn(store, wo["id"], 8 * 3600)
+
+    _deliver(fleet, wo["id"])
+
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == [
+        "you were interrupted — carry on"]
 
 
 def test_a_boundary_inside_the_ttl_does_not_compact(fleet, settle_turns):
@@ -158,6 +191,15 @@ def test_the_off_switch_stops_it_and_nothing_else(fleet, settle_turns):
 
     assert worker_session.compaction_due(store, fresh, BIG) is not None
     assert worker_session.compaction_due(store, fresh, None) is None
+    # …and the three call sites go through one entry point, so one switch covers all of
+    # them: delivery (neither), dispatch-resume (`queue`) and a relaunch (`pause`).
+    pause = worker_session.TurnPause(
+        reason=worker_session.PAUSE_BUDGET, turn=store.latest_turn(wo["id"]),
+        retry_at=0.0, attempts=1, message="raised")
+    for kwargs in ({}, {"queue": "go"}, {"pause": pause}):
+        assert worker_session.compact_before_relaunch(
+            store, fleet["project"], fresh, None, **kwargs) is None
+    assert not store.queued_messages(wo["id"])
 
 
 def test_an_opening_turn_is_never_compacted_before(fleet):
@@ -200,32 +242,81 @@ def test_a_compaction_is_never_followed_by_another(fleet, settle_turns):
     assert _turns(store, wo["id"])[-1] == ("message", "go on")
 
 
-def test_a_relaunched_turn_is_never_compacted_before(fleet, fake_claude, settle_turns):
-    """Two reasons, and the second is why this is not even asked at the decision.
-
-    `_nudge` tells the worker the conversation above is intact, which a compaction
-    makes false; and the pause is re-derived from the LATEST turn, so a compact turn
-    behind a paused one would erase the pause and strand the relaunch.
-    """
-    store, daemon = fleet["store"], fleet["daemon"]
+def _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch) -> dict:
+    """A work order whose last turn the usage window refused, now DUE and COLD."""
+    monkeypatch.setattr(worker_session, "RATE_LIMIT_MIN_DELAY", 0)
+    store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     fake_claude.turns_rate_limited()
     worker_session.send(store, fleet["project"], store.get_work_order(wo["id"]), "more")
     assert settle_turns(store)
     fake_claude.turns_recover()
+    # A reset long gone (`test_fleet_cap` uses the same form), and an end older than
+    # the cache TTL: exactly the state every paused turn is in when a window reopens.
+    turn = store.latest_turn(wo["id"])
+    store.conn.execute("UPDATE wo_turns SET error=?, ended_at=? WHERE id=?",
+                       ("Claude AI usage limit reached|1000000000",
+                        turn["ended_at"] - 3 * usage.WRITE_TTL_SECONDS, turn["id"]))
     pause = worker_session.turn_pause(store, wo["id"])
-    assert pause is not None
-    store.conn.execute("UPDATE wo_turns SET ended_at=? WHERE id=?",
-                       (pause.turn["ended_at"] - 3 * usage.WRITE_TTL_SECONDS,
-                        pause.turn["id"]))
+    assert pause is not None and pause.due()
+    # Where a paused order really is: `running`, holding its slot (the retry sweep reads
+    # `RETRY_SWEEP_STATUSES`, which `_running_wo`'s bare `start` never reaches).
+    store.set_status(wo["id"], "running")
+    return store.get_work_order(wo["id"])
+
+
+def test_a_cold_relaunch_compacts_first_and_the_relaunch_survives(
+        fleet, fake_claude, settle_turns, monkeypatch):
+    """ISSUE #843: a relaunch after a usage window is ALWAYS cold, and on 2026-09-28
+    eleven of them re-wrote 2.25M cache-write tokens in two minutes.
+
+    The two reasons this used to be refused are both answered, and this pins each: the
+    relaunch is QUEUED before the compaction starts, so a compact turn behind the paused
+    one cannot strand it; and it is delivered afterwards, into the compacted session.
+    """
+    store, daemon = fleet["store"], fleet["daemon"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    before = len(store.list_turns(wo["id"]))
 
     daemon.retry_paused_turns(fleet["project"], store)
+    assert len(store.list_turns(wo["id"])) == before + 1, "nothing was relaunched"
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == ["more"], \
+        "the refused prompt never reached the model, so it is re-queued verbatim"
     assert settle_turns(store)
 
-    assert COMPACT_TURN not in [k for k, _ in _turns(store, wo["id"])]
-    # …and the pause survived to be retried at all, which is the half a compaction
-    # would have broken.
-    assert _turns(store, wo["id"])[-1][0] == "message"
+    _deliver(fleet, wo["id"])
+    assert _turns(store, wo["id"])[-1] == ("message", "more")
+    assert not store.queued_messages(wo["id"])
+
+
+def test_a_warm_or_small_relaunch_is_not_compacted(fleet, fake_claude, settle_turns,
+                                                   monkeypatch):
+    """The cost rule is `compaction_due`'s, unchanged: inside the TTL, or under the
+    floor, the plain relaunch is the cheaper one."""
+    store = fleet["store"]
+    fresh = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    pause = worker_session.turn_pause(store, fresh["id"])
+    assert pause is not None
+
+    assert worker_session.compaction_due(store, fresh, BIG, pause=pause,
+                                         now=pause.turn["ended_at"] + 1) is None
+    cold = pause.turn["ended_at"] + usage.WRITE_TTL_SECONDS + 1
+    assert worker_session.compaction_due(store, fresh, HUGE, pause=pause,
+                                         now=cold) is None
+    assert worker_session.compaction_due(store, fresh, None, pause=pause,
+                                         now=cold) is None
+    assert worker_session.compaction_due(store, fresh, BIG, pause=pause,
+                                         now=cold) is not None
+
+
+def test_a_relaunch_that_reached_the_model_is_told_it_was_compacted(fleet):
+    """`_nudge` says the conversation is intact; behind a compaction that is false."""
+    pause = worker_session.TurnPause(
+        reason=worker_session.PAUSE_USAGE_LIMIT, turn={}, retry_at=0.0, attempts=1,
+        message="limit")
+    text = worker_session._nudge_after_compaction(pause)
+    assert "COMPACTED" in text and "intact" not in text
 
 
 def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude,
@@ -261,12 +352,16 @@ def test_a_message_queued_behind_a_paused_turn_never_compacts(fleet, fake_claude
                                          BIG) is None
 
 
-def test_a_pause_nothing_will_relaunch_reaches_the_decision_and_is_refused(
+def test_a_pause_nothing_will_relaunch_compacts_before_the_message(
         fleet, settle_turns):
-    """The case where nothing upstream rules it out. `delivery_hold` deliberately does
-    NOT hold behind a non-resumable pause — the message is the only thing left that can
-    start the conversation again — so the delivery pass arrives here with a pause on
-    record, past the TTL, over the floor, and only `compaction_due` can refuse it."""
+    """§1.3: the pause exclusion is narrowed to a RESUMABLE pause.
+
+    `delivery_hold` deliberately does NOT hold behind a non-resumable pause — the
+    message is the only thing left that can start the conversation again — so the
+    delivery pass arrives here past the TTL and over the floor. Neither reason for the
+    old blanket refusal applies: no relaunch is coming, so no nudge can lie about the
+    conversation, and there is no pause anyone is waiting on to erase.
+    """
     store = fleet["store"]
     wo = _running_wo(fleet, settle_turns)
     for _ in range(len(worker_session.TRANSIENT_BACKOFF) + 1):
@@ -279,16 +374,17 @@ def test_a_pause_nothing_will_relaunch_reaches_the_decision_and_is_refused(
     _big_context(store, wo["id"])
     fresh = store.get_work_order(wo["id"])
     assert worker_session.delivery_hold(store, fresh) is None, "the premise"
-    assert worker_session.compaction_due(store, fresh, BIG) is None
+    assert worker_session.compaction_due(store, fresh, BIG) is not None
     ops.send_message(wo["id"], "go on")
 
     _deliver(fleet, wo["id"])
 
-    # The message goes, as it did before this change; what must not be in front of it
-    # is a compaction.
-    assert _turns(store, wo["id"])[-1] == ("message", "go on")
-    assert COMPACT_TURN not in [k for k, _ in _turns(store, wo["id"])]
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    assert [m["content"] for m in store.queued_messages(wo["id"])] == ["go on"]
     assert settle_turns(store)
+
+    _deliver(fleet, wo["id"])
+    assert _turns(store, wo["id"])[-1] == ("message", "go on")
 
 
 def test_a_compaction_the_transport_lost_is_re_sent_verbatim(fleet, fake_claude,
@@ -359,6 +455,198 @@ def test_a_compaction_the_os_did_not_ask_for_still_reads_as_one(fleet, settle_tu
 
     assert timeline._describe("compacted", {"trigger": "auto"}) == (
         "Conversation compacted", "")
+
+
+# -- the paths that used to skip the decision (spec 2026-09-29, §1.2-§1.4) -------------
+
+
+def _re_dispatch(fleet, wo_id: str) -> dict:
+    """The §1.4 shape: an order with a conversation behind it, dispatched a second time
+    (`ops.defer_red_release` re-parks a running release order to `pending`)."""
+    from jarvis import dispatch
+    from jarvis.central_store import CentralStore
+
+    store = fleet["store"]
+    store.set_status(wo_id, "pending")
+    claimed = store.claim_next_pending()
+    assert claimed is not None and claimed["id"] == wo_id
+    central = CentralStore()
+    try:
+        return dispatch.dispatch_work_order(store, central, fleet["project"], claimed,
+                                            os_config=fleet["daemon"].catalog.os)
+    finally:
+        central.close()
+
+
+def test_a_re_dispatched_order_compacts_before_its_prompt_goes_out(fleet, settle_turns):
+    """The dispatch-resume path: `worker_session.start` resumes an existing session, so
+    a second dispatch past the TTL re-writes the whole conversation."""
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    _big_context(store, wo["id"])
+
+    _re_dispatch(fleet, wo["id"])
+
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    queued = store.queued_messages(wo["id"])
+    assert len(queued) == 1 and queued[0]["source"] == worker_session.RESUME_SOURCE
+    assert "task" in queued[0]["content"], "the dispatch prompt itself is what is queued"
+    kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    assert "dispatch_deferred_for_compaction" in kinds and "dispatched" not in kinds
+    assert store.get_work_order(wo["id"])["status"] == "running"
+    assert settle_turns(store)
+
+    _deliver(fleet, wo["id"])
+    assert _turns(store, wo["id"])[-1][0] == "message"
+    assert not store.queued_messages(wo["id"])
+
+
+def test_an_opening_dispatch_is_byte_identical(fleet):
+    """No turn on record, so the decision returns None and nothing about a first
+    dispatch changes."""
+    store = fleet["store"]
+    wo = ops.create_work_order("proj_a", "task")
+
+    _re_dispatch(fleet, wo["id"])
+
+    assert [k for k, _ in _turns(store, wo["id"])] == ["dispatch"]
+    kinds = [e["kind"] for e in store.list_events(wo["id"])]
+    assert "dispatched" in kinds and "dispatch_deferred_for_compaction" not in kinds
+
+
+def test_a_compaction_is_never_followed_by_another_on_the_new_paths(fleet,
+                                                                    settle_turns):
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    ops.send_message(wo["id"], "go on")
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    _deliver(fleet, wo["id"])
+    assert settle_turns(store)
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)  # cold again
+    compaction = store.latest_turn(wo["id"])
+    assert compaction["kind"] == COMPACT_TURN, "the premise"
+    fresh = store.get_work_order(wo["id"])
+    pause = worker_session.TurnPause(
+        reason=worker_session.PAUSE_BUDGET, turn=compaction, retry_at=0.0, attempts=1,
+        message="raised")
+
+    assert worker_session.compact_before_relaunch(
+        store, fleet["project"], fresh, BIG, queue="dispatch me") is None
+    assert worker_session.compact_before_relaunch(
+        store, fleet["project"], fresh, BIG, pause=pause) is None
+
+
+def _exhausted_cold(fleet, settle_turns) -> dict:
+    """An order parked in `budget_exhausted` over a cold, large conversation (§1.2)."""
+    from jarvis import budget as budget_mod
+
+    store = fleet["store"]
+    wo = _running_wo(fleet, settle_turns)
+    _age_last_turn(store, wo["id"], usage.WRITE_TTL_SECONDS + 60)
+    # Over the REAL floor: `ops._resume_after_budget` resolves the catalog from the file,
+    # so the fleet fixture's lowered `compact_min_context` does not reach it.
+    _big_context(store, wo["id"], 150_000)
+    store.set_status(wo["id"], budget_mod.EXHAUSTED)
+    return store.get_work_order(wo["id"])
+
+
+def test_raising_the_budget_on_a_cold_order_compacts_before_the_relaunch(
+        fleet, settle_turns):
+    """§1.2, observed on wo-35fc3de7: the budget-raise resume builds a synthetic pause
+    and relaunched cold, re-writing 115,829 tokens out of the money just added."""
+    store = fleet["store"]
+    wo = _exhausted_cold(fleet, settle_turns)
+
+    out = ops.set_work_order_budget(wo["id"], 50.0)
+
+    assert out["resumed"], out
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    queued = store.queued_messages(wo["id"])
+    assert len(queued) == 1 and queued[0]["source"] == worker_session.RESUME_SOURCE
+    event = [e for e in store.list_events(wo["id"])
+             if e["kind"] == "budget_resumed"][-1]
+    payload = json.loads(event["payload"])
+    # Otherwise the timeline reads as if the worker resumed directly, on a seq that is
+    # the COMPACTION's.
+    assert payload["compacted"] is True
+    assert settle_turns(store)
+
+    _deliver(fleet, wo["id"])
+    assert _turns(store, wo["id"])[-1][0] == "message"
+
+
+def test_a_second_top_up_does_not_re_send_a_relaunch_that_is_still_queued(
+        fleet, settle_turns):
+    """The §2 double relaunch, from the other end: the queued relaunch IS the resume."""
+    from jarvis import budget as budget_mod
+
+    store = fleet["store"]
+    wo = _exhausted_cold(fleet, settle_turns)
+    assert ops.set_work_order_budget(wo["id"], 50.0)["resumed"]
+    turns = len(store.list_turns(wo["id"]))
+    store.set_status(wo["id"], budget_mod.EXHAUSTED)
+
+    out = ops.set_work_order_budget(wo["id"], 80.0)
+
+    assert out["resumed"] and "queued relaunch" in out["note"]
+    assert len(store.list_turns(wo["id"])) == turns, "nothing new was launched"
+    assert len(store.queued_messages(wo["id"])) == 1
+
+
+def test_an_ordinary_queued_message_does_not_look_like_a_relaunch(fleet, settle_turns):
+    """§3.5 step 1 distinguishes on the source, so `jarvis wo send`'s default must not
+    match it — a false positive skips the retry and the lost turn gets no nudge."""
+    store = fleet["store"]
+    wo = _exhausted_cold(fleet, settle_turns)
+    ops.send_message(wo["id"], "one more thing")
+    turns = len(store.list_turns(wo["id"]))
+
+    out = ops.set_work_order_budget(wo["id"], 50.0)
+
+    assert out["resumed"] and "queued relaunch" not in out["note"], out
+    assert len(store.list_turns(wo["id"])) > turns, "the lost turn was relaunched"
+    sources = {m["source"] for m in store.queued_messages(wo["id"])}
+    assert worker_session.RESUME_SOURCE in sources
+
+
+def test_a_queued_relaunch_renders_as_jarvis_not_as_the_user():
+    """Nobody decided a relaunch, so it belongs in `timeline.UNAUTHORED_SOURCES`."""
+    from jarvis import timeline
+
+    assert worker_session.RESUME_SOURCE in timeline.UNAUTHORED_SOURCES
+    m = {"direction": "user_to_agent", "source": worker_session.RESUME_SOURCE}
+    assert timeline._message_label(m) == "jarvis → worker"
+    assert timeline._message_event_label(m) == "Jarvis messaged the worker"
+
+
+def test_a_relaunch_after_a_budget_raise_is_not_told_the_transport_failed(fleet):
+    """`_nudge` has an honest budget branch; behind a compaction it needs the same one
+    — the budget-raise path is now a caller."""
+    pause = worker_session.TurnPause(
+        reason=worker_session.PAUSE_BUDGET, turn={}, retry_at=0.0, attempts=1,
+        message="its budget was raised")
+    text = worker_session._nudge_after_compaction(pause)
+
+    assert "budget" in text and "COMPACTED" in text
+    assert "transport" not in text and "intact" not in text
+
+
+def test_a_compaction_that_cannot_be_launched_withdraws_the_queued_relaunch(
+        fleet, fake_claude, settle_turns, monkeypatch):
+    """§3.3: queue-first is what stops the pause being erased, so the failure path has
+    to take the queued relaunch back — otherwise it goes out behind a later retry."""
+    store, daemon = fleet["store"], fleet["daemon"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    monkeypatch.setattr(worker_session, "compact",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no")))
+    before = len(store.list_turns(wo["id"]))
+
+    daemon.retry_paused_turns(fleet["project"], store)
+
+    assert len(store.list_turns(wo["id"])) == before, "no turn was launched"
+    assert not store.queued_messages(wo["id"]), "the relaunch was withdrawn"
+    assert store.list_messages(wo["id"])[-1]["status"] == "failed"
 
 
 def test_a_compaction_that_cannot_be_launched_never_costs_the_message(

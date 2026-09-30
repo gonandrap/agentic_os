@@ -324,6 +324,36 @@ def test_holds_are_listed_and_by_cause_sums_to_them(started, project, monkeypatc
     assert list(held["by_cause"]) == ["neo_question", "gate"]
 
 
+def test_the_report_closes_a_synthesised_hold_the_round_ended(started, project,
+                                                              monkeypatch):
+    """`jarvis wo why` is 2d1's reader: `_diagnose_holds` calls `holds.held`, so a hold
+    the round's verdict ended must read closed HERE, where the user asks. wo-3615faf7
+    read 11.7h open instead of 57m, and an eternally open hold also suppresses genuine
+    park blockers — `parked_reason` subtracts hold seconds before it decides. Spec §2d1
+    of docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md."""
+    from jarvis.holds import PAUSE_USAGE_LIMIT
+    from jarvis.project_store import VALIDATION_HELD_CAUSE
+
+    wo = ops.create_work_order("proj_a", "held, then judged")
+    now = db.now()
+    store = ProjectStore(project)
+    try:
+        at(monkeypatch, now - 7200)
+        store.add_event(wo["id"], "validation_failed",
+                        {"round": 1, "cause": VALIDATION_HELD_CAUSE})
+        at(monkeypatch, now - 3600)
+        store.add_event(wo["id"], "validation_passed", {"round": 1})
+    finally:
+        store.close()
+    monkeypatch.setattr(db, "now", lambda: now)
+
+    held = ops.diagnose(wo["id"])["holds"]
+
+    assert held["open"] is None
+    assert [e["cause"] for e in held["episodes"]] == [PAUSE_USAGE_LIMIT]
+    assert held["episodes"][0]["seconds"] == pytest.approx(3600, abs=2.0)
+
+
 # -- 8. a settled order diagnoses cleanly ------------------------------------------------
 
 

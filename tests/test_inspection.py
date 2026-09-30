@@ -17,6 +17,7 @@ the user has put it down.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,7 +43,11 @@ def real_session(monkeypatch):
 
 def test_the_wall_clock_splits_the_way_the_method_says(real_session):
     """`docs/findings/anatomy-of-an-expensive-turn.md`'s summary table, to the second:
-    1886s of wall clock, 576s blocked on a subagent join, 58s executing tools.
+    1886s of wall clock, 582s blocked on a subagent join, 52s executing tools.
+
+    CORRECTED from 576/58 by issue #845: the session's two foreground `Agent` spans (2.8s
+    and 2.9s) are a JOIN and were being counted as tools the lead ran. Six seconds move
+    between two buckets; the wall clock and the finding's conclusion are unchanged.
 
     The question that started this: a DESIGN-ONLY agent with three 14-minute turns. A
     third of it was the lead agent asleep with no API call in flight, which is invisible
@@ -51,8 +56,8 @@ def test_the_wall_clock_splits_the_way_the_method_says(real_session):
     part = real_session.partition()
 
     assert round(part["wall"]) == 1886
-    assert round(part["blocked"]) == 576
-    assert round(part["tools"]) == 58
+    assert round(part["blocked"]) == 582
+    assert round(part["tools"]) == 52
     assert sum(part[k] for k in inspection.PARTS) == pytest.approx(part["wall"])
 
 
@@ -70,11 +75,15 @@ def test_the_method_s_66_percent_is_generating_plus_idle(real_session):
 
 
 def test_each_turn_matches_the_method_s_per_turn_table(real_session):
-    """§2: 865s / 136s blocked / 26s tools, then 885s / 440s / 23s, then 136s / 0 / 9s."""
+    """§2: 865s / 139s blocked / 23s tools, then 885s / 443s / 20s, then 136s / 0 / 9s.
+
+    CORRECTED from 136/26 and 440/23 for the reason above (issue #845): each of the first
+    two turns delegated once in the foreground, and those ~3s are a wait, not a tool.
+    """
     rows = [(round(t.wall), round(t.blocked), round(t.tools))
             for t in real_session.turns]
 
-    assert rows == [(865, 136, 26), (885, 440, 23), (136, 0, 9)]
+    assert rows == [(865, 139, 23), (885, 443, 20), (136, 0, 9)]
     # "Half of turn 2 was the lead agent doing nothing, holding a 193k context."
     assert round(real_session.turns[1].share()["blocked"], 2) == 0.50
 
@@ -455,29 +464,136 @@ def test_each_threshold_raises_its_own_alarm():
                                               dispatched=0.0)] == [inspection.JOIN_ALARM]
 
 
-def test_a_stalled_turn_is_alarmed_as_stalled_and_never_as_billed():
-    """THE DETECTOR THAT SHOULD HAVE FIRED on wo-f1ce0f24 turn 3. `going-in-circles`
-    said effort was being re-spent and the escalation said it was BILLED IN FULL; the
-    turn had made no API call at all, so nothing had started and nothing was billed."""
+def awaiting(*, since: float, wall: float, calls: int = 0) -> tuple:
+    """A one-turn anatomy whose last row is an input — a request is in flight."""
+    turn = inspection.Turn(seq=1, started=since, ended=since + wall)
+    turn.awaiting_since = since
+    turn.calls = [api_call(since + 1.0 + n) for n in range(calls)]
+    return inspection.Anatomy(session_id="s", found=True, turns=[turn]), since + wall
+
+
+def test_a_turn_whose_last_row_is_an_input_is_awaiting_and_not_stalled():
+    """Spec §1: the absence of an assistant row is a request in flight, not a dead turn."""
     cfg = InspectConfig()
-    stalled, now = burning(wall=cfg.alarm_stalled_minutes * 60 + 1, calls=0)
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 - 60)
 
-    raised = inspection.alarms(stalled, cfg, now=now, dispatched=0.0)
-
-    assert [a.kind for a in raised] == [inspection.STALL_ALARM]
-    assert "no API call" in raised[0].reason
-    assert "billed" not in raised[0].reason
+    assert anatomy.turns[0].awaiting is True
+    assert inspection.alarms(anatomy, cfg, now=now, dispatched=0.0) == []
 
 
-def test_a_stalled_turn_never_raises_the_long_turn_alarm():
-    """The two are the same wall clock read two ways, and only one of them is true. The
-    long-turn alarm's whole claim is that money is being spent."""
+def test_past_the_awaiting_threshold_exactly_one_informational_alarm_is_raised():
+    """Spec §2 branch 1."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
+
+    raised = inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.SLOW_RESPONSE_ALARM]
+    assert raised[0].reason.startswith(inspection.awaiting_note(anatomy.turns[0]))
+    assert "no API call" not in raised[0].reason
+    assert inspection.SLOW_RESPONSE_ALARM in inspection.INFORMATIONAL_KINDS
+
+
+def test_a_billed_turn_awaiting_a_tool_result_still_raises_the_long_turn_alarm():
+    """THE TWO ARE INDEPENDENT, NOT EXCLUSIVE. `awaiting_since` is set on every
+    `tool_result` row, so a healthy turn 27 calls deep is awaiting at the sampling
+    moment — an `elif` here would make `long-turn` unraisable on most running turns."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
+                            calls=3)
+    # Awaiting only since the last tool result, well inside the awaiting threshold.
+    anatomy.turns[0].awaiting_since = now - 60
+
+    kinds = [a.kind for a in inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)]
+
+    assert kinds == [inspection.TURN_ALARM]
+
+
+def test_a_long_billed_turn_can_raise_both():
+    """Both findings are true at once: it is being billed AND the current request has
+    completed nothing for an hour."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_turn_minutes * 60 + 60,
+                            calls=3)
+
+    kinds = [a.kind for a in inspection.alarms(anatomy, cfg, now=now, dispatched=0.0)]
+
+    assert kinds == [inspection.TURN_ALARM, inspection.SLOW_RESPONSE_ALARM]
+
+
+def test_the_awaiting_clock_is_the_active_one():
+    """The user's 2026-09-18 ruling: a held order is obeying, not answering slowly."""
+    cfg = InspectConfig()
+    anatomy, now = awaiting(since=1_000.0, wall=cfg.alarm_awaiting_minutes * 60 + 60)
+    anatomy.holds = [inspection.Hold(cause="usage_window", started=1_000.0, ended=now)]
+
+    assert inspection.alarms(anatomy, cfg, now=now, dispatched=0.0) == []
+
+
+def test_the_stalled_turn_alarm_is_never_raised_live():
+    """Spec §2 branch 2: the evidence for "the work never started" was an absence, and
+    the absence is what this spec proves unreliable. `worker_session.TURN_STALL_SECONDS`
+    judges the PROCESS and still catches a genuinely hung turn."""
     cfg = InspectConfig()
     stalled, now = burning(wall=cfg.alarm_turn_minutes * 60 + 1, calls=0)
 
-    kinds = [a.kind for a in inspection.alarms(stalled, cfg, now=now, dispatched=0.0)]
+    assert inspection.alarms(stalled, cfg, now=now, dispatched=0.0) == []
 
-    assert kinds == [inspection.STALL_ALARM]
+
+def test_a_historical_stalled_turn_row_still_renders():
+    """Spec §2: the kind and its legend stay for the rows already in `wo_alarms`."""
+    row = {"kind": inspection.STALL_ALARM, "source": "cost"}
+
+    assert ops.alarm_kind_label(row, {}) == "stalled-turn"
+    assert "was open" in inspection.ALARM_KINDS[inspection.STALL_ALARM]
+
+
+def test_awaiting_is_derived_in_the_walk_read_transcript_already_does(write_transcript):
+    """Spec §1: no second pass, no new file read."""
+    session = write_transcript("s", [
+        prompt_row(1_000.0, "You are the worker agent for wo-1"),
+        assistant_row(1_030.0, "m1"),
+        prompt_row(1_100.0, "carry on"),
+    ])
+
+    first, second = inspection.read_session(session).turns
+
+    assert first.awaiting is False and first.awaiting_since == 0.0
+    assert second.awaiting is True and second.awaiting_since == 1_100.0
+
+
+def test_a_tool_result_reopens_the_wait(write_transcript):
+    """Spec §1: the model is answering again after every tool_result too."""
+    session = write_transcript("s", [
+        prompt_row(1_000.0, "You are the worker agent for wo-1"),
+        *tool_rows(1_030.0, 1_060.0, "t1", "Bash"),
+    ])
+
+    (turn,) = inspection.read_session(session).turns
+
+    assert turn.awaiting is True and turn.awaiting_since == 1_060.0
+
+
+def test_the_turn_dict_carries_awaiting_additively():
+    """Spec §1: the rule `subagents` was added under."""
+    turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
+    turn.awaiting_since = 1_000.0
+
+    said = turn.as_dict()
+
+    assert said["awaiting"] is True and said["awaiting_since"] == 1_000.0
+    assert said["observed"] is False
+
+
+def test_the_awaiting_sentence_is_written_once_for_every_surface():
+    """Spec §1: one formatter, so no surface invents a second vocabulary."""
+    turn = inspection.Turn(seq=1, started=1_000.0, ended=1_060.0)
+    turn.awaiting_since = 1_000.0
+
+    said = inspection.awaiting_note(turn)
+
+    assert said.startswith("awaiting the model since ")
+    assert "request in flight, no block completed" in said
 
 
 def test_the_stall_is_named_before_the_long_turn_alarm_could_call_it_spend():
@@ -556,6 +672,157 @@ def test_a_join_that_came_back_is_not_an_alarm(write_transcript):
     ])
 
     assert inspection.live_alarms(session, InspectConfig(), now=500, dispatched=0.0) == []
+
+
+# -- a foreground delegation is a WAIT, and a hung subagent call is the alarm -----------
+#
+# docs/superpowers/specs/2026-09-29-a-runaway-tool-call-is-not-a-slow-subagent.md,
+# issue #845.
+
+
+def test_a_foreground_delegation_is_a_wait_and_not_a_tool_the_lead_ran(write_transcript):
+    """Spec §1. `Agent` returns immediately only when the subagent is BACKGROUNDED; a
+    foreground call blocks the lead until the subagent returns, so its seconds are
+    `blocked` and not `tools`."""
+    session = write_transcript("delegated", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(10, 130, "t1", "Agent", {"description": "write the spec"}),
+    ])
+    anatomy = inspection.read_session(session)
+    (turn,) = anatomy.turns
+    (span,) = turn.spans
+
+    assert span.is_join is True
+    assert anatomy.joins(0) == [span]
+    assert (turn.blocked, turn.tools) == (120.0, 0.0)
+
+
+def test_a_backgrounded_agent_is_not_a_wait(write_transcript):
+    """The other half of §1, and why `backgrounded` is read from the RAW `tool_use`
+    input: `run_in_background: true` hands the wait to `TaskOutput`."""
+    session = write_transcript("backgrounded", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(10, 130, "t1", "Agent",
+                   {"description": "write the spec", "run_in_background": True}),
+    ])
+    anatomy = inspection.read_session(session)
+    (turn,) = anatomy.turns
+    (span,) = turn.spans
+
+    assert span.is_join is False
+    assert anatomy.joins(0) == []
+    assert (turn.blocked, turn.tools) == (0.0, 120.0)
+
+
+def delegation_transcript(write_transcript, *, session: str, sub_rows: list[dict],
+                          background: bool = False, label: str = "") -> str:
+    """A lead whose foreground `Agent` span is still open, plus one subagent transcript.
+
+    The `Agent` input carries a `description` and no task id, which is what Claude Code
+    actually writes — so the subagent is UNATTACHED and the alarm has to scan the
+    session's anatomies rather than one turn's children.
+    """
+    inp: dict = {"description": "write the spec", "subagent_type": "jarvis-spec-writer"}
+    if background:
+        inp["run_in_background"] = True
+    written = write_transcript(session, [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[{"type": "tool_use", "id": "t1",
+                                          "name": "Agent", "input": inp}]),
+    ], subagents={"agent-a7b62083": sub_rows})
+    if label:
+        root = Path(os.environ[usage.TRANSCRIPT_ROOT_ENV])
+        (root / "-proj" / session / "subagents" / "agent-a7b62083.meta.json").write_text(
+            json.dumps({"agentType": label, "description": "write the spec"}))
+    return written
+
+
+def healthy_sub_rows() -> list[dict]:
+    return [prompt_row(100, "write the spec"),
+            *tool_rows(110, 130, "s1", "Read", {"file_path": "/x.py"})]
+
+
+HUNG_PATTERN = r"^def .*\n(.*\n)*?.*return"
+
+
+def hung_sub_rows(at: float = 130.0) -> list[dict]:
+    return [prompt_row(100, "write the spec"),
+            *tool_rows(110, 120, "s1", "Read", {"file_path": "/x.py"}),
+            assistant_row(at, "s-m2", content=[
+                {"type": "tool_use", "id": "s2",
+                 "name": "mcp__serena__search_for_pattern",
+                 "input": {"substring_pattern": HUNG_PATTERN}}])]
+
+
+def test_a_working_subagent_raises_nothing_however_long_the_delegation(write_transcript):
+    """Spec §2 test 1, THE REGRESSION GUARD: 43 of the fleet's 272 foreground
+    delegations run past 20 minutes and nearly all of them are real work. Elapsed wait
+    alone is not evidence of a hang."""
+    session = delegation_transcript(write_transcript, session="working",
+                                    sub_rows=healthy_sub_rows())
+
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=311,
+                                  dispatched=0.0) == []
+
+
+def test_a_backgrounded_delegation_is_never_considered_by_the_join_loop(write_transcript):
+    """Spec §2 test 2. Not a join at all, so the hang evidence is never even read — the
+    wait it defers is `TaskOutput`'s."""
+    session = delegation_transcript(write_transcript, session="bg-hung",
+                                    sub_rows=hung_sub_rows(), background=True)
+    anatomy = inspection.read_session(session)
+    (span,) = anatomy.turns[0].spans
+
+    assert span.is_join is False
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=500,
+                                  dispatched=0.0) == []
+
+
+def test_a_hung_subagent_tool_call_raises_one_join_alarm_that_names_it(write_transcript):
+    """Spec §2 tests 3 and §2c: the alarm names the hung TOOL and the subagent it found,
+    which is what issue #845 asks for."""
+    cfg = InspectConfig()
+    session = delegation_transcript(write_transcript, session="hung",
+                                    sub_rows=hung_sub_rows(),
+                                    label="jarvis-spec-writer")
+    now = 130 + cfg.alarm_subagent_tool_minutes * 60 + 1
+
+    raised = inspection.live_alarms(session, cfg, wo_id="wo-1", now=now, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.JOIN_ALARM]
+    assert "mcp__serena__search_for_pattern" in raised[0].reason
+    assert "jarvis-spec-writer" in raised[0].reason
+    # The pattern itself, through `_detail_of` — the bound and the redaction already in
+    # place, and the thing the user needs to see to know what to stop writing.
+    assert HUNG_PATTERN[:20] in raised[0].reason
+    assert "jarvis inspect wo-1" in raised[0].reason
+
+
+def test_a_subagent_tool_call_under_the_threshold_is_not_a_hang(write_transcript):
+    """The threshold is a threshold: one minute into an MCP call is normal."""
+    session = delegation_transcript(write_transcript, session="slow-not-hung",
+                                    sub_rows=hung_sub_rows())
+
+    assert inspection.live_alarms(session, InspectConfig(), wo_id="wo-1", now=190,
+                                  dispatched=0.0) == []
+
+
+def test_task_output_still_alarms_on_elapsed_wait_alone(write_transcript):
+    """Spec §2a, unchanged byte for byte: a pure wait with no subagent transcript of its
+    own to inspect, judged on the 5-minute cache TTL."""
+    cfg = InspectConfig()
+    session = write_transcript("collected", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m2", content=[{"type": "tool_use", "id": "t1",
+                                          "name": "TaskOutput",
+                                          "input": {"task_id": "a7b62083"}}]),
+    ], subagents={"agent-a7b62083": healthy_sub_rows()})
+
+    raised = inspection.live_alarms(session, cfg, wo_id="wo-1",
+                                    now=10 + cfg.alarm_join_seconds + 1, dispatched=0.0)
+
+    assert [a.kind for a in raised] == [inspection.JOIN_ALARM]
+    assert "blocked" in raised[0].reason
 
 
 def synthetic_row(at: float, mid: str, text: str) -> dict:
@@ -665,9 +932,17 @@ def test_the_defaults_are_the_measured_ones():
 
     assert (cfg.alarm_turn_minutes, cfg.alarm_join_seconds,
             cfg.alarm_write_tokens) == (60, 300, 300_000)
+    # The hang evidence behind a foreground delegation's join alarm (issue #845). ONE
+    # opinion about how long a single tool call may take: the same boundary as
+    # `alarm_join_seconds` and as the `MCP_TOOL_TIMEOUT` every worker is launched with.
+    assert cfg.alarm_subagent_tool_minutes == 5
+    assert cfg.alarm_subagent_tool_minutes * 60 == cfg.alarm_join_seconds
     # p99 of time-to-first-API-call over the fleet's 4,543 turns is 61 seconds, so this
     # is fifteen times a slow start and fires on 0.26% of them.
     assert cfg.alarm_stalled_minutes == 15
+    # The measured slow response was 19 minutes, so anything under the hour would
+    # re-raise the very case the spec exists to stop reporting.
+    assert cfg.alarm_awaiting_minutes == 60
     assert cfg.alarm_join_seconds == inspection.TTL_5M
     # The report is deliberately far more talkative than the alarm: the same blocking
     # join is worth a line at 30s and worth interrupting someone at 300s.
@@ -696,6 +971,9 @@ def test_nothing_in_the_module_hard_codes_a_threshold():
     allowed = {0, 1, 2, 4, 60, 300.0, 3600.0,   # indices, seconds-per-minute, the TTLs
                1e6,                             # tokens per million: the price unit
                inspection.NAMED_SESSIONS,       # a display bound, see the docstring
+               # A measurement of the order two files are written in (spec 2026-09-27
+               # §3), not a judgement anyone gets to set — so not a catalog setting.
+               inspection.TURN_BIND_TOLERANCE_SECONDS,
                # The parameter caps (spec §4a) are a STRUCTURAL bound on how big one
                # report may get, not a per-project judgement about what is expensive —
                # no catalog wants its own answer to "may this print a megabyte". 6 and
@@ -742,12 +1020,15 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
     from jarvis import config_version
 
     cat = catalog.parse_catalog({
-        "os": {"inspect": {"alarm_turn_minutes": 90, "report_write_floor": 50_000}},
+        "os": {"inspect": {"alarm_turn_minutes": 90, "report_write_floor": 50_000,
+                           "alarm_awaiting_minutes": 120}},
         "projects": [{"name": "quick", "path": str(tmp_path),
                       "inspect": {"alarm_turn_minutes": 15}}],
     })
     project = cat.project("quick")
 
+    assert project.inspect.alarm_subagent_tool_minutes == 5  # inherited from the default
+    assert project.inspect.alarm_awaiting_minutes == 120   # inherited from os
     assert project.inspect.alarm_turn_minutes == 15        # its own
     assert project.inspect.report_write_floor == 50_000    # inherited from os
     assert project.inspect.alarm_write_tokens == 300_000   # inherited from the default
@@ -756,9 +1037,28 @@ def test_a_project_overrides_one_threshold_and_inherits_the_rest(tmp_path):
         "projects.quick.inspect.alarm_turn_minutes"] == 15
 
 
+def test_the_hang_threshold_is_settable_fleet_wide_and_per_project(tmp_path):
+    """Spec §2 test 5. A project whose MCP server is genuinely slow raises it; the rest
+    of `InspectConfig` still inherits field by field."""
+    from jarvis import config_version
+
+    cat = catalog.parse_catalog({
+        "os": {"inspect": {"alarm_subagent_tool_minutes": 10}},
+        "projects": [{"name": "slow-mcp", "path": str(tmp_path),
+                      "inspect": {"alarm_subagent_tool_minutes": 20}}],
+    })
+
+    assert cat.os.inspect.alarm_subagent_tool_minutes == 10
+    assert cat.project("slow-mcp").inspect.alarm_subagent_tool_minutes == 20
+    assert cat.project("slow-mcp").inspect.alarm_join_seconds == 300   # inherited
+    assert config_version.resolve(cat)[
+        "projects.slow-mcp.inspect.alarm_subagent_tool_minutes"] == 20
+
+
 @pytest.mark.parametrize("key", ["alarm_write_tokens", "report_write_floor",
                                  "quote_chars", "alarm_turn_minutes",
-                                 "alarm_stalled_minutes"])
+                                 "alarm_stalled_minutes", "alarm_awaiting_minutes",
+                                 "alarm_subagent_tool_minutes"])
 def test_a_threshold_of_zero_is_refused_rather_than_flagging_everything(key):
     """Zero would report every write a session makes and flag every work order the fleet
     runs — and it arrives by a typo in a `jarvis config set`, so it is caught where the
@@ -867,12 +1167,69 @@ def test_the_turn_line_says_no_api_call_before_it_says_anything_about_duration(
     assert "unacc 100%" in line and "gen   0%" in line
 
 
+def test_a_turn_awaiting_the_model_is_not_flagged_as_having_made_no_call(capsys):
+    """Spec §1: the flag is a claim about the API, and here a request is in flight."""
+    from jarvis import cli
+
+    turn = inspection.Turn(seq=3, started=1_000.0, ended=1_000.0 + 65 * 60)
+    turn.awaiting_since = 1_000.0
+    anatomy = inspection.Anatomy(session_id="s", found=True, turns=[turn])
+    unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
+
+    cli._print_anatomy(unit, InspectConfig().report_write_floor)
+    line = next(l for l in capsys.readouterr().out.splitlines() if "turn  3" in l)
+
+    assert cli.AWAITING_FLAG in line and cli.NO_CALL_FLAG not in line
+    # One column, so the split after it stays a column whichever flag is printed.
+    assert cli.FLAG_WIDTH >= max(len(cli.AWAITING_FLAG), len(cli.NO_CALL_FLAG))
+
+
 def test_a_work_order_with_no_session_reports_no_transcript(started):
     wo = ops.create_work_order("proj_a", "never dispatched")
 
     (unit,) = ops.inspect_report(wo["id"])["units"]
 
     assert unit["found"] is False and unit["turns"] == []
+
+
+def test_inspect_names_the_biggest_os_side_input_for_the_order(started, capsys):
+    """Spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md: `jarvis
+    inspect` names the biggest OS-side input for the order it is inspecting."""
+    from jarvis import agent_usage, cli
+
+    wo = ops.create_work_order("proj_a", "an order Neo answered twice")
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo["id"], label="question",
+                       model="claude-opus-5",
+                       usage={"output": 1, "prompt_chars": 8_000,
+                              "system_prompt_chars": 500})
+    agent_usage.record("panel_seat", project="proj_a", wo_id=wo["id"], label="premise",
+                       model="claude-opus-5",
+                       usage={"output": 1, "prompt_chars": 140_000,
+                              "system_prompt_chars": 2_000})
+
+    (unit,) = ops.inspect_report(wo["id"])["units"]
+
+    biggest = unit["largest_os_input"]
+    assert biggest["kind"] == "panel_seat" and biggest["label"] == "premise"
+    assert (biggest["prompt_chars"], biggest["system_prompt_chars"]) == (140_000, 2_000)
+
+    cli._print_anatomy(unit, InspectConfig().report_write_floor)
+    out = capsys.readouterr().out
+    assert "140,000" in out and "2,000" in out and "premise" in out
+
+
+def test_an_order_whose_os_calls_measured_nothing_names_none(started):
+    """NEVER a fabricated number: a call recorded before the columns existed reads 0,
+    and 0 is not a size."""
+    from jarvis import agent_usage
+
+    wo = ops.create_work_order("proj_a", "an order from before the sizes existed")
+    agent_usage.record("neo_answer", project="proj_a", wo_id=wo["id"], label="question",
+                       model="claude-opus-5", usage={"output": 1})
+
+    (unit,) = ops.inspect_report(wo["id"])["units"]
+
+    assert unit["largest_os_input"] is None
 
 
 def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
@@ -934,35 +1291,36 @@ def test_a_burning_turn_reaches_the_user_the_way_everything_else_does(
         store.close()
 
 
-def test_a_stalled_turn_reaches_the_user_as_a_stall_and_not_as_a_bill(
+def test_a_slow_response_is_recorded_and_never_escalated(
         started, monkeypatch, tmp_path):
-    """END TO END, the case that was reported backwards (issue 227). The attention line
-    is what became a Telegram saying an hour of generation had been billed."""
+    """END TO END, spec §2's "what must not escalate means mechanically"."""
     from jarvis.project_store import ProjectStore
 
     root = tmp_path / "projects"
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
     daemon = started
-    wo = ops.create_work_order("proj_a", "the dead one")
+    wo = ops.create_work_order("proj_a", "the slow one")
 
     store = ProjectStore(ops.find_work_order(wo["id"])[1])
     try:
         turn = store.create_turn(wo["id"], "dispatch", "go")
         at = turn["started_at"]
-        # A prompt and nothing else: the turn opened and no API call was ever made.
-        (root / "-proj" / "dead.jsonl").write_text(
+        # A prompt and nothing after it: a request is in flight, no block has landed.
+        (root / "-proj" / "slow.jsonl").write_text(
             json.dumps(prompt_row(at + 1, "You are the worker agent for wo-1")) + "\n")
-        store.update_work_order(wo["id"], status="running", session_id="dead")
+        store.update_work_order(wo["id"], status="running", session_id="slow")
         monkeypatch.setattr("jarvis.daemon.time.time", lambda: at + 2 * 3600)
         daemon.check_burning_turns(daemon.catalog.projects[0], store)
 
-        flagged = store.get_work_order(wo["id"])
         (alarm,) = store.alarms_of(wo["id"])
-        assert alarm["kind"] == inspection.STALL_ALARM
-        assert "no API call at all" in flagged["attention_reason"]
-        assert "billed" not in flagged["attention_reason"]
-        assert "still being billed" not in flagged["attention_reason"]
+        assert alarm["kind"] == inspection.SLOW_RESPONSE_ALARM
+        assert alarm["status"] == "informational"
+        # The queue's own predicate is the enforcement — no new filter anywhere.
+        assert store.claim_next_alarm() is None
+        assert store.get_work_order(wo["id"])["needs_attention"] == 0
+        # The timeline and the dedupe memory are unchanged.
+        assert len(store.events_of_kind(wo["id"], "cost_alarm")) == 1
     finally:
         store.close()
 
@@ -2024,3 +2382,304 @@ def test_a_credential_flag_inside_quotes_loses_its_value(line, leak):
 
     assert "<redacted: a credential passed as a flag>" in out
     assert leak not in out
+
+
+# -- binding transcript turns to the OS's own numbering ---------------------------------
+#
+# Spec docs/superpowers/specs/2026-09-27-a-request-in-flight-is-not-a-stalled-turn.md §3.
+
+
+def _numbered(write_transcript, starts: list[float], session: str = "numbered") -> str:
+    """One transcript turn per entry, each with an assistant row so the next one opens."""
+    rows: list[dict] = []
+    for i, at in enumerate(starts):
+        rows.append(prompt_row(at, f"<task-notification> turn {i}"))
+        rows.append(assistant_row(at + 1, f"m{i}"))
+    return write_transcript(session, rows)
+
+
+def test_turn_numbers_match_the_turn_files_across_a_compaction(write_transcript):
+    """§3's measured case, wo-dbea82cf: 11 `wo_turns` rows, 10 transcript turns, and the
+    `/compact` turn leaves no prompt row of its own. Every later number shifted by one,
+    so the alarm said turn 11 and `jarvis inspect` said turn 10 about one turn."""
+    os_starts = [(1, 0.0), (2, 100.0), (3, 200.0), (4, 300.0), (5, 400.0),
+                 (6, 420.0), (7, 500.0), (8, 600.0), (9, 700.0), (10, 800.0),
+                 (11, 900.0)]
+    # The turn file is written 3-4s before the transcript's prompt row (§3's tolerance).
+    session = _numbered(write_transcript,
+                        [4.0, 104.0, 204.0, 304.0, 424.0, 504.0, 604.0, 704.0,
+                         804.0, 904.0])
+
+    anatomy = inspection.read_session(session, turn_starts=os_starts)
+
+    assert [t.seq for t in anatomy.turns] == [1, 2, 3, 4, 6, 7, 8, 9, 10, 11]
+    assert anatomy.unmatched_os_turns == [5]
+    assert anatomy.turns[-1].seq == 11
+
+
+def test_read_session_without_turn_starts_still_numbers_one_to_n(write_transcript):
+    """The regression guard for every existing caller — §3's first rule."""
+    session = _numbered(write_transcript, [0.0, 100.0, 200.0], session="plain")
+
+    anatomy = inspection.read_session(session)
+
+    assert [t.seq for t in anatomy.turns] == [1, 2, 3]
+    assert anatomy.unmatched_os_turns == []
+    assert [t.part for t in anatomy.turns] == [1, 1, 1]
+
+
+def test_two_transcript_turns_on_one_os_turn_are_parts_of_it(write_transcript):
+    """§3: the compaction shape read forwards. Both keep the `seq`; `part` tells them
+    apart, and `jarvis inspect` renders part 2 as `turn 1 (continued)`."""
+    session = _numbered(write_transcript, [4.0, 50.0, 104.0], session="parts")
+
+    anatomy = inspection.read_session(
+        session, turn_starts=[(1, 0.0), (2, 100.0)])
+
+    assert [(t.seq, t.part) for t in anatomy.turns] == [(1, 1), (1, 2), (2, 1)]
+    assert anatomy.turns[0].as_dict()["part"] == 1
+
+
+def test_a_transcript_turn_before_the_first_os_turn_is_unrecorded(write_transcript):
+    """§3: what an injected or adopted session looks like. Never -1 — `NO_TURN` belongs
+    to `wo_alarms` and this module must not import a store."""
+    session = _numbered(write_transcript, [10.0, 104.0], session="injected")
+
+    anatomy = inspection.read_session(session, turn_starts=[(1, 100.0)])
+
+    assert [t.seq for t in anatomy.turns] == [0, 1]
+    assert inspection.turn_name(0) == "an unrecorded turn"
+    assert inspection.turn_name(7) == "turn 7"
+
+
+def test_an_os_turn_with_no_transcript_turn_is_reported_not_dropped(write_transcript):
+    """§3: the `/compact` case. `Anatomy.unmatched_os_turns` carries it and the renderer
+    prints a line per entry rather than letting the number vanish."""
+    session = _numbered(write_transcript, [4.0, 304.0], session="unmatched")
+
+    anatomy = inspection.read_session(
+        session, turn_starts=[(1, 0.0), (2, 100.0), (3, 200.0), (4, 300.0)])
+
+    assert [t.seq for t in anatomy.turns] == [1, 4]
+    assert anatomy.unmatched_os_turns == [2, 3]
+    assert anatomy.as_dict()["unmatched_os_turns"] == [2, 3]
+
+
+# -- the measurement of the fix: a polled turn against a blocked one -------------------
+#
+# §9 of docs/superpowers/specs/2026-09-29-a-lead-must-not-block-past-its-cache.md. The
+# pair is the point: without the negative twin the positive proves only that the fixture
+# is short.
+
+SUITE_RUN = {"command": "uv run pytest tests/ -q", "run_in_background": True}
+CHECK_INS = (260.0, 500.0, 740.0, 980.0, 1220.0)
+
+
+def _polled_turn(write_transcript) -> str:
+    """Twenty minutes of background suite, collected every four minutes."""
+    rows = [prompt_row(0, "You are the worker agent for wo-1"),
+            assistant_row(10, "m0", write=45_000),
+            *tool_rows(20, 20.2, "t-launch", "Bash", SUITE_RUN)]
+    for i, at in enumerate(CHECK_INS):
+        # Each check-in is inside `TTL_5M` of the previous call, so its own delta write
+        # is a PREFIX_MISS at worst and never an expiry, and the read is charged at 0.1x.
+        rows.append(assistant_row(at - 1, f"m{i + 1}", write=25_000, read=150_000))
+        rows.extend(tool_rows(at, at + 1.0, f"t{i}", "BashOutput",
+                              {"bash_id": "b51fl7bhe"}))
+    return write_transcript("polled", rows)
+
+
+def _blocked_turn(write_transcript) -> str:
+    """The same twenty minutes as ONE foreground join, and nothing collected."""
+    return write_transcript("blocked", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        assistant_row(10, "m0", write=45_000),
+        # No `tool_result`: the join is still open at `now`, which is the shape every one
+        # of the 85 measured re-writes had.
+        {"type": "assistant", "timestamp": stamp(20),
+         "message": {"id": "m1", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 1},
+                     "content": [{"type": "tool_use", "id": "t-join",
+                                  "name": "TaskOutput",
+                                  "input": {"description": "the suite"}}]}},
+        assistant_row(1220, "m2", write=193_139, read=0),
+    ])
+
+
+def test_polled_turn_has_no_mid_turn_ttl_expiry(write_transcript):
+    """The fix, measured on the clock it is about: every gap is under `TTL_5M`, so no
+    write in the turn is a `TTL_EXPIRY` and no join is open long enough to alarm.
+
+    Pins the MEASUREMENT, not new code — `inspection` is unchanged — and it is issue
+    868's named acceptance criterion, so it stays green from arrival."""
+    anatomy = inspection.read_session(_polled_turn(write_transcript))
+    (turn,) = anatomy.turns
+
+    inside = [w for w in anatomy.writes if w.ts >= turn.started]
+    assert inside, "the fixture wrote nothing, so it measures nothing"
+    assert [w.cause for w in inside if w.cause == inspection.TTL_EXPIRY] == []
+    assert max(w.gap for w in inside) <= inspection.TTL_5M
+    assert [a.kind for a in inspection.alarms(
+        anatomy, InspectConfig(), now=CHECK_INS[-1] + 2, dispatched=0.0)] == []
+
+
+def test_the_same_twenty_minutes_as_one_join_still_produces_both(write_transcript):
+    """The negative twin. Same wall clock, one blocking call: the conversation is
+    re-sent at the write rate and the OS raises the join alarm that says so.
+
+    Pins the MEASUREMENT of issue 868's fix, not new code: it is what stops the positive
+    twin proving only that its fixture is short."""
+    anatomy = inspection.read_session(_blocked_turn(write_transcript))
+
+    expiries = [w for w in anatomy.writes if w.cause == inspection.TTL_EXPIRY]
+    assert [w.written for w in expiries] == [193_139]
+    assert expiries[0].gap > inspection.TTL_5M
+    raised = inspection.alarms(anatomy, InspectConfig(), now=1221.0, dispatched=0.0)
+    assert inspection.JOIN_ALARM in [a.kind for a in raised]
+
+
+def test_turn_starts_hands_inspection_the_pairs_it_binds_on(started):
+    """`ProjectStore.turn_starts` is the only new read §3 needs: `(seq, started_at)`,
+    in seq order, for `read_session(turn_starts=...)`."""
+    from jarvis.project_store import ProjectStore
+
+    wo = ops.create_work_order("proj_a", "numbered")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        first = store.create_turn(wo["id"], "dispatch", "go")
+        second = store.create_turn(wo["id"], "message", "more")
+
+        assert store.turn_starts(wo["id"]) == [
+            (1, first["started_at"]), (2, second["started_at"])]
+    finally:
+        store.close()
+
+
+# -- a boundary is classified once, and every turn gets its own -------------------------
+#
+# Spec docs/superpowers/specs/2026-09-29-inspect-boundary-classification.md, issue #867:
+# `Turn.usage` summed `usage.priced()`, which classifies nothing, so every
+# classification key of every turn was structurally zero.
+
+COLD_FLOOR = 5_000
+
+
+def _compact_boundary_row(at: float, pre: int = 293_382, post: int = 4_697) -> dict:
+    return {"type": "system", "subtype": "compact_boundary", "timestamp": stamp(at),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post}}
+
+
+@pytest.fixture()
+def three_turns(write_transcript) -> str:
+    """Three turns: an ordinary one, one that COMPACTED, one that came back past the TTL.
+
+    One boundary per cause the session can have, in two different turns — which is the
+    only shape that can tell "attributed to its own turn" from "summed and smeared".
+    """
+    return write_transcript("s-boundaries", [
+        prompt_row(0.0, "dispatch"),
+        assistant_row(5.0, "a", write=200_000, read=0),
+        assistant_row(10.0, "b", write=3_000, read=200_000),
+        prompt_row(60.0, "keep going"),
+        assistant_row(65.0, "c", write=5_000, read=203_000),
+        _compact_boundary_row(70.0),
+        # Seconds after the summary landed: the static head, and by gap and read alone
+        # indistinguishable from a prefix miss.
+        assistant_row(90.0, "d", write=15_380, read=12_776),
+        prompt_row(600.0, "after the cache expired"),
+        assistant_row(605.0, "e", write=120_000, read=0),
+    ])
+
+
+def test_the_turn_that_compacted_reports_its_own_compacted_boundary(three_turns):
+    """#867's ask, and the only assertion in the issue that was ever about the fix."""
+    cfg = InspectConfig(report_write_floor=10_000)
+    anatomy = inspection.read_session(three_turns, cfg, cold_prefix_floor=COLD_FLOOR)
+
+    assert [t.usage.boundaries_compact for t in anatomy.turns] == [0, 1, 0]
+    assert anatomy.turns[1].usage.rewrite_compact_write == 15_380
+    # …and the same write, labelled by the other classifier, on the same turn.
+    compacted = [w for w in anatomy.writes if w.cause == inspection.COMPACTION]
+    assert [w.written for w in compacted] == [15_380]
+    assert anatomy.turns[1].started <= compacted[0].ts <= anatomy.turns[1].ended
+
+
+def test_a_turn_reports_the_boundary_that_fell_in_it_and_one_context_peak(three_turns):
+    """The per-turn `usage` block's keys were all structurally zero (spec §1.2), and
+    `context_peak` was emitted twice under one name with one of the two always 0."""
+    anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+
+    assert [t.usage.resume_boundaries for t in anatomy.turns] == [0, 1, 1]
+    assert [t.usage.boundaries_ttl for t in anatomy.turns] == [0, 0, 1]
+    assert anatomy.turns[2].usage.rewrite_ttl_write == 120_000
+    for turn in anatomy.turns:
+        payload = turn.as_dict()
+        assert payload["usage"]["context_peak"] == payload["context_peak"]
+    assert anatomy.turns[0].usage.rewrite_excess == 0
+
+
+def test_the_session_total_agrees_with_jarvis_cost_and_with_its_own_turns(three_turns):
+    """Two grains and a third surface, laid side by side — the rule
+    `test_the_cohort_script_classifies_boundaries_exactly_as_the_bill_does` already
+    enforces for `scripts/compaction_cohort.py`."""
+    anatomy = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+    block = anatomy.as_dict()["rewrite"]
+    theirs = usage.read_session(three_turns, COLD_FLOOR).total
+
+    for key, field in (("compact_write", "rewrite_compact_write"),
+                       ("ttl_write", "rewrite_ttl_write"),
+                       ("prefix_write", "rewrite_prefix_write"),
+                       ("cache_write", "cache_write")):
+        assert block[key] == getattr(theirs, field), key
+    assert (block["boundaries"], block["compact_boundaries"],
+            block["ttl_boundaries"], block["undecided_boundaries"]) == (2, 1, 1, 0)
+    assert block["tokens"] == anatomy.rewrite_excess()
+
+    summed = usage.Usage()
+    for turn in anatomy.turns:
+        summed = summed + turn.usage
+    assert summed.resume_boundaries == block["boundaries"]
+    assert summed.boundaries_compact == block["compact_boundaries"]
+    assert summed.rewrite_ttl_write == block["ttl_write"]
+    # `Usage.__add__` takes the MAX of `context_peak`, so summing turns yields the
+    # session's peak rather than a nonsense total.
+    assert summed.context_peak == anatomy.as_dict()["context_peak"]
+
+
+def test_an_unknown_floor_counts_every_boundary_and_guesses_no_cause(three_turns):
+    """`jarvis inspect` over a moved catalog must not fail and must not invent the
+    threshold (spec §4, rejected alternative 4). `UNDECIDED` is what that costs."""
+    known = inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR)
+    anatomy = inspection.read_session(three_turns)
+    block = anatomy.as_dict()["rewrite"]
+
+    assert block["boundaries"] == known.as_dict()["rewrite"]["boundaries"]
+    assert block["compact_boundaries"] == 1  # rule 2 needs no floor
+    assert block["ttl_write"] == 0 and block["prefix_write"] == 0
+    assert block["undecided_boundaries"] == block["boundaries"] - 1
+    # The turn whose only boundary was left open: nothing in any write bucket, so the
+    # share is `None` — "not measured", which a renderer must not print as 0%.
+    open_turn = anatomy.turns[2].usage
+    assert open_turn.boundaries_undecided == 1 and open_turn.resume_boundaries == 1
+    assert open_turn.rewrite_ttl_share is None
+
+
+def test_the_boundary_census_is_printed_and_not_only_in_the_json(three_turns, capsys):
+    """A `--json`-only field nobody can see is half a fix. With the split left open the
+    line says so instead of printing "0 expired", which would read as a finding."""
+    rendered(inspection.read_session(three_turns, cold_prefix_floor=COLD_FLOOR))
+    assert "boundaries 2 — 0 prefix, 1 expired, 1 compacted" in capsys.readouterr().out
+
+    rendered(inspection.read_session(three_turns))
+    line = next(ln for ln in capsys.readouterr().out.splitlines()
+                if ln.strip().startswith("boundaries "))
+    assert "boundaries 2 — 1 compacted, 1 unclassified (no os.cold_prefix_floor)" in line
+    assert "expired" not in line and "prefix," not in line
+
+
+def test_the_cold_prefix_floor_is_none_when_no_catalog_can_be_reached(jarvis_home):
+    """`ops.inspect_config`'s guarantee: a report over files on disk must not fail
+    because a catalog has moved. Unlike it, this falls back to None and not a number."""
+    assert ops.cold_prefix_floor() is None

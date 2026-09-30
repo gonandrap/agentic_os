@@ -394,3 +394,66 @@ def test_build_worker_prompt_passes_the_kind_down():
 def test_template_version_bumped_for_crew():
     from jarvis.bootstrap import TEMPLATE_VERSION
     assert TEMPLATE_VERSION >= 12
+
+
+# -- §6 of 2026-09-29-a-lead-must-not-block-past-its-cache.md: the poll rhythm ----------
+
+
+def test_core_contract_carries_the_poll_rhythm():
+    """The bullet asked for the behaviour that cost $52 (issue 868). What replaces the
+    prescription is the rhythm, with the numbers a lead has to act on."""
+    from jarvis import worker_brief
+
+    core = "\n".join(worker_brief.core_contract("wo-brief01", "t", "p1",
+                                               has_knowledge=False))
+    bullet = [line for line in core.split("\n")
+              if line.startswith("- **A turn is one-shot")]
+
+    assert len(bullet) == 1
+    text = bullet[0]
+    assert "BACKGROUND" in text and "run_in_background" in text
+    assert "3-4 minutes" in text
+    assert "240 seconds" in text
+    assert "uncollected" in text
+    # …and the heading sentence stays: it is still true, and it is WHY the rhythm is a
+    # poll and not a wait.
+    assert "NOTHING wakes you" in text
+    # Everything else still may not be backgrounded.
+    assert "REFUSED" in text
+
+
+def test_core_contract_no_longer_says_re_run_in_the_foreground():
+    """The defect, stated as policy. `hooks.long_foreground_decision` now refuses it."""
+    from jarvis import worker_brief
+
+    core = "\n".join(worker_brief.core_contract("wo-brief01", "t", "p1",
+                                                has_knowledge=False))
+
+    assert "re-run it in the FOREGROUND and wait" not in core
+    assert "in the FOREGROUND and wait" not in core
+
+
+def test_standing_instructions_carry_the_carve_out():
+    """The same rewrite at prose length, and the three things that start the next turn
+    stay: nothing about backgrounding changes the fact that no event re-invokes a
+    worker."""
+    from jarvis import worker_brief
+
+    section = worker_brief.render_section("record", wo_id="wo-brief01", project="p1")
+
+    assert "So work that outlasts one command runs in the FOREGROUND" not in section
+    assert "run_in_background" in section
+    assert "3-4 minutes" in section
+    assert "240 seconds" in section
+    assert "1.25x" in section and "0.1x" in section
+    for resumer in ("jarvis wo ask", "gate", "message"):
+        assert resumer in section
+    assert "I'll pick this up when the" in section
+
+
+def test_template_version_bumped():
+    """Prose is the whole mechanism for an already-bootstrapped repo, and it only
+    reaches one through the bump."""
+    from jarvis.bootstrap import TEMPLATE_VERSION
+
+    assert TEMPLATE_VERSION >= 13

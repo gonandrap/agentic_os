@@ -396,6 +396,107 @@ def test_an_alarm_still_with_the_user_keeps_its_escalation(escalated_alarm, stor
 # case where nobody called it.
 
 
+# -- the worker's own question: no pointer at all, only the timeline -------------------
+
+
+def event_at(store: ProjectStore, wo_id: str, kind: str, ts: float,
+             payload: dict | None = None) -> None:
+    """One timeline row, placed on the clock — the store stamps `db.now()` otherwise."""
+    store.add_event(wo_id, kind, payload or {})
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events WHERE wo_id=?)",
+        (ts, wo_id))
+    store.conn.commit()
+
+
+@pytest.fixture()
+def worker_question(store, neo):
+    """`jarvis wo ask`, escalated. The one kind with NO subject row pointing back at it."""
+    wo = store.create_work_order(title="the exporter", description="")
+    store.set_status(wo["id"], "needs_review")
+    q = neo.ask("proj_a", wo["id"], "CSV or JSON for the export default?")
+    neo.mark(q["id"], "escalated", reason="the user must rule")
+    return store.get_work_order(wo["id"]), question(neo, q["id"])
+
+
+def test_a_review_of_a_delivery_newer_than_the_question_retires_it(worker_question,
+                                                                   store, neo):
+    """wo-4beada49: the user settled the assumptions the question was about and nothing
+    could retire it — Neo will not re-answer an escalated row, and the user has no reason
+    to answer a question they have already answered another way."""
+    wo, q = worker_question
+    event_at(store, wo["id"], "finished", q["ts"] + 10)
+    event_at(store, wo["id"], "reviewed", q["ts"] + 20, {"accepted": True})
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert [v.context["question_id"] for v in violations] == [q["id"]]
+    assert violations[0].context["kind"] == "question"
+    closed = question(neo, q["id"])
+    assert closed["status"] == "answered"
+    assert closed["answered_by"] == "os"
+    assert wo["id"] in closed["answer_reason"]
+
+
+def test_a_finish_with_no_review_leaves_the_question_open(worker_question, store, neo):
+    """Neo's ruling, and the half most likely to be lost: a finish is the WORKER's act,
+    not the user's answer. Closing on it would retire a decision nobody took."""
+    wo, q = worker_question
+    event_at(store, wo["id"], "finished", q["ts"] + 10)
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, q["id"])["status"] == "escalated"
+
+
+def test_a_review_of_a_delivery_older_than_the_question_leaves_it_open(worker_question,
+                                                                       store, neo):
+    """The `finished` BETWEEN them is what makes the verdict about a delivery newer than
+    the question. Without it a review of an older delivery retires a question the worker
+    asked afterwards."""
+    wo, q = worker_question
+    event_at(store, wo["id"], "finished", q["ts"] - 20)
+    event_at(store, wo["id"], "reviewed", q["ts"] + 20, {"accepted": True})
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, q["id"])["status"] == "escalated"
+
+
+def test_a_review_with_no_delivery_between_leaves_the_question_open(worker_question,
+                                                                    store, neo):
+    """The other boundary of the same predicate: a verdict with NO `finished` between it
+    and the question is a review of work the question was asked about, not of a delivery
+    answering it. Both halves are required, and this is the half where the timeline
+    carries a `reviewed` and nothing else."""
+    wo, q = worker_question
+    event_at(store, wo["id"], "reviewed", q["ts"] + 20, {"accepted": True})
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, q["id"])["status"] == "escalated"
+
+
+def test_another_projects_worker_question_is_left_alone(store, neo):
+    """The rule all the siblings share: the checks run per project against an OS-wide
+    `neo.db`, so a work order this project does not know is not this project's to close."""
+    stranger = neo.ask("proj_b", "wo-elsewhere", "CSV or JSON?")
+    neo.mark(stranger["id"], "escalated", reason="theirs to decide")
+
+    violations = [v for v in check_project(store, repair=True)
+                  if v.invariant == "INV-NEO-ESCALATION-STALE"]
+
+    assert violations == []
+    assert question(neo, stranger["id"])["status"] == "escalated"
+
+
 # -- the listing that showed them ------------------------------------------------------
 
 

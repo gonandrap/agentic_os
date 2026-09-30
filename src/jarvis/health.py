@@ -19,7 +19,11 @@ SECONDS_PER_MINUTE = 60  # a unit, not a setting
 #: The vocabulary `due` answers in, and `health_reviews.trigger` records. Recorded rather
 #: than re-derived because "why did it look now" is a question about a decision already
 #: taken, and re-deriving it later reads the state as it is now.
-TRIGGERS = ("first-look", "changed", "stale")
+#:
+#: `account-window` is the odd one: it records no look at all, it is what the daemon
+#: writes against the ACCOUNT when the usage window is shut (spec
+#: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
+TRIGGERS = ("first-look", "changed", "stale", "account-window")
 
 #: What separates the parts of a fingerprint. Any character not in a status, a sequence
 #: number or a count would do; the point is that the string is one opaque value to

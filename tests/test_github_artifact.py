@@ -165,6 +165,64 @@ def test_the_local_git_carve_out_excludes_everything_it_does_not_name(source, al
         f"{source!r} should {'pass' if allowed else 'FAIL'} the carve-out")
 
 
+# ------------------------------------------------- the open pull request on a branch
+
+
+def test_the_open_pull_request_on_a_branch_comes_back_as_its_url(fake_gh):
+    """`ops.submit_plan`'s read: spec
+    docs/superpowers/specs/2026-09-27-a-planner-submits-behind-its-spec-pull-request.md §1.
+    """
+    fake_gh.set_open_pr("plan/wo-1", PR)
+
+    assert github.open_pull_request_for_branch("plan/wo-1") == PR
+
+    argv = fake_gh.calls[-1]["argv"]
+    assert argv[:2] == ["pr", "list"]
+    assert argv[argv.index("--head") + 1] == "plan/wo-1"
+    # `--state open` only: a closed or merged pull request lands nothing.
+    assert argv[argv.index("--state") + 1] == "open"
+
+
+def test_a_branch_with_no_open_pull_request_answers_empty_rather_than_raising(fake_gh):
+    """"" is a FACT about the branch; a raise would say the OS could not look."""
+    assert github.open_pull_request_for_branch("plan/wo-2") == ""
+
+
+@pytest.mark.parametrize("bad", ["--state", "-X", "", " main", "x y", "a;b"])
+def test_open_pull_request_for_branch_refuses_a_branch_it_may_not_ask_about(bad, fake_gh):
+    """`BRANCH_RE`, the guard `branch_protection` already applies: no leading `-`, so
+    `gh` cannot read the value as a flag, and no whitespace."""
+    with pytest.raises(github.GitHubError) as caught:
+        github.open_pull_request_for_branch(bad)
+    assert caught.value.reason == github.GitHubError.URL_REFUSED
+    assert fake_gh.calls == [], f"{bad!r} reached gh"
+
+
+def test_the_branchs_pull_request_is_checked_before_any_caller_may_hold_it(tmp_path,
+                                                                          fake_gh):
+    """`checked_pr_url`, the same check every other recorded `pr_url` passes."""
+    repo = _repo_with_origin(tmp_path, "https://github.com/mine/proj.git")
+    fake_gh.set_open_pr("plan/wo-3", "https://github.com/someone/else/pull/1")
+
+    with pytest.raises(github.UntrustedPullRequest):
+        github.open_pull_request_for_branch("plan/wo-3", cwd=repo)
+
+
+def test_a_gh_that_ran_and_refused_raises_rather_than_answering_nothing(fake_gh):
+    """"no open pull request" and "the OS could not ask" have opposite remedies."""
+    fake_gh.fail("HTTP 502")
+    with pytest.raises(github.GitHubError) as caught:
+        github.open_pull_request_for_branch("plan/wo-4")
+    assert caught.value.reason == github.GitHubError.REFUSED
+
+
+def test_a_branch_answer_that_is_not_json_is_unreadable(monkeypatch, fake_gh):
+    monkeypatch.setattr(github, "_run", lambda *a, **k: "not json at all")
+    with pytest.raises(github.GitHubError) as caught:
+        github.open_pull_request_for_branch("main")
+    assert caught.value.reason == github.GitHubError.UNREADABLE
+
+
 def test_fetching_an_artifact_runs_only_read_verbs(artifact):
     github.pr_artifact(PR)
     for call in artifact.calls:

@@ -8,6 +8,7 @@ from jarvis.testing import (  # noqa: F401
     fake_systemd,
     improvement_order,
     jarvis_home,
+    local_base,
     make_git_project,
     project,
     settle_turns,

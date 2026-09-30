@@ -62,7 +62,7 @@ def fts_query(term: str) -> str:
     instead of as FTS5 syntax — see
     docs/superpowers/specs/2026-08-24-ranked-knowledge-search.md §5.
     """
-    words = [w for w in (term or "").split() if any(c.isalnum() for c in w)]
+    words = db.cap_words([w for w in (term or "").split() if any(c.isalnum() for c in w)])
     return " OR ".join('"' + w.replace('"', '""') + '"' for w in words)
 
 
@@ -225,6 +225,11 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     cache_write INTEGER NOT NULL DEFAULT 0,
     cache_read INTEGER NOT NULL DEFAULT 0,
     output INTEGER NOT NULL DEFAULT 0,
+    -- How big the OS's own input to this call was, in characters. Measurement only,
+    -- nothing is capped: spec §3,
+    -- docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    prompt_chars INTEGER NOT NULL DEFAULT 0,
+    system_prompt_chars INTEGER NOT NULL DEFAULT 0,
     usage_json TEXT
 );
 -- What the OS believes is a privileged action, and what it has LEARNED is not.
@@ -263,6 +268,107 @@ CREATE TABLE IF NOT EXISTS gate_rules (
     retired_at REAL,                        -- NULL = in force; set = retracted
     retired_reason TEXT NOT NULL DEFAULT ''
 );
+-- The self-evolution registry: the gaps the OS has learned to RECOGNISE in itself, and
+-- what it proposes doing about each one. See rules.py and
+-- docs/specs/2026-09-27-self-evolution.md §3.1.
+--
+-- CENTRAL AND FLEET-WIDE, for the reason `gate_rules` above is: most gaps are OS
+-- behaviour rather than one project's, so a rule learned on `jarvis_os` protects every
+-- project without being copied into each project's database.
+--
+-- ONE DIFFERENCE, and it has to be stated because the two tables sit side by side with
+-- identically named columns that do NOT mean the same thing: `gate_rules.project` is
+-- provenance only, while `detectors.project` is provenance AND an optional SCOPE — `''`
+-- means every project, a name means that one. `list_detectors(project=…)` therefore
+-- selects `project=? OR project=''`, and the obvious `WHERE project=?` is wrong.
+--
+-- Two tables and not one: a single row carrying condition and remedy together cannot
+-- express "the detector was right and the remedy failed", which is the distinction the
+-- recurrence ledger must make, and one detector legitimately accumulates several
+-- remedies over time with the older ones retracted.
+--
+-- Rows here are NEVER deleted and never rewritten in place except the counters, the
+-- timestamps and the arm/retract fields — the same append-mostly discipline as
+-- `gate_rules` and the knowledge base, because what the OS believed and when is
+-- evidence. Retraction writes `retired_at` and a required reason; the row stays.
+CREATE TABLE IF NOT EXISTS detectors (
+    id TEXT PRIMARY KEY,                  -- 'dt-' + db.new_id
+    ts REAL NOT NULL,
+    gap_class TEXT NOT NULL,              -- slug, probes.ID_PATTERN shape; the join key
+    project TEXT NOT NULL DEFAULT '',     -- provenance AND optional scope; '' = fleet-wide
+    subjects TEXT NOT NULL DEFAULT 'work_order',
+    condition TEXT NOT NULL,              -- JSON, the rules.py grammar
+    summary TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'dry_run',   -- dry_run | armed | retracted
+    source TEXT NOT NULL DEFAULT 'builtin',   -- builtin | io | user
+    io_id TEXT NOT NULL DEFAULT '', fix_wo_id TEXT NOT NULL DEFAULT '',
+    issue_url TEXT NOT NULL DEFAULT '', pr_url TEXT NOT NULL DEFAULT '',
+    hits INTEGER NOT NULL DEFAULT 0, last_fired REAL, last_cleared REAL,
+    -- The four arming/false-positive columns ship HERE, written by NO code path in this
+    -- release: `arm_detector` and `record_false_positive` land with the alarm bridge.
+    -- They are here so that later child does not have to buy a migration for a column,
+    -- which is the one thing adding a column to a table that already ships costs.
+    false_positives INTEGER NOT NULL DEFAULT 0,
+    recurrences INTEGER NOT NULL DEFAULT 0,
+    arm_threshold INTEGER,                -- recorded, NEVER acted on: only a person arms
+    armed_at REAL, armed_by TEXT NOT NULL DEFAULT '',
+    armed_reason TEXT NOT NULL DEFAULT '',
+    retired_at REAL, retired_reason TEXT NOT NULL DEFAULT '',
+    seed_version INTEGER NOT NULL DEFAULT 0
+);
+
+-- `status` here uses the SAME three values as `detectors.status` and is never set on its
+-- own: A REMEDY ROW FOLLOWS ITS DETECTOR. The alarm bridge's `arm_detector` flips the
+-- detector and every non-retracted remedy row under it in ONE transaction; the disarm
+-- interlock flips the same set back to `dry_run`; `retract_detector` retracts its remedy
+-- rows with the detector's own reason. The ONE independent verb is `retract_remedy_rule`,
+-- which retracts one remedy under a LIVE detector — that is how a remedy is replaced
+-- without losing the condition's hit history, which is the whole reason the rule is two
+-- rows. So a remedy row is never `armed` under a `dry_run` detector, and the EFFECTIVE
+-- status of a rule is the WEAKER of the two: read the pair through
+-- `rules.effective_status`, never the remedy row alone.
+CREATE TABLE IF NOT EXISTS remedy_rules (
+    id TEXT PRIMARY KEY,                  -- 'rm-' + db.new_id
+    detector_id TEXT NOT NULL REFERENCES detectors(id),
+    ts REAL NOT NULL,
+    primitive TEXT NOT NULL,              -- a key of remedies.REMEDIES, validated on insert
+    params TEXT NOT NULL DEFAULT '{}',
+    argument TEXT NOT NULL DEFAULT '',    -- what the gate request says, in words
+    status TEXT NOT NULL DEFAULT 'dry_run',
+    hits INTEGER NOT NULL DEFAULT 0, last_fired REAL,
+    false_positives INTEGER NOT NULL DEFAULT 0,
+    retired_at REAL, retired_reason TEXT NOT NULL DEFAULT ''
+);
+
+-- `outcome` distinguishes six things that must not be collapsed. `recorded` is a dry
+-- run: the condition held and nothing was proposed. `proposed` is an armed fire that
+-- raised an alarm; `applied` is one whose remedy the gate then let run, and the two are
+-- separate because the headline counts ACTS, not intentions — an alarm nobody approved
+-- changed nothing. `refused` is an armed fire the remedy path declined (allow-list,
+-- missing grant, precondition) with the refusal's own words in `detail`: not a hit and
+-- not a false positive, it is the gate working. `unreadable` is the pinned ruling's
+-- case — something could not be READ, nothing was decided, and the row exists so the
+-- silence is visible. `cleared` closes a fire.
+--
+-- The enum ships COMPLETE even though only the evaluation-and-firing section ever writes
+-- `proposed`, `applied` or `refused`: a value a later child adds to a column a shipped
+-- release already reads is a migration, and there is no reason to buy one.
+CREATE TABLE IF NOT EXISTS rule_fires (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+    detector_id TEXT NOT NULL, remedy_rule_id TEXT NOT NULL DEFAULT '',
+    project TEXT NOT NULL, order_id TEXT NOT NULL, order_kind TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,            -- health.fingerprint, the dedupe memory
+    mode TEXT NOT NULL,                   -- dry_run | armed
+    outcome TEXT NOT NULL,                -- recorded | proposed | applied | refused
+                                          --   | unreadable | cleared
+    alarm_id TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '',
+    cleared_at REAL, cleared_seconds REAL,
+    false_positive INTEGER NOT NULL DEFAULT 0,
+    false_positive_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
+CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
 -- The append-only history of what the fleet was configured to run, and the only place
 -- that record exists: `projects.catalog_json` holds the CURRENT project dict and is
 -- overwritten on every `jarvis start`, and the catalog file is untracked, so git is not
@@ -347,6 +453,10 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 # Until this existed `os.db` had no upgrade path at all — `CentralStore.__init__` ran
 # `executescript(SCHEMA)` and nothing else — which is why the first column ever added to
 # it had to bring the mechanism with it.
+#
+# NOTHING HERE FOR `detectors`/`remedy_rules`/`rule_fires`, and that is not an oversight:
+# they are NEW tables, so `CREATE TABLE IF NOT EXISTS` creates them in a live `os.db` too.
+# This guard is only for a column added to a table that ALREADY ships.
 ADDED_COLUMNS = {
     "knowledge": {
         # Retraction. NULL on every pre-existing row, which reads as "standing".
@@ -371,6 +481,11 @@ ADDED_COLUMNS = {
         # from the transcript. '' on every pre-existing row, which reads as "not
         # recorded" — those calls keep their totals and simply cannot be expanded.
         "session_id": "TEXT NOT NULL DEFAULT ''",
+        # How big the call's own input was (spec §3,
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). 0 on a
+        # pre-existing row means NOT MEASURED, never "an empty prompt".
+        "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
+        "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
     },
 }
 
@@ -803,7 +918,7 @@ class CentralStore:
         Catches what stemming splits apart, and keeps the empty term meaning
         "everything" — the read `jarvis learn list` and the dashboard rely on.
         """
-        words = [w for w in (term or "").split() if w] or [""]
+        words = db.cap_words([w for w in (term or "").split() if w]) or [""]
         score = " + ".join(
             "(CASE WHEN content LIKE ? OR topic LIKE ? OR tags LIKE ? THEN 1 ELSE 0 END)"
             for _ in words)
@@ -1146,6 +1261,324 @@ class CentralStore:
         )
         return self.get_gate_rule(rule_id)  # type: ignore[return-value]
 
+    # -- the self-evolution registry (detectors, remedy rules, fires; see rules.py) ----
+    #
+    # docs/specs/2026-09-27-self-evolution.md §3. These mirror the
+    # `gate_rules` methods above deliberately, retraction semantics included: a retraction
+    # NEVER deletes, a reason is required, and a second one raises. Rows are never
+    # rewritten in place except the counters, the timestamps and the retract fields —
+    # the same append-mostly discipline as `gate_rules` and the knowledge base, because
+    # what the OS believed, and when, is evidence.
+    #
+    # Nothing here seeds: `rules.seed_rows()` is invoked by the section that owns the
+    # evaluation pass, and calling it from this module would put builtin rows into every
+    # `os.db` before anything could fire them.
+
+    def add_detector(self, gap_class: str, condition: Any, *, project: str = "",
+                     subjects: str = "work_order", summary: str = "",
+                     source: str = "builtin", io_id: str = "", fix_wo_id: str = "",
+                     issue_url: str = "", pr_url: str = "",
+                     arm_threshold: int | None = None, seed_version: int = 0,
+                     detector_id: str | None = None) -> dict[str, Any]:
+        """Register a gap the OS should recognise. ALWAYS in `dry_run`.
+
+        There is no argument that writes an ARMED detector, and there will not be one:
+        only a person arms a rule, once its hit history says it is right (spec §3.3).
+        Arming lands with the alarm bridge, as `arm_detector`.
+
+        `condition` is JSON text or an already-decoded object, and either way it goes
+        through `rules.parse_condition` and is stored CANONICALLY, so nothing unvalidated
+        reaches the table. A `RulesError` propagates with every problem in it — the
+        caller is a person or a model, and both re-submit per error message.
+
+        `detector_id` is a parameter for the reason `add_gate_rule`'s is: the seeder
+        passes a CONTENT-DERIVED id (`rules.seed_id`) so re-seeding is idempotent and
+        cannot resurrect a rule the user retracted.
+
+        An `io` detector may not be fleet-wide. Widening one afterwards is a person
+        RETRACTING the scoped row and registering a fleet-wide one — which leaves both on
+        the record with their reasons — and never an `UPDATE` nobody reviews.
+        """
+        from . import probes, rules
+
+        if not probes.ID_PATTERN.match(gap_class or ""):
+            raise ValueError(
+                f"gap_class {gap_class!r} is not a slug — it is the key later sections "
+                f"join on, so it must match {probes.ID_PATTERN.pattern}")
+        # A rule learned on one project may not silently police the others. Fleet-wide is
+        # the POWERFUL case, so it is the REVIEWED one: only `builtin` (seed rows, which
+        # are reviewed code in a diff) and `user` (a person typing) may take it. An
+        # investigation's rule is scoped to the project that produced it, always.
+        # Widening one afterwards is a person retracting the scoped row and registering a
+        # fleet-wide one, leaving both on the record with their reasons — never an
+        # `UPDATE` nobody reviews (spec §3).
+        if source == "io" and not project:
+            raise ValueError(
+                "an io-learned detector may not be fleet-wide: pass the project that "
+                "produced it. A rule learned on one project may not silently police the "
+                "others, and only `builtin` and `user` detectors — reviewed code, or a "
+                "person typing — may leave `project` empty. To widen this one later, "
+                "retract it and register a fleet-wide rule, so both stay on the record "
+                "with their reasons.")
+        parsed = rules.parse_condition(condition)
+        did = detector_id or db.new_id("dt")
+        self.conn.execute(
+            """INSERT INTO detectors
+               (id, ts, gap_class, project, subjects, condition, summary, status,
+                source, io_id, fix_wo_id, issue_url, pr_url, arm_threshold,
+                seed_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (did, db.now(), gap_class, project, subjects,
+             json.dumps(parsed, sort_keys=True, separators=(",", ":")), summary,
+             rules.DRY_RUN, source, io_id, fix_wo_id, issue_url, pr_url, arm_threshold,
+             seed_version),
+        )
+        return self.get_detector(did)  # type: ignore[return-value]
+
+    def get_detector(self, detector_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM detectors WHERE id=?",
+                                (detector_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_detectors(self, *, project: str = "", gap_class: str = "",
+                       status: str = "",
+                       include_retired: bool = False) -> list[dict[str, Any]]:
+        """The registered detectors, oldest first.
+
+        `project` is a SCOPE filter, not an equality filter: it returns the rows scoped
+        to that project AND the fleet-wide ones (`project=''`). That is what the column
+        means, and the obvious `WHERE project=?` would hide every builtin rule — all of
+        which are fleet-wide — from every project that asked.
+        """
+        q = "SELECT * FROM detectors WHERE 1=1"
+        params: list[Any] = []
+        if not include_retired:
+            q += " AND retired_at IS NULL"
+        if project:
+            q += " AND (project=? OR project='')"
+            params.append(project)
+        if gap_class:
+            q += " AND gap_class=?"
+            params.append(gap_class)
+        if status:
+            q += " AND status=?"
+            params.append(status)
+        q += " ORDER BY ts, id"
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def detectors_for_gap(self, gap_class: str,
+                          project: str = "") -> list[dict[str, Any]]:
+        """The live detectors for one gap class, in this project's scope."""
+        return self.list_detectors(project=project, gap_class=gap_class)
+
+    def add_remedy_rule(self, detector_id: str, primitive: str, *,
+                        params: Any = None, argument: str = "",
+                        remedy_id: str | None = None) -> dict[str, Any]:
+        """What this detector proposes doing. ALWAYS in `dry_run`.
+
+        The primitive and its parameters are validated at INSERT through
+        `rules.validate_params`, and every problem is raised at once. The name check is
+        the load-bearing one: **the database grows RULES, never PRIMITIVES**
+        (kn-6c252734) — a row names one of the closed `remedies.REMEDIES` and can never
+        introduce one.
+
+        A retracted detector is refused because a live remedy row under a dead detector
+        is a row `rules.resolve` would still pair if anything looked it up by primitive.
+
+        THE STATE MACHINE: a remedy row follows its detector. Same three values as
+        `detectors.status`, and nothing here sets `armed` — the alarm bridge's
+        `arm_detector` flips the detector and every non-retracted remedy row under it in
+        one transaction, the disarm interlock flips the same set back, and
+        `retract_detector` retracts them with the detector's reason. The one independent
+        verb is `retract_remedy_rule`, which retracts one remedy under a LIVE detector:
+        that is how a remedy is replaced without losing the condition's history, which is
+        why the rule is two rows. A remedy row is therefore never `armed` under a
+        `dry_run` detector, and a rule's EFFECTIVE status is the weaker of the pair —
+        read it through `rules.effective_status`, never off this row alone.
+        """
+        from . import rules
+
+        detector = self.get_detector(detector_id)
+        if detector is None:
+            raise KeyError(f"detector {detector_id} not found")
+        if detector["retired_at"] is not None:
+            raise ValueError(f"detector {detector_id} is retracted — a remedy under a "
+                             f"retracted detector would never be reached, and would "
+                             f"still resolve if anything looked it up by primitive")
+        decoded = params if params is not None else {}
+        if isinstance(decoded, str):
+            decoded = db.from_json(decoded, {})
+        problems = rules.validate_params(primitive, decoded)
+        if problems:
+            raise ValueError("; ".join(problems))
+        rid = remedy_id or db.new_id("rm")
+        self.conn.execute(
+            """INSERT INTO remedy_rules
+               (id, detector_id, ts, primitive, params, argument, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            (rid, detector_id, db.now(), primitive,
+             json.dumps(decoded, sort_keys=True, separators=(",", ":")), argument,
+             rules.DRY_RUN),
+        )
+        return self.get_remedy_rule(rid)  # type: ignore[return-value]
+
+    def get_remedy_rule(self, remedy_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM remedy_rules WHERE id=?",
+                                (remedy_id,)).fetchone()
+        return dict(row) if row else None
+
+    def remedy_rules_for(self, detector_id: str, *,
+                         include_retired: bool = False) -> list[dict[str, Any]]:
+        q = "SELECT * FROM remedy_rules WHERE detector_id=?"
+        if not include_retired:
+            q += " AND retired_at IS NULL"
+        q += " ORDER BY ts, id"
+        return db.rows_to_dicts(self.conn.execute(q, (detector_id,)).fetchall())
+
+    def retract_detector(self, detector_id: str, reason: str) -> dict[str, Any]:
+        """Retire a detector, and every live remedy rule under it.
+
+        The cascade is the point. A live remedy row whose detector is retracted is a row
+        `rules.resolve` would still pair the moment anything looked one up by primitive
+        rather than by detector, so it is retired in the same breath with a reason saying
+        it followed its detector. Nothing is deleted: `list_detectors(include_retired=
+        True)` still returns the row, because a rule that turned out to be wrong has to
+        stop applying without the record losing what the OS believed while it did.
+        """
+        from . import rules
+
+        detector = self.get_detector(detector_id)
+        if detector is None:
+            raise KeyError(f"detector {detector_id} not found")
+        if detector["retired_at"] is not None:
+            raise ValueError(f"detector {detector_id} is already retracted")
+        now = db.now()
+        self.conn.execute(
+            "UPDATE detectors SET status=?, retired_at=?, retired_reason=? WHERE id=?",
+            (rules.RETRACTED, now, reason, detector_id),
+        )
+        self.conn.execute(
+            """UPDATE remedy_rules SET status=?, retired_at=?, retired_reason=?
+               WHERE detector_id=? AND retired_at IS NULL""",
+            (rules.RETRACTED, now,
+             f"followed its detector {detector_id}, retracted: {reason}", detector_id),
+        )
+        return self.get_detector(detector_id)  # type: ignore[return-value]
+
+    def retract_remedy_rule(self, remedy_id: str, reason: str) -> dict[str, Any]:
+        rule = self.get_remedy_rule(remedy_id)
+        if rule is None:
+            raise KeyError(f"remedy rule {remedy_id} not found")
+        if rule["retired_at"] is not None:
+            raise ValueError(f"remedy rule {remedy_id} is already retracted")
+        from . import rules
+
+        self.conn.execute(
+            "UPDATE remedy_rules SET status=?, retired_at=?, retired_reason=? WHERE id=?",
+            (rules.RETRACTED, db.now(), reason, remedy_id),
+        )
+        return self.get_remedy_rule(remedy_id)  # type: ignore[return-value]
+
+    def record_rule_fire(self, *, detector_id: str, project: str, order_id: str,
+                         order_kind: str, fingerprint: str, mode: str, outcome: str,
+                         remedy_rule_id: str = "", alarm_id: str = "",
+                         detail: str = "") -> dict[str, Any]:
+        """Record one thing the registry noticed about one order.
+
+        ONLY A HIT COUNTS. `recorded`, `proposed` and `applied` increment `hits` and move
+        `last_fired`; `refused`, `unreadable` and `cleared` do not, and the distinction is
+        the whole reason the enum has six values. A refusal is the GATE WORKING, not the
+        detector being right — counting it would calibrate an arm threshold on evidence
+        that says nothing about the rule. An `unreadable` is not a decision at all: it is
+        the record that something could not be read and nothing was decided. A `cleared`
+        closes a fire that was already counted when it opened.
+
+        `detail` is bounded through `rules.bound`, the way every other payload in this
+        codebase is, with the cap recorded in the text.
+        """
+        from . import rules
+
+        if outcome not in rules.FIRE_OUTCOMES:
+            raise ValueError(f"unknown fire outcome {outcome!r} — expected one of "
+                             f"{', '.join(rules.FIRE_OUTCOMES)}")
+        now = db.now()
+        cur = self.conn.execute(
+            """INSERT INTO rule_fires
+               (ts, detector_id, remedy_rule_id, project, order_id, order_kind,
+                fingerprint, mode, outcome, alarm_id, detail)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (now, detector_id, remedy_rule_id, project, order_id, order_kind,
+             fingerprint, mode, outcome, alarm_id, rules.bound(detail)),
+        )
+        if outcome in (rules.RECORDED, rules.PROPOSED, rules.APPLIED):
+            self.conn.execute(
+                "UPDATE detectors SET hits = hits + 1, last_fired=? WHERE id=?",
+                (now, detector_id))
+            if remedy_rule_id:
+                self.conn.execute(
+                    "UPDATE remedy_rules SET hits = hits + 1, last_fired=? WHERE id=?",
+                    (now, remedy_rule_id))
+        return self.get_rule_fire(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def get_rule_fire(self, fire_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM rule_fires WHERE id=?",
+                                (fire_id,)).fetchone()
+        return dict(row) if row else None
+
+    def open_rule_fire(self, detector_id: str,
+                       order_id: str) -> dict[str, Any] | None:
+        """The NEWEST uncleared fire for this detector on this order. The dedupe memory.
+
+        A condition standing for six hours is one fire, not 720, and the dedupe is
+        against the NEWEST record rather than against every past one — commit `0c1e3f9`
+        ("Dedupe a hold against the newest one, not every past one") already had to learn
+        that once, on the holds ledger, where matching any past row meant a condition
+        that recurred after being cleared was silently swallowed for ever.
+        """
+        row = self.conn.execute(
+            """SELECT * FROM rule_fires
+               WHERE detector_id=? AND order_id=? AND cleared_at IS NULL
+               ORDER BY ts DESC, id DESC LIMIT 1""",
+            (detector_id, order_id)).fetchone()
+        return dict(row) if row else None
+
+    def close_rule_fire(self, fire_id: int, *,
+                        now: float | None = None) -> dict[str, Any]:
+        """Close a fire: the condition no longer holds, and this detector may fire on
+        this order again.
+
+        `cleared_seconds` is measured from the fire's OWN `ts` rather than recomputed by
+        a caller, so how long a condition stood is a fact of the row and not of whoever
+        happened to close it.
+        """
+        fire = self.get_rule_fire(fire_id)
+        if fire is None:
+            raise KeyError(f"rule fire {fire_id} not found")
+        if fire["cleared_at"] is not None:
+            raise ValueError(f"rule fire {fire_id} is already closed")
+        ts = db.now() if now is None else now
+        self.conn.execute(
+            "UPDATE rule_fires SET cleared_at=?, cleared_seconds=? WHERE id=?",
+            (ts, max(0.0, ts - float(fire["ts"])), fire_id))
+        self.conn.execute("UPDATE detectors SET last_cleared=? WHERE id=?",
+                          (ts, fire["detector_id"]))
+        return self.get_rule_fire(fire_id)  # type: ignore[return-value]
+
+    def list_rule_fires(self, *, detector_id: str = "", project: str = "",
+                        order_id: str = "", outcome: str = "",
+                        limit: int = 50) -> list[dict[str, Any]]:
+        """The fire history, NEWEST FIRST — this is the one place read as a timeline."""
+        q = "SELECT * FROM rule_fires WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("detector_id", detector_id), ("project", project),
+                              ("order_id", order_id), ("outcome", outcome)):
+            if value:
+                q += f" AND {column}=?"
+                params.append(value)
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
     # --- the config version ledger -------------------------------------------------
     # docs/superpowers/specs/2026-08-27-the-config-console.md §2, §9.
 
@@ -1271,7 +1704,8 @@ class CentralStore:
     def add_agent_call(self, kind: str, *, project: str = "", wo_id: str = "",
                        label: str = "", model: str = "", question_id: int | None = None,
                        ok: bool = True, session_id: str = "",
-                       usage: dict[str, Any] | None = None) -> int:
+                       usage: dict[str, Any] | None = None,
+                       prompt_chars: int = 0, system_prompt_chars: int = 0) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
         `usage` is a `claude_cli.derive_turn_usage` envelope, or None for a call that
@@ -1284,12 +1718,14 @@ class CentralStore:
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,
-                                        cache_write, cache_read, output, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        cache_write, cache_read, output,
+                                        prompt_chars, system_prompt_chars, usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
              session_id,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
+             prompt_chars, system_prompt_chars,
              db.to_json(usage) if usage else None),
         )
         return int(cur.lastrowid or 0)
@@ -1344,6 +1780,13 @@ class CentralStore:
         2026-08-22-the-five-minute-write-everywhere.md). `json_extract` returns NULL both
         for a row with no envelope and for one whose envelope predates the field, and
         COALESCE folds both into the same honest zero: no split known, floor rate.
+
+        `max_input_chars` is the largest TOTAL input one call in the group sent: that
+        call's prompt plus that call's system prompt, maximised per row and never two
+        separate maxima added, which would report a size no call ever sent. MAX and not
+        SUM because the question is which call had the biggest input, and a sum of prompt
+        sizes is a meaningless number (spec §3,
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
         """
         clause = "WHERE project=?" if project else ""
         params = (project,) if project else ()
@@ -1352,6 +1795,7 @@ class CentralStore:
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
+                       MAX(prompt_chars + system_prompt_chars) AS max_input_chars,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
                            AS cache_1h,
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
