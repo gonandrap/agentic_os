@@ -2122,6 +2122,505 @@ def _disagreements(blocker: dict[str, Any], needs_you: list[str]) -> list[str]:
     return out
 
 
+#: The `waiting_on` answers that are NOT A BLOCKER: something is coming by itself, or the
+#: order has settled. They are answered in words and offered nothing — handing back
+#: `detail` as the user's command would invent a move out of a sentence that describes a
+#: wait, and offering an empty list of proposals reads as "nothing to do" when the truth is
+#: "nothing is wrong" (issue #227).
+#:
+#: THE RULE THIS MEMBERSHIP FOLLOWS, which `manager_idle` proved: a slug whose `detail`
+#: NAMES NO COMMAND belongs here. `FIX_UNCOVERED`'s other arm hands `detail` back labelled
+#: with whose move it is (`FIX_YOURS_TO_RUN`, or `FIX_WORKERS_TO_RUN` for the closed set
+#: `FIX_WORKER_MOVE` names) — so a description of a wait reaching it is
+#: the OS inventing a move the user cannot make, on top of calling a healthy order blocked.
+#: The slugs that DO name a command in their own detail are enumerated in `FIX_USERS_MOVE`
+#: and `FIX_WORKER_MOVE`, one per whose move it is. Adding a `waiting_on` answer means
+#: deciding it into one of those three sets — and a slug in none of them now reaches
+#: `_fix_match`'s default arm, which files for a remedy to be WRITTEN (Neo q839).
+FIX_NOTHING_TO_CLEAR: tuple[str, ...] = (
+    "turn_running", "validating", "retry_pending", "neo_question", "gate_with_neo",
+    "queued_message", "pending", "manager_idle", "completed", "cancelled", "failed",
+    "waiting_pr_merge", "needs_review",
+)
+
+#: Said of a blocker no shipped remedy covers AND whose way through somebody can type —
+#: `FIX_USERS_MOVE` and `FIX_WORKER_MOVE`, and only those. The way through is §6's own
+#: pre-validated sentence, labelled with whose it is to run.
+#:
+#: IT IS NO LONGER THE ANSWER FOR AN UNCLASSIFIED SLUG. It used to be, and the user rejected
+#: that (Neo q839): "it should not auto-match with known blockers, because doing that it
+#: will never learn about new bugs or gaps in the OS." A slug none of the four sets names is
+#: a gap CLASS, and `_fix_match`'s default arm opens or points to an INVESTIGATION of it
+#: (the user's later design addition, superseding Neo q839's own default arm, which used to
+#: offer a work order guessing at a new remedy — `wo-4beada49`'s order kind now registers
+#: one instead, through fo-69ba1cc4's registry).
+FIX_UNCOVERED = ("no shipped remedy covers this blocker ({what}) — the OS is not offering "
+                 "to act on it")
+FIX_YOURS_TO_RUN = ("this is yours to run: the OS is not offering to take it, and nothing "
+                    "here has been filed")
+#: The same hand-back, labelled for the slugs whose way through the USER MAY NOT RUN.
+FIX_WORKERS_TO_RUN = ("this is the WORKER's to run in its own worktree, not yours: the OS "
+                      "is not offering to take it, and nothing here has been filed")
+#: CLOSED SET, `gate_held` its only member today. A held gate's two exits — `jarvis gate
+#: request` and `jarvis gate contest` — are refused from anyone but the worker whose
+#: worktree the case belongs to (spec 2026-09-12 §8), so `FIX_YOURS_TO_RUN` on that detail
+#: sends the user at a command the OS will not accept from them.
+#:
+#: It is closed because membership is a fact about WHO MAY RUN the command the slug's own
+#: `detail` names, decided one slug at a time against the command's own rule — never
+#: inferred from the wording, which is how a slug ends up mislabelled in the first place.
+#: Adding a `waiting_on` answer means deciding it here, exactly as `FIX_NOTHING_TO_CLEAR`
+#: above must be decided.
+FIX_WORKER_MOVE: frozenset[str] = frozenset({"gate_held"})
+
+#: CLOSED SET: the slugs whose own `detail` names a command THE USER MAY RUN. This was the
+#: DEFAULT arm until Neo q839; it is a membership list now, because "everything else is
+#: yours to type" hid the case the user actually cares about — a blocker the OS has no
+#: remedy for and never learns it needs one. Each member is decided against the command its
+#: own `waiting_on` detail names, never inferred from the wording:
+#:
+#: * `signin` — `/login`, which only the user can type;
+#: * `assumptions` and `plan_assumptions` — `jarvis wo review`, the user's ruling and
+#:   nobody else's (the second one on its feature's PLANNER);
+#: * `gate_escalated` — `jarvis gate approve` / `deny`, escalated to the user BY NAME;
+#: * `neo_escalated` — `jarvis neo answer`, a question Neo could not settle;
+#: * `message_stuck` — `jarvis wo show`, then `jarvis wo done` if the order is finished
+#:   with it.
+#:
+#: `gate_held` is deliberately NOT here: its two exits are refused from anyone but the
+#: worker, which is what `FIX_WORKER_MOVE` exists to say.
+FIX_USERS_MOVE: frozenset[str] = frozenset({
+    "signin", "assumptions", "plan_assumptions", "gate_escalated", "neo_escalated",
+    "message_stuck",
+})
+FIX_NOTHING = "nothing here for a remedy to clear — {detail}"
+FIX_LIVE_EDGES = ("every dependency edge it waits on is still LIVE, so the `unblock` "
+                  "remedy would cut nothing and is not offered — only `--all` cuts a live "
+                  "edge, and it then runs without the work it was told to build on")
+
+#: What `confirm=False` has and has not done. Printed beside the remedy's own `blast`, so
+#: the user reads the cost and the next step in one place.
+FIX_APPROVING = ("nothing has been done and nothing has been filed. `jarvis wo fix "
+                 "{wo_id} --remedy {remedy} --confirm` files a gate request for it; a "
+                 "reviewer decides, and the OS applies it only after the gate opens")
+FIX_OFFERED = ("one shipped remedy covers this blocker and this project has it armed — "
+               "read what it touches before you confirm it")
+
+#: `propose_fix`'s `reason`: WHY the OS is asking, in the reviewer's hands and in the
+#: nudge the worker may receive. The user reached this off §6, so the diagnosis is the
+#: whole case and it travels verbatim.
+FIX_REASON = "the user asked for this off `jarvis wo why {wo_id}`, which reported: {detail}"
+
+#: The `argument` each matched remedy carries when the caller named none. OS-authored, and
+#: per remedy rather than one line: the nudge's argument is read by a worker mid-task and
+#: `unblock`'s is read only by the reviewer.
+FIX_ARGUMENTS = {
+    "nudge": ("Say where you are. The OS's own diagnosis could not account for why this "
+              "order has not moved, and nobody can see inside your turn."),
+    "unblock": ("Cut the dependency edges that can never clear, so this order can be "
+                "dispatched."),
+}
+
+#: THE DEFAULT ARM's answer for a slug `remedies.resolve` claims for nobody: a GAP CLASS,
+#: not a blocker to guess a fix for. Supersedes Neo q839's `FIX_NEW_REMEDY_BRIEF` (the
+#: user's later design addition): the registry is DATA rows fo-69ba1cc4 builds, keyed by
+#: `gap_class`, so the gap ends in a REGISTERED REMEDY through an INVESTIGATION —
+#: `wo-4beada49`'s order kind, whose analyst adds the row and its mechanical detector — and
+#: never in a work order guessing at one.
+#:
+#: OS-AUTHORED, and the only interpolation is the `waiting_on` slug: text the OS wrote
+#: (`diagnose`'s boundary, kn-1791a5e6).
+FIX_GAP_NO_INVESTIGATION = (
+    "no registered remedy covers this blocker ({what}) — that gap class has no "
+    "investigation open yet. Opening one on this order is the move that ends it: an "
+    "analyst reads the gap and registers a remedy that clears `{what}` wherever it "
+    "appears next, rather than a one-off fix for this order alone"
+)
+#: The same gap, but a LIVE improvement order already names this work order OR THIS GAP
+#: CLASS as evidence — the POINT half of the fallback, widened by Neo q863: the class is
+#: the unit of work an investigation ends, so a second investigation of the same class is
+#: duplicated effort even when it names a different order. The two interpolations are the
+#: slug and the `io-` id, both OS-computed.
+FIX_GAP_INVESTIGATING = (
+    "no registered remedy covers this blocker ({what}) — {io_id} is already investigating "
+    "this gap class. Read it with `jarvis io show {io_id}`"
+)
+
+#: Neo q863(a): TITLE and BRIEF for the investigation `_fix_gap_note` opens on `confirm=True`
+#: with no live one covering the class. OS-authored — the only interpolations are the slug,
+#: this order's id, and §6's own `detail` (the evidence the analyst starts from), never an
+#: exception tail, a gate command, a prompt or a transcript line (`diagnose`'s boundary,
+#: kn-1791a5e6).
+FIX_GAP_INVESTIGATION_TITLE = (
+    "Investigate the `{what}` gap class: no registered remedy clears it"
+)
+#: Neo's ruling condition on q863: the brief MUST end by filing a work order for a new
+#: REUSABLE remedy in src/jarvis/remedies.py — tests, a `SHIPPED_REMEDIES` update, and the
+#: remedy left OFF `RemedyConfig`'s allow-list by default, so it ships disarmed. Stating
+#: that requirement here is what makes q863's condition binding on the analyst rather than
+#: a preference this module remembered and nobody else can see.
+FIX_GAP_INVESTIGATION_BRIEF = (
+    "`jarvis wo fix` found blocker `{what}` on {wo_id} with no registered remedy to clear "
+    "it. `jarvis wo why {wo_id}` reported: {detail}\n\n"
+    "End this investigation by filing a work order for a new REUSABLE remedy in "
+    "src/jarvis/remedies.py: it needs tests, a `SHIPPED_REMEDIES` entry, and it must ship "
+    "OFF `RemedyConfig`'s allow-list by default so the remedy arrives disarmed."
+)
+#: The just-opened case's own note — distinct from `FIX_GAP_INVESTIGATING`'s "already
+#: investigating" because nobody has read this one yet; naming the io id and the gap class
+#: so the user's next move is `jarvis io show {io_id}`, same as the point half.
+FIX_GAP_OPENED = (
+    "no registered remedy covers this blocker ({what}) — {io_id} is now open to "
+    "investigate this gap class. Read it with `jarvis io show {io_id}`"
+)
+#: A FAILURE IS NEVER A VERDICT (kn-40db1828): `create_improvement_order` can raise
+#: `OpsError` (unregistered project, or its own no-description/no-refs refusals, neither
+#: reachable here since this call always supplies both). NO `{error}` SLOT — the exception
+#: string stays in the `log.warning` and never reaches the payload (`FIX_UNREACHABLE`'s
+#: precedent, same file).
+FIX_GAP_FILING_FAILED = (
+    "no registered remedy covers this blocker ({what}) — an investigation could not be "
+    "opened, and nothing was filed. Nothing was decided either: run this again"
+)
+
+#: A proposal the reviewer has been asked about, and one nobody could be asked about.
+#: UNREACHABLE IS NOT A VERDICT (kn-40db1828): the grant stays pending and is answerable by
+#: number, and the OS says so rather than reporting a decision nobody took.
+FIX_FILED = ("gate request {approval} is filed and a reviewer decides it. The act happens "
+             "only after the gate opens — `jarvis gate show {approval}`")
+#: NO `{error}` SLOT. The payload carries only text the OS wrote (`diagnose`'s docstring,
+#: kn-1791a5e6) and an exception string can carry a path; it stays in the `log.warning`.
+FIX_UNREACHABLE = ("the OS could not reach Neo to put this request to a reviewer, so "
+                   "nothing was decided")
+FIX_STILL_PENDING = ("gate request {approval} is filed and still pending, and no reviewer "
+                     "has been asked yet — nothing was applied. Answer it yourself with "
+                     "`jarvis gate approve {approval} --reason \"…\"`, or run this again "
+                     "once Neo is reachable")
+FIX_UNREACHABLE_NO_ROW = ("nothing was filed and nothing was applied — run it again once "
+                          "Neo is reachable")
+
+
+def remedy_config(project: str | None = None) -> Any:
+    """The `supervisor.remedies` settings in force for `project` — `validation_config`'s
+    shape and its reasons.
+
+    A missing, moved or unparseable catalog answers the SHIPPED DEFAULT rather than
+    raising, and the shipped default is off with an empty allow-list: a surface that cannot
+    read the catalog must offer less, never more.
+    """
+    from .catalog import RemedyConfig
+
+    try:
+        catalog = resolve_catalog()
+        spec: Any = catalog.os if project is None else catalog.project(project)
+        return spec.supervisor.remedies
+    except (OpsError, CatalogError, OSError, ValueError):
+        return RemedyConfig()
+
+
+def _fix_gap_note(project: str, wo_id: str, what: str, detail: str, confirm: bool) -> str:
+    """§11's fallback for a slug `remedies.resolve` claims for nobody — the user's design
+    addition superseding Neo q839's own default arm. POINTS at a LIVE improvement order
+    that already evidences this gap class, or on `confirm=True` OPENS one (Neo q863(a)).
+    `confirm=False` stays read-only (issue #227 still applies — the gap reads as a gap, in
+    words, never as an empty list).
+
+    Reads the evidence through `evidence_refs`, the one home for that read — see its own
+    docstring for why this function does not know the metadata shape itself. Matches on
+    EITHER this work order's id OR the slug itself (Neo q863's whole reason for the second
+    evidence ref): the class is the unit of work an investigation ends, so a second
+    investigation of the same class is duplicated effort even filed against a different
+    order — `FIX_GAP_INVESTIGATING`'s "already investigating this gap class" is equally
+    true either way.
+    """
+    for io in list_improvement_orders(project, include_settled=False):
+        refs = evidence_refs(io)
+        if wo_id in refs or what in refs:
+            return FIX_GAP_INVESTIGATING.format(what=what, io_id=io["id"])
+    if not confirm:
+        return FIX_GAP_NO_INVESTIGATION.format(what=what)
+    # NO GATE (Neo q863(a), in Neo's own terms): the user pressing `--confirm` IS the
+    # authorisation, and an investigation only OBSERVES — it reaches no session, changes no
+    # status, alters nothing — unlike `file_work_order`, which is gated because it FILES
+    # WORK. REFS ARE THE WO ID *AND* THE GAP-CLASS SLUG, in that order, so a later
+    # investigation can dedupe by CLASS and not only by order — the loop above, widened.
+    try:
+        io = create_improvement_order(
+            project,
+            FIX_GAP_INVESTIGATION_TITLE.format(what=what),
+            FIX_GAP_INVESTIGATION_BRIEF.format(what=what, wo_id=wo_id, detail=detail),
+            refs=[wo_id, what],
+            # `WO_ORIGINS` (project_store.py) is a CLOSED set and this is the right
+            # member of it, not the default nobody chose: a `jarvis` command the user ran
+            # filed this, the same bucket `jarvis bug report` uses — as against a direct DB
+            # insert (`manual`), a clock (`schedule`) or Neo's own writes (`neo`). `fix()`
+            # is one function behind both the CLI and the debug-page button, so there is no
+            # narrower bucket to hand it and inventing one would widen a closed set.
+            origin="jarvis")
+    except OpsError as exc:
+        # A FAILURE IS NEVER A VERDICT (kn-40db1828): the exception text stays here, never
+        # in the payload — `FIX_UNREACHABLE`'s precedent, same file.
+        log.warning("could not open an investigation of the %s gap class on %s: %s",
+                    what, wo_id, exc)
+        return FIX_GAP_FILING_FAILED.format(what=what)
+    return FIX_GAP_OPENED.format(what=what, io_id=io["id"])
+
+
+def _fix_match(store: ProjectStore, wo: dict[str, Any], blocker: dict[str, Any],
+               asked: str | None, project: str, confirm: bool
+               ) -> tuple[str | None, str | None, dict[str, str] | None, str | None]:
+    """`(remedy, note, your_move, argument)` for one blocker — the matching rule, and it is
+    the REGISTRY's rather than this module's (Neo q839, and the user's later design
+    addition that the registry is DATA rows fo-69ba1cc4 builds, resolved through
+    `remedies.resolve`).
+
+    `argument` is the matched row's own `params["argument"]` when it has one and None
+    everywhere else, so a caller's `--argument` still wins and the shipped `FIX_ARGUMENTS`
+    default still applies when neither is given (`fix`'s own precedence comment).
+
+    Reads only, EXCEPT the gap arm on `confirm=True`, which may open an investigation
+    (`_fix_gap_note`, Neo q863(a)) — every other arm here still writes nothing. The
+    predicates are the ones `_diagnose_commands` calls, not copies of them (kn-4ea33fe6),
+    and the `NUDGE_IS_WRONG` arm mirrors `resume_in_auto`'s refusal in that mapping's own
+    words rather than restating why.
+    """
+    from . import remedies as remedies_mod
+
+    wo_id = str(wo["id"])
+    what = str(blocker["what"])
+    # ASKED THE REGISTRY, not a table here: one home per rule, so a remedy shipped later is
+    # reachable without an edit to this function (`remedies.resolve`).
+    match = None if asked is not None else remedies_mod.resolve(what)
+    matched = asked if asked is not None else (match.remedy if match else None)
+    # THE MAPPING OWNS THE RULE, on the asked path too: there is no `--force` here, and an
+    # OS proposing a nudge its own mapping calls wrong is asking a reviewer to approve a
+    # known no-op.
+    if matched == "nudge" and what in NUDGE_IS_WRONG:
+        return None, f"{NUDGE_IS_WRONG[what]} {blocker['detail']}", None, None
+    if asked is not None:
+        return asked, None, None, None
+    if matched == "unblock":
+        edges = store.unfinished_dependencies(wo_id)
+        if not edges:
+            return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
+        if not invariants.dead_dependencies(store, wo):
+            return None, FIX_LIVE_EDGES, {
+                "detail": f"jarvis wo unblock {wo_id} --all",
+                "note": FIX_YOURS_TO_RUN}, None
+    if matched is not None:
+        assert match is not None
+        return matched, None, None, match.params.get("argument")
+    if what in FIX_NOTHING_TO_CLEAR:
+        return None, FIX_NOTHING.format(detail=blocker["detail"]), None, None
+    if what in FIX_USERS_MOVE or what in FIX_WORKER_MOVE:
+        return None, FIX_UNCOVERED.format(what=what), {
+            # §6's sentence, which the function that diagnosed the blocker wrote and which
+            # is already pre-validated against what the OS would accept right now.
+            "detail": blocker["detail"],
+            # WHOSE move it is — `FIX_WORKER_MOVE`'s reason.
+            "note": (FIX_WORKERS_TO_RUN if what in FIX_WORKER_MOVE
+                     else FIX_YOURS_TO_RUN)}, None
+    # A SLUG NO REMEDY RESOLVES IS A GAP CLASS, and this arm is the whole point of the
+    # change (Neo q839, overriding §11's "add no remedy" — and now the user's design
+    # addition, overriding Neo q839's own answer in turn): it ends in a registered remedy
+    # through an INVESTIGATION (`wo-4beada49`'s order kind), never a work order guessing
+    # at a fix. No new authority: this arm never guesses a remedy, and on `confirm=False`
+    # it still files nothing. On `confirm=True` with no live investigation, it opens ONE —
+    # Neo q863(a): the user's own press is the authorisation, so this is not the exception
+    # to "`fix` files nothing without `confirm=True`" above, it is that rule applied.
+    gap = _fix_gap_note(project, wo_id, what, blocker["detail"], confirm)
+    return None, gap, None, None
+
+
+def _file_fix(store: ProjectStore, project: str, wo: dict[str, Any], remedy_id: str,
+              argument: str, reason: str, cfg: Any) -> dict[str, Any]:
+    """File one proposal through `remedies.propose_fix` and report what came back.
+
+    A TRANSPORT FAILURE IS NOT A VERDICT (kn-40db1828, and
+    docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2). `propose_fix`
+    writes the grant before it asks, so a Neo that cannot be reached leaves a PENDING
+    request nobody has been asked about — reported as unreachable, by number, and never as
+    decided, escalated or refused.
+    """
+    from . import remedies
+    from .neo_store import NeoStore
+
+    command = remedies.user_intent(str(wo["id"]), remedy_id, argument)
+    try:
+        neo = NeoStore()
+    except Exception as exc:  # noqa: BLE001 — see docstring: never a synthesised verdict
+        return _fix_unreachable(store, wo, command, exc)
+    try:
+        outcome = remedies.propose_fix(store, neo, project, wo, remedy_id, argument, cfg,
+                                       reason=reason)
+    except Exception as exc:  # noqa: BLE001 — same
+        return _fix_unreachable(store, wo, command, exc)
+    finally:
+        neo.close()
+    approval = outcome["approval"]
+    question = outcome["question"]
+    return {
+        "proposed": bool(outcome["proposed"]), "reason": outcome["reason"],
+        # IDS AND NOT THE ROWS. The number is what the user needs to answer the request,
+        # and the row carries the gate's `command` column — text this payload's boundary
+        # keeps out (`diagnose`'s docstring, kn-1791a5e6).
+        "approval": approval["id"] if approval else None,
+        "question": question["id"] if question else None,
+        "unreachable": False,
+        "note": (FIX_FILED.format(approval=approval["id"]) if outcome["proposed"]
+                 else outcome["reason"]),
+    }
+
+
+def _fix_unreachable(store: ProjectStore, wo: dict[str, Any], command: str,
+                     exc: Exception) -> dict[str, Any]:
+    """`_file_fix`'s answer when nobody could be asked. The request is named if it exists:
+    a pending grant the user can answer themselves is the one thing that gets them
+    unstuck, and a re-run would otherwise refuse as a duplicate without saying why."""
+    pending = next((row for row in store.pending_approvals(str(wo["id"]))
+                    if row["command"] == command), None)
+    log.warning("could not put a %s fix on %s to a reviewer: %s", command, wo["id"], exc)
+    return {
+        "proposed": False, "reason": FIX_UNREACHABLE,
+        "approval": pending["id"] if pending else None, "question": None,
+        "unreachable": True,
+        "note": (FIX_STILL_PENDING.format(approval=pending["id"]) if pending
+                 else FIX_UNREACHABLE_NO_ROW),
+    }
+
+
+def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = None,
+        argument: str | None = None, confirm: bool = False) -> dict[str, Any]:
+    """Clear the blocker §6 just named — `jarvis wo fix`, §11 of
+    docs/specs/2026-09-24-order-observability.md.
+
+    IT ADDS NO AUTHORITY AND THAT IS THE WHOLE DESIGN. Every remedy is resolved through
+    `remedies.resolve` — CODE today, and DATA rows fo-69ba1cc4 builds tomorrow, keyed by
+    the same slug — the allow-list ships off, and every act rides an approved `self_heal`
+    grant a reviewer opened. THERE IS NO RUNTIME AUTHORING OF A REMEDY EITHER WAY: a
+    blocker `resolve` claims for nobody is a GAP CLASS, and this function points at a LIVE
+    investigation already evidencing it or offers to open one — `wo-4beada49`'s order
+    kind, whose analyst adds the registry row and its mechanical detector (the user's
+    design addition, superseding Neo q839's `file_work_order`/`FIX_NEW_REMEDY_BRIEF`
+    answer to the same gap — that ruling's OWN point stands: auto-matching against a
+    closed table means the OS never learns which blockers it has no remedy for). The entry
+    point is still the only new thing here: a shipped remedy reachable from the diagnosis
+    the user is already looking at. Every exclusion `remedies.py` names is inherited
+    verbatim: no cancelling a turn, no `set_status`, no `wo done`, no `fo resume`, no
+    killing a process, and nothing here does one of those under another name.
+
+    `confirm=False` WRITES NOTHING AT ALL — it returns the proposal and the user reads it.
+    `confirm=True` files it through `remedies.propose_fix` and stops there; `Daemon.
+    remedy_tick` applies an approved grant, so filing and acting stay two facts. THE ONE
+    EXCEPTION is the gap arm (Neo q863(a)): with no registered remedy and no live
+    investigation, `confirm=True` opens an improvement order directly, UNGATED — the
+    user's own press is the authorisation, and an investigation only OBSERVES, unlike
+    `file_work_order` which files WORK and so is gated.
+
+    THE BLOCKER IS `waiting_on`'S, called and never re-derived (kn-4ea33fe6), and it
+    travels verbatim so this payload and `jarvis wo why`'s cannot disagree. Every sentence
+    in the payload is one the OS wrote: no gate command, no prompt, no transcript line, no
+    error tail — `diagnose`'s boundary, for its security reason.
+
+    ABSENT IS NEVER ZERO (issue #227). No blocker, remedies off for the project, a remedy
+    not in the allow-list, a blocker whose way through is somebody's to type: each says so
+    in words and offers nothing. There is no list of proposals to come back empty.
+    """
+    from . import remedies as remedies_mod
+
+    name, path, wo = find_work_order(wo_id, project_name)
+    cfg = remedy_config(name)
+    store = ProjectStore(path)
+    try:
+        blocker = waiting_on(store, wo)
+        matched, note, your_move, offered = _fix_match(store, wo, blocker, remedy, name,
+                                                       confirm)
+        # PRECEDENCE: the CALLER'S `--argument` wins, then the matched row's own
+        # `params["argument"]` (what a data row's parameters will supply, fo-69ba1cc4),
+        # then the shipped `FIX_ARGUMENTS` default. Resolved before the refusals below
+        # because `file_work_order`'s own refusal is about whether there IS an argument.
+        arg = (argument or "").strip() or offered or FIX_ARGUMENTS.get(matched or "", "")
+        if matched is not None:
+            # THE CATALOG FIRST, `_config_refusal`'s own ordering: the user must never be
+            # shown something their own catalog forbids, let alone asked to approve it.
+            # Called rather than restated — one home for the rule, whoever asked.
+            note = remedies_mod._config_refusal(
+                matched, remedies_mod.subject_kind_of(wo), cfg)
+            if note is None and matched == "file_work_order" and not arg:
+                # `_apply_file_work_order`'s refusal, stated before a grant is filed
+                # instead of after one was spent.
+                note = remedies_mod.NO_ARGUMENT.format(origin=str(wo["id"]))
+            if note is not None:
+                matched = None
+        payload: dict[str, Any] = {
+            "wo_id": str(wo["id"]), "project": name, "title": wo["title"],
+            "status": wo["status"], "blocker": blocker,
+            "remedy": matched, "proposal": None, "your_move": your_move,
+            "filed": None, "note": note or FIX_OFFERED,
+        }
+        if matched is None:
+            return payload
+        remedy_row = remedies_mod.REMEDIES[matched]
+        payload["proposal"] = {
+            "remedy": matched,
+            # VERBATIM OFF THE REGISTRY. The words the user weighs and the words the
+            # reviewer rules on are one string, or the two are ruling on different acts.
+            "headline": remedy_row.headline, "blast": remedy_row.blast,
+            "subject": str(wo["id"]), "argument": arg,
+            "approving": FIX_APPROVING.format(wo_id=wo["id"], remedy=matched),
+        }
+        if confirm:
+            payload["filed"] = _file_fix(
+                store, name, wo, matched, arg,
+                FIX_REASON.format(wo_id=wo["id"], detail=blocker["detail"]), cfg)
+        return payload
+    finally:
+        store.close()
+
+
+#: The bounded flags a surface may carry back when NOTHING WAS FILED, mapped to the
+#: sentence `ops` wrote for that case. A fixed enum and never free text: see
+#: `fix_filed_notice` for why.
+FIX_FLAG_NOTICES = {"unreachable": FIX_UNREACHABLE}
+
+#: The other bounded shape a surface may carry back: `pending-<digits>`, for an unreachable
+#: press that left a request the user can answer. A prefix plus an INTEGER and nothing else.
+FIX_PENDING_PREFIX = "pending-"
+
+
+def fix_filed_notice(approval_id: int) -> str:
+    """`FIX_FILED` for a page that has just redirected after filing a fix —
+    `forced_round_notice`'s rule, one authority along.
+
+    REBUILT FROM THE ID, never carried across the redirect as text. A note the query
+    string supplies renders as the OS speaking about what happened to an order, so a
+    crafted link could state a false fact about an ACT — which is what §11's wording rules
+    exist to prevent (autoescaping only stops it being script). The id selects the words;
+    it cannot author them. Here rather than in the route so the CLI's sentence and the
+    page's are one string and cannot drift.
+    """
+    return FIX_FILED.format(approval=approval_id)
+
+
+def fix_pending_notice(approval_id: int) -> str:
+    """`fix_filed_notice` for the press nobody could be asked about, where the grant EXISTS.
+
+    `propose_fix` writes the request before it asks, so an unreachable Neo leaves a pending
+    request the user can answer themselves — the one thing that gets them unstuck, and the
+    number `FIX_UNREACHABLE` alone drops. Both facts, in `FIX_UNREACHABLE`'s and
+    `FIX_STILL_PENDING`'s own words: the transport failed AND the request is answerable by
+    number. The id selects the words; it cannot author them.
+    """
+    return f"{FIX_UNREACHABLE} — {FIX_STILL_PENDING.format(approval=approval_id)}"
+
+
+def fix_flag_notice(flag: str) -> str | None:
+    """`fix_filed_notice` for the cases with no id to name — nothing was filed, or nobody
+    could be asked. The flag is matched against a closed map and an unknown one renders
+    NOTHING, so the page never claims a request exists."""
+    return FIX_FLAG_NOTICES.get(flag)
+
+
 def assume(wo_id: str, content: str) -> dict[str, Any]:
     """Record an assumption: DB row + ASSUMPTIONS.md append + review flag.
 
@@ -7280,6 +7779,20 @@ def list_feature_orders(project_name: str | None = None,
 #: about the OS's records, not a CLI error (§2.6).
 EVIDENCE_REFS_KEY = "evidence_refs"
 
+
+def evidence_refs(fo: dict[str, Any]) -> list[str]:
+    """The evidence an improvement order was filed with, off one row.
+
+    ONE HOME FOR THE READ and not just for the key (kn-4ea33fe6): `show_improvement_order`
+    renders these and `_fix_gap_note` asks whether one of them names a work order, and a
+    second place that knows the metadata is JSON under `EVIDENCE_REFS_KEY` is how the two
+    come to disagree about which order an investigation is evidence for. Defensive at every
+    step: a row written before §2.1 of the improvement-orders spec carries no metadata at
+    all, and absent is not an error here — it is an order with no refs recorded.
+    """
+    metadata = db.from_json(fo.get("metadata"), {}) or {}
+    return list(metadata.get(EVIDENCE_REFS_KEY) or [])
+
 #: `work_orders.metadata`/`feature_orders.metadata` key on an order FILED FROM a finding:
 #: the improvement order it came from. The back-link's machine-readable half — the human
 #: half is the first line of the description (§5.3.1). A filed order is never a child:
@@ -7400,7 +7913,7 @@ def show_improvement_order(io_id: str, project_name: str | None = None) -> dict[
         "report": report if isinstance(report, dict) else {},
         "filed_orders": _filed_orders(findings),
         "observation": fo["description"],
-        "evidence_refs": list(metadata.get(EVIDENCE_REFS_KEY) or []),
+        "evidence_refs": evidence_refs(fo),
         "analyst": analyst,
         "status_label": feature_status_label("improvement", fo["status"]),
         "alarms": alarms,
