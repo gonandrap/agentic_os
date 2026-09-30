@@ -598,6 +598,41 @@ def test_a_turn_that_predates_the_context_ledger_reads_as_not_recorded(tmp_path,
     assert "not recorded" in out["turns"][0]["note"]
 
 
+def test_an_order_that_predates_the_autopsy_column_reads_as_never_sealed(tmp_path):
+    """kn-c712a5d6's other half for `autopsy_json`: `tests/test_autopsy.py` writes the
+    column, and this reads a row that PREDATES it.
+
+    The frozen 0.1.11 asset has no autopsy pair at all, so the migration is what must add
+    it. NULL is the honest answer for an order that settled before the seal existed — never
+    an empty payload, which would read as "this order did nothing" — and such a row stays
+    on the queue, which is exactly how the backlog of already-settled orders gets read
+    while their transcripts are still on disk.
+    """
+    from jarvis import autopsy
+
+    proj = tmp_path / "legacy-autopsy"
+    (proj / ".jarvis").mkdir(parents=True)
+    old = sqlite3.connect(proj / ".jarvis" / "jarvis.db")
+    old.executescript(SHIPPED_SCHEMA.read_text())
+    old.execute("INSERT INTO work_orders (id, title, description, status, created_at, "
+                "updated_at) VALUES ('wo-old', 'ran before the autopsy', 'd', "
+                "'completed', 1.0, 1.0)")
+    old.commit()
+    old.close()
+
+    store = ProjectStore(proj)                                 # the upgrade
+    try:
+        assert {"autopsy_json", "autopsy_sealed_at"} <= schema_of(store.conn)[
+            "work_orders"]
+        row = store.get_work_order("wo-old")
+        assert row["autopsy_json"] is None                     # never sealed, not "{}"
+        assert row["autopsy_sealed_at"] is None
+        assert autopsy.unseal(row) is None
+        assert [o["id"] for o in store.unsealed_autopsy_orders()] == ["wo-old"]
+    finally:
+        store.close()
+
+
 #: An arbitrary epoch the backfill fixtures hang off.
 SPAN_T0 = 1_700_000_000.0
 

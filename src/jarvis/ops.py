@@ -1163,6 +1163,9 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
         note = f"note: work order is {wo['status']}; the session will be revived"
+        # §9.3 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        if wo["status"] == "failed":
+            note += f" (`jarvis wo retry {wo_id}` is the named form of this)"
     else:
         note = None
     store = ProjectStore(path)
@@ -1182,6 +1185,112 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
             "delivery": "jarvisd delivers when the worker is idle"}
+
+
+#: What a message-less `jarvis wo retry` puts on the queue. §3 of
+#: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+RETRY_NOTE = (
+    "The OS is relaunching this work order because the user asked for it. Its last turn "
+    "ended without a result, so the OS recorded it as failed — nothing about the work was "
+    "judged wrong. Say where you got to, then carry on from there; do not start again. "
+    "Finish with `jarvis wo finish` when the work is done."
+)
+
+#: §5: no status write, so the order really is still `failed` until the turn goes out.
+RETRY_QUEUED = ("queued as message {msg}; jarvisd launches the turn on its next tick. The "
+                "order stays `failed` — and stays flagged — until that turn starts.")
+
+
+def retry_refusal(wo: dict[str, Any]) -> str | None:
+    """Why this work order CANNOT be retried, in the sentence that refuses it — or None.
+
+    THE ONE HOME OF THE RULE, with three callers: `retry` raises it, `_diagnose_commands`
+    mirrors it so `jarvis wo why` never offers a command that would be refused, and
+    `retry_state` renders it beside the dashboard control. `_diagnose_commands`' own rule,
+    quoted: "Every predicate here MIRRORS the refusal of the command it offers rather than
+    restating it … a second copy of a predicate passes every behavioural test and drifts
+    anyway (kn-4ea33fe6)." Same structure as `force_validation_refusal` and `ack_refusal`.
+
+    Pure over the row: §4 of
+    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    wo_id = str(wo["id"])
+    status = str(wo["status"] or "")
+    if status != "failed":
+        return (f"{wo_id} is {status}, not failed — `wo retry` relaunches an order whose "
+                f"worker died without delivering. Carry on a {status} one with "
+                f"`jarvis wo send {wo_id} \"…\"`.")
+    if not str(wo.get("session_id") or ""):
+        return (f"{wo_id} failed before it ever opened a conversation, so there is no "
+                f"session to relaunch — a message queued here would sit undelivered "
+                f"(`worker_session.delivery_hold` holds it: \"it has no session to "
+                f"resume\"). Nothing here can be retried; file the work again.")
+    return None
+
+
+def retry_queued_notice(msg_id: int) -> str:
+    """`RETRY_QUEUED` for a page that has just redirected after a retry —
+    `fix_filed_notice`'s rule, one authority along: "REBUILT FROM THE ID, never carried
+    across the redirect as text. A note the query string supplies renders as the OS
+    speaking about what happened to an order, so a crafted link could state a false fact
+    about an ACT." The id selects the words; it cannot author them.
+    """
+    return RETRY_QUEUED.format(msg=msg_id)
+
+
+def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the work-order page's retry control shows, or None — `force_validation_state`'s
+    shape, including its None convention.
+
+    None — no control at all — on any order that is not `failed`: a permanently disabled
+    box on every page is noise for a mechanism that does not apply there. §7b of
+    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    if str(wo["status"] or "") != "failed":
+        return None
+    refusal = retry_refusal(wo)
+    return {"can_retry": refusal is None, "refusal": refusal,
+            "assumptions": len(store.pending_assumptions(str(wo["id"])))}
+
+
+def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
+          relay: bool = False) -> dict[str, Any]:
+    """`jarvis wo retry` — relaunch a `failed` work order in its own session.
+
+    The named form of the revive `ops.send_message` has always done as a side effect, and
+    it DELEGATES to it rather than extracting a shared helper: the revival is not code in
+    either function but the queue row plus `Daemon._deliver`'s `set_status`, and a second
+    queueing path would falsify `project_store.queue_message`'s rule that `send_message`
+    is the only caller that ever passes `MESSAGE_AUTHOR_USER`.
+
+    MANUAL ONLY — the automatic half is declined (Neo q1108: a turn that ends with no
+    result is exactly the replay risk kn-3d8fa23a excludes), and the shape is Neo q1107's.
+    Design: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+
+    `failed` only, and it writes no status: until the daemon launches the turn the order
+    really is `failed`. Pending assumptions do NOT refuse it — a retry buries nothing, so
+    the payload carries the count instead of blocking on it.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    refusal = retry_refusal(wo)
+    if refusal is not None:
+        raise OpsError(refusal)
+    text = message if message is not None else RETRY_NOTE
+    # §3: an OS literal must never carry the user's stamp, whatever the surface said.
+    sent = send_message(wo_id, text, source="retry", project_name=name,
+                        relay=relay and message is not None)
+    store = ProjectStore(path)
+    try:
+        # After the delegated send, so a crash between them leaves a queued message and
+        # no claim about who asked — `resume_feature_order`'s ordering reasoning (§8).
+        store.add_event(wo_id, "retry_requested",
+                        {"msg_id": sent["msg_id"], "authored": bool(message)})
+        pending = store.pending_assumptions(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "msg_id": sent["msg_id"],
+            "status": "failed", "authored": bool(message),
+            "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
 
 
 def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
@@ -1315,7 +1424,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "
                           f"`jarvis wo review {hold['planner_id']}`"}
-    if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
+    # §6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    if wo["status"] == "failed":
+        return {"what": "failed", "stalled": False,
+                "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
+                          f"relaunches it in the same session; nothing is running to nudge"}
+    if wo["status"] in ("completed", "cancelled", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
                 "detail": f"the work order is {wo['status']} — nothing is running to "
@@ -1891,22 +2005,20 @@ def _diagnose_clock(store: ProjectStore, wo_id: str, now: float) -> dict[str, An
 def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
                     project: str, now: float) -> dict[str, Any]:
     """Every episode the record says held this order, plus the honest residual."""
+    from . import autopsy
     from . import holds as holds_mod
-    from . import inspection
 
     episodes = holds_mod.held(store, wo["id"], now=now)
     by_cause = {cause: round(seconds, 2) for cause, seconds
                 in holds_mod.by_cause(episodes, float("-inf"), now, now=now).items()}
-    session = str(wo.get("session_id") or "")
-    # Exactly `inspect_report`'s inner `unit()` shape, and it takes the SAME two
-    # arguments for the same reason: `read_session` has never opened the OS's database,
-    # so the spans are passed in. The walk itself is not touched here — this report reads
-    # one number off it (Neo, question 680).
-    anatomy = (inspection.read_session(session, inspect_config(project),
-                                       spans=list(episodes),
-                                       turn_starts=store.turn_starts(wo["id"]))
-               if session else None)
-    if anatomy is not None and anatomy.found:
+    # Exactly `inspect_report`'s inner `unit()` shape, and through §4's chokepoint for
+    # the same reason: one definition of "this order's anatomy", preferring the seal and
+    # saying which reading answered. The walk itself is not touched here — this report
+    # reads one number off it (Neo, question 680).
+    anatomy, provenance = autopsy.anatomy_for(
+        wo, inspect_config(project), spans=list(episodes),
+        turn_starts=store.turn_starts(wo["id"]))
+    if anatomy.found:
         unexplained = {"seconds": round(anatomy.unexplained, 2),
                        "seconds_human": ago_phrase(anatomy.unexplained),
                        "residual": True, "note": UNEXPLAINED_NOTE}
@@ -1919,7 +2031,8 @@ def _diagnose_holds(store: ProjectStore, wo: dict[str, Any],
             for h in episodes]
     return {"episodes": rows, "by_cause": by_cause,
             "open": next((r for r in reversed(rows) if r["open"]), None),
-            "unexplained": unexplained}
+            # Beside the one figure it attributes: which reading the residual came from.
+            "unexplained": unexplained, "provenance": provenance}
 
 
 def _diagnose_os_calls(wo_id: str, limit: int = OS_CALLS_LIMIT,
@@ -1982,6 +2095,15 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     wo_id = str(wo["id"])
     out: list[dict[str, str]] = []
     refusals: list[str] = []
+
+    # FIRST — §7 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    retry_no = retry_refusal(wo)
+    if retry_no is None:
+        out.append({"command": f"jarvis wo retry {wo_id}",
+                    "why": "relaunch the worker in its own session from where it died — "
+                           "nothing about the work was judged wrong"})
+    elif wo["status"] == "failed":
+        refusals.append(retry_no)
 
     refusal = force_validation_refusal(store, wo, project=project,
                                        cfg=validation_config(project))
@@ -12050,7 +12172,7 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import holds, inspection
+    from . import autopsy, holds
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -12080,16 +12202,15 @@ def inspect_report(target: str, project: str | None = None, *,
         # The OS's own record of what it was holding this order for, so the report can
         # state both clocks and name the difference (`holds`). Two indexed reads.
         spans = holds.held(store, wo["id"])
-        # Spec 2026-09-27 §3: the turns are numbered with the OS's own `wo_turns.seq`.
-        anatomy = (inspection.read_session(session, cfg, index=index, spans=spans,
-                                           turn_starts=store.turn_starts(wo["id"]),
-                                           cold_prefix_floor=floor)
-                   if session
-                   else inspection.Anatomy(session_id="", holds=list(spans),
-                                           write_floor=cfg.report_write_floor,
-                                           join_floor=cfg.report_join_floor))
+        # Spec 2026-09-27 §4: the ONE chokepoint, which prefers the seal and says which
+        # reading answered. Per UNIT and never one key on the report: a feature's planner
+        # and each of its children have a seal each (Neo q1080).
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=spans, index=index,
+            turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
-        payload.update(wo_id=wo["id"], project=project_name, title=wo["title"],
+        payload.update(provenance=provenance,
+                       wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",
                        # The biggest input Jarvis itself sent on this order's behalf
                        # (spec §3,
@@ -12207,8 +12328,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     binds every transcript turn to a `wo_turns.seq` (spec 2026-09-27 §3) — so this join
     is no longer a workaround for a sequence that meant something else.
     """
+    from . import autopsy, inspection
     from . import context as context_mod
-    from . import inspection
     from . import usage as usage_mod
 
     name, path, wo = find_work_order(wo_id, project)
@@ -12220,13 +12341,12 @@ def context_report(wo_id: str, project: str | None = None, *,
         session = wo.get("session_id") or ""
         cfg = inspect_config(name)
         # Spec 2026-09-27 §3: the same rows this report already read, reused to bind
-        # inspect's numbering to `wo_turns.seq`.
-        anatomy = (inspection.read_session(
-                       session, cfg, index=usage_mod.index_sessions(),
-                       turn_starts=[(int(r["seq"]), float(r["started_at"]))
-                                    for r in rows],
-                       cold_prefix_floor=cold_prefix_floor())
-                   if session else None)
+        # inspect's numbering to `wo_turns.seq`. §4: through the chokepoint, and `spans=[]`
+        # because this report has never read the holds and states no hold-derived figure.
+        anatomy, provenance = autopsy.anatomy_for(
+            wo, cfg, spans=[], index=usage_mod.index_sessions(),
+            turn_starts=[(int(r["seq"]), float(r["started_at"])) for r in rows],
+            cold_prefix_floor=cold_prefix_floor())
         if turn is not None and not any(r["seq"] == turn for r in rows):
             raise OpsError(f"{wo_id} has no turn {turn} "
                            f"(it has {len(rows)}: "
@@ -12266,6 +12386,8 @@ def context_report(wo_id: str, project: str | None = None, *,
     return {
         "wo_id": wo["id"], "project": name, "title": wo["title"],
         "recorded": bool(recorded),
+        # Which reading the residual and the prefix joins above came from (§4).
+        "provenance": provenance,
         "note": "" if recorded else NOT_RECORDED,
         "turns": [t for t in out if turn is None or t["seq"] == turn],
     }

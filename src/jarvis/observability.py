@@ -6,21 +6,21 @@ and the METER (what looking at an order COSTS, recorded through `agent_usage` at
 level and never switchable off). Conflating them is what makes the rest of the feature
 read as a contradiction.
 
-THE GATE GOVERNS EXACTLY ONE WRITE: §5's per-turn ingredient row on
-`wo_turns.context_json` (`context.record`, its only consumer). It governs no read. `off`
-does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page —
-those are arithmetic over files Claude Code already wrote, they collect nothing, and
-gating a read would cost the user the very view they opened while buying them nothing.
-What a user notices at `off` is that the order has no context ledger afterwards, so
-`jarvis wo context` reports it as not recorded.
+THE GATE GOVERNS TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json`
+(`context.record`, its only consumer) and the sealed autopsy (`autopsy.records_autopsy`,
+§5 of docs/specs/2026-09-27-order-autopsy-durability.md). It governs no read — so `off`
+stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
+`jarvis wo why` or the debug page, which are arithmetic over files Claude Code already
+wrote, collect nothing, and would cost the user the very view they opened. What a user
+notices at `off` is that the order has no context ledger and no sealed autopsy afterwards,
+so `jarvis wo context` reports it as not recorded.
 
-`FULL` RECORDS EXACTLY WHAT `NORMAL` DOES. §10 leaves that to this child, and there is
-nothing worth recording beyond the ingredient list, so the two collapse rather than
-inventing a difference to justify a third level; it exists for the config surface to grow
-into. The autopsy is unconditional for the same reason (Neo 814): every turn, its tools,
-its token classes and its context total, delta, peak and composition are read-time
-arithmetic over the transcript (§§3, 4, 6, 7), so there is nothing there for `full` to
-turn on.
+`FULL` AND `NORMAL` BOTH RECORD THE CONTEXT ROW, and differ by exactly one thing: the tool
+parameters a `full` seal retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md).
+The autopsy READING itself — every turn, its tools, its token classes and its context
+total, delta, peak and composition — is read-time arithmetic over the transcript (§§3, 4,
+6, 7) and is shown for every order at every level, `off` included; what `off` withholds is
+the SEAL that makes it survive the transcript.
 
 A LEAF: it imports `agent_usage` (a leaf itself, and the meter's only seam) and nothing
 from `ops`, `bill` or `dispatch` — every one of which the metered functions live in or
@@ -44,7 +44,7 @@ from . import agent_usage
 
 log = logging.getLogger(__name__)
 
-#: The three levels. `off` = no per-turn ingredient row and NOTHING else changed.
+#: The three levels. `off` = no per-turn ingredient row, no sealed autopsy, no read gated.
 OFF, NORMAL, FULL = "off", "normal", "full"
 LEVELS = (OFF, NORMAL, FULL)
 

@@ -3025,3 +3025,99 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
 
     page = " ".join(client.get(f"/wo/proj_a/{wo['id']}").text.split())
     assert "still in it · active" in html.unescape(page)
+
+
+# -- the retry control -----------------------------------------------------------------
+# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+
+#: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
+#: the timeline or the conversation, which also talk about retries (kn-d51713af).
+RETRY_HEADING = "Retry this work order"
+
+
+def _page(client, wo_id: str, query: str = "") -> str:
+    return html.unescape(" ".join(client.get(f"/wo/proj_a/{wo_id}{query}").text.split()))
+
+
+def _died(daemon, project, session: bool = True) -> dict:
+    """A work order whose worker died without delivering — with or without a session."""
+    wo = ops.create_work_order("proj_a", "died without delivering")
+    if session:
+        daemon.tick()
+    store = ProjectStore(project)
+    try:
+        if session:
+            store.set_status(wo["id"], "failed")
+        else:
+            store.release_dispatch_claim(wo["id"], "worker turn never started",
+                                         max_attempts=1)
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_the_retry_control_is_on_a_failed_order_and_on_no_other(client, daemon, project):
+    """`ops.retry_state`'s None convention: no control at all where the mechanism does
+    not apply, rather than a permanently disabled box on every page."""
+    dead = _died(daemon, project)
+    live = ops.create_work_order("proj_a", "still going")
+    daemon.tick()
+
+    assert RETRY_HEADING in _page(client, dead["id"])
+    assert RETRY_HEADING not in _page(client, live["id"])
+
+
+def test_the_no_session_refusal_renders_above_a_disabled_box(client, daemon, project):
+    wo = _died(daemon, project, session=False)
+
+    page = _page(client, wo["id"])
+
+    assert "no session to relaunch" in page
+    # Above the control it governs, and the control is shut.
+    assert page.index("no session to relaunch") < page.index('name="message"')
+    assert page.count("disabled") >= 2
+
+
+def test_pressing_retry_queues_the_message_and_says_so(client, daemon, project):
+    wo = _died(daemon, project)
+
+    response = client.post(f"/wo/proj_a/{wo['id']}/retry", data={"message": ""})
+
+    store = ProjectStore(project)
+    try:
+        msgs = store.list_messages(wo["id"])
+    finally:
+        store.close()
+    assert msgs[0]["content"] == ops.RETRY_NOTE and msgs[0]["source"] == "retry"
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        f"/wo/proj_a/{wo['id']}?retried={msgs[0]['id']}#retry")
+    assert ops.retry_queued_notice(msgs[0]["id"]) in _page(
+        client, wo["id"], f"?retried={msgs[0]['id']}")
+
+
+def test_a_refused_press_flashes_the_refusal_and_claims_nothing(client, daemon, project):
+    wo = _died(daemon, project, session=False)
+
+    response = client.post(f"/wo/proj_a/{wo['id']}/retry", data={"message": ""})
+
+    assert response.status_code == 303
+    assert "error=" in response.headers["location"]
+    assert "#retry" in response.headers["location"]
+    store = ProjectStore(project)
+    try:
+        assert store.list_messages(wo["id"]) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("crafted", ["999999", "nonsense", "-1"])
+def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted):
+    """The notice is rebuilt from an id the record knows, never carried as text —
+    `fix_filed_notice`'s rule. An unparsable or unknown one renders no claim."""
+    wo = _died(daemon, project)
+
+    page = _page(client, wo["id"], f"?retried={crafted}")
+
+    assert RETRY_HEADING in page
+    assert "jarvisd launches the turn" not in page

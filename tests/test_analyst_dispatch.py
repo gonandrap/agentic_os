@@ -218,12 +218,14 @@ def test_the_investigator_never_gets_the_workers_pull_request_contract(project, 
                      if not any(w in line.lower()
                                 for w in ("not", "never", " no ", "cannot", "refus",
                                           "nothing")))
-    for contract in ("open a PR", "gh pr create", "--pr ", "[wo-",
+    for contract in ("gh pr create", "--pr ", "[wo-",
                      "Co-Authored-By"):
         assert contract not in body, contract
     assert "jarvis investigate verdict" in investigator
-    # The control: the worker contract DOES carry the lines this kind must not see.
-    assert "open a PR" in worker
+    # The control: the worker contract DOES carry the lines this kind must not see. Not
+    # "open a PR" — that prose now rides in `git_briefing`/--append-system-prompt
+    # (kn-dfdab9f8), not in the prompt positional.
+    assert "--pr " in worker
 
 
 def test_a_manager_is_unaffected_by_the_feature_context_change(project, store):

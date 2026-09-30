@@ -847,3 +847,19 @@ def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
                           "reason": "x"})
 
     assert "no round spent" in label and "rework you asked for" not in label
+
+
+def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
+    """§8 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
+    an unlabelled kind renders as a bare kind plus a JSON blob while `event_level` calls
+    it signal. THE VERB SAYS WHO — this event is only ever written by a user-facing
+    surface and must never read afterwards as something the OS decided."""
+    entries = build_timeline({}, [ev("retry_requested", 1.0, msg_id=4, authored=True),
+                                  ev("retry_requested", 2.0, msg_id=5, authored=False)],
+                             [])
+
+    assert [e["level"] for e in entries] == ["signal", "signal"]
+    assert [e["label"] for e in entries] == ["You retried this order"] * 2
+    assert entries[0]["detail"] == "with your message"
+    assert entries[1]["detail"] == ("the OS's own relaunch note — you sent no message")
+    assert "{" not in "".join(e["label"] + e["detail"] for e in entries)
