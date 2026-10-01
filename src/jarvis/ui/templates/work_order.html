@@ -272,6 +272,45 @@
    Nothing here decides anything — `ops.retry_state` says whether the control exists at
    all, `ops.retry_refusal` says why it is disabled in the words the CLI refuses with.
    See docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b. #}
+{# WHAT THE OS SAVED when the last turn died without writing a result, immediately above
+   the button that relaunches it: the reader decides whether to retry knowing what is
+   already on disk. `ops.harvest_state` says whether there is a line at all.
+   See docs/specs/2026-09-30-harvesting-a-dead-turn.md §5. #}
+{% if harvest %}
+<h2 id="harvest">What the OS saved from the last turn</h2>
+<div class="panel">
+  <div class="row">
+    <div class="grow">
+      <p class="sub">That turn's process ended without writing a result, so the OS read
+        the worktree while it could still see it. Nobody reviewed any of this.</p>
+      <p>{{ harvest.line }}</p>
+      {% if harvest.checkpoint %}
+      <p class="sub">Checkpoint commit <code>{{ harvest.checkpoint }}</code> on
+        <code>{{ harvest.branch }}</code>, trailer
+        <code>Jarvis-Checkpoint: {{ wo.id }}/{{ harvest.seq }}</code> — local only, never
+        pushed. Amend, reset or rewrite it freely.</p>
+      {% elif harvest.checkpoint_skipped %}
+      <p class="sub">◌ No checkpoint commit: {{ harvest.checkpoint_skipped }}</p>
+      {% endif %}
+      {% if harvest.said %}
+      <p class="sub">It last said: “{{ harvest.said }}”</p>
+      {% endif %}
+      {% if harvest.unpushed %}
+      <p class="sub">{{ harvest.unpushed }}
+        commit{{ '' if harvest.unpushed == 1 else 's' }} not pushed to
+        <code>{{ harvest.upstream }}</code>.</p>
+      {% endif %}
+      {% if harvest.pr_url %}
+      <p class="sub">Pull request: <a href="{{ harvest.pr_url }}">{{ harvest.pr_url }}</a></p>
+      {% endif %}
+      {% if harvest.unreadable %}
+      <p class="sub">◌ The worktree could not be read: {{ harvest.unreadable }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {% if retry %}
 <h2 id="retry">Retry this work order</h2>
 <div class="panel">

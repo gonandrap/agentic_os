@@ -1273,6 +1273,11 @@ def create_app() -> FastAPI:
             # is REBUILT from an id this order's own record knows: a number the query
             # string invented states no fact.
             retry = ops.retry_state(store, wo)
+            # WHAT THE OS SAVED when the last turn died, rendered directly above that
+            # control: it is what the user reads before pressing the button. None keeps
+            # it off every page whose turn was never harvested — §5 of
+            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            harvest = ops.harvest_state(store, wo)
             retried_line = (ops.retry_queued_notice(int(retried))
                             if retried.isdigit()
                             and any(m["id"] == int(retried) for m in messages) else "")
@@ -1319,7 +1324,7 @@ def create_app() -> FastAPI:
                       merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
-                      retry=retry, retried_line=retried_line,
+                      retry=retry, retried_line=retried_line, harvest=harvest,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),

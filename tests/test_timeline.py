@@ -863,3 +863,21 @@ def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
     assert entries[0]["detail"] == "with your message"
     assert entries[1]["detail"] == ("the OS's own relaunch note — you sent no message")
     assert "{" not in "".join(e["label"] + e["detail"] for e in entries)
+
+
+def test_turn_harvested_is_signal():
+    """What the OS read off disk when a turn died is the story, not the plumbing —
+    docs/specs/2026-09-30-harvesting-a-dead-turn.md §5."""
+    from jarvis.timeline import TURN_HARVESTED
+
+    assert event_level(TURN_HARVESTED) == "signal"
+    full = build_timeline({}, [ev(TURN_HARVESTED, 1.0, seq=7, version=1, empty=False,
+                                  authored={"branch": "wo-2ae", "base": "origin/main",
+                                            "commits": 3, "dirty": ["src/a.py"]},
+                                  checkpoint="9f8e7d6")], [])[0]
+    assert full["label"] == "Harvested what the turn left behind"
+    assert full["detail"] == "3 commits, 1 uncommitted file checkpointed as 9f8e7d6"
+    empty = build_timeline({}, [ev(TURN_HARVESTED, 1.0, seq=7, version=1, empty=True,
+                                   authored={}, checkpoint="")], [])[0]
+    assert empty["label"] == "Nothing to harvest"
+    assert empty["detail"] == "the worktree was clean and the turn said nothing"
