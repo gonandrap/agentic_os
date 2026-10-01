@@ -990,6 +990,60 @@ def test_daily_cap_holds_fleet_wide(jarvis_home, project, tmp_path):
             store.close()
 
 
+def test_daily_cap_counts_projects_not_due_this_tick(jarvis_home, project, tmp_path):
+    """§6c against Neo 1086's PER-PROJECT cadence: the cap counts wider than the scan.
+
+    Two projects on different `sweep_every_ticks`. A spends the whole day's allowance on
+    a tick of its own; a later tick that sweeps ONLY B must open nothing. Counting
+    `opened_today` over the due projects alone would let every cadence have its own
+    allowance — the one spend ceiling on this pass, failing open.
+    """
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(
+        tmp_path,
+        [{"name": "proj_a", "path": str(project),
+          "fleet_health": {"sweep_every_ticks": 1000}},
+         {"name": "proj_b", "path": str(other), "fleet_health": {"sweep_every_ticks": 3}}],
+        name="stuck-cadences.json")
+    daemon = Daemon(load_catalog(cat))
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+
+    def run_row() -> dict:
+        central = CentralStore()
+        try:
+            return db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})
+        finally:
+            central.close()
+
+    try:
+        for name, hours in (("proj_a", (9, 8, 7, 6)), ("proj_b", (5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+
+        daemon.tick_count = 1
+        daemon.stuck_tick(None, projects=daemon.stuck_due_projects())
+        assert run_row()["opened"] == 4
+        assert len(_opened("proj_a")) == 4
+
+        daemon.tick_count = 4
+        due = daemon.stuck_due_projects()
+        assert [p.name for p in due] == ["proj_b"], "only the finer cadence is due"
+        daemon.stuck_tick(None, projects=due)
+
+        run = run_row()
+        assert run["opened"] == 0
+        assert run["skipped"]["daily_cap"] == 2
+        assert _opened("proj_b") == []
+    finally:
+        for store in stores.values():
+            store.close()
+
+
 def test_an_investigation_is_never_a_subject(stuck_os):
     """§6's third layer: the SWEEP skips it, and `ops` still refuses it."""
     store, daemon = stuck_os["store"], stuck_os["daemon"]

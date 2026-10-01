@@ -4098,6 +4098,11 @@ class Daemon:
                  if p.fleet_health.enabled]
         return min(asked) if asked else DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
 
+    def _stuck_projects(self) -> list[ProjectSpec]:
+        """Every project the stuck sweep covers at all: enabled and on disk."""
+        return [p for p in self.catalog.projects
+                if p.fleet_health.enabled and p.path.is_dir()]
+
     def stuck_tick(self, state: fleet.Fleet | None = None,
                    projects: list[ProjectSpec] | None = None) -> None:
         """Investigate every open order past its per-status threshold, capped and cooled.
@@ -4113,9 +4118,7 @@ class Daemon:
         broken project must not stop the rest (`fleet.read`'s per-order rule) and because a
         sweep that wrote nothing is indistinguishable from one that never ran (§8).
         """
-        projects = projects if projects is not None else [
-            p for p in self.catalog.projects
-            if p.fleet_health.enabled and p.path.is_dir()]
+        projects = projects if projects is not None else self._stuck_projects()
         if not projects:
             return
         now = db.now()
@@ -4124,9 +4127,13 @@ class Daemon:
         errors: list[str] = []
         try:
             run["excluded"] = self._stuck_exclusion(state)
+            # COUNTED OVER EVERY ENABLED PROJECT, not over `projects` — the cap is
+            # fleet-wide while the scan is per-project (Neo 1086's `sweep_every_ticks`),
+            # so a tick sweeping one project must still see what the others filed today.
             opened_today = sum(
                 self.store_for(p).count_feature_orders(
-                    "investigation", "fleet_health", now - 86400.0) for p in projects)
+                    "investigation", "fleet_health", now - 86400.0)
+                for p in self._stuck_projects())
             candidates: list[dict[str, Any]] = []
             for project in projects:
                 try:
@@ -4157,9 +4164,7 @@ class Daemon:
         what a direct call (a test, `jarvis doctor`) means by asking for a sweep.
         """
         due = []
-        for project in self.catalog.projects:
-            if not (project.fleet_health.enabled and project.path.is_dir()):
-                continue
+        for project in self._stuck_projects():
             last = self.stuck_swept.get(project.name)
             if last is not None \
                     and self.tick_count - last < project.fleet_health.sweep_every_ticks:
