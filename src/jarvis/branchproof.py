@@ -54,6 +54,30 @@ def _env() -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1", "GCM_INTERACTIVE": "never"}
 
 
+def attempt(repo: Path, *args: str, stdin: str | None = None) -> tuple[str | None, str]:
+    """`run`, with GIT'S OWN STDERR beside the stdout — (stdout or None, stderr).
+
+    Exists because `run` logs the reason a command failed and returns None, so a caller
+    that has to RECORD the refusal had nothing to record: `harvest._checkpoint` writes
+    git's words into `checkpoint_skipped` (spec
+    docs/specs/2026-09-30-harvesting-a-dead-turn.md §7). Same `_env()`, same
+    `GIT_TIMEOUT`, never raises; `run` delegates here so there is one subprocess block.
+    `""` when the process could not run at all, or when it succeeded.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              text=True, errors="replace", timeout=GIT_TIMEOUT,
+                              check=False, env=_env(), input=stdin)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("git %s in %s could not run: %s", args[0], repo, exc)
+        return None, ""
+    if proc.returncode != 0:
+        log.debug("git %s in %s exited %d: %s", " ".join(args), repo, proc.returncode,
+                  proc.stderr.strip()[:200])
+        return None, proc.stderr.strip()
+    return proc.stdout, ""
+
+
 def run(repo: Path, *args: str, stdin: str | None = None) -> str | None:
     """`git -C repo args`, or None on any failure. Never raises.
 
@@ -62,18 +86,7 @@ def run(repo: Path, *args: str, stdin: str | None = None) -> str | None:
     of the `subprocess.run` block (spec docs/specs/2026-09-30-harvesting-a-dead-turn.md
     §2). `_git` stays as the in-module alias so no existing call site changes.
     """
-    try:
-        proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
-                              text=True, errors="replace", timeout=GIT_TIMEOUT,
-                              check=False, env=_env(), input=stdin)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warning("git %s in %s could not run: %s", args[0], repo, exc)
-        return None
-    if proc.returncode != 0:
-        log.debug("git %s in %s exited %d: %s", " ".join(args), repo, proc.returncode,
-                  proc.stderr.strip()[:200])
-        return None
-    return proc.stdout
+    return attempt(repo, *args, stdin=stdin)[0]
 
 
 #: The in-module name, unchanged: every existing call site reads `_git`.

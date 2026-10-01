@@ -301,8 +301,9 @@ def test_harvest_skips_checkpoint_during_rebase(fleet, settle_turns):
     assert payload["authored"]["dirty"] == ["halfway.py"]
 
 
-def test_refused_checkpoint_commit_is_recorded(fleet, settle_turns):
-    """§7: git refuses the commit — the fixed reason is recorded and the rest stands."""
+def test_refused_checkpoint_commit_records_gits_own_words(fleet, settle_turns):
+    """§7: git refuses the commit — ITS OWN STDERR is recorded, clipped to one line, and
+    the rest of the harvest stands."""
     wo = _order(fleet, code="exporter", dirty="halfway")
     heads = fleet["path"] / ".git" / "refs" / "heads"
     heads.chmod(0o500)  # no ref lock can be made here, so the commit cannot land
@@ -312,13 +313,42 @@ def test_refused_checkpoint_commit_is_recorded(fleet, settle_turns):
         heads.chmod(0o700)
 
     payload = _harvest_payload(fleet["store"], wo["id"])
+    reason = payload["checkpoint_skipped"]
+    print(f"git said: {reason!r}")
     assert payload["checkpoint"] == ""
-    assert payload["checkpoint_skipped"] == (
-        "git refused the checkpoint commit — see the daemon log")
+    assert reason.startswith("git refused the checkpoint commit: ")
+    assert "\n" not in reason  # the CLI and the HTML page both render it on one line
+    assert len(reason) <= len("git refused the checkpoint commit: ") + harvest.SKIP_CHARS
+    # what git ACTUALLY says here, verbatim from the run above
+    assert "cannot lock ref 'HEAD'" in reason
+    assert "Permission denied" in reason
     assert payload["said"] == "Half of the CSV path is written."
     assert payload["authored"]["commits"] == 1
     assert payload["authored"]["dirty"] == ["halfway.py"]
     assert payload["empty"] is False
+
+
+def test_a_refusal_with_nothing_to_say_falls_back_to_the_fixed_reason(
+        fleet, settle_turns, monkeypatch):
+    """§7: the fixed string is the FALLBACK — the field is never empty when git failed
+    with an empty stderr, or could not be run at all. Monkeypatched: a real git that
+    exits non-zero and says nothing is not reachable from a test."""
+    from jarvis import branchproof
+
+    real = branchproof.attempt
+
+    def mute(repo, *args, **kwargs):
+        return (None, "") if "commit" in args else real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(branchproof, "attempt", mute)
+    wo = _order(fleet, code="exporter", dirty="halfway")
+
+    _dead_turn(fleet, wo["id"], settle_turns)
+
+    payload = _harvest_payload(fleet["store"], wo["id"])
+    assert payload["checkpoint"] == ""
+    assert payload["checkpoint_skipped"] == (
+        "git refused the checkpoint commit — see the daemon log")
 
 
 def test_second_harvest_skips_an_already_checkpointed_head(fleet, settle_turns):

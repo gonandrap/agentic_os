@@ -47,6 +47,10 @@ VERSION = 1
 #: row and the transcript is where the rest lives while it lives.
 SAID_CHARS = 2000
 
+#: How much of GIT'S OWN STDERR rides in `checkpoint_skipped` (spec §7). git writes
+#: multi-line errors; the CLI and the work order's page both render this on one line.
+SKIP_CHARS = 200
+
 #: The machine handle on the checkpoint commit: a later harvest skips a HEAD that already
 #: carries it, and the relaunched worker can find its own checkpoint with `git log --grep`.
 TRAILER = "Jarvis-Checkpoint"
@@ -267,11 +271,13 @@ def _checkpoint(worktree: Path | None, wo_id: str, seq: int,
     if branchproof.run(worktree, *_IDENTITY, "add", "-A") is None:
         return "", "git could not stage the worktree"
     message = CHECKPOINT_MESSAGE.format(wo_id=wo_id, seq=seq, trailer=TRAILER)
-    if branchproof.run(worktree, *_IDENTITY, "commit", "--no-verify", "--no-gpg-sign",
-                       "-m", message) is None:
-        # `branchproof.run` logs git's stderr and returns None; the reason a reader gets
-        # here is the refusal itself, not the log line (spec §7).
-        return "", "git refused the checkpoint commit — see the daemon log"
+    out, stderr = branchproof.attempt(worktree, *_IDENTITY, "commit", "--no-verify",
+                                      "--no-gpg-sign", "-m", message)
+    if out is None:
+        # spec §7: git's own words, collapsed to one line and clipped.
+        reason = " ".join(stderr.split())[:SKIP_CHARS]
+        return "", (f"git refused the checkpoint commit: {reason}" if reason
+                    else "git refused the checkpoint commit — see the daemon log")
     sha = branchproof.run(worktree, "rev-parse", "--short", "HEAD")
     return (sha or "").strip(), ""
 
