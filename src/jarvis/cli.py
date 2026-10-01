@@ -682,7 +682,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    m = wo.add_parser("send", help="send feedback to the worker handling a work order")
+    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
+                                   "on a failed order this also revives the session; "
+                                   "`wo retry` is the named form")
     m.add_argument("wo_id")
     m.add_argument("message")
     m.add_argument("--project")
@@ -788,6 +791,16 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--force", action="store_true",
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
+
+    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
+                                     "the named form of `wo send`'s revive. Nothing "
+                                     "automatic: a turn that died with no result is "
+                                     "never replayed by the OS")
+    rt.add_argument("wo_id")
+    rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
+                                      "own relaunch note, unattributed")
+    rt.add_argument("--project")
 
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
@@ -3095,6 +3108,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "retry":
+        # `relay=True` as `send` does: `ops.user_authorship` decides whether this process
+        # is a surface the human reaches, and `ops.retry` drops it for its own note.
+        _print(ops.retry(args.wo_id, message=args.message,
+                         project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:

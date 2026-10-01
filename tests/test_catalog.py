@@ -247,6 +247,7 @@ def test_validation_ships_disabled_with_every_default_spelled_out():
     assert v.timeout == 300
     assert v.max_rounds == 3
     assert v.diff_chars == 150000
+    assert v.decision_record_chars == 6000
     assert v.feature_units is True
     # and an empty block is the same thing as no block at all
     assert validation_of({}) == v
@@ -358,10 +359,12 @@ def test_the_confirmation_pass_has_its_own_diff_budget_and_never_reads_the_panel
 
 
 @pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars",
-                                 "confirm_diff_chars"])
+                                 "confirm_diff_chars", "decision_record_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
-    panel handed nothing, which the design says must never be asked to judge."""
+    panel handed nothing, which the design says must never be asked to judge. Zero
+    decision_record_chars is a reviewer shown none of the order's own rulings, which is
+    the defect the record exists to fix."""
     with pytest.raises(CatalogError, match=f"os.validation.{key}"):
         validation_of({key: 0})
 
@@ -403,7 +406,8 @@ def test_a_project_override_inherits_every_key_it_does_not_name():
     key must carry the OS's answer for the other seven, so no caller has two objects to
     reconcile."""
     os_raw = {"enabled": True, "roster": ["tester", "chair"], "chair_model": "opus",
-              "timeout": 90, "max_rounds": 1, "diff_chars": 200, "feature_units": False}
+              "timeout": 90, "max_rounds": 1, "diff_chars": 200,
+              "decision_record_chars": 400, "feature_units": False}
     [v] = projects_validation(os_raw, {"validation": {"max_rounds": 5}})
     assert v.max_rounds == 5
     assert v.enabled is True
@@ -411,6 +415,7 @@ def test_a_project_override_inherits_every_key_it_does_not_name():
     assert v.chair_model == "opus"
     assert v.timeout == 90
     assert v.diff_chars == 200
+    assert v.decision_record_chars == 400
     assert v.feature_units is False
 
 

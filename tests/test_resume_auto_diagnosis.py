@@ -380,3 +380,23 @@ def test_resume_auto_names_the_plan_hold(started, project):
 
     assert parked["waiting_on"] == "plan_assumptions"
     assert "nothing is running to nudge" not in parked["diagnosis"]
+
+
+def test_a_failed_order_is_not_stalled_so_no_nudge_is_offered(started, project):
+    """§6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md: `stalled` is the
+    narrow claim that a MESSAGE is a repair, and a nudge into a dead conversation is not
+    the move — `jarvis wo retry` is, offered by its own predicate."""
+    wo = ops.create_work_order("proj_a", "died without delivering")
+    started.tick()
+    store = ProjectStore(project)
+    try:
+        store.finish_turn(store.latest_turn(wo["id"])["id"], "failed")
+        store.set_status(wo["id"], "failed")
+        blocker = ops.waiting_on(store, store.get_work_order(wo["id"]))
+    finally:
+        store.close()
+
+    assert blocker["what"] == "failed"
+    assert blocker["stalled"] is False
+    d = ops.diagnose(wo["id"])
+    assert not any("resume-auto" in c["command"] for c in d["commands"])
