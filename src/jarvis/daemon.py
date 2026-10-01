@@ -109,7 +109,7 @@ PR_POLL_EVERY_TICKS = 24
 
 #: How often orders that have stopped moving are swept is `fleet_health.sweep_every_ticks`
 #: — A PER-PROJECT CATALOG CONFIG AND NOT A CONSTANT HERE, per Neo 1086, which overrides §5
-#: of the spec and the `PR_POLL_EVERY_TICKS` rule above. The shipped 360 (30 minutes at the
+#: of the spec and the `PR_POLL_EVERY_TICKS` rule above. The shipped 60 (5 minutes at the
 #: default 5s interval) lives in `catalog.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS`.
 
 #: Which work orders' pull requests get asked about. EVERY STATUS WHERE A PULL REQUEST

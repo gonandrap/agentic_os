@@ -1423,7 +1423,7 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
 #
 # §8 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
 
-def _sweep_run(tmp_path, project, *, projects=None, **row) -> Path:
+def _sweep_run(tmp_path, project, *, projects=None, os_extra=None, **row) -> Path:
     """A registered catalog at `fleet_health`'s shipped defaults, plus one run row."""
     import json
 
@@ -1433,7 +1433,7 @@ def _sweep_run(tmp_path, project, *, projects=None, **row) -> Path:
 
     path = tmp_path / "stuck-catalog.json"
     path.write_text(json.dumps({
-        "os": {"notifications": {"sinks": ["log"]}},
+        "os": {"notifications": {"sinks": ["log"]}, **(os_extra or {})},
         "projects": projects or [
             {"name": "proj_a", "path": str(project), "description": "test"}],
     }))
@@ -1483,17 +1483,38 @@ def test_sweep_error_raises_the_invariant_once(jarvis_home, tmp_path, project,
 
 
 def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project, monkeypatch):
-    """§8: 180 minutes is six sweep intervals, so one capped tick cannot trip it."""
+    """§8: the window is six sweep intervals, so one capped tick cannot trip it."""
+    import jarvis.catalog as catalog_mod
+
     _own_the_os(monkeypatch, project)
-    _sweep_run(tmp_path, project, ts=time.time() - 181 * 60)
+    window = catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+    _sweep_run(tmp_path, project, ts=time.time() - (window + 1) * 60)
     store = ProjectStore(project)
 
     (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
-    assert invariants.STUCK_SWEEP_DARK_MINUTES == 180
+    assert window == 180
 
-    _sweep_run(tmp_path, project, ts=time.time() - 179 * 60)
+    _sweep_run(tmp_path, project, ts=time.time() - (window - 1) * 60)
     assert _stuck_dark(store) == []
+    store.close()
+
+
+def test_the_fleet_catalog_value_is_what_the_check_judges_by(
+        jarvis_home, tmp_path, project, monkeypatch):
+    """`sweep_dark_minutes` is a CATALOG setting, not a module constant: a silence the
+    180-minute default would not report fires once the fleet number is turned down."""
+    _own_the_os(monkeypatch, project)
+    silence = 20 * 60  # 20 minutes — well inside the shipped 180
+    _sweep_run(tmp_path, project, ts=time.time() - silence)
+    store = ProjectStore(project)
+    assert _stuck_dark(store) == []
+
+    _sweep_run(tmp_path, project, ts=time.time() - silence,
+               os_extra={"fleet_health": {"sweep_dark_minutes": 10}})
+    (violation,) = _stuck_dark(store)
+    assert violation.context["cause"] == "dark"
+    assert violation.context["dark_minutes"] == 20
     store.close()
 
 

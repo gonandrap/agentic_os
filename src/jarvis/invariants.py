@@ -3240,13 +3240,6 @@ def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     )
 
 
-#: How long the stuck sweep may be silent before the user is told. Six sweep intervals at
-#: the shipped cadence, `OS_HEALTH_SWEEP_DARK_MINUTES`' value and its reasoning: a daemon
-#: restart or one capped tick cannot trip it, and a sweep switched off by a bad edit is
-#: named the same working day.
-STUCK_SWEEP_DARK_MINUTES = 180
-
-
 def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     """INV-STUCK-SWEEP-DARK — the sweep must never be the thing that is stuck. §8.
 
@@ -3282,7 +3275,9 @@ def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
         run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), None)
     finally:
         central.close()
-    window = STUCK_SWEEP_DARK_MINUTES * 60
+    # The FLEET number, off `catalog.os` the way `Daemon.stuck_tick` reads `max_per_day`:
+    # one fleet-wide run record cannot be judged by an arbitrary project's answer.
+    window = catalog.os.fleet_health.sweep_dark_minutes * 60
     if run and str(run.get("error") or ""):
         yield Violation(
             invariant="INV-STUCK-SWEEP-DARK",

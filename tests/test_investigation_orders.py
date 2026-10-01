@@ -965,13 +965,18 @@ def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
 
 
 def test_daily_cap_holds_fleet_wide(jarvis_home, project, tmp_path):
-    """§6c: four a day across the whole fleet, and the cap cuts the LEAST overdue."""
+    """§6c: the cap holds across the whole fleet, and cuts the LEAST overdue.
+
+    The cap is NAMED here rather than taken from the default: Neo 1148 raised the shipped
+    `max_per_day` to 48 so a 5-minute threshold cannot spend the day's allowance in the
+    first hour, and what this test is about is the cap's ARITHMETIC, not its value.
+    """
     from jarvis.testing import make_git_project
 
     other = make_git_project(tmp_path, "proj_b")
     cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project)},
                                    {"name": "proj_b", "path": str(other)}],
-                        name="stuck-two.json")
+                        name="stuck-two.json", fleet_health={"max_per_day": 4})
     stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
     overdue = {}
     try:
@@ -1010,7 +1015,7 @@ def test_daily_cap_counts_projects_not_due_this_tick(jarvis_home, project, tmp_p
         [{"name": "proj_a", "path": str(project),
           "fleet_health": {"sweep_every_ticks": 1000}},
          {"name": "proj_b", "path": str(other), "fleet_health": {"sweep_every_ticks": 3}}],
-        name="stuck-cadences.json")
+        name="stuck-cadences.json", fleet_health={"max_per_day": 4})
     daemon = Daemon(load_catalog(cat))
     stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
 

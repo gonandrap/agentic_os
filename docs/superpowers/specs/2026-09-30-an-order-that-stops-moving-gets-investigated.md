@@ -186,16 +186,24 @@ Shipped constants, as module-level `DEFAULT_FLEET_HEALTH_*` names:
 | key | value | who set it |
 |---|---|---|
 | `enabled` | `True` | this spec — ships on |
-| `thresholds["waiting_pr_merge"]` | 180 min | Neo 1073 |
-| `thresholds["needs_review"]` | 240 min | Neo 1073 |
-| `thresholds["validating"]` | 120 min | Neo 1073 |
-| `thresholds["running"]` | 120 min, since last activity | Neo 1073 |
-| `thresholds["pending"]` | 240 min | Neo 1073 |
-| `thresholds["waiting_input"]` | 480 min | Neo 1073 |
-| `thresholds["dispatching"]` | 30 min | this spec — claimed-to-spawned is seconds of work (`worker_session.start`); half an hour there is already broken |
-| `fallback_minutes` | 240 | this spec — covers `idle`, `budget_exhausted` and any status added to `WO_STATUSES` later |
-| `cooldown_minutes` | 720 | Neo 1073 |
-| `max_per_day` | 4, fleet-wide | Neo 1073 |
+| `thresholds["waiting_pr_merge"]` | 60 min | the user 2026-10-01, Neo 1148 (was 180, Neo 1073) |
+| `thresholds["needs_review"]` | 60 min | the user 2026-10-01, Neo 1148 (was 240, Neo 1073) |
+| `thresholds["validating"]` | 15 min | the user 2026-10-01, Neo 1148 (was 120, Neo 1073) |
+| `thresholds["running"]` | 5 min, since last activity | the user 2026-10-01, Neo 1148 (was 120, Neo 1073) |
+| `thresholds["pending"]` | 30 min | the user 2026-10-01, Neo 1148 (was 240, Neo 1073) |
+| `thresholds["waiting_input"]` | 60 min | the user 2026-10-01, Neo 1148 (was 480, Neo 1073) |
+| `thresholds["dispatching"]` | 5 min | the user 2026-10-01, Neo 1148 (was 30, this spec) |
+| `fallback_minutes` | 30 | the user 2026-10-01, Neo 1148 (was 240, this spec) — covers `idle`, `budget_exhausted` and any status added to `WO_STATUSES` later |
+| `cooldown_minutes` | 720 | Neo 1073 — UNCHANGED, Neo 1148 explicitly: one stuck order must not eat the burst |
+| `max_per_day` | 48, fleet-wide | Neo 1148 (was 4, Neo 1073) |
+| `sweep_dark_minutes` | 180, fleet-wide | this spec §8 — moved off `invariants.STUCK_SWEEP_DARK_MINUTES` into the catalog, same value |
+
+**THE RULING BEHIND THESE NUMBERS — the user, 2026-10-01, accepted by Neo 1148.** Thirty
+minutes of idle is unacceptable; FIVE minutes of idle — no tool call, no script running,
+no usage-limit hold — means something is wrong. `running` is still judged on time since
+the last ACTIVITY and not since entry (`stuck.ACTIVITY_STATUSES`), which is what makes a
+five-minute number safe for a turn that is working: a long turn that keeps calling tools
+is never over threshold. The earlier, looser figures were Neo 1073's and are superseded.
 
 Every open status in `project_store.OPEN_STATUSES` (src/jarvis/project_store.py:65) is
 therefore covered: seven named, `idle` and `budget_exhausted` on the fallback. `idle` is
@@ -215,9 +223,15 @@ Three refusals, each where the message can name the key:
   fleet answer for the other eight. `probes.resolve`'s merge-by-id rule
   (src/jarvis/probes.py), for its reason — a project disabling one threshold must not
   drop the rest.
-* `max_per_day` on a PROJECT is refused, naming `os.fleet_health.max_per_day`. It is a
-  fleet number and no arrangement of per-project numbers can ration it —
-  `fleet.py`'s opening paragraph, verbatim in intent.
+* `max_per_day` and `sweep_dark_minutes` on a PROJECT are refused, each naming
+  `os.fleet_health.<key>`. They are fleet numbers and no arrangement of per-project
+  numbers can express either — `fleet.py`'s opening paragraph, verbatim in intent. One
+  named set carries both, `FLEET_HEALTH_FLEET_ONLY_KEYS`, mapping each key to the reason
+  the refusal states, rather than a per-key check. `sweep_dark_minutes` is fleet-only for
+  `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run record
+  (`Daemon.STUCK_RUN_KEY`), so no arrangement of per-project numbers can say how long that
+  one record may be silent, and `check_stuck_sweep_alive` reads it off `catalog.os` the
+  way `Daemon.stuck_tick` reads `max_per_day`.
 
 **Neo's one condition: no second dollar knob.** The per-investigation spend is
 `worker.investigation_budget_usd` via `budget.investigation_default_for`
@@ -239,20 +253,21 @@ makes model calls; this one makes none — its whole cost is indexed reads — s
 inline, on `schedule_tick`'s pattern (src/jarvis/daemon.py:856). No `health_sweeping`
 flag, no done-callback, no thread-local store question.
 
-**Cadence: `fleet_health.sweep_every_ticks`, default 360** — 30 minutes at the default 5s
+**Cadence: `fleet_health.sweep_every_ticks`, default 60** — 5 minutes at the default 5s
 `poll_interval` (src/jarvis/daemon.py:508). **Neo 1086 OVERRIDES this section's original
 module constant**: the cadence is a per-project catalog config, resolved like every other
 `fleet_health` field, because the user has turned down the module-constant precedent before
 and prefers a config per project. `Daemon.stuck_cadence()` is the FINEST cadence any
 enabled project asked for — that is what `tick()` gates on — and `Daemon._stuck_due` is
-what keeps a coarser project on the number it asked for. Why 30
-minutes: the tightest threshold that governs a spend is 120 minutes, so 30 minutes of
-slop is at most 4% late on the earliest possible dispatch, and invisible against a
-2-hour symptom. Why not every tick: the pass costs one `ops.state_durations` per open
+what keeps a coarser project on the number it asked for. Why 5
+minutes and not the 30 this section first shipped (Neo 1148): a 30-minute cadence cannot
+see a 5-minute idle — detection would lag the threshold by up to six times the threshold
+itself. Why not every tick: the pass costs one `ops.state_durations` per open
 order per project — one indexed read per table plus one `stat()` per transcript file
 (src/jarvis/ops.py:1772) — plus one `holds.held`, which is two more indexed reads. That
-is `PR_POLL_EVERY_TICKS`-class work, and at 30 minutes it is 12x cheaper per hour than
-the pull-request poll already is.
+is `PR_POLL_EVERY_TICKS`-class work, and at 5 minutes it still runs less than half as
+often per hour as the pull-request poll already does (`PR_POLL_EVERY_TICKS = 24`, two
+minutes).
 
 What the tick does, in order. Each step is a refusal or a read, and the expensive one is
 last:
@@ -350,11 +365,18 @@ changed is never re-investigated, however long it has been; and one that HAS cha
 still waits out the 720 minutes, because "it moved" and "it is better" are not the same
 claim.
 
-**(c) The fleet-wide daily cap.** `max_per_day = 4`, counted per §5 step 2 over
+**(c) The fleet-wide daily cap.** `max_per_day = 48` (Neo 1148; it was 4, Neo 1073),
+counted per §5 step 2 over
 `origin='fleet_health'` investigations created in the trailing 86400s. Needs one new
 indexed reader, `ProjectStore.count_feature_orders(kind, origin, since)`, beside
 `list_feature_orders` — a COUNT, not a listing filtered in Python, because the listing
 walks every investigation the project has ever had.
+
+**Why 48 and not 4.** At the user's five-minute sensitivity a cap of 4 is spent in the
+first hour and then fails CLOSED exactly when a genuinely stuck order appears.
+`worker.investigation_budget_usd` is the real money ceiling (Neo's one condition, above),
+so this cap rations BURSTS rather than the day. The per-subject `cooldown_minutes` stays
+at 720 — Neo 1148 was explicit — so one stuck order cannot eat the burst.
 
 **An investigation or investigator order is NEVER a subject.** Three layers, and that is
 deliberate: `create_investigation_order` refuses it (src/jarvis/ops.py:8301), the sweep
@@ -429,12 +451,16 @@ Two causes, named because they have two different fixes:
 
 * `failing` — the newest run carries an `error`. Detail quotes it, clipped.
 * `dark` — `fleet_health` is enabled for at least one project and the newest run is older
-  than `STUCK_SWEEP_DARK_MINUTES = 180`, or there has never been one AND THE DAEMON IS UP
-  — a stopped daemon sweeps nothing by construction and `jarvis status` already says so,
-  so firing there would report a fresh install as broken. 180 is
-  `OS_HEALTH_SWEEP_DARK_MINUTES`' value (src/jarvis/invariants.py:3103) and its
-  reasoning holds here: six sweep intervals, so a daemon restart or one capped tick
-  cannot trip it, and a sweep switched off by a bad edit is named the same working day.
+  than `os.fleet_health.sweep_dark_minutes`, default 180, or there has never been one AND
+  THE DAEMON IS UP — a stopped daemon sweeps nothing by construction and `jarvis status`
+  already says so, so firing there would report a fresh install as broken. A CATALOG
+  SETTING AND NOT A MODULE CONSTANT: the user's standing rule is that no threshold a
+  surface judges by is a module constant, so the `STUCK_SWEEP_DARK_MINUTES` this section
+  first shipped is gone and `DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES` carries the same
+  180. It is fleet-only (§4). 180 is `OS_HEALTH_SWEEP_DARK_MINUTES`' value
+  (src/jarvis/invariants.py:3103) and its reasoning holds here: a daemon restart or one
+  capped tick cannot trip it, and a sweep switched off by a bad edit is named the same
+  working day.
 
 No `disabled` cause, unlike the OS sweep's: `fleet_health.enabled=false` is a legal
 choice for a project, and there is no user rule saying otherwise. Not repairable, for
@@ -454,7 +480,7 @@ Extend existing files. Every assertion named; the fixtures are `jarvis.testing`'
 | `test_held_seconds_do_not_count` | `tests/test_health_sweep.py` | same order after the window reopened: `active_seconds == seconds_in_status - held`, and it is not stuck until `active_seconds` alone passes the threshold |
 | `test_stuck_order_gets_exactly_one_investigation` | `tests/test_investigation_orders.py` | one order 5h in `waiting_pr_merge`: first `stuck_tick` creates one `kind='investigation'` with `origin='fleet_health'`; a second tick creates none and the live count stays 1 |
 | `test_cooldown_holds_until_the_fingerprint_changes` | `tests/test_investigation_orders.py` | with the first investigation settled and `now` past `cooldown_minutes`: unchanged fingerprint opens none; changing the status (or the blocker sentence) opens one; still inside the cooldown with a changed fingerprint opens none |
-| `test_daily_cap_holds_fleet_wide` | `tests/test_investigation_orders.py` | six stuck orders across two projects, `max_per_day=4`: exactly 4 investigations, and they are the four most overdue |
+| `test_daily_cap_holds_fleet_wide` | `tests/test_investigation_orders.py` | six stuck orders across two projects, catalog `max_per_day=4` (NAMED in the catalog, not the shipped 48 — the test is about the cap's arithmetic, not its value): exactly 4 investigations, and they are the four most overdue |
 | `test_an_investigation_is_never_a_subject` | `tests/test_investigation_orders.py` | an `investigator` work order parked past every threshold, plus its `investigation` row: `stuck_tick` opens nothing, and `ops.create_investigation_order` on the investigator still raises `OpsError` naming the kind |
 | `test_a_user_owed_order_is_investigated` | `tests/test_investigation_orders.py` | **the §3 regression test.** A `needs_review` order with `needs_attention=1` and `attention_reason == invariants.VALIDATION_STUCK_BLOCKER`, 5h in status: one investigation is opened, and its `why` contains §3's three questions |
 | `test_fleet_pause_opens_nothing_but_records_a_run` | `tests/test_fleet_pause.py` | with `fleet.pause(central, …)` live: `opened == 0`, a run row exists with the exclusion named, and `INV-STUCK-SWEEP-DARK` does not fire |
@@ -462,7 +488,9 @@ Extend existing files. Every assertion named; the fixtures are `jarvis.testing`'
 | `test_a_failing_sweep_reaches_the_attention_list` | `tests/test_invariants.py` | **the round-1 test.** `ops.stuck_scan` patched to raise, then `stuck_tick` + `Daemon.check_invariants`: exactly one `ops.os_status()['attention']` item names `INV-STUCK-SWEEP-DARK`, `healthy` is False, a second tick still yields one, and a clean sweep judged with `sweep_landings=True` removes it |
 | `test_the_fleet_wide_sweep_is_reported_once_not_once_per_project` | `tests/test_invariants.py` | two projects, one owning the install: the owner reports `cause == "failing"` and the ordinary project reports nothing |
 | `test_the_stuck_check_is_registered_where_it_can_push` | `tests/test_invariants.py` | `check_stuck_sweep_alive` is in `INVARIANTS` and in neither `OS_INVARIANTS` nor `SLOW_INVARIANTS` |
-| `test_sweep_dark_raises_after_the_window` | `tests/test_invariants.py` | enabled, newest run `181` minutes old: one violation, `cause == "dark"`; at 179 minutes, none |
+| `test_sweep_dark_raises_after_the_window` | `tests/test_invariants.py` | enabled, newest run one minute past `DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES`: one violation, `cause == "dark"`; one minute inside it, none |
+| `test_the_fleet_catalog_value_is_what_the_check_judges_by` | `tests/test_invariants.py` | a 20-minute silence the 180-minute default does not report fires once `os.fleet_health.sweep_dark_minutes` is 10 — the FLEET catalog value is what the check judges by |
+| `test_sweep_dark_minutes_is_refused_on_a_project` | `tests/test_catalog.py` | a project naming `sweep_dark_minutes` raises `CatalogError` naming `os.fleet_health.sweep_dark_minutes` and calling it a FLEET number; set on `os`, it reaches every project |
 | `test_every_open_status_has_a_threshold` | `tests/test_catalog.py` | for every `s in project_store.OPEN_STATUSES`, the resolved config answers a positive threshold (named or fallback) — the test that makes a new status a failure rather than a blind spot |
 | `test_fleet_health_inherits_per_status` | `tests/test_catalog.py` | a project naming `thresholds["running"]` keeps the fleet values for the other eight; an unknown status key raises `CatalogError` naming it; a project setting `max_per_day` raises `CatalogError` naming `os.fleet_health.max_per_day` |
 | `test_no_second_budget_knob` | `tests/test_budget.py` | the investigation the sweep opened carries `budget.investigation_default_for(spec)`, and a project setting `worker.investigation_budget_usd` changes it — i.e. the sweep passes no `budget_usd` |
@@ -500,9 +528,9 @@ Extend existing files. Every assertion named; the fixtures are `jarvis.testing`'
 * **The lifted-pause residual** in §2 is a symptom fix, stated as one: a `jarvis pause`
   that has ended leaves no episode to discount, and the root cause is that the brake is a
   flag rather than a record.
-* **Unverified number:** `dispatching` at 30 minutes and `fallback_minutes` at 240 are
-  mine, not Neo's, and no measurement backs them. They are marked as such in the table
-  and are the two most likely to want changing after a week of run rows.
+* **Unverified number:** `dispatching` and `fallback_minutes` were mine, not Neo's, and no
+  measurement backed them. SETTLED by the user on 2026-10-01 (Neo 1148): 5 and 30
+  minutes, under the five-minutes-of-idle bar in §4.
 
 ### 12. A standing critical violation is an attention item — Neo 1084
 

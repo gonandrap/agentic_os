@@ -3032,7 +3032,7 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     investigated.md: one reader, two renderers, and neither computes a number."""
     from test_health_sweep import park_order
 
-    from jarvis import cli
+    from jarvis import catalog, cli
 
     wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
     store = ProjectStore(project)
@@ -3044,7 +3044,9 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
     rows = ops.stuck_report()
     (row,) = [r for r in rows if r["id"] == wo["id"]]
     assert row["stuck"] and row["status"] == "waiting_pr_merge"
-    assert row["threshold_seconds"] == 180 * 60 and row["excluded"] == ""
+    assert row["threshold_seconds"] == \
+        catalog.DEFAULT_FLEET_HEALTH_THRESHOLDS["waiting_pr_merge"] * 60
+    assert row["excluded"] == ""
 
     assert cli.main(["stuck", "--json"]) == 0
     printed = json.loads(capsys.readouterr().out)

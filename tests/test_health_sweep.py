@@ -1312,12 +1312,15 @@ def test_usage_limit_hold_is_not_stuck(stuck_os):
 
 def test_held_seconds_do_not_count(stuck_os):
     """§2: the threshold is on ACTIVE seconds, so a reopened window still discounts."""
+    import jarvis.catalog as catalog_mod
     from jarvis import stuck
 
     store, daemon = stuck_os["store"], stuck_os["daemon"]
-    wo = ops.create_work_order("proj_a", "held for four of its five hours")
+    # Held for all but half the shipped threshold, so `active_seconds` is what decides.
+    threshold = catalog_mod.DEFAULT_FLEET_HEALTH_THRESHOLDS["waiting_pr_merge"] * 60
+    wo = ops.create_work_order("proj_a", "held for almost all of its five hours")
     at = park_order(store, wo["id"], "waiting_pr_merge", hours=5)
-    usage_hold(store, wo["id"], started=at, ended=at + 4 * HOUR)
+    usage_hold(store, wo["id"], started=at, ended=at + 5 * HOUR - threshold / 2)
 
     daemon.stuck_tick(None)
     assert ops.list_investigation_orders("proj_a", include_settled=True) == []
@@ -1352,17 +1355,20 @@ def test_assess_is_pure():
 
 
 def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
-    """Neo 1086 OVERRIDES §5: the cadence is a per-project catalog config, default 360."""
+    """Neo 1086 OVERRIDES §5: the cadence is a per-project catalog config. Neo 1148 set
+    the default to 60 ticks — 5 minutes at the default 5s poll interval, because a
+    30-minute cadence cannot see a 5-minute idle."""
     import jarvis.catalog as catalog_mod
     from jarvis import db
     from jarvis.central_store import CentralStore
 
-    assert catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS == 360
+    assert catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS == 60
     cat = load_catalog(stuck_catalog(
         tmp_path, [{"name": "proj_a", "path": str(project),
                     "fleet_health": {"sweep_every_ticks": 12}}],
         name="stuck-cadence.json"))
-    assert cat.os.fleet_health.sweep_every_ticks == 360
+    assert cat.os.fleet_health.sweep_every_ticks == \
+        catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
     cfg = cat.projects[0].fleet_health
     assert cfg.sweep_every_ticks == 12
     assert cfg.cooldown_minutes == catalog_mod.DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES

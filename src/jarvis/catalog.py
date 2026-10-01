@@ -861,43 +861,74 @@ class InspectConfig:
 #: `worker.investigation_budget_usd`.
 DEFAULT_FLEET_HEALTH_ENABLED = True
 
-#: Minutes in status before one open status is over threshold. Neo 1073 set every entry
-#: except `dispatching`, which is this spec's: claimed-to-spawned is seconds of work
-#: (`worker_session.start`), so half an hour there is already broken. `running` is measured
-#: from the last ACTIVITY, not from entry — `stuck.ACTIVITY_STATUSES`.
+#: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
+#: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
+#: — means something is wrong, and thirty minutes of it is unacceptable. `running` is
+#: still judged on time since the last ACTIVITY and not since entry
+#: (`stuck.ACTIVITY_STATUSES`), which is what makes a five-minute number safe for a turn
+#: that is working: a long turn that keeps calling tools is never over threshold.
+#: Neo 1073 set the earlier entries; SUPERSEDED BY THE USER, Neo 1148 accepting.
 DEFAULT_FLEET_HEALTH_THRESHOLDS: dict[str, int] = {
-    "pending": 240,
-    "dispatching": 30,
-    "running": 120,
-    "validating": 120,
-    "needs_review": 240,
-    "waiting_pr_merge": 180,
-    "waiting_input": 480,
+    "pending": 30,
+    "dispatching": 5,
+    "running": 5,
+    "validating": 15,
+    "needs_review": 60,
+    "waiting_pr_merge": 60,
+    "waiting_input": 60,
 }
 
 #: The answer for an open status the mapping does not name — `idle`, `budget_exhausted`,
 #: and anything added to `WO_STATUSES` later, which is watched on the day it ships rather
-#: than silently unwatched. Unmeasured, like `dispatching` above.
-DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES = 240
+#: than silently unwatched. The user's 2026-10-01 bar, Neo 1148: an unnamed open status
+#: idle for half an hour is reported.
+DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES = 30
 
 #: How long one subject waits before a second investigation, Neo 1073. It holds even when
 #: the fingerprint has changed: "it moved" and "it is better" are not the same claim (§6b).
 DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES = 720
 
 #: Investigations the sweep may open in a day, FLEET-WIDE and counted from the records
-#: themselves (§6c). Neo 1073.
-DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 4
+#: themselves (§6c). Neo 1073 set 4; Neo 1148 raised it to 48 under the user's tighter
+#: bar, because at five-minute sensitivity a cap of 4 is spent in the first hour and then
+#: fails CLOSED exactly when a genuinely stuck order appears.
+#: `worker.investigation_budget_usd` is the real money ceiling, so this cap rations
+#: BURSTS rather than the day. The per-subject cooldown
+#: (`DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES`) is unchanged, Neo 1148 explicitly: one stuck
+#: order must not eat the burst.
+DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 48
 
-#: Ticks between sweeps of one project — 30 minutes at the default 5s `poll_interval`.
+#: Ticks between sweeps of one project — 5 minutes at the default 5s `poll_interval`.
 #: A CATALOG CONFIG AND NOT A MODULE CONSTANT, per Neo 1086, which overrides §5: the user
 #: has turned down the module-constant precedent before and prefers a per-project config.
-DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 360
+#: 5 minutes and not 30 (Neo 1148): a 30-minute cadence cannot see a 5-minute idle —
+#: detection would lag the threshold by up to six times the threshold itself.
+DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
+
+#: How long the stuck sweep itself may be silent before the user is told
+#: (`invariants.check_stuck_sweep_alive`, §8) — `OS_HEALTH_SWEEP_DARK_MINUTES`' value and
+#: its reasoning: a daemon restart or one capped tick cannot trip it, and a sweep switched
+#: off by a bad edit is named the same working day. A FLEET number, see
+#: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
+DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
 
 #: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
 #: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
 #: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
 #: silently leaving that status unwatched.
 FLEET_HEALTH_MAP_KEYS = ("thresholds",)
+
+#: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
+#: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
+#: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
+#: (`Daemon.STUCK_RUN_KEY`). No arrangement of per-project numbers can express either.
+FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
+    "max_per_day": "No arrangement of per-project numbers can ration a fleet-wide "
+                   "daily cap.",
+    "sweep_dark_minutes": "The stuck sweep writes ONE fleet-wide run record, so no "
+                          "arrangement of per-project numbers can say how long that one "
+                          "record may be silent.",
+}
 
 
 @dataclass
@@ -909,8 +940,9 @@ class FleetHealthConfig:
     status keeps the fleet answer for the other eight (`probes.resolve`'s merge-by-id rule,
     for its reason).
 
-    `max_per_day` is a FLEET number and is refused on a project: no arrangement of
-    per-project numbers can ration a fleet-wide daily cap.
+    `max_per_day` and `sweep_dark_minutes` are FLEET numbers and are refused on a project
+    (`FLEET_HEALTH_FLEET_ONLY_KEYS`): no arrangement of per-project numbers can ration a
+    fleet-wide daily cap, nor bound the silence of one fleet-wide run record.
 
     There is no money key here and there must not be one — Neo's one condition on 1073.
     `max_per_day` rations the number of sessions and `worker.investigation_budget_usd`
@@ -926,6 +958,8 @@ class FleetHealthConfig:
     max_per_day: int = DEFAULT_FLEET_HEALTH_MAX_PER_DAY
     #: Neo 1086: how often this project is swept, per project rather than a constant.
     sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+    #: Fleet-only: how long the sweep's own run record may be silent (§8).
+    sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
 
     def threshold_seconds(self, status: str) -> float:
         """This status's threshold, in the seconds `stuck.assess` compares — the named one
@@ -1738,10 +1772,11 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
     base = base or FleetHealthConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    if where != "os.fleet_health" and "max_per_day" in raw:
-        raise _err(f"{where}.max_per_day is a FLEET number — set "
-                   f"os.fleet_health.max_per_day. No arrangement of per-project numbers "
-                   f"can ration a fleet-wide daily cap.")
+    if where != "os.fleet_health":
+        for key, why in FLEET_HEALTH_FLEET_ONLY_KEYS.items():
+            if key in raw:
+                raise _err(f"{where}.{key} is a FLEET number — set "
+                           f"os.fleet_health.{key}. {why}")
     thresholds = dict(base.thresholds)
     named = raw.get("thresholds", {})
     if not isinstance(named, dict):
@@ -1760,6 +1795,7 @@ def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
         cooldown_minutes=int(raw.get("cooldown_minutes", base.cooldown_minutes)),
         max_per_day=int(raw.get("max_per_day", base.max_per_day)),
         sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
+        sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
     )
     for name, value in vars(cfg).items():
         if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":

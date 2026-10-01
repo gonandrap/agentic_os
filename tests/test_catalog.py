@@ -583,3 +583,20 @@ def test_fleet_health_inherits_per_status():
     with pytest.raises(CatalogError, match=r"os\.fleet_health\.max_per_day"):
         parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
                                      "fleet_health": {"max_per_day": 9}}]})
+
+
+def test_sweep_dark_minutes_is_refused_on_a_project():
+    """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
+    record, so no arrangement of per-project numbers can say how long it may be silent."""
+    with pytest.raises(CatalogError, match=r"os\.fleet_health\.sweep_dark_minutes"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"sweep_dark_minutes": 20}}]})
+    with pytest.raises(CatalogError, match="is a FLEET number"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"sweep_dark_minutes": 20}}]})
+    cat = parse_catalog({"os": {"fleet_health": {"sweep_dark_minutes": 20}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.fleet_health.sweep_dark_minutes == 20
+    assert cat.projects[0].fleet_health.sweep_dark_minutes == 20
+    assert jarvis.catalog.FleetHealthConfig().sweep_dark_minutes == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
