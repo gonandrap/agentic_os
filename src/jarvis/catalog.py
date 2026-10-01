@@ -8,8 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import claude_cli
 from . import concision
 from . import probes as probes_mod
+# The ceiling's constants live in `claude_cli` and are imported HERE, not the other way
+# round: catalog -> project_store -> claude_cli is already a chain, so the reverse
+# import is a cycle. Spec §4:
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
 from .neo_store import Q_KINDS, SEATS
@@ -357,6 +363,15 @@ DEFAULT_COMPACT_MIN_CONTEXT: int | None = 100_000
 #: boundary in sight at a loss.
 COMPACT_MIN_CONTEXT_MIN = 10_000
 
+#: How much of a Neo question the DIGEST model is shown (`os.neo.digest_max_question_chars`).
+#: MEASURED over production's `neo.db`, 991 questions at or over `digest.MIN_CHARS`:
+#: median 3,110, p90 12,098, p95 65,261, p99 135,141, max 151,652. The distribution has
+#: a knee — 88% sit under 10,000 — and everything past it is one shape: an `assumption`
+#: row carrying a pasted diff, not a longer question. 20,000 clears p90 with headroom
+#: and caps the worst digest input at 20k instead of 151.7k (q722 bought two calls at
+#: that size). Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DEFAULT_DIGEST_MAX_QUESTION_CHARS = 20_000
+
 
 _MISSING = object()
 
@@ -441,6 +456,13 @@ DEFAULT_VALIDATION_MAX_ROUNDS = 3
 # docs/superpowers/specs/2026-09-13-a-round-the-panel-can-afford.md
 DEFAULT_VALIDATION_DIFF_CHARS = 150000
 
+# Characters of DECISION RECORD one assumption-review packet may carry — the order's own
+# answered questions, the user's messages and their rulings on sibling assumptions. Newest
+# first, and what it evicts is stated in the packet rather than dropped silently. Per
+# project because that is what the user asked for on this key. Spec §3:
+# docs/superpowers/specs/2026-09-28-an-assumption-review-reads-the-orders-own-rulings.md
+DEFAULT_VALIDATION_DECISION_RECORD_CHARS = 6000
+
 # Truncation limit for the diff ONE CONFIRMATION QUESTION carries, and it is not the
 # panel's number: measured at q660-748, confirmation questions ran 7K-152K chars against
 # 1-3.8K for the first-pass review of the same assumption and 12-15K for the largest
@@ -515,6 +537,7 @@ class ValidationConfig:
     timeout: int = DEFAULT_VALIDATION_TIMEOUT
     max_rounds: int = DEFAULT_VALIDATION_MAX_ROUNDS
     diff_chars: int = DEFAULT_VALIDATION_DIFF_CHARS
+    decision_record_chars: int = DEFAULT_VALIDATION_DECISION_RECORD_CHARS
     confirm_diff_chars: int = DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS
     # Whether a FEATURE order validates as a whole once its children are done, which is
     # a separate question from whether its children each validated: the feature is the
@@ -1251,6 +1274,9 @@ class NeoConfig:
     # SET IT TO "" TO TURN DIGESTING OFF: no model named, no call made, and the page
     # falls back to rendering every question in full, which is what it did before.
     digest_model: str = "haiku"
+    #: How much of a question the digest model is shown, clipped and LABELLED — spec §4,
+    #: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+    digest_max_question_chars: int = DEFAULT_DIGEST_MAX_QUESTION_CHARS
     panel: PanelConfig = field(default_factory=PanelConfig)
 
 
@@ -1280,6 +1306,9 @@ class OsConfig:
     #: the break-even is a property of the prompt cache's prices, which no project has
     #: its own copy of. See DEFAULT_COMPACT_MIN_CONTEXT.
     compact_min_context: int | None = DEFAULT_COMPACT_MIN_CONTEXT
+    #: Backstop ceiling on one OS-side model call's combined prompt. No off switch —
+    #: see `_max_os_prompt_chars_or_err` and DEFAULT_MAX_OS_PROMPT_CHARS.
+    max_os_prompt_chars: int = DEFAULT_MAX_OS_PROMPT_CHARS
     notification_sinks: list[str] = field(default_factory=lambda: ["log"])
     telegram_token_env: str = "JARVIS_TELEGRAM_TOKEN"
     telegram_chat_id_env: str = "JARVIS_TELEGRAM_CHAT_ID"
@@ -1376,6 +1405,51 @@ def _compact_min_context_or_err(os_raw: dict[str, Any]) -> int | None:
     return value
 
 
+def _max_os_prompt_chars_or_err(os_raw: dict[str, Any]) -> int:
+    """`os.max_os_prompt_chars`, validated at boot. NO null and no off switch.
+
+    A backstop with an off switch is not a backstop, which is why this differs from
+    `_compact_min_context_or_err`: switching a cost control off is a policy, switching
+    a safety limit off is the bug it exists to catch.
+
+    `MAX_OS_PROMPT_CHARS_MIN` sits just above the measured worst case (285,929 chars, a
+    feature chair round). Below it the ceiling refuses every validation seat — the panel
+    would decide nothing, silently — so a value there is refused where it was typed.
+    """
+    value = os_raw.get("max_os_prompt_chars", DEFAULT_MAX_OS_PROMPT_CHARS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _err(f"os.max_os_prompt_chars must be a whole number of characters, "
+                   f"got {value!r} (there is deliberately no off switch)")
+    if value < MAX_OS_PROMPT_CHARS_MIN:
+        raise _err(f"os.max_os_prompt_chars {value} is below "
+                   f"{MAX_OS_PROMPT_CHARS_MIN}, where it would refuse the validation "
+                   f"panel's own prompts and silently disable validation")
+    return value
+
+
+def _digest_max_question_chars_or_err(neo_raw: dict[str, Any]) -> int:
+    """`os.neo.digest_max_question_chars` — see DEFAULT_DIGEST_MAX_QUESTION_CHARS.
+
+    THE FLOOR IS `digest.MIN_CHARS`, read from that module rather than copied, so the
+    two cannot drift. Below it every digested question is clipped to less than the
+    length that earned it a digest call at all. The import is local because `digest`
+    imports this module. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    """
+    from .digest import MIN_CHARS
+
+    value = neo_raw.get("digest_max_question_chars", DEFAULT_DIGEST_MAX_QUESTION_CHARS)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _err("os.neo.digest_max_question_chars must be a positive whole number "
+                   f"of characters, got {value!r}")
+    if value < MIN_CHARS:
+        raise _err(f"os.neo.digest_max_question_chars {value} is below {MIN_CHARS}, "
+                   f"the length at which a question is digested at all "
+                   f"(`digest.MIN_CHARS`): under it every digested question would be "
+                   f"clipped to less than the threshold that earned it the call")
+    return value
+
+
 def _cache_health_or_err(os_raw: dict[str, Any]) -> tuple[int, int, int, float]:
     """The cache-health window and its three floors, validated at boot.
 
@@ -1420,7 +1494,12 @@ def load_catalog(path: str | Path) -> Catalog:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as e:
         raise _err(f"invalid JSON in {path}: {e}") from e
-    return parse_catalog(data, source_path=path)
+    cat = parse_catalog(data, source_path=path)
+    # Arm the transport backstop here: every startup path — daemon boot, `ops`, the CLI
+    # — loads the catalog from a file through this one function (Neo, q1077). Spec §4:
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    claude_cli.set_max_os_prompt_chars(cat.os.max_os_prompt_chars)
+    return cat
 
 
 def _parse_panel(raw: Any) -> PanelConfig:
@@ -1512,6 +1591,10 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
     diff_chars = int(raw.get("diff_chars", base.diff_chars))
     if diff_chars < 1:
         raise _err(f"{where}.diff_chars must be >= 1")
+    decision_record_chars = int(
+        raw.get("decision_record_chars", base.decision_record_chars))
+    if decision_record_chars < 1:
+        raise _err(f"{where}.decision_record_chars must be >= 1")
     confirm_diff_chars = int(raw.get("confirm_diff_chars", base.confirm_diff_chars))
     if confirm_diff_chars < 1:
         raise _err(f"{where}.confirm_diff_chars must be >= 1")
@@ -1536,6 +1619,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         timeout=timeout,
         max_rounds=max_rounds,
         diff_chars=diff_chars,
+        decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
@@ -1963,6 +2047,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         learnings_limit=int(neo_raw.get("learnings_limit", 50)),
         timeout=int(neo_raw.get("timeout", 300)),
         digest_model=str(neo_raw.get("digest_model", "haiku")),
+        digest_max_question_chars=_digest_max_question_chars_or_err(neo_raw),
         panel=_parse_panel(neo_raw.get("panel", {})),
     )
 
@@ -1994,6 +2079,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         cache_health_min_boundaries=health_bounds,
         cache_health_prefix_share=health_prefix,
         compact_min_context=_compact_min_context_or_err(os_raw),
+        max_os_prompt_chars=_max_os_prompt_chars_or_err(os_raw),
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),

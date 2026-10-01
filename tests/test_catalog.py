@@ -247,6 +247,7 @@ def test_validation_ships_disabled_with_every_default_spelled_out():
     assert v.timeout == 300
     assert v.max_rounds == 3
     assert v.diff_chars == 150000
+    assert v.decision_record_chars == 6000
     assert v.feature_units is True
     # and an empty block is the same thing as no block at all
     assert validation_of({}) == v
@@ -358,10 +359,12 @@ def test_the_confirmation_pass_has_its_own_diff_budget_and_never_reads_the_panel
 
 
 @pytest.mark.parametrize("key", ["timeout", "max_rounds", "diff_chars",
-                                 "confirm_diff_chars"])
+                                 "confirm_diff_chars", "decision_record_chars"])
 def test_a_validation_budget_below_one_is_rejected(key):
     """Zero rounds is a review that never runs while claiming to; zero diff_chars is a
-    panel handed nothing, which the design says must never be asked to judge."""
+    panel handed nothing, which the design says must never be asked to judge. Zero
+    decision_record_chars is a reviewer shown none of the order's own rulings, which is
+    the defect the record exists to fix."""
     with pytest.raises(CatalogError, match=f"os.validation.{key}"):
         validation_of({key: 0})
 
@@ -403,7 +406,8 @@ def test_a_project_override_inherits_every_key_it_does_not_name():
     key must carry the OS's answer for the other seven, so no caller has two objects to
     reconcile."""
     os_raw = {"enabled": True, "roster": ["tester", "chair"], "chair_model": "opus",
-              "timeout": 90, "max_rounds": 1, "diff_chars": 200, "feature_units": False}
+              "timeout": 90, "max_rounds": 1, "diff_chars": 200,
+              "decision_record_chars": 400, "feature_units": False}
     [v] = projects_validation(os_raw, {"validation": {"max_rounds": 5}})
     assert v.max_rounds == 5
     assert v.enabled is True
@@ -411,6 +415,7 @@ def test_a_project_override_inherits_every_key_it_does_not_name():
     assert v.chair_model == "opus"
     assert v.timeout == 90
     assert v.diff_chars == 200
+    assert v.decision_record_chars == 400
     assert v.feature_units is False
 
 
@@ -543,3 +548,55 @@ def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
             {"name": "a", "path": "/tmp/a", "observability": {"level": "loud"}}]})
     with pytest.raises(CatalogError, match="must be an object"):
         parse_catalog({"os": {"observability": "full"}, "projects": []})
+
+
+# -- the backstop ceiling on an OS-side prompt (spec §4,
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) -------------------------
+
+
+def test_the_os_prompt_ceiling_defaults_to_the_measured_number():
+    """400,000 is a MEASURED default: the worst legitimate OS call is 285,929 chars."""
+    from jarvis.catalog import DEFAULT_MAX_OS_PROMPT_CHARS
+
+    assert DEFAULT_MAX_OS_PROMPT_CHARS == 400_000
+    assert parse_catalog({"projects": []}).os.max_os_prompt_chars == 400_000
+    assert parse_catalog({"os": {"max_os_prompt_chars": 500_000},
+                          "projects": []}).os.max_os_prompt_chars == 500_000
+
+
+def test_a_ceiling_below_the_floor_is_refused_at_boot():
+    """Below the floor the ceiling silently disables validation, which is worse than
+    the bug it fixes — so it fails where it was typed."""
+    from jarvis.catalog import MAX_OS_PROMPT_CHARS_MIN
+
+    assert MAX_OS_PROMPT_CHARS_MIN == 300_000
+    with pytest.raises(CatalogError) as caught:
+        parse_catalog({"os": {"max_os_prompt_chars": 150_000}, "projects": []})
+    msg = str(caught.value).replace(",", "")
+    assert "150000" in msg
+    assert str(MAX_OS_PROMPT_CHARS_MIN) in msg
+    assert "validation" in msg
+    for bad in ("400000", True, 0, -1, MAX_OS_PROMPT_CHARS_MIN - 1):
+        with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+            parse_catalog({"os": {"max_os_prompt_chars": bad}, "projects": []})
+
+
+def test_the_ceiling_has_no_off_switch():
+    """A backstop with an off switch is not a backstop: null is refused, not honoured."""
+    with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+        parse_catalog({"os": {"max_os_prompt_chars": None}, "projects": []})
+
+
+def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
+    """The seam Neo ruled on (q1077): one override at startup, not a parameter plumbed
+    through twenty call sites."""
+    from jarvis import claude_cli
+
+    before = claude_cli.MAX_OS_PROMPT_CHARS
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps({"os": {"max_os_prompt_chars": 450_000}, "projects": []}))
+    try:
+        load_catalog(f)
+        assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
+    finally:
+        claude_cli.set_max_os_prompt_chars(before)

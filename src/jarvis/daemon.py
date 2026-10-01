@@ -64,6 +64,7 @@ from .central_store import CentralStore
 from .dispatch import dispatch_work_order
 from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
+from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
@@ -516,6 +517,9 @@ class CarryOutcome:
 class Daemon:
     def __init__(self, catalog: Catalog, poll_interval: float = 5.0):
         self.catalog = catalog
+        # Daemon boot arms the transport backstop too, for the catalog it was HANDED —
+        # spec §4, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
+        claude_cli.set_max_os_prompt_chars(catalog.os.max_os_prompt_chars)
         self.poll_interval = poll_interval
         self.central = CentralStore()
         self.stores: dict[str, ProjectStore] = {}
@@ -2206,6 +2210,14 @@ class Daemon:
                 log.info("[%s] %s: round %d held until Claude Code can authenticate",
                          project.name, wo_id, n)
                 return
+            if isinstance(failure, claude_cli.PromptTooLargeError):
+                # BEFORE the generic outage below — a `ClaudeCliError` subclass, so a
+                # clause after it is never reached — and it must not spend one of the
+                # three RETRYABLE attempts: the OS built this prompt past its own
+                # ceiling, so the next two would be built identically. Spec §4:
+                # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+                self._validation_refused(store, project, wo, round_id, n, failure)
+                return
             if failure is not None:
                 self._validation_outage(store, wo, round_id, n, failure)
                 return
@@ -2586,6 +2598,38 @@ class Daemon:
                          "reopens_at": reopens, "attempt": attempt,
                          "error": auth.message[:500]})
 
+    def _validation_refused(self, store: ProjectStore, project: ProjectSpec, wo: dict,
+                            round_id: int, n: int,
+                            error: claude_cli.PromptTooLargeError) -> None:
+        """The OS refused its own seat prompt. ESCALATE ONCE — never retry.
+
+        `_validation_outage`'s opposite in the one respect that matters: an outage is
+        a blip worth three attempts, and this is deterministic, so the three would be
+        three identical refusals and a quarter of an hour of silence before the user
+        heard anything. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+        The give-up goes through `_escalate` like every other, so the round, the status
+        and the notification are the ones the user already knows. The flag is then
+        REWRITTEN to the refusal's own sentence, which `invariants.true_blockers`
+        re-derives above VALIDATION_STUCK_BLOCKER: "the panel could not be satisfied"
+        would point the user at the work, and the cause is a prompt nobody ever sent.
+        """
+        central = CentralStore()          # thread-local, as `_round_config` opens its own
+        try:
+            said = self._note_prompt_refusal(central, store, project.name, wo["id"],
+                                             f"validation round {n}", error)
+        finally:
+            central.close()
+        self._escalate(
+            store, wo, round_id, n,
+            f"the review could not be run: the OS built a {said['total']}-char prompt "
+            f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
+            f"it was never sent. Nobody has judged the work.")
+        from . import invariants
+
+        store.flag_attention(wo["id"], invariants.os_prompt_refused_blocker(said))
+
     def _validation_outage(self, store: ProjectStore, wo: dict, round_id: int, n: int,
                            error: Exception) -> None:
         """The validator could not be reached. That is a transport failure, NOT a
@@ -2847,6 +2891,12 @@ class Daemon:
                 log.info("[%s] feature %s: round %d held until Claude Code can "
                          "authenticate", project.name, fo_id, n)
                 return
+            except claude_cli.PromptTooLargeError as e:
+                # BEFORE the generic clause — a `ClaudeCliError` subclass — and
+                # refused once rather than retried three times, the work-order twin's
+                # reasoning verbatim (`_validation_refused`).
+                self._feature_refused(store, project, fo, round_id, n, e)
+                return
             except claude_cli.ClaudeCliError as e:
                 self._feature_outage(store, fo, round_id, n, e)
                 return
@@ -3044,6 +3094,44 @@ class Daemon:
                           {"round": n, "cause": VALIDATION_AUTH_CAUSE,
                            "reopens_at": reopens, "attempt": attempt,
                            "error": auth.message[:500], "feature_order": fo_id})
+
+    def _feature_refused(self, store: ProjectStore, project: ProjectSpec, fo: dict,
+                         round_id: int, n: int,
+                         error: claude_cli.PromptTooLargeError) -> None:
+        """`_validation_refused` for a feature round — read that one; this is its twin.
+
+        The carrier differs for `_feature_outage`'s reason: these events live on the
+        MANAGER's timeline, because `wo_events.wo_id` is a foreign key into
+        `work_orders`. The inbox row therefore carries the FEATURE id in its title and
+        no `wo_id`, exactly as `_escalate_feature`'s notification does — naming the
+        manager would point every sink at a session rather than at the rounds.
+        """
+        from . import ops
+        from .project_store import OS_PROMPT_REFUSED_EVENT
+
+        fo_id = fo["id"]
+        said = self.prompt_refusal_payload(f"feature validation round {n}", error)
+        ops.feature_event(store, fo_id, OS_PROMPT_REFUSED_EVENT,
+                          {**said, "round": n, "feature_order": fo_id})
+        central = CentralStore()
+        try:
+            central.add_inbox(
+                project=project.name, level="critical",
+                title=f"An OS model call for {fo_id} was refused: the prompt was too "
+                      f"large",
+                body=f"Call: {said['call']}\nPrompt {said['prompt_chars']} chars + "
+                     f"system prompt {said['system_prompt_chars']} chars = "
+                     f"{said['total']}, over the {said['ceiling']}-char ceiling "
+                     f"({said['setting']}).\nNOBODY HAS JUDGED THIS: the call was "
+                     f"never made, and no retry can help.\nRaise {said['setting']} in "
+                     f"the catalog, or shrink what that call carries.")
+        finally:
+            central.close()
+        self._escalate_feature(
+            store, fo, round_id, n,
+            f"the review could not be run: the OS built a {said['total']}-char prompt "
+            f"for it, over the {said['ceiling']}-char ceiling ({said['setting']}), so "
+            f"it was never sent. Nobody has judged the work.")
 
     def _feature_outage(self, store: ProjectStore, fo: dict, round_id: int, n: int,
                         error: Exception) -> None:
@@ -3282,6 +3370,88 @@ class Daemon:
             finally:
                 pstore.close()
 
+    @staticmethod
+    def prompt_refusal_payload(
+            call: str,
+            error: claude_cli.PromptTooLargeError | QuestionTooLargeError,
+    ) -> dict[str, Any]:
+        """What a refusal is allowed to say about itself. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+        NUMBERS AND IDENTIFIERS ONLY — no head, no tail, no ellipsised middle of the
+        prompt. This payload becomes an inbox row the user reads and the digest model
+        is then sent, which is one of the places this feature exists to keep the
+        payload out of.
+
+        ONE renderer for both refusals: the transport measures prompt + system prompt,
+        `neo_store.ask` measures question + context, and those two ARE the prompt the
+        refused call would have been built from. `total` is the combined size in both
+        cases.
+        """
+        prompt_chars = int(getattr(error, "prompt_chars", 0)
+                           or getattr(error, "question_chars", 0))
+        system_prompt_chars = int(getattr(error, "system_prompt_chars", 0)
+                                  or getattr(error, "context_chars", 0))
+        return {"call": call, "prompt_chars": prompt_chars,
+                "system_prompt_chars": system_prompt_chars,
+                "total": prompt_chars + system_prompt_chars,
+                "ceiling": error.ceiling, "setting": "os.max_os_prompt_chars"}
+
+    def _note_prompt_refusal(self, central: CentralStore, store: ProjectStore,
+                             project: str, wo_id: str, call: str,
+                             error: claude_cli.PromptTooLargeError
+                             | QuestionTooLargeError) -> dict[str, Any]:
+        """The OS refused its own prompt. Say so ONCE, durably, and flag the order.
+
+        The event is what makes the flag survive a reconcile tick: `flag_attention`
+        alone is rewritten by INV-ATTENTION-REASON, so the fact is written down and
+        `invariants.true_blockers` re-derives the same sentence from it every tick
+        (`ProjectStore.os_prompt_refusal_open`, kn-78346a2d's rule).
+        """
+        from . import invariants
+        from .project_store import OS_PROMPT_REFUSED_EVENT
+
+        said = self.prompt_refusal_payload(call, error)
+        store.add_event(wo_id, OS_PROMPT_REFUSED_EVENT, said)
+        central.add_inbox(
+            project=project, level="critical",
+            title=f"An OS model call for {wo_id} was refused: the prompt was too large",
+            body=f"Call: {said['call']}\n"
+                 f"Prompt {said['prompt_chars']} chars + system prompt "
+                 f"{said['system_prompt_chars']} chars = {said['total']}, over the "
+                 f"{said['ceiling']}-char ceiling ({said['setting']}).\n"
+                 f"NOBODY HAS JUDGED THIS: the call was never made, so nothing was "
+                 f"decided and no retry can help — the same prompt is built the same "
+                 f"way every time.\n"
+                 f"Raise {said['setting']} in the catalog, or shrink what that call "
+                 f"carries.",
+            wo_id=wo_id)
+        store.flag_attention(wo_id, invariants.os_prompt_refused_blocker(said))
+        return said
+
+    def _note_confirmation_refused(self, project: ProjectSpec, store: ProjectStore,
+                                   wo: dict, assumption: dict,
+                                   error: QuestionTooLargeError) -> None:
+        """A confirmation question the store would not hold. ONCE, then log and move on.
+
+        ONCE IS THE WHOLE GUARD. `autoreview.propose_confirmation` asks before it links,
+        so the assumption stays pending with a NULL `confirm_question_id` and this pass
+        reaches the same row on every reconcile tick — an unguarded write would put a
+        critical row in the inbox every few seconds for ever. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        """
+        if store.os_prompt_refusal_open(wo["id"]) is not None:
+            log.info("[%s] %s: assumption #%s is still too large to confirm: %s",
+                     project.name, wo["id"], assumption.get("n"), error)
+            return
+        central = CentralStore()          # thread-local, as `_validation_refused` opens
+        try:
+            self._note_prompt_refusal(
+                central, store, project.name, wo["id"],
+                f"assumption #{assumption.get('n')} confirmation", error)
+        finally:
+            central.close()
+
     def _neo_drain(self) -> None:
         """Answer every queued question in order (runs on the single neo thread)."""
         from . import invariants
@@ -3369,12 +3539,34 @@ class Daemon:
                 if pstore:
                     pstore.close()
 
+        def refused(q: dict, error: claude_cli.PromptTooLargeError) -> None:
+            """The OS built a prompt past its own ceiling (spec §4). One row, one flag,
+            no retry — and never `_note_question_unreachable`, whose sentence says the
+            retries are spent when none was ever made."""
+            ppath = paths.get(q["project"])
+            if not (ppath and ppath.is_dir() and q.get("wo_id")):
+                # A `triage` question has no work order behind it, so there is nothing
+                # to flag; the user is still told (issue #240's rule).
+                central.add_inbox(
+                    project=q["project"], level="critical",
+                    title="An OS model call was refused: the prompt was too large",
+                    body=str(error), wo_id=None)
+                return
+            pstore = ProjectStore(ppath)
+            try:
+                self._note_prompt_refusal(
+                    central, pstore, q["project"], q["wo_id"],
+                    f"neo {q.get('kind') or 'question'}", error)
+            finally:
+                pstore.close()
+
         try:
             results = neo_mod.drain_queue(
                 store, model=cfg.model, learnings_limit=cfg.learnings_limit,
                 deliver=deliver, answer=self._panel_answer(cfg),
                 unreachable=lambda q, detail: self._note_question_unreachable(
                     central, q, detail),
+                refused=refused,
             )
             if results:
                 log.info("neo drained %d question(s)", len(results))
@@ -3434,6 +3626,7 @@ class Daemon:
                 try:
                     view = digest_mod.summarise(
                         q["question"], model=model,
+                        max_chars=self.catalog.os.neo.digest_max_question_chars,
                         # The question knows which work order it came from, and the
                         # transport does not — so the attribution is bound here.
                         on_usage=agent_usage.recorder(
@@ -6035,8 +6228,16 @@ class Daemon:
                     self._note_autoreview_held(store, wo["id"], evidence_ok,
                                                suppress=suppress)
                     continue
-                autoreview.propose_confirmation(store, neo_store, project.name, wo, a,
-                                                assumptions, evidence=ce)
+                try:
+                    autoreview.propose_confirmation(store, neo_store, project.name, wo,
+                                                    a, assumptions, evidence=ce, cfg=cfg)
+                except QuestionTooLargeError as e:
+                    # The store refused to hold the question, so nothing was asked and
+                    # nothing was linked. Say so and carry on to the next assumption:
+                    # the outer handler would abandon this work order's whole pass over
+                    # one row. Spec §4:
+                    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+                    self._note_confirmation_refused(project, store, wo, a, e)
                 continue
             def judge(stakes_verdict=None, a=a):
                 return rule(a, wo, cfg, round_outcome=outcome, round_n=round_n,
@@ -6052,7 +6253,7 @@ class Daemon:
                                            suppress=suppress)
                 continue
             autoreview.propose(store, neo_store, project.name, wo, a, assumptions,
-                               early=early)
+                               early=early, cfg=cfg)
 
     def _stakes_reviewed(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                          cfg: Any, a: dict, decision: Any,
