@@ -999,6 +999,114 @@ def test_decide_evidence_holds_and_carries_the_row_it_is_about():
     assert SECRET_VALUE not in d.reason
 
 
+# -- the question the store refuses to hold ---------------------------------------------
+
+#: Planted in every CHANGED PATH, so the refusal really is about text carrying it.
+#: Nothing the user reads may repeat it. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DIFF_MARKER = "PASTED-DIFF-MARKER-7b2d"
+
+
+def _path(i: int) -> str:
+    return f"render_{DIFF_MARKER}_{i:05d}.py"
+
+
+def _huge_stat() -> tuple[str, str]:
+    """A delivery of tens of thousands of files: the stat and the file list alone carry
+    the question past `claude_cli.MAX_OS_PROMPT_CHARS`, with the diff BODY well inside
+    `validation.confirm_diff_chars`.
+
+    § 2 budgets the diff body and NOTHING else — `_what_changed` interpolates `ev.stat`
+    whole and never truncates `ev.files`, both on purpose — so §4 is the backstop over
+    exactly the parts § 2 does not own:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md § 2 and §4.
+    """
+    from jarvis import claude_cli
+
+    # One stat line plus one file-list entry per file: what the question pays per file.
+    per_file = len(f" {_path(0)} | 1 +\n") + len(f"  {_path(0)}\n")
+    n = claude_cli.MAX_OS_PROMPT_CHARS // per_file + 500
+    stat = "".join(f" {_path(i)} | 1 +\n" for i in range(n))
+    stat += f" {n} files changed, {n} insertions(+)\n"
+    diff = "".join(
+        f"diff --git a/{_path(i)} b/{_path(i)}\nnew file mode 100644\n"
+        f"--- /dev/null\n+++ b/{_path(i)}\n@@ -0,0 +1,1 @@\n+    pass\n"
+        for i in range(n))
+    return stat, diff
+
+
+def _refusals(store, wo_id: str) -> list[dict]:
+    from jarvis.project_store import OS_PROMPT_REFUSED_EVENT
+
+    return events(store, wo_id, OS_PROMPT_REFUSED_EVENT)
+
+
+def _refusal_inbox(wo_id: str) -> list[dict]:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return [r for r in central.unacked_inbox()
+                if r["wo_id"] == wo_id and "too large" in r["title"]]
+    finally:
+        central.close()
+
+
+def _oversized_confirmation(started, monkeypatch):
+    """A parked order whose confirmation question is past the ceiling. TICKS TWICE.
+
+    Twice is the whole point: `propose_confirmation` asks BEFORE it links, so the
+    assumption is still pending with a NULL `confirm_question_id` and every later tick
+    arrives here again.
+    """
+    store, wo = park(started, auto_review=True)
+    stub_evidence(monkeypatch, *_huge_stat())
+    provisional(store, wo)
+
+    ask(started, store)
+    ask(started, store)
+    return store, wo
+
+
+def test_a_confirmation_too_large_to_store_does_not_take_the_tick_down(
+        started, monkeypatch):
+    """`neo_store.ask` refuses before it persists, and the refusal is a `ValueError`
+    nothing on this path used to catch — so it escaped the per-assumption loop and took
+    the whole reconcile tick with it."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    row = store.all_assumptions(wo["id"])[0]
+    assert row["status"] == "pending"
+    assert row["confirm_question_id"] is None
+    assert questions() == [], "an oversized question was persisted after all"
+
+
+def test_the_confirmation_refusal_is_written_down_exactly_once(started, monkeypatch):
+    """THE ONCE-GUARD. This loop runs on every reconcile tick, so an unguarded write
+    would put a critical row in the inbox every few seconds for ever."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    assert len(_refusals(store, wo["id"])) == 1
+    rows = _refusal_inbox(wo["id"])
+    assert len(rows) == 1 and rows[0]["level"] == "critical"
+
+
+def test_the_confirmation_refusal_repeats_no_byte_of_the_question(started, monkeypatch):
+    """NUMBERS AND IDENTIFIERS ONLY, on every surface the user reads."""
+    store, wo = _oversized_confirmation(started, monkeypatch)
+
+    (said,) = _refusals(store, wo["id"])
+    assert said["total"] > said["ceiling"], (
+        "nothing was over the ceiling, so the rule below is vacuous")
+    (row,) = _refusal_inbox(wo["id"])
+    assert "os.max_os_prompt_chars" in row["body"]
+    assert DIFF_MARKER not in row["title"]
+    assert DIFF_MARKER not in row["body"]
+    fresh = store.get_work_order(wo["id"])
+    assert DIFF_MARKER not in str(fresh["attention_reason"])
+    assert "os.max_os_prompt_chars" in str(fresh["attention_reason"])
+
+
 # -- the confirmation question's own diff budget (spec § 2) -----------------------------
 
 #: One file's section, and every file below is this size: equal-length names make the

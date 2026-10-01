@@ -4672,6 +4672,9 @@ def main(argv: list[str] | None = None) -> int:
         return main_hook()
     from .bugreport import BugReportError
     from .catalog import CatalogError
+    # A refusal a worker can act on, not a crash. Spec §4:
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
         if args.cmd == "start":
@@ -4741,7 +4744,7 @@ def main(argv: list[str] | None = None) -> int:
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError, BugReportError) as e:
+    except (OpsError, CatalogError, BugReportError, QuestionTooLargeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

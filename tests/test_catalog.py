@@ -548,3 +548,55 @@ def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
             {"name": "a", "path": "/tmp/a", "observability": {"level": "loud"}}]})
     with pytest.raises(CatalogError, match="must be an object"):
         parse_catalog({"os": {"observability": "full"}, "projects": []})
+
+
+# -- the backstop ceiling on an OS-side prompt (spec §4,
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) -------------------------
+
+
+def test_the_os_prompt_ceiling_defaults_to_the_measured_number():
+    """400,000 is a MEASURED default: the worst legitimate OS call is 285,929 chars."""
+    from jarvis.catalog import DEFAULT_MAX_OS_PROMPT_CHARS
+
+    assert DEFAULT_MAX_OS_PROMPT_CHARS == 400_000
+    assert parse_catalog({"projects": []}).os.max_os_prompt_chars == 400_000
+    assert parse_catalog({"os": {"max_os_prompt_chars": 500_000},
+                          "projects": []}).os.max_os_prompt_chars == 500_000
+
+
+def test_a_ceiling_below_the_floor_is_refused_at_boot():
+    """Below the floor the ceiling silently disables validation, which is worse than
+    the bug it fixes — so it fails where it was typed."""
+    from jarvis.catalog import MAX_OS_PROMPT_CHARS_MIN
+
+    assert MAX_OS_PROMPT_CHARS_MIN == 300_000
+    with pytest.raises(CatalogError) as caught:
+        parse_catalog({"os": {"max_os_prompt_chars": 150_000}, "projects": []})
+    msg = str(caught.value).replace(",", "")
+    assert "150000" in msg
+    assert str(MAX_OS_PROMPT_CHARS_MIN) in msg
+    assert "validation" in msg
+    for bad in ("400000", True, 0, -1, MAX_OS_PROMPT_CHARS_MIN - 1):
+        with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+            parse_catalog({"os": {"max_os_prompt_chars": bad}, "projects": []})
+
+
+def test_the_ceiling_has_no_off_switch():
+    """A backstop with an off switch is not a backstop: null is refused, not honoured."""
+    with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+        parse_catalog({"os": {"max_os_prompt_chars": None}, "projects": []})
+
+
+def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
+    """The seam Neo ruled on (q1077): one override at startup, not a parameter plumbed
+    through twenty call sites."""
+    from jarvis import claude_cli
+
+    before = claude_cli.MAX_OS_PROMPT_CHARS
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps({"os": {"max_os_prompt_chars": 450_000}, "projects": []}))
+    try:
+        load_catalog(f)
+        assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
+    finally:
+        claude_cli.set_max_os_prompt_chars(before)
