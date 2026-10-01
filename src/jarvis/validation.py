@@ -977,6 +977,7 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
             missing.append(seats.Opinion(seat=seat, raw=str(e), status="failed",
                                          replied=False, unavailable=True))
 
+    _refuse_oversized_seats(prompts)
     models = {seat: seat_model(seat, cfg) for seat in prompts}
     # WITHOUT THIS THE ROUND STILL PAYS FIVE WRITES. `run_blind` submits every seat
     # before reading any result — that is what makes it blind — so on a cold cache none
@@ -1067,6 +1068,36 @@ def decide(store: ProjectStore, round_row: dict[str, Any], packet: EvidencePacke
     # FAILS TOWARD THE USER, never toward a pass.
     return _out("escalated", reason or "the review could not reach a verdict on this "
                                        "submission.", opinions, round_no=round_no)
+
+
+def _refuse_oversized_seats(prompts: Mapping[str, tuple[str, str]]) -> None:
+    """Raise `claude_cli.PromptTooLargeError` for the largest seat past the ceiling.
+
+    PRE-FLIGHT, on the calling thread and before the priming call, because
+    `seats._run_seat` cannot do it: it documents "Never raises", runs on a pool thread
+    and touches no store, so the refusal there has nowhere to go — it becomes an
+    abstention that shrinks the quorum and
+    `Daemon._validate_work_order`'s `isinstance(failure, claude_cli.PromptTooLargeError)`
+    branch is never reached. The `prefix` is SHARED by every seat, so one seat over the
+    ceiling means every seat is: there is no partial panel worth running, and the
+    priming call must not be spent either.
+
+    The LARGEST offending seat, so the reported numbers are the true worst case. NUMBERS
+    AND IDENTIFIERS ONLY — never a fragment of the prompt. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    """
+    ceiling = claude_cli.MAX_OS_PROMPT_CHARS
+    over = [(len(prefix) + len(user), seat, len(prefix), len(user))
+            for seat, (prefix, user) in prompts.items()
+            if len(prefix) + len(user) > ceiling]
+    if not over:
+        return
+    total, seat, system_chars, prompt_chars = max(over, key=lambda row: row[0])
+    raise claude_cli.PromptTooLargeError(
+        f"refused the validation seat {seat}: prompt {prompt_chars} chars + system "
+        f"prompt {system_chars} chars = {total}, over the {ceiling}-char ceiling "
+        f"(os.max_os_prompt_chars)",
+        prompt_chars=prompt_chars, system_prompt_chars=system_chars, ceiling=ceiling)
 
 
 def _out(outcome: str, reason: str, opinions: Sequence[seats.Opinion], *,

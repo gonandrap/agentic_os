@@ -547,6 +547,31 @@ RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}`
                             "not on anything about the release.")
 
 
+#: What a work order says when an OS-built prompt for it was past the ceiling, so the
+#: call was never made. NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt:
+#: this string is rendered to the user and read back by the digest model. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+OS_PROMPT_REFUSED_BLOCKER = (
+    "the OS built a {call} prompt of {total} chars for this work order ({prompt} + "
+    "{system} system), over the {ceiling}-char ceiling (os.max_os_prompt_chars), so "
+    "the call was never made and nobody has judged the work. Raise the ceiling or "
+    "shrink what that call carries.")
+
+
+def os_prompt_refused_blocker(said: dict[str, Any]) -> str:
+    """OS_PROMPT_REFUSED_BLOCKER filled from the event the refusing call site wrote.
+
+    ONE renderer for both ends, RELEASE_BASE_RED_BLOCKER's rule: the call site flags it
+    and this module re-derives it, or INV-ATTENTION-REASON relabels the flag on the
+    next reconcile tick.
+    """
+    return OS_PROMPT_REFUSED_BLOCKER.format(
+        call=said.get("call") or "model", total=said.get("total") or 0,
+        prompt=said.get("prompt_chars") or 0,
+        system=said.get("system_prompt_chars") or 0,
+        ceiling=said.get("ceiling") or 0)
+
+
 def release_base_red_blocker(said: dict[str, Any]) -> str:
     """RELEASE_BASE_RED_BLOCKER filled from the park event `ops.defer_red_release` wrote.
 
@@ -834,6 +859,17 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
         blockers.append("worker failed — review and retry")
+    # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
+    # and above the `needs_review` triage, because it outranks both of the generic
+    # sentences it would otherwise sit under: a question Neo "could not answer" and a
+    # panel that "could not be satisfied" both point the user at the wrong remedy when
+    # the cause is a prompt nobody ever sent. Gated on the status so no settled work
+    # order pays for the query, as the neighbouring blockers are.
+    if wo["status"] in OPEN_STATUSES:
+        refusal = store.os_prompt_refusal_open(wo["id"])
+        if refusal is not None:
+            blockers.append(os_prompt_refused_blocker(refusal))
     # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). Before the
     # `waiting_input` branch below, whose generic "waiting on your input" would send the
     # user looking for a session to type into — the thing to do is `/login`, and once

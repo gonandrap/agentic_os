@@ -411,6 +411,53 @@ def test_the_digest_model_is_catalog_configurable_and_cheap_by_default(tmp_path,
     assert catalog.load_catalog(path).os.neo.digest_model == "sonnet"
 
 
+# -- the clipped input (spec §4,
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) --------------------------
+
+
+def test_an_over_long_question_is_clipped_before_it_becomes_the_prompt():
+    """`MAX_FIELD_CHARS` bounds the model's REPLY only, so q722 bought two digest calls
+    at 151,700 chars each on top of the Neo call."""
+    huge = "z" * 50_000
+    call, calls = canned({"headline": "h"})
+    digest.summarise(huge, model="haiku", call=call, max_chars=20_000)
+    prompt = calls[0]["prompt"]
+    assert prompt.startswith("z" * 20_000)
+    assert len(prompt) < 20_500
+    assert "z" * 20_001 not in prompt
+
+
+def test_the_clip_is_labelled_inside_the_prompt_the_model_reads():
+    """A silent clip makes the model write a confident headline about a question it only
+    half saw. The label says how much was cut and where the full text lives."""
+    call, calls = canned({"headline": "h"})
+    digest.summarise("z" * 50_000, model="haiku", call=call, max_chars=20_000)
+    label = calls[0]["prompt"][20_000:]
+    assert "30000" in label.replace(",", "")
+    assert "work-order record" in label
+    assert "clipped" in label.lower() or "cut" in label.lower()
+
+
+def test_a_question_under_the_clip_is_untouched():
+    call, calls = canned({"headline": "h"})
+    digest.summarise(LONG, model="haiku", call=call, max_chars=20_000)
+    assert calls[0]["prompt"] == LONG          # byte-identical, no label appended
+
+
+def test_the_clip_is_a_catalog_setting_with_the_measured_default(tmp_path, project):
+    """Measured off production's 991 questions over `MIN_CHARS`: median 3,110,
+    p90 12,098 — the default sits above the knee."""
+    assert catalog.NeoConfig().digest_max_question_chars == 20_000
+    assert digest.MAX_QUESTION_CHARS == 20_000
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "os": {"neo": {"digest_max_question_chars": 30_000}},
+        "projects": [{"name": "proj_a", "path": str(project), "description": "d"}],
+    }))
+    cat = catalog.load_catalog(path)
+    assert cat.os.neo.digest_max_question_chars == 30_000
+
+
 def test_neo_reads_the_question_in_full_and_the_disclosure_shows_that_prompt():
     """The disclosure's contract: what it displays is what `answer_question` sends, built
     by the same function, so the two cannot drift."""
