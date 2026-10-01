@@ -3057,3 +3057,26 @@ def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
 
     page = " ".join(client.get("/stuck").text.split())
     assert wo["id"] in page and "jarvis rules list" in page
+
+
+def test_the_terminal_names_the_blocker_too(client, project, capsys):
+    """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders.
+
+    §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    investigated.md: one reader, two renderers — a user-owed wait must read the same
+    in the terminal as on the page.
+    """
+    from test_health_sweep import park_order
+
+    from jarvis import cli
+
+    wo = ops.create_work_order("proj_a", "asked a question hours ago")
+    store = ProjectStore(project)
+    try:
+        park_order(store, wo["id"], "waiting_input", hours=5)
+    finally:
+        store.close()
+
+    assert cli.main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "what the record says blocks it: worker is waiting on your input" in out

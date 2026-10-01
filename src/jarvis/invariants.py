@@ -3247,13 +3247,19 @@ def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
 STUCK_SWEEP_DARK_MINUTES = 180
 
 
-def check_stuck_sweep_alive() -> Iterator[Violation]:
+def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     """INV-STUCK-SWEEP-DARK — the sweep must never be the thing that is stuck. §8.
 
-    OS-LEVEL rather than per-project, because the sweep is fleet-wide and its run row is
-    central: `check_os_health_sweep_alive` is the SHAPE this copies (named causes, one
-    `Violation`, `level="critical"`, not repairable) and `check_ui_healthy` is the
-    placement — takes nothing, opens what it needs, repairs nothing.
+    AN OS-LEVEL FACT REGISTERED PER PROJECT, and `check_os_health_sweep_alive` above is
+    both the SHAPE this copies (named causes, one `Violation`, `level="critical"`, not
+    repairable) and the REGISTRATION precedent: it too reads a fleet-wide fact and still
+    sits in `INVARIANTS`, short-circuiting on `_os_owning_project`. `OS_INVARIANTS` is
+    run by `jarvis doctor` ALONE, and only `Daemon.check_invariants` writes the
+    `violation_reports` rows `ops.os_status` builds its critical attention items from —
+    so a check registered there can never put an item on the attention list, and a
+    failing or dark sweep left `jarvis status` reading HEALTHY (review round 1). Hence
+    the OS-owning project runs it, exactly one project per tick, and the fleet-wide
+    sweep is reported ONCE rather than once per project.
 
     Two causes, because they have two different fixes. No `disabled` cause, unlike the OS
     sweep's: `fleet_health.enabled=false` is a legal choice for a project. No hold discount
@@ -3266,6 +3272,8 @@ def check_stuck_sweep_alive() -> Iterator[Violation]:
     from .central_store import CentralStore
     from .daemon import Daemon
 
+    if _os_owning_project(store) is None:
+        return
     catalog = _live_catalog()
     if catalog is None or not any(p.fleet_health.enabled for p in catalog.projects):
         return
@@ -4236,7 +4244,6 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_production_clean,
     check_cache_ttl_trigger,
     check_prefix_stable,
-    check_stuck_sweep_alive,
 )
 
 
@@ -4454,6 +4461,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing,
                                    # and a liveness check that runs hourly is a liveness
                                    # check with an hour of blind spot
+    check_stuck_sweep_alive,       # ...and beside it for the same reason: a fleet-wide
+                                   # fact short-circuited on `_os_owning_project`, HERE
+                                   # and not in `OS_INVARIANTS` because only this
+                                   # tuple's checks reach the attention list (round 1).
+                                   # Shells out to nothing either
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing

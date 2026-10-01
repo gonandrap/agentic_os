@@ -1423,7 +1423,7 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
 #
 # §8 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
 
-def _sweep_run(tmp_path, project, **row) -> None:
+def _sweep_run(tmp_path, project, *, projects=None, **row) -> Path:
     """A registered catalog at `fleet_health`'s shipped defaults, plus one run row."""
     import json
 
@@ -1434,7 +1434,8 @@ def _sweep_run(tmp_path, project, **row) -> None:
     path = tmp_path / "stuck-catalog.json"
     path.write_text(json.dumps({
         "os": {"notifications": {"sinks": ["log"]}},
-        "projects": [{"name": "proj_a", "path": str(project), "description": "test"}],
+        "projects": projects or [
+            {"name": "proj_a", "path": str(project), "description": "test"}],
     }))
     central = CentralStore()
     try:
@@ -1445,37 +1446,128 @@ def _sweep_run(tmp_path, project, **row) -> None:
                  "skipped": {}, "excluded": "", "error": "", **row}))
     finally:
         central.close()
+    return path
 
 
-def _stuck_dark() -> list:
-    return [v for v in invariants.check_os() if v.invariant == "INV-STUCK-SWEEP-DARK"]
+def _own_the_os(monkeypatch, project) -> None:
+    """Make `project` the OS-OWNING project — it owns the OS only by CONTAINING the
+    running install (`_os_owning_project`), so the install is pointed inside it."""
+    from jarvis import schedule
+
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
 
 
-def test_sweep_error_raises_the_invariant_once(jarvis_home, tmp_path, project):
+def _stuck_dark(store) -> list:
+    return [v for v in invariants.check_stuck_sweep_alive(store)
+            if v.invariant == "INV-STUCK-SWEEP-DARK"]
+
+
+def test_sweep_error_raises_the_invariant_once(jarvis_home, tmp_path, project,
+                                               monkeypatch):
     """§8: the run row carries the error, and the row is what the check reads."""
+    _own_the_os(monkeypatch, project)
     _sweep_run(tmp_path, project, error="OperationalError: database is locked")
+    store = ProjectStore(project)
 
-    (violation,) = _stuck_dark()
+    (violation,) = _stuck_dark(store)
     assert violation.level == "critical" and not violation.repaired
     assert violation.context["cause"] == "failing"
     assert "database is locked" in violation.detail
     # The STATE, not an event: a second read of the same row says the same thing.
-    assert [v.context["cause"] for v in _stuck_dark()] == ["failing"]
+    assert [v.context["cause"] for v in _stuck_dark(store)] == ["failing"]
 
     _sweep_run(tmp_path, project, error="")
-    assert _stuck_dark() == []
+    assert _stuck_dark(store) == []
+    store.close()
 
 
-def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project):
+def test_sweep_dark_raises_after_the_window(jarvis_home, tmp_path, project, monkeypatch):
     """§8: 180 minutes is six sweep intervals, so one capped tick cannot trip it."""
+    _own_the_os(monkeypatch, project)
     _sweep_run(tmp_path, project, ts=time.time() - 181 * 60)
+    store = ProjectStore(project)
 
-    (violation,) = _stuck_dark()
+    (violation,) = _stuck_dark(store)
     assert violation.context["cause"] == "dark"
     assert invariants.STUCK_SWEEP_DARK_MINUTES == 180
 
     _sweep_run(tmp_path, project, ts=time.time() - 179 * 60)
-    assert _stuck_dark() == []
+    assert _stuck_dark(store) == []
+    store.close()
+
+
+def test_the_stuck_check_is_registered_where_it_can_push(tmp_path, project):
+    """Review round 1: in `OS_INVARIANTS` only `jarvis doctor` ran it, so a failing
+    sweep never reached the attention list. `check_os_health_sweep_alive`'s placement."""
+    assert invariants.check_stuck_sweep_alive in invariants.INVARIANTS
+    assert invariants.check_stuck_sweep_alive not in invariants.OS_INVARIANTS
+    assert invariants.check_stuck_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+def test_the_fleet_wide_sweep_is_reported_once_not_once_per_project(
+        jarvis_home, tmp_path, project, monkeypatch):
+    """One run row, one report: every project but the owner short-circuits."""
+    other = tmp_path / "other"
+    (other / ".jarvis").mkdir(parents=True)
+    _own_the_os(monkeypatch, project)
+    _sweep_run(tmp_path, project, error="boom", projects=[
+        {"name": "proj_a", "path": str(project), "description": "the OS's own"},
+        {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
+    ])
+    owner, ordinary = ProjectStore(project), ProjectStore(other)
+
+    assert [v.context["cause"] for v in _stuck_dark(owner)] == ["failing"]
+    assert _stuck_dark(ordinary) == []
+    owner.close()
+    ordinary.close()
+
+
+def test_a_failing_sweep_reaches_the_attention_list(jarvis_home, tmp_path, project,
+                                                    monkeypatch):
+    """Review round 1: the push surface. A check the daemon runs per project writes a
+    `violation_reports` row, and that row is what `ops.os_status` reads (Neo 1084)."""
+    from jarvis import ops as ops_module
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    _own_the_os(monkeypatch, project)
+    path = _sweep_run(tmp_path, project)
+    ops.start_os(str(path), foreground=True)
+    clean_scan = ops_module.stuck_scan
+
+    def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(ops_module, "stuck_scan", boom)
+    catalog = load_catalog(path)
+    daemon, store = Daemon(catalog), ProjectStore(project)
+    try:
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store)
+
+        items = _stuck_attention(catalog)
+        assert len(items) == 1
+        assert "database is locked" in items[0]["reason"]
+        assert not ops.os_status(catalog)["healthy"]
+
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store)
+        assert len(_stuck_attention(catalog)) == 1, "one item, not one per tick"
+
+        # A CLEAN sweep clears it — but `check_invariants` only closes reports on a
+        # sweep tick, so the clean pass must be invoked with `sweep_landings=True`.
+        monkeypatch.setattr(ops_module, "stuck_scan", clean_scan)
+        daemon.stuck_tick()
+        daemon.check_invariants(catalog.projects[0], store, sweep_landings=True)
+        assert _stuck_attention(catalog) == []
+    finally:
+        store.close()
+
+
+def _stuck_attention(catalog) -> list:
+    return [i for i in ops.os_status(catalog)["attention"]
+            if i.get("invariant") == "INV-STUCK-SWEEP-DARK"]
 
 
 # -- Neo 1084: a standing critical violation is ONE attention item ----------------------
@@ -1507,3 +1599,11 @@ def test_a_standing_critical_violation_reaches_the_attention_list(
     assert items[0]["reason"] == "a standing break"
     assert status["attention"] == items, "nothing else is asking, so this is why"
     assert not status["healthy"]
+
+    # ...and the report row is also what takes it away again.
+    closed = ProjectStore(project)
+    try:
+        assert closed.close_violation_report("INV-TEST-CRITICAL", wo["id"])
+    finally:
+        closed.close()
+    assert ops.os_status(catalog)["attention"] == [], "the row is also the removal"

@@ -410,14 +410,20 @@ holding the NEWEST run, not a table: `CentralStore.set_base_health`
 (src/jarvis/central_store.py:1817) is the precedent for a fleet-shaped fact in `os_state`
 and gives the reason. `error` is `""` on a clean run, which is what clears the violation.
 
-**One invariant: `INV-STUCK-SWEEP-DARK`**, in `OS_INVARIANTS`
-(src/jarvis/invariants.py:4165) and therefore run by `check_os()` and by `jarvis doctor`.
-OS-level and not per-project, because the sweep is fleet-wide and the run row is central —
-`check_os_health_sweep_alive` (src/jarvis/invariants.py:3167) is the SHAPE this copies
-(three named causes, one `Violation`, `level="critical"`, **not repairable**) and not the
-placement; it is per-project only because it is about one project's own sweep.
-`check_ui_healthy` (src/jarvis/invariants.py:3694) is the placement precedent: takes
-nothing, opens what it needs, reports and repairs nothing.
+**One invariant: `INV-STUCK-SWEEP-DARK`**, in the per-project `INVARIANTS`
+(src/jarvis/invariants.py) and therefore run by the daemon's reconcile tick as well as by
+`jarvis doctor`. It reads a fleet-wide fact — the central run row — and still takes a
+`ProjectStore`, returning at once unless `_os_owning_project` says this store is the
+project that runs the OS, so it fires on exactly one project per tick and the sweep is
+reported once. `check_os_health_sweep_alive` (src/jarvis/invariants.py:3167) is BOTH the
+SHAPE this copies (named causes, one `Violation`, `level="critical"`, **not repairable**)
+and the registration precedent, for the same reason.
+
+**It was in `OS_INVARIANTS` and review round 1 rejected that**, correctly: `OS_INVARIANTS`
+is run by `jarvis doctor` alone, and only `Daemon.check_invariants` writes the
+`violation_reports` rows `ops.os_status` builds its critical attention items from. A
+failing or dark sweep would therefore have reached no push surface and left `jarvis status`
+reading HEALTHY — the raised-but-invisible class this spec exists to close.
 
 Two causes, named because they have two different fixes:
 
@@ -452,7 +458,10 @@ Extend existing files. Every assertion named; the fixtures are `jarvis.testing`'
 | `test_an_investigation_is_never_a_subject` | `tests/test_investigation_orders.py` | an `investigator` work order parked past every threshold, plus its `investigation` row: `stuck_tick` opens nothing, and `ops.create_investigation_order` on the investigator still raises `OpsError` naming the kind |
 | `test_a_user_owed_order_is_investigated` | `tests/test_investigation_orders.py` | **the §3 regression test.** A `needs_review` order with `needs_attention=1` and `attention_reason == invariants.VALIDATION_STUCK_BLOCKER`, 5h in status: one investigation is opened, and its `why` contains §3's three questions |
 | `test_fleet_pause_opens_nothing_but_records_a_run` | `tests/test_fleet_pause.py` | with `fleet.pause(central, …)` live: `opened == 0`, a run row exists with the exclusion named, and `INV-STUCK-SWEEP-DARK` does not fire |
-| `test_sweep_error_raises_the_invariant_once` | `tests/test_invariants.py` | a sweep whose read raises: the run row carries the error, `check_os()` yields exactly one `INV-STUCK-SWEEP-DARK` with `cause == "failing"`, a second `check_os()` yields it again from the same row (the state, not an event), and a clean run clears it |
+| `test_sweep_error_raises_the_invariant_once` | `tests/test_invariants.py` | a sweep whose read raises: the run row carries the error, `check_stuck_sweep_alive(store)` on the OS-owning project yields exactly one `INV-STUCK-SWEEP-DARK` with `cause == "failing"`, a second call yields it again from the same row (the state, not an event), and a clean run clears it |
+| `test_a_failing_sweep_reaches_the_attention_list` | `tests/test_invariants.py` | **the round-1 test.** `ops.stuck_scan` patched to raise, then `stuck_tick` + `Daemon.check_invariants`: exactly one `ops.os_status()['attention']` item names `INV-STUCK-SWEEP-DARK`, `healthy` is False, a second tick still yields one, and a clean sweep judged with `sweep_landings=True` removes it |
+| `test_the_fleet_wide_sweep_is_reported_once_not_once_per_project` | `tests/test_invariants.py` | two projects, one owning the install: the owner reports `cause == "failing"` and the ordinary project reports nothing |
+| `test_the_stuck_check_is_registered_where_it_can_push` | `tests/test_invariants.py` | `check_stuck_sweep_alive` is in `INVARIANTS` and in neither `OS_INVARIANTS` nor `SLOW_INVARIANTS` |
 | `test_sweep_dark_raises_after_the_window` | `tests/test_invariants.py` | enabled, newest run `181` minutes old: one violation, `cause == "dark"`; at 179 minutes, none |
 | `test_every_open_status_has_a_threshold` | `tests/test_catalog.py` | for every `s in project_store.OPEN_STATUSES`, the resolved config answers a positive threshold (named or fallback) — the test that makes a new status a failure rather than a blind spot |
 | `test_fleet_health_inherits_per_status` | `tests/test_catalog.py` | a project naming `thresholds["running"]` keeps the fleet values for the other eight; an unknown status key raises `CatalogError` naming it; a project setting `max_per_day` raises `CatalogError` naming `os.fleet_health.max_per_day` |

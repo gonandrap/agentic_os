@@ -2565,6 +2565,8 @@ def cmd_stuck(args: argparse.Namespace) -> int:
               f"threshold {_hours(row['threshold_seconds'])} on the "
               f"{row['clock']} clock")
         print(f"    {row['reason']}")
+        # Parity with `ui/templates/stuck.html`, worded the same (§7).
+        print(f"    what the record says blocks it: {row['blocker']}")
         inv = row["investigation"]
         if inv:
             print(f"    {inv['id']}  {inv['status']}"
