@@ -388,7 +388,9 @@ def test_a_staged_release_re_renders_too(tmp_path):
     """`--stage` exits before the restarts and hands them to the daemon (release.py).
     The units have to be written by then, because that restart is what reads them."""
     repo = _make_repo(tmp_path)
-    r = _dry_run(repo, _deployed(tmp_path), "0.2.0", "--stage", "--wo", "wo-1234abcd")
+    base = _sha(repo, "HEAD")
+    r = _dry_run(repo, _deployed(tmp_path), "0.2.0", "--stage", "--wo", "wo-1234abcd",
+                 "--base", base)
     assert r.returncode == 0, r.stderr
 
     assert "install_prod_service.sh' --no-restart" in r.stdout
@@ -527,7 +529,9 @@ def test_the_release_is_published_after_the_tag_reaches_origin(tmp_path):
 def test_a_staged_release_is_published_too(tmp_path):
     """--stage hands the restarts to the daemon, not the changelog."""
     repo = _make_repo(tmp_path)
-    r = _dry_run(repo, tmp_path / "prod", "--stage", "--wo", "wo-abc123", "0.2.0")
+    base = _sha(repo, "HEAD")
+    r = _dry_run(repo, tmp_path / "prod", "--stage", "--wo", "wo-abc123", "0.2.0",
+                 "--base", base)
     assert r.returncode == 0, r.stderr
     assert "gh release create 'jarvis-0.2.0'" in r.stdout
 
