@@ -7686,15 +7686,18 @@ carrying them:
 
 Run the ordinary release path and nothing else:
 
-    scripts/shipit.sh --stage --wo {wo_id}
+    scripts/shipit.sh --stage --wo {wo_id} --base <sha>
 
 That is a PRIVILEGED ACTION and it will be gated — that is correct and expected. Make \
 your case first (`jarvis gate request`), and read `jarvis brief gates` before you do. Do \
 NOT invent a second release path, do not restart any service by hand, and do not drop \
-`--stage`: an inline restart kills your own session mid-turn.
+`--stage`: an inline restart kills your own session mid-turn. Dropping or changing \
+`--base` after approval invalidates the grant: the approved string names the commit.
 
-Check `main` is green before you ask. If it is not, say so and stop — a release is not \
-the place to fix a red build."""
+Resolve `<sha>` BEFORE you ask, so the reviewer and the command name one commit: the \
+newest commit on `origin/main` that carries every fix listed above and whose CI is \
+green, written out in full (40 characters). If that base is red, or you cannot read \
+CI's verdict on it, say so and stop — a release is not the place to fix a red build."""
 
     def ensure_release(self, project: ProjectSpec, store: ProjectStore,
                        wo: dict) -> str:

@@ -682,3 +682,114 @@ def test_guard_refuses_when_head_carries_no_lock_at_all(tmp_path):
     r = _run_guard(wt, "0.2.0")
     assert r.returncode != 0
     assert "no uv.lock at HEAD" in (r.stdout + r.stderr)
+
+
+# -- a release pinned to a commit (2026-10-01 spec) ------------------------------
+#
+# A release grant authorises a byte-exact command string and `origin/main` moves while
+# the reviewer decides, so the approved command has to name the commit it ships.
+
+
+def _sha(repo: Path, rev: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", rev],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_stage_requires_a_base_sha(tmp_path):
+    """§1: the approval is scoped to the string, so the commit has to be in it."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--stage", "--wo", "wo-1234abcd", "0.2.0")
+    assert r.returncode != 0
+    assert "--base" in (r.stdout + r.stderr)
+
+
+def test_base_must_be_a_full_sha(tmp_path):
+    """An abbreviation names one commit today and can name another later."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--base", "442729f", "0.2.0")
+    assert r.returncode != 0
+    assert "40-character" in (r.stdout + r.stderr)
+
+
+def test_base_must_be_an_ancestor_of_origin_main(tmp_path):
+    """§2: releases are cut from already-merged main."""
+    repo = _make_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "side")
+    _commit(repo, "never merged")
+    side = _sha(repo, "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--base", side, "0.2.0")
+    assert r.returncode != 0
+    err = r.stdout + r.stderr
+    assert "origin/main" in err
+    assert _sha(repo, "origin/main")[:7] in err
+
+
+def test_an_unknown_base_says_so_rather_than_failing_ancestry(tmp_path):
+    """`merge-base --is-ancestor` on an unknown object reports the wrong fault."""
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "--base", "0" * 40, "0.2.0")
+    assert r.returncode != 0
+    assert "not a commit in this checkout" in (r.stdout + r.stderr)
+
+
+def test_the_release_branch_is_cut_from_the_base_not_mains_tip(tmp_path):
+    """§3, the regression this spec exists for: gate 347 was approved on 442729f while
+    main advanced to 535b93c, and shipping main's tip under that grant ships content no
+    reviewer saw CI pass on (issue #837)."""
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    _commit(repo, "landed after the approval")
+    _commit(repo, "and another")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"git branch 'release/jarvis-0.2.0' '{base}'" in r.stdout
+    assert "HEAD is not origin/main" not in (r.stdout + r.stderr)
+
+
+def test_a_pinned_release_ignores_the_local_head(tmp_path):
+    """The live gate-347 case: nothing about the working checkout is an input."""
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    _commit(repo, "main moved on")
+    _git(repo, "push", "-q", "origin", "main")
+    _git(repo, "checkout", "-q", "-b", "wo-33e1d0b4", base)
+    _commit(repo, "unrelated worker commit")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "jarvis-0.2.0" in r.stdout
+
+
+def test_the_notes_stop_at_the_base(tmp_path):
+    """§3: what merged after the base rides the next release's notes, not this one's."""
+    repo = _make_repo(tmp_path)
+    _tag_like_shipit(repo, "0.1.2")
+    _commit(repo, "Up to the base (#1)")
+    base = _sha(repo, "HEAD")
+    _commit(repo, "Merged after the base (#2)")
+    _git(repo, "push", "-q", "origin", "main")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "patch")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Up to the base (#1)" in r.stdout
+    assert "Merged after the base (#2)" not in r.stdout
+
+
+def test_a_dirty_os_managed_path_still_does_not_block_a_pinned_release(tmp_path):
+    """§2: the clean-tree guard asks about the operator, not about the base."""
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    (repo / "ASSUMPTIONS.md").write_text("# ASSUMPTIONS\n- [ ] (wo-x) mid-release\n")
+    r = _dry_run(repo, tmp_path / "prod", "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ASSUMPTIONS.md" in r.stdout
+
+
+def test_the_staged_marker_records_the_base(tmp_path):
+    """§6: an extra key in pending_release.json, as audit record."""
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    r = _dry_run(repo, _deployed(tmp_path), "--stage", "--wo", "wo-1234abcd",
+                 "--base", base, "0.2.0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert base in r.stdout

@@ -1023,8 +1023,12 @@ def test_a_landed_confirmed_blocker_files_a_release_through_the_ordinary_path(fl
     releases = fleet.releases()
     assert len(releases) == 1
     brief = releases[0]["description"]
-    assert f"scripts/shipit.sh --stage --wo {releases[0]['id']}" in brief, \
-        "the brief must name the staged path and the order's own id"
+    assert f"scripts/shipit.sh --stage --wo {releases[0]['id']} --base <sha>" in brief, \
+        "the brief must name the staged path, the order's own id and the pinned base"
+    # 2026-10-01 spec §5: the brief IS the interface, so it has to teach the resolution
+    # as well as the flag — an unpinned command brings back the gate-347 defect.
+    assert "newest commit on `origin/main`" in brief
+    assert "invalidates the grant" in brief
     assert "gated" in brief, "the worker is told the gate is expected, not a failure"
     assert fleet.issue_url in brief, "and which fix it is shipping"
 
