@@ -3240,6 +3240,79 @@ def check_os_health_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
     )
 
 
+#: How long the stuck sweep may be silent before the user is told. Six sweep intervals at
+#: the shipped cadence, `OS_HEALTH_SWEEP_DARK_MINUTES`' value and its reasoning: a daemon
+#: restart or one capped tick cannot trip it, and a sweep switched off by a bad edit is
+#: named the same working day.
+STUCK_SWEEP_DARK_MINUTES = 180
+
+
+def check_stuck_sweep_alive(store: ProjectStore) -> Iterator[Violation]:
+    """INV-STUCK-SWEEP-DARK — the sweep must never be the thing that is stuck. §8.
+
+    AN OS-LEVEL FACT REGISTERED PER PROJECT, and `check_os_health_sweep_alive` above is
+    both the SHAPE this copies (named causes, one `Violation`, `level="critical"`, not
+    repairable) and the REGISTRATION precedent: it too reads a fleet-wide fact and still
+    sits in `INVARIANTS`, short-circuiting on `_os_owning_project`. `OS_INVARIANTS` is
+    run by `jarvis doctor` ALONE, and only `Daemon.check_invariants` writes the
+    `violation_reports` rows `ops.os_status` builds its critical attention items from —
+    so a check registered there can never put an item on the attention list, and a
+    failing or dark sweep left `jarvis status` reading HEALTHY (review round 1). Hence
+    the OS-owning project runs it, exactly one project per tick, and the fleet-wide
+    sweep is reported ONCE rather than once per project.
+
+    Two causes, because they have two different fixes. No `disabled` cause, unlike the OS
+    sweep's: `fleet_health.enabled=false` is a legal choice for a project. No hold discount
+    either — the sweep makes no model call, so a usage window cannot silence it, and a
+    fleet pause is recorded as a RUN with `opened=0` rather than as no run at all.
+
+    Not repairable, for `check_os_health_sweep_alive`'s stated reason: a failing sweep's
+    cause is not derivable from state.
+    """
+    from .central_store import CentralStore
+    from .daemon import Daemon
+
+    if _os_owning_project(store) is None:
+        return
+    catalog = _live_catalog()
+    if catalog is None or not any(p.fleet_health.enabled for p in catalog.projects):
+        return
+    central = CentralStore()
+    try:
+        run = db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), None)
+    finally:
+        central.close()
+    window = STUCK_SWEEP_DARK_MINUTES * 60
+    if run and str(run.get("error") or ""):
+        yield Violation(
+            invariant="INV-STUCK-SWEEP-DARK",
+            detail=(f"the stuck sweep's newest run FAILED, so no order is being judged "
+                    f"for time in status: {str(run['error'])[:200]}"),
+            level="critical", context={"cause": "failing",
+                                       "error": str(run["error"])[:500]},
+        )
+        return
+    if run is None:
+        # NEVER SWEPT is only dark while the OS is UP. A stopped daemon sweeps nothing by
+        # construction and `jarvis status` already says so, so firing here would report a
+        # fresh install as broken. The first tick writes the row.
+        from .daemon import daemon_running
+
+        if not daemon_running():
+            return
+    dark = db.now() - float((run or {}).get("ts") or 0.0)
+    if run is not None and dark < window:
+        return
+    minutes = int(dark / 60) if run else 0
+    yield Violation(
+        invariant="INV-STUCK-SWEEP-DARK",
+        detail=(f"the stuck sweep has not run for {minutes}m" if run else
+                "the stuck sweep is enabled but has never run — no sweep has been "
+                "scheduled") + ", so an order that stopped moving is nobody's finding",
+        level="critical", context={"cause": "dark", "dark_minutes": minutes},
+    )
+
+
 def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
     """INV-WORK-LANDED — a completed work order's pull request must have merged.
 
@@ -4388,6 +4461,11 @@ INVARIANTS: tuple[Callable[[ProjectStore], Iterator[Violation]], ...] = (
     check_os_health_sweep_alive,   # NOT in SLOW_INVARIANTS: it shells out to nothing,
                                    # and a liveness check that runs hourly is a liveness
                                    # check with an hour of blind spot
+    check_stuck_sweep_alive,       # ...and beside it for the same reason: a fleet-wide
+                                   # fact short-circuited on `_os_owning_project`, HERE
+                                   # and not in `OS_INVARIANTS` because only this
+                                   # tuple's checks reach the attention list (round 1).
+                                   # Shells out to nothing either
     check_paused_turns_resume,     # ditto: a pure read of what the retry pass did or
                                    # did not do, with nothing to repair
     check_pause_deadline_stable,   # ...and its companion: the pass can also be failing

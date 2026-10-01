@@ -223,6 +223,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # then `message_delivered` (spec 2026-09-29 §3.6).
         return ("Dispatch held behind a compaction",
                 "the prompt goes out once the conversation is summarised")
+    # §7: the verdict on THIS order, written here because the investigator's own work
+    # order is not what a reader of this one opens.
+    if kind == "investigation_verdict":
+        return (f"Investigated: {p.get('classification') or 'no classification'}",
+                " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing

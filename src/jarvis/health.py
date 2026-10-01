@@ -49,7 +49,10 @@ def observer_kinds() -> tuple[str, ...]:
     """
     from .project_store import ALARM_EVENT_KINDS
 
-    return (*ALARM_EVENT_KINDS, "attention")
+    # `investigation_verdict` is written ONTO the subject by `ops.submit_verdict` (§7 of
+    # docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md),
+    # so it is the same class of event and `stuck.fingerprint` must not count it.
+    return (*ALARM_EVENT_KINDS, "attention", "investigation_verdict")
 
 
 def fingerprint(pstore: Any, subject: dict[str, Any]) -> str:
