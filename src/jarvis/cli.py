@@ -653,7 +653,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
 
     c.add_argument("--observability", choices=["off", "normal", "full"],
-                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). The three levels: "
+                        "`off` — no per-turn context ledger and no sealed autopsy. It does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page: those read files that already exist, so the autopsy READING — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level. What `off` stops is the autopsy being SEALED, so that reading survives only as long as Claude Code keeps the transcript. "
+                        "`normal` — the default: the per-turn context ledger, and the autopsy sealed onto the order when it settles. "
+                        "`full` — that, plus the detail a `full` seal retains: verbatim tool parameters and nested subagent anatomies")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -687,7 +690,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    m = wo.add_parser("send", help="send feedback to the worker handling a work order")
+    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
+                                   "on a failed order this also revives the session; "
+                                   "`wo retry` is the named form")
     m.add_argument("wo_id")
     m.add_argument("message")
     m.add_argument("--project")
@@ -793,6 +799,16 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--force", action="store_true",
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
+
+    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
+                                     "the named form of `wo send`'s revive. Nothing "
+                                     "automatic: a turn that died with no result is "
+                                     "never replayed by the OS")
+    rt.add_argument("wo_id")
+    rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
+                                      "own relaunch note, unattributed")
+    rt.add_argument("--project")
 
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
@@ -2124,6 +2140,21 @@ def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
             print(f"               ({note})")
 
 
+def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
+    """Which reading answered — spec §4 of 2026-09-27-order-autopsy-durability.md.
+
+    COMPOSES NOTHING. The sentence, the level sentence and the sealed-floor warning are
+    all keys of the payload `autopsy.anatomy_for` returned, for `ago_phrase`'s reason: a
+    renderer that words one of them is one the dashboard will disagree with.
+    """
+    if not provenance:
+        return
+    print(f"  reading: {provenance['note']}")
+    for sentence in (provenance["level_note"], provenance["floor_note"]):
+        if sentence:
+            print(f"           {sentence}")
+
+
 def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
                    params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
@@ -2146,6 +2177,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
               f"{biggest['label']}: {biggest['prompt_chars']:,} characters of prompt, "
               f"{biggest['system_prompt_chars']:,} of system prompt "
               f"({biggest['model'] or 'model not recorded'})")
+    # ABOVE the transcript check, in `largest_os_input`'s position and for its reason:
+    # which reading answered is exactly what a reader needs when nothing was found, and
+    # a provenance line below the early return is invisible in the one case it matters.
+    _print_autopsy_provenance(unit.get("provenance"))
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -2843,6 +2878,9 @@ def _print_context(res: dict[str, Any]) -> None:
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
     (spec docs/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
+    # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
+    # the one who most needs to know which reading was consulted.
+    _print_autopsy_provenance(res.get("provenance"))
     if not res["recorded"]:
         print(f"\n  {res['note']}")
         return
@@ -3121,6 +3159,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "retry":
+        # `relay=True` as `send` does: `ops.user_authorship` decides whether this process
+        # is a surface the human reaches, and `ops.retry` drops it for its own note.
+        _print(ops.retry(args.wo_id, message=args.message,
+                         project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
@@ -3183,6 +3226,8 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         for episode in held["episodes"]:
             mark = " (still held)" if episode["open"] else ""
             print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    # Where `_diagnose_holds`' reading surfaces, so its provenance belongs here.
+    _print_autopsy_provenance(held.get("provenance"))
     residual = held["unexplained"]
     if residual["seconds"] is None:
         print(f"  unexplained: none measurable — {residual['note']}")

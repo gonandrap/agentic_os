@@ -913,6 +913,27 @@ def test_a_signin_park_is_the_users_own_move(started, catalog_file):
     _nothing_was_written(wo["id"])
 
 
+def test_a_failed_order_still_has_nothing_for_a_remedy_to_clear(started, catalog_file):
+    """§6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md: the slug stays
+    `failed`, so `FIX_NOTHING_TO_CLEAR` membership is unchanged — with a detail that now
+    names the retry. `fix`'s job is remedies; the OFFER belongs to `jarvis wo why`."""
+    _arm(catalog_file, *remedies.SHIPPED_REMEDIES)
+    wo = ops.create_work_order("proj_a", "died without delivering")
+    store = _store(wo["id"])
+    try:
+        store.set_status(wo["id"], "failed")
+    finally:
+        store.close()
+
+    out = ops.fix(wo["id"])
+
+    assert out["blocker"]["what"] == "failed"
+    assert out["remedy"] is None and out["proposal"] is None and out["your_move"] is None
+    assert out["note"] == ops.FIX_NOTHING.format(detail=out["blocker"]["detail"])
+    assert f"jarvis wo retry {wo['id']}" in out["note"]
+    _nothing_was_written(wo["id"])
+
+
 # -- 6. the slug NOBODY resolves: a gap CLASS, ending in an investigation ---------------
 #
 # The user's later design addition, superseding Neo q839's own default arm (which used to

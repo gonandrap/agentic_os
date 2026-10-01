@@ -865,6 +865,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # The user closed it, not the worker — worth telling apart on the record.
         return "Marked done by you", (
             "the worker's turn was stopped" if p.get("session_stopped") else "")
+    if kind == "retry_requested":
+        # §8 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        return ("You retried this order",
+                "with your message" if p.get("authored")
+                else "the OS's own relaunch note — you sent no message")
     if kind == "hidden":
         return ("Hidden" if p.get("hidden") else "Unhidden"), ""
     if kind == "invariant":

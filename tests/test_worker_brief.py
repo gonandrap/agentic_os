@@ -84,6 +84,32 @@ def test_core_contract_is_under_the_budget():
     assert len(p) < 5000, f"bare worker prompt is {len(p)} chars"
 
 
+def test_the_core_says_to_pass_a_reference_and_never_a_payload():
+    """§5 of docs/superpowers/specs/2026-09-26-bounded-model-inputs.md, and it earns the
+    core rather than the fetched section for the budget comment's test: the damage — a
+    `$(git diff)` expanded into this worker's context and the target worker's next turn —
+    is done on the FIRST send, before any section could be fetched. It was paid for by
+    cutting, not by raising the budget."""
+    p = _prompt()
+
+    assert "REFERENCE" in p
+    for alternative in ("pull request URL", "commit SHA", "line range",
+                        "command that reproduces it"):
+        assert alternative in p, f"the core does not offer {alternative!r}"
+    assert "refused before the command runs" in p
+    # The rule is stated in the fetched section too, for the worker that goes looking.
+    from jarvis import worker_brief
+    assert "REFERENCE" in worker_brief.render_section("concision")
+
+
+def test_the_evidence_re_finish_rule_survived_the_cut_into_the_record_section():
+    """The sentence the core gave up to pay for the rule above is not allowed to vanish:
+    a worker whose review comes back asking for more has to know that finishing again
+    with the fuller account is the move."""
+    from jarvis import worker_brief
+    assert "finish again" in worker_brief.render_section("record")
+
+
 def test_index_names_every_section_and_says_fetching_is_one_command():
     p = _prompt(GATED)
     assert "# Full briefings" in p
