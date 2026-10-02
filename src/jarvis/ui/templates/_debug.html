@@ -99,10 +99,15 @@
   <span class="kv mono">{{ fmt_dur(s.wall) }} · {{ s.api_calls }} API calls ·
     peak {{ fmt_tok(s.context_peak) }}</span>
 </div>
-{# THE SAME THREE STATES AS `cli._print_subagent` (spec 2026-10-02 §1.4): an empty
+{# THE SAME FOUR STATES AS `cli._print_subagent` (spec 2026-10-02 §1.4): an empty
    floored list is a FLOOR and never an absence, so the threshold-free total is printed
    beside it. #}
-{% if s.writes_by_cause %}
+{% if s.total_written is none %}
+{# THE FOURTH STATE, ahead of the rest: the figures are ABSENT, not zero, on every order
+   sealed before they were recorded. Names the SEAL, never an absence of writes. #}
+<div class="sub" style="padding: 0 16px 8px;">cache anatomy not in this seal — sealed
+  before it was recorded.</div>
+{% elif s.writes_by_cause %}
 <div class="sub" style="padding: 0 16px 8px;">cache writes:
   {% for cause, written in s.writes_by_cause.items() %}<span class="mono">{{ cause }}</span> {{ fmt_tok(written) }}{{ " · " if not loop.last }}{% endfor %}
 </div>

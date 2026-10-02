@@ -2869,3 +2869,47 @@ def test_the_cold_prefix_floor_is_none_when_no_catalog_can_be_reached(jarvis_hom
     """`ops.inspect_config`'s guarantee: a report over files on disk must not fail
     because a catalog has moved. Unlike it, this falls back to None and not a number."""
     assert ops.cold_prefix_floor() is None
+
+
+def _sealed_before_the_fields(anatomy: inspection.Anatomy) -> dict:
+    """A unit whose subagent carries NO threshold-free figures — the shape every seal
+    written before spec 2026-10-02 §1.1 added them rehydrates to."""
+    unit = {"wo_id": "wo-1", "title": "t", **anatomy.as_dict()}
+    for turn in unit["turns"]:
+        for sub in turn["subagents"]:
+            sub["total_written"] = sub["max_write"] = None
+            sub["write_floor"] = sub["api_call_count"] = None
+            sub["rewrite"] = None
+    return unit
+
+
+def test_a_subagent_sealed_before_the_fields_blames_the_seal_not_the_writes(
+        write_transcript, capsys):
+    """§1.4's FOURTH state: absent is not zero. `wrote nothing to the cache` over a
+    subagent that wrote 334,427 tokens is worse than the `no large writes` it replaced
+    (wo-fb7c0fc2, a8e11a7e)."""
+    from jarvis import cli
+
+    session = write_transcript("old-seal-render", parent_rows(),
+                               subagents={f"agent-{TASK}": under_floor_rows(1100)})
+    anatomy = inspection.read_session(session)
+    cli._print_anatomy(_sealed_before_the_fields(anatomy),
+                       InspectConfig().report_write_floor)
+    out = capsys.readouterr().out
+
+    assert cli.SUB_NOT_SEALED in out
+    assert "seal" in cli.SUB_NOT_SEALED
+    assert cli.SUB_NO_WRITES not in out
+    assert "no single write reached the" not in out
+
+
+def test_a_measured_zero_still_renders_as_wrote_nothing(write_transcript, capsys):
+    """The state the fourth one must not swallow: `total_written == 0` is measured."""
+    from jarvis import cli
+
+    session = write_transcript("measured-zero-render", parent_rows(),
+                               subagents={f"agent-{TASK}": sub_rows(1100)})
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+
+    assert cli.SUB_NO_WRITES in out and cli.SUB_NOT_SEALED not in out

@@ -883,6 +883,62 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+# -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216,
+# §2.3 of
+# docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
+# re-measuring under a different definition of "navigation" must not need a release.
+
+#: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no more:
+#: the BEFORE figure (41.3%) was measured with these six, and a wider set makes the AFTER
+#: figure incomparable rather than better.
+DEFAULT_NAVIGATION_BASH_COMMANDS = ("cat", "head", "sed", "grep", "rg", "find")
+
+#: Symbol tools, BARE — `navigation.is_symbol_tool` strips the `mcp__<server>__` prefix,
+#: because both `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet.
+#: `search_for_pattern` is DELIBERATELY ABSENT: it is text search with a Serena name, and
+#: counting it as a symbol call is the vacuity trap kn-a397fb52 documents.
+DEFAULT_NAVIGATION_SYMBOL_TOOLS = ("find_symbol", "find_referencing_symbols",
+                                   "get_symbols_overview", "find_declaration",
+                                   "find_implementations")
+
+#: The TOOLS that are text search. `Bash` is not here and must not be — a worker runs all
+#: sorts of legitimate shell; the COMMAND is classified instead.
+DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = ("Grep", "Glob")
+
+#: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
+DEFAULT_NAVIGATION_CODE_SUFFIXES = (".py",)
+
+#: The default window for a wide scope, in days. Seven, for
+#: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
+#: reports the trend away, and the trend is the whole question after `worker.bash_first`.
+DEFAULT_NAVIGATION_WINDOW_DAYS = 7
+
+#: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
+#: refuse all four the same way. An empty one reports 0% everywhere and looks like a win.
+NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
+                           "code_suffixes")
+
+
+@dataclass
+class NavigationConfig:
+    """What `jarvis navigation` calls navigation, and over how long.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_navigation`): a project that names one key keeps the OS answer for the rest,
+    so no caller consults two objects.
+
+    `enabled` is carried for the shape every other block here has; this report reads
+    files that are already on disk and costs nothing until someone runs it.
+    """
+
+    enabled: bool = True
+    bash_commands: tuple[str, ...] = DEFAULT_NAVIGATION_BASH_COMMANDS
+    symbol_tools: tuple[str, ...] = DEFAULT_NAVIGATION_SYMBOL_TOOLS
+    text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
+    code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
+    window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
+
+
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
@@ -1222,6 +1278,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    navigation: NavigationConfig = field(default_factory=NavigationConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
@@ -1341,6 +1398,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    navigation: NavigationConfig = field(default_factory=NavigationConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
@@ -1728,6 +1786,50 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
+                      where: str = "os.navigation") -> NavigationConfig:
+    """`os.navigation`, or a project's override of it — `_parse_inspect`'s field-level
+    inheritance exactly: a project naming one key keeps the OS answer for the rest, so
+    no caller consults two objects.
+
+    Three refusals, each because the failure is silent otherwise: a pattern list that is
+    not a list of strings; an EMPTY pattern list, which makes an empty classifier report
+    0% everywhere and read as a win; and a window below a day or a suffix with no leading
+    dot, both of which measure nothing while looking measured.
+    """
+    base = base or NavigationConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+
+    def patterns(name: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+        if name not in raw:
+            return fallback
+        value = raw[name]
+        if (not isinstance(value, (list, tuple))
+                or not all(isinstance(v, str) for v in value)):
+            raise _err(f'"{where}.{name}" must be a list of strings')
+        if not value:
+            raise _err(f'"{where}.{name}" must not be empty — an empty classifier '
+                       f"reports 0% everywhere and looks like a win")
+        return tuple(value)
+
+    cfg = NavigationConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        bash_commands=patterns("bash_commands", base.bash_commands),
+        symbol_tools=patterns("symbol_tools", base.symbol_tools),
+        text_search_tools=patterns("text_search_tools", base.text_search_tools),
+        code_suffixes=patterns("code_suffixes", base.code_suffixes),
+        window_days=int(raw.get("window_days", base.window_days)),
+    )
+    if cfg.window_days < 1:
+        raise _err(f"{where}.window_days must be >= 1")
+    for suffix in cfg.code_suffixes:
+        if not suffix.startswith("."):
+            raise _err(f'"{where}.code_suffixes" entries must start with a dot — '
+                       f"{suffix!r} matches no path")
+    return cfg
+
+
 def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
                         where: str = "os.observability") -> ObservabilityConfig:
     """`os.observability`, or a project's override of it — field-level, like
@@ -2104,6 +2206,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        navigation=_parse_navigation(os_raw.get("navigation", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
@@ -2207,6 +2310,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        navigation_cfg = _parse_navigation(
+            p.get("navigation", {}), base=os_cfg.navigation,
+            where=f"projects[{i}] ({name}).navigation")
         observability_cfg = _parse_observability(
             p.get("observability", {}), base=os_cfg.observability,
             where=f"projects[{i}] ({name}).observability")
@@ -2243,6 +2349,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                navigation=navigation_cfg,
                 observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,

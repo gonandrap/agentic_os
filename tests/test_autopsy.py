@@ -1273,3 +1273,44 @@ def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue
     assert json.loads(store.get_work_order(good["id"])["autopsy_json"])[
         "payload_v"] == autopsy.PAYLOAD_VERSION
     assert store.get_work_order(bad["id"])["autopsy_json"] == "not json"
+
+
+def test_a_seal_predating_the_threshold_free_keys_rehydrates_absent_and_not_zero(
+        write_transcript):
+    """Spec 2026-10-02 §1.3 applied to seals written BEFORE the fields existed: every
+    settled order on this box is one. `row.get("total_written", 0)` turned an ABSENT
+    figure into a measured zero, and the renderer then printed `wrote nothing to the
+    cache` over a subagent that wrote 334,427 tokens (wo-fb7c0fc2, a8e11a7e)."""
+    session = write_transcript("old-seal", parent_rows(),
+                               subagents={f"agent-{TASK}": under_floor_rows(1100)})
+    sealed = autopsy.to_seal(inspection.read_session(session), level="normal")
+    row = sealed["turns"][0]["subagents"][0]
+    for key in ("total_written", "max_write", "write_floor", "api_call_count",
+                "boundaries"):
+        del row[key]
+
+    sub = autopsy.from_seal(sealed, spans=[]).turns[0].subagents[0]
+
+    assert sub.total_written is None and sub.max_write is None
+    assert sub.write_floor is None and sub.api_call_count is None
+    assert sub.boundaries == []
+    assert sub.rewrite() is None
+    assert sub.as_dict()["rewrite"] is None
+    assert sub.as_dict()["total_written"] is None
+
+
+def test_a_seal_from_the_current_code_round_trips_a_real_measured_zero(
+        write_transcript):
+    """The other half: a genuine `total_written == 0` is a MEASUREMENT and must survive
+    the seal as 0, never as `None`."""
+    session = write_transcript("zero-seal", parent_rows(),
+                               subagents={f"agent-{TASK}": sub_rows(1100)})
+    a = inspection.read_session(session)
+    live = a.turns[0].subagents[0]
+    sealed = autopsy.from_seal(autopsy.to_seal(a, level="normal"),
+                               spans=[]).turns[0].subagents[0]
+
+    assert live.total_written == 0 and sealed.total_written == 0
+    assert sealed.max_write == 0 and sealed.api_call_count == 3
+    assert sealed.write_floor == 20_000
+    assert sealed.rewrite()["cache_write"] == 0

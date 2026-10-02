@@ -824,13 +824,18 @@ class SubagentAnatomy:
     #: THRESHOLD-FREE, and the reason this class needed more than `writes`: a subagent
     #: that wrote 334,427 tokens in 115 writes none of which reached the floor had an
     #: empty `writes` list and rendered as "no large writes" (wo-fb7c0fc2, a8e11a7e).
-    total_written: int = 0
+    #:
+    #: `None` AND NEVER 0 WHEN IT WAS NOT MEASURED — `SideVolume.code_nav_share()`'s
+    #: rule: a zero share is a finding and an unmeasured one is not. Every order sealed
+    #: before these fields existed carries no key at all, and defaulting those to 0 made
+    #: the renderer say `wrote nothing to the cache` about that same 334,427.
+    total_written: int | None = None
     #: The largest single write, floor-free — the number that EXPLAINS an empty `writes`
     #: list, and the only one that distinguishes "under the floor" from "wrote nothing".
-    max_write: int = 0
+    max_write: int | None = None
     #: The floor `writes` was built at, carried so a renderer never has to consult the
     #: config to word an absence (`Anatomy.write_floor`'s rule).
-    write_floor: int = 0
+    write_floor: int | None = None
     #: `usage.classify_boundaries` over THIS subagent's calls — the threshold-free
     #: census q1215 requires. One run of calls per transcript, which is the grain
     #: `classify_boundaries` documents.
@@ -838,8 +843,8 @@ class SubagentAnatomy:
     #: Calls, carried as a count so `total_written` can be read as a rate. A FIELD and
     #: not `api_calls`: a transcript with no prompt row has no turns at all
     #: (`read_transcript` opens one only at a prompt), so the property counts 0 over the
-    #: calls that were made, and the two must not disagree.
-    api_call_count: int = 0
+    #: calls that were made, and the two must not disagree. `None` is absent, as above.
+    api_call_count: int | None = None
 
     @property
     def wall(self) -> float:
@@ -861,8 +866,17 @@ class SubagentAnatomy:
             totals[write.cause] = totals.get(write.cause, 0) + write.written
         return totals
 
-    def rewrite(self) -> dict[str, int | None]:
-        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`."""
+    def rewrite(self) -> dict[str, int | None] | None:
+        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`.
+
+        `None` WHEN THE FIGURES WERE NEVER MEASURED, because the census is derived from
+        them: `cache_write` is `total_written` and `tokens` is its excess over the peak,
+        so a block built over an absence would be a dict of zeros claiming "no re-write
+        tax" about a subagent nobody counted. An empty `boundaries` list cannot say
+        which, so the absence is carried on the scalar.
+        """
+        if self.total_written is None:
+            return None
         return _rewrite_block(self.boundaries, written=self.total_written,
                               excess=max(0, self.total_written - self.context_peak))
 
@@ -882,7 +896,9 @@ class SubagentAnatomy:
             "write_floor": self.write_floor,
             "api_call_count": self.api_call_count,
             # The CENSUS, not the rows: the per-turn `boundaries` key already exists at
-            # the parent grain and a renderer needs the counts.
+            # the parent grain and a renderer needs the counts. `None` when unmeasured,
+            # and the key is still EMITTED: an omitted key is exactly what an old seal
+            # looks like, which is the bug, so absence is said rather than left out.
             "rewrite": self.rewrite(),
         }
 

@@ -564,6 +564,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
+        "navigation",
+        help="how the fleet NAVIGATED code — symbol calls against shell reads, by "
+             "side, as shares of read volume",
+    )
+    sp.add_argument("target", nargs="?",
+                    help="a work-order id, a feature-order id, or a project name")
+    sp.add_argument("--project")
+    # OPT-IN, because the wide walk is 2.7G and 11,889 lead transcripts: a no-argument
+    # run is refused rather than answered expensively (§2.1).
+    sp.add_argument("--fleet", action="store_true",
+                    help="every project's transcripts, within --days")
+    sp.add_argument("--days", type=int, metavar="N",
+                    help="only transcripts modified in the last N days, for a project "
+                         "or --fleet (default: the project's os.navigation.window_days, "
+                         f"{catalog.DEFAULT_NAVIGATION_WINDOW_DAYS})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
         "watch",
         help="what a work order's turn is doing RIGHT NOW: the tool in flight and how "
              "long it has been running — or, when nothing has been written, since when",
@@ -2086,7 +2104,7 @@ BAR_GLYPHS = {"generating": "█", "blocked": "▓", "tools": "▒", "idle": "�
 #: Fixed, so every turn's bar is comparable at a glance and the columns after it line up.
 BAR_WIDTH = 20
 
-#: A SUBAGENT'S THREE CACHE STATES (spec 2026-10-02 §1.4), worded here beside
+#: A SUBAGENT'S FOUR CACHE STATES (spec 2026-10-02 §1.4), worded here beside
 #: `PART_LABELS` because the dashboard reads the payload and not these words. An empty
 #: floored list can never read as "nothing here": `no large writes` is deleted, because
 #: a subagent that wrote 334,427 tokens in 115 sub-floor writes rendered as that string
@@ -2094,6 +2112,10 @@ BAR_WIDTH = 20
 SUB_UNDER_FLOOR = ("wrote {total} in {calls} calls — no single write reached the "
                    "{floor:,} floor (largest {largest})")
 SUB_NO_WRITES = "wrote nothing to the cache"
+#: THE FOURTH STATE, ahead of the other three: the figures are ABSENT, not zero. Every
+#: order sealed before §1.1 added them has no key to read, and naming the SEAL is the
+#: only wording that cannot be read as an absence of writes.
+SUB_NOT_SEALED = "cache anatomy not in this seal — sealed before it was recorded"
 #: The ZERO as the FINDING rather than as silence: a subagent's written volume never
 #: exceeds its own context peak and one continuous conversation has no cache read going
 #: backwards, so the arithmetic can give nothing else.
@@ -2173,8 +2195,12 @@ def _print_subagent(sub: dict[str, Any], indent: str) -> None:
     """
     writes = ", ".join(f"{cause} {_tok(written)}"
                        for cause, written in (sub["writes_by_cause"] or {}).items())
-    total = sub.get("total_written", 0)
-    if writes:
+    total = sub.get("total_written")
+    if total is None:
+        # FIRST, ahead of the writes list: an old seal carries neither, and a floored
+        # list read off one says nothing about what was written (§1.4).
+        cache = SUB_NOT_SEALED
+    elif writes:
         cache = "writes " + writes
     elif total:
         # THE FLOOR, NAMED. An empty list at a 20,000 floor is "nothing at that floor",
@@ -2385,6 +2411,68 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
             plural = "call " if row["calls"] == 1 else "calls"
             print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
                   f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+
+    # One reader, two surfaces (q1216): the same payload `jarvis navigation` prints,
+    # after the tools it is about.
+    _print_navigation(unit.get("navigation"), indent="  ")
+
+
+#: The two sides, spelled for the eye. Beside `PART_LABELS` for its reason: the strings
+#: live in `cli` because the dashboard reads the payload and not these words. The BEFORE
+#: figure is NOT here — it comes out of the payload (`navigation.BEFORE_NOTE`) so both
+#: surfaces quote the same number.
+NAV_SIDE_LABELS = {"lead": "lead", "subagent": "subagent"}
+
+
+def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
+    """How this scope navigated code, by side.
+
+    THIS RENDERER DERIVES NOTHING. Every number and every share is a value out of
+    `navigation.NavigationVolume.as_dict()`; a renderer that computed one is one the
+    dashboard would disagree with (PR 65).
+    """
+    if not payload:
+        return
+    window = payload.get("window_days")
+    scope = (f"{indent}navigation"
+             + (f" — last {window} days" if window else ""))
+    print(f"\n{scope}:")
+    if not payload.get("found"):
+        # Absent is never zero (issue #227): no transcript is a different answer from
+        # no navigation.
+        print(f"{indent}  no transcript — nothing to measure")
+        return
+    for side in ("lead", "subagent"):
+        row = payload["sides"][side]
+        share = row["code_nav_share"]
+        # None and never 0.0: an unmeasured share is not a zero one.
+        share_text = ("not measured — no tool results"
+                      if share is None else f"{share * 100:.1f}%")
+        print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
+              f"{row['transcripts']:>4} transcripts  "
+              f"{row['symbol_calls']:>4} symbol  "
+              f"{row['text_search_calls']:>4} text-search  "
+              f"{row['nav_bash_calls']:>4} bash-nav "
+              f"({row['code_nav_bash_calls']} on code)  "
+              f"{row['read_tool_calls']:>4} Read")
+        print(f"{indent}           code reads via bash: {share_text} of "
+              f"{_tok(row['result_bytes'])} bytes of tool results"
+              + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
+                 if row["unattributed_bytes"] else ""))
+    print(f"{indent}  {payload['before']}")
+
+
+def cmd_navigation(args: argparse.Namespace) -> int:
+    from . import ops
+
+    res = ops.navigation_report(args.target, args.project,
+                                fleet=args.fleet, days=args.days)
+    if args.json:
+        _print(res, True)
+        return 0
+    print(f"{res['scope']}")
+    _print_navigation(res)
+    return 0
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -4801,6 +4889,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cost(args)
         if args.cmd == "inspect":
             return cmd_inspect(args)
+        if args.cmd == "navigation":
+            return cmd_navigation(args)
         if args.cmd == "watch":
             return cmd_watch(args)
         if args.cmd == "alarms":
