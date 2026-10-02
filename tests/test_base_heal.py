@@ -1257,6 +1257,23 @@ def test_a_fetch_of_a_ref_nobody_publishes_fails_rather_than_guessing(tmp_path):
     assert not branchproof.fetch(repo, "--upload-pack=false")
 
 
+def test_attempt_hands_back_gits_own_stderr(tmp_path):
+    """spec docs/specs/2026-09-30-harvesting-a-dead-turn.md §7: `run` drops the reason a
+    command failed, so `checkpoint_skipped` could only hold a fixed string. `attempt` is
+    the same execution block, handing back git's stderr beside the stdout `run` returns."""
+    from jarvis import branchproof
+
+    repo, _judged, _caught_up, _evil = _a_branch_that_merged_main(tmp_path)
+
+    out, err = branchproof.attempt(repo, "rev-parse", "--verify", "no-such-ref")
+    assert out is None
+    assert err, "a failing command must hand back what git said"
+
+    out, err = branchproof.attempt(repo, "rev-parse", "--verify", "HEAD")
+    assert out and out.strip()
+    assert err == ""
+
+
 def test_the_local_proof_module_runs_git_and_talks_to_nothing_else():
     """`test_this_module_writes_only_the_branch_update`'s guard, for the new module. `ci`
     is held against a `gh` allowlist and `github` against a read-only one; this module is

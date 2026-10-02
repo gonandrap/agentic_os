@@ -39,7 +39,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import (budget, bus, config_version, db, fleet, health, invariants,
+from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
                observability, release, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
@@ -1254,6 +1254,60 @@ def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
             "assumptions": len(store.pending_assumptions(str(wo["id"])))}
 
 
+def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the OS read off disk when this order's latest turn died, or None.
+
+    `retry_state`'s shape and its None convention, and it is THE single render contract:
+    `jarvis wo show` and the work-order page both read this, so the two cannot disagree
+    about what was saved. None — no line anywhere — when that turn was never harvested,
+    which is every turn that did not die without a result. §5 of
+    docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+    """
+    payload = harvest.of_turn(store, wo)
+    if not payload:
+        return None
+    authored = payload.get("authored") or {}
+    dirty = list(authored.get("dirty") or ())
+    commits = int(authored.get("commits") or 0)
+    jobs = int(payload.get("jobs") or 0)
+    if payload.get("empty"):
+        line = "nothing — the worktree was clean and the turn said nothing"
+    else:
+        parts = []
+        if commits:
+            # PLAIN PROSE, no markdown: this one string is rendered by the HTML page as
+            # well as by the terminal, and the page has no markdown (spec §5).
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''} on "
+                         f"{authored.get('branch') or 'its branch'}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {payload['checkpoint']}"
+                            if payload.get("checkpoint") else " NOT checkpointed"
+                            + (f" ({payload['checkpoint_skipped']})"
+                               if payload.get("checkpoint_skipped") else "")))
+        if payload.get("said"):
+            parts.append("its last message")
+        if jobs:
+            parts.append(f"{jobs} orphaned background job"
+                         f"{'s' if jobs != 1 else ''}")
+        line = ", ".join(parts) or "nothing"
+    return {"seq": payload.get("seq"), "empty": bool(payload.get("empty")),
+            "line": line, "said": str(payload.get("said") or ""),
+            "branch": str(authored.get("branch") or ""),
+            "base": str(authored.get("base") or ""),
+            "commits": commits, "dirty": dirty,
+            "turn_commits": list(payload.get("turn_commits") or ()),
+            "since": str(payload.get("since") or ""),
+            "checkpoint": str(payload.get("checkpoint") or ""),
+            "checkpoint_skipped": str(payload.get("checkpoint_skipped") or ""),
+            "detached": bool(payload.get("detached")),
+            "upstream": str(payload.get("upstream") or ""),
+            "unpushed": int(payload.get("unpushed") or 0),
+            "pr_url": str(payload.get("pr_url") or ""), "jobs": jobs,
+            "unreadable": str(payload.get("unreadable") or "")}
+
+
 def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
           relay: bool = False) -> dict[str, Any]:
     """`jarvis wo retry` — relaunch a `failed` work order in its own session.
@@ -1276,7 +1330,15 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     refusal = retry_refusal(wo)
     if refusal is not None:
         raise OpsError(refusal)
-    text = message if message is not None else RETRY_NOTE
+    # §6 of docs/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
+    # beats asking the worker to re-derive it. Its own connection, closed before the
+    # delegated send opens one.
+    brief_store = ProjectStore(path)
+    try:
+        text = (message if message is not None
+                else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
+    finally:
+        brief_store.close()
     # §3: an OS literal must never carry the user's stamp, whatever the surface said.
     sent = send_message(wo_id, text, source="retry", project_name=name,
                         relay=relay and message is not None)

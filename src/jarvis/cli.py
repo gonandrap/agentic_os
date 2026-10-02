@@ -197,6 +197,21 @@ def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_harvest(detail: dict[str, Any]) -> dict[str, Any]:
+    """The harvest collapsed to its one line, for HUMAN output.
+
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the payload,
+    where the checkpoint sha and the branch are read from, while a person gets
+    `harvest: 3 commits on `wo-2ae…`, 1 uncommitted file checkpointed as 9f8e7d6` — what
+    the OS saved, in the words the dashboard uses above the retry button (spec §5).
+    """
+    row = dict(detail)
+    state = row.pop("harvest", None)
+    if state:
+        row["harvest"] = state["line"]
+    return row
+
+
 def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     """The automatic assumption review collapsed to its one line, and each assumption to
     `ops.assumption_line`, for HUMAN output.
@@ -2172,7 +2187,8 @@ def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
     if not provenance:
         return
     print(f"  reading: {provenance['note']}")
-    for sentence in (provenance["level_note"], provenance["floor_note"]):
+    for sentence in (provenance["level_note"], provenance["params_note"],
+                     provenance["floor_note"]):
         if sentence:
             print(f"           {sentence}")
 
@@ -3036,6 +3052,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # rule, and the reason it is not folded into those rounds is that an
                 # order judged four times filed into four fragments with no total.
                 "issues": ops.issue_index(store, args.wo_id),
+                # WHAT THE OS READ OFF DISK when this order's latest turn died without
+                # writing a result. Same never-always rule: no line at all for a turn
+                # that was never harvested — spec §5 of
+                # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+                **({"harvest": h} if (h := ops.harvest_state(store, wo)) else {}),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
                 # work order the mechanism never touched has no line here at all, which
@@ -3080,9 +3101,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
-            _readable_automerge(_readable_alarms(_readable_time_in_state(
-                _readable_rounds(_readable_issues(
-                    _readable_conversation(detail))))))))))
+            _readable_automerge(_readable_harvest(_readable_alarms(
+                _readable_time_in_state(_readable_rounds(_readable_issues(
+                    _readable_conversation(detail)))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -4702,6 +4723,9 @@ def main(argv: list[str] | None = None) -> int:
         return main_hook()
     from .bugreport import BugReportError
     from .catalog import CatalogError
+    # A refusal a worker can act on, not a crash. Spec §4:
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
         if args.cmd == "start":
@@ -4771,7 +4795,7 @@ def main(argv: list[str] | None = None) -> int:
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError, BugReportError) as e:
+    except (OpsError, CatalogError, BugReportError, QuestionTooLargeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

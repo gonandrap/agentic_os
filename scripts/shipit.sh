@@ -4,10 +4,10 @@
 # Releases never bypass code review: the code changes must already be on main via a
 # reviewed PR before you run this. shipit only does the release-cut + deploy:
 #
-#   1. Verify the tree is clean, that HEAD is exactly origin/main, and resolve the
-#      target version X.Y.Z (from the latest jarvis-* tag — main's pyproject is NOT
-#      bumped by shipit).
-#   2. Cut branch  release/jarvis-X.Y.Z  from main.
+#   1. Verify the tree is clean, that the commit being shipped is on origin/main (HEAD
+#      itself with no --base), and resolve the target version X.Y.Z (from the latest
+#      jarvis-* tag — main's pyproject is NOT bumped by shipit).
+#   2. Cut branch  release/jarvis-X.Y.Z  from that commit.
 #   3. Bump pyproject.toml AND uv.lock + commit + annotated tag  jarvis-X.Y.Z  *on the
 #      release branch* — main is never modified (done in a throwaway git worktree so the
 #      shared main checkout's HEAD never moves). Both files, or the tag ships a lock
@@ -20,7 +20,7 @@
 #   6. Notify Telegram (best-effort).
 #
 # GIT IS THE SOURCE OF TRUTH. Every ref a release depends on lives on the remote:
-# shipit refuses to run if HEAD isn't origin/main, pushes the release branch and tag
+# shipit refuses to ship a commit that is not on origin/main, pushes the release branch and tag
 # before deploying, and production tracks `origin` — so what runs in prod is exactly
 # what is on the remote, reproducible from any machine.
 #
@@ -29,7 +29,11 @@
 #   scripts/shipit.sh 1.2.0           # release an explicit version
 #   scripts/shipit.sh patch|minor|major
 #   scripts/shipit.sh --dry-run [ver] # print what would happen, change nothing
-#   scripts/shipit.sh --stage <ver> --wo <wo-id>
+#   scripts/shipit.sh --base <sha>    # cut the release from THAT commit, not from HEAD.
+#                                     # A release approval is scoped to the exact command
+#                                     # string, so the commit being shipped has to be in
+#                                     # it (2026-10-01 spec §1-§3). Required in --stage.
+#   scripts/shipit.sh --stage <ver> --wo <wo-id> --base <sha>
 #                                     # SELF-SHIP mode: everything above EXCEPT the
 #                                     # service restarts and the Telegram notify.
 #                                     # Writes $JARVIS_HOME/run/pending_release.json;
@@ -50,12 +54,14 @@ set -euo pipefail
 DRY_RUN=0
 STAGE=0
 WO_ID=""
+BASE_SHA=""
 BUMP_OR_VERSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --stage)   STAGE=1 ;;
     --wo)      shift; WO_ID="${1:-}" ;;
+    --base)    shift; BASE_SHA="${1:-}" ;;
     *) BUMP_OR_VERSION="$1" ;;
   esac
   shift
@@ -63,6 +69,17 @@ done
 if [ "$STAGE" = 1 ] && [ -z "$WO_ID" ]; then
   printf '\033[1;31m✗ %s\033[0m\n' \
     "--stage requires --wo <work-order-id>: the daemon needs to know which work order to wait for and settle" >&2
+  exit 1
+fi
+# Pure argument checks, before any git call (2026-10-01 spec §1).
+if [ "$STAGE" = 1 ] && [ -z "$BASE_SHA" ]; then
+  printf '\033[1;31m✗ %s\033[0m\n' \
+    "--stage requires --base <sha>: a release approval is scoped to the command string, so the commit being shipped has to be in it" >&2
+  exit 1
+fi
+if [ -n "$BASE_SHA" ] && { [ "${#BASE_SHA}" != 40 ] || [ -n "${BASE_SHA//[0-9a-f]/}" ]; }; then
+  printf '\033[1;31m✗ %s\033[0m\n' \
+    "--base takes a full 40-character sha, not '$BASE_SHA' — an abbreviation names one commit today and can name another later" >&2
   exit 1
 fi
 
@@ -81,7 +98,12 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- 1. preconditions -----------------------------------------------------------
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "main" ] || say "warning: shipping from '$BRANCH', not 'main' (releases cut from merged main)"
+# Nothing to warn about under --base: the commit is named, the checkout is not an input,
+# and every daemon-filed release runs from a `wo-*` worktree branch — so the line would
+# fire on all of them and teach readers to ignore it (2026-10-01 spec §3).
+if [ -z "$BASE_SHA" ] && [ "$BRANCH" != "main" ]; then
+  say "warning: shipping from '$BRANCH', not 'main' (releases cut from merged main)"
+fi
 
 # Runtime artifacts the OS writes into the trees it manages. This repo is registered
 # as a project in the PRODUCTION catalog, so the live daemon and its workers rewrite
@@ -102,8 +124,8 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 #                          test is the same one the others meet — not an authored edit,
 #                          and not an input to a release
 #
-# Ignoring them carries no shipping risk: the release branch is cut from the
-# origin/main COMMIT, the bump+tag happen in a throwaway worktree, and production
+# Ignoring them carries no shipping risk: the release branch is cut from the commit
+# named by `--base` (or from HEAD), the bump+tag happen in a throwaway worktree, and production
 # deploys the tag from ORIGIN — this working tree is never an input to a release.
 # The guard below only asks "do you have uncommitted work you care about", and
 # OS-injected drift is not such work. We still print every ignored path by name so
@@ -150,7 +172,18 @@ say "syncing with origin ($ORIGIN_URL)"
 git fetch origin --tags --prune --quiet || die "cannot fetch origin — releases require the remote"
 git rev-parse -q --verify refs/remotes/origin/main >/dev/null \
   || die "origin/main not found on $ORIGIN_URL"
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+# The fork is on the FLAG, not on the mode (2026-10-01 spec §2): a named base is checked
+# AGAINST origin/main and the local HEAD stops being constrained at all; with no flag the
+# old precondition stands verbatim, because ancestry alone would let a stale checkout
+# release an old main. Existence before ancestry — `merge-base --is-ancestor` on an
+# unknown object exits non-zero with a git error, which reports the wrong fault.
+if [ -n "$BASE_SHA" ]; then
+  git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null \
+    || die "--base $BASE_SHA is not a commit in this checkout — fetch origin and pass a sha from origin/main"
+  git merge-base --is-ancestor "$BASE_SHA" origin/main \
+    || die "--base $BASE_SHA is not an ancestor of origin/main — releases are cut from already-merged main
+     (origin/main is at $(git rev-parse --short origin/main))"
+elif [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
   die "HEAD is not origin/main — land the code on main via a merged PR and pull first
      (local $(git rev-parse --short HEAD) vs origin/main $(git rev-parse --short origin/main))"
 fi
@@ -219,14 +252,17 @@ REL_BRANCH="release/jarvis-$VERSION"
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
 git rev-parse -q --verify "refs/heads/$REL_BRANCH" >/dev/null && die "branch $REL_BRANCH already exists"
 
-MAIN_SHA="$(git rev-parse HEAD)"
-say "Releasing Jarvis OS $VERSION  (base tag: ${BASE}, from $BRANCH ${MAIN_SHA:0:9})"
+# The single ref the rest of the script hangs off. Not "main's sha" since §3: the branch,
+# the bump commit, the tag and production's checkout all descend from this one commit, so
+# whatever merged after the reviewer approved it rides the next release.
+SHIP_SHA="$(git rev-parse "${BASE_SHA:-HEAD}")"
+say "Releasing Jarvis OS $VERSION  (base tag: ${BASE}, base: ${SHIP_SHA:0:9})"
 say "  branch: $REL_BRANCH   tag: $TAG"
 say "  deploy: $PROD_DIR"
 
-# --- 2. cut the release branch from main ----------------------------------------
-say "cutting release branch $REL_BRANCH from $BRANCH"
-run "git branch '$REL_BRANCH' '$MAIN_SHA'"
+# --- 2. cut the release branch from the shipped commit ---------------------------
+say "cutting release branch $REL_BRANCH from ${SHIP_SHA:0:9}"
+run "git branch '$REL_BRANCH' '$SHIP_SHA'"
 
 # --- 3. bump + commit + tag ON the release branch (main is never modified) -------
 # Use a throwaway worktree so the shared main checkout's HEAD/tree never moves.
@@ -267,7 +303,7 @@ run "git push origin 'refs/tags/$TAG'"
 #
 # The notes are built here rather than left to `gh --generate-notes` because our tags
 # DO NOT SIT ON MAIN: each is a lone bump commit on a release branch, so the range that
-# describes a release is `<previous tag>..<the main head being shipped>`. Reachability
+# describes a release is `<previous tag>..<the commit being shipped>`. Reachability
 # makes that exact — the previous tag's own bump commit is not an ancestor of main, but
 # everything main held when that tag was cut is, so the range is precisely what this
 # release adds and nothing else, with no need to know where the tag was planted.
@@ -283,10 +319,10 @@ PREV_TAG="jarvis-$BASE"
 GH_TITLE="Jarvis OS $VERSION"
 
 release_notes() {  # the body of the release page, on stdout
-  local range="$MAIN_SHA" have_prev=0 base
+  local range="$SHIP_SHA" have_prev=0 base
   if git rev-parse -q --verify "refs/tags/$PREV_TAG" >/dev/null 2>&1; then
     have_prev=1
-    range="$PREV_TAG..$MAIN_SHA"
+    range="$PREV_TAG..$SHIP_SHA"
   fi
   printf "## What's changed\n\n"
   git log --first-parent --format='- %s (%h)' "$range" \
@@ -412,12 +448,13 @@ if [ "$STAGE" = 1 ]; then
   MARKER="$JARVIS_HOME_DIR/run/pending_release.json"
   say "staging: writing release marker $MARKER"
   if [ "$DRY_RUN" = 1 ]; then
-    printf '  [dry-run] write %s (state: staged, wo: %s, tag: %s)\n' \
-      "$MARKER" "$WO_ID" "$TAG"
+    printf '  [dry-run] write %s (state: staged, wo: %s, tag: %s, base: %s)\n' \
+      "$MARKER" "$WO_ID" "$TAG" "$SHIP_SHA"
   else
     mkdir -p "$JARVIS_HOME_DIR/run"
-    printf '{"wo_id": "%s", "project": "jarvis_os", "version": "%s", "tag": "%s", "staged_at": %s, "state": "staged"}\n' \
-      "$WO_ID" "$VERSION" "$TAG" "$(date +%s)" > "$MARKER"
+    # `base` is audit record only — every consumer reads by key (2026-10-01 spec §6).
+    printf '{"wo_id": "%s", "project": "jarvis_os", "version": "%s", "tag": "%s", "base": "%s", "staged_at": %s, "state": "staged"}\n' \
+      "$WO_ID" "$VERSION" "$TAG" "$SHIP_SHA" "$(date +%s)" > "$MARKER"
   fi
   say "staged $TAG → $PROD_DIR — services NOT restarted"
   say "what happens next:"

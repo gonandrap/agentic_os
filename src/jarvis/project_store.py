@@ -67,6 +67,16 @@ OPEN_STATUSES = ("pending", "dispatching", "running", "idle", "waiting_input",
 # Settled: nothing more will happen to these on their own. They are the bulk of an old
 # project's history, so listings collapse them behind a count rather than printing them.
 TERMINAL_STATUSES = ("completed", "cancelled", "failed")
+
+#: An OS-built prompt for this work order was past `claude_cli.MAX_OS_PROMPT_CHARS`, so
+#: the call was never made and nothing judged the work. The payload carries NUMBERS AND
+#: IDENTIFIERS ONLY. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+OS_PROMPT_REFUSED_EVENT = "os_prompt_refused"
+#: What settles one: the next OS call for this order that actually produced something.
+#: See `ProjectStore.os_prompt_refusal_open` for why `finished` is not in here.
+OS_PROMPT_REFUSAL_CLEARED_BY = ("neo_answered", "validation_passed",
+                                "validation_rejected", "abandoned")
 # Where a PERSON may force a fresh validation round (`ops.force_validation`). AN
 # ALLOWLIST, not a blocklist, and the two are not the same statement here: the question is
 # not "has this settled" but "has this work order DELIVERED, and is nobody typing". An
@@ -3841,6 +3851,29 @@ class ProjectStore:
                      for kind in ("finished", "abandoned", "release_completed")
                      for e in self.events_of_kind(wo_id, kind))
         return None if closed else db.from_json(parked[-1]["payload"], {})
+
+    def os_prompt_refusal_open(self, wo_id: str) -> dict[str, Any] | None:
+        """The open prompt-ceiling refusal on this work order, or None.
+        `release_red_park_open`'s arithmetic over another event. Spec §4:
+        docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+        Returns the PAYLOAD because `invariants.true_blockers` rebuilds the attention
+        line from it — the sizes and the call kind, which no constant can carry.
+
+        CLOSED BY THE NEXT SUCCESSFUL OS CALL FOR THE ORDER, and by nothing else: a Neo
+        answer, a panel verdict either way, or the order being abandoned. `finished` is
+        deliberately NOT one — a worker re-delivering is not a model call, and the same
+        evidence would be refused again, so it would take the flag down while the
+        refusal was still true.
+        """
+        refused = self.events_of_kind(wo_id, OS_PROMPT_REFUSED_EVENT)
+        if not refused:
+            return None
+        since = float(refused[-1]["ts"])
+        closed = any(float(e["ts"]) > since
+                     for kind in OS_PROMPT_REFUSAL_CLEARED_BY
+                     for e in self.events_of_kind(wo_id, kind))
+        return None if closed else db.from_json(refused[-1]["payload"], {})
 
     def count_events(self, wo_id: str, exclude: tuple[str, ...] = ()) -> int:
         """How many events this work order has, unbounded, minus the kinds named.
