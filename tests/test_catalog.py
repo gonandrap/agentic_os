@@ -114,8 +114,55 @@ def test_absent_and_null_are_different():
     assert cat.projects[1].worker.autocompact_window is None
 
 
+def test_bash_first_defaults_off_and_overrides_per_project():
+    """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
+    enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
+    a softer copy of the instruction that already beat the brief at a measured 0% hit
+    rate."""
+    from jarvis.catalog import DEFAULT_WORKER_BASH_FIRST, VALID_BASH_FIRST
+
+    assert DEFAULT_WORKER_BASH_FIRST == "off"
+    assert VALID_BASH_FIRST == ("off", "relaxed", "strict", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_bash_first == "off"
+    assert cat.projects[0].worker.bash_first == "off"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"bash_first": "relaxed"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"bash_first": "cli"}},
+        ],
+    })
+    assert cat.os.default_bash_first == "relaxed"
+    assert cat.projects[0].worker.bash_first == "relaxed"   # inherits the fleet value
+    assert cat.projects[1].worker.bash_first == "cli"
+
+
+@pytest.mark.parametrize("value", ["off", "relaxed", "strict", "cli"])
+def test_every_bash_first_value_parses(value):
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                       "worker": {"bash_first": value}}]})
+    assert cat.projects[0].worker.bash_first == value
+
+
+def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
+    re-parses the document to validate (spec §1)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"bash_first": "true"}}]})
+    assert "worker.bash_first" in str(e.value)
+    for value in ("off", "relaxed", "strict", "cli"):
+        assert value in str(e.value)
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({"projects": "nope"}, "projects"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"bash_first": "yes"}}]},
+     "bash_first"),
+    ({"os": {"defaults": {"bash_first": "on"}}}, "os.defaults.bash_first"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
