@@ -13540,20 +13540,31 @@ NEO_ESCALATION_INVISIBLE_NOTE = (
 
 
 def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
-    """Over SETTLED questions only, and `None` — never `0.0` — with no denominator.
+    """`escalated` ALONE over SETTLED questions, `None` — never `0.0` — with no denominator.
 
+    UNREACHABLE IS NEVER BLENDED IN and is reported as its own figure
+    (`_unreachable_rate`), because a crash is not a decision: a question Neo was never
+    reached for reads as unreachable and never as escalated (cli.py:1577-1584, cli.py:4526).
     Open questions have no outcome yet, and including them would make the rate fall
     whenever the queue is busy. Absent is not zero (spec §4's zero rule).
     """
     settled = answered + escalated + failed
     if not settled:
         return None
-    return round((escalated + failed) / settled, 4)
+    return round(escalated / settled, 4)
+
+
+def _unreachable_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """`_escalation_rate`'s sibling: `failed` over the same settled denominator."""
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round(failed / settled, 4)
 
 
 def _neo_outcome_bucket() -> dict[str, Any]:
     return {"asked": 0, "answered": 0, "escalated": 0, "failed": 0,
-            "escalation_rate": None}
+            "escalation_rate": None, "unreachable_rate": None}
 
 
 def _neo_spend_bucket() -> dict[str, Any]:
@@ -13608,7 +13619,7 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     scope = {project: paths[project]} if project else paths
 
     questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
-                 "superseded": 0, "escalation_rate": None}
+                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
     by_kind: dict[str, dict[str, Any]] = {}
     by_project: dict[str, dict[str, Any]] = {}
     by_day: dict[str, dict[str, Any]] = {}
@@ -13648,6 +13659,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
                    *by_day.values()):
         bucket["escalation_rate"] = _escalation_rate(
             bucket["answered"], bucket["escalated"], bucket["failed"])
+        bucket["unreachable_rate"] = _unreachable_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
 
     # A day inside the window with no questions is a measured zero and appears; days
     # outside it do not (spec §4).
@@ -13655,7 +13668,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         for step in range(int(days or 0) + 1):
             day = _local_day(since + step * 86400)
             by_day.setdefault(day, {**_neo_outcome_bucket(), "day": day,
-                                    "escalation_rate": None})
+                                    "escalation_rate": None,
+                                    "unreachable_rate": None})
     question_days = [by_day[day] for day in sorted(by_day)][-limit:]
 
     chosen: dict[str, int] = {}

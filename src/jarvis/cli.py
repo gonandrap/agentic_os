@@ -4271,12 +4271,17 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
     print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
           f"(over settled questions only)")
+    # Its own figure, never blended into the escalation rate: a crash is not a decision.
+    print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
+          f"(same denominator — NOT escalations)")
 
     if res["by_day"]:
         print("\nTHE TREND — one line per day, newest last")
         for d in res["by_day"]:
             print(f"  {d['day']}  asked {d['asked']:>3} · answered {d['answered']:>3} · "
-                  f"escalated {d['escalated']:>3} · rate {_pct(d['escalation_rate'])}")
+                  f"escalated {d['escalated']:>3} · rate {_pct(d['escalation_rate'])} · "
+                  f"never reached {d['failed']:>3} · unreachable "
+                  f"{_pct(d['unreachable_rate'])}")
 
     causes = res["causes"]
     print("\nWHAT IT ESCALATES FOR — three classes, because WHO DECIDED has three "
@@ -4307,7 +4312,9 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
     print("\nBY KIND")
     for kind, k in sorted(res["by_kind"].items(), key=lambda kv: -kv[1]["asked"]):
         print(f"  {kind:<12} asked {k['asked']:>4} · answered {k['answered']:>4} · "
-              f"escalated {k['escalated']:>4} · rate {_pct(k['escalation_rate'])}")
+              f"escalated {k['escalated']:>4} · rate {_pct(k['escalation_rate'])} · "
+              f"never reached {k['failed']:>4} · unreachable "
+              f"{_pct(k['unreachable_rate'])}")
     if res["by_kind"]:
         print(f"  note: {res['by_kind_note']}")
 

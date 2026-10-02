@@ -138,14 +138,23 @@ those are the only two clauses `neo.PERSONA` states.
 | `attempts-exhausted` | `NeoStore.reclaim_stale`'s `failed` UPDATE (neo_store.py:355) — `MAX_ANSWER_ATTEMPTS` spent on a stranded claim |
 | `prompt-refused` | `drain_queue`'s `PromptTooLargeError` / `InputTooLargeError` clauses (neo.py:435,449), both `release_claim(..., max_attempts=0)`; also `NeoStore.ask`'s `QuestionTooLargeError` where a row exists |
 | `unparseable-reply` | `neo._unparseable_verdict` (neo.py:301), i.e. `structured.coerce`'s `on_invalid` after `structured.InvalidOutput` |
-| `classifier-unreachable` | `stakes.HIGH_UNREACHABLE` (src/jarvis/stakes.py:59) reaching `autoreview.HELD_HIGH_STAKES` |
-| `classifier-unparseable` | `stakes.HIGH_UNPARSEABLE` (stakes.py:60), same path |
-| `stakes-unclassified` | `autoreview.read_ruling` (autoreview.py:1167-1177): an acceptance whose `stakes` is missing, empty or misspelled is force-escalated by the `ROUTINE_STAKES` allowlist. The daemon marks it `escalated` at daemon.py:6756 |
 
-`stakes-unclassified` is in the FAILED class and that placement is the point: it is a
-reply the OS would not read as an answer, not a judgement Neo made, and it is a strong
-candidate for the "majority of assumptions" the user is seeing. Putting it among the
-chosen causes would attribute an OS backstop to Neo's taste.
+**FOUR members, per the amendment above** (`neo_store.ESCALATION_CAUSES_FAILED`):
+`classifier-unreachable` and `classifier-unparseable` were DROPPED — nothing can write them
+— and `stakes-unclassified` MOVED to `ESCALATION_CAUSES_OVERRIDDEN`, because Neo DID answer
+there and the OS overrode the answer. The FAILED class means Neo never answered at all, and
+that is also why the report gives it a rate of its own: `unreachable_rate`, never folded
+into `escalation_rate` (§4).
+
+**Overridden — derived by `autoreview.escalation_cause`, never read off a reply.**
+
+| member | what the OS held |
+|---|---|
+| `stakes-high` | Neo accepted and flagged it high; the OS obeyed |
+| `stakes-unclassified` | `autoreview.read_ruling` (autoreview.py:1167-1177): an acceptance whose `stakes` is missing or empty, force-escalated by the `ROUTINE_STAKES` allowlist |
+| `stakes-unreadable` | a stakes word the OS cannot read as routine |
+| `neo-denied` | `verdict: deny`, and there is no machine rejection |
+| `scope-over-cap` | children at or over `plans.CHILD_CAP` |
 
 `hold_claim` (neo_store.py:393, usage limit) writes **no cause**: it returns the question
 to `queued` and escalates nothing. A window that will reopen is not an escalation.
@@ -248,13 +257,19 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
 ```
 {
   "scope": project or "fleet", "days": days, "since": ts | None,
-  "questions": {"asked", "answered", "escalated", "failed", "open",
-                "superseded", "escalation_rate": float | None},
-  "by_kind":    {kind:    {"asked","answered","escalated","failed","escalation_rate"}},
-  "by_project": {project: {"asked","answered","escalated","failed","escalation_rate"}},
+  "questions": {"asked", "answered", "escalated", "failed", "open", "superseded",
+                "escalation_rate": float | None, "unreachable_rate": float | None},
+  "by_kind":    {kind:    {"asked","answered","escalated","failed",
+                           "escalation_rate","unreachable_rate"}},
+  "by_project": {project: {"asked","answered","escalated","failed",
+                           "escalation_rate","unreachable_rate"}},
   "by_day":     [{"day": "YYYY-MM-DD", "asked","answered","escalated","failed",
-                  "escalation_rate"}],              # oldest first
-  "causes": {"chosen": {cause: n}, "failed": {cause: n}, "not_recorded": n},
+                  "escalation_rate","unreachable_rate"}],      # oldest first
+  "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
+  # FOUR keys, one per class of "who decided" plus the backlog — see §1's amendment
+  "causes": {"chosen": {cause: n}, "overridden": {cause: n}, "failed": {cause: n},
+             "not_recorded": n},
+  "causes_note": NEO_ESCALATION_INVISIBLE_NOTE,
   "per_order": {"work_orders": n, "questions_per_wo": float | None,
                 "feature_orders": n, "questions_per_fo": float | None},
   "spend": {"totals":     {"calls","input","cache_write","cache_read","output",
@@ -273,17 +288,25 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
   broken out and **excluded from the rate's denominator**: `NeoStore.supersede`'s
   docstring says the decision was taken somewhere else, so it is neither Neo answering nor
   Neo handing back. `open` is `NEO_HELD_Q_STATUSES`.
-- `escalation_rate = (escalated + failed) / (answered + escalated + failed)`, over settled
-  questions only. Open ones have no outcome yet and including them would make the rate fall
-  whenever the queue is busy.
+- `escalation_rate = escalated / (answered + escalated + failed)`, over settled questions
+  only. Open ones have no outcome yet and including them would make the rate fall whenever
+  the queue is busy.
+- `unreachable_rate = failed / (answered + escalated + failed)` — its own figure, never
+  blended into `escalation_rate`, because a crash is not a decision: a question Neo was
+  never reached for reads as UNREACHABLE and never as escalated, the same rule
+  `jarvis status` and `jarvis neo list` already state. Folding it in also destroyed the
+  chosen-vs-failed split this report exists for, and made a day of transport failures draw
+  a bar labelled "rate 100%" beside "escalated 0". Both rates carry through every bucket —
+  `questions`, `by_kind`, `by_project`, `by_day` — and both are `None`, never `0.0`, on an
+  empty denominator.
 - `by_day` buckets `ts` with `strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime')` — SQLite
   does the bucketing, as `agent_call_totals` already sums in SQL. A day inside the window
   with no questions appears with zeroes (see the zero rule below); days outside it do not
   appear.
 - `causes` is a `GROUP BY escalation_cause` over `status IN ('escalated','failed')`, split
-  into the two dicts by membership of the two tuples. `not_recorded` is the NULL count. A
-  value in neither tuple (a release that removed a member) is counted into
-  `not_recorded` rather than silently inventing a bucket.
+  into the three dicts by membership of the three tuples. `not_recorded` is the NULL count.
+  A value in none of them (a release that removed a member) is counted into `not_recorded`
+  rather than silently inventing a bucket.
 - **Reuse, do not re-derive, the pricing.** `spend` is built from
   `CentralStore.agent_call_totals(project)` grouped by `kind/label/model` and priced per
   group through the same `ops._priced_group` / `_call_spend` path `cost_report` uses
@@ -324,7 +347,8 @@ the middle:
 
 - `questions` is a **census**. Every question Neo was ever asked has a row, so a count of
   zero is measured and prints `0`: "0 escalated" is a fact. Only the *ratios* can be
-  absent — `escalation_rate`, `questions_per_wo`, `questions_per_fo` are `None` (never
+  absent — `escalation_rate`, `unreachable_rate`, `questions_per_wo`, `questions_per_fo`
+  are `None` (never
   `0.0`) when their denominator is zero, and the renderers print "not recorded". Zero
   settled questions and zero escalations are different answers.
 - `spend` and `latency` are a **sample**, floored. `agent_usage.record` never raises, so a
@@ -442,10 +466,12 @@ New file **tests/test_neo_stats.py** — the report's own behaviours, against a 
 1. counts and the per-kind / per-project / per-day splits over a known fixture, including
    that `superseded` (`answered_by='os'`) is out of the rate's denominator and that
    `kind='triage'` is out of `per_order`;
-2. `escalation_rate` and both `questions_per_*` are `None` — not `0.0` — with a zero
-   denominator, and a question count of zero is `0`;
-3. the cause split: a chosen member lands in `causes.chosen`, a mechanical one in
-   `causes.failed`, a NULL in `not_recorded`, and the three never add into each other;
+2. `escalation_rate`, `unreachable_rate` and both `questions_per_*` are `None` — not
+   `0.0` — with a zero denominator, and a question count of zero is `0`; a window of only
+   unreachable questions is 0% escalation and 100% unreachable;
+3. the cause split: a chosen member lands in `causes.chosen`, an override in
+   `causes.overridden`, a never-answered one in `causes.failed`, a NULL in
+   `not_recorded`, and the four never add into each other;
 4. `--days` windowing excludes older rows from every section including `spend`;
 5. latency: a window of rows with no `latency_ms` yields `p50_ms is None` and a non-zero
    `unmeasured`, never `0`.

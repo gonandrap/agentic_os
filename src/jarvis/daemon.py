@@ -6647,7 +6647,8 @@ class Daemon:
                 # hold event is what puts the WHY on the work order, where
                 # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
                 #
-                # AND NO CAUSE, deliberately. Neo's ruling ACCEPTED here — that is the
+                # AND THE CAUSE COMES OUT NULL, which `escalation_cause` below DERIVES
+                # rather than this site omitting. Neo's ruling ACCEPTED here — that is the
                 # branch this is inside — so nothing in its reply caused this escalation:
                 # the condition table re-running at the settle did, and `still.code` is
                 # where that fact is recorded, on the work order. `escalation_cause`

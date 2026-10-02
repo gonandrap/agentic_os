@@ -479,6 +479,30 @@ def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
         assert "white-space: nowrap" in line, line
 
 
+def test_the_stats_page_trend_row_carries_the_unreachable_count_and_rate(client, daemon,
+                                                                        project):
+    """Spec §4: a bar may never contradict the counts beside it."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "never reached" in page
+    block = page.split("The trend")[1].split("<h2>")[0]
+    assert "never reached" in block
+    assert "unreachable" in block
+    # the bar stays driven by the ESCALATION rate, which is 0 here, so none is drawn
+    assert "0%" in block
+
+
 def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
     page = client.get("/neo/stats?project=nope")
     assert page.status_code == 200

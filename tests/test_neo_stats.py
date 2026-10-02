@@ -81,8 +81,9 @@ def test_the_counts_and_the_three_splits_over_a_known_fixture(fleet, project):
     q = res["questions"]
     assert (q["asked"], q["answered"], q["escalated"], q["failed"]) == (6, 2, 1, 1)
     assert (q["open"], q["superseded"]) == (1, 1)
-    # (escalated + failed) / (answered + escalated + failed) — settled questions only
-    assert q["escalation_rate"] == pytest.approx(2 / 4)
+    # escalated ALONE / (answered + escalated + failed) — unreachable is never blended in
+    assert q["escalation_rate"] == pytest.approx(1 / 4)
+    assert q["unreachable_rate"] == pytest.approx(1 / 4)
     assert res["by_kind"]["assumption"]["answered"] == 1
     assert res["by_kind"]["question"]["asked"] == 5
     assert res["by_project"]["proj_a"]["asked"] == 6
@@ -122,6 +123,7 @@ def test_an_empty_fleet_reports_measured_zeroes_and_absent_ratios(fleet):
     assert (q["asked"], q["answered"], q["escalated"], q["failed"]) == (0, 0, 0, 0)
     # The ratios are absent, and absent is None — never 0.0.
     assert q["escalation_rate"] is None
+    assert q["unreachable_rate"] is None
     assert res["per_order"]["questions_per_wo"] is None
     assert res["per_order"]["questions_per_fo"] is None
     assert res["causes"] == {"chosen": {}, "overridden": {}, "failed": {},
@@ -142,6 +144,42 @@ def test_open_questions_alone_leave_the_rate_absent(fleet):
     res = ops.neo_stats_report()
     assert res["questions"]["open"] == 2
     assert res["questions"]["escalation_rate"] is None
+    assert res["questions"]["unreachable_rate"] is None
+
+
+def test_a_window_of_only_unreachable_questions_reports_no_escalation(fleet):
+    """Spec §4: a question Neo was never reached for is UNREACHABLE and never escalated."""
+    neo = NeoStore()
+    try:
+        seed_question(neo, status="failed", cause="transport-unreachable")
+        seed_question(neo, status="failed", cause="attempts-exhausted")
+    finally:
+        neo.close()
+
+    res = ops.neo_stats_report()
+    for bucket in (res["questions"], res["by_kind"]["question"],
+                   res["by_project"]["proj_a"], res["by_day"][-1]):
+        assert bucket["escalated"] == 0
+        assert bucket["failed"] == 2
+        assert bucket["escalation_rate"] == 0.0
+        assert bucket["unreachable_rate"] == 1.0
+
+
+def test_a_mixed_window_splits_the_two_rates(fleet):
+    neo = NeoStore()
+    try:
+        seed_question(neo, status="answered", answered_by="neo")
+        seed_question(neo, status="answered", answered_by="neo")
+        seed_question(neo, status="escalated", cause="high-stakes")
+        seed_question(neo, status="failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+
+    res = ops.neo_stats_report()
+    for bucket in (res["questions"], res["by_day"][-1],
+                   res["by_kind"]["question"], res["by_project"]["proj_a"]):
+        assert bucket["escalation_rate"] == pytest.approx(0.25)
+        assert bucket["unreachable_rate"] == pytest.approx(0.25)
 
 
 # -- 3. the cause split ---------------------------------------------------------------
@@ -352,3 +390,47 @@ def test_the_rendering_reads_the_causes_as_three_answers_to_who_decided(fleet, c
     for member in ("high-stakes", "stakes-unclassified", "transport-unreachable"):
         assert member in out
     assert ops.NEO_ESCALATION_INVISIBLE_NOTE in out
+
+
+def _trend_lines(out: str) -> list[str]:
+    return [ln for ln in out.splitlines()
+            if "asked" in ln and "escalated" in ln and "rate" in ln]
+
+
+def test_the_trend_row_prints_the_unreachable_count_and_rate(fleet, capsys):
+    """Spec §4: a bar may never contradict the counts beside it."""
+    from jarvis import cli
+
+    neo = NeoStore()
+    try:
+        seed_question(neo, status="failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+    capsys.readouterr()
+    assert cli.main(["neo", "stats"]) == 0
+
+    out = capsys.readouterr().out
+    rows = _trend_lines(out)
+    assert rows, out
+    for line in rows:
+        assert "never reached" in line, line
+        assert "unreachable" in line, line
+    assert "escalation rate   0%" in out and "unreachable rate  100%" in out
+
+
+def test_an_absent_trend_rate_prints_not_recorded(fleet, capsys):
+    from jarvis import cli
+
+    neo = NeoStore()
+    try:
+        seed_question(neo, status="queued")
+    finally:
+        neo.close()
+    capsys.readouterr()
+    assert cli.main(["neo", "stats"]) == 0
+
+    out = capsys.readouterr().out
+    assert "0%" not in out, "an absent rate must never render as a measured zero"
+    rows = _trend_lines(out)
+    assert rows, out
+    assert rows[-1].count("not recorded") == 2, rows[-1]

@@ -47,6 +47,11 @@
     <span class="sub">— over settled questions only; superseded ones are out of it,
       and an open one has no outcome yet</span>
   </p>
+  {# Its own figure, never blended into the rate above: a crash is not a decision. #}
+  <p class="kv" style="margin: 6px 0 0;">
+    unreachable rate {{ pct(q.unreachable_rate) }}
+    <span class="sub">— same denominator, and NOT escalations: Neo was never reached</span>
+  </p>
 </div>
 
 {% if report.by_day %}
@@ -58,9 +63,9 @@
   {% for d in report.by_day %}
   <div class="row">
     <span class="mono sub" style="width: 92px;">{{ d.day }}</span>
-    {# bill.html:110's idiom, plus room for two-digit counts: at 150px this wrapped #}
-    <span class="mono" style="width: 200px; white-space: nowrap;">{{ d.asked }} asked ·
-      {{ d.escalated }} escalated</span>
+    {# bill.html:110's idiom, widened for the third count: at 200px this wrapped #}
+    <span class="mono" style="width: 320px; white-space: nowrap;">{{ d.asked }} asked ·
+      {{ d.escalated }} escalated · {{ d.failed }} never reached</span>
     <span class="grow">
       {# same scale down the column, bill.html:122-126's inline bar, so a rising rate is
          visible as shape rather than as a column of numbers #}
@@ -72,8 +77,12 @@
       </div>
       {% endif %}
     </span>
+    {# The bar is the ESCALATION rate; the unreachable one rides beside it so a bar can
+       never contradict the counts. #}
     <span class="mono" style="width: 110px; text-align: right;"
       >{{ pct(d.escalation_rate) }}</span>
+    <span class="mono sub" style="width: 150px; text-align: right; white-space: nowrap;"
+      >{{ pct(d.unreachable_rate) }} unreachable</span>
   </div>
   {% endfor %}
 </div>
@@ -115,9 +124,11 @@
   <div class="row">
     <span class="mono grow">{{ kind }}</span>
     <span class="mono sub">{{ k.asked }} asked · {{ k.answered }} answered ·
-      {{ k.escalated }} escalated</span>
+      {{ k.escalated }} escalated · {{ k.failed }} never reached</span>
     <span class="mono" style="width: 110px; text-align: right;"
       >{{ pct(k.escalation_rate) }}</span>
+    <span class="mono sub" style="width: 150px; text-align: right; white-space: nowrap;"
+      >{{ pct(k.unreachable_rate) }} unreachable</span>
   </div>
   {% else %}
   <div class="empty">no questions in this window</div>
