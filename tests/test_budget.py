@@ -1182,6 +1182,20 @@ def test_the_show_path_explains_the_cap_in_the_same_words(started, store):
     assert "jarvis investigate budget" in shown["note"]
 
 
+def test_a_broke_family_reads_zero_and_not_a_dash(started, store):
+    """`budget.format_usd` renders 0.0 and None identically as an em dash, and 0.00 is
+    the ONLY unreserved figure this note ever carries — nothing left is the whole
+    condition for showing it. An em dash there reads as "unknown" when the fact is
+    "zero", and zero is what tells the user to raise the FAMILY, not the child again."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(store, inv, "investigator", spent=9.0)
+
+    note = ops.set_work_order_budget(child, 500.0)["note"]
+    assert "$0.00 unreserved" in note
+    assert "—" not in note                      # the sentence reads on one pass
+    assert note == ops.work_order_budget(child)["note"]
+
+
 def test_the_family_is_not_the_worker_children(started, store):
     """Obligation 5 (Neo question 1198). The family budget is ENFORCED over
     `budget.family` and was REPORTED over `ProjectStore.feature_children`, which is the
@@ -1209,4 +1223,71 @@ def test_raising_a_features_budget_still_names_its_parked_child(started, store):
     assert out["exhausted_children"] == [child["id"]]
     assert child["id"] in [c["wo_id"]
                            for c in ops.feature_order_budget(fo["id"])["children"]]
+
+
+def test_a_parked_investigation_child_is_not_told_a_feature_capped_it(started, store):
+    """The attention line is the loudest surface — `jarvis status` and the attention
+    strip read nothing else — and it still called an investigation's family a feature.
+    The card, the status label and the flash were made kind-aware; this is the last."""
+    from jarvis.central_store import CentralStore
+
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    store.set_status(child, "running")
+
+    central = CentralStore()
+    try:
+        row = store.get_work_order(child)
+        out = budget.exhaustion(store, central, row)
+        assert out is not None
+        budget.escalate(store, row, out)
+    finally:
+        central.close()
+
+    line = store.get_work_order(child)["attention_reason"]
+    assert "its investigation's slice" in line
+    assert "its investigation has" in line
+    assert "feature" not in line
+
+
+def test_a_parked_feature_child_still_says_feature(started, store):
+    """The negative control: the default family word is unchanged."""
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
+
+    central = CentralStore()
+    try:
+        row = store.get_work_order(child["id"])
+        out = budget.exhaustion(store, central, row)
+        assert out is not None
+        budget.escalate(store, row, out)
+    finally:
+        central.close()
+
+    line = store.get_work_order(child["id"])["attention_reason"]
+    assert "its feature's slice" in line
+    assert "its feature has" in line
+
+
+def test_a_zero_spend_against_a_budget_reads_as_zero(started, store):
+    """`budget.status_note` rendered a real 0.0 through `format_usd` as an em dash, so an
+    order that has spent nothing read `— of $5.00`. Zero is a number here."""
+    from jarvis.central_store import CentralStore
+
+    wo = store.create_work_order("nothing spent yet", description="look")
+    store.update_work_order(wo["id"], budget_usd=5.0)
+
+    central = CentralStore()
+    try:
+        note = budget.status_note(store, central, store.get_work_order(wo["id"]))
+    finally:
+        central.close()
+    assert note == "$0.00 of $5.00"
+    assert budget.format_money(0.0) == "$0.00"
+    assert budget.format_usd(0.0) == "—"       # left alone: it means "absent"
 

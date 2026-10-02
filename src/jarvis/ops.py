@@ -13734,6 +13734,12 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         # stopped by its own number needs no explanation beyond the number. Through
         # `_feature_unreserved`, the set path's own read, so the two strings are one
         # string and not two that agree today.
+        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
+        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
+        # and is NOT a claim that the parent is a feature order, so a card reading it
+        # raw told an investigation's child about "its feature's slice". Same
+        # `family_prose` table as the note, so card and note agree.
+        family = family_prose(parent["kind"])[0] if parent else None
         note = ""
         if cap is not None and cap.source == "feature" and cap.exhausted:
             note = _still_capped_note(cap, spend.total_usd, parent,
@@ -13758,6 +13764,7 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "remaining_usd": cap.remaining_usd if cap else None,
         "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+        "family": family,
         "note": note,
     }
 
@@ -13836,15 +13843,18 @@ def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
     Here and not in `budget.py`: the sentence names CLI COMMANDS, and the allocator knows
     nothing about surfaces.
     """
-    note = (f"still over its ceiling — {budget.format_usd(spent_usd)} "
-            f"spent against {budget.format_usd(cap.cap_usd)}")
+    spent, cap_usd = budget.format_usd(spent_usd), budget.format_usd(cap.cap_usd)
     if cap.source != "feature":
-        return note
+        return f"still over its ceiling — {spent} spent against {cap_usd}"
     family, verb = family_prose((parent or {}).get("kind"))
-    return note + (f" (its {family}'s slice, and the {family} has "
-                   f"{budget.format_usd(unreserved_usd)} unreserved of its "
-                   f"{budget.format_usd((parent or {}).get('budget_usd'))} budget — "
-                   f"raise the {family} with `{verb}`)")
+    # `format_money`, not `format_usd`: the remainder being NOTHING is the entire
+    # condition for this sentence, and the dash would read as "unknown". The parent's
+    # budget keeps `format_usd`: a family cap always has one.
+    return (f"still over its ceiling: {spent} spent against {cap_usd}, which is its "
+            f"{family}'s slice. The {family} has "
+            f"{budget.format_money(unreserved_usd)} unreserved of "
+            f"its {budget.format_usd((parent or {}).get('budget_usd'))} budget, so "
+            f"raise the {family} with `{verb}`.")
 
 
 def _parent_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:

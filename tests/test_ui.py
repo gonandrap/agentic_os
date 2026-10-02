@@ -2826,6 +2826,18 @@ def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, pro
     assert '<div class="note-flash"' in page
 
 
+def test_the_budget_card_calls_the_family_by_its_kind(client, project):
+    """The card beside the flash said "its feature's slice" for an investigation.
+    `Ceiling.source == 'feature'` is the ALLOCATOR's word for "the family's cap", not a
+    claim about the parent's kind — the two surfaces must agree, so the card reads the
+    same `ops.family_prose` table the note does."""
+    _fo_id, child = _broke_family(project)
+    page = html.unescape(client.get(f"/wo/proj_a/{child}").text)
+    assert "its investigation's slice" in page
+    assert "its feature's slice" not in page
+    assert "its investigation has $0.00 unreserved" in page
+
+
 def test_raising_a_family_with_parked_children_names_them(client, project):
     """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to
     the user — `jarvis wo budget <child> <amount>` is what spends the new money."""
@@ -2839,6 +2851,9 @@ def test_raising_a_family_with_parked_children_names_them(client, project):
                                     f"{location[location.index('?'):]}").text)
     assert child in page
     assert "jarvis wo budget" in page
+    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN
+    # ceiling, not on "their own ceiling".
+    assert "1 work order still parked on its own ceiling" in page
 
 
 def test_api_status_carries_every_feature_order_kind(client, project):

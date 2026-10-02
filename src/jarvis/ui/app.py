@@ -1760,9 +1760,12 @@ def create_app() -> FastAPI:
         # doing it from this end would have to guess the split (`ops.set_feature_budget`).
         stuck = result.get("exhausted_children") or []
         if stuck:
-            note = (f"budget raised. {len(stuck)} work order"
-                    f"{'' if len(stuck) == 1 else 's'} still parked on their own "
-                    f"ceiling: {', '.join(stuck)} — spend the new money on one with "
+            one = len(stuck) == 1
+            # The WHOLE clause agrees, not only the noun: "1 work order ... their own
+            # ceiling" was half-pluralised.
+            note = (f"budget raised. {len(stuck)} work order{'' if one else 's'} still "
+                    f"parked on {'its own ceiling' if one else 'their own ceilings'}: "
+                    f"{', '.join(stuck)} — spend the new money on one with "
                     f"`jarvis wo budget <id> <amount>`")
             return RedirectResponse(f"/fo/{name}/{fo_id}?note={quote(note)}",
                                     status_code=303)
