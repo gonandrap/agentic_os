@@ -278,8 +278,10 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         "touches what you are about to do, FETCH IT — before you act on it, and before "
         "you ask Neo or record an assumption about it:",
         "```bash",
-        f'jarvis learn search "<term>" --project {project_name}  # full text of matches',
-        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f'jarvis learn search "<term>" --project {project_name}  # finds and ranks '
+        f"matches: headline, id and a matching line",
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries — the ONLY "
+        "verb that returns a body",
         f"jarvis learn list --project {project_name} --topic <t>  # everything in a topic",
         f"jarvis learn topics --project {project_name}  # what topics exist",
         "```",
@@ -290,6 +292,21 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         for k in brief.pinned:
             topic = f" [{k['topic']}]" if k["topic"] else ""
             lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
+    if brief.hints:
+        # Above the index, because it is the most relevant thing in the section; below it
+        # this would read as a footnote. Labelled as evidence rather than as a verdict —
+        # the rule `knowledge_usage_report` already states for `could_have_read`, and
+        # without the label a lexical coincidence reads as an instruction.
+        lines += [
+            "",
+            "## Matched your work order's TITLE — a HINT, not an instruction",
+            "These entries' text matches words from your title. That is EVIDENCE they may "
+            "be relevant, NOT a verdict that they apply: read them and decide. Headline "
+            "and id only — `jarvis learn show <id>` for the body.",
+        ]
+        for k in brief.hints:
+            scope = "" if k["project"] == project_name else " (global)"
+            lines.append(f"- `{k['id']}`{scope} {k['headline']}")
     if brief.digest:
         lines += ["", "## Index — headline only, `jarvis learn show <id>` for the rest"]
         current = object()
@@ -306,7 +323,8 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
             f"## Not indexed above — {brief.overflow_count} further entries, by topic",
             f"{listed}",
             f"Reach them with `jarvis learn list --project {project_name} --topic <topic>` "
-            f"or `jarvis learn search`.",
+            f"or `jarvis learn search \"<term>\"`, which ranks matches and gives you ids to "
+            f"`jarvis learn show`.",
         ]
     return lines
 
@@ -690,7 +708,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         # go and read one
         *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
            f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`. A plan built "
+           f"--project {project.name}` finds and ranks matching entries, then "
+           f"`jarvis learn show <id>` returns the body. A plan built "
            f"without it will hand children the lessons the fleet already paid for, "
            f"again."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
@@ -805,8 +824,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- `jarvis cost <project|wo-id|fo-id>` — what it cost, split worker vs Jarvis",
         "- `jarvis alarms [project]` — turns the OS raised while they burned",
         "- `jarvis issues [project]` — tracker issues the fleet keeps hitting",
-        "- `jarvis learn search \"<term>\"` / `jarvis learn show <id>` — what the fleet "
-        "already knows",
+        "- `jarvis learn search \"<term>\"` — which of the fleet's entries match, by "
+        "headline and id; `jarvis learn show <id>` then returns the body",
         "- `gh pr view <url>` / `gh pr diff <url>` — a pull request and what it changed",
         *(["",
            "## The evidence you were given",
@@ -884,7 +903,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+           f"--project {project.name}` ranks the matching entries and gives you their "
+           f"ids, `jarvis learn show <id>` returns a body."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
@@ -1073,7 +1093,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+           f"--project {project.name}` ranks the matching entries and gives you their "
+           f"ids, `jarvis learn show <id>` returns a body."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         "",
@@ -1202,7 +1223,8 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
         "to you.",
         f"- Read what the fleet already knows before you decide anything: `jarvis learn "
-        f"search \"<term>\" --project {project.name}`."
+        f"search \"<term>\" --project {project.name}` for the matching headlines and ids, "
+        f"then `jarvis learn show <id>` for a body."
         if knowledge else
         f"- Record what you learn: `jarvis learn add \"...\" --project {project.name}`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
@@ -1324,6 +1346,9 @@ def dispatch_work_order(
         pinned_limit=cfg.knowledge_inject_limit,
         digest_limit=cfg.knowledge_digest_limit,
         digest_chars=cfg.knowledge_digest_chars,
+        title=wo["title"],
+        hint_limit=cfg.knowledge_hint_limit,
+        hint_chars=cfg.knowledge_hint_chars,
     )
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),

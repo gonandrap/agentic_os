@@ -9,7 +9,9 @@ cost, nothing silently invisible, and retrieval verbs that actually work.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -519,3 +521,246 @@ def test_catalog_exposes_the_budget(jarvis_home):
     assert (cat.os.knowledge_inject_limit, cat.os.knowledge_digest_limit,
             cat.os.knowledge_digest_chars) == (2, 7, 300)
     assert OsConfig().knowledge_digest_limit == 40
+
+
+# -- `jarvis learn search` is an index, not a payload ------------------------------------
+#
+# Spec: docs/superpowers/specs/2026-10-02-learn-search-returns-an-index.md. `search` was
+# the one retrieval verb with no index form, and it printed every matching body in full.
+
+
+BODY = ("deploy runs from the tag\n"
+        "the second line names the gate it must pass\n"
+        + "padding that nobody should ever be charged for. " * 40)
+
+
+def test_search_rows_never_carry_a_body(jarvis_home, capsys):
+    """Spec test 1 — the acceptance test. A truncated body would still be a body."""
+    central = CentralStore()
+    central.add_knowledge(BODY, project="p1", topic="releases")
+    _run(["--json", "learn", "search", "deploy", "--project", "p1"])
+    out = capsys.readouterr().out
+    rows = json.loads(out)
+    assert rows and all("content" not in r for r in rows)
+    assert "padding that nobody should ever be charged for" not in out
+    assert rows[0]["headline"] == "deploy runs from the tag"
+
+
+def test_search_still_records_a_hit_on_every_entry_it_named(jarvis_home, capsys):
+    """Spec test 3 — `search` stays in AIMED_VERBS."""
+    central = CentralStore()
+    row = central.add_knowledge(BODY, project="p1", topic="releases")
+    _run(["--json", "learn", "search", "deploy", "--project", "p1"])
+    capsys.readouterr()
+    assert central.knowledge_hit_counts() == {row["id"]: 1}
+
+
+def test_an_excerpt_quotes_the_body_line_that_matched(jarvis_home, capsys):
+    """Spec test 4, case 1."""
+    central = CentralStore()
+    central.add_knowledge(BODY, project="p1", topic="releases")
+    _run(["--json", "learn", "search", "gate", "--project", "p1"])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["excerpt"] == "the second line names the gate it must pass"
+
+
+def test_a_long_matching_line_is_bounded_like_a_headline(jarvis_home, capsys):
+    """Spec test 4, case 2 — `headline()` IS the bound; no new constant."""
+    central = CentralStore()
+    central.add_knowledge("short first line\n" + "gate " * 200, project="p1")
+    _run(["--json", "learn", "search", "gate", "--project", "p1"])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert len(row["excerpt"]) <= 160 and row["excerpt"].endswith("…")
+
+
+def test_a_match_only_in_the_first_line_yields_no_excerpt(jarvis_home, capsys):
+    """Spec test 4, case 3 — the headline already shows it."""
+    central = CentralStore()
+    central.add_knowledge("deploy from the tag\nnothing else matches here", project="p1")
+    _run(["--json", "learn", "search", "deploy", "--project", "p1"])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert "excerpt" not in row and row["headline"] == "deploy from the tag"
+
+
+def test_a_hit_with_no_matching_body_line_still_returns_the_row(jarvis_home, capsys):
+    """Spec test 4, case 4 — a topic hit has nothing to quote."""
+    central = CentralStore()
+    central.add_knowledge("one line only", project="p1", topic="releases")
+    _run(["--json", "learn", "search", "releases", "--project", "p1"])
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1 and "excerpt" not in rows[0]
+
+
+def test_an_index_row_prices_the_fetch(jarvis_home, capsys):
+    """Spec test 6 — `chars` is the body length, so `show <id>` can be priced first."""
+    central = CentralStore()
+    central.add_knowledge(BODY, project="p1", topic="releases")
+    _run(["--json", "learn", "search", "deploy", "--project", "p1"])
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["chars"] == len(BODY)
+
+
+def test_no_prompt_promises_that_search_returns_full_text(jarvis_home):
+    """Spec test 7 — every prompt string that advertised bodies from `search`."""
+    from jarvis import dispatch, worker_brief
+
+    central = CentralStore()
+    central.add_knowledge("something worth knowing", project="p1", topic="ci")
+    brief = central.knowledge_brief("p1")
+    rendered = [
+        _prompt(brief),
+        "\n".join(dispatch.render_knowledge_block(brief, "p1")),
+        worker_brief.knowledge_section("p1"),
+        worker_brief.contract_section("wo-brief01", "p1"),
+    ]
+    for text in rendered:
+        assert "full text of matches" not in text
+    # `show` keeps the promise, and the contract keeps the literal substring
+    assert "full text of specific entries" in rendered[1]
+    assert "jarvis learn search" in rendered[3]
+
+
+# -- half 2: title-matched hints at dispatch ---------------------------------------------
+
+
+def _stocked(central, n=60, project="p1"):
+    """A base deep enough that the oldest entries fall into overflow."""
+    for i in range(n):
+        central.add_knowledge(f"bulk {i} " + "padding " * 20, project=project,
+                              topic=f"t{i % 5}")
+
+
+def test_a_brief_with_no_title_has_no_hints(jarvis_home):
+    """Spec test 8 — the default must stay byte-identical (validation.py, _index_cost)."""
+    central = CentralStore()
+    central.add_knowledge("deploy runs from the tag", project="p1", topic="releases")
+    brief = central.knowledge_brief("p1")
+    assert brief.hints == []
+    assert "TITLE" not in _prompt(brief)
+
+
+def test_a_title_matched_overflow_entry_reaches_the_prompt(jarvis_home):
+    """Spec test 9 — the 586-entry overflow is where the relevant entry was hiding."""
+    central = CentralStore()
+    target = central.add_knowledge(
+        "the gate matches the shipit command byte for byte", project="p1", topic="gates")
+    _stocked(central)
+    plain = central.knowledge_brief("p1", digest_limit=5, digest_chars=600)
+    assert target["id"] not in {r["id"] for r in plain.digest}
+
+    hinted = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
+                                     title="the shipit gate matches byte for byte")
+    assert target["id"] in {r["id"] for r in hinted.hints}
+    assert target["id"] in _prompt(hinted)
+
+
+def test_dispatch_passes_the_work_order_title_and_the_hint_bounds(
+        jarvis_home, fake_claude, project, catalog_file):
+    """Spec test 9, the wiring half: the real launch path asks for hints."""
+    from jarvis import dispatch, ops
+    from jarvis.catalog import load_catalog
+    from jarvis.project_store import ProjectStore
+
+    ops.start_os(str(catalog_file), foreground=True)
+    cat = load_catalog(catalog_file)
+    ops.create_work_order("proj_a", "the shipit gate matches byte for byte")
+    store = ProjectStore(project)
+    central = CentralStore()
+    central.add_knowledge("the gate matches the shipit command byte for byte",
+                          project="proj_a", topic="gates")
+    seen: dict[str, Any] = {}
+    real = central.knowledge_brief
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    central.knowledge_brief = spy  # type: ignore[method-assign]
+    wo = store.claim_next_pending()
+    try:
+        dispatch.dispatch_work_order(store, central, cat.projects[0], wo,
+                                     os_config=cat.os)
+    finally:
+        store.close()
+        central.close()
+    assert seen["title"] == "the shipit gate matches byte for byte"
+    assert seen["hint_limit"] == cat.os.knowledge_hint_limit
+    assert seen["hint_chars"] == cat.os.knowledge_hint_chars
+
+
+def test_an_entry_already_in_the_index_is_not_repeated_as_a_hint(jarvis_home):
+    """Spec test 10."""
+    central = CentralStore()
+    indexed = central.add_knowledge("the shipit gate matches byte for byte",
+                                    project="p1", topic="gates")
+    pinned = central.add_knowledge("never ship a byte without the gate", project="p1",
+                                   topic="gates", tags=PINNED_TAG)
+    brief = central.knowledge_brief("p1", title="the shipit gate matches byte for byte")
+    assert indexed["id"] in {r["id"] for r in brief.digest}
+    assert pinned["id"] in {r["id"] for r in brief.pinned}
+    assert brief.hints == []
+
+
+def test_the_hint_budget_is_separate_from_the_digest_budget(jarvis_home):
+    """Spec test 11 — bounds hold and the digest is the same size either way."""
+    central = CentralStore()
+    for i in range(6):
+        central.add_knowledge(f"the shipit gate matches byte for byte, case {i} "
+                              + "padding " * 20, project="p1", topic="gates")
+    _stocked(central)
+    plain = central.knowledge_brief("p1", digest_limit=5, digest_chars=600)
+    hinted = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
+                                     title="the shipit gate matches byte for byte",
+                                     hint_limit=3, hint_chars=400)
+    assert len(hinted.hints) <= 3
+    assert sum(len(h["headline"]) for h in hinted.hints) <= 400
+    assert [r["id"] for r in hinted.digest] == [r["id"] for r in plain.digest]
+
+    tight = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
+                                    title="the shipit gate matches byte for byte",
+                                    hint_limit=3, hint_chars=40)
+    assert len(tight.hints) < len(hinted.hints)
+
+
+def test_a_short_title_gets_no_hints(jarvis_home):
+    """Spec test 12 — below MISSED_MIN_WORDS the query matches half the base."""
+    from jarvis.central_store import MISSED_MIN_WORDS
+
+    central = CentralStore()
+    central.add_knowledge("the shipit gate matches byte for byte", project="p1",
+                          topic="gates")
+    _stocked(central)                      # pushes the target out of the digest
+    bounds = {"digest_limit": 5, "digest_chars": 600}
+    short = " ".join("gate matches byte for byte".split()[:MISSED_MIN_WORDS - 1])
+    assert central.knowledge_brief("p1", title=short, **bounds).hints == []
+    assert central.knowledge_brief("p1", title="gate matches byte", **bounds).hints != []
+
+
+def test_a_hint_is_not_filtered_by_when_the_order_was_created(jarvis_home):
+    """Spec test 13 — the report's `ts <= created_at` filter does NOT apply here."""
+    central = CentralStore()
+    _stocked(central)
+    fresh = central.add_knowledge("the shipit gate matches byte for byte", project="p1",
+                                  topic="gates")
+    # a newer entry in the same topic, so round-robin indexes that one and `fresh` is in
+    # overflow — the case this hint tier exists for
+    central.add_knowledge("gates are reviewed by Neo", project="p1", topic="gates")
+    brief = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
+                                    title="the shipit gate matches byte for byte")
+    assert fresh["id"] in {r["id"] for r in brief.hints}
+
+
+def test_the_hint_block_says_title_match_and_says_hint(jarvis_home):
+    """Spec test 14 — a lexical coincidence must not read as an instruction."""
+    from jarvis.dispatch import render_knowledge_block
+
+    central = CentralStore()
+    central.add_knowledge("the shipit gate matches byte for byte\n" + "body " * 100,
+                          project="p1", topic="gates")
+    _stocked(central)
+    brief = central.knowledge_brief("p1", digest_limit=5, digest_chars=600,
+                                    title="the shipit gate matches byte for byte")
+    text = "\n".join(render_knowledge_block(brief, "p1"))
+    block = text[text.index("TITLE"):]
+    assert "HINT" in block and "not an instruction" in block
+    assert brief.hints and all(h["content"] not in text for h in brief.hints)

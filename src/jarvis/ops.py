@@ -46,7 +46,7 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import CentralStore
+from .central_store import MISSED_MIN_WORDS, CentralStore
 from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
@@ -13157,10 +13157,10 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # -- what the knowledge base costs, and who actually reads it -----------------------------
 
-#: How much of a work order's own title has to survive into a search for the "it could
-#: have looked" signal to mean anything. Below this the query is words like "fix the",
-#: which match half the base and would manufacture a miss for every silent order.
-MISSED_MIN_WORDS = 3
+#: `MISSED_MIN_WORDS` — how much of a work order's own title has to survive into a search
+#: for a title match to mean anything — is defined in `central_store` and imported at the
+#: top of this module: the dispatch hint tier applies the same rule to the same query, and
+#: two copies of that threshold would drift.
 
 
 def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
