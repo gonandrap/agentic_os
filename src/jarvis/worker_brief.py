@@ -554,6 +554,55 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
     return "\n".join(lines)
 
 
+#: The ToolSearch recovery call, as the worker must type it. Both prefixes in ONE select
+#: — `mcp__serena__` from `claude mcp add serena`, `mcp__plugin_serena_serena__` from a
+#: plugin install (`dispatch.SERENA_TOOL_PREFIXES`) — because an absent name is silently
+#: ignored and the rest of the select survives: probed on 2.1.284, where a select naming
+#: both spellings of `find_symbol` on a plugin install returned only the plugin one. Four
+#: tools, not eleven: these are the ones the defect is about. §3 item 1 of
+#: docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md.
+NAV_SELECT_TOOLS = ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                    "activate_project")
+NAV_SELECT_LINE = "select:" + ",".join(
+    f"{prefix}{tool}"
+    for tool in NAV_SELECT_TOOLS
+    for prefix in ("mcp__serena__", "mcp__plugin_serena_serena__"))
+
+
+def navigation_core(serena: bool = True) -> list[str]:
+    """The navigation posture INLINE in the bare worker prompt — spec §3.
+
+    Cause 3 of the defect: an ordinary lead gets one index line pointing at
+    `jarvis brief navigation` and the measured fetch behaviour is that it does not
+    fetch, so the posture never reaches the session the brief was written for. The
+    planner and the analyst already get the full section inline through
+    `dispatch._common_briefing`.
+
+    Composed AFTER `section_index` rather than inside the core: the core has 38 chars of
+    headroom against CORE_BUDGET_CHARS and every sentence in it is A/B-graded as a unit
+    (evals/llm/test_worker_contract_ab.py), so 500 ungraded chars in there would dilute a
+    claim, not just a number.
+
+    `serena=False` renders nothing: the index already swaps in NO_SERENA_HOOK and the
+    fetched section already carries the grep posture.
+    """
+    if not serena:
+        return []
+    return [
+        "# Finding code: your symbol tools are DEFERRED, not absent",
+        "They are NOT in your tool list — this CLI resolves them on demand. One "
+        "`ToolSearch` call with this select brings back the four that matter (both "
+        "prefixes; a name this install lacks is ignored):",
+        NAV_SELECT_LINE,
+        "- The bash-first reminder does NOT govern code navigation: `cat`/`sed "
+        "-n`/`grep` answer text questions, never symbol ones.",
+        "- `find_referencing_symbols` for callers — grep has no equivalent; "
+        "`get_symbols_overview` before opening a file whole; `find_symbol` instead of "
+        "`grep -rn \"def foo\"`.",
+        "- `activate_project` on the repo root if a call says no project is active.",
+    ]
+
+
 def navigation_section(serena: bool = True) -> str:
     """Serena before grep, for every session Jarvis dispatches.
 
@@ -588,8 +637,9 @@ def navigation_section(serena: bool = True) -> str:
         ])
     lines = [
         "# Navigating the code: Serena first, grep second",
-        "If this project has Serena (its symbol tools appear in your tool list, or "
-        "`.serena/project.yml` is in the repo), use it to find code and do NOT "
+        # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+        "Serena is wired to this project, and its symbol tools are DEFERRED behind "
+        "`ToolSearch` rather than listed — so use them to find code and do NOT "
         "grep for symbols. Serena has a language-server symbol index, so "
         "`find_symbol`, `get_symbols_overview` and especially "
         "`find_referencing_symbols` answer where something is defined and who "

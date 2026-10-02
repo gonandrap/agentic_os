@@ -10697,6 +10697,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.model", "next-dispatch"),
     ("*.effort", "next-dispatch"),
     ("*.permission_mode", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the system prompt it was launched with. Spec §1:
+    # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+    ("*.bash_first", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`

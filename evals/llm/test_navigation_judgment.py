@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -42,7 +43,7 @@ import pytest
 
 from jarvis import claude_cli
 from jarvis.catalog import ProjectSpec
-from jarvis.dispatch import build_worker_prompt, serena_allow_rules
+from jarvis.dispatch import bash_first_env, build_worker_prompt, serena_allow_rules
 
 pytestmark = [
     pytest.mark.skipif(not os.environ.get("JARVIS_EVALS_LLM"),
@@ -54,14 +55,66 @@ MODEL = os.environ.get("JARVIS_EVALS_MODEL", "sonnet")
 
 ASSETS = Path(__file__).resolve().parents[2] / "src" / "jarvis" / "assets"
 
-# What "grepped for code" looks like in a tool log. `Bash` is not here: a worker runs all
-# sorts of legitimate shell, and only the built-in search tools are unambiguous evidence
-# that it went looking for code by text.
+# The BUILT-IN search tools. Kept as its own set because the negative control is scoped
+# by the question, not by the tool — but on its own this set is blind to the real defect:
+# the fleet called `Grep` ZERO times over 276 transcripts and greps through `Bash`
+# (4,271 `grep`, 3,902 `sed -n`, 999 `cat`). §5.2 item 2 of
+# docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md — so the command
+# string is classified below, rather than every `Bash` call being failed.
 TEXT_SEARCH_TOOLS = {"Grep", "Glob"}
+
+#: Command words that READ or SEARCH rather than do work. `sed` counts only with `-n`,
+#: which is the measured navigation spelling; a `sed -i` is an edit.
+NAV_COMMANDS = {"grep", "egrep", "fgrep", "rg", "ack", "cat", "head", "tail", "find",
+                "sed", "awk", "less", "nl"}
+SOURCE_SUFFIXES = (".py", ".pyi", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".rb")
 
 
 def is_serena(tool: str) -> bool:
     return tool.startswith("mcp__serena__") or tool.startswith("mcp__plugin_serena_serena__")
+
+
+def _statements(command: str) -> list[list[str]]:
+    return [part.split() for part in re.split(r"[;&|()\n]", command) if part.split()]
+
+
+def bash_navigates_code(command: str) -> bool:
+    """Is this Bash command a code-navigation call — the thing the steer produces?
+
+    TWO conditions, and both are needed to keep the suite honest. The command word must
+    be a reader or a searcher (`pytest`, `git`, `jarvis`, `uv` are not: a worker runs all
+    sorts of legitimate shell, which is what the original tool-level comment was right
+    about), AND it must be aimed at SOURCE — a path with a code suffix, a `*.py` glob, or
+    a recursive sweep of the tree. `cat tool-log.jsonl` is bookkeeping; `grep -rn
+    "total_for" .` is the defect.
+    """
+    for words in _statements(command):
+        if not words:
+            continue
+        head = Path(words[0]).name
+        if head not in NAV_COMMANDS:
+            continue
+        if head == "sed" and "-n" not in words:
+            continue  # `sed -i` is an edit, not a read
+        args = words[1:]
+        if any(a.endswith(SOURCE_SUFFIXES) for a in args):
+            return True
+        if any("*" + s in a for a in args for s in SOURCE_SUFFIXES):
+            return True
+        if any(a in (".", "./", "src", "./src") for a in args):
+            return True
+    return False
+
+
+def text_search_for_code(calls: list[dict[str, str]]) -> list[str]:
+    """Every call in this log that went looking for CODE by text."""
+    found = []
+    for c in calls:
+        if c["tool"] in TEXT_SEARCH_TOOLS:
+            found.append(c["tool"])
+        elif c["tool"] == "Bash" and bash_navigates_code(c.get("command") or ""):
+            found.append(f"Bash({c['command']})")
+    return found
 
 
 def symbol_tools(tools: list[str]) -> list[str]:
@@ -119,6 +172,9 @@ def preview(order):
     return total_for(order)
 '''
 
+# The Bash COMMAND is recorded, not just the tool name: without it a `Bash(grep -rn …)`
+# is indistinguishable from `Bash(pytest …)` and the whole suite is blind to the measured
+# failure (spec §5.2 item 2).
 RECORDER = '''\
 import json, os, sys
 try:
@@ -127,7 +183,9 @@ except Exception:
     d = {}
 with open(os.environ["JARVIS_TOOL_LOG"], "a") as f:
     f.write(json.dumps({"tool": d.get("tool_name") or "",
-                        "agent": d.get("agent_type") or ""}) + "\\n")
+                        "agent": d.get("agent_type") or "",
+                        "command": ((d.get("tool_input") or {}).get("command") or "")})
+            + "\\n")
 print("{}")
 '''
 
@@ -153,17 +211,41 @@ def repo(tmp_path_factory) -> Path:
     return root
 
 
+#: The two arms, by `worker.bash_first` value. `off` is what §1 and §2 now write for
+#: every project in the fleet; `strict` PINS the steer rather than leaving it to the
+#: per-session statsig cohort draw, which is the only way the arm is a measurement.
+STEER_ARMS = [
+    pytest.param("off", id="no-steer"),
+    pytest.param("strict", id="steer",
+                 marks=pytest.mark.xfail(
+                     strict=False,
+                     reason="recorded, not asserted: the steer is a vendor system-prompt "
+                            "block whose variant is drawn per session by statsig, and CI "
+                            "must not go red on a cohort draw inside a vendor binary. "
+                            "The arm's job is to show the two arms differ, which is the "
+                            "measurement that `off` is the right default (spec §5.2)")),
+]
+
+
 def run_and_record(repo: Path, prompt: str, agents: dict[str, Path] | None = None,
                    system_prompt: str | None = None,
-                   timeout: int = 420) -> list[dict[str, str]]:
-    """Run one headless turn and return every tool call it made, with its agent_type."""
+                   timeout: int = 420, bash_first: str = "off",
+                   permission_mode: str = "auto") -> list[dict[str, str]]:
+    """Run one headless turn and return every tool call it made, with its agent_type.
+
+    `auto` AND THE BASH-FIRST ENV ARE THE SUBJECT, not incidental settings. This used to
+    hardcode `acceptEdits` while `dispatch` spawns every worker under `auto`, so no arm of
+    this suite had ever seen the steer the suite exists to catch (spec §5.2 item 1). The
+    env is taken from `dispatch.bash_first_env` rather than retyped, so the arm cannot
+    drift from what a real spawn writes.
+    """
     log = repo / "tool-log.jsonl"
     log.write_text("")
     recorder = repo / "record_tool.py"
     recorder.write_text(RECORDER)
     settings = repo / "eval-settings.json"
     settings.write_text(json.dumps({
-        "env": {"JARVIS_TOOL_LOG": str(log)},
+        "env": {"JARVIS_TOOL_LOG": str(log), **bash_first_env(bash_first)},
         # The SAME allow rules dispatch writes for a real worker, imported rather than
         # retyped. Naming a Serena tool in `tools:` makes it visible; permission is a
         # separate gate, and a headless turn cannot answer a prompt — probed live, a seat
@@ -183,7 +265,7 @@ def run_and_record(repo: Path, prompt: str, agents: dict[str, Path] | None = Non
         # measures whether a worker carrying its CLAUDE.md and settings reaches for
         # Serena — so the persona is APPENDED here and only here.
         claude_cli.run_headless(prompt, system_prompt=system_prompt, settings=settings,
-                                permission_mode="acceptEdits", model=MODEL, cwd=repo,
+                                permission_mode=permission_mode, model=MODEL, cwd=repo,
                                 timeout=timeout, tools=None, keep_default_context=True)
     except claude_cli.ClaudeCliError:
         pass  # the tool log is the measurement; a failed turn still made its calls
@@ -232,8 +314,8 @@ def test_a_seat_does_not_grep_for_code(repo, seat):
         repo, SEAT_QUESTION.format(seat=seat),
         agents={seat: ASSETS / "agents" / f"{seat}.md"})
 
-    used = seat_calls(calls, seat)
-    grepped = [t for t in used if t in TEXT_SEARCH_TOOLS]
+    seat_log = [c for c in calls if c.get("agent") == seat]
+    grepped = text_search_for_code(seat_log)
     assert not grepped, f"{seat} used {grepped} to find code that Serena had indexed"
 
 
@@ -250,16 +332,21 @@ def worker_briefing(repo) -> str:
         spec, [])
 
 
+@pytest.mark.parametrize("bash_first", STEER_ARMS)
 @scenario("navigation", "worker-uses-serena")
-def test_a_worker_finds_code_with_serena(repo, worker_briefing):
+def test_a_worker_finds_code_with_serena(repo, worker_briefing, bash_first):
     """No capability restriction is possible here — a worker needs Grep and Bash. The
     briefing's wording is the entire mechanism, so this is what would catch a rewording
-    that quietly drops the ranking."""
+    that quietly drops the ranking.
+
+    Two arms. `no-steer` is the fleet's new default and is ASSERTED. `steer` is recorded
+    only — see STEER_ARMS for why CI must not go red on it.
+    """
     calls = run_and_record(
         repo,
         "Where is `total_for` defined in this repository, and which functions call it? "
         "Do not change any files; just answer.",
-        system_prompt=worker_briefing)
+        system_prompt=worker_briefing, bash_first=bash_first)
 
     used = [c["tool"] for c in calls]
     assert used, f"the worker made no tool calls at all: {calls}"
@@ -268,15 +355,19 @@ def test_a_worker_finds_code_with_serena(repo, worker_briefing):
     )
 
 
+@pytest.mark.parametrize("bash_first", STEER_ARMS)
 @scenario("navigation", "worker-does-not-grep")
-def test_a_worker_does_not_grep_for_code(repo, worker_briefing):
+def test_a_worker_does_not_grep_for_code(repo, worker_briefing, bash_first):
+    """`Bash(grep -rn …)` counts here, not just `Grep` — see `bash_navigates_code`. The
+    same two arms, and the same reason the `steer` one is recorded rather than asserted.
+    """
     calls = run_and_record(
         repo,
         "Where is `apply_discount` defined in this repository, and which functions call "
         "it? Do not change any files; just answer.",
-        system_prompt=worker_briefing)
+        system_prompt=worker_briefing, bash_first=bash_first)
 
-    grepped = [c["tool"] for c in calls if c["tool"] in TEXT_SEARCH_TOOLS]
+    grepped = text_search_for_code(calls)
     assert not grepped, f"the worker used {grepped} to find code that Serena had indexed"
 
 
