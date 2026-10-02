@@ -40,6 +40,7 @@ from tests.test_inspection import (  # noqa: F401
     real_session,
     sub_rows,
     tool_rows,
+    under_floor_rows,
     write_meta,
     write_transcript,
 )
@@ -707,6 +708,31 @@ def test_a_nested_subagent_s_params_survive_the_round_trip_at_full(write_transcr
     assert sealed["turns"][0]["subagents"][0]["turns"][0]["spans"][0]["params"] == \
         {"pattern": "needle"}
     assert autopsy.from_seal(sealed, spans=[]).as_dict() == a.as_dict()
+
+
+def test_a_subagent_s_threshold_free_figures_survive_the_seal(write_transcript):
+    """Spec 2026-10-02 §1.3: a sealed order is the only reading left once the transcript
+    expires, so a field the seal drops becomes a silent zero on every settled order —
+    the exact failure mode this spec fixes."""
+    rows = under_floor_rows(1100) + [
+        # One cache read going BACKWARDS, so there is a boundary to round-trip too.
+        assistant_row(1200, "s-back", write=5_000, read=1_000)]
+    session = write_transcript("sealed-floor", parent_rows(),
+                               subagents={f"agent-{TASK}": rows})
+    a = inspection.read_session(session, cold_prefix_floor=50_000)
+    live = a.turns[0].subagents[0]
+
+    back = autopsy.from_seal(autopsy.to_seal(a, level="full"), spans=[])
+    sealed = back.turns[0].subagents[0]
+
+    assert sealed.total_written == live.total_written == 35_000
+    assert sealed.max_write == live.max_write == 5_000
+    assert sealed.write_floor == live.write_floor == 20_000
+    assert sealed.api_call_count == live.api_call_count == 7
+    assert [b.cause for b in sealed.boundaries] == [b.cause for b in live.boundaries]
+    assert len(sealed.boundaries) == 1
+    assert sealed.as_dict() == live.as_dict()
+    assert back.as_dict() == a.as_dict()
 
 
 def test_a_secret_in_a_nested_subagent_s_params_never_reaches_a_full_seal(

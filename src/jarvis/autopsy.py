@@ -219,7 +219,12 @@ def _turn(turn: inspection.Turn, *, params: bool) -> dict[str, Any]:
 def _subagent(sub: inspection.SubagentAnatomy, *, params: bool) -> dict[str, Any]:
     return {"task_id": sub.task_id, "label": sub.label, "deeper": sub.deeper,
             "turns": [_turn(t, params=params) for t in sub.turns],
-            "writes": [_write(w) for w in sub.writes]}
+            "writes": [_write(w) for w in sub.writes],
+            # THRESHOLD-FREE, and sealed for the reason spec 2026-10-02 §1.3 gives: a
+            # field the seal drops silently becomes zero on every settled order.
+            "total_written": sub.total_written, "max_write": sub.max_write,
+            "write_floor": sub.write_floor, "api_call_count": sub.api_call_count,
+            "boundaries": [_boundary(b) for b in sub.boundaries]}
 
 
 def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
@@ -369,7 +374,12 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
         task_id=row["task_id"], label=row.get("label", ""),
         deeper=row.get("deeper", 0),
         turns=[_read_turn(t) for t in row.get("turns") or []],
-        writes=[_read_write(w) for w in row.get("writes") or []])
+        writes=[_read_write(w) for w in row.get("writes") or []],
+        total_written=row.get("total_written", 0),
+        max_write=row.get("max_write", 0),
+        write_floor=row.get("write_floor", 0),
+        api_call_count=row.get("api_call_count", 0),
+        boundaries=[_read_boundary(b) for b in row.get("boundaries") or []])
 
 
 def from_seal(payload: dict[str, Any], *,
