@@ -106,8 +106,16 @@ kills it mid-final-turn and the work order lands as `failed` despite a perfect d
 run the staged mode instead:
 
 ```bash
-scripts/shipit.sh --stage 1.4.0 --wo <your-wo-id>
+scripts/shipit.sh --stage 1.4.0 --wo <your-wo-id> --base <sha>
 ```
+
+`--base` is the commit being shipped, and it is REQUIRED in staged mode: a release
+approval is scoped to the exact command string, so the sha has to be in it. Resolve it
+BEFORE you ask, so the reviewer and the command name one commit: the newest commit on
+`origin/main` that carries every fix you are shipping and whose CI is green, written out
+in full (40 characters). If that base is red, or you cannot read CI's verdict on it, say
+so and stop. Dropping or changing `--base` after approval invalidates the grant: the
+approved string names the commit.
 
 `--stage` performs every step **except** the service restarts and the Telegram notify,
 then writes `$JARVIS_HOME/run/pending_release.json`. From there the OS finishes the

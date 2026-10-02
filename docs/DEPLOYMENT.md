@@ -91,8 +91,16 @@ because staging is also what makes the release verifiable and what protects a ho
 has fallen back to the direct transport:
 
 ```bash
-scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345
+scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345 --base <sha>
 ```
+
+`--base` is REQUIRED in staged mode (2026-10-01 spec): a release approval authorises a
+byte-exact command string, so the commit being shipped has to be in it — the release
+branch is then cut from that sha and not from `origin/main`'s tip, whatever has merged
+since. Resolve it before asking for the gate: the newest commit on `origin/main` that
+carries every fix being shipped and whose CI is green, in full (40 characters); a red or
+unreadable base means say so and stop. Dropping or changing `--base` after approval
+invalidates the grant: the approved string names the commit.
 
 This performs every release step — preconditions, release branch, bump + tag, push,
 deploy of the tag to `$PRODUCTION_CODE/jarvis_os`, `uv sync` — **except** the service
@@ -101,7 +109,8 @@ restarts and the Telegram notify, then writes a marker file
 
 ```json
 {"wo_id": "wo-abc12345", "project": "jarvis_os", "version": "1.4.0",
- "tag": "jarvis-1.4.0", "staged_at": 1786500000, "state": "staged"}
+ "tag": "jarvis-1.4.0", "base": "442729f0c1e4b7a9d3f5068b2c4e7a1d9b0f3c58",
+ "staged_at": 1786500000, "state": "staged"}
 ```
 
 The daemon finishes the job (`src/jarvis/release.py`):
