@@ -2027,6 +2027,21 @@ def _print_bill(bill: dict) -> None:
               + _rewrite_cause(rewrite.get("ttl_share"),
                                rewrite.get("ttl_boundaries") or 0,
                                rewrite["boundaries"]))
+        # WHICH SIDE PAID IT (spec 2026-10-02 §1.5). The note only where the subagent
+        # side is a structural zero: a non-zero one is a real finding and that sentence
+        # would be a lie about it, so the two sides are then printed plainly.
+        sides = rewrite.get("by_side") or {}
+        sub_side = sides.get("subagent") or {}
+        if sub_side.get("structural_zero"):
+            print(bill_mod.SUBAGENT_REWRITE_ZERO.format(
+                count=sub_side.get("count", 0),
+                written=f"{sub_side.get('cache_write', 0):,}"))
+        elif sub_side:
+            main_side = sides.get("main") or {}
+            print(f"by side — main {main_side.get('tokens', 0):,} tokens across "
+                  f"{main_side.get('boundaries', 0)}, "
+                  f"subagent {sub_side.get('tokens', 0):,} across "
+                  f"{sub_side.get('boundaries', 0)}")
     subagents = bill.get("subagents") or {}
     if subagents.get("count"):
         print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
@@ -2077,6 +2092,23 @@ BAR_GLYPHS = {"generating": "█", "blocked": "▓", "tools": "▒", "idle": "�
 
 #: Fixed, so every turn's bar is comparable at a glance and the columns after it line up.
 BAR_WIDTH = 20
+
+#: A SUBAGENT'S THREE CACHE STATES (spec 2026-10-02 §1.4), worded here beside
+#: `PART_LABELS` because the dashboard reads the payload and not these words. An empty
+#: floored list can never read as "nothing here": `no large writes` is deleted, because
+#: a subagent that wrote 334,427 tokens in 115 sub-floor writes rendered as that string
+#: (wo-fb7c0fc2, a8e11a7e).
+SUB_UNDER_FLOOR = ("wrote {total} in {calls} calls — no single write reached the "
+                   "{floor:,} floor (largest {largest})")
+SUB_NO_WRITES = "wrote nothing to the cache"
+#: The ZERO as the FINDING rather than as silence: a subagent's written volume never
+#: exceeds its own context peak and one continuous conversation has no cache read going
+#: backwards, so the arithmetic can give nothing else.
+SUB_NO_BOUNDARY = ("no boundary — one continuous conversation, so no re-write tax. "
+                   "STRUCTURAL, not small: {written} was still written")
+#: NEVER "0 prefix misses", which would read as a finding: with no floor the TTL-vs-prefix
+#: split is not measured (`usage.classify_boundaries`).
+SUB_UNCLASSIFIED = "unclassified (no os.cold_prefix_floor)"
 
 #: What a turn with no API call says, ahead of any duration breakdown. A fixed width so
 #: the split below it stays a column, and stated rather than left to be inferred from
@@ -2148,9 +2180,34 @@ def _print_subagent(sub: dict[str, Any], indent: str) -> None:
     """
     writes = ", ".join(f"{cause} {_tok(written)}"
                        for cause, written in (sub["writes_by_cause"] or {}).items())
+    total = sub.get("total_written", 0)
+    if writes:
+        cache = "writes " + writes
+    elif total:
+        # THE FLOOR, NAMED. An empty list at a 20,000 floor is "nothing at that floor",
+        # and the threshold-free figures are the only thing that can say so (§1.4).
+        cache = SUB_UNDER_FLOOR.format(total=f"{total:,}",
+                                       calls=sub.get("api_call_count", 0),
+                                       floor=sub.get("write_floor", 0),
+                                       largest=f"{sub.get('max_write', 0):,}")
+    else:
+        cache = SUB_NO_WRITES
     print(f"{indent}⤷ {sub['label'] or sub['task_id']}  {_mins(sub['wall']):>7}  "
           f"{sub['api_calls']:>3} api calls  peak {_tok(sub['context_peak']):>5}  "
-          f"{'writes ' + writes if writes else 'no large writes'}")
+          f"{cache}")
+    census = sub.get("rewrite") or {}
+    if census.get("boundaries"):
+        parts = [f"{census['boundaries']} boundar"
+                 f"{'ies' if census['boundaries'] != 1 else 'y'}",
+                 f"re-write {_tok(census['tokens'])}"]
+        if census.get("undecided_boundaries"):
+            parts.append(SUB_UNCLASSIFIED)
+        else:
+            parts.append(f"ttl {_tok(census['ttl_write'])}, "
+                         f"prefix-miss {_tok(census['prefix_write'])}")
+        print(f"{indent}  {' · '.join(parts)}")
+    elif total:
+        print(f"{indent}  {SUB_NO_BOUNDARY.format(written=f'{total:,}')}")
     if sub["deeper"]:
         # Never imply completeness (spec §4b): one directory level is globbed, so a
         # subagent's own subagents are counted and their transcripts are not read.

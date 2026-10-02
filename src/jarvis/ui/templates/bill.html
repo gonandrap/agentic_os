@@ -210,6 +210,23 @@
     Jarvis cannot fix it; what it can do is cost fewer boundaries, which is why sending
     a worker one message beats sending it three.
   </p>
+  {# WHICH SIDE PAID IT (spec 2026-10-02 §1.5). The sentence comes from
+     `bill.SUBAGENT_REWRITE_ZERO`, read by `jarvis cost` too, and ONLY where the subagent
+     side is a structural zero: a non-zero one is a real finding. #}
+  {% if bill.rewrite.by_side and bill.rewrite.by_side.subagent.structural_zero %}
+  <p class="sub" style="margin: 6px 0 0;">
+    {{ subagent_rewrite_zero.format(
+         count=bill.rewrite.by_side.subagent.count,
+         written='{:,}'.format(bill.rewrite.by_side.subagent.cache_write)) }}
+  </p>
+  {% elif bill.rewrite.by_side %}
+  <p class="sub" style="margin: 6px 0 0;">
+    by side — main {{ '{:,}'.format(bill.rewrite.by_side.main.tokens) }} tokens across
+    {{ bill.rewrite.by_side.main.boundaries }}, subagent
+    {{ '{:,}'.format(bill.rewrite.by_side.subagent.tokens) }} across
+    {{ bill.rewrite.by_side.subagent.boundaries }}.
+  </p>
+  {% endif %}
 </div>
 {% endif %}
 

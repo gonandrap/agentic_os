@@ -1990,6 +1990,132 @@ def test_a_subagent_s_prefix_miss_is_never_folded_into_the_parent_s_writes(
     assert inspection.PREFIX_MISS not in [w.cause for w in anatomy.writes]
 
 
+# -- the floor, named: an empty floored list is never an absence (spec 2026-10-02 §1) --
+
+
+def under_floor_rows(base: float, *, count: int = 6, write: int = 5_000) -> list[dict]:
+    """A subagent of many writes, every one of them under `report_write_floor`.
+
+    wo-fb7c0fc2's `a8e11a7e` shape, scaled: 115 writes, largest 19,381, none at 20,000.
+    """
+    rows: list[dict] = [prompt_row(base, "do the thing", sdk=False)]
+    rows += [assistant_row(base + 1 + i, f"u-m{i}", write=write,
+                           read=100_000 + 1_000 * i)
+             for i in range(count)]
+    return rows
+
+
+def test_a_subagent_whose_every_write_is_under_the_floor_reports_the_total_anyway(
+        write_transcript):
+    """§1.1: `writes` empty is "nothing AT THAT FLOOR", and the threshold-free figures
+    beside it are the only thing that can say so."""
+    anatomy = inspection.read_session(write_transcript(
+        "under-floor", parent_rows(),
+        subagents={f"agent-{TASK}": under_floor_rows(1100)}))
+    sub = anatomy.turns[0].subagents[0]
+
+    assert sub.writes == []
+    assert sub.total_written == 30_000
+    assert sub.max_write == 5_000 < sub.write_floor
+    assert sub.write_floor == 20_000
+    assert sub.api_call_count == 6
+
+
+def test_a_subagent_that_wrote_nothing_is_a_different_answer_from_under_the_floor(
+        write_transcript):
+    anatomy = inspection.read_session(write_transcript(
+        "no-writes", parent_rows(), subagents={f"agent-{TASK}": sub_rows(1100)}))
+    sub = anatomy.turns[0].subagents[0]
+
+    assert sub.writes == [] and sub.total_written == 0 and sub.max_write == 0
+
+
+def test_a_subagent_whose_cache_read_goes_backwards_has_one_boundary(write_transcript):
+    """§1.2: `usage.classify_boundaries` over THIS subagent's calls, reused and not
+    reimplemented."""
+    rows = [prompt_row(1100, "do the thing", sdk=False),
+            assistant_row(1101, "b-m1", write=5_000, read=200_000),
+            assistant_row(1102, "b-m2", write=5_000, read=1_000)]
+    anatomy = inspection.read_session(
+        write_transcript("sub-boundary", parent_rows(),
+                         subagents={f"agent-{TASK}": rows}),
+        cold_prefix_floor=50_000)
+    sub = anatomy.turns[0].subagents[0]
+
+    assert len(sub.boundaries) == 1
+    assert sub.rewrite()["boundaries"] == 1
+    assert sub.rewrite()["cache_write"] == sub.total_written == 10_000
+
+
+def test_a_continuous_subagent_has_no_boundary_and_a_structural_zero_tax(
+        write_transcript):
+    """The structural zero §1.5 must label: a monotonic subagent whose written volume
+    never exceeds its own context peak pays NO re-write tax, by arithmetic."""
+    anatomy = inspection.read_session(
+        write_transcript("sub-monotonic", parent_rows(),
+                         subagents={f"agent-{TASK}": under_floor_rows(1100)}),
+        cold_prefix_floor=50_000)
+    sub = anatomy.turns[0].subagents[0]
+
+    assert sub.boundaries == []
+    assert sub.rewrite()["tokens"] == 0 and sub.rewrite()["boundaries"] == 0
+
+
+def test_an_unknown_cold_prefix_floor_is_undecided_and_never_zero_prefix_misses(
+        write_transcript):
+    """§1.2: `None` yields `BOUNDARY_UNDECIDED`, so 0 prefix misses can never be read
+    as a finding."""
+    rows = [prompt_row(1100, "do the thing", sdk=False),
+            assistant_row(1101, "u-m1", write=5_000, read=200_000),
+            assistant_row(1500, "u-m2", write=5_000, read=1_000)]
+    anatomy = inspection.read_session(write_transcript(
+        "sub-undecided", parent_rows(), subagents={f"agent-{TASK}": rows}))
+    sub = anatomy.turns[0].subagents[0]
+
+    assert [b.cause for b in sub.boundaries] == [usage.BOUNDARY_UNDECIDED]
+    assert sub.rewrite()["undecided_boundaries"] == 1
+    assert sub.rewrite()["prefix_write"] == 0
+
+
+def test_api_call_count_and_the_api_calls_property_can_disagree(write_transcript):
+    """WHY `api_call_count` is a field and not the existing property: a subagent
+    transcript with no prompt row yields NO turns (`read_transcript` opens one only at a
+    prompt), so the property counts 0 calls over 0 turns while two were made. The
+    threshold-free total has to be readable as a rate either way (§1.1)."""
+    rows = [assistant_row(1101, "h-m1", write=5_000, read=100_000),
+            assistant_row(1102, "h-m2", write=5_000, read=101_000)]
+    anatomy = inspection.read_session(write_transcript(
+        "headless-sub", parent_rows(), subagents={f"agent-{TASK}": rows}))
+    sub = anatomy.turns[0].subagents[0]
+
+    assert sub.turns == [] and sub.api_calls == 0
+    assert sub.api_call_count == 2 and sub.total_written == 10_000
+
+
+def test_the_five_new_fields_are_on_the_payload(write_transcript):
+    """`as_dict()` carries them, because the dashboard DERIVES NOTHING (§1.1)."""
+    anatomy = inspection.read_session(
+        write_transcript("sub-payload", parent_rows(),
+                         subagents={f"agent-{TASK}": under_floor_rows(1100)}),
+        cold_prefix_floor=50_000)
+    row = anatomy.turns[0].subagents[0].as_dict()
+
+    assert row["total_written"] == 30_000 and row["max_write"] == 5_000
+    assert row["write_floor"] == 20_000 and row["api_call_count"] == 6
+    assert row["rewrite"]["boundaries"] == 0 and row["rewrite"]["tokens"] == 0
+
+
+def test_both_rewrite_blocks_have_the_same_keys(write_transcript):
+    """One spelling of that dict (§1.1): two is how one key comes to mean two things."""
+    anatomy = inspection.read_session(
+        write_transcript("rewrite-keys", parent_rows(),
+                         subagents={f"agent-{TASK}": under_floor_rows(1100)}),
+        cold_prefix_floor=50_000)
+
+    assert (set(anatomy.turns[0].subagents[0].rewrite())
+            == set(anatomy.rewrite()))
+
+
 def test_a_subagent_no_span_names_is_unattached_and_on_no_turn(write_transcript):
     """Issue 227's mistake was inventing a parent the record does not name: no timestamp
     fallback, so an unnamed subagent is REPORTED as unattached."""
@@ -2198,6 +2324,66 @@ def test_a_deeper_subagent_says_its_levels_were_not_read(
     out = capsys.readouterr().out
 
     assert "NOT read" in out and "depth read 1" in out
+
+
+def test_an_under_floor_subagent_never_renders_as_no_large_writes(
+        write_transcript, capsys):
+    """§1.4: the string `no large writes` is DELETED. An empty floored list reads as a
+    floor, with the threshold-free total in the sentence."""
+    session = write_transcript(
+        "floor-render", parent_rows(),
+        subagents={f"agent-{TASK}": under_floor_rows(1100)})
+
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+
+    assert "no large writes" not in out
+    assert "no single write reached the" in out
+    assert "30,000" in out and "6 calls" in out and "20,000 floor" in out
+
+
+def test_a_subagent_that_wrote_nothing_says_so(write_transcript, capsys):
+    session = write_transcript("zero-render", parent_rows(),
+                               subagents={f"agent-{TASK}": sub_rows(1100)})
+
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+
+    from jarvis import cli
+
+    assert cli.SUB_NO_WRITES in out and "no large writes" not in out
+
+
+def test_a_continuous_subagent_s_zero_tax_is_rendered_as_structural(
+        write_transcript, capsys):
+    """§1.4: the zero is the FINDING, worded so it can never read as "nothing here"."""
+    session = write_transcript("structural-render", parent_rows(),
+                               subagents={f"agent-{TASK}": under_floor_rows(1100)})
+
+    rendered(inspection.read_session(session, cold_prefix_floor=50_000))
+    out = capsys.readouterr().out
+
+    assert "no boundary" in out and "STRUCTURAL, not small" in out
+
+
+def test_the_unread_depth_line_survives_the_new_states(
+        write_transcript, tmp_path, capsys):
+    """`SUBAGENT_DEPTH_READ` stays 1 and the unread-depth labelling q1215 requires
+    stays exactly as it was (§1.4)."""
+    session = write_transcript(
+        "floor-deep-render", parent_rows(),
+        subagents={f"agent-{TASK}": under_floor_rows(1100)})
+    deeper = (tmp_path / "projects" / "-proj" / session / "subagents"
+              / f"agent-{TASK}" / "subagents")
+    deeper.mkdir(parents=True)
+    (deeper / "agent-child.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in sub_rows(1150)))
+
+    rendered(inspection.read_session(session))
+    out = capsys.readouterr().out
+
+    assert "NOT read — depth read 1" in out
+    assert inspection.SUBAGENT_DEPTH_READ == 1
 
 
 def test_an_unattached_subagent_gets_its_own_section(write_transcript, capsys):
