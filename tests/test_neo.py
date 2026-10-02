@@ -1030,6 +1030,52 @@ def test_every_chosen_cause_is_asked_for_by_at_least_one_persona():
     assert set(ESCALATION_CAUSES_CHOSEN) == every
 
 
+def test_the_three_classes_are_disjoint_and_sum_to_the_enum():
+    """Three tuples because "who decided" has three answers (Neo, question 1170). One
+    tuple would invite a report that adds them up, which is the reading this exists to
+    prevent."""
+    from jarvis.neo_store import (ESCALATION_CAUSES, ESCALATION_CAUSES_CHOSEN,
+                                  ESCALATION_CAUSES_FAILED,
+                                  ESCALATION_CAUSES_OVERRIDDEN)
+
+    chosen, overridden, failed = (set(ESCALATION_CAUSES_CHOSEN),
+                                  set(ESCALATION_CAUSES_OVERRIDDEN),
+                                  set(ESCALATION_CAUSES_FAILED))
+    assert not chosen & overridden and not chosen & failed
+    assert not overridden & failed
+    assert chosen | overridden | failed == set(ESCALATION_CAUSES)
+    assert len(ESCALATION_CAUSES) == len(set(ESCALATION_CAUSES))
+    assert overridden == {"stakes-high", "stakes-unclassified", "stakes-unreadable",
+                          "neo-denied", "scope-over-cap"}
+
+
+def test_a_model_may_never_name_an_overridden_cause(jarvis_home):
+    """These five are facts about what the OS did with Neo's answer. A model claiming one
+    is describing something it cannot know, so `parse_verdict` drops it — and a persona
+    that offered one would be asking for a label nobody could trust."""
+    from jarvis import autoreview, gates, plans, supervisor
+    from jarvis.neo_store import ESCALATION_CAUSES_OVERRIDDEN
+
+    v = neo_mod.parse_verdict('{"escalate": true, "answer": "", "reason": "r",'
+                              ' "cause": "stakes-high"}')
+    assert v["cause"] == ""
+    for text in (neo_mod.PERSONA, gates.REVIEWER_PERSONA, plans.PLAN_REVIEWER_PERSONA,
+                 supervisor.ALARM_REVIEWER_PERSONA,
+                 autoreview.ASSUMPTION_REVIEWER_PERSONA):
+        for member in ESCALATION_CAUSES_OVERRIDDEN:
+            assert member not in text
+
+
+def test_mark_records_a_cause_from_the_overridden_class(jarvis_home):
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.mark(q["id"], "escalated", reason="r", cause="scope-over-cap")
+        assert neo.get(q["id"])["escalation_cause"] == "scope-over-cap"
+    finally:
+        neo.close()
+
+
 def test_mark_refuses_a_cause_outside_the_enum(jarvis_home):
     neo = NeoStore()
     try:

@@ -79,6 +79,40 @@ ESCALATION_CAUSES_FAILED = (...)   # the OS derived this, mechanically
 ESCALATION_CAUSES = ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_FAILED
 ```
 
+**AMENDED, Neo's ruling on question 1170 — there are THREE tuples, not two.** Two classes
+cannot express the largest escalation population: four sites in `daemon.py` re-mark a
+question `escalated` AFTER Neo ANSWERED, because the OS overrode the answer, and that is a
+third answer to "who decided". So a third tuple ships:
+
+```python
+ESCALATION_CAUSES_OVERRIDDEN = ("stakes-high", "stakes-unclassified",
+                                "stakes-unreadable", "neo-denied", "scope-over-cap")
+```
+
+Five members, every one derived mechanically by `autoreview.escalation_cause` (one pure
+helper, so the four call sites cannot drift) from `Ruling.overridden`, `Ruling.stakes`,
+`Ruling.accept`, the verdict's own `escalate` and the plan path's child cap. Never read off
+a reply: no persona offers one, and `neo.parse_verdict` drops one a model names.
+`stakes-unclassified` MOVES here out of FAILED — the OS overriding an acceptance is not
+"Neo never answered".
+
+The same ruling DROPS `classifier-unreachable` and `classifier-unparseable`:
+`stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `autoreview.HELD_HIGH_STAKES`, which
+holds the review before any question row exists, so nothing could ever write them. A class
+nothing can write is better documented as invisible than left in the enum, so the report
+NAMES it instead — `ops.NEO_ESCALATION_INVISIBLE_NOTE`, rendered by the CLI and the page as
+what the reader cannot see here rather than as a zero.
+
+`causes` therefore has four keys: `{"chosen": {...}, "overridden": {...},
+"failed": {...}, "not_recorded": n}`, and a cause in none of the three tuples still counts
+into `not_recorded`. Both renderers show the three classes as three labelled groups, each
+carrying the sentence that says what it means for who decided.
+
+The site this does NOT label: `_deliver_assumption_verdict`'s settle-time drop
+(`still.armed` false). Neo's ruling ACCEPTED there — the escalation was caused by the
+condition table re-running, which `still.code` records on the work order — so the cause is
+NULL. A member of the enum would claim a stakes word or a denial that did not happen.
+
 **Chosen — each member is tied to the persona text that asks for it. No member exists that
 no persona mentions.**
 

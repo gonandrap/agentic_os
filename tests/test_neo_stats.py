@@ -124,7 +124,8 @@ def test_an_empty_fleet_reports_measured_zeroes_and_absent_ratios(fleet):
     assert q["escalation_rate"] is None
     assert res["per_order"]["questions_per_wo"] is None
     assert res["per_order"]["questions_per_fo"] is None
-    assert res["causes"] == {"chosen": {}, "failed": {}, "not_recorded": 0}
+    assert res["causes"] == {"chosen": {}, "overridden": {}, "failed": {},
+                             "not_recorded": 0}
     assert res["latency"]["by_kind"] == {} and res["latency"]["unmeasured"] == 0
 
 
@@ -145,11 +146,15 @@ def test_open_questions_alone_leave_the_rate_absent(fleet):
 
 # -- 3. the cause split ---------------------------------------------------------------
 
-def test_the_three_cause_buckets_never_add_into_each_other(fleet):
+def test_the_four_cause_buckets_never_add_into_each_other(fleet):
+    """THREE CLASSES, because "who decided" has three answers (Neo, question 1170): Neo
+    handed it back, Neo answered and the OS overrode it, or Neo never answered."""
     neo = NeoStore()
     try:
         seed_question(neo, status="escalated", cause="high-stakes")
         seed_question(neo, status="escalated", cause="high-stakes")
+        seed_question(neo, status="escalated", cause="stakes-unclassified")
+        seed_question(neo, status="escalated", cause="neo-denied")
         seed_question(neo, status="failed", cause="attempts-exhausted")
         seed_question(neo, status="escalated")            # predates cause recording
         # and an ANSWERED question is in no bucket at all
@@ -159,10 +164,37 @@ def test_the_three_cause_buckets_never_add_into_each_other(fleet):
 
     causes = ops.neo_stats_report()["causes"]
     assert causes["chosen"] == {"high-stakes": 2}
+    assert causes["overridden"] == {"stakes-unclassified": 1, "neo-denied": 1}
     assert causes["failed"] == {"attempts-exhausted": 1}
     assert causes["not_recorded"] == 1
-    assert sum(causes["chosen"].values()) + sum(causes["failed"].values()) \
-        + causes["not_recorded"] == 4
+    assert sum(causes["chosen"].values()) + sum(causes["overridden"].values()) \
+        + sum(causes["failed"].values()) + causes["not_recorded"] == 6
+
+
+def test_a_member_a_release_dropped_lands_in_not_recorded(fleet):
+    """The two classifier members `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` could
+    never be written and were dropped from the enum: a row carrying one is not a cause."""
+    neo = NeoStore()
+    try:
+        qid = seed_question(neo, status="failed")
+        neo.conn.execute("UPDATE questions SET escalation_cause='classifier-unreachable' "
+                         "WHERE id=?", (qid,))
+    finally:
+        neo.close()
+
+    causes = ops.neo_stats_report()["causes"]
+    assert causes["chosen"] == causes["overridden"] == causes["failed"] == {}
+    assert causes["not_recorded"] == 1
+
+
+def test_the_report_names_the_class_the_counts_cannot_show(fleet):
+    """Neo's ruling on 1170: a class nothing can ever write is better documented as
+    invisible than left in the enum — so the report has to SAY what is not in it."""
+    res = ops.neo_stats_report()
+    note = res["causes_note"]
+    assert note == ops.NEO_ESCALATION_INVISIBLE_NOTE
+    assert "never became a Neo question" in note
+    assert "not in these counts" in note
 
 
 def test_a_cause_in_neither_tuple_is_counted_as_not_recorded(fleet):
@@ -296,3 +328,27 @@ def test_the_human_rendering_of_an_empty_fleet_prints_no_measured_zero_rate(flee
     assert "escalation rate   not recorded" in out
     # and the counts, which ARE measured zeroes, print as 0
     assert "escalated         0" in out
+
+
+def test_the_rendering_reads_the_causes_as_three_answers_to_who_decided(fleet, capsys):
+    """A flat list of labels is not the deliverable: each class carries the sentence that
+    says what it MEANS for who decided, and the invisible class is named."""
+    from jarvis import cli
+
+    neo = NeoStore()
+    try:
+        seed_question(neo, status="escalated", cause="high-stakes")
+        seed_question(neo, status="escalated", cause="stakes-unclassified")
+        seed_question(neo, status="failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+    capsys.readouterr()
+    assert cli.main(["neo", "stats"]) == 0
+
+    out = capsys.readouterr().out
+    assert "Neo chose to hand it back" in out
+    assert "Neo answered and the OS overrode it" in out
+    assert "Neo never answered" in out
+    for member in ("high-stakes", "stakes-unclassified", "transport-unreachable"):
+        assert member in out
+    assert ops.NEO_ESCALATION_INVISIBLE_NOTE in out

@@ -79,31 +79,34 @@
 {% endif %}
 
 <h2>What it escalates for</h2>
+{# THREE LABELLED GROUPS, because "who decided" has three answers (Neo, question 1170).
+   A flat list of every label would not answer the question the page exists for. #}
+{% for key, heading, per_row in [
+     ('chosen', 'Neo chose to hand it back', 'Neo chose this label'),
+     ('overridden', 'Neo answered and the OS overrode it',
+      'the OS derived it from the answer'),
+     ('failed', 'Neo never answered', 'the OS derived it — no judgement at all')] %}
+<p class="sub">{{ heading }}</p>
 <div class="panel">
-  {% for cause, n in report.causes.chosen | dictsort(by='value', reverse=true) %}
+  {% for cause, n in report.causes[key] | dictsort(by='value', reverse=true) %}
   <div class="row">
     <span class="mono grow">{{ cause }}</span>
-    <span class="sub">Neo chose this label</span>
+    <span class="sub">{{ per_row }}</span>
     <span class="mono" style="width: 60px; text-align: right;">{{ n }}</span>
   </div>
+  {% else %}
+  <div class="empty">none in this window</div>
   {% endfor %}
-  {% for cause, n in report.causes.failed | dictsort(by='value', reverse=true) %}
-  <div class="row">
-    <span class="mono grow">{{ cause }}</span>
-    <span class="sub">the OS derived it — not Neo's judgement</span>
-    <span class="mono" style="width: 60px; text-align: right;">{{ n }}</span>
-  </div>
-  {% endfor %}
-  {% if not report.causes.chosen and not report.causes.failed %}
-  <div class="empty">no escalation in this window carries a cause</div>
-  {% endif %}
 </div>
+{% endfor %}
 {% if report.causes.not_recorded %}
 {# NOT rendered as a cause: nobody may read the backlog as a finding about Neo. #}
 <p class="sub">{{ report.causes.not_recorded }}
   escalation{{ '' if report.causes.not_recorded == 1 else 's' }} predate cause
   recording — those rows have only prose, and no label was guessed from it.</p>
 {% endif %}
+{# The class that is in none of the three counts, said as what cannot be seen here. #}
+<p class="sub">{{ report.causes_note }}</p>
 
 <h2>By kind</h2>
 <div class="panel">

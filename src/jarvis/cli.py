@@ -4279,17 +4279,30 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
                   f"escalated {d['escalated']:>3} · rate {_pct(d['escalation_rate'])}")
 
     causes = res["causes"]
-    print("\nWHAT IT ESCALATES FOR")
-    for cause, n in sorted(causes["chosen"].items(), key=lambda kv: -kv[1]):
-        print(f"  {cause:<24} {n:>4}   (Neo chose this label)")
-    for cause, n in sorted(causes["failed"].items(), key=lambda kv: -kv[1]):
-        print(f"  {cause:<24} {n:>4}   (the OS derived it — not Neo's judgement)")
-    if not causes["chosen"] and not causes["failed"]:
-        print(f"  {NOT_RECORDED} — no escalation in this window carries a cause")
+    print("\nWHAT IT ESCALATES FOR — three classes, because WHO DECIDED has three "
+          "answers")
+    # Three labelled groups, each with the sentence that says what the class means. A flat
+    # list of fifteen labels would not answer the question the report exists for (§3 of
+    # docs/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
+    groups = (("chosen", "Neo chose to hand it back", "Neo chose this label"),
+              ("overridden", "Neo answered and the OS overrode it",
+               "the OS derived it from Neo's answer"),
+              ("failed", "Neo never answered",
+               "the OS derived it — no judgement at all"))
+    for key, heading, per_row in groups:
+        bucket = causes[key]
+        print(f"  {heading}")
+        if not bucket:
+            print(f"    {NOT_RECORDED} — none in this window")
+            continue
+        for cause, n in sorted(bucket.items(), key=lambda kv: -kv[1]):
+            print(f"    {cause:<24} {n:>4}   ({per_row})")
     if causes["not_recorded"]:
         # NOT printed as a cause: nobody may read the backlog as a finding about Neo.
         print(f"  {causes['not_recorded']} escalation"
               f"{'' if causes['not_recorded'] == 1 else 's'} predate cause recording")
+    # The class that is in NO count above, said as what the reader cannot see here.
+    print(f"  note: {res['causes_note']}")
 
     print("\nBY KIND")
     for kind, k in sorted(res["by_kind"].items(), key=lambda kv: -kv[1]["asked"]):

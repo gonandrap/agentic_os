@@ -412,6 +412,31 @@ def test_the_neo_stats_page_prints_the_counts_and_the_cause_split(client, daemon
     assert "Neo chose this label" in page
 
 
+def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client, daemon,
+                                                                        project):
+    """Neo, question 1170: an override is a THIRD answer to "who decided", and the class
+    nothing can write is named rather than left to vanish."""
+    from jarvis import ops as ops_mod
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="stakes-unclassified")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "stakes-unclassified" in page
+    assert "Neo answered and the OS overrode it" in page
+    assert "Neo chose to hand it back" in page
+    assert "Neo never answered" in page
+    assert ops_mod.NEO_ESCALATION_INVISIBLE_NOTE in page
+
+
 def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
     page = client.get("/neo/stats?project=nope")
     assert page.status_code == 200

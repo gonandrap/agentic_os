@@ -13526,6 +13526,18 @@ NEO_ASSUMPTION_KIND_NOTE = (
     "project database and walking events per question"
 )
 
+#: THE ESCALATION CLASS THESE COUNTS CANNOT SHOW, named rather than left to vanish —
+#: Neo's ruling on question 1170. `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach
+#: `autoreview.HELD_HIGH_STAKES`, which holds the review before a Neo question row exists,
+#: so the two `classifier-*` members were dropped from the enum. Worded as what the reader
+#: cannot see here and NOT as a zero: a zero would be a measured figure, and this
+#: population is simply absent from the table.
+NEO_ESCALATION_INVISIBLE_NOTE = (
+    "an assumption the OS held because the stakes classifier could not be reached, or "
+    "could not be read, never became a Neo question at all — so those are not in these "
+    "counts, in any class"
+)
+
 
 def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
     """Over SETTLED questions only, and `None` — never `0.0` — with no denominator.
@@ -13586,7 +13598,8 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     from . import agent_usage
     from . import usage as usage_mod
     from .neo_store import (ESCALATION_CAUSES_CHOSEN, ESCALATION_CAUSES_FAILED,
-                            NEO_HELD_Q_STATUSES, NeoStore)
+                            ESCALATION_CAUSES_OVERRIDDEN, NEO_HELD_Q_STATUSES,
+                            NeoStore)
 
     since = db.now() - days * 86400 if days else None
     paths = registered_project_paths()
@@ -13646,12 +13659,16 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
     question_days = [by_day[day] for day in sorted(by_day)][-limit:]
 
     chosen: dict[str, int] = {}
+    overridden_causes: dict[str, int] = {}
     failed_causes: dict[str, int] = {}
     not_recorded = 0
     for row in cause_rows:
         cause, n = row["cause"], int(row["n"] or 0)
         if cause in ESCALATION_CAUSES_CHOSEN:
             chosen[cause] = chosen.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_OVERRIDDEN:
+            # The third answer to "who decided": Neo answered and the OS did not take it.
+            overridden_causes[cause] = overridden_causes.get(cause, 0) + n
         elif cause in ESCALATION_CAUSES_FAILED:
             failed_causes[cause] = failed_causes.get(cause, 0) + n
         else:
@@ -13754,8 +13771,9 @@ def neo_stats_report(project: str | None = None, days: int | None = None,
         "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
         "by_project": by_project,
         "by_day": question_days,
-        "causes": {"chosen": chosen, "failed": failed_causes,
-                   "not_recorded": not_recorded},
+        "causes": {"chosen": chosen, "overridden": overridden_causes,
+                   "failed": failed_causes, "not_recorded": not_recorded},
+        "causes_note": NEO_ESCALATION_INVISIBLE_NOTE,
         "per_order": per_order,
         "spend": {"totals": spend_totals, "by_kind": spend_by_kind,
                   "by_project": spend_by_project,

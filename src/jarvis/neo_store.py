@@ -99,9 +99,10 @@ LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 # `SEATS`' reason exactly: the personas, the CLI and the report all need it and none
 # should have to depend on another.
 #
-# TWO TUPLES, because the two classes are different kinds of fact and one tuple invites a
-# report that adds them up. CHOSEN is a label the model picked, and every member is tied
-# to the persona text that asks for it (no member exists that no persona mentions).
+# THREE TUPLES, because "who decided" has THREE answers (Neo's ruling on question 1170)
+# and one tuple invites a report that adds them up. CHOSEN is a label the model picked,
+# and every member is tied to the persona text that asks for it (no member exists that no
+# persona mentions).
 ESCALATION_CAUSES_CHOSEN = (
     "high-stakes",
     "no-learning-applies",
@@ -112,19 +113,35 @@ ESCALATION_CAUSES_CHOSEN = (
     "evidence-insufficient",
     "user-decision",
 )
-# FAILED is derived by the OS at the code path, never read off a model's reply.
-# `stakes-unclassified` sits here and that placement is the point: it is a reply the OS
-# would not read as an answer, not a judgement Neo made.
+# OVERRIDDEN is the third answer and the largest escalation population: NEO ANSWERED AND
+# THE OS DID NOT TAKE THE ANSWER. Every member is derived mechanically by
+# `autoreview.escalation_cause` from facts the code holds — a stakes word, a denial with
+# no machine rejection behind it, a child count — and NONE is ever read off a reply or
+# matched out of prose. The four daemon sites that re-mark a question `escalated` after
+# Neo answered write these, and `kind='assumption'` is the kind they cover.
+ESCALATION_CAUSES_OVERRIDDEN = (
+    "stakes-high",            # Neo accepted and flagged it high; the OS obeyed
+    "stakes-unclassified",    # no readable stakes, and silence is not routine
+    "stakes-unreadable",      # a stakes word the OS cannot read as routine
+    "neo-denied",             # `verdict: deny`, and there is no machine rejection
+    "scope-over-cap",         # children at or over `plans.CHILD_CAP`
+)
+# FAILED is derived by the OS at the code path too, and the distinction from OVERRIDDEN
+# is that NEO NEVER ANSWERED AT ALL.
+#
+# `classifier-unreachable` / `classifier-unparseable` were REMOVED: `stakes`'
+# `HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `autoreview.HELD_HIGH_STAKES`, which
+# holds the review before any question row exists, so nothing could ever write them. A
+# class nothing can write is better documented as invisible than left in the enum (Neo,
+# question 1170) — the report names it, through `ops.NEO_ESCALATION_INVISIBLE_NOTE`.
 ESCALATION_CAUSES_FAILED = (
     "transport-unreachable",
     "attempts-exhausted",
     "prompt-refused",
     "unparseable-reply",
-    "classifier-unreachable",
-    "classifier-unparseable",
-    "stakes-unclassified",
 )
-ESCALATION_CAUSES = ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_FAILED
+ESCALATION_CAUSES = (ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_OVERRIDDEN
+                     + ESCALATION_CAUSES_FAILED)
 
 # How one seat's contribution ended. A seat that errors or times out is recorded as
 # `abstained` and the panel proceeds; `failed` is for a call that came back unusable.

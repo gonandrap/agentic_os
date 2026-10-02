@@ -529,6 +529,80 @@ def test_everything_that_is_not_an_explicit_approval_stays_with_the_user(verdict
     assert not autoreview.read_ruling(verdict).accept
 
 
+# -- why the OS escalated, as one groupable label --------------------------------------
+#
+# docs/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
+# override is a THIRD answer to "who decided", so these five members are their own class
+# and every one is derived from facts the code already holds — never read off a reply.
+
+
+def test_an_override_names_the_stakes_word_that_caused_it():
+    high = autoreview.read_ruling(accepted(stakes="high"))
+    assert autoreview.escalation_cause(high) == "stakes-high"
+    unclassified = accepted()
+    unclassified.pop("stakes")
+    assert autoreview.escalation_cause(
+        autoreview.read_ruling(unclassified)) == "stakes-unclassified"
+    odd = autoreview.read_ruling(accepted(stakes="elevated"))
+    assert autoreview.escalation_cause(odd) == "stakes-unreadable"
+
+
+def test_neo_declining_with_no_machine_rejection_is_its_own_cause():
+    denied = autoreview.read_ruling(accepted(verdict="denied"))
+    assert autoreview.escalation_cause(denied) == "neo-denied"
+
+
+def test_children_at_or_over_the_cap_is_the_plan_paths_cause():
+    """No `Ruling` on that path: the cap outranks whatever Neo said about the plan."""
+    assert autoreview.escalation_cause(over_cap=True) == "scope-over-cap"
+    # Neo escalated on its own, so the cause is Neo's chosen label, not this one.
+    assert autoreview.escalation_cause(over_cap=True, escalate=True) == ""
+
+
+def test_a_fact_pattern_that_is_none_of_the_five_records_no_cause():
+    """A NULL is correct and a wrong label is not. An acceptance the OS dropped at settle
+    time for its own reasons is not one of these five."""
+    assert autoreview.escalation_cause(autoreview.read_ruling(accepted())) == ""
+    assert autoreview.escalation_cause() == ""
+    # Neo escalated on its own: the cause is the CHOSEN label off its reply, which
+    # `drain_queue` already wrote, and this must not overwrite it.
+    escalated = accepted(escalate=True, verdict="denied")
+    assert autoreview.escalation_cause(autoreview.read_ruling(escalated),
+                                       escalate=True) == ""
+
+
+def test_every_cause_this_helper_can_return_is_in_the_overridden_class():
+    """The helper lives in a PURE module and spells the members as literals, so the enum
+    is pinned from the test rather than by an import that would invert the layering."""
+    from jarvis.neo_store import (ESCALATION_CAUSES, ESCALATION_CAUSES_CHOSEN,
+                                  ESCALATION_CAUSES_FAILED,
+                                  ESCALATION_CAUSES_OVERRIDDEN)
+
+    unclassified = accepted()
+    unclassified.pop("stakes")
+    produced = {
+        autoreview.escalation_cause(autoreview.read_ruling(accepted(stakes="high"))),
+        autoreview.escalation_cause(autoreview.read_ruling(unclassified)),
+        autoreview.escalation_cause(autoreview.read_ruling(accepted(stakes="elevated"))),
+        autoreview.escalation_cause(autoreview.read_ruling(accepted(verdict="denied"))),
+        autoreview.escalation_cause(over_cap=True),
+    }
+    assert produced == set(ESCALATION_CAUSES_OVERRIDDEN)
+    assert not produced & set(ESCALATION_CAUSES_CHOSEN)
+    assert not produced & set(ESCALATION_CAUSES_FAILED)
+    assert produced <= set(ESCALATION_CAUSES)
+
+
+def test_the_members_nothing_can_write_are_no_longer_in_the_enum():
+    """`stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `HELD_HIGH_STAKES`, which
+    holds the review BEFORE a question row exists — so nothing could ever write these.
+    Documented as an invisible class in the report instead (Neo, question 1170)."""
+    from jarvis.neo_store import ESCALATION_CAUSES
+
+    assert "classifier-unreachable" not in ESCALATION_CAUSES
+    assert "classifier-unparseable" not in ESCALATION_CAUSES
+
+
 # -- the daemon: asking ----------------------------------------------------------------
 
 
@@ -1059,6 +1133,54 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
     assert "left with you" in line
     # Still pending: no resolution clause (the spec's §Tests 3).
     assert "since " not in line
+
+
+# -- WHO decided, on the row the report groups by --------------------------------------
+#
+# docs/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
+# re-marks happen AFTER Neo answered, so without a cause every one of them renders "not
+# recorded" for ever — on `kind='assumption'`, the population the user complained about.
+
+
+def _cause(question_id: int) -> str | None:
+    neo_store = NeoStore()
+    try:
+        return neo_store.get(question_id)["escalation_cause"]
+    finally:
+        neo_store.close()
+
+
+@pytest.mark.parametrize("token, cause", [
+    ("FORCE_DENY", "neo-denied"),           # no machine rejection, so the user decides
+    ("FORCE_ACCEPT_HIGH", "stakes-high"),   # Neo accepted and flagged it; the OS obeyed
+])
+def test_an_override_at_the_settle_records_which_fact_caused_it(started, token, cause):
+    store, _wo = park(started, auto_review=True,
+                      assumptions=(f"{token} — {ROUTINE}",))
+    ask(started, store)
+    (q,) = questions()
+
+    drain(started)
+
+    assert _cause(q["id"]) == cause
+
+
+def test_a_ruling_the_os_dropped_at_the_settle_records_no_cause(started):
+    """THE HONEST NULL. This escalation is caused by the condition table re-running, not
+    by anything in Neo's reply — the acceptance itself was routine. A label from the five
+    would say the OS overrode a stakes word or Neo denied it, and neither happened."""
+    store, wo = park(started, auto_review=True, outcome="pending",
+                     assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    ask(started, store)
+    (q,) = questions()
+    store.close_validation_round(
+        store.latest_validation_round(wo_id=wo["id"])["id"], "escalated",
+        "the seats could not agree")
+
+    drain(started)
+
+    assert questions()[0]["status"] == "escalated"
+    assert _cause(q["id"]) is None
 
 
 # -- the banner against the assumption's CURRENT row -----------------------------------

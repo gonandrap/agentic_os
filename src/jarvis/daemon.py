@@ -3738,6 +3738,7 @@ class Daemon:
         a nine-node dependency graph with no read on it, which is the most expensive
         thing to review unaided.
         """
+        from . import autoreview
         from . import db as db_mod
         from . import plans
 
@@ -3779,8 +3780,11 @@ class Daemon:
                       f"Neo's reading: {verdict.get('verdict', '?')} — {reason}")
             # Neo answered, but the answer is not what happens. Re-marking the question
             # keeps `jarvis neo list` and `jarvis status` telling the same story: this
-            # is now the user's to decide.
-            neo_store.mark(q["id"], "escalated", reason=reason)
+            # is now the user's to decide — with WHICH fact overrode it, so the report
+            # can group it (§1 of docs/specs/2026-10-01-neo-observability.md).
+            neo_store.mark(q["id"], "escalated", reason=reason,
+                           cause=autoreview.escalation_cause(
+                               over_cap=True, escalate=bool(verdict["escalate"])))
         pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
         central.add_inbox(
             project=q["project"], level="warning",
@@ -6570,8 +6574,10 @@ class Daemon:
                 # the user's to decide — `_deliver_plan_verdict`'s over-cap branch, for
                 # the same reason. Both shapes reach here: a `deny` (there is no machine
                 # rejection, so it becomes an escalation) and an acceptance this module
-                # overrode on stakes.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # overrode on stakes — and WHICH of the two, as the groupable cause.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
@@ -6640,7 +6646,17 @@ class Daemon:
                 # re-mark the non-acceptance branch above does, for the same reason. The
                 # hold event is what puts the WHY on the work order, where
                 # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
-                neo_store.mark(q["id"], "escalated", reason=still.reason)
+                #
+                # AND NO CAUSE, deliberately. Neo's ruling ACCEPTED here — that is the
+                # branch this is inside — so nothing in its reply caused this escalation:
+                # the condition table re-running at the settle did, and `still.code` is
+                # where that fact is recorded, on the work order. `escalation_cause`
+                # returns `""` for an acceptance and the NULL is the honest answer; a
+                # member of the enum would claim a stakes word or a denial that did not
+                # happen (§1's rule that a guessed label is worse than none).
+                neo_store.mark(q["id"], "escalated", reason=still.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             self._note_autoreview_held(pstore, wo["id"], still, settling=True)
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
@@ -6753,8 +6769,11 @@ class Daemon:
         if not (ruling.accept or objected):
             if not verdict.get("escalate"):
                 # `_deliver_assumption_verdict`'s branch, for its reason: Neo answered and
-                # the answer is not what happens, so the record has to say whose this is.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # the answer is not what happens, so the record has to say whose this
+                # is — and which fact made it theirs.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": assumption.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
