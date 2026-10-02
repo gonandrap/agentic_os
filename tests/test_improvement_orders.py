@@ -383,11 +383,15 @@ def test_the_two_settle_passes_name_their_kind_explicitly():
     """Obligation 9. The guard against the next leak, source-level like
     `test_no_negative_kind_filter_exists_in_the_new_sql` above and for the same reason:
     the defect is a MISSING ARGUMENT, which no behavioural test can see on a path no
-    fixture covers. The budget pass is every kind; the settlement pass is feature-only BY
-    LIFECYCLE and must say so rather than rest on a default."""
+    fixture covers. The settlement pass is feature-only BY LIFECYCLE and must say so
+    rather than rest on a default; the budget pass visits every kind, one at a time, so
+    it must not be feature-only."""
     src = inspect.getsource(Daemon.settle_features)
-    assert "kind=None" in src
-    assert 'kind="feature"' in src
+    assert 'statuses=("executing",), kind="feature"' in src
+    # The budget pass drives its kind off the table of what each kind runs in, so it
+    # reaches all three. A literal `kind="feature"` there would be the leak again.
+    assert "_FAMILY_RUNNING_STATUS.items()" in src
+    assert src.count('kind="feature"') == 1
 
 
 def test_the_shared_fixture_files_one(improvement_order, store):

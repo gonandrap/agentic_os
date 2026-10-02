@@ -13727,6 +13727,12 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         live = budget.in_flight(store, wo_id)
         parent = _parent_of(store, wo)
         parent_pool = budget.pool(store, central, parent) if parent else None
+        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
+        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
+        # and is NOT a claim that the parent is a feature order, so a card reading it
+        # raw told an investigation's child about "its feature's slice". Same
+        # `family_prose` table as the note, so card and note agree.
+        family = family_prose(parent["kind"])[0] if parent else None
         # THE SAME SENTENCE THE SET PATH RETURNS (§1 of
         # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): four
         # numbers the reader has to assemble themselves is what made a raise look
@@ -13734,12 +13740,6 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         # stopped by its own number needs no explanation beyond the number. Through
         # `_feature_unreserved`, the set path's own read, so the two strings are one
         # string and not two that agree today.
-        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
-        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
-        # and is NOT a claim that the parent is a feature order, so a card reading it
-        # raw told an investigation's child about "its feature's slice". Same
-        # `family_prose` table as the note, so card and note agree.
-        family = family_prose(parent["kind"])[0] if parent else None
         note = ""
         if cap is not None and cap.source == "feature" and cap.exhausted:
             note = _still_capped_note(cap, spend.total_usd, parent,

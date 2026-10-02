@@ -1082,15 +1082,18 @@ def _an_improvement(budget_usd: float | None = None) -> dict:
         refs=["wo-11111111"], budget_usd=budget_usd)
 
 
-def _the_one_child(store, fo: dict, kind: str, spent: float,
+def _the_one_child(started, store, fo: dict, kind: str, spent: float,
                    reserved: float | None = None) -> str:
     """The state the daemon leaves a non-feature family in: ONE child, the family's whole
     slice cut for it, parked on it — and the parent in `planning`.
 
-    Written through the store rather than ticked into existence: a non-feature family's
-    one child is its `plan_wo_id` (`budget.family`) and it settles on its first turn, so
-    a fixture that ticks races the settler for the billing. The allocator's own arithmetic
-    is pinned above; this is about the paths that read the parent's KIND.
+    THE PARKING IS THE DAEMON'S: the child is created `running` with its turn billed
+    over its reserve, and the tick here lets `settle_work_order` write
+    `budget_exhausted` itself. So the fixture pins the state the OS actually produces,
+    not a status hand-written past the code that decides it.
+
+    The PARENT's `planning` and `plan_wo_id` stay store-written: a real dispatch spawns a
+    `claude` process for the planner/analyst/investigator, which no unit test wants.
     """
     child = store.create_work_order(f"work on {fo['id']}", description="look",
                                     kind=kind, parent_id=fo["id"])
@@ -1099,8 +1102,10 @@ def _the_one_child(store, fo: dict, kind: str, spent: float,
     if reserved is None:
         reserved = fo.get("budget_usd")
     store.update_work_order(child["id"], budget_reserved_usd=reserved,
-                            status=budget.EXHAUSTED)
+                            status="running")
     bill_the_turn(store, child["id"], spent)
+    started.tick()
+    assert store.get_work_order(child["id"])["status"] == budget.EXHAUSTED
     return child["id"]
 
 
@@ -1109,7 +1114,7 @@ def test_topping_up_an_investigation_puts_it_back_to_planning(started, store):
     its lifecycle never enters — so the budget pass has to escalate it AND restore it
     there."""
     inv = _an_investigation(store, budget_usd=2.0)
-    _the_one_child(store, inv, "investigator", spent=9.0)
+    _the_one_child(started, store, inv, "investigator", spent=9.0)
     started.tick()
     assert store.get_feature_order(inv["id"])["status"] == "budget_exhausted"
 
@@ -1123,7 +1128,7 @@ def test_topping_up_an_investigation_puts_it_back_to_planning(started, store):
 def test_topping_up_an_improvement_order_puts_it_back_to_planning(started, store):
     """Obligation 1, the other non-feature kind — its `planning` reads "analysing"."""
     io = _an_improvement(budget_usd=2.0)
-    _the_one_child(store, io, "analyst", spent=9.0)
+    _the_one_child(started, store, io, "analyst", spent=9.0)
     started.tick()
     assert store.get_feature_order(io["id"])["status"] == "budget_exhausted"
 
@@ -1133,9 +1138,17 @@ def test_topping_up_an_improvement_order_puts_it_back_to_planning(started, store
 
 
 def test_the_settlement_pass_never_reaches_a_non_feature_family(started, store):
-    """Obligation 2, the negative control for the split: an investigation settles from its
-    VERDICT, so a dead investigator must not fail the order under it. Passes today by
-    accident — the kind default — and must pass by construction."""
+    """Obligation 2. An investigation settles from its VERDICT, so a dead investigator
+    must not fail the order under it.
+
+    THIS PASSES ON MAIN AND IS NOT A REGRESSION TEST. It is a standing guard over two
+    independent defences, and it goes red only if BOTH are dropped: the settlement pass
+    being `kind="feature"`, and `ProjectStore.feature_children` returning `kind='worker'`
+    rows only. Measured 2026-10-02: widening the pass to
+    `statuses=("executing","planning"), kind=None` leaves this test GREEN, because the
+    investigator child is `kind='investigator'` and `feature_children` does not return
+    it. It would go red if the pass were merged back into one AND read its children
+    kind-agnostically (`budget.family`)."""
     inv = _an_investigation(store)
     child = store.create_work_order(f"investigate {inv['id']}", kind="investigator",
                                     parent_id=inv["id"])
@@ -1152,13 +1165,13 @@ def test_the_note_names_the_raise_verb_of_its_parents_own_kind(started, store):
     """Obligation 3. `jarvis fo budget` on an `io-`/`inv-` row refuses — the OS telling
     the user to run a command it will reject."""
     inv = _an_investigation(store, budget_usd=3.0)
-    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
     note = ops.set_work_order_budget(child, 500.0)["note"]
     assert "jarvis investigate budget" in note
     assert "jarvis fo budget" not in note
 
     io = _an_improvement(budget_usd=3.0)
-    io_child = _the_one_child(store, io, "analyst", spent=9.0)
+    io_child = _the_one_child(started, store, io, "analyst", spent=9.0)
     io_note = ops.set_work_order_budget(io_child, 500.0)["note"]
     assert "jarvis io budget" in io_note
     assert "jarvis fo budget" not in io_note
@@ -1170,7 +1183,7 @@ def test_the_show_path_explains_the_cap_in_the_same_words(started, store):
     ONE HOME: the set path and the show path state the same fact, and two wordings of it
     is how two users come to believe different things."""
     inv = _an_investigation(store, budget_usd=3.0)
-    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
 
     set_note = ops.set_work_order_budget(child, 500.0)["note"]
     shown = ops.work_order_budget(child)
@@ -1188,7 +1201,7 @@ def test_a_broke_family_reads_zero_and_not_a_dash(started, store):
     condition for showing it. An em dash there reads as "unknown" when the fact is
     "zero", and zero is what tells the user to raise the FAMILY, not the child again."""
     inv = _an_investigation(store, budget_usd=3.0)
-    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
 
     note = ops.set_work_order_budget(child, 500.0)["note"]
     assert "$0.00 unreserved" in note
@@ -1202,11 +1215,34 @@ def test_the_family_is_not_the_worker_children(started, store):
     `kind='worker'` children only. A non-feature family's one child is reached as the
     parent's `plan_wo_id`, so for those two kinds the sets do not even intersect."""
     inv = _an_investigation(store, budget_usd=2.0)
-    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
     fo = store.get_feature_order(inv["id"])
 
     assert [c["id"] for c in budget.family(store, fo)] == [child]
     assert store.feature_children(inv["id"]) == []
+
+
+def test_a_planner_overspending_never_parks_the_feature(started, store):
+    """A FEATURE in `planning` is out of the budget pass, and that is why the pass runs
+    per kind. `budget.family` counts the planner, so admitting `planning` for
+    `kind='feature'` would park the feature on its planner's spend and then restore it to
+    `executing` — past plan approval, with no approved plan and no children. §4 of
+    docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  budget_usd=2.0)
+    planner = store.create_work_order(f"plan {fo['id']}", description=ASK,
+                                      kind="planner", parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"])
+    store.set_feature_status(fo["id"], "planning")
+    store.update_work_order(planner["id"], budget_reserved_usd=2.0)
+    bill_the_turn(store, planner["id"], 9.0)
+
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
+
+    ops.set_feature_budget(fo["id"], 100.0)
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
 
 
 def test_raising_a_features_budget_still_names_its_parked_child(started, store):
@@ -1232,7 +1268,7 @@ def test_a_parked_investigation_child_is_not_told_a_feature_capped_it(started, s
     from jarvis.central_store import CentralStore
 
     inv = _an_investigation(store, budget_usd=3.0)
-    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
     store.set_status(child, "running")
 
     central = CentralStore()
