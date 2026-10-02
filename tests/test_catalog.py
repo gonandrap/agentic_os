@@ -647,3 +647,42 @@ def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
         assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
     finally:
         claude_cli.set_max_os_prompt_chars(before)
+
+
+def test_the_blocker_set_is_the_catalogs_to_narrow(tmp_path):
+    """`supervisor.health_reassert_blockers` is a CATALOG SETTING and never a module
+    constant (kn-1cec46b5, Neo q1217). An unknown id is refused with the known ones
+    named — `_parse_remedies`' rule — and a project overrides the list field by field
+    while the rest of `os.supervisor` is inherited.
+
+    It also pins the `_SUPERVISOR_NON_NUMERIC` trap: a field missing from that set is a
+    `TypeError` on every catalog load, which this test is the first to see.
+    """
+    from jarvis import health
+
+    with pytest.raises(CatalogError, match=", ".join(health.BLOCKERS)):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": ["the-weather"]}}, "projects": []})
+    with pytest.raises(CatalogError, match="list of blocker ids"):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": "dependency"}}, "projects": []})
+
+    cat = parse_catalog({"os": {"supervisor": {"health_stale_minutes": 90,
+                                              "health_reassert_blockers": ["user"]}},
+                         "projects": [{"name": "p", "path": str(tmp_path)},
+                                      {"name": "q", "path": str(tmp_path),
+                                       "supervisor": {"health_reassert_blockers":
+                                                      ["dependency"]}}]})
+    assert cat.os.supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[0].supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[1].supervisor.health_reassert_blockers == ("dependency",)
+    assert cat.projects[1].supervisor.health_stale_minutes == 90, (
+        "a project naming the blockers keeps the fleet's answer for everything else")
+
+
+def test_the_sweep_cadence_defaults_do_not_move(tmp_path):
+    """The free re-assertion buys quiet by SPENDING less, never by watching less — the
+    spec's "out of scope" list, and the alternative it rejected."""
+    cfg = parse_catalog({"os": {}, "projects": []}).os.supervisor
+    assert (cfg.health_every_ticks, cfg.health_min_interval_minutes,
+            cfg.health_stale_minutes, cfg.health_max_units_per_tick) == (20, 30, 720, 4)

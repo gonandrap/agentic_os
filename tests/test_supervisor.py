@@ -877,6 +877,40 @@ def test_the_work_order_packet_is_byte_for_byte_what_it_has_always_been(
     assert packet == EXPECTED_WORK_ORDER_PACKET.format(wo_id=wo["id"])
 
 
+def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
+        started, monkeypatch, tmp_path):
+    """WHAT ALARM al-4bb82f7e ASKED FOR: an order correctly waiting on a dependency used
+    to read as unexplained, because the packet never stated a reason the OS already held.
+
+    The silent half is the pin: `blocker: none` would be a claim the judge weighs, and it
+    would reprice every cached review — so an unblocked order's packet keeps its bytes.
+    """
+    daemon = started()
+    monkeypatch.setattr(db, "now", lambda: FIXED_NOW)
+    inspect_cfg = daemon.catalog.projects[0].inspect
+
+    wo = ops.create_work_order("proj_a", "write the design doc")
+    store = ProjectStore(ops.find_work_order(wo["id"])[1])
+    try:
+        plain = supervisor.build_evidence(store, _wo_subject(store, wo["id"]), None,
+                                          CFG, inspect_cfg)
+        waits_on = store.create_work_order("the thing it waits on",
+                                           status="running")["id"]
+        blocked = store.create_work_order("the blocked one",
+                                          depends_on=[waits_on])["id"]
+        packet = supervisor.build_evidence(store, _wo_subject(store, blocked), None,
+                                           CFG, inspect_cfg)
+    finally:
+        store.close()
+
+    assert not [line for line in plain.splitlines() if line.startswith("blocked")]
+    (line,) = [line for line in packet.splitlines() if line.startswith("blocked:")]
+    assert line == f"blocked: {supervisor.BLOCKED_SENTENCES['dependency']}"
+    assert packet.splitlines().index(line) == \
+           packet.splitlines().index(next(l for l in packet.splitlines()
+                                          if l.startswith("this session is"))) + 1
+
+
 def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_was_not(
         started, monkeypatch, tmp_path):
     """§4 of docs/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which
