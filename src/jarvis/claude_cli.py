@@ -1639,6 +1639,9 @@ class HeadlessResult:
     #: spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
     prompt_chars: int = 0
     system_prompt_chars: int = 0
+    #: How long the subprocess took, in milliseconds. 0 means NOT MEASURED, which is what
+    #: a hand-built result is — §3 of docs/specs/2026-10-01-neo-observability.md.
+    latency_ms: int = 0
 
 
 def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
@@ -1885,8 +1888,13 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                      "--setting-sources", "", "--disable-slash-commands"]
         args += stack.enter_context(
             _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
+        # AROUND THE SUBPROCESS AND NOTHING ELSE — §3 of
+        # docs/specs/2026-10-01-neo-observability.md: argument assembly and JSON parsing
+        # are not the model's time.
+        started = time.monotonic()
         out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
                    stdin_text=prompt if over else None)
+        latency_ms = int((time.monotonic() - started) * 1000)
     data: Any = None
     try:
         data = json.loads(out)
@@ -1897,7 +1905,8 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         # `run_headless` has always returned here), and there is nothing to account.
         result = HeadlessResult(text=out, model=model or "",
                                 prompt_chars=prompt_chars,
-                                system_prompt_chars=system_prompt_chars)
+                                system_prompt_chars=system_prompt_chars,
+                                latency_ms=latency_ms)
     else:
         served = [name for name in (data.get("modelUsage") or {})]
         result = HeadlessResult(
@@ -1905,6 +1914,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
             usage=derive_turn_usage(data),
             prompt_chars=prompt_chars,
             system_prompt_chars=system_prompt_chars,
+            latency_ms=latency_ms,
             session_id=data.get("session_id") or "",
             # One key is the ordinary case; more than one means the call was served by
             # several models and no single name is honest, so the requested one stands.
@@ -1918,6 +1928,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         # sizes would record as zero (spec §3).
         result.usage["prompt_chars"] = prompt_chars
         result.usage["system_prompt_chars"] = system_prompt_chars
+        # Same reason one field along: the sites that hand over `usage=result.usage` never
+        # see the dataclass — §3 of docs/specs/2026-10-01-neo-observability.md.
+        result.usage["latency_ms"] = latency_ms
     if not records_itself:
         _attribute_subprocess(result, record)
     return result

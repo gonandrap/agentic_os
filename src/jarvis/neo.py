@@ -25,7 +25,7 @@ import time
 from typing import Any
 
 from . import claude_cli, structured
-from .neo_store import NeoStore
+from .neo_store import ESCALATION_CAUSES_CHOSEN, NeoStore
 
 log = logging.getLogger("neo")
 
@@ -82,6 +82,9 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "answer": "<the decision, addressed to the worker — 1 line of explanation if you agree with its recommendation, 50 words max if you override it>", "reason": "<one line why>"}
   or
   {"escalate": true, "answer": "", "reason": "<one line why the user must decide>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+high-stakes | no-learning-applies>"
 Either may carry one optional cleanup dispatch:
   "dispatch": {"title": "<short: which record is wrong>", "description": "<the full brief>"}"""
 
@@ -262,6 +265,22 @@ def parse_dispatch(data: Any) -> dict[str, str] | None:
             "description": str(data.get("description") or "").strip()}
 
 
+def _escalation_cause(raw: Any) -> str:
+    """The model's `cause` label, or `""` — §2 of docs/specs/2026-10-01-neo-observability.md.
+
+    NEVER RAISES, AND NEVER REJECTS THE VERDICT. A missing or unrecognised cause is a
+    label absent from an otherwise valid decision; rejecting it would route a perfectly
+    good verdict through `_unparseable_verdict` and reach the user as an escalation the
+    model never made — question 388's bug one field along. `""` stores as NULL and renders
+    "not recorded".
+
+    Only `ESCALATION_CAUSES_CHOSEN` is accepted: a model naming a FAILED-class member is
+    describing something it cannot know about.
+    """
+    cause = str(raw or "").strip().lower()
+    return cause if cause in ESCALATION_CAUSES_CHOSEN else ""
+
+
 def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
     """Normalise a parsed Neo reply into the verdict dict, or raise.
 
@@ -289,6 +308,9 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         # acquire an opinion about a vocabulary it does not own. Absent on every other
         # kind, which reads as `routine` there and is never consulted.
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
+        # Read exactly as `stakes` is — normalised, never trusted, never fatal. §2 of
+        # docs/specs/2026-10-01-neo-observability.md.
+        "cause": _escalation_cause(data.get("cause")),
     }
 
 
@@ -312,6 +334,9 @@ def _unparseable_verdict(raw: str) -> dict[str, Any]:
     """
     return {"escalate": True, "answer": "", "approve": False, "verdict": "denied",
             "verdict_stated": False, "dispatch": None,
+            # The one FAILED-class member written in this module, and the OS writes it in
+            # the fail-safe rather than copying it off a reply (spec §2).
+            "cause": "unparseable-reply",
             "reason": f"{UNPARSEABLE_PREFIX}{(raw or '')[:120]}"}
 
 
@@ -472,7 +497,9 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         if verdict["escalate"]:
-            store.mark(q["id"], "escalated", reason=verdict["reason"])
+            # Spec §2 of docs/specs/2026-10-01-neo-observability.md.
+            store.mark(q["id"], "escalated", reason=verdict["reason"],
+                       cause=verdict.get("cause") or "")
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])
         else:
             # `text`, not `answer`: `answer` is the injected answerer above, and rebinding

@@ -371,6 +371,144 @@ def test_a_question_that_does_not_exist_says_so(client):
     assert "not found" in r.text
 
 
+def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
+    """§6 of docs/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
+    and an absent ratio reads "not recorded" rather than 0%."""
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert '<span class="sub">not recorded</span>' in page.text
+    # past the stylesheet, whose own percentages are not figures
+    body = page.text.split("</style>")[-1]
+    assert "0%" not in body, "an absent rate must never render as a measured zero"
+    # a measured zero IS printed: the question census has a row for everything
+    assert "0 question" in page.text
+
+
+def test_the_neo_page_links_to_the_report_and_is_otherwise_unchanged(client):
+    page = client.get("/neo")
+    assert page.status_code == 200
+    assert 'href="/neo/stats"' in page.text
+    # no statistics block among the review forms — the reason the report is its own page
+    assert "escalation rate" not in page.text
+
+
+def test_the_neo_stats_page_prints_the_counts_and_the_cause_split(client, daemon,
+                                                                 project):
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="high-stakes")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "high-stakes" in page
+    assert "1 question" in page
+    assert "Neo chose this label" in page
+
+
+def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client, daemon,
+                                                                        project):
+    """Neo, question 1170: an override is a THIRD answer to "who decided", and the class
+    nothing can write is named rather than left to vanish."""
+    from jarvis import ops as ops_mod
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="stakes-unclassified")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "stakes-unclassified" in page
+    assert "Neo answered and the OS overrode it" in page
+    assert "Neo chose to hand it back" in page
+    assert "Neo never answered" in page
+    assert ops_mod.NEO_ESCALATION_INVISIBLE_NOTE in page
+
+
+def test_the_stats_page_renders_spend_and_latency_over_several_neo_kinds(client, project):
+    """Two kinds is the case the page is FOR, and it is where sorting by a bucket breaks:
+    `dictsort(by='value')` compares the bucket dicts themselves and raises
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'`.
+
+    Found by scripts/screenshot_neo_stats.py — every earlier test seeded at most one kind.
+    """
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project))
+        for kind, model, latency in (("neo_answer", "claude-sonnet-4-5", 240),
+                                     ("panel_seat", "claude-opus-5", None)):
+            central.add_agent_call(
+                kind, project="proj_a", wo_id="wo-1", model=model, latency_ms=latency,
+                usage={"input": 10, "cache_write": 20, "cache_read": 30, "output": 40,
+                       "total_cost_usd": 0.01})
+        central.conn.commit()
+    finally:
+        central.close()
+
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert "neo_answer" in page.text and "panel_seat" in page.text
+    # the latency block's "measured/calls" rendering, with the untimed kind at 0/1
+    assert "0/1 timed" in page.text and "1/1 timed" in page.text
+
+
+def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
+    """wo-327f211c: at 1280px "10 asked · 1 escalated" wrapped inside a 150px span, so the
+    trend block rendered at twice its height. bill.html:110 idiom is white-space: nowrap."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/stats").text
+    trend = [ln for ln in page.splitlines() if "asked ·" in ln and "style" in ln]
+    assert trend, "no inline-styled trend row found"
+    for line in trend:
+        assert "white-space: nowrap" in line, line
+
+
+def test_the_stats_page_trend_row_carries_the_unreachable_count_and_rate(client, daemon,
+                                                                        project):
+    """Spec §4: a bar may never contradict the counts beside it."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "never reached" in page
+    block = page.split("The trend")[1].split("<h2>")[0]
+    assert "never reached" in block
+    assert "unreachable" in block
+    # the bar stays driven by the ESCALATION rate, which is 0 here, so none is drawn
+    assert "0%" in block
+
+
+def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
+    page = client.get("/neo/stats?project=nope")
+    assert page.status_code == 200
+    assert "not registered" in page.text
+
+
 def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
     """The timeline sends the reader here; the decision has to be here too.
 

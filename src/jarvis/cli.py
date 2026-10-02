@@ -1405,6 +1405,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "`supervisor` for what your alarm reviews have taught the "
                         "supervisor (global rows alone are shown without it)")
     n.add_argument("--json", action="store_true", help="machine-readable output")
+    n = ne.add_parser("stats", help="Neo's volume, outcomes, escalation causes, spend "
+                                    "and latency")
+    n.add_argument("--project", default="")
+    n.add_argument("--days", type=int, default=None,
+                   help="window in days; omit for all time")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
     n = ne.add_parser("export", help="Neo's whole ledger as one document: every "
                                      "question, learning and panel opinion")
     n.add_argument("--json", action="store_true", help="machine-readable output")
@@ -4252,6 +4258,131 @@ def _print_knowledge_usage(res: dict[str, Any], as_json: bool) -> None:
             print(f"      → {e['id']}  {e['headline'][:62]}")
 
 
+#: What an absent figure prints. One spelling, because the dashboard has one too
+#: (`bill.html`'s `<span class="sub">not recorded</span>`) and a report that said "0%" on
+#: one surface and "not recorded" on the other would be read as two different findings.
+NOT_RECORDED = "not recorded"
+
+
+def _pct(rate: float | None) -> str:
+    """A rate as a percentage, or "not recorded" — NEVER `0%` for an absent one.
+
+    Zero settled questions and zero escalations are different answers (spec §4's zero
+    rule, docs/specs/2026-10-01-neo-observability.md).
+    """
+    return NOT_RECORDED if rate is None else f"{rate * 100:.0f}%"
+
+
+def _ms(value: int | None) -> str:
+    return NOT_RECORDED if value is None else f"{value}ms"
+
+
+def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
+    """`jarvis neo stats` for a person, in the order the user asked the questions:
+    volume and outcomes, the trend, the causes, the kinds, per-order averages, then spend
+    and latency last.
+
+    `--json` prints the ops dict unchanged — `_print_knowledge_usage`'s contract, and what
+    keeps the dashboard and the terminal reading the same report.
+    """
+    if as_json:
+        _print(res, True)
+        return
+    q = res["questions"]
+    window = f", last {res['days']}d" if res["days"] else ", all time"
+    print(f"{res['scope']}{window} — {q['asked']} question"
+          f"{'' if q['asked'] == 1 else 's'} asked\n")
+
+    print("OUTCOMES")
+    print(f"  answered by Neo   {q['answered']}")
+    print(f"  escalated         {q['escalated']}")
+    print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
+    print(f"  still open        {q['open']}")
+    print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
+    print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
+          f"(over settled questions only)")
+    # Its own figure, never blended into the escalation rate: a crash is not a decision.
+    print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
+          f"(same denominator — NOT escalations)")
+
+    if res["by_day"]:
+        print("\nTHE TREND — one line per day, newest last")
+        for d in res["by_day"]:
+            print(f"  {d['day']}  asked {d['asked']:>3} · answered {d['answered']:>3} · "
+                  f"escalated {d['escalated']:>3} · rate {_pct(d['escalation_rate'])} · "
+                  f"never reached {d['failed']:>3} · unreachable "
+                  f"{_pct(d['unreachable_rate'])}")
+
+    causes = res["causes"]
+    print("\nWHAT IT ESCALATES FOR — three classes, because WHO DECIDED has three "
+          "answers")
+    # Three labelled groups, each with the sentence that says what the class means. A flat
+    # list of fifteen labels would not answer the question the report exists for (§3 of
+    # docs/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
+    groups = (("chosen", "Neo chose to hand it back", "Neo chose this label"),
+              ("overridden", "Neo answered and the OS overrode it",
+               "the OS derived it from Neo's answer"),
+              ("failed", "Neo never answered",
+               "the OS derived it — no judgement at all"))
+    for key, heading, per_row in groups:
+        bucket = causes[key]
+        print(f"  {heading}")
+        if not bucket:
+            print(f"    {NOT_RECORDED} — none in this window")
+            continue
+        for cause, n in sorted(bucket.items(), key=lambda kv: -kv[1]):
+            print(f"    {cause:<24} {n:>4}   ({per_row})")
+    if causes["not_recorded"]:
+        # NOT printed as a cause: nobody may read the backlog as a finding about Neo.
+        print(f"  {causes['not_recorded']} escalation"
+              f"{'' if causes['not_recorded'] == 1 else 's'} predate cause recording")
+    # The class that is in NO count above, said as what the reader cannot see here.
+    print(f"  note: {res['causes_note']}")
+
+    print("\nBY KIND")
+    for kind, k in sorted(res["by_kind"].items(), key=lambda kv: -kv[1]["asked"]):
+        print(f"  {kind:<12} asked {k['asked']:>4} · answered {k['answered']:>4} · "
+              f"escalated {k['escalated']:>4} · rate {_pct(k['escalation_rate'])} · "
+              f"never reached {k['failed']:>4} · unreachable "
+              f"{_pct(k['unreachable_rate'])}")
+    if res["by_kind"]:
+        print(f"  note: {res['by_kind_note']}")
+
+    per = res["per_order"]
+    print("\nPER ORDER — triage questions excluded (they have no order behind them)")
+    wo_avg = per["questions_per_wo"]
+    fo_avg = per["questions_per_fo"]
+    print(f"  {per['work_orders']} work order"
+          f"{'' if per['work_orders'] == 1 else 's'}, "
+          f"{NOT_RECORDED if wo_avg is None else f'{wo_avg} questions each'}")
+    print(f"  {per['feature_orders']} feature order"
+          f"{'' if per['feature_orders'] == 1 else 's'}, "
+          f"{NOT_RECORDED if fo_avg is None else f'{fo_avg} questions each'}")
+
+    spend, totals = res["spend"], res["spend"]["totals"]
+    print(f"\nWHAT NEO COST — {totals['calls']} call"
+          f"{'' if totals['calls'] == 1 else 's'}, "
+          f"${totals['recorded_cost_usd']:.2f} recorded / "
+          f"~${totals['list_cost_usd']:.2f} at list prices")
+    for kind, s in sorted(spend["by_kind"].items(), key=lambda kv: -kv[1]["calls"]):
+        print(f"  {kind:<18} {s['calls']:>4} calls · {s['input']:>8} in · "
+              f"{s['cache_write']:>9} cache write · {s['cache_read']:>10} cache read · "
+              f"{s['output']:>7} out · ${s['recorded_cost_usd']:.2f}")
+
+    lat = res["latency"]
+    print("\nHOW LONG IT TOOK")
+    for kind, entry in sorted(lat["by_kind"].items(), key=lambda kv: -kv[1]["calls"]):
+        print(f"  {kind:<18} {entry['measured']}/{entry['calls']} timed · "
+              f"p50 {_ms(entry['p50_ms'])} · p90 {_ms(entry['p90_ms'])} · "
+              f"max {_ms(entry['max_ms'])}")
+    if lat["unmeasured"]:
+        print(f"  {lat['unmeasured']} call"
+              f"{'' if lat['unmeasured'] == 1 else 's'} in this window were never timed")
+    if not lat["by_kind"]:
+        print(f"  {NOT_RECORDED} — no call in this window")
+    print(f"\nThe spend and latency figures are {res['floor_reason']}")
+
+
 def cmd_learn(args: argparse.Namespace) -> int:
     import os
 
@@ -4504,6 +4635,9 @@ def cmd_neo(args: argparse.Namespace) -> int:
                       f"({r['source']}) {r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
+    elif args.neo_cmd == "stats":
+        _print_neo_stats(ops.neo_stats_report(project=args.project or None,
+                                              days=args.days), args.json)
     elif args.neo_cmd == "export":
         _print(ops.neo_export(), args.json)
     elif args.neo_cmd == "learn":
