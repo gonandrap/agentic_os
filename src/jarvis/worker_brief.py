@@ -246,8 +246,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
-            f"`jarvis learn show <id>`, `jarvis learn search \"<term>\" "
-            f"--project {project}`.",
+            f"`jarvis learn show <id>` for a body, `jarvis learn search \"<term>\" "
+            f"--project {project}` to find which entries match.",
         ] if has_knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project} --topic \"<topic>\"`. Your "
@@ -414,12 +414,14 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         f"order suggested it, and tells you nothing back, because nothing you do "
         f"next should depend on the answer.",
         f"- READ the OS knowledge base on demand: `jarvis learn show <id>` for an "
-        f"entry your prompt's index lists, `jarvis learn search \"<term>\" "
-        f"--project {project}` to sweep for one. Look up any area you are about to "
+        f"entry your prompt's index lists — it is the only verb that returns a "
+        f"body — and `jarvis learn search \"<term>\" --project {project}` to find "
+        f"which entries match, which answers with headlines, ids and one matching "
+        f"line each. Look up any area you are about to "
         f"touch BEFORE you touch it, and before you ask or assume about it — a "
-        f"past worker probably already paid for the lesson. A headline is a "
-        f"truncated first line, never the whole entry: if it looks relevant, fetch "
-        f"it rather than acting on the summary.",
+        f"past worker probably already paid for the lesson. A headline or a quoted "
+        f"line is never the whole entry: if it looks relevant, `show` it rather "
+        f"than acting on the summary.",
         f"- WRITE to it too: the OS knowledge base is the ONLY memory that "
         f"survives you: `jarvis learn add \"...\" --project {project} --topic "
         f"\"<topic>\"`. Anything durable you learn — project state, gotchas, "
@@ -838,14 +840,17 @@ def knowledge_section(project: str = PROJECT_PLACEHOLDER) -> str:
         "touch it, and before you ask or assume about it; a past worker probably "
         "already paid for the lesson:",
         "```bash",
-        f'jarvis learn search "<term>" --project {project}  # full text of matches',
-        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f'jarvis learn search "<term>" --project {project}  # which entries match: '
+        f"headline, id, one matching line",
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries — the only "
+        "verb that returns a body",
         f"jarvis learn list --project {project} --topic <t>  # everything in a "
         f"topic",
         f"jarvis learn topics --project {project}  # what topics exist",
         "```",
-        "A headline is a truncated first line, never the whole entry: if it looks "
-        "relevant, fetch it rather than acting on the summary. And LOOK IT UP "
+        "A headline is a truncated first line and an excerpt is one quoted matching "
+        "line, never the whole entry: if it looks relevant, `show` it rather than "
+        "acting on the summary. And LOOK IT UP "
         "FIRST when a headline names the area you are unsure about — a lookup is "
         "not a doubt, so it comes before `jarvis wo ask`. When nothing in the "
         "index fits, ask; never let searching become a substitute for recording a "

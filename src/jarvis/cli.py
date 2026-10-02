@@ -1345,7 +1345,8 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--topic")
     k.add_argument("--full", action="store_true", help="full text instead of headlines")
     k.add_argument("--limit", type=int, default=100)
-    k = kn.add_parser("search", help="full text of entries matching a term")
+    k = kn.add_parser("search", help="which entries match a term: headline, id, one "
+                                     "matching line (`learn show` for a body)")
     k.add_argument("term")
     k.add_argument("--project", help="this project + global entries")
     k.add_argument("--topic")
@@ -4290,6 +4291,28 @@ def cmd_learn(args: argparse.Namespace) -> int:
             out.append(row)
         return out
 
+    def excerpted(rows: list[dict[str, Any]], term: str) -> list[dict[str, Any]]:
+        """`search`'s index form: `digested` plus what a reader needs to choose.
+
+        `chars` prices `jarvis learn show <id>` before it is paid for, and `excerpt` quotes
+        the first body line a query word appears in — bounded by `headline()`, which IS the
+        bound, so no truncated body ever leaves here. Omitted when the only match is the
+        first line (the headline already shows it) or when nothing in the body matched (an
+        FTS5 stem hit, or a hit on `topic`/`tags`): the row is still a hit, it just has
+        nothing to quote.
+        """
+        words = [w.lower() for w in (term or "").split() if any(c.isalnum() for c in w)]
+        out = []
+        for row, r in zip(digested(rows), rows, strict=True):
+            row["chars"] = len(r["content"] or "")
+            for line in (r["content"] or "").split("\n")[1:]:
+                low = line.lower()
+                if any(w in low for w in words) and headline(line):
+                    row["excerpt"] = headline(line)
+                    break
+            out.append(row)
+        return out
+
     central = CentralStore()
     try:
         if args.kn_cmd == "add":
@@ -4315,12 +4338,22 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "search":
             rows = central.search_knowledge(args.term, limit=args.limit,
                                             project=args.project, topic=args.topic)
-            central.record_knowledge_read("search", rows, term=args.term,
-                                          project=reader_project, wo_id=acting_wo)
+            index = excerpted(rows, args.term)
+            # Charged for what was PRINTED, like the `list` branch above: the index rows,
+            # not the bodies they point at. Without this `jarvis learn stats` keeps
+            # reporting text nobody received (spec
+            # docs/superpowers/specs/2026-10-02-learn-search-returns-an-index.md).
+            central.record_knowledge_read(
+                "search", rows, term=args.term, project=reader_project, wo_id=acting_wo,
+                chars=sum(len(r["headline"]) + len(r.get("excerpt", "")) for r in index))
             if not rows and not args.json:
                 print(f"no knowledge matching {args.term!r} — "
                       f"try `jarvis learn topics` for what is recorded")
-            _print(rows, args.json)
+            elif not args.json:
+                print("index only — `excerpt` is ONE quoted matching line, never the "
+                      "entry; `jarvis learn show <id>` for a body "
+                      "(`chars` prices it first)")
+            _print(index, args.json)
         elif args.kn_cmd == "show":
             rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
             central.record_knowledge_read("show", rows, term=" ".join(args.ids),
