@@ -12225,7 +12225,7 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     which is `usage.index_sessions`' reason, so a wide scope is a walk and therefore
     windowed.
     """
-    from . import navigation
+    from . import nav_volume
     from . import usage as usage_mod
 
     if not target and not project and not fleet:
@@ -12271,11 +12271,11 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
 
     if session_ids:
         index = usage_mod.index_sessions()
-        rolled = navigation.NavigationVolume(scope=scope)
+        rolled = nav_volume.NavigationVolume(scope=scope)
         for _label, session in session_ids:
             if not session:
                 continue
-            rolled.fold(navigation.read_session(session, cfg, index=index))
+            rolled.fold(nav_volume.read_session(session, cfg, index=index))
         return rolled.as_dict()
 
     # A project or the fleet: the tree, within the window. A project is scoped by the
@@ -12284,9 +12284,9 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     # not name is refused rather than silently answered with the whole fleet.
     prefix = ""
     if scope_project:
-        prefix = navigation.slug_of(
+        prefix = nav_volume.slug_of(
             project_spec(resolve_catalog(), scope_project).path)
-    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix)
+    volume = nav_volume.read_tree(None, cfg, days=window, slug_prefix=prefix)
     payload = volume.as_dict()
     payload["scope"] = scope
     return payload
@@ -12435,7 +12435,7 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import autopsy, holds, navigation
+    from . import autopsy, holds, nav_volume
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -12485,7 +12485,7 @@ def inspect_report(target: str, project: str | None = None, *,
                        # §2.2: the per-order navigation volume, same reader as
                        # `jarvis navigation`'s. Read from the transcript, so an order
                        # whose session is gone reports `found: false` rather than zeros.
-                       navigation=navigation.read_session(
+                       navigation=nav_volume.read_session(
                            session, nav_settings(project_name), index=index).as_dict(),
                        wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",

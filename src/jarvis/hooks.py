@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from . import concision
+# §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
+from .navigation import _mask_shell_text, _statements
 from .project_store import ProjectStore
 
 # A Bash command every worker must be able to run without a permission prompt:
@@ -473,19 +475,6 @@ LONG_SEATS = ("jarvis-implementer", "jarvis-spec-writer")
 _BACKGROUNDING_WORD = re.compile(
     r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
 
-_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
-_SHELL_COMMENT = re.compile(r"(?:(?<=^)|(?<=\s))#[^\n]*")
-
-
-def _mask_shell_text(command: str) -> str:
-    """The command with quoted spans and comments blanked, positions preserved.
-
-    An `&` inside a string or a comment is prose. This is the whole difficulty of the
-    shell half of §4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
-    """
-    masked = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
-    return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
-
 
 def backgrounds_through_shell(command: str) -> bool:
     """Whether this command starts a job the shell detaches from the turn.
@@ -557,10 +546,6 @@ def background_task_decision(payload: dict[str, Any],
     )
 
 
-#: Shell words that open a compound statement, so the command after them is still in
-#: command position: `; do sleep 30; done`.
-_KEYWORDS = frozenset({"do", "then", "else", "elif", "{", "(", "!", "time"})
-
 #: `pytest` flags that take a SEPARATE value, so the value is not a positional path.
 #: `pytest -k expr tests/test_hooks.py` is a targeted run, and reading `expr` as a path
 #: would deny it.
@@ -585,22 +570,6 @@ _MULTIPLIER = {"": 1.0, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
 def _seconds(word: str) -> float | None:
     found = _DURATION.match(word)
     return (float(found.group(1)) * _MULTIPLIER[found.group(2)]) if found else None
-
-
-def _statements(masked: str) -> list[list[str]]:
-    """The masked command as word lists, one per statement, keywords stripped.
-
-    Command position is what every arm below tests, and a `;`, `|`, `&` or newline is
-    where the next one starts — the same reading `_BACKGROUNDING_WORD` does with a regex.
-    """
-    out: list[list[str]] = []
-    for part in re.split(r"[;&|()\n]", masked):
-        words = part.split()
-        while words and (words[0] in _KEYWORDS or "=" in words[0]):
-            words = words[1:]
-        if words:
-            out.append(words)
-    return out
 
 
 def _is_whole_suite(words: list[str]) -> bool:
