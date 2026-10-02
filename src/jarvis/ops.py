@@ -6300,7 +6300,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             return {"project": name, "wo_id": wo_id, "status": deferred,
                     **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
-        if validation_applies(cfg, fresh):
+        # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01
+        # spec §2, a-release-that-authored-files-is-judged-like-any-other).
+        submits = validation_applies(cfg, {**fresh, "pr_url": pr_url})
+        if submits:
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
             # None means BOUNCED, and only here: with validation off no submission was
@@ -6316,10 +6319,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's — but a
             # BOUNCE is told to it rather than re-derived from the latest round, which
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
-            # A release order opened no round at all, so the join is TOLD rather than
-            # left to re-read one that was never opened (§2).
+            # An exempt release order opened no round at all, so the join is TOLD rather
+            # than left to re-read one that was never opened (2026-10-01 spec §3).
             status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
-                                       panel_cleared=release.is_release_order(fresh))
+                                       panel_cleared=not submits)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -7634,15 +7637,26 @@ def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
     """Does a validation round open over THIS submission? One predicate, two call sites.
 
     `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
-    and a RELEASE ORDER is never one of them: it authors no files and stages no tag, so
-    `evidence.nothing_to_judge` escalated it with "nothing to review" and
-    `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
-    post-condition a release owes already exists and is a machine check
+    and a RELEASE ORDER THAT DELIVERED NO PULL REQUEST is never one of them: it authors no
+    files and stages no tag, so `evidence.nothing_to_judge` escalated it with "nothing to
+    review" and `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
+    post-condition such a release owes already exists and is a machine check
     (`Daemon.settle_shipped_releases`: a `jarvis-*` tag containing every payload commit
     AND production running it), so a seat reading a release worker's prose adds nothing
     to it (2026-09-29 spec §2).
+
+    THE EXEMPTION'S GROUND IS THE ABSENT PULL REQUEST, and `is_release_order` only
+    narrows which orders may claim it. One that finished with `--pr` authored a diff, so
+    `nothing_to_judge` does not apply to it and it submits like any code-bearing order —
+    wo-33e1d0b4 changed `scripts/shipit.sh` under the old kind-keyed predicate, reached no
+    panel, and could never clear `automerge`'s `validated_head` condition. `wo["pr_url"]`
+    is the one source: a second argument would be a second answer to "was there a diff".
+    Callers holding a dict whose column is not yet written overlay it (`finish`).
+
+    docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md §1
     """
-    return cfg is not None and cfg.enabled and not release.is_release_order(wo)
+    return (cfg is not None and cfg.enabled
+            and not (release.is_release_order(wo) and not str(wo.get("pr_url") or "")))
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -7669,8 +7683,9 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
-    # Told, not re-read: a release order opened no round here either (§2).
-    cleared = release.is_release_order(fresh)
+    # Told, not re-read: an exempt release order opened no round here either. The
+    # UNBLANKED row, never `fresh` (2026-10-01 spec §3).
+    cleared = not validation_applies(cfg, store.get_work_order(wo_id))
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced

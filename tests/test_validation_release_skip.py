@@ -1,12 +1,15 @@
-"""A release order opens no validation round, at EITHER submission site — issue #838 §2.
+"""A release order is exempt from the panel ONLY when it delivered no pull request.
 
-docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md
+docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md
+supersedes
+docs/superpowers/specs/2026-09-29-a-release-blocked-by-a-red-main-retries-itself.md §2.
 
-Defect (b) of the live case: a blocked release authors no files and stages no tag, so
-`evidence.nothing_to_judge` hit row 2 of its table, the round escalated with "nothing to
-review", and `autoreview.HELD_PANEL_GAVE_UP` went on the assumption — so not even Neo
-could clear it. The post-condition for a release is a machine check
-(`Daemon.settle_shipped_releases`), so no panel is opened at all.
+Defect (b) of the 2026-09-29 case: a blocked release authors no files and stages no tag,
+so `evidence.nothing_to_judge` hit row 2 of its table, the round escalated with "nothing
+to review", and `autoreview.HELD_PANEL_GAVE_UP` went on the assumption — so not even Neo
+could clear it. That exemption stays, and it is now conditional on the thing it claims:
+the ABSENT pull request. A release order that finished with `--pr` authored a diff and
+submits like any code-bearing order, at either submission site.
 """
 
 from __future__ import annotations
@@ -148,17 +151,77 @@ def test_a_release_that_delivered_nothing_reaches_no_panel(fleet, monkeypatch):
     assert autoreview.HELD_PANEL_GAVE_UP not in holds
 
 
-def test_a_release_with_a_pull_request_reaches_no_panel_either(fleet):
-    """§2's predicate is the ORDER, not the artifact: a release that opened a PR (a
-    version bump, a changelog) is still judged by `settle_shipped_releases`."""
+def test_release_order_with_pr_opens_a_round_at_finish(fleet):
+    """The predicate is now the ARTIFACT, not the order: a release that opened a PR
+    authored a diff, so a seat reads it. Staging a tag does not buy the exemption back —
+    this order staged `jarvis-0.10.26` AND authored a diff, and it still goes to the
+    panel. Fails before the fix: `fresh["pr_url"]` is empty at `ops.finish`'s submission
+    branch, so the predicate needs the overlay (§2 of this change's spec,
+    docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md).
+    """
     rel = release_order(fleet)
     stage_release(rel)
+    fleet.change(rel, "print('version bump')\n")
+
+    ops.finish(rel, "shipped jarvis-0.10.26",
+               pr_url="https://github.com/x/y/pull/731",
+               evidence="ran `pytest -q`: 412 passed")
+
+    assert len(rounds(fleet, rel)) == 1
+
+
+def test_release_order_with_pr_is_not_told_the_panel_is_cleared(fleet):
+    """§3: both `panel_cleared` sites move with the predicate. If one did not, the join
+    would land this order `completed`/`waiting_pr_merge` with a diff no seat read."""
+    rel = release_order(fleet)
+    stage_release(rel)
+    fleet.change(rel, "print('version bump')\n")
 
     result = ops.finish(rel, "shipped jarvis-0.10.26",
-                        pr_url="https://github.com/x/y/pull/731")
+                        pr_url="https://github.com/x/y/pull/732",
+                        evidence="ran `pytest -q`: 412 passed")
 
-    assert rounds(fleet, rel) == []
-    assert result["status"] != "validating"
+    assert result["status"] == "validating"
+    assert row(fleet, rel)["status"] == "validating"
+
+
+def test_release_order_with_pr_submits_on_review_acceptance(fleet):
+    """§3 at `_land_after_acceptance`: the predicate reads the UNBLANKED row, so a
+    release order parked `needs_review` with a stored pull request submits on acceptance
+    and `cleared` is false."""
+    rel = release_order(fleet, status="needs_review",
+                        assume="shipped without the changelog entry")
+    stage_release(rel)
+    fleet.change(rel, "print('version bump')\n")
+    store = fleet.store()
+    try:
+        store.update_work_order(rel, pr_url="https://github.com/x/y/pull/733")
+    finally:
+        store.close()
+
+    result = ops.review_work_order(rel, accept=True)
+
+    assert len(rounds(fleet, rel)) == 1
+    assert result["status"] == "validating"
+    assert row(fleet, rel)["status"] == "validating"
+
+
+def test_automerge_decide_unchanged(fleet):
+    """§4: a release order with a pull request and no passed round is still held — the
+    fix belongs where the wrong question is asked, not where the right answer is
+    enforced."""
+    from jarvis import automerge
+    from tests.test_automerge import cfg, pr
+
+    decision = automerge.decide(
+        None,
+        {"id": "wo-1", "status": "waiting_pr_merge", "title": "Ship the fix",
+         "pr_url": "https://github.com/x/y/pull/899",
+         "metadata": db.to_json({release.BATCH_KEY: [ISSUE]})},
+        pr(), cfg(), validated_head=None)
+
+    assert not decision.armed
+    assert decision.code == automerge.HELD_NOT_PASSED
 
 
 def test_the_predicate_is_the_batch_keys_presence(fleet):
