@@ -12272,6 +12272,113 @@ def inspect_config(project: str | None = None) -> Any:
         return InspectConfig()
 
 
+def navigation_config(project: str | None = None) -> Any:
+    """The `jarvis navigation` settings in force for `project` — or the OS's — or defaults.
+
+    `ops.inspect_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved, and falling back to
+    `NavigationConfig()` rather than to None because every default here is a pattern list
+    with a measured justification (§2.3 of the 2026-10-02 navigation spec).
+    """
+    from .catalog import NavigationConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.navigation if project is None
+                else catalog.project(project).navigation)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return NavigationConfig()
+
+
+#: Why a no-argument `jarvis navigation` refuses. `~/.claude/projects` is 2.7G with
+#: 11,889 lead transcripts, so the wide scope is opt-in and windowed (§2.1).
+NAVIGATION_NEEDS_SCOPE = (
+    "name a work order, a feature order or a project — or pass --fleet. A no-argument "
+    "run would walk every transcript Claude Code has ever written (2.7G, 11,889 lead "
+    "files on this box) to answer a question that is usually about one order."
+)
+
+
+def navigation_report(target: str | None = None, project: str | None = None, *,
+                      fleet: bool = False, days: int | None = None) -> dict[str, Any]:
+    """How an order, a project or the fleet NAVIGATED code — `jarvis navigation`.
+
+    Resolves a target the way `inspect_report` does, feature order first and for the same
+    reason, so the two commands agree about what an id means. Read-only, no paid call:
+    everything comes from transcripts already on disk.
+
+    A PROJECT or `--fleet` reads the transcript TREE and honours `days`: a project's
+    worker sessions are not enumerable from the record alone once a worktree is gone,
+    which is `usage.index_sessions`' reason, so a wide scope is a walk and therefore
+    windowed.
+    """
+    from . import navigation
+    from . import usage as usage_mod
+
+    if not target and not project and not fleet:
+        raise OpsError(NAVIGATION_NEEDS_SCOPE)
+
+    scope_project = project
+    session_ids: list[tuple[str, str]] = []     # (label, session id)
+    if target:
+        try:
+            name, path, fo = find_feature_order(target, project)
+            store = ProjectStore(path)
+            try:
+                ids = []
+                planner_id = fo.get("plan_wo_id")
+                if planner_id:
+                    try:
+                        ids.append(store.get_work_order(planner_id))
+                    except KeyError:
+                        pass
+                ids.extend(store.feature_children(fo["id"]))
+            finally:
+                store.close()
+            scope_project = scope_project or name
+            session_ids = [(wo["id"], wo.get("session_id") or "") for wo in ids]
+            scope = fo["id"]
+        except OpsError:
+            try:
+                name, wo_path, wo = find_work_order(target, project)
+            except OpsError:
+                # Not an id at all: the third resolution `inspect_report` does.
+                scope_project = target
+                session_ids = []
+                scope = target
+            else:
+                scope_project = scope_project or name
+                session_ids = [(wo["id"], wo.get("session_id") or "")]
+                scope = wo["id"]
+    else:
+        scope = scope_project or "fleet"
+
+    cfg = navigation_config(scope_project)
+    window = cfg.window_days if days is None else days
+
+    if session_ids:
+        index = usage_mod.index_sessions()
+        rolled = navigation.NavigationVolume(scope=scope)
+        for _label, session in session_ids:
+            if not session:
+                continue
+            rolled.fold(navigation.read_session(session, cfg, index=index))
+        return rolled.as_dict()
+
+    # A project or the fleet: the tree, within the window. A project is scoped by the
+    # slug Claude Code derives from the cwd — a worker's worktree lives under the project
+    # path, so the project's slug is a prefix of its workers'. A project the catalog does
+    # not name is refused rather than silently answered with the whole fleet.
+    prefix = ""
+    if scope_project:
+        prefix = navigation.slug_of(
+            project_spec(resolve_catalog(), scope_project).path)
+    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix)
+    payload = volume.as_dict()
+    payload["scope"] = scope
+    return payload
+
+
 def cold_prefix_floor(project: str | None = None) -> int | None:
     """`os.cold_prefix_floor` if a catalog can be reached, else None.
 
@@ -12415,10 +12522,19 @@ def inspect_report(target: str, project: str | None = None, *,
     """
     from dataclasses import replace
 
-    from . import autopsy, holds
+    from . import autopsy, holds, navigation
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
+    # One reader, two surfaces (q1216): the per-order navigation section is a key on
+    # this report as well as `jarvis navigation`'s own answer, so the two cannot
+    # disagree. Per project and cached, like the inspect settings below.
+    nav_configs: dict[str, Any] = {}
+
+    def nav_settings(project_name: str) -> Any:
+        if project_name not in nav_configs:
+            nav_configs[project_name] = navigation_config(project_name)
+        return nav_configs[project_name]
     # Resolved ONCE for the whole report, beside the index and best-effort for the same
     # reason: an `os.*` setting, so it is the same value for every unit.
     floor = cold_prefix_floor()
@@ -12453,6 +12569,11 @@ def inspect_report(target: str, project: str | None = None, *,
             turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
         payload.update(provenance=provenance,
+                       # §2.2: the per-order navigation volume, same reader as
+                       # `jarvis navigation`'s. Read from the transcript, so an order
+                       # whose session is gone reports `found: false` rather than zeros.
+                       navigation=navigation.read_session(
+                           session, nav_settings(project_name), index=index).as_dict(),
                        wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",
                        # The biggest input Jarvis itself sent on this order's behalf

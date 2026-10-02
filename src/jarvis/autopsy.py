@@ -375,10 +375,13 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
         deeper=row.get("deeper", 0),
         turns=[_read_turn(t) for t in row.get("turns") or []],
         writes=[_read_write(w) for w in row.get("writes") or []],
-        total_written=row.get("total_written", 0),
-        max_write=row.get("max_write", 0),
-        write_floor=row.get("write_floor", 0),
-        api_call_count=row.get("api_call_count", 0),
+        # NO `0` DEFAULT (spec 2026-10-02 §1.3, as it lands on seals written BEFORE the
+        # keys existed): absent must stay distinguishable from a measured zero, or the
+        # renderer says `wrote nothing to the cache` about 334,427 tokens.
+        total_written=row.get("total_written"),
+        max_write=row.get("max_write"),
+        write_floor=row.get("write_floor"),
+        api_call_count=row.get("api_call_count"),
         boundaries=[_read_boundary(b) for b in row.get("boundaries") or []])
 
 
