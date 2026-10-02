@@ -4243,9 +4243,12 @@ class Daemon:
             # and counts it. `due` compares the fingerprint against the first and floors
             # the spend on the second — see issue #216.
             attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
+            # The blocker is computed BESIDE the fingerprint and passed in: `due` is the
+            # whole spend decision and reads no state itself (see its docstring).
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
                                  float(row.get("created_at") or 0.0),
-                                 last_attempt=attempt)
+                                 last_attempt=attempt,
+                                 blocker=health.blocker(pstore, subject, cfg))
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
@@ -4259,6 +4262,7 @@ class Daemon:
         project — a recorded hold that nobody reads is just a quieter retry storm (spec
         docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
         """
+        from . import health
         from . import supervisor as supervisor_mod
         from .neo_store import NeoStore
 
@@ -4278,8 +4282,18 @@ class Daemon:
                         log.debug("[%s] health sweep held until %s: %s",
                                   project.name, hold[0], hold[1])
                         continue
-                    for _, subject, trigger in self._health_candidates(
-                            pstore, cfg)[:cfg.health_max_units_per_tick]:
+                    candidates = self._health_candidates(pstore, cfg)
+                    # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every
+                    # due re-assertion is processed. Otherwise a mostly-parked project
+                    # would spend its whole cap on free rows and starve the paid looks
+                    # the cap's rotation exists to guarantee.
+                    free = [c for c in candidates if c[2] == health.REASSERT]
+                    paid = [c for c in candidates
+                            if c[2] != health.REASSERT][:cfg.health_max_units_per_tick]
+                    for _, subject, trigger in free + paid:
+                        if trigger == health.REASSERT:
+                            supervisor_mod.reassert_health(pstore, project.name, subject)
+                            continue
                         supervisor_mod.review_health(
                             pstore, neo_store, project.name, subject, cfg.probes, cfg,
                             trigger, inspect_cfg=project.inspect)
