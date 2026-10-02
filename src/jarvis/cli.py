@@ -306,19 +306,49 @@ def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
     # read as a measurement (spec §3, Neo's ruling).
     if payload.get("approximate"):
         lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    held_now = payload.get("held_now")
     for total in payload.get("totals") or []:
         entries = total["entries"]
         word = "entry" if entries == 1 else "entries"
+        held = float(total.get("held_seconds") or 0.0)
+        current = bool(total["status"]) and total["status"] == payload.get(
+            "current_status")
+        # The HEADLINE is active and wall is never deleted (Neo 1130, spec §3); a status
+        # never held renders byte for byte as it did before holds were read at all.
+        duration = total["active_human"] if held else total["seconds_human"]
         line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
-                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{duration:>7}  {entries} {word:<8} "
                 f"{total['share'] * 100:>3.0f}%")
-        if total["status"] and total["status"] == payload.get("current_status"):
+        if held and not (current and held_now):
+            breakdown = ((payload.get("current_status_held_by") if current
+                          else total.get("held_by")) or [])
+            line += (f"   ({total['held_human']} held by {_held_phrase(breakdown)}, "
+                     f"{total['seconds_human']} wall)")
+        if current and held_now:
+            line += (f"   ← HELD {held_now['seconds_human']} by {held_now['phrase']}, "
+                     f"running {payload['current_status_active_age_human']} of "
+                     f"{payload['current_status_age_human']}")
+        elif current:
             idle = payload.get("last_activity_age_human")
             since = (f"nothing since {idle} ago" if idle
                      else "nothing on the record at all")
             line += f"   ← now, {payload['current_status_age_human']}, {since}"
         lines.append(line)
     return lines
+
+
+def _held_phrase(held_by: list[dict[str, Any]]) -> str:
+    """"a fleet usage limit and 2 others" — `holds.Hold.phrase` verbatim, biggest first.
+
+    Spec §3: the OS's own sentence for the cause, never a second spelling of it.
+    """
+    if not held_by:
+        return "a hold"
+    others = len(held_by) - 1
+    if not others:
+        return str(held_by[0]["phrase"])
+    return (f"{held_by[0]['phrase']} and {others} "
+            f"{'other' if others == 1 else 'others'}")
 
 
 def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
