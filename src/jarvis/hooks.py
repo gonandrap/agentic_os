@@ -26,6 +26,11 @@ from .project_store import ProjectStore
 # a chain of `cd <dir>` / `jarvis …` segments joined by &&, nothing else.
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
 
+#: The same characters split by quote kind for `jarvis_verbs`
+#: (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+_SHELL_STRUCTURE = re.compile(r"[|;<>]")
+_SHELL_SUBSTITUTION = re.compile(r"\$\(|`")
+
 
 def is_jarvis_command_chain(command: str) -> bool:
     if _SHELL_DANGEROUS.search(command):
@@ -51,17 +56,31 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     A SIBLING of `is_jarvis_command_chain`, which stays untouched: that one answers "is
     this a chain of `cd`/`jarvis` segments", which for every other kind is the right
     question, and narrowing it would change every kind's behaviour (§2.6 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `_SHELL_DANGEROUS`
-    and `shlex` parse, so the two cannot disagree about what a segment is.
+    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `shlex` parse, so
+    the two cannot disagree about what a segment IS — only about which characters count
+    as structure: this one judges STRUCTURE, not raw text, because every write it must
+    clear carries prose in quotes (docs/superpowers/specs/2026-10-01-investigator-writes-
+    unreachable.md).
 
     An empty tuple means "no `jarvis` verb this can vouch for": not a jarvis chain, a
     command carrying shell metacharacters, or one shlex cannot parse. The caller decides
     what that means — for the investigator it means the allowlist cannot clear it.
     """
-    if _SHELL_DANGEROUS.search(command):
+    masked = _mask_shell_text(command)
+    # Literal inside EITHER quote kind, so judged on fully masked text (spec §The
+    # mechanism, 1).
+    if _SHELL_STRUCTURE.search(masked):
+        return ()
+    # The shell INTERPOLATES inside double quotes, so these two are judged with only
+    # single quotes masked (spec §The mechanism, 2).
+    if _SHELL_SUBSTITUTION.search(_mask_single_quoted(command)):
+        return ()
+    # Parameter expansion yields a VALUE inside quotes; unquoted, `$` stays dangerous
+    # (spec DELTA 1).
+    if "$" in masked:
         return ()
     out: list[tuple[str, str]] = []
-    for segment in command.split("&&"):
+    for segment in _and_segments(command, masked):
         try:
             words = shlex.split(segment.strip())
         except ValueError:
@@ -474,6 +493,7 @@ _BACKGROUNDING_WORD = re.compile(
     r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
 
 _QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
+_SINGLE_QUOTED_SPAN = re.compile(r"'[^']*'", re.DOTALL)
 _SHELL_COMMENT = re.compile(r"(?:(?<=^)|(?<=\s))#[^\n]*")
 
 
@@ -485,6 +505,29 @@ def _mask_shell_text(command: str) -> str:
     """
     masked = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
     return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
+
+
+def _mask_single_quoted(command: str) -> str:
+    """The command with SINGLE-quoted spans blanked only, positions preserved.
+
+    The shell interpolates inside double quotes, so `$(` and a backtick there are
+    structure (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+    """
+    return _SINGLE_QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
+
+
+def _and_segments(command: str, masked: str) -> list[str]:
+    """`command` split on its `&&` offsets taken from `masked`, so a quoted one is prose.
+
+    docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md.
+    """
+    out: list[str] = []
+    start = 0
+    for found in re.finditer(r"&&", masked):
+        out.append(command[start:found.start()])
+        start = found.end()
+    out.append(command[start:])
+    return out
 
 
 def backgrounds_through_shell(command: str) -> bool:
