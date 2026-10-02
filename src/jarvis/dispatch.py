@@ -999,8 +999,11 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "leaves the OS blind is refused.",
         "",
         "# The verdict",
-        f"Write it to `verdict.json` in your worktree root — that filename exactly, it is "
-        f"the one path you are permitted to write — and submit it with the command below, "
+        f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
+        f"that filename exactly, it is the one path you are permitted to write, and "
+        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`: a "
+        f"shell heredoc that writes a file is refused for every worker in the fleet "
+        f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
         f"settles this work order for you. `--from-file` and not inline flags, because "
         f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "
