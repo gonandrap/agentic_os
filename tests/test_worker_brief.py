@@ -265,7 +265,7 @@ def test_navigation_section_is_the_full_navigation_briefing():
     from jarvis import worker_brief
     text = worker_brief.render_section("navigation")
     for phrase in ("Serena first, grep second", "find_referencing_symbols",
-                   "no Serena", "read_memory"):
+                   "DEFERRED", "read_memory"):
         assert phrase in text, f"lost from the navigation section: {phrase!r}"
     # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md:
     # the symbol tools are DEFERRED behind `ToolSearch`, so "appear in your tool list"

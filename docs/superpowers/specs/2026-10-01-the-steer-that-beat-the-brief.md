@@ -77,6 +77,10 @@ probes, opus, `claude -p --permission-mode auto`, reading the `attachment` recor
 | `/tmp/bf5` | `CLAUDE_CODE_COZY_TEAPOT=relaxed` | same, `relaxed` |
 | `/tmp/bf6` | `CLAUDE_CODE_THRIFTY_SONIC=false` | **none at all** — and the string `auto mode is active` appears nowhere in the transcript |
 
+The ledger is append-only, so the correction needed a command, not a spec edit: during
+this work order the lead retracted `kn-8107745e` and filed `kn-40d0ba16` with the
+corrected claim. Done, not pending.
+
 Also recorded because it changes how the defect reads: this work order's own session
 attachment says `"bashFirstSteer":"strict"` while the unset `/tmp/bf4` baseline said
 `"relaxed"`. The variant is a per-session statsig cohort draw. Today a worker's steer
@@ -419,10 +423,6 @@ Not a blocker on this order, and not something this order can fake.
 ## Not in scope
 
 * The AFTER measurement (§5.3) — needs the change live on the fleet.
-* Retiring kn-8107745e's false "no setting turns it off" claim. §1 records the correction
-  and the probe method, but the ledger is append-only: the lead runs
-  `jarvis learn retract kn-8107745e --reason "…"` and files the corrected entry. A spec
-  cannot retract a learning.
 * `jarvis-architect` and `jarvis-test-lead`. Already graded by
   `evals/llm/test_navigation_judgment.py:210-237` and not implicated by the measurement.
 * The deferral itself. A vendor behaviour; §3 routes around it.

@@ -608,9 +608,9 @@ def navigation_section(serena: bool = True) -> str:
 
     Prose rather than a capability restriction, and it has to be: a worker needs
     `Grep` and `Bash` for its actual job, so the seats' trick of simply not
-    granting the tool is not available. Stated conditionally because whether a
-    worker has Serena depends on the user's own Claude configuration and on whether
-    the project is indexed.
+    granting the tool is not available. The two cases are separate BRANCHES rather
+    than one hedged paragraph: `dispatch` writes `JARVIS_SERENA` from the project's
+    real wiring, so each branch can state its own case unconditionally.
 
     `serena=False` is the one case Jarvis DOES know about: the project deselected it
     on /config, so `dispatch` did not wire it. Recommending it there would send every
@@ -659,10 +659,6 @@ def navigation_section(serena: bool = True) -> str:
         "wrong, it is just the wrong tool for finding code.",
         "- If the symbol tools say no project is active, `activate_project` on the "
         "repo root first.",
-        "",
-        "If the project has no Serena, `Glob` and `Grep` are the fallback and "
-        "there is nothing to apologise for — just expect to work harder for a less "
-        "complete picture.",
     ]
     return "\n".join(lines)
 
