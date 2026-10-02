@@ -104,13 +104,20 @@ sentence is false.
 
 ### The mechanism
 
-Two masks, one per character class.
+Two masks, one per character class, both produced by ONE escape-aware scan of the
+command (`_scan_shell_quotes`, which returns `(full, single_only, terminated)`).
 
-1. `|`, `;`, `<`, `>` and the positions of the `&&` split: judge on quote-masked text
-   from `_mask_shell_text` (`hooks.py:480`), which blanks single- and double-quoted spans
-   and comments while PRESERVING POSITIONS. These five are literal inside EITHER quote
-   kind, so masking both is correct for them.
-2. `$` and a backtick: judge on text with ONLY single-quoted spans masked. The shell
+0. BACKSLASH ESCAPES ARE PART OF QUOTE STATE. Outside single quotes, `\` makes the next
+   character literal: `\;` is not structure and `\"` does NOT open a quoted span. So the
+   scanner blanks the escape PAIR in both masks and never changes state on an escaped
+   quote. Inside single quotes there are no escapes at all — only a `'` closes. And an
+   UNTERMINATED quote (state not NONE at end of string) FAILS CLOSED: `jarvis_verbs`
+   returns `()`, because the structure of such a command is not knowable here.
+1. `|`, `;`, `<`, `>` and the positions of the `&&` split: judge on the FULL mask, which
+   blanks single- and double-quoted spans while PRESERVING POSITIONS. These five are
+   literal inside EITHER quote kind, so masking both is correct for them.
+2. `$` and a backtick: judge on the SINGLE-ONLY mask, with single-quoted spans masked and
+   double-quoted content KEPT (escape pairs blanked there too — `\$` is literal). The shell
    INTERPOLATES inside double quotes, so
    `jarvis wo ask wo-1 "$(sed -i s/a/b/ src/x.py)"` is a jarvis command on its face and a
    write when it runs. Masking double quotes for these two would hand the investigator
@@ -122,10 +129,12 @@ hole passes every test about prose.
 
 ### The new mask
 
-A sibling of `_mask_shell_text`, next to it at `hooks.py:480`, reusing a single-quote-only
-variant of `_QUOTED_SPAN` (`hooks.py:476`, currently `r"'[^']*'|\"[^\"]*\""`): the same
-substitution with the double-quoted alternative dropped. It must blank with spaces of
-equal length, exactly as `_mask_shell_text` does, because POSITIONS ARE LOAD-BEARING:
+A sibling of `_mask_shell_text`, next to it, used by `jarvis_verbs` ONLY —
+`_mask_shell_text`, `_QUOTED_SPAN` and `_SHELL_COMMENT` keep their three other callers
+and are not touched. NOT a regex: regex spans cannot see backslash escapes (DELTA 2
+below), so this is a single-pass state scanner that emits both masks. It must blank with
+spaces of equal length, exactly as `_mask_shell_text` does, because POSITIONS ARE
+LOAD-BEARING:
 the `&&` split is taken on the masked text and the resulting offsets index back into the
 ORIGINAL `command` to get each segment's real text for `shlex.split`. A mask that changed
 lengths would slice segments at the wrong byte.
@@ -139,6 +148,24 @@ Everything after the metacharacter decision stays as it is: `shlex.split` per se
 segment. The empty-tuple contract does not change, so `_investigator_may_run`'s fallback
 path, `INVESTIGATOR_JARVIS_DENIED`, `INVESTIGATOR_JARVIS_ARG_VERBS` and the deny text all
 stay untouched.
+
+### Deltas
+
+**DELTA 1.** A bare `$` (parameter expansion, no `$(`) is refused on the FULL mask:
+`"$HOME"` yields a VALUE inside quotes and is prose, unquoted `$x` is not. So the check
+is `"$" in full_mask`, after the two regex classes.
+
+**DELTA 2 (review round 1).** The first implementation masked quoted spans with the
+regexes `r"'[^']*'|\"[^\"]*\""` / `r"'[^']*'"`, which IGNORE BACKSLASH ESCAPES. A
+backslash-escaped quote outside any quote was read as the START of a span, so
+`jarvis wo ask wo-1 \" ; git commit -am x ; \"` had its two real `;` masked, cleared
+`jarvis_verbs` as `(('wo','ask'),)`, and bash then ran `git commit` as a separate
+command — an arbitrary-execution path out of the read-only investigator, which the old
+raw scan had refused. Regex masking therefore did NOT "fail closed"; it failed OPEN, and
+any claim otherwise in this spec is wrong. Fixed by the escape-aware scanner (mechanism
+0): escape pairs are blanked, an escaped quote changes no state, and an unterminated
+quote now fails closed with `()`. Deny tests for the three escaped-quote shapes run
+through BOTH `investigator_bash_decision` and `preflight_decision`.
 
 ### Rejected alternatives
 

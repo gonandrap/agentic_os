@@ -17,7 +17,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import concision
 from .project_store import ProjectStore
@@ -66,14 +66,18 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     command carrying shell metacharacters, or one shlex cannot parse. The caller decides
     what that means — for the investigator it means the allowlist cannot clear it.
     """
-    masked = _mask_shell_text(command)
+    scan = _scan_shell_quotes(command)
+    # An unterminated quote has no knowable structure, so fail closed (spec DELTA 2).
+    if not scan.terminated:
+        return ()
+    masked = scan.full
     # Literal inside EITHER quote kind, so judged on fully masked text (spec §The
     # mechanism, 1).
     if _SHELL_STRUCTURE.search(masked):
         return ()
     # The shell INTERPOLATES inside double quotes, so these two are judged with only
     # single quotes masked (spec §The mechanism, 2).
-    if _SHELL_SUBSTITUTION.search(_mask_single_quoted(command)):
+    if _SHELL_SUBSTITUTION.search(scan.single_only):
         return ()
     # Parameter expansion yields a VALUE inside quotes; unquoted, `$` stays dangerous
     # (spec DELTA 1).
@@ -493,7 +497,6 @@ _BACKGROUNDING_WORD = re.compile(
     r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
 
 _QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
-_SINGLE_QUOTED_SPAN = re.compile(r"'[^']*'", re.DOTALL)
 _SHELL_COMMENT = re.compile(r"(?:(?<=^)|(?<=\s))#[^\n]*")
 
 
@@ -507,13 +510,67 @@ def _mask_shell_text(command: str) -> str:
     return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
 
 
-def _mask_single_quoted(command: str) -> str:
-    """The command with SINGLE-quoted spans blanked only, positions preserved.
+class _QuoteMasks(NamedTuple):
+    """One escape-aware scan of a command, as the two masks `jarvis_verbs` judges on.
 
-    The shell interpolates inside double quotes, so `$(` and a backtick there are
-    structure (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+    `full`: single- AND double-quoted content blanked. `single_only`: only single-quoted
+    content blanked, because the shell still interpolates inside double quotes. Escape
+    pairs (`\\;`, `\\"`, `\\$`) are blanked in BOTH: they are literal characters, not
+    structure. `terminated` is False when a quote never closed — the caller fails closed
+    (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md, DELTA 2).
     """
-    return _SINGLE_QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
+
+    full: str
+    single_only: str
+    terminated: bool
+
+
+def _scan_shell_quotes(command: str) -> _QuoteMasks:
+    """Quote state of `command`, tracking backslash escapes, positions preserved.
+
+    A regex span cannot do this: it reads `\\"` as the start of a quoted span and masks
+    the real structure after it (spec DELTA 2, review round 1).
+    """
+    full: list[str] = []
+    single_only: list[str] = []
+    state = ""  # "" = outside quotes, "'" = single, '"' = double
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if state == "'":
+            full.append(" ")
+            single_only.append(" ")
+            if char == "'":
+                state = ""
+            i += 1
+            continue
+        if char == "\\" and state != "'":
+            # Bash: a backslash outside single quotes makes the next character literal.
+            width = 2 if i + 1 < len(command) else 1
+            full.append(" " * width)
+            single_only.append(" " * width)
+            i += width
+            continue
+        if state == '"':
+            full.append(" ")
+            single_only.append(char if char != '"' else '"')
+            if char == '"':
+                state = ""
+            i += 1
+            continue
+        if char == "'":
+            state = "'"
+            full.append(" ")
+            single_only.append(" ")
+        elif char == '"':
+            state = '"'
+            full.append(" ")
+            single_only.append(char)
+        else:
+            full.append(char)
+            single_only.append(char)
+        i += 1
+    return _QuoteMasks("".join(full), "".join(single_only), state == "")
 
 
 def _and_segments(command: str, masked: str) -> list[str]:

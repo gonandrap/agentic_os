@@ -302,6 +302,39 @@ def test_real_shell_structure_and_the_refused_verbs_stay_refused():
             _bash(command), _env())) == "deny", command
 
 
+# -- review round 1: a BACKSLASH-ESCAPED quote does not open a span (spec DELTA 2) ----
+
+#: The regex masks took each `\"`/`\'` for the start of a quoted span, so the real `;`
+#: between them was masked and bash ran `git commit` as its own command.
+ESCAPED_QUOTE_ESCAPES = (
+    'jarvis wo ask wo-1 \\" ; git commit -am x ; \\"',
+    "jarvis wo ask wo-1 \\' ; git commit -am x ; \\'",
+    "jarvis wo ask wo-1 \\' $(sed -i s/a/b/ src/x.py) \\'",
+)
+
+
+def test_a_backslash_escaped_quote_does_not_mask_real_structure():
+    for command in ESCAPED_QUOTE_ESCAPES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_leaves_the_next_quote_a_real_quote():
+    """A literal backslash, so the `"` after it still opens a span."""
+    command = 'jarvis wo ask wo-1 \\\\" ; git commit -am x "'
+    assert hooks.jarvis_verbs(command) == (("wo", "ask"),)
+    assert _decision(hooks.investigator_bash_decision(
+        _bash(command), _env())) == "allow", command
+
+
+def test_an_unterminated_quote_fails_closed():
+    assert hooks.jarvis_verbs('jarvis wo ask wo-1 "oops') == ()
+    assert hooks.jarvis_verbs("jarvis wo ask wo-1 'oops") == ()
+
+
 def test_the_prose_fixtures_leave_every_other_kind_alone():
     for command in (REAL_REFUSED_ASKS + tuple(_prose_writes())
                     + SUBSTITUTION_IN_DOUBLE_QUOTES + REAL_STRUCTURE
