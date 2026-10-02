@@ -522,3 +522,24 @@ def test_tool_parameters_are_html_escaped(client, dispatched, transcripts):
 
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
     assert "<script>alert(1)</script>" not in page
+
+
+def test_the_anatomy_page_shows_the_navigation_counts(client, dispatched, transcripts):
+    """§3: the page and `jarvis inspect` read the SAME literals, so neither can report a
+    navigation reading the other contradicts."""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"),
+                 *tool_rows(at, at + 1, "t1", "Bash",
+                            {"command": "grep -rn total_for src/pricing.py"}),
+                 *tool_rows(at + 1, at + 2, "t2", "mcp__serena__find_symbol",
+                            {"name_path_pattern": "a"}),
+                 *tool_rows(at + 2, at + 3, "t3", "Bash", {"description": "no command"}),
+                 assistant_row(at + 4, "m1")])
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug").text
+    (unit,) = ops.inspect_report(wo_id, "proj_a")["units"]
+
+    assert unit["nav"] == {"symbol_calls": 1, "source_nav_calls": 1, "unclassified": 1}
+    assert inspection.nav_line(unit["nav"]) in page

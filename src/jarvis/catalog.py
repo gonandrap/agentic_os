@@ -18,6 +18,8 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
+from .navigation import (NAV_COMMANDS, SOURCE_SUFFIXES, SYMBOL_TOOLS,
+                         TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
@@ -888,25 +890,25 @@ class InspectConfig:
 # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
 # re-measuring under a different definition of "navigation" must not need a release.
 
+# §3 of the 2026-10-02 navigation split: ONE definition, in the stdlib-only leaf.
+
 #: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no more:
 #: the BEFORE figure (41.3%) was measured with these six, and a wider set makes the AFTER
 #: figure incomparable rather than better.
-DEFAULT_NAVIGATION_BASH_COMMANDS = ("cat", "head", "sed", "grep", "rg", "find")
+DEFAULT_NAVIGATION_BASH_COMMANDS = NAV_COMMANDS
 
-#: Symbol tools, BARE — `navigation.is_symbol_tool` strips the `mcp__<server>__` prefix,
+#: Symbol tools, BARE — `navigation.is_symbol_call` strips the `mcp__<server>__` prefix,
 #: because both `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet.
 #: `search_for_pattern` is DELIBERATELY ABSENT: it is text search with a Serena name, and
 #: counting it as a symbol call is the vacuity trap kn-a397fb52 documents.
-DEFAULT_NAVIGATION_SYMBOL_TOOLS = ("find_symbol", "find_referencing_symbols",
-                                   "get_symbols_overview", "find_declaration",
-                                   "find_implementations")
+DEFAULT_NAVIGATION_SYMBOL_TOOLS = SYMBOL_TOOLS
 
 #: The TOOLS that are text search. `Bash` is not here and must not be — a worker runs all
 #: sorts of legitimate shell; the COMMAND is classified instead.
-DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = ("Grep", "Glob")
+DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = TEXT_SEARCH_TOOLS
 
 #: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
-DEFAULT_NAVIGATION_CODE_SUFFIXES = (".py",)
+DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 
 #: The default window for a wide scope, in days. Seven, for
 #: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
