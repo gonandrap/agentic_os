@@ -647,3 +647,79 @@ def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
         assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
     finally:
         claude_cli.set_max_os_prompt_chars(before)
+
+
+# -- navigation: the classifier's patterns are DATA, never module constants -------------
+#
+# q1216's condition, §2.3 of
+# docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
+# re-measuring under a different definition of "navigation" must not need a release.
+
+
+def test_navigation_ships_the_measured_defaults_fleet_wide_and_per_project():
+    from jarvis.catalog import (
+        DEFAULT_NAVIGATION_BASH_COMMANDS,
+        DEFAULT_NAVIGATION_CODE_SUFFIXES,
+        DEFAULT_NAVIGATION_SYMBOL_TOOLS,
+        DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS,
+        DEFAULT_NAVIGATION_WINDOW_DAYS,
+    )
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+
+    assert DEFAULT_NAVIGATION_BASH_COMMANDS == ("cat", "head", "sed", "grep", "rg",
+                                                "find")
+    assert DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS == ("Grep", "Glob")
+    assert DEFAULT_NAVIGATION_CODE_SUFFIXES == (".py",)
+    assert DEFAULT_NAVIGATION_WINDOW_DAYS == 7
+    # text search with a Serena name is NOT a symbol call (kn-a397fb52)
+    assert "search_for_pattern" not in DEFAULT_NAVIGATION_SYMBOL_TOOLS
+    assert cat.os.navigation.bash_commands == DEFAULT_NAVIGATION_BASH_COMMANDS
+    assert cat.projects[0].navigation.symbol_tools == DEFAULT_NAVIGATION_SYMBOL_TOOLS
+    assert cat.projects[0].navigation.enabled is True
+
+
+def test_a_project_naming_one_navigation_key_inherits_the_rest():
+    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER, so
+    no caller consults two objects."""
+    cat = parse_catalog({
+        "os": {"navigation": {"window_days": 30}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b",
+             "navigation": {"bash_commands": ["cat", "rg"]}},
+        ],
+    })
+
+    assert cat.os.navigation.window_days == 30
+    assert cat.projects[0].navigation.window_days == 30
+    assert cat.projects[1].navigation.window_days == 30
+    assert cat.projects[1].navigation.bash_commands == ("cat", "rg")
+    assert cat.projects[1].navigation.code_suffixes == (".py",)
+
+
+def test_an_empty_navigation_pattern_list_is_refused_naming_the_key():
+    """An empty classifier reports 0% everywhere and looks like a win."""
+    with pytest.raises(CatalogError, match="navigation.bash_commands"):
+        parse_catalog({"os": {"navigation": {"bash_commands": []}}, "projects": []})
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).navigation"):
+        parse_catalog({"projects": [
+            {"name": "a", "path": "/tmp/a", "navigation": {"symbol_tools": []}}]})
+
+
+def test_a_navigation_pattern_list_that_is_not_strings_is_refused():
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"navigation": {"bash_commands": "cat"}}, "projects": []})
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"navigation": {"text_search_tools": [1, 2]}},
+                       "projects": []})
+    with pytest.raises(CatalogError, match="must be an object"):
+        parse_catalog({"os": {"navigation": "on"}, "projects": []})
+
+
+def test_a_suffix_without_a_leading_dot_and_a_zero_window_are_refused():
+    with pytest.raises(CatalogError, match="code_suffixes"):
+        parse_catalog({"os": {"navigation": {"code_suffixes": ["py"]}},
+                       "projects": []})
+    with pytest.raises(CatalogError, match="window_days"):
+        parse_catalog({"os": {"navigation": {"window_days": 0}}, "projects": []})

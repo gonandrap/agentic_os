@@ -807,6 +807,9 @@ def create_app() -> FastAPI:
         # page and `jarvis cost` both — it was spelled out in each until §10 needed a
         # fourth sentence, and a caveat worded two ways is one the reader stops trusting.
         absent_notes=bill.absent_notes,
+        # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded
+        # once, in `bill.SUBAGENT_REWRITE_ZERO`, and read by this page and `jarvis cost`.
+        subagent_rewrite_zero=bill.SUBAGENT_REWRITE_ZERO,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,

@@ -40,6 +40,7 @@ from tests.test_inspection import (  # noqa: F401
     real_session,
     sub_rows,
     tool_rows,
+    under_floor_rows,
     write_meta,
     write_transcript,
 )
@@ -709,6 +710,31 @@ def test_a_nested_subagent_s_params_survive_the_round_trip_at_full(write_transcr
     assert autopsy.from_seal(sealed, spans=[]).as_dict() == a.as_dict()
 
 
+def test_a_subagent_s_threshold_free_figures_survive_the_seal(write_transcript):
+    """Spec 2026-10-02 §1.3: a sealed order is the only reading left once the transcript
+    expires, so a field the seal drops becomes a silent zero on every settled order —
+    the exact failure mode this spec fixes."""
+    rows = under_floor_rows(1100) + [
+        # One cache read going BACKWARDS, so there is a boundary to round-trip too.
+        assistant_row(1200, "s-back", write=5_000, read=1_000)]
+    session = write_transcript("sealed-floor", parent_rows(),
+                               subagents={f"agent-{TASK}": rows})
+    a = inspection.read_session(session, cold_prefix_floor=50_000)
+    live = a.turns[0].subagents[0]
+
+    back = autopsy.from_seal(autopsy.to_seal(a, level="full"), spans=[])
+    sealed = back.turns[0].subagents[0]
+
+    assert sealed.total_written == live.total_written == 35_000
+    assert sealed.max_write == live.max_write == 5_000
+    assert sealed.write_floor == live.write_floor == 20_000
+    assert sealed.api_call_count == live.api_call_count == 7
+    assert [b.cause for b in sealed.boundaries] == [b.cause for b in live.boundaries]
+    assert len(sealed.boundaries) == 1
+    assert sealed.as_dict() == live.as_dict()
+    assert back.as_dict() == a.as_dict()
+
+
 def test_a_secret_in_a_nested_subagent_s_params_never_reaches_a_full_seal(
         write_transcript, tmp_path):
     """The nesting is REDACTED and not copied: the secret lives only in the subagent's own
@@ -1247,3 +1273,44 @@ def test_an_order_whose_sealed_payload_is_not_json_does_not_stop_the_stale_queue
     assert json.loads(store.get_work_order(good["id"])["autopsy_json"])[
         "payload_v"] == autopsy.PAYLOAD_VERSION
     assert store.get_work_order(bad["id"])["autopsy_json"] == "not json"
+
+
+def test_a_seal_predating_the_threshold_free_keys_rehydrates_absent_and_not_zero(
+        write_transcript):
+    """Spec 2026-10-02 §1.3 applied to seals written BEFORE the fields existed: every
+    settled order on this box is one. `row.get("total_written", 0)` turned an ABSENT
+    figure into a measured zero, and the renderer then printed `wrote nothing to the
+    cache` over a subagent that wrote 334,427 tokens (wo-fb7c0fc2, a8e11a7e)."""
+    session = write_transcript("old-seal", parent_rows(),
+                               subagents={f"agent-{TASK}": under_floor_rows(1100)})
+    sealed = autopsy.to_seal(inspection.read_session(session), level="normal")
+    row = sealed["turns"][0]["subagents"][0]
+    for key in ("total_written", "max_write", "write_floor", "api_call_count",
+                "boundaries"):
+        del row[key]
+
+    sub = autopsy.from_seal(sealed, spans=[]).turns[0].subagents[0]
+
+    assert sub.total_written is None and sub.max_write is None
+    assert sub.write_floor is None and sub.api_call_count is None
+    assert sub.boundaries == []
+    assert sub.rewrite() is None
+    assert sub.as_dict()["rewrite"] is None
+    assert sub.as_dict()["total_written"] is None
+
+
+def test_a_seal_from_the_current_code_round_trips_a_real_measured_zero(
+        write_transcript):
+    """The other half: a genuine `total_written == 0` is a MEASUREMENT and must survive
+    the seal as 0, never as `None`."""
+    session = write_transcript("zero-seal", parent_rows(),
+                               subagents={f"agent-{TASK}": sub_rows(1100)})
+    a = inspection.read_session(session)
+    live = a.turns[0].subagents[0]
+    sealed = autopsy.from_seal(autopsy.to_seal(a, level="normal"),
+                               spans=[]).turns[0].subagents[0]
+
+    assert live.total_written == 0 and sealed.total_written == 0
+    assert sealed.max_write == 0 and sealed.api_call_count == 3
+    assert sealed.write_floor == 20_000
+    assert sealed.rewrite()["cache_write"] == 0

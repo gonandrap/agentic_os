@@ -327,6 +327,36 @@ def test_subagents_are_counted_separately_and_included_in_the_total(transcripts)
     assert session.total.output == 22
 
 
+def test_the_subagent_rewrite_tax_is_a_structural_zero_not_a_small_one(transcripts):
+    """Spec 2026-10-02 §1.5, asserted as a PROPERTY and not as a constant.
+
+    The main side's cache read goes BACKWARDS once, so it has a boundary and an excess.
+    The subagent's never does and its written volume never exceeds its own context peak,
+    so `rewrite_excess` and `resume_boundaries` can only be 0 — while it still wrote
+    real tokens. That is the zero `jarvis cost` has to label.
+    """
+    transcripts(
+        "structural",
+        [row("m1", write=60_000, read=50_000, at="2026-08-09T00:00:00.000Z"),
+         row("m2", write=60_000, read=1_000, at="2026-08-09T01:00:00.000Z"),
+         row("m3", write=60_000, read=2_000, at="2026-08-09T02:00:00.000Z")],
+        subagents={"agent-aaa": [
+            row("s1", write=5_000, read=100_000, at="2026-08-09T00:10:00.000Z"),
+            row("s2", write=5_000, read=120_000, at="2026-08-09T00:11:00.000Z")]})
+    session = usage.read_session("structural", FLOOR)
+
+    assert session.subagents.cache_write == 10_000
+    assert session.subagents.rewrite_excess == 0
+    assert session.subagents.resume_boundaries == 0
+    assert session.main.rewrite_excess > 0 and session.main.resume_boundaries == 1
+    # `Usage.__add__` sums both sides, so the total carries the main side's tax alone —
+    # which is why an unlabelled rollup reads as "subagent cache spend is negligible".
+    assert session.total.rewrite_excess == session.main.rewrite_excess
+    assert session.total.resume_boundaries == session.main.resume_boundaries
+    assert session.total.cache_write == (session.main.cache_write
+                                         + session.subagents.cache_write)
+
+
 def test_an_empty_subagent_transcript_is_not_counted_as_an_agent(transcripts):
     """Claude Code leaves behind stub files for agents that produced nothing."""
     transcripts("s1", [row("m1", write=100)], subagents={"agent-empty": []})
