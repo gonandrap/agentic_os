@@ -1263,6 +1263,10 @@ why the call was routine and the user reads it on the record. On an escalation i
 what the user has to decide. **On an objection the WORKER reads it, mid-task** — so write
 it to that reader: say what is wrong with the call and what to do instead, in the
 imperative, with no preamble and nothing about the machinery that sent it.
+
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+high-stakes | no-learning-applies | evidence-insufficient>"
 """
 
 

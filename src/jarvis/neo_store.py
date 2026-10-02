@@ -94,6 +94,38 @@ SUPERVISOR_SEAT = "supervisor"
 # widens against this; every roster validator stays on `SEATS`.
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 
+# WHY an escalation happened, as one groupable label — §1 of
+# docs/specs/2026-10-01-neo-observability.md. Here, beside the vocabularies above, for
+# `SEATS`' reason exactly: the personas, the CLI and the report all need it and none
+# should have to depend on another.
+#
+# TWO TUPLES, because the two classes are different kinds of fact and one tuple invites a
+# report that adds them up. CHOSEN is a label the model picked, and every member is tied
+# to the persona text that asks for it (no member exists that no persona mentions).
+ESCALATION_CAUSES_CHOSEN = (
+    "high-stakes",
+    "no-learning-applies",
+    "conflicting-authority",
+    "ambiguous-intent",
+    "scope-too-large",
+    "privileged-action",
+    "evidence-insufficient",
+    "user-decision",
+)
+# FAILED is derived by the OS at the code path, never read off a model's reply.
+# `stakes-unclassified` sits here and that placement is the point: it is a reply the OS
+# would not read as an answer, not a judgement Neo made.
+ESCALATION_CAUSES_FAILED = (
+    "transport-unreachable",
+    "attempts-exhausted",
+    "prompt-refused",
+    "unparseable-reply",
+    "classifier-unreachable",
+    "classifier-unparseable",
+    "stakes-unclassified",
+)
+ESCALATION_CAUSES = ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_FAILED
+
 # How one seat's contribution ended. A seat that errors or times out is recorded as
 # `abstained` and the panel proceeds; `failed` is for a call that came back unusable.
 OPINION_STATUSES = ("ok", "abstained", "failed")
@@ -171,6 +203,9 @@ CREATE TABLE IF NOT EXISTS questions (
     answer TEXT,
     answered_by TEXT,                        -- neo | user
     answer_reason TEXT,                      -- Neo's stated reasoning / escalation reason
+    -- ESCALATION_CAUSES, or NULL for "not recorded". Also in ADDED_COLUMNS, where the
+    -- reasoning for the nullability is.
+    escalation_cause TEXT,
     answered_at REAL,
     review_status TEXT NOT NULL DEFAULT 'unreviewed',
     review_feedback TEXT,
@@ -226,6 +261,11 @@ ADDED_COLUMNS = {
         # predates this feature is, and what the daemon looks for. It is a DISPLAY
         # artefact: nothing that reaches Neo, a worker or a learning is built from it.
         "digest": "TEXT",
+        # Why this escalation happened — §1 of docs/specs/2026-10-01-neo-observability.md.
+        # NULLABLE, and NOT `NOT NULL DEFAULT ''` like its siblings above: this column is
+        # read by a GROUP BY, where an empty-string bucket beside the real causes reads as
+        # one more cause. NULL on every pre-existing row and never backfilled from prose.
+        "escalation_cause": "TEXT",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -357,6 +397,7 @@ class NeoStore:
             for r in self.conn.execute(
                 """UPDATE questions
                       SET status='failed',
+                          escalation_cause='attempts-exhausted',
                           answer_reason='neo could not be reached: stranded in '
                                         || 'answering after ' || attempts
                                         || ' reclaim attempt(s) — nobody has judged this'
@@ -429,11 +470,15 @@ class NeoStore:
         attempts = int(q["attempts"] or 0)
         reason = f"{UNREACHABLE_PREFIX}{detail}"
         if attempts >= max_attempts:
+            # `max_attempts=0` is the REFUSAL contract: the only callers that pass it are
+            # the prompt/input ceiling clauses, where no call was ever made. §1 of
+            # docs/specs/2026-10-01-neo-observability.md.
+            cause = "prompt-refused" if max_attempts == 0 else "transport-unreachable"
             self.conn.execute(
-                "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=? "
-                "WHERE id=?",
+                "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=?, "
+                "escalation_cause=? WHERE id=?",
                 (f"{reason} (after {attempts} retries — nobody has judged this)",
-                 question_id))
+                 cause, question_id))
             return "unreachable"
         self.conn.execute(
             "UPDATE questions SET status='queued', attempts=attempts+1, claimed_at=NULL, "
@@ -475,11 +520,17 @@ class NeoStore:
         self.record_answer(question_id, answer, answered_by="os", reason=reason)
         return True
 
-    def mark(self, question_id: int, status: str, reason: str = "") -> None:
+    def mark(self, question_id: int, status: str, reason: str = "",
+             cause: str = "") -> None:
+        # `cause` is ESCALATION_CAUSES or "" for "not recorded" — §2 of
+        # docs/specs/2026-10-01-neo-observability.md.
         assert status in Q_STATUSES, status
+        assert cause == "" or cause in ESCALATION_CAUSES, cause
         self.conn.execute(
-            "UPDATE questions SET status=?, answer_reason=COALESCE(NULLIF(?,''), answer_reason) WHERE id=?",
-            (status, reason, question_id),
+            "UPDATE questions SET status=?, "
+            "answer_reason=COALESCE(NULLIF(?,''), answer_reason), "
+            "escalation_cause=COALESCE(NULLIF(?,''), escalation_cause) WHERE id=?",
+            (status, reason, cause, question_id),
         )
 
     # -- digests (the dashboard's shortened rendering — see `jarvis.digest`) ----
@@ -597,6 +648,71 @@ class NeoStore:
         q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
         rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
         return db.rows_to_dicts(rows)
+
+    def question_outcomes(self, project: str = "",
+                          since: float | None = None) -> list[dict[str, Any]]:
+        """Every question in the window, grouped on (kind, project, day, outcome).
+
+        One query behind every count in `ops.neo_stats_report` — §4 of
+        docs/specs/2026-10-01-neo-observability.md. `answered_by` rides in the key because
+        `answered_by='os'` is a SUPERSEDED question, which is neither Neo answering nor
+        Neo handing back and must not reach the escalation rate's denominator.
+
+        The day bucket is SQL's, as `counts`' GROUP BY above already is.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT kind, project, status, COALESCE(answered_by, '') AS answered_by,
+                       strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS n
+                FROM questions {clause}
+                GROUP BY kind, project, status, answered_by, day
+                ORDER BY day""", params).fetchall())
+
+    def escalation_cause_counts(self, project: str = "",
+                                since: float | None = None) -> list[dict[str, Any]]:
+        """`GROUP BY escalation_cause` over the handed-back questions. NULL included: the
+        bucket that says how many escalations predate cause recording (spec §4)."""
+        where = ["status IN ('escalated','failed')"]
+        params: list[Any] = []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT escalation_cause AS cause, COUNT(*) AS n
+                FROM questions WHERE {' AND '.join(where)}
+                GROUP BY escalation_cause""", params).fetchall())
+
+    def questions_per_order(self, project: str = "",
+                            since: float | None = None) -> list[dict[str, Any]]:
+        """Questions in the window by the order that asked, TRIAGE EXCLUDED.
+
+        A triage question has no work order behind it and its `wo_id` is empty (`Q_KINDS`),
+        so dividing it by an order count would be arithmetic over two populations — spec
+        §4. They stay in `question_outcomes`.
+        """
+        where = ["kind != 'triage'", "wo_id != ''"]
+        params: list[Any] = []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT project, wo_id, COUNT(*) AS n
+                FROM questions WHERE {' AND '.join(where)}
+                GROUP BY project, wo_id""", params).fetchall())
 
     def counts(self) -> dict[str, int]:
         by_status = {

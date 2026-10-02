@@ -371,6 +371,53 @@ def test_a_question_that_does_not_exist_says_so(client):
     assert "not found" in r.text
 
 
+def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
+    """§6 of docs/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
+    and an absent ratio reads "not recorded" rather than 0%."""
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert '<span class="sub">not recorded</span>' in page.text
+    # past the stylesheet, whose own percentages are not figures
+    body = page.text.split("</style>")[-1]
+    assert "0%" not in body, "an absent rate must never render as a measured zero"
+    # a measured zero IS printed: the question census has a row for everything
+    assert "0 question" in page.text
+
+
+def test_the_neo_page_links_to_the_report_and_is_otherwise_unchanged(client):
+    page = client.get("/neo")
+    assert page.status_code == 200
+    assert 'href="/neo/stats"' in page.text
+    # no statistics block among the review forms — the reason the report is its own page
+    assert "escalation rate" not in page.text
+
+
+def test_the_neo_stats_page_prints_the_counts_and_the_cause_split(client, daemon,
+                                                                 project):
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="high-stakes")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "high-stakes" in page
+    assert "1 question" in page
+    assert "Neo chose this label" in page
+
+
+def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
+    page = client.get("/neo/stats?project=nope")
+    assert page.status_code == 200
+    assert "not registered" in page.text
+
+
 def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
     """The timeline sends the reader here; the decision has to be here too.
 

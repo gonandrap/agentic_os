@@ -191,7 +191,10 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "answer": "<what the user is told, plain words, stands alone>",
    "reason": "<one line: what you read it against, for the record>"}
   {"escalate": true,  "answer": "",
-   "reason": "<one line: why this needs the user>"}"""
+   "reason": "<one line: why this needs the user>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+evidence-insufficient | user-decision>\""""
 
 #: User-facing copy: inbox rows reach every sink, Telegram included. Here rather than at
 #: the two call sites because §2's ack and §3's advice are the same row to a reader, and

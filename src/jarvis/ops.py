@@ -13506,6 +13506,265 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
     }
 
 
+def _local_day(ts: float) -> str:
+    """The same bucket SQLite's `strftime(..., 'localtime')` produces, in Python.
+
+    Used only to fill the days inside a window that have NO rows: the buckets themselves
+    are SQL's, and two different spellings of "which day is this" would disagree at a
+    boundary.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+#: What `by_kind` cannot say, carried beside it rather than left for a reader to assume —
+#: §"What this does NOT do" of docs/specs/2026-10-01-neo-observability.md.
+NEO_ASSUMPTION_KIND_NOTE = (
+    "`assumption` covers BOTH auto-review passes: which pass filed one is only on the "
+    "project store's `autoreview_asked` event, and splitting on it means opening every "
+    "project database and walking events per question"
+)
+
+
+def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """Over SETTLED questions only, and `None` — never `0.0` — with no denominator.
+
+    Open questions have no outcome yet, and including them would make the rate fall
+    whenever the queue is busy. Absent is not zero (spec §4's zero rule).
+    """
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round((escalated + failed) / settled, 4)
+
+
+def _neo_outcome_bucket() -> dict[str, Any]:
+    return {"asked": 0, "answered": 0, "escalated": 0, "failed": 0,
+            "escalation_rate": None}
+
+
+def _neo_spend_bucket() -> dict[str, Any]:
+    return {"calls": 0, "input": 0, "cache_write": 0, "cache_read": 0, "output": 0,
+            "recorded_cost_usd": 0.0, "list_cost_usd": 0.0}
+
+
+def _percentile(sorted_values: list[int], fraction: float) -> int | None:
+    """Nearest-rank percentile over a sample, or None when the sample is empty.
+
+    In Python because SQLite has none, and the row count is bounded by the window (spec
+    §4). None, not 0: a kind nobody timed has no percentile.
+    """
+    if not sorted_values:
+        return None
+    index = min(len(sorted_values) - 1,
+                max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return int(sorted_values[index])
+
+
+def neo_stats_report(project: str | None = None, days: int | None = None,
+                     limit: int = 20) -> dict[str, Any]:
+    """Neo's volume, outcomes, escalation causes, spend and latency — spec §4,
+    docs/specs/2026-10-01-neo-observability.md.
+
+    `knowledge_usage_report`'s shape above: `project` + `days` in, one plain dict out, no
+    rendering — the CLI and the dashboard render the same dict, so neither can show a
+    figure the other cannot.
+
+    Reads BOTH databases, which is the only way the question can be answered: `neo.db`
+    holds the questions and `os.db` holds what answering them cost.
+
+    THE ZERO RULE IS TWO RULES. `questions` is a census, so a count of zero is measured
+    and prints `0`; every RATIO is `None` when its denominator is empty and renders "not
+    recorded". `spend` and `latency` are a floored sample — `agent_usage.record` never
+    raises, so a missing row is possible — and `latency.unmeasured` says how much of the
+    window predates §3's measurement.
+
+    `limit` bounds the day SERIES (the newest `limit` days of it), not the counts: every
+    total above is over the whole window.
+    """
+    from . import agent_usage
+    from . import usage as usage_mod
+    from .neo_store import (ESCALATION_CAUSES_CHOSEN, ESCALATION_CAUSES_FAILED,
+                            NEO_HELD_Q_STATUSES, NeoStore)
+
+    since = db.now() - days * 86400 if days else None
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    scope = {project: paths[project]} if project else paths
+
+    questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
+                 "superseded": 0, "escalation_rate": None}
+    by_kind: dict[str, dict[str, Any]] = {}
+    by_project: dict[str, dict[str, Any]] = {}
+    by_day: dict[str, dict[str, Any]] = {}
+
+    neo = NeoStore()
+    try:
+        outcomes = neo.question_outcomes(project or "", since)
+        cause_rows = neo.escalation_cause_counts(project or "", since)
+        order_rows = neo.questions_per_order(project or "", since)
+    finally:
+        neo.close()
+
+    for row in outcomes:
+        n = int(row["n"] or 0)
+        kind = row["kind"] or "question"
+        buckets = [questions,
+                   by_kind.setdefault(kind, _neo_outcome_bucket()),
+                   by_project.setdefault(row["project"] or "", _neo_outcome_bucket()),
+                   by_day.setdefault(row["day"], {**_neo_outcome_bucket(),
+                                                  "day": row["day"]})]
+        for bucket in buckets:
+            bucket["asked"] += n
+        if row["status"] == "answered" and row["answered_by"] == "neo":
+            for bucket in buckets:
+                bucket["answered"] += n
+        elif row["status"] == "answered" and row["answered_by"] == "os":
+            # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor
+            # Neo handing back. Out of the rate's denominator.
+            questions["superseded"] += n
+        elif row["status"] in ("escalated", "failed"):
+            for bucket in buckets:
+                bucket[row["status"]] += n
+        if row["status"] in NEO_HELD_Q_STATUSES:
+            questions["open"] += n
+
+    for bucket in (questions, *by_kind.values(), *by_project.values(),
+                   *by_day.values()):
+        bucket["escalation_rate"] = _escalation_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
+
+    # A day inside the window with no questions is a measured zero and appears; days
+    # outside it do not (spec §4).
+    if since is not None:
+        for step in range(int(days or 0) + 1):
+            day = _local_day(since + step * 86400)
+            by_day.setdefault(day, {**_neo_outcome_bucket(), "day": day,
+                                    "escalation_rate": None})
+    question_days = [by_day[day] for day in sorted(by_day)][-limit:]
+
+    chosen: dict[str, int] = {}
+    failed_causes: dict[str, int] = {}
+    not_recorded = 0
+    for row in cause_rows:
+        cause, n = row["cause"], int(row["n"] or 0)
+        if cause in ESCALATION_CAUSES_CHOSEN:
+            chosen[cause] = chosen.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_FAILED:
+            failed_causes[cause] = failed_causes.get(cause, 0) + n
+        else:
+            # NULL, '' or a member a later release removed. Counted here rather than
+            # given a bucket of its own: an invented bucket reads as a cause.
+            not_recorded += n
+
+    central = CentralStore()
+    try:
+        groups = central.agent_call_totals_by_day(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+        latency_rows = central.agent_call_latencies(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+    finally:
+        central.close()
+
+    spend_totals = _neo_spend_bucket()
+    spend_by_kind: dict[str, dict[str, Any]] = {}
+    spend_by_project: dict[str, dict[str, Any]] = {}
+    spend_by_day: dict[str, dict[str, Any]] = {}
+    for g in groups:
+        # Priced PER MODEL GROUP through the same path `cost_report` uses: a digest on
+        # Haiku is not Opus waste, and a blended rate would hide it.
+        priced = _priced_group(usage_mod, g)
+        targets = [spend_totals,
+                   spend_by_kind.setdefault(g["kind"], _neo_spend_bucket()),
+                   spend_by_project.setdefault(g["project"] or "",
+                                               _neo_spend_bucket()),
+                   spend_by_day.setdefault(g["day"], {**_neo_spend_bucket(),
+                                                      "day": g["day"]})]
+        for bucket in targets:
+            bucket["calls"] += int(g["calls"] or 0)
+            for token in ("input", "cache_write", "cache_read", "output"):
+                bucket[token] += int(g[token] or 0)
+            bucket["recorded_cost_usd"] = round(
+                bucket["recorded_cost_usd"] + (g["cost_usd"] or 0.0), 6)
+            bucket["list_cost_usd"] = round(
+                bucket["list_cost_usd"] + priced.list_cost_usd, 6)
+
+    latency_by_kind: dict[str, dict[str, Any]] = {}
+    samples: dict[str, list[int]] = {}
+    unmeasured = 0
+    for row in latency_rows:
+        kind = row["kind"]
+        entry = latency_by_kind.setdefault(
+            kind, {"calls": 0, "measured": 0, "p50_ms": None, "p90_ms": None,
+                   "max_ms": None})
+        entry["calls"] += 1
+        if row["latency_ms"] is None:
+            unmeasured += 1
+            continue
+        entry["measured"] += 1
+        samples.setdefault(kind, []).append(int(row["latency_ms"]))
+    for kind, entry in latency_by_kind.items():
+        values = sorted(samples.get(kind, []))
+        entry["p50_ms"] = _percentile(values, 0.5)
+        entry["p90_ms"] = _percentile(values, 0.9)
+        entry["max_ms"] = max(values) if values else None
+
+    asked_by_wo = {(row["project"], row["wo_id"]): int(row["n"] or 0)
+                   for row in order_rows}
+    work_orders = feature_orders = 0
+    wo_questions = fo_questions = 0
+    for name, path in sorted(scope.items()):
+        store = ProjectStore(path)
+        try:
+            orders = [wo for wo in store.list_work_orders(limit=10_000,
+                                                          include_hidden=True)
+                      if since is None or (wo["created_at"] or 0) >= since]
+            features = [fo for fo in store.list_feature_orders(kind="feature",
+                                                               limit=10_000)
+                        if since is None or (fo["created_at"] or 0) >= since]
+        finally:
+            store.close()
+        # Hidden orders INCLUDED, `cost_report`'s reason: hiding is a gesture about
+        # attention, and the order still asked its questions.
+        work_orders += len(orders)
+        feature_orders += len(features)
+        feature_ids = {fo["id"] for fo in features}
+        # A feature order's questions are its planner's and its children's — those are
+        # the sessions that ask anything.
+        family = {fo["plan_wo_id"] for fo in features if fo.get("plan_wo_id")}
+        for wo in orders:
+            asked = asked_by_wo.get((name, wo["id"]), 0)
+            wo_questions += asked
+            if wo.get("parent_id") in feature_ids or wo["id"] in family:
+                fo_questions += asked
+    per_order = {
+        "work_orders": work_orders,
+        "questions_per_wo": (round(wo_questions / work_orders, 2)
+                             if work_orders else None),
+        "feature_orders": feature_orders,
+        "questions_per_fo": (round(fo_questions / feature_orders, 2)
+                             if feature_orders else None),
+    }
+
+    return {
+        "scope": project or "fleet", "days": days, "since": since,
+        "questions": questions,
+        "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
+        "by_project": by_project,
+        "by_day": question_days,
+        "causes": {"chosen": chosen, "failed": failed_causes,
+                   "not_recorded": not_recorded},
+        "per_order": per_order,
+        "spend": {"totals": spend_totals, "by_kind": spend_by_kind,
+                  "by_project": spend_by_project,
+                  "by_day": [spend_by_day[day] for day in sorted(spend_by_day)][-limit:]},
+        "latency": {"by_kind": latency_by_kind, "unmeasured": unmeasured},
+        "floor": True, "floor_reason": COST_FLOOR_NOTE,
+    }
+
+
 # -- budgets -----------------------------------------------------------------------
 #
 # The verbs behind `jarvis wo budget` and `jarvis fo budget`. Setting a budget is an

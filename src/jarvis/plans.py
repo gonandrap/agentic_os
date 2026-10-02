@@ -462,7 +462,10 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "verdict": "approve", "reason": "<one line: what you checked>"}
   {"escalate": false, "verdict": "reject",  "reason": "<what the planner must fix>"}
   {"escalate": true,  "verdict": "reject",  "reason": "<one line: why the user must \
-decide>"}"""
+decide>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+conflicting-authority | ambiguous-intent | scope-too-large | privileged-action>\""""
 
 
 #: How much spec may ride in one plan question. 120,000 chars, not §10's 40,000: every

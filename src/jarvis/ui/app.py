@@ -1513,6 +1513,27 @@ def create_app() -> FastAPI:
                       unreviewed=unreviewed, history=history, learnings=learnings,
                       opinions=opinions, digest_credit=_digest_credit())
 
+    @app.get("/neo/stats", response_class=HTMLResponse)
+    def neo_stats_page(request: Request, project: str = "", days: int | None = None):
+        """Neo's own report — §6 of docs/specs/2026-10-01-neo-observability.md.
+
+        A PAGE AND NOT A SECTION OF `/neo`, per kn-a7e321bc / kn-c609211f: that page is an
+        action surface, and a block counting `approval` questions among review forms
+        implies a gate escalation can be decided there. A separate URL also keeps
+        `neo_page`'s per-question `opinions` lookup from growing a second pass.
+
+        `active="neo"` so the existing nav entry stays highlighted and no top-level entry
+        is added. The route does no arithmetic: `ops` holds the report and the template
+        holds the rendering, which is how `/cost` and `bill.html` are split.
+        """
+        try:
+            report = ops.neo_stats_report(project=project or None, days=days)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="neo", message=str(e))
+        return render(request, "neo_stats.html", active="neo", report=report,
+                      project=project, days=days,
+                      projects=sorted(ops.registered_project_paths()))
+
     @app.get("/neo/question/{question_id}", response_class=HTMLResponse)
     def neo_question_page(request: Request, question_id: int):
         """One question and its answer — where a work order's timeline sends the reader.

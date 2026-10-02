@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% import "_bill.html" as bill_ui %}
+{% block title %}Neo stats — Jarvis{% endblock %}
+{% block content %}
+
+{# §6 of docs/specs/2026-10-01-neo-observability.md. No arithmetic here and none in the
+   route: every figure comes off `ops.neo_stats_report`, so the terminal and this page can
+   never disagree. An absent figure is `not recorded`, bill.html:128's idiom — never 0. #}
+{% set q = report.questions %}
+{% set per = report.per_order %}
+{% set spend = report.spend %}
+{% set lat = report.latency %}
+
+{% macro absent() %}<span class="sub">not recorded</span>{% endmacro %}
+{% macro pct(rate) %}{% if rate is none %}{{ absent() }}{% else %}{{ '%.0f'|format(rate * 100) }}%{% endif %}{% endmacro %}
+{% macro ms(value) %}{% if value is none %}{{ absent() }}{% else %}{{ value }}ms{% endif %}{% endmacro %}
+
+<h2>What Neo is doing — {{ report.scope }}</h2>
+
+<div class="panel" style="padding: 10px 16px;">
+  <span class="kv">
+    <a href="/neo">← Neo's questions</a> ·
+    <a href="/neo/stats">{{ '● ' if not project }}fleet</a>
+    {% for p in projects %}
+      · <a href="/neo/stats?project={{ p }}">{{ '● ' if project == p }}{{ p }}</a>
+    {% endfor %}
+    · window:
+    <a href="/neo/stats{{ '?project=' ~ project if project }}">{{ '● ' if not days }}all time</a>
+    {% for d in [7, 30] %}
+      · <a href="/neo/stats?days={{ d }}{{ '&project=' ~ project if project }}"
+        >{{ '● ' if days == d }}{{ d }}d</a>
+    {% endfor %}
+  </span>
+</div>
+
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 6px; font-size: 22px;" class="mono">
+    {{ q.asked }} question{{ '' if q.asked == 1 else 's' }}</p>
+  {# A count of zero is a MEASURED zero and prints 0; only the RATE can be absent. #}
+  <p class="kv mono" style="margin: 0;">
+    {{ q.answered }} answered by Neo · {{ q.escalated }} escalated ·
+    {{ q.failed }} never reached · {{ q.open }} still open ·
+    {{ q.superseded }} superseded
+  </p>
+  <p class="kv" style="margin: 6px 0 0;">
+    escalation rate {{ pct(q.escalation_rate) }}
+    <span class="sub">— over settled questions only; superseded ones are out of it,
+      and an open one has no outcome yet</span>
+  </p>
+</div>
+
+{% if report.by_day %}
+<h2>The trend</h2>
+<div class="panel">
+  {% set rate_scale = (report.by_day | map(attribute='escalation_rate')
+                       | reject('none') | list) %}
+  {% set top = (rate_scale | max) if rate_scale else 0 %}
+  {% for d in report.by_day %}
+  <div class="row">
+    <span class="mono sub" style="width: 92px;">{{ d.day }}</span>
+    <span class="mono" style="width: 150px;">{{ d.asked }} asked ·
+      {{ d.escalated }} escalated</span>
+    <span class="grow">
+      {# same scale down the column, bill.html:122-126's inline bar, so a rising rate is
+         visible as shape rather than as a column of numbers #}
+      {% if d.escalation_rate is not none and top %}
+      <div style="background: var(--raised); border: 1px solid var(--line);
+                  border-radius: 3px; height: 9px; width: 220px;">
+        <div style="background: var(--cyan); height: 100%; border-radius: 3px;
+                    width: {{ (100 * d.escalation_rate / top)|round(1) }}%;"></div>
+      </div>
+      {% endif %}
+    </span>
+    <span class="mono" style="width: 110px; text-align: right;"
+      >{{ pct(d.escalation_rate) }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<h2>What it escalates for</h2>
+<div class="panel">
+  {% for cause, n in report.causes.chosen | dictsort(by='value', reverse=true) %}
+  <div class="row">
+    <span class="mono grow">{{ cause }}</span>
+    <span class="sub">Neo chose this label</span>
+    <span class="mono" style="width: 60px; text-align: right;">{{ n }}</span>
+  </div>
+  {% endfor %}
+  {% for cause, n in report.causes.failed | dictsort(by='value', reverse=true) %}
+  <div class="row">
+    <span class="mono grow">{{ cause }}</span>
+    <span class="sub">the OS derived it — not Neo's judgement</span>
+    <span class="mono" style="width: 60px; text-align: right;">{{ n }}</span>
+  </div>
+  {% endfor %}
+  {% if not report.causes.chosen and not report.causes.failed %}
+  <div class="empty">no escalation in this window carries a cause</div>
+  {% endif %}
+</div>
+{% if report.causes.not_recorded %}
+{# NOT rendered as a cause: nobody may read the backlog as a finding about Neo. #}
+<p class="sub">{{ report.causes.not_recorded }}
+  escalation{{ '' if report.causes.not_recorded == 1 else 's' }} predate cause
+  recording — those rows have only prose, and no label was guessed from it.</p>
+{% endif %}
+
+<h2>By kind</h2>
+<div class="panel">
+  {% for kind, k in report.by_kind | dictsort %}
+  <div class="row">
+    <span class="mono grow">{{ kind }}</span>
+    <span class="mono sub">{{ k.asked }} asked · {{ k.answered }} answered ·
+      {{ k.escalated }} escalated</span>
+    <span class="mono" style="width: 110px; text-align: right;"
+      >{{ pct(k.escalation_rate) }}</span>
+  </div>
+  {% else %}
+  <div class="empty">no questions in this window</div>
+  {% endfor %}
+</div>
+<p class="sub">{{ report.by_kind_note }}</p>
+
+<h2>Per order</h2>
+<div class="panel">
+  <div class="row">
+    <span class="grow">{{ per.work_orders }}
+      work order{{ '' if per.work_orders == 1 else 's' }}</span>
+    <span class="mono">{% if per.questions_per_wo is none %}{{ absent() }}
+      {%- else %}{{ per.questions_per_wo }} questions each{% endif %}</span>
+  </div>
+  <div class="row">
+    <span class="grow">{{ per.feature_orders }}
+      feature order{{ '' if per.feature_orders == 1 else 's' }}</span>
+    <span class="mono">{% if per.questions_per_fo is none %}{{ absent() }}
+      {%- else %}{{ per.questions_per_fo }} questions each{% endif %}</span>
+  </div>
+</div>
+<p class="sub">Triage questions are excluded from both: a triage question has no order
+  behind it, so dividing it by an order count would be arithmetic over two populations.</p>
+
+<h2>What Neo cost</h2>
+<div class="panel" style="padding: 14px 16px;">
+  <p class="mono" style="margin: 0;">
+    {{ bill_ui.money(spend.totals.recorded_cost_usd, exact=true) }} recorded ·
+    {{ bill_ui.money(spend.totals.list_cost_usd) }} at list prices ·
+    {{ spend.totals.calls }} call{{ '' if spend.totals.calls == 1 else 's' }}
+  </p>
+</div>
+<div class="panel" style="margin-top: 10px;">
+  <table class="mono">
+    {# cost.html's column order, not a second token-table style. #}
+    <tr><th>kind</th><th>calls</th><th>input</th><th>cache write</th>
+      <th>cache read</th><th>output</th><th>recorded</th></tr>
+    {% for kind, s in spend.by_kind | dictsort(by='value', reverse=true) %}
+    <tr>
+      <td>{{ kind }}</td><td>{{ s.calls }}</td><td>{{ fmt_tok(s.input) }}</td>
+      <td>{{ fmt_tok(s.cache_write) }}</td><td>{{ fmt_tok(s.cache_read) }}</td>
+      <td>{{ fmt_tok(s.output) }}</td>
+      <td>{{ bill_ui.money(s.recorded_cost_usd, exact=true) }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="7" class="sub">no call in this window</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>How long it took</h2>
+<div class="panel">
+  {% for kind, e in lat.by_kind | dictsort(by='value', reverse=true) %}
+  <div class="row">
+    <span class="mono grow">{{ kind }}</span>
+    <span class="mono sub">{{ e.measured }}/{{ e.calls }} timed</span>
+    <span class="mono">p50 {{ ms(e.p50_ms) }} · p90 {{ ms(e.p90_ms) }} ·
+      max {{ ms(e.max_ms) }}</span>
+  </div>
+  {% else %}
+  <div class="empty">no call in this window</div>
+  {% endfor %}
+</div>
+{% if lat.unmeasured %}
+<p class="sub">{{ lat.unmeasured }} call{{ '' if lat.unmeasured == 1 else 's' }} in this
+  window were never timed — latency recording starts with the release that added it, so
+  this is how much of the window is blind.</p>
+{% endif %}
+
+<p class="sub" style="margin-top: 14px;">
+  The spend and latency figures are {{ report.floor_reason }}. Question counts are a
+  census: every question Neo was asked has a row, so a zero there is measured.
+</p>
+
+{% endblock %}
