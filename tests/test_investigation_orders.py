@@ -188,6 +188,207 @@ def test_jarvis_verbs_reads_each_segment_and_leaves_the_chain_predicate_alone():
     assert hooks.jarvis_verbs("git log") == ()
     # Untouched, so no other kind's behaviour changes (§2.6).
     assert hooks.is_jarvis_command_chain("cd /tmp && jarvis bug report x")
+    # …and still False for a prose-quoted command: #905's fix is deliberately NOT given
+    # to the chain predicate.
+    assert not hooks.is_jarvis_command_chain("jarvis wo ask wo-1 'a > b; c'")
+
+
+# -- #905: the four permitted writes carry PROSE, and prose is not shell structure ----
+
+#: wo-6be2ab21's own two refused commands, trimmed: a DOUBLE-quoted outer argument with
+#: SINGLE-quoted inner quotes, which is the shape the transcript shows.
+REAL_REFUSED_ASKS = (
+    'jarvis wo ask wo-6be2ab21 "Gap-class choice. \'jarvis validation show '
+    "wo-33e1d0b4' -> 'no validation has run on this work order', so automerge holds "
+    'for ever."',
+    'jarvis wo ask wo-6be2ab21 "Gap-class choice. Subject is a RELEASE order, so no '
+    'validation round can ever open; automerge then holds for ever while PR 899 is '
+    'green."',
+)
+
+#: The four writes the contract names, as a template for one prose argument.
+WRITE_TEMPLATES = (
+    "jarvis wo ask wo-inv001 {}",
+    "jarvis wo assume wo-inv001 {}",
+    "jarvis learn add {} --project proj_a",
+    "jarvis investigate verdict inv-1234abcd --from-file verdict.json {}",
+)
+
+#: One metacharacter each, inside a DOUBLE-quoted argument: `;` `|` `>` `<` and a bare
+#: `$`, every one of them inert there.
+DOUBLE_QUOTED_PROSE = (
+    '"automerge then holds for ever; nothing re-derives the hold"',
+    '"validation_applies returns False | no round can open"',
+    '"jarvis validation show wo-1 -> no validation has run"',
+    '"the hold is < one tick old"',
+    '"the bill was $56.88 and $HOME was unset"',
+)
+
+#: A backtick is prose only inside SINGLE quotes — inside double quotes the shell runs it.
+SINGLE_QUOTED_PROSE = ("'ops.validation_applies `returns` False; no round opens'",)
+
+
+def _prose_writes():
+    for template in WRITE_TEMPLATES:
+        for prose in DOUBLE_QUOTED_PROSE + SINGLE_QUOTED_PROSE:
+            yield template.format(prose)
+
+
+def test_the_two_commands_wo_6be2ab21_was_refused_are_allowed():
+    """#905: both arguments are one inert shell word, and both were denied."""
+    for command in REAL_REFUSED_ASKS:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "allow", command
+
+
+def test_prose_in_each_permitted_write_is_not_shell_structure():
+    for command in _prose_writes():
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "allow", command
+
+
+def test_an_ampersand_pair_inside_quotes_is_one_segment():
+    command = "jarvis learn add 'a && b' --project proj_a"
+    assert hooks.jarvis_verbs(command) == (("learn", "add"),)
+    assert _decision(hooks.investigator_bash_decision(
+        _bash(command), _env())) == "allow"
+
+
+#: COMMAND SUBSTITUTION INSIDE DOUBLE QUOTES. The shell interpolates there, so each of
+#: these is a jarvis command on its face and a write when it runs.
+SUBSTITUTION_IN_DOUBLE_QUOTES = tuple(
+    template.format(arg)
+    for template in WRITE_TEMPLATES
+    for arg in ('"$(sed -i s/a/b/ src/jarvis/ops.py)"',
+                '"`sed -i s/a/b/ src/jarvis/ops.py`"')
+)
+
+#: Real structure, unquoted: a second command, a redirection, a pipe into a shell.
+REAL_STRUCTURE = (
+    "jarvis wo ask wo-1 'q' ; git commit -am x",
+    "jarvis wo show wo-1 > f",
+    "jarvis wo show wo-1 | sh",
+)
+
+#: The refused verbs, now with a prose argument carrying a metacharacter — the new path
+#: to them (§3.1).
+PROSE_MUTATIONS = (
+    "jarvis bug report 'a stale hold; it never clears' -d x -e y -a z -p high",
+    'jarvis issues start 790 --note "a > b"',
+    'jarvis wo finish wo-inv001 --summary "done; the hold cleared"',
+)
+
+
+def test_command_substitution_in_a_double_quoted_write_is_still_refused():
+    """The asymmetry: `$` and a backtick are judged with ONLY single quotes masked,
+    because masking double quotes for them would hand this kind arbitrary execution
+    through the one branch that exists to let it talk to Neo."""
+    for command in SUBSTITUTION_IN_DOUBLE_QUOTES:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_real_shell_structure_and_the_refused_verbs_stay_refused():
+    for command in REAL_STRUCTURE + PROSE_MUTATIONS:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+# -- review round 1: a BACKSLASH-ESCAPED quote does not open a span (spec DELTA 2) ----
+
+#: The regex masks took each `\"`/`\'` for the start of a quoted span, so the real `;`
+#: between them was masked and bash ran `git commit` as its own command.
+ESCAPED_QUOTE_ESCAPES = (
+    'jarvis wo ask wo-1 \\" ; git commit -am x ; \\"',
+    "jarvis wo ask wo-1 \\' ; git commit -am x ; \\'",
+    "jarvis wo ask wo-1 \\' $(sed -i s/a/b/ src/x.py) \\'",
+)
+
+
+def test_a_backslash_escaped_quote_does_not_mask_real_structure():
+    for command in ESCAPED_QUOTE_ESCAPES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_leaves_the_next_quote_a_real_quote():
+    """A literal backslash, so the `"` after it still opens a span."""
+    command = 'jarvis wo ask wo-1 \\\\" ; git commit -am x "'
+    assert hooks.jarvis_verbs(command) == (("wo", "ask"),)
+    assert _decision(hooks.investigator_bash_decision(
+        _bash(command), _env())) == "allow", command
+
+
+#: An unterminated quote has no knowable structure. Round 1 pinned this at the
+#: `jarvis_verbs` level only; both decision entry points must refuse it too.
+UNTERMINATED_QUOTES = (
+    'jarvis wo ask wo-1 "oops',
+    "jarvis wo ask wo-1 'oops",
+)
+
+#: An ESCAPED BACKSLASH is a literal backslash, so it does NOT escape the character
+#: after it: the pair-blanking must not swallow the real `;`/`$(` that follows.
+ESCAPED_BACKSLASH_THEN_STRUCTURE = (
+    "jarvis wo ask wo-1 \\\\; git commit -am x",
+    "jarvis wo ask wo-1 \\\\$(sed -i s/a/b/ src/x.py)",
+)
+
+
+def test_an_unterminated_quote_fails_closed():
+    for command in UNTERMINATED_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_does_not_hide_the_structure_after_it():
+    for command in ESCAPED_BACKSLASH_THEN_STRUCTURE:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+# -- review round 2: BRACE PARAMETER EXPANSION inside double quotes (spec DELTA 3) ----
+
+#: `${...}` inside double quotes is NOT a value: `:=` assigns and the assigned text is
+#: then prompt-expanded, and `a[$(cmd)]` is evaluated as an arithmetic subscript. The
+#: escaped `\$` is blanked by the scanner, so `_SHELL_SUBSTITUTION` never sees a `$(`.
+BRACE_EXPANSION_IN_DOUBLE_QUOTES = (
+    'jarvis wo ask wo-1 "${x:=\\$(touch /tmp/p)}"',
+    'jarvis wo ask wo-1 "${x:=a[\\$(touch /tmp/p)]}"',
+)
+
+
+def test_brace_parameter_expansion_in_a_double_quoted_write_is_refused():
+    for command in BRACE_EXPANSION_IN_DOUBLE_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_the_prose_fixtures_leave_every_other_kind_alone():
+    for command in (REAL_REFUSED_ASKS + tuple(_prose_writes())
+                    + SUBSTITUTION_IN_DOUBLE_QUOTES + REAL_STRUCTURE
+                    + PROSE_MUTATIONS + BRACE_EXPANSION_IN_DOUBLE_QUOTES):
+        assert hooks.investigator_bash_decision(
+            _bash(command), _env("worker")) is None, command
 
 
 #: A read the git/gh pair test clears on its FIRST TWO WORDS while the rest of the command
@@ -825,6 +1026,26 @@ def test_the_prompt_names_the_four_classifications_and_what_it_cannot_file(
     assert "jarvis bug report" in prompt
     assert str(verdicts.MAX_VERDICT_CHARS) in prompt
     assert str(verdicts.MIN_QUOTE_CHARS) in prompt
+
+
+def test_every_write_the_prompt_promises_clears_the_hook(store, project_spec):
+    """#905: the hook's allow list pinned to the CONTRACT's list, derived from the
+    prompt, so a fifth write fails here instead of silently being unreachable."""
+    prompt = _prompt(store, "investigator", project_spec)
+    body = prompt.split("Writes — EXACTLY four, and nothing else is permitted:", 1)[1]
+    writes = []
+    for line in body.splitlines():
+        if line.startswith("- `jarvis "):
+            writes.append(line.split("`")[1])
+        elif writes:
+            break
+    assert len(writes) == 4, writes
+    for write in writes:
+        command = write.replace("<question>", "why does the hold hold; nothing clears it")
+        command = command.replace("<call you made with no doubt>", "the hold is written once")
+        command = command.replace("...", "a stale hold parks an order")
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
 
 
 def test_serena_reaches_the_investigator_read_only():

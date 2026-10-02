@@ -17,7 +17,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import concision
 from .project_store import ProjectStore
@@ -25,6 +25,11 @@ from .project_store import ProjectStore
 # A Bash command every worker must be able to run without a permission prompt:
 # a chain of `cd <dir>` / `jarvis …` segments joined by &&, nothing else.
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
+
+#: The same characters split by quote kind for `jarvis_verbs`
+#: (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+_SHELL_STRUCTURE = re.compile(r"[|;<>]")
+_SHELL_SUBSTITUTION = re.compile(r"\$\(|`")
 
 
 def is_jarvis_command_chain(command: str) -> bool:
@@ -51,17 +56,40 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     A SIBLING of `is_jarvis_command_chain`, which stays untouched: that one answers "is
     this a chain of `cd`/`jarvis` segments", which for every other kind is the right
     question, and narrowing it would change every kind's behaviour (§2.6 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `_SHELL_DANGEROUS`
-    and `shlex` parse, so the two cannot disagree about what a segment is.
+    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `shlex` parse, so
+    the two cannot disagree about what a segment IS — only about which characters count
+    as structure: this one judges STRUCTURE, not raw text, because every write it must
+    clear carries prose in quotes (docs/superpowers/specs/2026-10-01-investigator-writes-
+    unreachable.md). Quotes do not make every expansion inert: `${` is refused wherever
+    the shell would expand it, double quotes included (DELTA 3 of that spec).
 
     An empty tuple means "no `jarvis` verb this can vouch for": not a jarvis chain, a
     command carrying shell metacharacters, or one shlex cannot parse. The caller decides
     what that means — for the investigator it means the allowlist cannot clear it.
     """
-    if _SHELL_DANGEROUS.search(command):
+    scan = _scan_shell_quotes(command)
+    # An unterminated quote has no knowable structure, so fail closed (spec DELTA 2).
+    if not scan.terminated:
+        return ()
+    masked = scan.full
+    # Literal inside EITHER quote kind, so judged on fully masked text (spec §The
+    # mechanism, 1).
+    if _SHELL_STRUCTURE.search(masked):
+        return ()
+    # The shell INTERPOLATES inside double quotes, so these two are judged with only
+    # single quotes masked (spec §The mechanism, 2).
+    if _SHELL_SUBSTITUTION.search(scan.single_only):
+        return ()
+    # `${...}` ASSIGNS, prompt-expands and evaluates arithmetic, so it is not a value
+    # even inside double quotes (spec DELTA 3).
+    if "${" in scan.single_only:
+        return ()
+    # A bare `$NAME` yields a VALUE inside quotes; unquoted, `$` stays dangerous (spec
+    # DELTA 1, narrowed by DELTA 3).
+    if "$" in masked:
         return ()
     out: list[tuple[str, str]] = []
-    for segment in command.split("&&"):
+    for segment in _and_segments(command, masked):
         try:
             words = shlex.split(segment.strip())
         except ValueError:
@@ -485,6 +513,85 @@ def _mask_shell_text(command: str) -> str:
     """
     masked = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
     return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
+
+
+class _QuoteMasks(NamedTuple):
+    """One escape-aware scan of a command, as the two masks `jarvis_verbs` judges on.
+
+    `full`: single- AND double-quoted content blanked. `single_only`: only single-quoted
+    content blanked, because the shell still interpolates inside double quotes. Escape
+    pairs (`\\;`, `\\"`, `\\$`) are blanked in BOTH: they are literal characters, not
+    structure. `terminated` is False when a quote never closed — the caller fails closed
+    (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md, DELTA 2).
+    """
+
+    full: str
+    single_only: str
+    terminated: bool
+
+
+def _scan_shell_quotes(command: str) -> _QuoteMasks:
+    """Quote state of `command`, tracking backslash escapes, positions preserved.
+
+    A regex span cannot do this: it reads `\\"` as the start of a quoted span and masks
+    the real structure after it (spec DELTA 2, review round 1).
+    """
+    full: list[str] = []
+    single_only: list[str] = []
+    state = ""  # "" = outside quotes, "'" = single, '"' = double
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if state == "'":
+            full.append(" ")
+            single_only.append(" ")
+            if char == "'":
+                state = ""
+            i += 1
+            continue
+        if char == "\\" and state != "'":
+            # Outside quotes `\` escapes anything; inside double quotes only $ ` " \ and
+            # newline — every character special there — so blanking the pair cannot hide
+            # structure either way (spec DELTA 3).
+            width = 2 if i + 1 < len(command) else 1
+            full.append(" " * width)
+            single_only.append(" " * width)
+            i += width
+            continue
+        if state == '"':
+            full.append(" ")
+            single_only.append(char)
+            if char == '"':
+                state = ""
+            i += 1
+            continue
+        if char == "'":
+            state = "'"
+            full.append(" ")
+            single_only.append(" ")
+        elif char == '"':
+            state = '"'
+            full.append(" ")
+            single_only.append(char)
+        else:
+            full.append(char)
+            single_only.append(char)
+        i += 1
+    return _QuoteMasks("".join(full), "".join(single_only), state == "")
+
+
+def _and_segments(command: str, masked: str) -> list[str]:
+    """`command` split on its `&&` offsets taken from `masked`, so a quoted one is prose.
+
+    docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md.
+    """
+    out: list[str] = []
+    start = 0
+    for found in re.finditer(r"&&", masked):
+        out.append(command[start:found.start()])
+        start = found.end()
+    out.append(command[start:])
+    return out
 
 
 def backgrounds_through_shell(command: str) -> bool:
