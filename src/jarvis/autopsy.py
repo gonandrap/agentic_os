@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import db, inspection, observability
+from . import db, inspection, navigation, observability
 from . import usage as usage_mod
 from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal keeps"
 
@@ -60,7 +60,8 @@ from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal ke
 #: the stored payload alone.
 #:
 #: 1 — the original payload.
-PAYLOAD_VERSION = 1
+#: 2 — `ToolSpan.navigates_source`, the navigation reading of §3.
+PAYLOAD_VERSION = 2
 
 #: How many tool spans one TURN carries into a seal, the dearest by seconds. A long turn
 #: can run to thousands of spans and a seal is stored, not derived on demand; the rest are
@@ -106,7 +107,10 @@ def _span(span: inspection.ToolSpan, *, params: bool) -> dict[str, Any]:
     # `backgrounded` at EVERY level: `ToolSpan.is_join` derives from it (Neo 1124).
     row: dict[str, Any] = {"name": span.name, "tool_id": span.tool_id,
                            "started": span.started, "ended": span.ended,
-                           "detail": span.detail, "backgrounded": span.backgrounded}
+                           "detail": span.detail, "backgrounded": span.backgrounded,
+                           # §3: at EVERY level, for `backgrounded`'s reason — the
+                           # command it was derived from is only sealed at `full`.
+                           "navigates_source": span.navigates_source}
     # §6: the parameters are what `full` buys, so at `normal` none of the three keys exist.
     if params:
         row["params"] = span.params
@@ -324,6 +328,23 @@ _RUNGS = {
 # -- rehydrating -----------------------------------------------------------------------
 
 
+def _nav_of(row: dict[str, Any]) -> bool | None:
+    """The span's navigation reading, or None when this payload never held one.
+
+    §3: NO default and never `bool(...)` — `bool(None)` is a measured False over a call
+    nobody classified (kn-4d32fe12). A v1 payload is re-derived from the stored
+    `params["command"]` where there is one, and that re-derivation is LOSSY: at `normal`
+    no params were sealed and a `params_dropped` key cannot be recovered, so those spans
+    stay unclassified rather than becoming zero.
+    """
+    if "navigates_source" in row:
+        return row["navigates_source"]
+    command = str((row.get("params") or {}).get("command") or "")
+    if row.get("name") != "Bash" or not command:
+        return None
+    return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
+
+
 def _read_span(row: dict[str, Any]) -> inspection.ToolSpan:
     return inspection.ToolSpan(name=row["name"], tool_id=row["tool_id"],
                                started=row["started"], ended=row["ended"],
@@ -331,7 +352,8 @@ def _read_span(row: dict[str, Any]) -> inspection.ToolSpan:
                                params=row.get("params") or {},
                                params_truncated=list(row.get("params_truncated") or []),
                                params_dropped=list(row.get("params_dropped") or []),
-                               backgrounded=bool(row.get("backgrounded")))
+                               backgrounded=bool(row.get("backgrounded")),
+                               navigates_source=_nav_of(row))
 
 
 def _read_call(row: dict[str, Any]) -> usage_mod.Call:

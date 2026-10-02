@@ -2411,6 +2411,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
             plural = "call " if row["calls"] == 1 else "calls"
             print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
                   f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+        # §3: the sentence comes from the payload (`inspection.nav_line`), which the
+        # debug page renders too — one wording, never one per renderer.
+        if unit.get("nav_line"):
+            print(f"    {unit['nav_line']}")
 
     # One reader, two surfaces (q1216): the same payload `jarvis navigation` prints,
     # after the tools it is about.

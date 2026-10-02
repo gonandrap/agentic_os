@@ -2913,3 +2913,88 @@ def test_a_measured_zero_still_renders_as_wrote_nothing(write_transcript, capsys
     out = capsys.readouterr().out
 
     assert cli.SUB_NO_WRITES in out and cli.SUB_NOT_SEALED not in out
+
+
+# -- the navigation reading (spec §3, the cache-anatomy-and-navigation-split) ----------
+
+
+def test_a_bash_span_is_classified_from_the_raw_input_not_the_detail(write_transcript):
+    """§3: classified from the RAW input, where the command is — `_detail_of` prefers the
+    model's `description`, so a reading taken off `detail` would classify prose. The
+    redacted shape carries no `command` at all and is UNCLASSIFIED, never False."""
+    session = write_transcript("nav-raw", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"command": "grep -rn total_for src/pricing.py",
+                                        "description": "look for the total"}),
+    ])
+    (span,) = inspection.read_session(session).spans
+
+    assert span.navigates_source is True
+    assert span.detail == "look for the total"
+
+    redacted = write_transcript("nav-redacted", [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "t1", "Bash", {"description": "look for the total"}),
+    ])
+    (blind,) = inspection.read_session(redacted).spans
+
+    assert blind.navigates_source is None
+
+
+def nav_rows() -> list[dict]:
+    """2 symbol calls, 3 source reads, 1 text search and 1 bookkeeping read."""
+    return [
+        prompt_row(0, "You are the worker agent for wo-1"),
+        *tool_rows(1, 2, "s1", "mcp__serena__find_symbol", {"name_path_pattern": "a"}),
+        *tool_rows(2, 3, "s2", "mcp__plugin_serena_serena__find_symbol",
+                   {"name_path_pattern": "b"}),
+        *tool_rows(3, 4, "g1", "Bash", {"command": "grep -rn total_for src/pricing.py"}),
+        *tool_rows(4, 5, "g2", "Bash", {"command": "rg total_for src"}),
+        *tool_rows(5, 6, "g3", "Bash", {"command": "sed -n '1,40p' src/pricing.py"}),
+        *tool_rows(6, 7, "p1", "mcp__serena__search_for_pattern",
+                   {"substring_pattern": "x"}),
+        *tool_rows(7, 8, "c1", "Bash", {"command": "cat notes.md"}),
+    ]
+
+
+def test_the_nav_profile_counts_symbol_calls_and_source_greps(write_transcript):
+    """§3's contract, and `search_for_pattern` is the negative control: a text search
+    wearing a Serena name counts as neither."""
+    anatomy = inspection.read_session(write_transcript("nav-profile", nav_rows()))
+
+    assert anatomy.nav_profile() == {"symbol_calls": 2, "source_nav_calls": 3,
+                                     "unclassified": 0}
+
+
+def test_a_redacted_transcript_reports_unclassified_not_zero(real_session):
+    """The anti-vacuity test of §3: the committed fixture has NO `command` key anywhere
+    (`scripts/redact_transcript.py` kept only `description`), so its 55 Bash calls cannot
+    be classified — and absent is not zero (issue #227)."""
+    nav = real_session.nav_profile()
+
+    assert nav["unclassified"] == 55
+    assert nav["source_nav_calls"] == 0
+
+
+def test_the_tool_profile_is_unchanged_by_the_nav_block(real_session):
+    """§3: `nav_profile()` is a SIBLING of `tool_profile()`, never a replacement."""
+    rows = {r["name"]: r for r in real_session.tool_profile()}
+
+    assert rows["Bash"]["calls"] == 55
+    assert round(rows["Bash"]["seconds"], 1) == 45.6
+    assert round(rows["Bash"]["mean"], 1) == 0.8
+    assert sum(r["calls"] for r in real_session.tool_profile()) == 81
+    assert real_session.as_dict()["tools"] == real_session.tool_profile()
+
+
+def test_the_nav_counts_are_printed_in_the_tools_block(write_transcript, capsys):
+    """A `--json`-only field nobody can see is half a fix, and the unclassified count
+    prints as a word rather than as a zero."""
+    rows = [*nav_rows(), *tool_rows(8, 9, "b1", "Bash", {"description": "no command"})]
+    rendered(inspection.read_session(write_transcript("nav-render", rows)))
+    out = capsys.readouterr().out
+
+    tools = out.split("tools", 1)[1]
+    assert "2 symbol" in tools and "3 source" in tools and "1 unclassified" in tools
+    assert inspection.nav_line({"symbol_calls": 2, "source_nav_calls": 3,
+                                "unclassified": 1}) in tools
