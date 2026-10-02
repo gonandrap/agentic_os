@@ -638,6 +638,81 @@ def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_orde
         ops.show_investigation_order(improvement_order["id"])
 
 
+# -- the family budget (2026-10-01-a-family-capped-raise-must-say-so.md) ---------------
+
+
+def test_the_family_budget_works_on_an_inv_id_and_refuses_every_other(started, store,
+                                                                     improvement_order):
+    """Obligation 5. The two-step top-up's second step: the command the child's note
+    prints has to exist. The family here is the order plus its one investigator, so the
+    feature-order arithmetic is already correct (§2.6)."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(2.00)
+    assert ops.set_investigation_budget(inv["id"], 9.0)["budget_usd"] == 9.0
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == 9.0
+    assert ops.set_investigation_budget(inv["id"], None)["budget_usd"] is None
+
+    for other in (improvement_order["id"],
+                  ops.create_feature_order("proj_a", "CSV export",
+                                           description="the whole ask")["id"]):
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.investigation_order_budget(other)
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.set_investigation_budget(other, 9.0)
+
+
+def test_the_cli_shows_and_sets_the_investigation_budget(started, store, capsys):
+    """Obligation 5 through the surface the note names, word for word."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert cli.main(["investigate", "budget", inv["id"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(2.00)
+
+    assert cli.main(["investigate", "budget", inv["id"], "$12.50", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == 12.5
+    assert store.get_feature_order(inv["id"])["budget_usd"] == 12.5
+
+    assert cli.main(["investigate", "budget", inv["id"], "--clear", "--json"]) == 0
+    capsys.readouterr()
+    assert store.get_feature_order(inv["id"])["budget_usd"] is None
+
+    assert cli.main(["investigate", "budget", "wo-11111111"]) != 0
+
+
+def test_raising_the_budget_names_the_parked_investigator(started, store):
+    """Obligation 5, the half that was silent (Neo question 1198). `exhausted_children`
+    is the whole instruction — which `jarvis wo budget <child>` to run next — and it was
+    read off `feature_children`, which is the `kind='worker'` children only."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY, budget_usd=2.0)
+    child = store.create_work_order("investigate it", description="look",
+                                    kind="investigator", parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.update_work_order(child["id"], budget_reserved_usd=2.0,
+                            status="budget_exhausted")
+
+    out = ops.set_investigation_budget(inv["id"], 20.0)
+    assert out["exhausted_children"] == [child["id"]]
+    # The read path's per-child breakdown has the same hole: its totals are the
+    # family's, so the rows under them have to be the family's too.
+    shown = ops.investigation_order_budget(inv["id"])
+    assert [c["wo_id"] for c in shown["children"]] == [child["id"]]
+
+
+def test_a_settled_flagged_investigation_still_lists(started, store):
+    """Obligation 6. `submit_verdict` settles a `WAITING_ON_USER` to `completed` AND
+    flags it in the same transaction — four live attention items against an empty
+    `jarvis investigate list` is that pair."""
+    inv_id, _investigator, _out = _submitted(started, store, "WAITING_ON_USER")
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "completed" and row["needs_attention"]
+    assert inv_id in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+
+    quiet, _i, _o = _submitted(started, store, "TRANSIENT")
+    assert not store.get_feature_order(quiet)["needs_attention"]
+    assert quiet not in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+    assert quiet in [r["id"] for r in
+                     ops.list_investigation_orders("proj_a", include_settled=True)]
+
+
 # -- §2.7: the daemon seam ------------------------------------------------------------
 
 

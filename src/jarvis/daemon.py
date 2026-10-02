@@ -180,6 +180,21 @@ LANDING_SWEEP_EVERY_TICKS = 720
 #: default (`catalog.ScheduleConfig`).
 SCHEDULE_EVERY_TICKS = 12
 
+#: The status each kind of family RUNS in, per `feature_orders.kind` (§4 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md). A feature runs
+#: its children in `executing`; an improvement or investigation order runs its one child
+#: in `planning` and settles out of it directly, so `executing` is a status those two
+#: lifecycles never enter — it would render raw and lie about the phase.
+#:
+#: One table, read twice: it selects what the budget pass looks at and where a topped-up
+#: family is restored to. So the status a family is parked FROM is the status it is
+#: restored TO, by construction.
+_FAMILY_RUNNING_STATUS = {
+    "feature": "executing",
+    "improvement": "planning",
+    "investigation": "planning",
+}
+
 #: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
 #: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
 #: DAEMON: a substring pass over every transcript on the machine (843MB and 4,584 files
@@ -1288,26 +1303,46 @@ class Daemon:
             dead_feature_children,
         )
 
-        # THE FAMILY BUDGET IS ASKED ON A WIDER SET than the rest of this method, and
-        # `budget_exhausted` is in it so a topped-up feature can leave the state the same
-        # way it entered it. A feature runs no session of its own, so nothing else here
-        # would ever re-derive the status back to `executing`.
-        for fo in store.list_feature_orders(
-                statuses=("executing", budget_mod.FO_EXHAUSTED)):
-            pool = budget_mod.feature_exhaustion(store, self.central, fo)
-            if pool is not None:
-                budget_mod.escalate_feature(store, fo, pool)
-                continue
-            if fo["status"] == budget_mod.FO_EXHAUSTED:
-                # Topped up: back to work. Its children are still parked in their own
-                # `budget_exhausted` until each is topped up, which is the honest shape —
-                # the family has money again, and which child gets it is the user's call.
-                # `jarvis wo budget <child>` is what re-cuts that child's slice out of
-                # the new money; nothing here writes a reservation, because doing it from
-                # this end would have to guess the split.
-                store.set_feature_status(fo["id"], "executing")
-                store.clear_feature_attention(fo["id"])
-                continue
+        # PASS ONE: THE FAMILY BUDGET, EVERY KIND, ONE KIND AT A TIME. §4 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: an
+        # improvement or investigation family IS a `feature_orders` row and runs in
+        # `planning` — it never enters `executing` at all — so a feature-only,
+        # `executing`-only pass meant no non-feature family could ever escalate to, or
+        # leave, `budget_exhausted`.
+        #
+        # PER KIND BECAUSE A FAMILY CAN ONLY BE PARKED FROM THE ONE STATUS IT RUNS IN, so
+        # the status it is parked from and the status it is restored to are the same
+        # `_FAMILY_RUNNING_STATUS` entry. A FEATURE IN `planning` IS DELIBERATELY OUT:
+        # `budget.family` counts its planner, and a planner overspending must not park
+        # the feature. Writing `executing` onto such a row would put it past plan
+        # approval with no approved plan and no children. `budget_exhausted` is in each
+        # set so a topped-up family leaves the state the same way it entered it. A family
+        # runs no session of its own, so nothing else here re-derives its status.
+        for kind, running in _FAMILY_RUNNING_STATUS.items():
+            for fo in store.list_feature_orders(
+                    statuses=(running, budget_mod.FO_EXHAUSTED), kind=kind):
+                pool = budget_mod.feature_exhaustion(store, self.central, fo)
+                if pool is not None:
+                    budget_mod.escalate_feature(store, fo, pool)
+                    continue
+                if fo["status"] == budget_mod.FO_EXHAUSTED:
+                    # Topped up: back to work. Its children are still parked in their own
+                    # `budget_exhausted` until each is topped up, which is the honest
+                    # shape — the family has money again, and which child gets it is the
+                    # user's call. `jarvis wo budget <child>` is what re-cuts that child's
+                    # slice out of the new money; nothing here writes a reservation,
+                    # because doing it from this end would have to guess the split.
+                    store.set_feature_status(fo["id"], running)
+                    store.clear_feature_attention(fo["id"])
+
+        # PASS TWO: THE CHILD SETTLEMENT, FEATURE-ONLY BY LIFECYCLE, `kind='feature'`
+        # WRITTEN OUT. An investigation settles from its verdict (`ops.submit_verdict`)
+        # and an improvement order from its findings review, so running
+        # `dead_feature_children` or "all children completed" over them would settle them
+        # wrongly and could destroy a verdict in flight. The correctness used to rest on
+        # the `kind` default, and a reader cannot tell a deliberate feature-only pass
+        # from a leak — which is how this bug got here.
+        for fo in store.list_feature_orders(statuses=("executing",), kind="feature"):
             children = store.feature_children(fo["id"])
             if not children:
                 continue  # released with nothing in it; nothing to settle against

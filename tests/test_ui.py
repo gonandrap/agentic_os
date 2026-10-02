@@ -2772,6 +2772,106 @@ def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(clie
         assert ops.work_order_budget(wo["id"])["budget_usd"] is None
 
 
+def _broke_family(project, *, budget_usd: float = 3.0,
+                  kind: str = "investigation") -> tuple[str, str]:
+    """A family whose money is gone and one child parked on its slice.
+
+    Written through the store rather than ticked into existence: these two tests are about
+    the ROUTE's non-error channel, not about the allocator, which
+    tests/test_budget.py owns.
+    """
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order("why is it stuck", description="it is stuck",
+                                        kind=kind, budget_usd=budget_usd)
+        store.set_feature_status(fo["id"], "planning")
+        # The child's kind is the family's, not a free choice: `store.feature_children`
+        # selects `kind='worker'` only, and a non-feature family's one child reaches
+        # `budget.family` as the parent's `plan_wo_id` instead (tests/test_budget.py's
+        # `_the_one_child`). Get either wrong and the pool sees no spend at all.
+        child = store.create_work_order(
+            "diagnose it", description="look", parent_id=fo["id"],
+            kind="worker" if kind == "feature" else "investigator")
+        if kind != "feature":
+            store.update_feature_order(fo["id"], plan_wo_id=child["id"])
+        store.update_work_order(child["id"], budget_reserved_usd=budget_usd,
+                                status="budget_exhausted")
+        turn = store.create_turn(child["id"], kind="message", prompt="work")
+        store.finish_turn(turn["id"], "done", result="done", cost_usd=9.0,
+                          usage_json=json.dumps({"total_cost_usd": 9.0}))
+        return fo["id"], child["id"]
+    finally:
+        store.close()
+
+
+def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, project):
+    """Obligation 8 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
+    The reporter's literal path: the budget WAS raised and the page said nothing. A red ✗
+    would be the second false statement — a refusal is not an error, and a user who sees
+    one raises the child's number again instead of the family's."""
+    _fo_id, child = _broke_family(project)
+    r = client.post(f"/wo/proj_a/{child}/budget", data={"amount": "$10"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location
+    assert "error=" not in location
+    assert "jarvis+investigate+budget" in location or \
+        "jarvis%20investigate%20budget" in location
+
+    page = client.get(f"/wo/proj_a/{child}{location[location.index('?'):]}").text
+    assert "jarvis investigate budget" in html.unescape(page)
+    # The rendered DIV, not the class name: base.html's stylesheet defines
+    # `.error-flash` on every page, so a bare substring check can never fail.
+    assert '<div class="error-flash">' not in page
+    assert '<div class="note-flash"' in page
+
+
+def test_the_budget_card_calls_the_family_by_its_kind(client, project):
+    """The card beside the flash said "its feature's slice" for an investigation.
+    `Ceiling.source == 'feature'` is the ALLOCATOR's word for "the family's cap", not a
+    claim about the parent's kind — the two surfaces must agree, so the card reads the
+    same `ops.family_prose` table the note does."""
+    _fo_id, child = _broke_family(project)
+    page = html.unescape(client.get(f"/wo/proj_a/{child}").text)
+    assert "its investigation's slice" in page
+    assert "its feature's slice" not in page
+    assert "its investigation has $0.00 unreserved" in page
+
+
+def test_raising_a_family_with_parked_children_names_them(client, project):
+    """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to
+    the user — `jarvis wo budget <child> <amount>` is what spends the new money."""
+    fo_id, child = _broke_family(project, kind="feature")
+    r = client.post(f"/fo/proj_a/{fo_id}/budget", data={"amount": "$50"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location and "error=" not in location
+
+    page = html.unescape(client.get(f"/fo/proj_a/{fo_id}"
+                                    f"{location[location.index('?'):]}").text)
+    assert child in page
+    assert "jarvis wo budget" in page
+    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN
+    # ceiling, not on "their own ceiling".
+    assert "1 work order still parked on its own ceiling" in page
+
+
+def test_api_status_carries_every_feature_order_kind(client, project):
+    """Obligation 7 at the surface that reads the payload: `/api/status` and
+    `jarvis status --json` are its only consumers, Jarvis's own pulse check included."""
+    store = ProjectStore(project)
+    try:
+        io = store.create_feature_order("slow first turns", description="three in a row",
+                                        kind="improvement")
+        store.set_feature_status(io["id"], "planning")
+    finally:
+        store.close()
+    rows = client.get("/api/status").json()["projects"][0]["feature_orders"]
+    row = next(r for r in rows if r["id"] == io["id"])
+    assert row["kind"] == "improvement"
+    assert row["status_label"] == "analysing"
+
+
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     """It is the only blocker the reader cannot answer by reading: the order is stopped
     and spending nothing until they decide."""

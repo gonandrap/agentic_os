@@ -1593,8 +1593,21 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         if cap is None:
             # The budget was cleared and the tick that moves the status has not run.
             return "budget spent — cleared, resuming shortly"
-        return (f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
-                + (" (its feature's slice)" if cap.source == "feature" else ""))
+        line = f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
+        if cap.source != "feature":
+            return line
+        # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says
+        # nothing about the parent's kind, so the noun comes from the kind table every
+        # other surface reads (`ops.family_prose`) — this label and the budget card sit
+        # on the same page and called the same family two different things.
+        from .ops import family_prose
+        parent = None
+        if wo.get("parent_id"):
+            try:
+                parent = store.get_feature_order(wo["parent_id"])
+            except KeyError:
+                parent = None
+        return f"{line} (its {family_prose((parent or {}).get('kind'))[0]}'s slice)"
     # A booked retry on one of the settled-looking statuses the sweep reaches and the
     # branch above does not (issue #259). Ranked over the round note below it: a turn the
     # transport dropped is why nothing is moving, and it names the moment that changes.
