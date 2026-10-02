@@ -437,6 +437,48 @@ def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client,
     assert ops_mod.NEO_ESCALATION_INVISIBLE_NOTE in page
 
 
+def test_the_stats_page_renders_spend_and_latency_over_several_neo_kinds(client, project):
+    """Two kinds is the case the page is FOR, and it is where sorting by a bucket breaks:
+    `dictsort(by='value')` compares the bucket dicts themselves and raises
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'`.
+
+    Found by scripts/screenshot_neo_stats.py — every earlier test seeded at most one kind.
+    """
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project))
+        for kind, model, latency in (("neo_answer", "claude-sonnet-4-5", 240),
+                                     ("panel_seat", "claude-opus-5", None)):
+            central.add_agent_call(
+                kind, project="proj_a", wo_id="wo-1", model=model, latency_ms=latency,
+                usage={"input": 10, "cache_write": 20, "cache_read": 30, "output": 40,
+                       "total_cost_usd": 0.01})
+        central.conn.commit()
+    finally:
+        central.close()
+
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert "neo_answer" in page.text and "panel_seat" in page.text
+    # the latency block's "measured/calls" rendering, with the untimed kind at 0/1
+    assert "0/1 timed" in page.text and "1/1 timed" in page.text
+
+
+def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
+    """wo-327f211c: at 1280px "10 asked · 1 escalated" wrapped inside a 150px span, so the
+    trend block rendered at twice its height. bill.html:110 idiom is white-space: nowrap."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/stats").text
+    trend = [ln for ln in page.splitlines() if "asked ·" in ln and "style" in ln]
+    assert trend, "no inline-styled trend row found"
+    for line in trend:
+        assert "white-space: nowrap" in line, line
+
+
 def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
     page = client.get("/neo/stats?project=nope")
     assert page.status_code == 200

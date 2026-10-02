@@ -58,7 +58,8 @@
   {% for d in report.by_day %}
   <div class="row">
     <span class="mono sub" style="width: 92px;">{{ d.day }}</span>
-    <span class="mono" style="width: 150px;">{{ d.asked }} asked ·
+    {# bill.html:110's idiom, plus room for two-digit counts: at 150px this wrapped #}
+    <span class="mono" style="width: 200px; white-space: nowrap;">{{ d.asked }} asked ·
       {{ d.escalated }} escalated</span>
     <span class="grow">
       {# same scale down the column, bill.html:122-126's inline bar, so a rising rate is
@@ -155,7 +156,10 @@
     {# cost.html's column order, not a second token-table style. #}
     <tr><th>kind</th><th>calls</th><th>input</th><th>cache write</th>
       <th>cache read</th><th>output</th><th>recorded</th></tr>
-    {% for kind, s in spend.by_kind | dictsort(by='value', reverse=true) %}
+    {# dearest first. `sort(attribute=…)` and not `dictsort(by='value')`: the
+       values are BUCKET DICTS, and comparing two of them raises TypeError. #}
+    {% for kind, s in spend.by_kind | dictsort
+                      | sort(attribute='1.recorded_cost_usd', reverse=true) %}
     <tr>
       <td>{{ kind }}</td><td>{{ s.calls }}</td><td>{{ fmt_tok(s.input) }}</td>
       <td>{{ fmt_tok(s.cache_write) }}</td><td>{{ fmt_tok(s.cache_read) }}</td>
@@ -170,7 +174,8 @@
 
 <h2>How long it took</h2>
 <div class="panel">
-  {% for kind, e in lat.by_kind | dictsort(by='value', reverse=true) %}
+  {# busiest first; same bucket-dict reason as the spend table above. #}
+  {% for kind, e in lat.by_kind | dictsort | sort(attribute='1.calls', reverse=true) %}
   <div class="row">
     <span class="mono grow">{{ kind }}</span>
     <span class="mono sub">{{ e.measured }}/{{ e.calls }} timed</span>
