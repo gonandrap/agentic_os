@@ -194,7 +194,7 @@ def in_flight(store: ProjectStore, wo_id: str) -> float:
 
 def feature_in_flight(store: ProjectStore, fo: dict[str, Any]) -> float:
     """The same for a feature order's whole family — its planner and every child."""
-    return sum(in_flight(store, child["id"]) for child in _family(store, fo))
+    return sum(in_flight(store, child["id"]) for child in family(store, fo))
 
 
 def feature_spent(store: ProjectStore, central: CentralStore | None,
@@ -206,13 +206,21 @@ def feature_spent(store: ProjectStore, central: CentralStore | None,
     `jarvis cost <fo-id>`.
     """
     total = Spend()
-    for child in _family(store, fo):
+    for child in family(store, fo):
         total = total + spent(store, central, child["id"])
     return total
 
 
-def _family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every work order whose spend the feature is answerable for."""
+def family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every work order whose spend the feature is answerable for.
+
+    THE FAMILY THE FAMILY BUDGET IS BOUNDED OVER, and public so that what the OS REPORTS
+    is read off the same set the allocator ENFORCES over (Neo question 1198). It is
+    deliberately NOT `ProjectStore.feature_children`, which is the `kind='worker'`
+    children only: an improvement order's analyst and an investigation's investigator are
+    `kind='analyst'`/`'investigator'` and reach their parent as its `plan_wo_id`, so for
+    those two kinds the two sets do not intersect at all.
+    """
     orders: list[dict[str, Any]] = []
     planner_id = fo.get("plan_wo_id")
     if planner_id:
@@ -302,7 +310,7 @@ def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
     total = Spend()
     held = 0.0
     unclaimed = 0
-    for child in _family(store, fo):
+    for child in family(store, fo):
         child_spend = spent(store, central, child["id"])
         total = total + child_spend
         if child["id"] == claimant:

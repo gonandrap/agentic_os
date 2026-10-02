@@ -1029,6 +1029,8 @@ def test_topping_a_child_up_with_a_broke_feature_says_to_raise_the_feature(
     out = ops.set_work_order_budget(child["id"], 500.0)
     assert not out["resumed"]
     assert "its feature's slice" in out["note"]
+    # The NEGATIVE CONTROL for the kind-derived raise verb below: `jarvis fo budget` is
+    # right here and only here.
     assert "jarvis fo budget" in out["note"]
     assert "unreserved" in out["note"]
 
@@ -1052,4 +1054,159 @@ def test_the_post_condition_exempts_the_window_the_settler_declines(started, sto
     store.set_status(wo["id"], "running")
     assert [v.invariant for v in check_budgets_are_enforced(store)] == [
         "INV-BUDGET-OVERSPENT"]
+
+
+# -- a family that is not a feature ----------------------------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: every budget
+# path above runs over `feature_orders` rows, and an improvement or investigation order
+# IS one of those rows. No test exercised a non-feature family, which is why six kind
+# leaks shipped green.
+
+
+def _an_investigation(store, budget_usd: float | None = None) -> dict:
+    """An `inv-` family, filed the way the CLI files one. Its one child is the daemon's."""
+    subject = store.create_work_order("ship the CSV export", description=ASK)
+    store.update_work_order(subject["id"], status="validating")
+    return ops.create_investigation_order(
+        "proj_a", subject["id"],
+        "it has been validating for six hours with no turn in flight. Find out what is "
+        "holding it.",
+        budget_usd=budget_usd)
+
+
+def _an_improvement(budget_usd: float | None = None) -> dict:
+    return ops.create_improvement_order(
+        "proj_a", "first turns re-read the dispatch path",
+        description="Three work orders in a row spent their first turn re-reading it.",
+        refs=["wo-11111111"], budget_usd=budget_usd)
+
+
+def _the_one_child(store, fo: dict, kind: str, spent: float,
+                   reserved: float | None = None) -> str:
+    """The state the daemon leaves a non-feature family in: ONE child, the family's whole
+    slice cut for it, parked on it — and the parent in `planning`.
+
+    Written through the store rather than ticked into existence: a non-feature family's
+    one child is its `plan_wo_id` (`budget.family`) and it settles on its first turn, so
+    a fixture that ticks races the settler for the billing. The allocator's own arithmetic
+    is pinned above; this is about the paths that read the parent's KIND.
+    """
+    child = store.create_work_order(f"work on {fo['id']}", description="look",
+                                    kind=kind, parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=child["id"])
+    store.set_feature_status(fo["id"], "planning")
+    if reserved is None:
+        reserved = fo.get("budget_usd")
+    store.update_work_order(child["id"], budget_reserved_usd=reserved,
+                            status=budget.EXHAUSTED)
+    bill_the_turn(store, child["id"], spent)
+    return child["id"]
+
+
+def test_topping_up_an_investigation_puts_it_back_to_planning(started, store):
+    """Obligation 1. An investigation family runs in `planning` — `executing` is a status
+    its lifecycle never enters — so the budget pass has to escalate it AND restore it
+    there."""
+    inv = _an_investigation(store, budget_usd=2.0)
+    _the_one_child(store, inv, "investigator", spent=9.0)
+    started.tick()
+    assert store.get_feature_order(inv["id"])["status"] == "budget_exhausted"
+
+    ops.set_investigation_budget(inv["id"], 100.0)
+    started.tick()
+    row = store.get_feature_order(inv["id"])
+    assert row["status"] == "planning"
+    assert not row["needs_attention"]
+
+
+def test_topping_up_an_improvement_order_puts_it_back_to_planning(started, store):
+    """Obligation 1, the other non-feature kind — its `planning` reads "analysing"."""
+    io = _an_improvement(budget_usd=2.0)
+    _the_one_child(store, io, "analyst", spent=9.0)
+    started.tick()
+    assert store.get_feature_order(io["id"])["status"] == "budget_exhausted"
+
+    ops.set_improvement_budget(io["id"], 100.0)
+    started.tick()
+    assert store.get_feature_order(io["id"])["status"] == "planning"
+
+
+def test_the_settlement_pass_never_reaches_a_non_feature_family(started, store):
+    """Obligation 2, the negative control for the split: an investigation settles from its
+    VERDICT, so a dead investigator must not fail the order under it. Passes today by
+    accident — the kind default — and must pass by construction."""
+    inv = _an_investigation(store)
+    child = store.create_work_order(f"investigate {inv['id']}", kind="investigator",
+                                    parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    store.set_status(child["id"], "failed")
+
+    started.tick()
+    row = store.get_feature_order(inv["id"])
+    assert row["status"] == "planning"
+
+
+def test_the_note_names_the_raise_verb_of_its_parents_own_kind(started, store):
+    """Obligation 3. `jarvis fo budget` on an `io-`/`inv-` row refuses — the OS telling
+    the user to run a command it will reject."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    note = ops.set_work_order_budget(child, 500.0)["note"]
+    assert "jarvis investigate budget" in note
+    assert "jarvis fo budget" not in note
+
+    io = _an_improvement(budget_usd=3.0)
+    io_child = _the_one_child(store, io, "analyst", spent=9.0)
+    io_note = ops.set_work_order_budget(io_child, 500.0)["note"]
+    assert "jarvis io budget" in io_note
+    assert "jarvis fo budget" not in io_note
+
+
+def test_the_show_path_explains_the_cap_in_the_same_words(started, store):
+    """Obligation 4. The reporter had `budget_usd=10`, `cap_usd=2.0036`,
+    `cap_source='feature'` and `feature_unreserved_usd=0.0` and could not assemble them.
+    ONE HOME: the set path and the show path state the same fact, and two wordings of it
+    is how two users come to believe different things."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(store, inv, "investigator", spent=9.0)
+
+    set_note = ops.set_work_order_budget(child, 500.0)["note"]
+    shown = ops.work_order_budget(child)
+    assert shown["note"] == set_note
+    assert "its feature's slice" not in shown["note"]       # it is not a feature
+    assert f"{shown['cap_usd']:.2f}" in shown["note"]       # the family's slice
+    assert "$3.00" in shown["note"]                         # the family budget
+    assert "unreserved" in shown["note"]
+    assert "jarvis investigate budget" in shown["note"]
+
+
+def test_the_family_is_not_the_worker_children(started, store):
+    """Obligation 5 (Neo question 1198). The family budget is ENFORCED over
+    `budget.family` and was REPORTED over `ProjectStore.feature_children`, which is the
+    `kind='worker'` children only. A non-feature family's one child is reached as the
+    parent's `plan_wo_id`, so for those two kinds the sets do not even intersect."""
+    inv = _an_investigation(store, budget_usd=2.0)
+    child = _the_one_child(store, inv, "investigator", spent=9.0)
+    fo = store.get_feature_order(inv["id"])
+
+    assert [c["id"] for c in budget.family(store, fo)] == [child]
+    assert store.feature_children(inv["id"]) == []
+
+
+def test_raising_a_features_budget_still_names_its_parked_child(started, store):
+    """The negative control for that split: a feature's worker children are in the
+    family too, so the list `jarvis fo budget` prints must not change for them."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  budget_usd=2.0)
+    child = store.create_work_order("export it", description="work",
+                                    kind="worker", parent_id=fo["id"])
+    store.update_work_order(child["id"], budget_reserved_usd=2.0,
+                            status=budget.EXHAUSTED)
+
+    out = ops.set_feature_budget(fo["id"], 100.0)
+    assert out["exhausted_children"] == [child["id"]]
+    assert child["id"] in [c["wo_id"]
+                           for c in ops.feature_order_budget(fo["id"])["children"]]
 

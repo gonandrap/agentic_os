@@ -180,6 +180,17 @@ LANDING_SWEEP_EVERY_TICKS = 720
 #: default (`catalog.ScheduleConfig`).
 SCHEDULE_EVERY_TICKS = 12
 
+#: Where a TOPPED-UP family goes back to, per `feature_orders.kind` (§4 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md). A feature runs
+#: its children in `executing`; an improvement or investigation order runs its one child
+#: in `planning` and settles out of it directly, so `executing` is a status those two
+#: lifecycles never enter — it would render raw and lie about the phase.
+_RESUMED_STATUS = {
+    "feature": "executing",
+    "improvement": "planning",
+    "investigation": "planning",
+}
+
 #: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
 #: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
 #: DAEMON: a substring pass over every transcript on the machine (843MB and 4,584 files
@@ -1288,12 +1299,19 @@ class Daemon:
             dead_feature_children,
         )
 
-        # THE FAMILY BUDGET IS ASKED ON A WIDER SET than the rest of this method, and
-        # `budget_exhausted` is in it so a topped-up feature can leave the state the same
-        # way it entered it. A feature runs no session of its own, so nothing else here
-        # would ever re-derive the status back to `executing`.
+        # PASS ONE: THE FAMILY BUDGET, EVERY KIND, ON A WIDER STATUS SET than the
+        # settlement pass below. §4 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: an
+        # improvement or investigation family IS a `feature_orders` row and runs in
+        # `planning` — it never enters `executing` at all — so a feature-only,
+        # `executing`-only pass meant no non-feature family could ever escalate to, or
+        # leave, `budget_exhausted`. `kind=None` is written out because this path is
+        # kind-agnostic, and `budget_exhausted` is in the set so a topped-up family can
+        # leave the state the same way it entered it. A family runs no session of its
+        # own, so nothing else here re-derives its status.
         for fo in store.list_feature_orders(
-                statuses=("executing", budget_mod.FO_EXHAUSTED)):
+                statuses=("executing", "planning", budget_mod.FO_EXHAUSTED),
+                kind=None):
             pool = budget_mod.feature_exhaustion(store, self.central, fo)
             if pool is not None:
                 budget_mod.escalate_feature(store, fo, pool)
@@ -1305,9 +1323,25 @@ class Daemon:
                 # `jarvis wo budget <child>` is what re-cuts that child's slice out of
                 # the new money; nothing here writes a reservation, because doing it from
                 # this end would have to guess the split.
-                store.set_feature_status(fo["id"], "executing")
+                #
+                # THE RESTING STATUS IS KIND-DERIVED: `executing` is a status an
+                # improvement or investigation order's lifecycle never enters, so writing
+                # it there would render raw (no `feature_status_label` override exists)
+                # and lie about which phase the order is in. `assert status in
+                # FO_STATUSES` cannot catch that — `executing` is legal for the table,
+                # just not for the row.
+                store.set_feature_status(fo["id"], _RESUMED_STATUS.get(
+                    fo.get("kind") or "feature", "executing"))
                 store.clear_feature_attention(fo["id"])
-                continue
+
+        # PASS TWO: THE CHILD SETTLEMENT, FEATURE-ONLY BY LIFECYCLE, `kind='feature'`
+        # WRITTEN OUT. An investigation settles from its verdict (`ops.submit_verdict`)
+        # and an improvement order from its findings review, so running
+        # `dead_feature_children` or "all children completed" over them would settle them
+        # wrongly and could destroy a verdict in flight. The correctness used to rest on
+        # the `kind` default, and a reader cannot tell a deliberate feature-only pass
+        # from a leak — which is how this bug got here.
+        for fo in store.list_feature_orders(statuses=("executing",), kind="feature"):
             children = store.feature_children(fo["id"])
             if not children:
                 continue  # released with nothing in it; nothing to settle against

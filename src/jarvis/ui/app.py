@@ -1725,9 +1725,18 @@ def create_app() -> FastAPI:
                 status_code=303)
         try:
             parsed = None if clear else budget.parse_amount(amount)
-            ops.set_work_order_budget(wo_id, parsed, project_name=name)
+            result = ops.set_work_order_budget(wo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
+        # A RAISE THAT CHANGED NOTHING STILL OWES THE USER A SENTENCE, on the non-error
+        # channel (§7 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): the
+        # budget WAS raised and written, and the cap that still binds is the family's.
+        # Dropping the note is what redirected the reporter to an unchanged page saying
+        # nothing. Never `?error=` — a refusal is not an error.
+        if result.get("note") and not result.get("resumed"):
+            return RedirectResponse(f"/wo/{name}/{wo_id}?note={quote(result['note'])}",
+                                    status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/fo/{name}/{fo_id}/budget")
@@ -1742,9 +1751,21 @@ def create_app() -> FastAPI:
                 status_code=303)
         try:
             parsed = None if clear else budget.parse_amount(amount)
-            ops.set_feature_budget(fo_id, parsed, project_name=name)
+            result = ops.set_feature_budget(fo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        # The same channel: `exhausted_children` is the WHOLE INSTRUCTION to the user —
+        # the family has money again and `jarvis wo budget <child> <amount>` is what
+        # spends it on the child they meant to rescue. Nothing here funds them, because
+        # doing it from this end would have to guess the split (`ops.set_feature_budget`).
+        stuck = result.get("exhausted_children") or []
+        if stuck:
+            note = (f"budget raised. {len(stuck)} work order"
+                    f"{'' if len(stuck) == 1 else 's'} still parked on their own "
+                    f"ceiling: {', '.join(stuck)} — spend the new money on one with "
+                    f"`jarvis wo budget <id> <amount>`")
+            return RedirectResponse(f"/fo/{name}/{fo_id}?note={quote(note)}",
+                                    status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")

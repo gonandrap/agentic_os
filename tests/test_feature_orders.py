@@ -1217,6 +1217,24 @@ def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
     assert "http" not in human.split("spec")[-1]
 
 
+def test_a_failed_flagged_feature_order_still_lists(started, store):
+    """Obligation 6 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
+    `failed` is SETTLED and it is also the status a feature order raises its flag in —
+    `settle_features` writes both in one call — so an open-only listing drops the flag on
+    the floor at the exact moment it means the most."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    quiet = ops.create_feature_order("proj_a", "another ask", description=ASK)
+    store.set_feature_status(fo["id"], "failed")
+    store.flag_feature_attention(fo["id"], "wo-1 failed")
+    store.set_feature_status(quiet["id"], "completed")
+
+    listed = [r["id"] for r in ops.list_feature_orders("proj_a")]
+    assert fo["id"] in listed
+    assert quiet["id"] not in listed
+    assert quiet["id"] in [r["id"] for r in
+                           ops.list_feature_orders("proj_a", include_settled=True)]
+
+
 def test_the_github_link_is_omitted_rather_than_guessed(project):
     """§6. A 404 from a URL the OS assembled reads as the spec having been deleted."""
     from jarvis import github
