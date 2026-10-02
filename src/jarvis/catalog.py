@@ -69,6 +69,19 @@ VALID_PERMISSION_MODES = {
 # mode; `auto` does not weaken those. See ASSUMPTIONS.md §9.
 DEFAULT_PERMISSION_MODE = "auto"
 
+# Whether `auto` mode's bash-first steer reaches a worker, and in which variant. §1 of
+# docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md.
+#
+# A STRING ENUM and not a boolean: `cli` is the only value under which Jarvis asserts no
+# answer about a vendor behaviour it does not own, and a boolean cannot express it. The
+# DEFAULT DISABLES rather than relaxing — `relaxed` is a softer copy of the instruction
+# that beat Jarvis's own navigation posture at a measured 0% hit rate over 276
+# transcripts (kn-8107745e, io-edacb3ea). `strict` exists for the deterministic arm of
+# evals/llm/test_navigation_judgment.py: the variant is otherwise a per-session statsig
+# cohort draw, and an arm whose strength comes from a draw is not a measurement.
+VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
+DEFAULT_WORKER_BASH_FIRST = "off"
+
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
 # through to `claude --model`, so it accepts a full model id (pinned, as here) or an
@@ -409,6 +422,8 @@ class WorkerDefaults:
     model: str | None = None
     effort: str | None = None
     permission_mode: str = DEFAULT_PERMISSION_MODE
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
+    bash_first: str = DEFAULT_WORKER_BASH_FIRST
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -1285,6 +1300,8 @@ class OsConfig:
     default_model: str = DEFAULT_MODEL
     default_effort: str | None = None
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
+    default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -2057,6 +2074,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_model=defaults.get("model", DEFAULT_MODEL),
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
+        default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2097,6 +2115,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     )
     if os_cfg.default_permission_mode not in VALID_PERMISSION_MODES:
         raise _err(f"os.defaults.permission_mode {os_cfg.default_permission_mode!r} not in {sorted(VALID_PERMISSION_MODES)}")
+    # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1.
+    if os_cfg.default_bash_first not in VALID_BASH_FIRST:
+        raise _err(f"os.defaults.bash_first {os_cfg.default_bash_first!r} not in "
+                   f"{sorted(VALID_BASH_FIRST)}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2128,6 +2150,13 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         pmode = w.get("permission_mode", os_cfg.default_permission_mode)
         if pmode not in VALID_PERMISSION_MODES:
             raise _err(f"project {name}: worker.permission_mode {pmode!r} invalid")
+        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — this message IS what
+        # `jarvis config set <project> worker.bash_first` shows: `ops.set_config`
+        # re-parses the document to validate.
+        bash_first = w.get("bash_first", os_cfg.default_bash_first)
+        if bash_first not in VALID_BASH_FIRST:
+            raise _err(f"project {name}: worker.bash_first {bash_first!r} not in "
+                       f"{sorted(VALID_BASH_FIRST)}")
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2145,6 +2174,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             model=w.get("model") or p.get("model") or os_cfg.default_model,
             effort=w.get("effort", os_cfg.default_effort),
             permission_mode=pmode,
+            bash_first=bash_first,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",

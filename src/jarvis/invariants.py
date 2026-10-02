@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import budget, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
-from .automerge import HELD_SHA_MOVED
+from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
@@ -371,6 +371,22 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
 #: and has no branch below.
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
+
+#: THE SAME GIVE-UP, ONE STATUS LATER. `VALIDATION_STUCK_BLOCKER` above is raised only in
+#: `needs_review`; accepting the assumptions lands the order in `waiting_pr_merge`
+#: (`ops.land_when_cleared`) and nothing re-derives it there, so the panel's give-up went
+#: silent for 47h on wo-3615faf7 (issue 902). A SEPARATE SENTENCE because the remedy is
+#: different: in `needs_review` the user decides the work, here the work is decided and
+#: the PULL REQUEST is what will not move — `jarvis wo review` has nothing to review and
+#: would send them looking for a prompt that is not there.
+#:
+#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on AUTOMERGE_DENIED_BLOCKER's rule:
+#: `ack_attention` stores this verbatim and INV-ATTENTION-REASON compares it, so a reason
+#: that ticked could never be acknowledged.
+PARKED_GIVE_UP_BLOCKER = ("the panel gave up on this and no commit was ever accepted, so "
+                          "the automatic merge will never arm — merge it yourself, "
+                          "re-judge it (`jarvis validation force`), or give it another "
+                          "round (`validation.max_rounds`)")
 
 #: What a work order says when its turn died because Claude Code could not authenticate
 #: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work and nothing is wrong
@@ -706,6 +722,40 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
     return True
 
 
+def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is the panel's give-up the thing holding this parked pull request?
+
+    TWO FACTS: the latest validation round ESCALATED, and the newest automatic-merge hold
+    is `not_passed` — the one code `decide` reaches when no commit was ever accepted, so
+    it is the precise statement that the give-up is what the merge waits on. Without the
+    second fact this fires on every parked order in a project running with `auto_merge`
+    off, which writes no hold at all and where the pull request merges on GitHub with
+    nothing stuck. The hold check is folded in here rather than left to the branch for
+    the reason `rejudge_exhausted` above folds in its own: both facts answer one
+    question, and a predicate answering half of it would carry a name that lied.
+
+    Derived, never stored. A flag written where the hold is written sits on the daemon's
+    poll path and re-raises itself over `jarvis wo ack` every tick (kn-089de524);
+    INV-ATTENTION-MISSING raises it from here, which is the path that honours
+    `acknowledged_blockers`.
+
+    SELF-CLEARING by construction, and without waiting for a poll. Fact 1 reads the
+    LATEST round only, so a later round that passes or merely opens clears it on the same
+    tick, with no new hold event. Fact 2 clears it when the hold changes code — the head
+    moved, CI went red, the pull request closed — each of which has its own sentence and
+    its own machinery, and this one must not sit over them.
+
+    Spec 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
+    """
+    if not validation_escalated(store, wo):
+        return False
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if not held:
+        return False
+    newest = db.from_json(held[-1]["payload"], {})
+    return str(newest.get("code") or "") == HELD_NOT_PASSED
+
+
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Are this order's pending assumptions Neo's to decide on delivery, not the user's?
 
@@ -973,6 +1023,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # `sha_moved` on the judged head, this one needs no such hold.
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
+    # THE GIVE-UP, SURVIVING INTO THE STATUS THAT DROPPED IT (issue 902). Ranked last of
+    # the four documentarily: none of them can co-occur, proved in section 4 of spec
+    # 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
+    if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
+        blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the

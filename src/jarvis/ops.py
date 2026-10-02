@@ -4160,7 +4160,8 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
 
 
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any], status: str = "") -> bool:
+                         payload: dict[str, Any], status: str = "",
+                         assumption: dict[str, Any] | None = None) -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -4189,9 +4190,20 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     hold from either is dropped once the order reaches either status. Both mis-drops lose a
     stale sentence about a pass that no longer owns the row, while the pass that does own
     it writes its own events on the next tick — never a lost live one.
+
+    THE ASSUMPTION CLAUSE IS CODE-AGNOSTIC AND IS TESTED FIRST
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.3, Neo question 1196 Option A): a hold naming a row that is no longer
+    `pending` is stale whatever its code, because every per-assumption code claims
+    something about that row. `assumption` is the row the payload names, or `None` — a
+    payload with no `assumption_id` is an ORDER-LEVEL hold and this clause cannot answer
+    about it.
     """
     from . import autoreview
 
+    if int(payload.get("assumption_id") or 0) and assumption is not None:
+        if str(assumption.get("status") or "") != "pending":
+            return True
     if str(payload.get("code") or "") == autoreview.HELD_STATUS:
         return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
@@ -4212,26 +4224,38 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = N
     the row passes it rather than making this read the row again, and one that holds only
     the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
     of that code turns up.
+
+    The assumption rows are cached BY `assumption_id` and read only when a hold naming one
+    turns up (2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.3): one
+    closure is built per order and run over every row's events, so a single slot would
+    answer the second assumption with the first one's status.
     """
     from . import autoreview
 
     cache: dict[str, Any] = {}
+    rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
         code = str(payload.get("code") or "")
+        aid = int(payload.get("assumption_id") or 0)
+        if aid and aid not in rows:
+            rows[aid] = store.get_assumption(aid)
+        row = rows.get(aid)
+        # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of
+        # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md.
         if code not in codes:
-            return False
+            return _panel_hold_is_stale(None, payload, "", row)
         if "status" not in cache:
             cache["status"] = (status if status is not None
                               else str(store.get_work_order(wo_id)["status"] or ""))
         if code == autoreview.HELD_STATUS:
-            return _panel_hold_is_stale(None, payload, cache["status"])
+            return _panel_hold_is_stale(None, payload, cache["status"], row)
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"], row)
 
     return stale
 
@@ -10895,6 +10919,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.model", "next-dispatch"),
     ("*.effort", "next-dispatch"),
     ("*.permission_mode", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the system prompt it was launched with. Spec §1:
+    # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+    ("*.bash_first", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`

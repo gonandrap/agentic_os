@@ -6196,6 +6196,10 @@ class Daemon:
         kinds at once — §5 judges what it can while the worker runs — so that branch is
         per assumption and not per order. **The confirmation branch belongs to the parked
         pass only**: until the work is delivered there is no result to confirm against.
+
+        A row that is no longer `pending` is SKIPPED, whichever branch it would take:
+        docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+        assumption.md §3.1.
         """
         from . import autoreview, ops
 
@@ -6222,6 +6226,9 @@ class Daemon:
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
+            # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1.
+            if str(a.get("status") or "") != "pending":
+                continue
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):
