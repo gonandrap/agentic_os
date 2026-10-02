@@ -22,6 +22,7 @@ from jarvis.project_store import (
     ProjectStore,
     feature_status_label,
 )
+from jarvis.worker_session import PAUSE_USAGE_LIMIT
 
 MINUTE = 60.0
 HOUR = 3600.0
@@ -51,8 +52,9 @@ def backdate(store: ProjectStore, order_id: str, *stamps: float) -> None:
     store.conn.commit()
 
 
-def event_at(store: ProjectStore, wo_id: str, kind: str, ts: float) -> None:
-    store.add_event(wo_id, kind)
+def event_at(store: ProjectStore, wo_id: str, kind: str, ts: float,
+             payload: dict | None = None) -> None:
+    store.add_event(wo_id, kind, payload)
     store.conn.execute(
         "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events WHERE wo_id=?)",
         (ts, wo_id))
@@ -681,3 +683,190 @@ def test_set_status_refuses_to_leave_a_transition_half_written(store, monkeypatc
     monkeypatch.setattr(ProjectStore, "_record_span", lambda *a, **k: None)
     with pytest.raises(AssertionError):
         store.set_status(wo["id"], "needs_review")
+
+
+# a hold is not time in status (spec §5 of
+# docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md)
+# ---------------------------------------------------------------------------
+
+#: Issue 887's own numbers: `running` at T0, 45 minutes of turn, then the fleet usage
+#: window is spent until T0+5h24m.
+WORKED = 45 * MINUTE
+WALL = 5 * HOUR + 24 * MINUTE
+HELD = WALL - WORKED
+HELD_NOW = T0 + WALL
+
+
+def pause_at(store: ProjectStore, wo_id: str, ts: float, seq: int = 1,
+             reason: str = PAUSE_USAGE_LIMIT) -> None:
+    event_at(store, wo_id, "turn_paused", ts, {"reason": reason, "seq": seq})
+
+
+def resume_at(store: ProjectStore, wo_id: str, ts: float, seq: int = 1) -> None:
+    event_at(store, wo_id, "turn_resumed", ts, {"retried_seq": seq})
+
+
+def running_since_t0(store: ProjectStore) -> dict:
+    """A work order that entered `running` at T0 after an hour pending."""
+    wo = store.create_work_order("t")
+    store.set_status(wo["id"], "running")
+    backdate(store, wo["id"], T0 - HOUR, T0)
+    return wo
+
+
+def wo_887(store: ProjectStore, *, resumed: bool = True) -> dict:
+    wo = running_since_t0(store)
+    turn_at(store, wo["id"], T0, T0 + WORKED)
+    pause_at(store, wo["id"], T0 + WORKED)
+    if resumed:
+        resume_at(store, wo["id"], HELD_NOW)
+    return wo
+
+
+def test_usage_limit_hold_is_not_running_time(store):
+    wo = wo_887(store)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    total = totals_by_status(payload)["running"]
+    assert total["seconds"] == WALL                 # wall is never deleted
+    assert total["held_seconds"] == HELD
+    assert total["active_seconds"] == WORKED
+
+
+def test_open_hold_reads_as_held(store):
+    wo = wo_887(store, resumed=False)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert payload["held_now"]["cause"] == PAUSE_USAGE_LIMIT
+    assert payload["held_now"]["phrase"] == "a fleet usage limit"
+    assert payload["held_now"]["since"] == T0 + WORKED
+    assert payload["current_status_active_age"] < payload["current_status_age"]
+    assert payload["current_status_active_age"] == WORKED
+    assert [h["cause"] for h in payload["current_status_held_by"]] == [PAUSE_USAGE_LIMIT]
+
+
+def test_never_held_payload_is_unchanged(store):
+    wo = running_since_t0(store)
+    turn_at(store, wo["id"], T0, T0 + WORKED)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert payload["lifetime_held_seconds"] == 0
+    assert payload["lifetime_active_seconds"] == payload["lifetime_seconds"]
+    assert payload["held_now"] is None
+    assert payload["current_status_held_seconds"] == 0
+    assert payload["current_status_active_age"] == payload["current_status_age"]
+    assert payload["current_status_held_by"] == []
+    for row in [*payload["spans"], *payload["totals"]]:
+        assert row["held_seconds"] == 0
+        assert row["active_seconds"] == row["seconds"]
+
+
+def test_active_and_held_sum_to_wall(store):
+    wo = wo_887(store)
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    for row in [*payload["spans"], *payload["totals"]]:
+        assert round(row["active_seconds"] + row["held_seconds"], 2) == row["seconds"]
+    assert round(payload["lifetime_active_seconds"]
+                 + payload["lifetime_held_seconds"], 2) == payload["lifetime_seconds"]
+
+
+def test_hold_inside_a_running_turn_is_not_subtracted(store):
+    wo = running_since_t0(store)
+    turn_at(store, wo["id"], T0, T0 + 2 * HOUR)
+    event_at(store, wo["id"], "message_queued", T0 + 30 * MINUTE, {"msg_id": "m1"})
+    event_at(store, wo["id"], "message_delivered", T0 + HOUR, {"msg_ids": ["m1"]})
+
+    payload = ops.state_durations(store, wo_id=wo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert totals_by_status(payload)["running"]["held_seconds"] == 0
+
+
+def executing_feature(store: ProjectStore) -> dict:
+    fo = store.create_feature_order("f")
+    store.set_feature_status(fo["id"], "executing")
+    backdate(store, fo["id"], T0 - HOUR, T0)
+    return fo
+
+
+def test_feature_hold_is_the_familys(store):
+    fo = executing_feature(store)
+    a = store.create_work_order("a", parent_id=fo["id"])
+    b = store.create_work_order("b", parent_id=fo["id"])
+    pause_at(store, a["id"], T0 + HOUR)
+    resume_at(store, a["id"], T0 + 4 * HOUR)
+    turn_at(store, b["id"], T0 + 2 * HOUR, T0 + 3 * HOUR)
+
+    payload = ops.state_durations(store, fo_id=fo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert payload["lifetime_held_seconds"] == 2 * HOUR
+
+
+def test_feature_counts_one_fleet_hold_once(store):
+    fo = executing_feature(store)
+    for title in ("a", "b"):
+        child = store.create_work_order(title, parent_id=fo["id"])
+        pause_at(store, child["id"], T0 + HOUR)
+        resume_at(store, child["id"], T0 + 3 * HOUR)
+
+    payload = ops.state_durations(store, fo_id=fo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert payload["lifetime_held_seconds"] == 2 * HOUR
+    assert [h["cause"] for h in payload["current_status_held_by"]] == [PAUSE_USAGE_LIMIT]
+    assert payload["current_status_held_by"][0]["seconds"] == 2 * HOUR
+
+
+def test_planner_and_manager_count_as_family(store):
+    fo = executing_feature(store)
+    planner = store.create_work_order("plan", parent_id=fo["id"], kind="planner")
+    store.conn.execute("UPDATE feature_orders SET plan_wo_id=? WHERE id=?",
+                       (planner["id"], fo["id"]))
+    store.conn.commit()
+    manager = store.create_work_order("m", parent_id=fo["id"], kind="manager")
+    pause_at(store, planner["id"], T0 + HOUR)
+    resume_at(store, planner["id"], T0 + 2 * HOUR)
+    pause_at(store, manager["id"], T0 + 3 * HOUR)
+    resume_at(store, manager["id"], T0 + 4 * HOUR)
+
+    payload = ops.state_durations(store, fo_id=fo["id"], now=HELD_NOW).as_dict(HELD_NOW)
+
+    assert payload["lifetime_held_seconds"] == 2 * HOUR
+
+
+# the three renderer lines (spec §3) ----------------------------------------
+
+
+def _line(store: ProjectStore, wo_id: str, status: str) -> str:
+    payload = ops.state_durations(store, wo_id=wo_id, now=HELD_NOW).as_dict(HELD_NOW)
+    return [line for line in cli.time_in_state_lines(payload)
+            if f" {status} " in line][0]
+
+
+def test_never_held_line_is_byte_identical(store):
+    """The common case acquires no noise: the golden string is today's output."""
+    wo = running_since_t0(store)
+    turn_at(store, wo["id"], T0, T0 + WORKED)
+
+    assert _line(store, wo["id"], "running") == (
+        "🟢 running               5.4h  1 entry     84%   ← now, 5.4h, nothing since 4.7h ago")
+
+
+def test_previously_held_line_shows_active_then_wall(store):
+    wo = wo_887(store)
+
+    assert _line(store, wo["id"], "running") == (
+        "🟢 running                45m  1 entry     84%   "
+        "(4.7h held by a fleet usage limit, 5.4h wall)   "
+        "← now, 5.4h, nothing since 0s ago")
+
+
+def test_held_right_now_line_says_held(store):
+    wo = wo_887(store, resumed=False)
+
+    assert _line(store, wo["id"], "running") == (
+        "🟢 running                45m  1 entry     84%   "
+        "← HELD 4.7h by a fleet usage limit, running 45m of 5.4h")
