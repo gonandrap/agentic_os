@@ -330,15 +330,63 @@ def test_an_escaped_backslash_leaves_the_next_quote_a_real_quote():
         _bash(command), _env())) == "allow", command
 
 
+#: An unterminated quote has no knowable structure. Round 1 pinned this at the
+#: `jarvis_verbs` level only; both decision entry points must refuse it too.
+UNTERMINATED_QUOTES = (
+    'jarvis wo ask wo-1 "oops',
+    "jarvis wo ask wo-1 'oops",
+)
+
+#: An ESCAPED BACKSLASH is a literal backslash, so it does NOT escape the character
+#: after it: the pair-blanking must not swallow the real `;`/`$(` that follows.
+ESCAPED_BACKSLASH_THEN_STRUCTURE = (
+    "jarvis wo ask wo-1 \\\\; git commit -am x",
+    "jarvis wo ask wo-1 \\\\$(sed -i s/a/b/ src/x.py)",
+)
+
+
 def test_an_unterminated_quote_fails_closed():
-    assert hooks.jarvis_verbs('jarvis wo ask wo-1 "oops') == ()
-    assert hooks.jarvis_verbs("jarvis wo ask wo-1 'oops") == ()
+    for command in UNTERMINATED_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_does_not_hide_the_structure_after_it():
+    for command in ESCAPED_BACKSLASH_THEN_STRUCTURE:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+# -- review round 2: BRACE PARAMETER EXPANSION inside double quotes (spec DELTA 3) ----
+
+#: `${...}` inside double quotes is NOT a value: `:=` assigns and the assigned text is
+#: then prompt-expanded, and `a[$(cmd)]` is evaluated as an arithmetic subscript. The
+#: escaped `\$` is blanked by the scanner, so `_SHELL_SUBSTITUTION` never sees a `$(`.
+BRACE_EXPANSION_IN_DOUBLE_QUOTES = (
+    'jarvis wo ask wo-1 "${x:=\\$(touch /tmp/p)}"',
+    'jarvis wo ask wo-1 "${x:=a[\\$(touch /tmp/p)]}"',
+)
+
+
+def test_brace_parameter_expansion_in_a_double_quoted_write_is_refused():
+    for command in BRACE_EXPANSION_IN_DOUBLE_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
 
 
 def test_the_prose_fixtures_leave_every_other_kind_alone():
     for command in (REAL_REFUSED_ASKS + tuple(_prose_writes())
                     + SUBSTITUTION_IN_DOUBLE_QUOTES + REAL_STRUCTURE
-                    + PROSE_MUTATIONS):
+                    + PROSE_MUTATIONS + BRACE_EXPANSION_IN_DOUBLE_QUOTES):
         assert hooks.investigator_bash_decision(
             _bash(command), _env("worker")) is None, command
 

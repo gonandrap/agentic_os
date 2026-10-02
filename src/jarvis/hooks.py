@@ -60,7 +60,8 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     the two cannot disagree about what a segment IS — only about which characters count
     as structure: this one judges STRUCTURE, not raw text, because every write it must
     clear carries prose in quotes (docs/superpowers/specs/2026-10-01-investigator-writes-
-    unreachable.md).
+    unreachable.md). Quotes do not make every expansion inert: `${` is refused wherever
+    the shell would expand it, double quotes included (DELTA 3 of that spec).
 
     An empty tuple means "no `jarvis` verb this can vouch for": not a jarvis chain, a
     command carrying shell metacharacters, or one shlex cannot parse. The caller decides
@@ -79,8 +80,12 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     # single quotes masked (spec §The mechanism, 2).
     if _SHELL_SUBSTITUTION.search(scan.single_only):
         return ()
-    # Parameter expansion yields a VALUE inside quotes; unquoted, `$` stays dangerous
-    # (spec DELTA 1).
+    # `${...}` ASSIGNS, prompt-expands and evaluates arithmetic, so it is not a value
+    # even inside double quotes (spec DELTA 3).
+    if "${" in scan.single_only:
+        return ()
+    # A bare `$NAME` yields a VALUE inside quotes; unquoted, `$` stays dangerous (spec
+    # DELTA 1, narrowed by DELTA 3).
     if "$" in masked:
         return ()
     out: list[tuple[str, str]] = []
@@ -545,7 +550,9 @@ def _scan_shell_quotes(command: str) -> _QuoteMasks:
             i += 1
             continue
         if char == "\\" and state != "'":
-            # Bash: a backslash outside single quotes makes the next character literal.
+            # Outside quotes `\` escapes anything; inside double quotes only $ ` " \ and
+            # newline — every character special there — so blanking the pair cannot hide
+            # structure either way (spec DELTA 3).
             width = 2 if i + 1 < len(command) else 1
             full.append(" " * width)
             single_only.append(" " * width)
@@ -553,7 +560,7 @@ def _scan_shell_quotes(command: str) -> _QuoteMasks:
             continue
         if state == '"':
             full.append(" ")
-            single_only.append(char if char != '"' else '"')
+            single_only.append(char)
             if char == '"':
                 state = ""
             i += 1

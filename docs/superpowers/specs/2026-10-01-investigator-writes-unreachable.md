@@ -151,9 +151,10 @@ stay untouched.
 
 ### Deltas
 
-**DELTA 1.** A bare `$` (parameter expansion, no `$(`) is refused on the FULL mask:
-`"$HOME"` yields a VALUE inside quotes and is prose, unquoted `$x` is not. So the check
-is `"$" in full_mask`, after the two regex classes.
+**DELTA 1.** A bare `$NAME` (parameter expansion, no `$(` and no brace) is refused on the
+FULL mask: `"$HOME"` yields a VALUE inside quotes and is prose, unquoted `$x` is not. So
+the check is `"$" in full_mask`, after the two regex classes. NARROWED BY DELTA 3: the
+BRACE form `${...}` is not a value and is refused inside double quotes too.
 
 **DELTA 2 (review round 1).** The first implementation masked quoted spans with the
 regexes `r"'[^']*'|\"[^\"]*\""` / `r"'[^']*'"`, which IGNORE BACKSLASH ESCAPES. A
@@ -166,6 +167,38 @@ any claim otherwise in this spec is wrong. Fixed by the escape-aware scanner (me
 0): escape pairs are blanked, an escaped quote changes no state, and an unterminated
 quote now fails closed with `()`. Deny tests for the three escaped-quote shapes run
 through BOTH `investigator_bash_decision` and `preflight_decision`.
+
+**DELTA 3 (review round 2).** DELTA 1's claim that parameter expansion inside double
+quotes "yields a VALUE" is FALSE for the BRACE form. `${...}` can execute:
+
+- `jarvis wo ask wo-1 "${x:=\$(touch /tmp/p)}"` — `:=` assigns the literal text
+  `$(touch /tmp/p)` to `x`, and the assigned text is then prompt-expanded.
+- `jarvis wo ask wo-1 "${x:=a[\$(touch /tmp/p)]}"` — the same assignment, reached through
+  the arithmetic-subscript evaluation of `a[…]`.
+
+Neither was caught: the scanner blanks the escape pair `\$`, so `_SHELL_SUBSTITUTION`
+never sees a `$(` in the single-only mask, and the full mask has blanked the quoted span
+entirely. The round-0 raw scan refused every `$`, so mechanism 2 OPENED this path out of
+the read-only investigator. Fixed by refusing `${` wherever the shell would expand it:
+`"${" in scan.single_only`, beside `_SHELL_SUBSTITUTION` and before the bare-`$` check,
+so single-quoted `'${x}'` stays prose. Dollar figures (`$56.88`) and plain `$NAME` inside
+double quotes stay allowed — neither assigns, prompt-expands or evaluates arithmetic.
+Deny tests for both shapes run through BOTH `investigator_bash_decision` and
+`preflight_decision`.
+
+Also round 2: the escape-pair blanking of mechanism 0 is CONSERVATIVE inside double
+quotes, and the code comment claiming a backslash there makes any character literal was
+wrong. Bash honours a backslash inside double quotes before only `$`, a backtick, `"`,
+`\` and newline; before anything else the backslash stays literal. Blanking hides a
+character from the structure scan, so the only risk direction is hiding REAL structure —
+and it cannot here: every character that is special inside double quotes is also one the
+backslash really escapes, and the rest (`;`, `|`, `<`, `>`) are not structure inside a
+quoted span at all.
+
+Two round-1 shapes were asserted only at the `jarvis_verbs` level and now have deny tests
+through both entry points: an UNTERMINATED quote, and an ESCAPED BACKSLASH followed by
+real structure (`\\;` and `\\$(…)`), which pins that the pair-blanking does not swallow
+what comes after a literal backslash.
 
 ### Rejected alternatives
 
@@ -194,8 +227,9 @@ through BOTH `investigator_bash_decision` and `preflight_decision`.
 All in `tests/test_investigation_orders.py`.
 
 1. **Regression, the real commands.** The four writes with REALISTIC prose arguments
-   carrying each of `;`, `|`, `$`, `>`, `<` and a backtick inside SINGLE quotes are
-   ALLOWED through BOTH `hooks.investigator_bash_decision` and `hooks.preflight_decision`
+   carrying each of `;`, `|`, `$`, `>` and `<` inside a DOUBLE-quoted argument — the
+   shape the transcript shows — plus a backtick inside a SINGLE-quoted one, which is the
+   only quote kind where a backtick is inert, are ALLOWED through BOTH `hooks.investigator_bash_decision` and `hooks.preflight_decision`
    (the second is not redundant — `test_the_denial_is_reachable_through_preflight_not_
    just_directly` at `tests/test_investigation_orders.py:161` exists because ordering in
    `preflight_decision` is where this kind's rule can be bypassed). Use wo-6be2ab21's two
