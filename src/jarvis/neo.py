@@ -382,7 +382,8 @@ def answer_question(store: NeoStore, q: dict[str, Any], model: str,
 
 def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
                 deliver: Any = None, max_questions: int = 50,
-                answer: Any = None, unreachable: Any = None) -> list[dict[str, Any]]:
+                answer: Any = None, unreachable: Any = None,
+                refused: Any = None) -> list[dict[str, Any]]:
     """Answer every queued question in FIFO order, back-to-back.
 
     `deliver(question, verdict)` is called per question with the outcome — the
@@ -395,6 +396,11 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
     there is nothing for `deliver`'s per-kind branches to apply. Fired only once the
     retries are genuinely spent — spec
     docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
+
+    `refused(question, error)` is the THIRD outcome and a third hook for the same
+    reason: the OS built a prompt past its own ceiling, so no call was made, no retry
+    can help, and the user is told once. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
 
     `answer(store, question, model, learnings_limit) -> verdict` is HOW a question gets
     answered, defaulting to `answer_question` — one headless call, one agent. It is the
@@ -425,6 +431,20 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             store.hold_claim(q["id"], e.limit.message, reopens)
             log.info("neo question %s held until the usage window reopens", q["id"])
             results.append({"question": q, "verdict": None, "outcome": "held"})
+            continue
+        except claude_cli.PromptTooLargeError as e:
+            # BEFORE the generic outage below — it is a `ClaudeCliError` subclass, so
+            # Python would never reach a clause placed after it — and `max_attempts=0`
+            # for `InputTooLargeError`'s reason: the OS built this prompt past its own
+            # ceiling, so the same call fails the same way for ever. No synthesised
+            # verdict and no `deliver`: nothing was decided. Spec §4:
+            # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+            outcome = store.release_claim(q["id"], f"prompt too large: {e}",
+                                          max_attempts=0)
+            log.error("neo question %s was refused before it was sent: %s", q["id"], e)
+            if refused:
+                refused(q, e)
+            results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         except claude_cli.InputTooLargeError as e:
             # BEFORE the generic outage below, and the ordering is the mechanism: the

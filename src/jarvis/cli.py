@@ -197,6 +197,21 @@ def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_harvest(detail: dict[str, Any]) -> dict[str, Any]:
+    """The harvest collapsed to its one line, for HUMAN output.
+
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the payload,
+    where the checkpoint sha and the branch are read from, while a person gets
+    `harvest: 3 commits on `wo-2ae…`, 1 uncommitted file checkpointed as 9f8e7d6` — what
+    the OS saved, in the words the dashboard uses above the retry button (spec §5).
+    """
+    row = dict(detail)
+    state = row.pop("harvest", None)
+    if state:
+        row["harvest"] = state["line"]
+    return row
+
+
 def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     """The automatic assumption review collapsed to its one line, and each assumption to
     `ops.assumption_line`, for HUMAN output.
@@ -682,7 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    m = wo.add_parser("send", help="send feedback to the worker handling a work order")
+    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
+                                   "on a failed order this also revives the session; "
+                                   "`wo retry` is the named form")
     m.add_argument("wo_id")
     m.add_argument("message")
     m.add_argument("--project")
@@ -788,6 +806,16 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--force", action="store_true",
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
+
+    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
+                                     "the named form of `wo send`'s revive. Nothing "
+                                     "automatic: a turn that died with no result is "
+                                     "never replayed by the OS")
+    rt.add_argument("wo_id")
+    rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
+                                      "own relaunch note, unattributed")
+    rt.add_argument("--project")
 
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
@@ -2129,7 +2157,8 @@ def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
     if not provenance:
         return
     print(f"  reading: {provenance['note']}")
-    for sentence in (provenance["level_note"], provenance["floor_note"]):
+    for sentence in (provenance["level_note"], provenance["params_note"],
+                     provenance["floor_note"]):
         if sentence:
             print(f"           {sentence}")
 
@@ -2993,6 +3022,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # rule, and the reason it is not folded into those rounds is that an
                 # order judged four times filed into four fragments with no total.
                 "issues": ops.issue_index(store, args.wo_id),
+                # WHAT THE OS READ OFF DISK when this order's latest turn died without
+                # writing a result. Same never-always rule: no line at all for a turn
+                # that was never harvested — spec §5 of
+                # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+                **({"harvest": h} if (h := ops.harvest_state(store, wo)) else {}),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
                 # work order the mechanism never touched has no line here at all, which
@@ -3037,9 +3071,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
-            _readable_automerge(_readable_alarms(_readable_time_in_state(
-                _readable_rounds(_readable_issues(
-                    _readable_conversation(detail))))))))))
+            _readable_automerge(_readable_harvest(_readable_alarms(
+                _readable_time_in_state(_readable_rounds(_readable_issues(
+                    _readable_conversation(detail)))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -3094,6 +3128,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "retry":
+        # `relay=True` as `send` does: `ops.user_authorship` decides whether this process
+        # is a surface the human reaches, and `ops.retry` drops it for its own note.
+        _print(ops.retry(args.wo_id, message=args.message,
+                         project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
@@ -4654,6 +4693,9 @@ def main(argv: list[str] | None = None) -> int:
         return main_hook()
     from .bugreport import BugReportError
     from .catalog import CatalogError
+    # A refusal a worker can act on, not a crash. Spec §4:
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
         if args.cmd == "start":
@@ -4723,7 +4765,7 @@ def main(argv: list[str] | None = None) -> int:
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError, BugReportError) as e:
+    except (OpsError, CatalogError, BugReportError, QuestionTooLargeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

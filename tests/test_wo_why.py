@@ -581,3 +581,56 @@ def test_an_order_with_no_notes_reports_all_three_as_none(started):
     notes = ops.diagnose(wo["id"])["notes"]
 
     assert notes == {"parked": None, "pause": None, "fleet_hold": None}
+
+
+# -- 13. a failed order is offered the retry, and only a failed one ----------------------
+# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §6 and §7.
+
+
+def _failed(started, project, session: bool = True) -> dict:
+    wo = an_order(started) if session else ops.create_work_order("proj_a", "never opened")
+    store = ProjectStore(project)
+    try:
+        # The turn DIED — without ending it the diagnosis is `turn_running`, which is the
+        # honest answer while a process is alive.
+        turn = store.latest_turn(wo["id"])
+        if turn is not None:
+            store.finish_turn(turn["id"], "failed")
+        store.set_status(wo["id"], "failed")
+        return store.get_work_order(wo["id"])
+    finally:
+        store.close()
+
+
+def test_a_failed_order_is_offered_the_retry_and_its_blocker_names_it(started, project):
+    wo = _failed(started, project)
+
+    d = ops.diagnose(wo["id"])
+
+    assert d["blocker"]["what"] == "failed"
+    assert d["blocker"]["stalled"] is False
+    assert f"jarvis wo retry {wo['id']}" in d["blocker"]["detail"]
+    # FIRST: on a failed order it is the only command that moves the work, and the list
+    # is read top down.
+    assert d["commands"][0]["command"] == f"jarvis wo retry {wo['id']}"
+    assert not any(f"wo retry {wo['id']}" in r for r in d["refusals"])
+
+
+def test_a_failed_order_with_no_session_reports_the_retry_as_refused(started, project):
+    wo = _failed(started, project, session=False)
+
+    d = ops.diagnose(wo["id"])
+
+    assert not any("wo retry" in c["command"] for c in d["commands"])
+    assert any("no session to relaunch" in r for r in d["refusals"])
+
+
+def test_no_healthy_order_is_told_why_it_cannot_be_retried(started):
+    """The `elif` guard: a running order does not want a line explaining a mechanism
+    that does not apply to it."""
+    wo = an_order(started)
+
+    d = ops.diagnose(wo["id"])
+
+    assert not any("wo retry" in c["command"] for c in d["commands"])
+    assert not any("wo retry" in r for r in d["refusals"])

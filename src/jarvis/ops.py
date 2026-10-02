@@ -38,7 +38,7 @@ from .catalog import (
     parse_catalog,
     worker_stalls_on_prompts,
 )
-from . import (budget, bus, config_version, db, fleet, health, invariants,
+from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
                observability, release, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
@@ -1163,6 +1163,9 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
         note = f"note: work order is {wo['status']}; the session will be revived"
+        # §9.3 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        if wo["status"] == "failed":
+            note += f" (`jarvis wo retry {wo_id}` is the named form of this)"
     else:
         note = None
     store = ProjectStore(path)
@@ -1182,6 +1185,174 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
         store.close()
     return {"project": name, "wo_id": wo_id, "msg_id": msg_id, "note": note,
             "delivery": "jarvisd delivers when the worker is idle"}
+
+
+#: What a message-less `jarvis wo retry` puts on the queue. §3 of
+#: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+RETRY_NOTE = (
+    "The OS is relaunching this work order because the user asked for it. Its last turn "
+    "ended without a result, so the OS recorded it as failed — nothing about the work was "
+    "judged wrong. Say where you got to, then carry on from there; do not start again. "
+    "Finish with `jarvis wo finish` when the work is done."
+)
+
+#: §5: no status write, so the order really is still `failed` until the turn goes out.
+RETRY_QUEUED = ("queued as message {msg}; jarvisd launches the turn on its next tick. The "
+                "order stays `failed` — and stays flagged — until that turn starts.")
+
+
+def retry_refusal(wo: dict[str, Any]) -> str | None:
+    """Why this work order CANNOT be retried, in the sentence that refuses it — or None.
+
+    THE ONE HOME OF THE RULE, with three callers: `retry` raises it, `_diagnose_commands`
+    mirrors it so `jarvis wo why` never offers a command that would be refused, and
+    `retry_state` renders it beside the dashboard control. `_diagnose_commands`' own rule,
+    quoted: "Every predicate here MIRRORS the refusal of the command it offers rather than
+    restating it … a second copy of a predicate passes every behavioural test and drifts
+    anyway (kn-4ea33fe6)." Same structure as `force_validation_refusal` and `ack_refusal`.
+
+    Pure over the row: §4 of
+    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    wo_id = str(wo["id"])
+    status = str(wo["status"] or "")
+    if status != "failed":
+        return (f"{wo_id} is {status}, not failed — `wo retry` relaunches an order whose "
+                f"worker died without delivering. Carry on a {status} one with "
+                f"`jarvis wo send {wo_id} \"…\"`.")
+    if not str(wo.get("session_id") or ""):
+        return (f"{wo_id} failed before it ever opened a conversation, so there is no "
+                f"session to relaunch — a message queued here would sit undelivered "
+                f"(`worker_session.delivery_hold` holds it: \"it has no session to "
+                f"resume\"). Nothing here can be retried; file the work again.")
+    return None
+
+
+def retry_queued_notice(msg_id: int) -> str:
+    """`RETRY_QUEUED` for a page that has just redirected after a retry —
+    `fix_filed_notice`'s rule, one authority along: "REBUILT FROM THE ID, never carried
+    across the redirect as text. A note the query string supplies renders as the OS
+    speaking about what happened to an order, so a crafted link could state a false fact
+    about an ACT." The id selects the words; it cannot author them.
+    """
+    return RETRY_QUEUED.format(msg=msg_id)
+
+
+def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the work-order page's retry control shows, or None — `force_validation_state`'s
+    shape, including its None convention.
+
+    None — no control at all — on any order that is not `failed`: a permanently disabled
+    box on every page is noise for a mechanism that does not apply there. §7b of
+    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    """
+    if str(wo["status"] or "") != "failed":
+        return None
+    refusal = retry_refusal(wo)
+    return {"can_retry": refusal is None, "refusal": refusal,
+            "assumptions": len(store.pending_assumptions(str(wo["id"])))}
+
+
+def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """What the OS read off disk when this order's latest turn died, or None.
+
+    `retry_state`'s shape and its None convention, and it is THE single render contract:
+    `jarvis wo show` and the work-order page both read this, so the two cannot disagree
+    about what was saved. None — no line anywhere — when that turn was never harvested,
+    which is every turn that did not die without a result. §5 of
+    docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+    """
+    payload = harvest.of_turn(store, wo)
+    if not payload:
+        return None
+    authored = payload.get("authored") or {}
+    dirty = list(authored.get("dirty") or ())
+    commits = int(authored.get("commits") or 0)
+    jobs = int(payload.get("jobs") or 0)
+    if payload.get("empty"):
+        line = "nothing — the worktree was clean and the turn said nothing"
+    else:
+        parts = []
+        if commits:
+            # PLAIN PROSE, no markdown: this one string is rendered by the HTML page as
+            # well as by the terminal, and the page has no markdown (spec §5).
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''} on "
+                         f"{authored.get('branch') or 'its branch'}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {payload['checkpoint']}"
+                            if payload.get("checkpoint") else " NOT checkpointed"
+                            + (f" ({payload['checkpoint_skipped']})"
+                               if payload.get("checkpoint_skipped") else "")))
+        if payload.get("said"):
+            parts.append("its last message")
+        if jobs:
+            parts.append(f"{jobs} orphaned background job"
+                         f"{'s' if jobs != 1 else ''}")
+        line = ", ".join(parts) or "nothing"
+    return {"seq": payload.get("seq"), "empty": bool(payload.get("empty")),
+            "line": line, "said": str(payload.get("said") or ""),
+            "branch": str(authored.get("branch") or ""),
+            "base": str(authored.get("base") or ""),
+            "commits": commits, "dirty": dirty,
+            "turn_commits": list(payload.get("turn_commits") or ()),
+            "since": str(payload.get("since") or ""),
+            "checkpoint": str(payload.get("checkpoint") or ""),
+            "checkpoint_skipped": str(payload.get("checkpoint_skipped") or ""),
+            "detached": bool(payload.get("detached")),
+            "upstream": str(payload.get("upstream") or ""),
+            "unpushed": int(payload.get("unpushed") or 0),
+            "pr_url": str(payload.get("pr_url") or ""), "jobs": jobs,
+            "unreadable": str(payload.get("unreadable") or "")}
+
+
+def retry(wo_id: str, message: str | None = None, project_name: str | None = None,
+          relay: bool = False) -> dict[str, Any]:
+    """`jarvis wo retry` — relaunch a `failed` work order in its own session.
+
+    The named form of the revive `ops.send_message` has always done as a side effect, and
+    it DELEGATES to it rather than extracting a shared helper: the revival is not code in
+    either function but the queue row plus `Daemon._deliver`'s `set_status`, and a second
+    queueing path would falsify `project_store.queue_message`'s rule that `send_message`
+    is the only caller that ever passes `MESSAGE_AUTHOR_USER`.
+
+    MANUAL ONLY — the automatic half is declined (Neo q1108: a turn that ends with no
+    result is exactly the replay risk kn-3d8fa23a excludes), and the shape is Neo q1107's.
+    Design: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+
+    `failed` only, and it writes no status: until the daemon launches the turn the order
+    really is `failed`. Pending assumptions do NOT refuse it — a retry buries nothing, so
+    the payload carries the count instead of blocking on it.
+    """
+    name, path, wo = find_work_order(wo_id, project_name)
+    refusal = retry_refusal(wo)
+    if refusal is not None:
+        raise OpsError(refusal)
+    # §6 of docs/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
+    # beats asking the worker to re-derive it. Its own connection, closed before the
+    # delegated send opens one.
+    brief_store = ProjectStore(path)
+    try:
+        text = (message if message is not None
+                else (harvest.retry_brief(brief_store, wo) or RETRY_NOTE))
+    finally:
+        brief_store.close()
+    # §3: an OS literal must never carry the user's stamp, whatever the surface said.
+    sent = send_message(wo_id, text, source="retry", project_name=name,
+                        relay=relay and message is not None)
+    store = ProjectStore(path)
+    try:
+        # After the delegated send, so a crash between them leaves a queued message and
+        # no claim about who asked — `resume_feature_order`'s ordering reasoning (§8).
+        store.add_event(wo_id, "retry_requested",
+                        {"msg_id": sent["msg_id"], "authored": bool(message)})
+        pending = store.pending_assumptions(wo_id)
+    finally:
+        store.close()
+    return {"project": name, "wo_id": wo_id, "msg_id": sent["msg_id"],
+            "status": "failed", "authored": bool(message),
+            "note": retry_queued_notice(sent["msg_id"]), "assumptions": len(pending)}
 
 
 def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
@@ -1315,7 +1486,12 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "
                           f"`jarvis wo review {hold['planner_id']}`"}
-    if wo["status"] in ("completed", "cancelled", "failed", "waiting_pr_merge",
+    # §6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    if wo["status"] == "failed":
+        return {"what": "failed", "stalled": False,
+                "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
+                          f"relaunches it in the same session; nothing is running to nudge"}
+    if wo["status"] in ("completed", "cancelled", "waiting_pr_merge",
                         "needs_review"):
         return {"what": wo["status"], "stalled": False,
                 "detail": f"the work order is {wo['status']} — nothing is running to "
@@ -1981,6 +2157,15 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     wo_id = str(wo["id"])
     out: list[dict[str, str]] = []
     refusals: list[str] = []
+
+    # FIRST — §7 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    retry_no = retry_refusal(wo)
+    if retry_no is None:
+        out.append({"command": f"jarvis wo retry {wo_id}",
+                    "why": "relaunch the worker in its own session from where it died — "
+                           "nothing about the work was judged wrong"})
+    elif wo["status"] == "failed":
+        refusals.append(retry_no)
 
     refusal = force_validation_refusal(store, wo, project=project,
                                        cfg=validation_config(project))

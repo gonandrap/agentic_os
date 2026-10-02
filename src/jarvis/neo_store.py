@@ -119,6 +119,29 @@ MAX_ANSWER_ATTEMPTS = 3
 #: hand. Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
 UNREACHABLE_PREFIX = "neo could not be reached: "
 
+
+class QuestionTooLargeError(ValueError):
+    """`ask` refused to persist a question past the ceiling. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+    A `ValueError` subclass so every existing handler still catches it, NAMED so the
+    `jarvis wo ask` path can render it as one loud line: a worker told the size, the
+    ceiling and the setting can shorten and retry, and a traceback tells it nothing.
+
+    The sizes ride as `question_chars` / `context_chars` / `ceiling` and NOT as `limit`,
+    `claude_cli.PromptTooLargeError`'s rule: `seats._run_seat` does
+    `refused=getattr(e, "limit", None)` and an int there poisons a `UsageLimit`.
+    `Daemon.prompt_refusal_payload` renders both refusals from these.
+    """
+
+    def __init__(self, message: str, *, question_chars: int, context_chars: int,
+                 ceiling: int) -> None:
+        super().__init__(message)
+        self.question_chars = question_chars
+        self.context_chars = context_chars
+        self.ceiling = ceiling
+
+
 #: How long a question held back by a transport failure waits before it may be claimed
 #: again, indexed by how many attempts it has already spent.
 #:
@@ -240,6 +263,25 @@ class NeoStore:
     def ask(self, project: str, wo_id: str, question: str, context: str = "",
             kind: str = "question") -> dict[str, Any]:
         assert kind in Q_KINDS, kind
+        # REFUSE, never trim, and never persist: a question is stored before it is ever
+        # sent, so the store is the last place that can refuse one, and a trimmed
+        # question would be answered as if it were the question asked (Neo, q1078,
+        # option A). The SAME ceiling as the transport's rather than a second setting:
+        # it is a backstop, not the binding limit, and one number cannot fall out of
+        # step with itself. Spec §4:
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        from . import claude_cli
+
+        size = len(question) + len(context)
+        ceiling = claude_cli.MAX_OS_PROMPT_CHARS
+        if size > ceiling:
+            # Numbers only — no fragment of the question: this reaches the inbox.
+            raise QuestionTooLargeError(
+                f"refused to store a {kind}: question + context is {size} chars, over "
+                f"the {ceiling}-char ceiling (os.max_os_prompt_chars) — shorten it and "
+                f"ask again, referencing what you would have pasted",
+                question_chars=len(question), context_chars=len(context),
+                ceiling=ceiling)
         cur = self.conn.execute(
             "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
             "VALUES (?,?,?,?,?,?)",
@@ -505,6 +547,23 @@ class NeoStore:
                   AND status IN ({','.join('?' for _ in OPEN_Q_STATUSES)})
                 ORDER BY ts""",
             (wo_id, *OPEN_Q_STATUSES),
+        ).fetchall())
+
+    def answered_questions(self, wo_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Decisions already taken on this work order, NEWEST FIRST.
+
+        `open_questions`' other half, and the two differences are both deliberate. The
+        order is reversed because the caller caps the text it can carry
+        (`validation.decision_record_chars`) and the newest ruling is the one that
+        supersedes. And there is NO `kind` filter: that exclusion is load-bearing above
+        because an open `approval` is a gate reported elsewhere, while here every row is a
+        ruling on this order — an `approval` the user answered is exactly the authority a
+        reviewer escalated for want of (GitHub issue #832).
+        """
+        return db.rows_to_dicts(self.conn.execute(
+            """SELECT * FROM questions WHERE wo_id=? AND status='answered'
+               ORDER BY ts DESC, id DESC LIMIT ?""",
+            (wo_id, limit),
         ).fetchall())
 
     def list_questions(self, statuses: tuple[str, ...] | None = None,

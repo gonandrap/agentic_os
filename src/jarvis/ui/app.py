@@ -1210,7 +1210,7 @@ def create_app() -> FastAPI:
 
     @app.get("/wo/{name}/{wo_id}", response_class=HTMLResponse)
     def work_order(request: Request, name: str, wo_id: str, debug: str = "",
-                   forced: str = ""):
+                   forced: str = "", retried: str = ""):
         try:
             pname, path, wo = ops.find_work_order(wo_id, name)
         except ops.OpsError as e:
@@ -1267,6 +1267,20 @@ def create_app() -> FastAPI:
             forced_lines = ops.forced_round_notice(
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
+            # The retry control, and the note a press just left — §7b of
+            # docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
+            # order that is not `failed`, so no control renders there at all. The notice
+            # is REBUILT from an id this order's own record knows: a number the query
+            # string invented states no fact.
+            retry = ops.retry_state(store, wo)
+            # WHAT THE OS SAVED when the last turn died, rendered directly above that
+            # control: it is what the user reads before pressing the button. None keeps
+            # it off every page whose turn was never harvested — §5 of
+            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            harvest = ops.harvest_state(store, wo)
+            retried_line = (ops.retry_queued_notice(int(retried))
+                            if retried.isdigit()
+                            and any(m["id"] == int(retried) for m in messages) else "")
             # And the same for the assumption review, on the same rule — and for the
             # same reason one authority along: None keeps the line off the page for
             # every order the mechanism never looked at.
@@ -1310,6 +1324,7 @@ def create_app() -> FastAPI:
                       merge_state=merge_state,
                       issues=issue_index,
                       auto_review=auto_review, force=force, forced_lines=forced_lines,
+                      retry=retry, retried_line=retried_line, harvest=harvest,
                       timeline=build_timeline(wo, events, messages,
                                               include_debug=show_debug),
                       debug=show_debug, debug_count=count_debug(events),
@@ -1812,6 +1827,25 @@ def create_app() -> FastAPI:
             return RedirectResponse(f"{back}#block-fix", status_code=303)
         return RedirectResponse(f"{back}?filed={int(approval)}#block-fix",
                                 status_code=303)
+
+    @app.post("/wo/{name}/{wo_id}/retry")
+    def retry_wo(name: str, wo_id: str, message: str = Form("")):
+        """`jarvis wo retry` from the work-order page — the SAME `ops.retry`, so the two
+        surfaces cannot come to disagree about which orders may be relaunched.
+
+        `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
+        rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
+        docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        """
+        back = f"/wo/{name}/{wo_id}"
+        try:
+            out = ops.retry(wo_id, message=message.strip() or None, project_name=name,
+                            relay=True)
+        except ops.OpsError as e:
+            return RedirectResponse(
+                f"{back}?{urlencode({'error': str(e)}, quote_via=quote)}#retry",
+                status_code=303)
+        return RedirectResponse(f"{back}?retried={out['msg_id']}#retry", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/validation/force")
     def force_validation(name: str, wo_id: str, reason: str = Form(...)):
