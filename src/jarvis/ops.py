@@ -10863,6 +10863,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # already holds the system prompt it was launched with. Spec §1:
     # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
     ("*.bash_first", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's
+    # tool list cannot change mid-conversation. Spec §4:
+    # docs/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.tool_search", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`

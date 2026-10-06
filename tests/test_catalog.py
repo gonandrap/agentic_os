@@ -114,6 +114,42 @@ def test_absent_and_null_are_different():
     assert cat.projects[1].worker.autocompact_window is None
 
 
+def test_tool_search_defaults_and_overrides_per_project():
+    """§4 of docs/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
+    fleet-wide with a per-project override. The default is the SHIPPED state — this key
+    arriving must not change any worker's tool list; §7 owns the flip."""
+    from jarvis.catalog import DEFAULT_WORKER_TOOL_SEARCH, VALID_TOOL_SEARCH
+
+    assert DEFAULT_WORKER_TOOL_SEARCH == "cli"
+    assert VALID_TOOL_SEARCH == ("off", "on", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_tool_search == "cli"
+    assert cat.projects[0].worker.tool_search == "cli"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"tool_search": "off"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"tool_search": "on"}},
+        ],
+    })
+    assert cat.os.default_tool_search == "off"
+    assert cat.projects[0].worker.tool_search == "off"      # inherits the fleet value
+    assert cat.projects[1].worker.tool_search == "on"
+
+
+def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
+    re-parses the document to validate (spec §4)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"tool_search": "true"}}]})
+    assert "worker.tool_search" in str(e.value)
+    for value in ("off", "on", "cli"):
+        assert value in str(e.value)
+
+
 def test_bash_first_defaults_off_and_overrides_per_project():
     """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
     enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
@@ -163,6 +199,9 @@ def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
     ({"projects": [{"name": "a", "path": "/x", "worker": {"bash_first": "yes"}}]},
      "bash_first"),
     ({"os": {"defaults": {"bash_first": "on"}}}, "os.defaults.bash_first"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"tool_search": "yes"}}]},
+     "tool_search"),
+    ({"os": {"defaults": {"tool_search": "relaxed"}}}, "os.defaults.tool_search"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
@@ -660,3 +699,42 @@ def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
         assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
     finally:
         claude_cli.set_max_os_prompt_chars(before)
+
+
+def test_the_blocker_set_is_the_catalogs_to_narrow(tmp_path):
+    """`supervisor.health_reassert_blockers` is a CATALOG SETTING and never a module
+    constant (kn-1cec46b5, Neo q1217). An unknown id is refused with the known ones
+    named — `_parse_remedies`' rule — and a project overrides the list field by field
+    while the rest of `os.supervisor` is inherited.
+
+    It also pins the `_SUPERVISOR_NON_NUMERIC` trap: a field missing from that set is a
+    `TypeError` on every catalog load, which this test is the first to see.
+    """
+    from jarvis import health
+
+    with pytest.raises(CatalogError, match=", ".join(health.BLOCKERS)):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": ["the-weather"]}}, "projects": []})
+    with pytest.raises(CatalogError, match="list of blocker ids"):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": "dependency"}}, "projects": []})
+
+    cat = parse_catalog({"os": {"supervisor": {"health_stale_minutes": 90,
+                                              "health_reassert_blockers": ["user"]}},
+                         "projects": [{"name": "p", "path": str(tmp_path)},
+                                      {"name": "q", "path": str(tmp_path),
+                                       "supervisor": {"health_reassert_blockers":
+                                                      ["dependency"]}}]})
+    assert cat.os.supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[0].supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[1].supervisor.health_reassert_blockers == ("dependency",)
+    assert cat.projects[1].supervisor.health_stale_minutes == 90, (
+        "a project naming the blockers keeps the fleet's answer for everything else")
+
+
+def test_the_sweep_cadence_defaults_do_not_move(tmp_path):
+    """The free re-assertion buys quiet by SPENDING less, never by watching less — the
+    spec's "out of scope" list, and the alternative it rejected."""
+    cfg = parse_catalog({"os": {}, "projects": []}).os.supervisor
+    assert (cfg.health_every_ticks, cfg.health_min_interval_minutes,
+            cfg.health_stale_minutes, cfg.health_max_units_per_tick) == (20, 30, 720, 4)

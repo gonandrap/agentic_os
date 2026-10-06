@@ -4434,7 +4434,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
 
     print(worker_brief.render_section(args.section, wo_id=wo_id, project=project,
                                       gates_enabled=gates_enabled,
-                                      serena=os.environ.get("JARVIS_SERENA") != "0"))
+                                      serena=os.environ.get("JARVIS_SERENA") != "0",
+                                      tool_search=os.environ.get(
+                                          "JARVIS_TOOL_SEARCH", "cli")))
     return 0
 
 

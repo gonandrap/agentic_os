@@ -1202,3 +1202,355 @@ def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
     while daemon.health_sweeping and time.monotonic() < deadline:
         time.sleep(0.01)
     assert seen["state"] is shut
+
+
+# -- the free re-assertion: a stale look at a unit the OS can already explain -----------
+#
+# docs/superpowers/specs/2026-10-02-the-health-sweep-must-not-pay-to-restate-a-fingerprint.md
+# The spend decision reads ONE more bit — is there a re-derivable reason this unit is
+# still — and a restatement of a judgement already on the record is written for free.
+
+
+def _blocked(store, title="the blocked one", **fields) -> str:
+    """A work order whose stillness the OS can already explain: an unmet dependency.
+
+    The dependency is `injected`, so it is UNGOVERNED and never a sweep candidate of its
+    own — every call count below is therefore about the blocked order alone.
+    """
+    dep = store.create_work_order("the thing it waits on", origin="injected",
+                                  status="running")["id"]
+    return _wo(store, title, status="pending", depends_on=[dep], **fields)
+
+
+def test_a_stale_unchanged_finding_on_a_blocked_order_is_re_asserted_for_free(
+        started, catalog_file, fake_claude, store, clock):
+    """THE DEFECT ITSELF: the second look learns nothing the fingerprint did not already
+    say, and the prior judgement is carried forward rather than bought again."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == 1
+    (paid,) = _reviews(store, subject_id=wo_id)
+    assert paid["outcome"] == "findings"
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 1, "the restatement must be free"
+    paid, free = _reviews(store, subject_id=wo_id)
+    assert free["trigger"] == "re-assert"
+    assert free["fingerprint"] == paid["fingerprint"]
+    assert [free[k] for k in ("outcome", "findings", "detail")] == \
+           [paid[k] for k in ("outcome", "findings", "detail")], (
+        "a re-assertion that records nothing is a silent drop")
+
+
+def test_a_prior_clear_still_buys_the_stale_call(
+        started, catalog_file, fake_claude, store, clock):
+    """A clear verdict found nothing, so there is no prior judgement to copy forward —
+    a free row there would be the OS inventing one."""
+    _enable(catalog_file)
+    wo_id = _blocked(store, description="FORCE_HEALTH_CLEAR")
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_an_unexplained_still_order_still_buys_the_stale_call(
+        started, catalog_file, fake_claude, store, clock):
+    """The regression that would hide a genuinely unexplained stall: no dependency, no
+    hold, nothing the OS can derive — so the stillness IS the news and is paid for."""
+    _enable(catalog_file)
+    wo_id = _wo(store, status="running")
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_a_changed_fingerprint_always_buys_a_call(
+        started, catalog_file, fake_claude, store, clock):
+    """The gate sits INSIDE the stale clause: a unit that moved is judged afresh however
+    well the OS can explain it."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    store.add_event(wo_id, "note", {"n": 1})
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "changed"]
+
+
+def test_a_re_assertion_raises_no_alarm_and_puts_no_flag_back(
+        started, catalog_file, fake_claude, store, clock):
+    """§6.3's wallpaper failure, arriving through the free path: the flag must not come
+    straight back, and the dedupe memory must say exactly what it said before."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    findings_before = _findings(store)
+    fp = _reviews(store, subject_id=wo_id)[0]["fingerprint"]
+    reported_before = store.probes_reported_at("work_order", wo_id, fp)
+    store.clear_attention(wo_id)
+    finding_events = len(store.events_of_kind(wo_id, "health_finding"))
+    reviewed_events = len(store.events_of_kind(wo_id, "health_reviewed"))
+
+    _sweep(daemon, clock)
+
+    # BY ID, never by row: the cost-review drain claims and decides an alarm of its own
+    # accord, so the row moves for reasons that have nothing to do with the sweep.
+    assert [a["id"] for a in _findings(store)] == [a["id"] for a in findings_before]
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+    assert len(store.events_of_kind(wo_id, "health_finding")) == finding_events
+    assert len(store.events_of_kind(wo_id, "health_reviewed")) == reviewed_events, (
+        "no judge looked, so nothing says one did")
+    assert store.probes_reported_at("work_order", wo_id, fp) == reported_before
+
+
+def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
+    """EVERY ID IS REUSED, NOT RE-DERIVED — which is how two surfaces come to disagree
+    about one order. Each case drives the canonical source and asserts the id follows it.
+    """
+    from jarvis import db as db_mod, health, invariants, ops as ops_mod, worker_session
+
+    cfg = catalog.SupervisorConfig()
+
+    def subject(wo_id):
+        return {"kind": "work_order", "row": store.get_work_order(wo_id)}
+
+    plain = _wo(store, "plain", status="running")
+    assert health.blocker(store, subject(plain), cfg) is None, (
+        "a running order with nothing known about it is unexplained and stays paid")
+
+    # 1. `user` — `invariants.true_blockers`, and first whatever else is also true.
+    with monkeypatch.context() as m:
+        m.setattr(invariants, "true_blockers",
+                  lambda s, wo, now=None: ["3 assumptions pending your review"])
+        assert health.blocker(store, subject(plain), cfg) == "user"
+
+    # 2. `dependency` — `ops.blocked_by`, which `true_blockers` is silent on by design.
+    blocked = _blocked(store)
+    assert health.blocker(store, subject(blocked), cfg) == "dependency"
+    with monkeypatch.context() as m:
+        m.setattr(ops_mod, "blocked_by", lambda s, wo: [])
+        assert health.blocker(store, subject(blocked), cfg) is None
+
+    # 3. `pull-request` — the row's own two columns, and no network.
+    parked = _wo(store, "parked", status="waiting_pr_merge")
+    store.update_work_order(parked, pr_url="https://example.invalid/pr/1")
+    assert health.blocker(store, subject(parked), cfg) == "pull-request"
+    store.update_work_order(parked, pr_url="")
+    assert health.blocker(store, subject(parked), cfg) is None
+
+    # 4. ONE ID PER TRANSPORT CAUSE, each an OPEN `holds.Hold` of its own cause (Neo
+    # q1241). Collapsed under `usage-limit` they could not be narrowed apart.
+    from jarvis import holds
+
+    assert set(health.transport_blockers().values()) == holds.TRANSPORT, (
+        "a fourth transport cause fails here, not as an unexplained stall")
+    for cause, expected in ((worker_session.PAUSE_USAGE_LIMIT, "usage-limit"),
+                            (worker_session.PAUSE_TRANSIENT, "api-outage"),
+                            (worker_session.PAUSE_AUTH, "expired-login")):
+        held = _wo(store, f"held by {cause}", status="running")
+        with monkeypatch.context() as m:
+            m.setattr(db_mod, "now", lambda: time.time() - 600)
+            store.add_event(held, "turn_paused", {"seq": 1, "reason": cause})
+        assert health.blocker(store, subject(held), cfg) == expected
+        narrowed = catalog.SupervisorConfig(health_reassert_blockers=("usage-limit",))
+        assert health.blocker(store, subject(held), narrowed) == (
+            expected if expected == "usage-limit" else None), (
+            "a catalog naming only the usage limit has said nothing about the others")
+
+    # 5. `assumptions` — `pstore.pending_assumptions`, where rule 1 declined it.
+    asking = _wo(store, "asking", status="running")
+    store.add_assumption(asking, "I assumed the console is the surface")
+    with monkeypatch.context() as m:
+        m.setattr(invariants, "true_blockers", lambda s, wo, now=None: [])
+        assert health.blocker(store, subject(asking), cfg) == "assumptions"
+
+
+def test_a_narrowed_blocker_set_buys_the_stale_call_again(
+        started, catalog_file, fake_claude, store, clock):
+    """The set is the CATALOG'S to narrow: a project that does not count a dependency as
+    an explanation pays for the stale look on a blocked order."""
+    from jarvis import health
+
+    _enable(catalog_file,
+            health_reassert_blockers=[b for b in health.BLOCKERS if b != "dependency"])
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login(
+        started, catalog_file, fake_claude, store, clock):
+    """WHY THE TRANSPORT BLOCKER IS THREE IDS (Neo q1241): a project that counts a spent
+    window as an explanation has said nothing about an expired sign-in, and under one
+    collapsed id that order was re-asserted free."""
+    from jarvis import health, worker_session
+
+    _enable(catalog_file, health_reassert_blockers=["usage-limit"])
+    wo_id = _wo(store, "signed out", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(wo_id, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_AUTH})
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+    # The other half of the narrowing: the cause the catalog DID name goes free.
+    spent = _wo(store, "window spent", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(spent, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_USAGE_LIMIT})
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+    assert [r["trigger"] for r in _reviews(store, subject_id=spent)] == \
+           ["first-look", health.REASSERT]
+
+
+def test_a_re_assertion_does_not_spend_a_paid_slot(
+        started, catalog_file, fake_claude, store, clock):
+    """The cap bounds SPEND. A mostly-parked project that spent its cap on free rows
+    would starve the paid looks the cap's rotation exists to guarantee."""
+    _enable(catalog_file, health_max_units_per_tick=1)
+    blocked_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)   # the blocked order alone: one paid first look
+    assert len(_health_calls(fake_claude)) == 1
+    moving_id = _wo(store, "the moving one", status="running")
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2, "one call: the unit nothing explains"
+    assert _reviews(store, subject_id=blocked_id)[-1]["trigger"] == "re-assert"
+    assert _reviews(store, subject_id=moving_id)[-1]["trigger"] == "first-look"
+
+
+def _blocked_feature(store, children: list[dict]) -> str:
+    """A feature and its children, each entry the `create_work_order` fields for one.
+
+    The children are `injected` for `_blocked`'s reason: ungoverned, so no child is a
+    sweep candidate in its own right and every count is about the feature.
+    """
+    fo_id = _feature(store)
+    for i, child in enumerate(children):
+        store.create_work_order(f"child {i}", parent_id=fo_id, origin="injected",
+                                **child)
+    return fo_id
+
+
+def test_a_feature_whose_every_child_is_blocked_is_re_asserted_for_free(
+        started, catalog_file, fake_claude, store, clock):
+    """fo-ac00376e's triple repeat of "Nothing is moving": every non-settled child has a
+    re-derivable blocker, which is the only thing that explains a feature's stillness."""
+    _enable(catalog_file)
+    dep = store.create_work_order("the thing they wait on", origin="injected",
+                                  status="running")["id"]
+    fo_id = _blocked_feature(store, [{"status": "pending", "depends_on": [dep]},
+                                     {"status": "completed"}])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == 1
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 1
+    reviews = _reviews(store, kind="feature_order", subject_id=fo_id)
+    assert [r["trigger"] for r in reviews] == ["first-look", "re-assert"]
+    assert reviews[1]["outcome"] == reviews[0]["outcome"]
+
+
+@pytest.mark.parametrize("child", [{"status": "running"},      # one child is moving
+                                   {"status": "pending"}])     # one is unexplained
+def test_a_feature_with_a_running_or_unexplained_child_still_buys_the_call(
+        started, catalog_file, fake_claude, store, clock, child):
+    """IT FAILS CLOSED: one child moving, or one nobody can explain, and the feature's
+    stillness is not accounted for — so it is paid for."""
+    _enable(catalog_file)
+    dep = store.create_work_order("the thing it waits on", origin="injected",
+                                  status="running")["id"]
+    fo_id = _blocked_feature(store, [{"status": "pending", "depends_on": [dep]}, child])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in
+            _reviews(store, kind="feature_order", subject_id=fo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_a_feature_with_no_children_at_all_stays_paid(
+        started, catalog_file, fake_claude, store, clock):
+    """Nothing is derived about a feature with nothing under it, so there is nothing to
+    re-assert."""
+    _enable(catalog_file)
+    fo_id = _blocked_feature(store, [])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in
+            _reviews(store, kind="feature_order", subject_id=fo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_an_all_parked_project_keeps_the_os_sweep_invariant_green(
+        started, catalog_file, fake_claude, store, clock, monkeypatch):
+    """(d) IS DECIDED BEHAVIOUR: a re-assertion carries a copied `outcome`, so it counts
+    as a judgement and an all-parked project is not dark. The transport canary still
+    fires on a run of failures, which is what keeps that decision safe."""
+    from pathlib import Path
+
+    from jarvis import invariants, schedule
+
+    _enable(catalog_file)
+    _blocked(store)
+    daemon = started()
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(store.project_path) / "src" / "jarvis" / "schedule.py"))
+
+    _sweep(daemon, clock)
+    clock.advance(invariants.OS_HEALTH_SWEEP_DARK_MINUTES + STEP_MINUTES)
+    _sweep(daemon, clock)
+
+    assert [r["trigger"] for r in store.recent_health_reviews(1)] == ["re-assert"]
+    assert list(invariants.check_os_health_sweep_alive(store)) == [], (
+        "a free row is a judgement for this query, by design")
+
+    _force_failures(store, invariants.HEALTH_SWEEP_FAILURE_RUN)
+    assert list(invariants.check_health_sweep_produces_judgements(store)), (
+        "the transport canary must still see a broken sweep")

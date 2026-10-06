@@ -10,6 +10,7 @@ from typing import Any
 
 from . import claude_cli
 from . import concision
+from . import health as health_mod
 from . import probes as probes_mod
 # The ceiling's constants live in `claude_cli` and are imported HERE, not the other way
 # round: catalog -> project_store -> claude_cli is already a chain, so the reverse
@@ -81,6 +82,15 @@ DEFAULT_PERMISSION_MODE = "auto"
 # cohort draw, and an arm whose strength comes from a draw is not a measurement.
 VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
+
+# Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
+# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+#
+# A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
+# behaviour Jarvis does not own, and writes no key. `cli` IS the shipped default — §7
+# owns the flip, so this key arriving changes no worker's tool list.
+VALID_TOOL_SEARCH = ("off", "on", "cli")
+DEFAULT_WORKER_TOOL_SEARCH = "cli"
 
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
@@ -424,6 +434,8 @@ class WorkerDefaults:
     permission_mode: str = DEFAULT_PERMISSION_MODE
     # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -1194,6 +1206,11 @@ class SupervisorConfig:
     health_min_interval_minutes: int = DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES
     health_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES
     health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
+    # Which re-derivable reasons count as explaining a still unit, so a stale look at it
+    # is a free re-assertion rather than a model call. A whole immutable list, addressed
+    # at once for `probes`' reason, and a SETTING rather than a module constant: Neo
+    # q1217's one condition and kn-1cec46b5's standing rule.
+    health_reassert_blockers: tuple[str, ...] = health_mod.BLOCKERS
     max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
     probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
 
@@ -1302,6 +1319,8 @@ class OsConfig:
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -1916,7 +1935,8 @@ def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
 #: casts everything else with `int()`, so a non-numeric field missing from this set is a
 #: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
 #: trips the `>= 1` floor instead and blames the wrong key.
-_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies")
+_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies",
+                           "health_reassert_blockers")
 
 
 def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
@@ -1942,6 +1962,25 @@ def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
             raise _err(f"{where}.allowed names unknown remedy {remedy_id!r} — "
                        f"known: {', '.join(remedies_mod.SHIPPED_REMEDIES)}")
     return RemedyConfig(enabled=bool(raw.get("enabled", base.enabled)), allowed=allowed)
+
+
+def _parse_blockers(raw: Any, base: tuple[str, ...], where: str) -> tuple[str, ...]:
+    """`supervisor.health_reassert_blockers`, or a project's override — field-level.
+
+    `_parse_remedies`' shape exactly, including the refusal of an unknown id with the
+    known ones named: a setting the user believes they changed, silently unset, is the
+    failure this block exists to prevent.
+    """
+    if raw is None:
+        return tuple(base)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise _err(f'"{where}" must be a list of blocker ids')
+    ids = tuple(str(item) for item in raw)
+    for blocker_id in ids:
+        if blocker_id not in health_mod.BLOCKERS:
+            raise _err(f"{where} names unknown blocker {blocker_id!r} — "
+                       f"known: {', '.join(health_mod.BLOCKERS)}")
+    return ids
 
 
 def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
@@ -2037,6 +2076,9 @@ def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
         model=str(raw.get("model", base.model) or base.model),
         health_enabled=bool(raw.get("health_enabled", base.health_enabled)),
         probes=_parse_probes(raw.get("probes"), base.probes, f"{where}.probes"),
+        health_reassert_blockers=_parse_blockers(
+            raw.get("health_reassert_blockers"), base.health_reassert_blockers,
+            f"{where}.health_reassert_blockers"),
         remedies=_parse_remedies(raw.get("remedies"), base.remedies,
                                  f"{where}.remedies"),
         **{k: int(raw.get(k, v)) for k, v in numbers.items()},
@@ -2081,6 +2123,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
+        default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2127,6 +2170,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_bash_first not in VALID_BASH_FIRST:
         raise _err(f"os.defaults.bash_first {os_cfg.default_bash_first!r} not in "
                    f"{sorted(VALID_BASH_FIRST)}")
+    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
+        raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
+                   f"{sorted(VALID_TOOL_SEARCH)}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2165,6 +2212,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if bash_first not in VALID_BASH_FIRST:
             raise _err(f"project {name}: worker.bash_first {bash_first!r} not in "
                        f"{sorted(VALID_BASH_FIRST)}")
+        # Spec 2026-10-02-serena-the-cheap-path.md §4 — this message IS what
+        # `jarvis config set <project> worker.tool_search` shows.
+        tool_search = w.get("tool_search", os_cfg.default_tool_search)
+        if tool_search not in VALID_TOOL_SEARCH:
+            raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
+                       f"{sorted(VALID_TOOL_SEARCH)}")
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2183,6 +2236,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             effort=w.get("effort", os_cfg.default_effort),
             permission_mode=pmode,
             bash_first=bash_first,
+            tool_search=tool_search,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
