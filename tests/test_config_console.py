@@ -308,6 +308,11 @@ def test_reading_configuration_is_not_blocked_for_a_worker(catalog, monkeypatch)
     ("os.ui.port", "restart"),
     ("projects.p.path", "restart"),
     ("projects.p.settings_overrides.hooks", "restart"),
+    # No APPLY_RULES entry, and `hot` is correct: nothing is baked into a worker's
+    # settings file, the value is read when the report runs (§2.3 of
+    # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md).
+    ("projects.x.navigation.bash_commands", "hot"),
+    ("os.navigation.window_days", "hot"),
 ])
 def test_every_class_in_the_design_table(path, cls):
     assert ops.apply_class(path) == cls

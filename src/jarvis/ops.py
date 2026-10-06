@@ -12272,6 +12272,174 @@ def inspect_config(project: str | None = None) -> Any:
         return InspectConfig()
 
 
+def navigation_config(project: str | None = None) -> Any:
+    """The `jarvis navigation` settings in force for `project` — or the OS's — or defaults.
+
+    `ops.inspect_config`'s shape and its reasoning: best-effort, because a report over
+    files on disk must not fail because a catalog has moved, and falling back to
+    `NavigationConfig()` rather than to None because every default here is a pattern list
+    with a measured justification (§2.3 of the 2026-10-02 navigation spec).
+    """
+    from .catalog import NavigationConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.navigation if project is None
+                else catalog.project(project).navigation)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return NavigationConfig()
+
+
+#: Why a no-argument `jarvis navigation` refuses. `~/.claude/projects` is 2.7G with
+#: 11,889 lead transcripts, so the wide scope is opt-in and windowed (§2.1).
+NAVIGATION_NEEDS_SCOPE = (
+    "name a work order, a feature order or a project — or pass --fleet. A no-argument "
+    "run would walk every transcript Claude Code has ever written (2.7G, 11,889 lead "
+    "files on this box) to answer a question that is usually about one order."
+)
+
+
+#: Why `jarvis navigation --days 0` refuses. `days=0` used to read as "no window" and
+#: therefore walked the whole 2.7G the window exists to bound — the opposite of what
+#: narrowing a window asks for (PR 927 review).
+NAVIGATION_DAYS_POSITIVE = (
+    "--days must be a positive number of days. `--days 0` would REMOVE the window "
+    "rather than narrow it, and walk every transcript Claude Code has ever written "
+    "(2.7G, 11,889 lead files on this box). Omit --days for the project's configured "
+    "window."
+)
+
+
+#: What `_resolve_report_target` returns in the first slot. `_TARGET_PROJECT` is the
+#: sentinel for "no id at all" — only `jarvis navigation` can read a target that way.
+_TARGET_FEATURE = "feature_order"
+_TARGET_WORK = "work_order"
+_TARGET_PROJECT = "<project>"
+
+#: How an order id is spelled, taken from `_resolve_order_id` (ops.py:239) and
+#: `create_investigation`'s "the wo-/fo-/io- id" rather than invented here.
+_ORDER_ID_PREFIXES = ("wo-", "fo-")
+
+
+def _resolve_report_target(target: str, project: str | None = None, *,
+                           project_fallback: bool = False,
+                           ) -> tuple[str, str | None, str | None,
+                                      dict[str, Any] | None]:
+    """What one id means to a report: `(kind, project name, project path, record)`.
+
+    Feature order FIRST, then work order, written once so `jarvis inspect` and `jarvis
+    navigation` can never disagree about an id. The ONLY difference between them is
+    `project_fallback`: `navigation` has a third reading for a target that is no id at
+    all (a project name), and a time report has none, so there the work-order lookup's
+    OpsError is the answer, unchanged.
+
+    A target that LOOKS like an order id takes the lookup's error even under the flag: a
+    mistyped `jarvis navigation wo-deadbeef` used to answer "no project named
+    'wo-deadbeef'", which names the wrong record entirely (PR 927 review).
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        pass
+    else:
+        return _TARGET_FEATURE, name, path, fo
+    try:
+        name, path, wo = find_work_order(target, project)
+    except OpsError:
+        if not project_fallback or target.startswith(_ORDER_ID_PREFIXES):
+            raise
+        return _TARGET_PROJECT, None, None, None
+    return _TARGET_WORK, name, path, wo
+
+
+def navigation_report(target: str | None = None, project: str | None = None, *,
+                      fleet: bool = False, days: int | None = None) -> dict[str, Any]:
+    """How an order, a project or the fleet NAVIGATED code — `jarvis navigation`.
+
+    Resolves a target the way `inspect_report` does, feature order first and for the same
+    reason, so the two commands agree about what an id means. Read-only, no paid call:
+    everything comes from transcripts already on disk.
+
+    A PROJECT or `--fleet` reads the transcript TREE and honours `days`: a project's
+    worker sessions are not enumerable from the record alone once a worktree is gone,
+    which is `usage.index_sessions`' reason, so a wide scope is a walk and therefore
+    windowed.
+    """
+    from . import navigation
+    from . import usage as usage_mod
+
+    if not target and not project and not fleet:
+        raise OpsError(NAVIGATION_NEEDS_SCOPE)
+    if days is not None and days <= 0:
+        raise OpsError(NAVIGATION_DAYS_POSITIVE)
+
+    scope_project = project
+    session_ids: list[tuple[str, str]] = []     # (label, session id)
+    if target:
+        # The one resolver `inspect_report` uses, plus the project reading only this
+        # command has.
+        kind, name, path, record = _resolve_report_target(
+            target, project, project_fallback=True)
+        if kind == _TARGET_FEATURE:
+            store = ProjectStore(path)
+            try:
+                ids = []
+                planner_id = record.get("plan_wo_id")
+                if planner_id:
+                    try:
+                        ids.append(store.get_work_order(planner_id))
+                    except KeyError:
+                        pass
+                ids.extend(store.feature_children(record["id"]))
+            finally:
+                store.close()
+            scope_project = scope_project or name
+            session_ids = [(wo["id"], wo.get("session_id") or "") for wo in ids]
+            scope = record["id"]
+        elif kind == _TARGET_WORK:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        else:
+            scope_project = target
+            session_ids = []
+            scope = target
+    else:
+        scope = scope_project or "fleet"
+
+    cfg = navigation_config(scope_project)
+    window = cfg.window_days if days is None else days
+
+    if session_ids:
+        index = usage_mod.index_sessions()
+        rolled = navigation.NavigationVolume(scope=scope)
+        for _label, session in session_ids:
+            if not session:
+                continue
+            rolled.fold(navigation.read_session(session, cfg, index=index))
+        return rolled.as_dict()
+
+    # A project or the fleet: the tree, within the window. A project is scoped by the
+    # slug Claude Code derives from the cwd — a worker's worktree lives under the project
+    # path, so the project's slug is a prefix of its workers'. A project the catalog does
+    # not name is refused rather than silently answered with the whole fleet.
+    prefix = ""
+    siblings: list[str] = []
+    if scope_project:
+        catalog = resolve_catalog()
+        prefix = navigation.slug_of(project_spec(catalog, scope_project).path)
+        # The OTHER projects' slugs: `slug_of` is not injective, so `/ws/jarvis_os`
+        # slugifies to `/ws/jarvis`'s slug plus a dash and cannot be told from a
+        # subdirectory without them (`navigation.in_slug_scope`, PR 927 review).
+        siblings = [navigation.slug_of(spec.path) for spec in catalog.projects
+                    if spec.name != scope_project]
+    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix,
+                                  slug_exclude=siblings)
+    payload = volume.as_dict()
+    payload["scope"] = scope
+    return payload
+
+
 def cold_prefix_floor(project: str | None = None) -> int | None:
     """`os.cold_prefix_floor` if a catalog can be reached, else None.
 
@@ -12401,7 +12569,8 @@ def messaging_config_at(project_path: Path) -> Any:
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
-                   join_floor: int | None = None) -> dict[str, Any]:
+                   join_floor: int | None = None,
+                   with_navigation: bool = False) -> dict[str, Any]:
     """Where a work order's or a feature order's TIME went — `jarvis cost`'s other half.
 
     Resolves the target exactly the way `_cost_for_target` does, feature order first and
@@ -12412,13 +12581,30 @@ def inspect_report(target: str, project: str | None = None, *,
     unit whose transcript has expired is reported with `found: false`, the same honest
     gap `jarvis cost` reports, because an unmeasurable clock and an idle one are
     different answers.
+
+    `with_navigation` adds the per-order navigation volume, and is OFF by default
+    because it is a SECOND pass over every transcript of every unit: `inspection` has
+    already opened them for the anatomy, and on a feature order with many children that
+    doubled the disk read of a report the dashboard's debugging page never rendered (PR
+    927 review). `cli.cmd_inspect` asks for it — it prints the section — and the
+    dashboard does not. The key's shape when asked for is unchanged:
+    `navigation.NavigationVolume.as_dict()`.
     """
     from dataclasses import replace
 
-    from . import autopsy, holds
+    from . import autopsy, holds, navigation
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
+    # One reader, two surfaces (q1216): the per-order navigation section is a key on
+    # this report as well as `jarvis navigation`'s own answer, so the two cannot
+    # disagree. Per project and cached, like the inspect settings below.
+    nav_configs: dict[str, Any] = {}
+
+    def nav_settings(project_name: str) -> Any:
+        if project_name not in nav_configs:
+            nav_configs[project_name] = navigation_config(project_name)
+        return nav_configs[project_name]
     # Resolved ONCE for the whole report, beside the index and best-effort for the same
     # reason: an `os.*` setting, so it is the same value for every unit.
     floor = cold_prefix_floor()
@@ -12452,6 +12638,13 @@ def inspect_report(target: str, project: str | None = None, *,
             wo, cfg, spans=spans, index=index,
             turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
+        if with_navigation:
+            # §2.2: the per-order navigation volume, same reader as `jarvis
+            # navigation`'s. Read from the transcript, so an order whose session is gone
+            # reports `found: false` rather than zeros. A SECOND pass over every
+            # transcript, so only when a caller asks (see the docstring).
+            payload["navigation"] = navigation.read_session(
+                session, nav_settings(project_name), index=index).as_dict()
         payload.update(provenance=provenance,
                        wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",
@@ -12461,12 +12654,13 @@ def inspect_report(target: str, project: str | None = None, *,
                        largest_os_input=_largest_os_input(wo["id"]))
         return payload
 
-    try:
-        name, path, fo = find_feature_order(target, project)
-    except OpsError:
-        name, wo_path, wo = find_work_order(target, project)
+    # The one resolver `jarvis navigation` uses; no project reading here, so a target
+    # that is no id at all is the work-order lookup's error.
+    kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_WORK:
+        wo = record
         cfg = settings(name)
-        store = ProjectStore(wo_path)
+        store = ProjectStore(path)
         try:
             payload = unit(name, wo, store)
         finally:
@@ -12475,6 +12669,7 @@ def inspect_report(target: str, project: str | None = None, *,
                 "write_floor": cfg.report_write_floor,
                 "join_floor": cfg.report_join_floor, "units": [payload]}
 
+    fo = record
     store = ProjectStore(path)
     try:
         units = []

@@ -774,6 +774,33 @@ class Turn:
         }
 
 
+def _rewrite_block(boundaries: Sequence[usage_mod.Boundary], *,
+                   written: int, excess: int) -> dict[str, int | None]:
+    """A boundary census, keyed to `jarvis cost`'s own `rewrite` block.
+
+    ONE SPELLING of that dict, called by `Anatomy.rewrite` and `SubagentAnatomy.rewrite`
+    both (spec 2026-10-02 §1.1): two is how one key comes to mean two things on two
+    surfaces, the rule `usage.fold_boundaries` was factored out under.
+    """
+    def count(cause: str) -> int:
+        return sum(1 for b in boundaries if b.cause == cause)
+
+    def written_at(cause: str) -> int:
+        return sum(b.cache_write for b in boundaries if b.cause == cause)
+
+    return {
+        "boundaries": len(boundaries),
+        "ttl_boundaries": count(usage_mod.BOUNDARY_TTL),
+        "compact_boundaries": count(usage_mod.BOUNDARY_COMPACTED),
+        "undecided_boundaries": count(usage_mod.BOUNDARY_UNDECIDED),
+        "ttl_write": written_at(usage_mod.BOUNDARY_TTL),
+        "prefix_write": written_at(usage_mod.BOUNDARY_PREFIX),
+        "compact_write": written_at(usage_mod.BOUNDARY_COMPACTED),
+        "cache_write": written,
+        "tokens": excess,
+    }
+
+
 @dataclass
 class SubagentAnatomy:
     """One subagent's OWN anatomy: its turns, its cache writes, its context peak.
@@ -794,6 +821,30 @@ class SubagentAnatomy:
     writes: list[Write] = field(default_factory=list)
     #: Subagents of THIS subagent, counted and not read — see `SUBAGENT_DEPTH_READ`.
     deeper: int = 0
+    #: THRESHOLD-FREE, and the reason this class needed more than `writes`: a subagent
+    #: that wrote 334,427 tokens in 115 writes none of which reached the floor had an
+    #: empty `writes` list and rendered as "no large writes" (wo-fb7c0fc2, a8e11a7e).
+    #:
+    #: `None` AND NEVER 0 WHEN IT WAS NOT MEASURED — `SideVolume.code_nav_share()`'s
+    #: rule: a zero share is a finding and an unmeasured one is not. Every order sealed
+    #: before these fields existed carries no key at all, and defaulting those to 0 made
+    #: the renderer say `wrote nothing to the cache` about that same 334,427.
+    total_written: int | None = None
+    #: The largest single write, floor-free — the number that EXPLAINS an empty `writes`
+    #: list, and the only one that distinguishes "under the floor" from "wrote nothing".
+    max_write: int | None = None
+    #: The floor `writes` was built at, carried so a renderer never has to consult the
+    #: config to word an absence (`Anatomy.write_floor`'s rule).
+    write_floor: int | None = None
+    #: `usage.classify_boundaries` over THIS subagent's calls — the threshold-free
+    #: census q1215 requires. One run of calls per transcript, which is the grain
+    #: `classify_boundaries` documents.
+    boundaries: list[usage_mod.Boundary] = field(default_factory=list)
+    #: Calls, carried as a count so `total_written` can be read as a rate. A FIELD and
+    #: not `api_calls`: a transcript with no prompt row has no turns at all
+    #: (`read_transcript` opens one only at a prompt), so the property counts 0 over the
+    #: calls that were made, and the two must not disagree. `None` is absent, as above.
+    api_call_count: int | None = None
 
     @property
     def wall(self) -> float:
@@ -815,6 +866,20 @@ class SubagentAnatomy:
             totals[write.cause] = totals.get(write.cause, 0) + write.written
         return totals
 
+    def rewrite(self) -> dict[str, int | None] | None:
+        """This subagent's own boundary census, same keys as `Anatomy.rewrite()`.
+
+        `None` WHEN THE FIGURES WERE NEVER MEASURED, because the census is derived from
+        them: `cache_write` is `total_written` and `tokens` is its excess over the peak,
+        so a block built over an absence would be a dict of zeros claiming "no re-write
+        tax" about a subagent nobody counted. An empty `boundaries` list cannot say
+        which, so the absence is carried on the scalar.
+        """
+        if self.total_written is None:
+            return None
+        return _rewrite_block(self.boundaries, written=self.total_written,
+                              excess=max(0, self.total_written - self.context_peak))
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id, "label": self.label,
@@ -824,6 +889,17 @@ class SubagentAnatomy:
             "context_peak": self.context_peak,
             "wall": round(self.wall, 2), "api_calls": self.api_calls,
             "deeper": self.deeper, "depth_read": SUBAGENT_DEPTH_READ,
+            # THRESHOLD-FREE, beside the floored list and never instead of it (spec
+            # 2026-10-02 §1.1): `writes_by_cause` empty means "nothing at that floor",
+            # and only these can say so.
+            "total_written": self.total_written, "max_write": self.max_write,
+            "write_floor": self.write_floor,
+            "api_call_count": self.api_call_count,
+            # The CENSUS, not the rows: the per-turn `boundaries` key already exists at
+            # the parent grain and a renderer needs the counts. `None` when unmeasured,
+            # and the key is still EMITTED: an omitted key is exactly what an old seal
+            # looks like, which is the bug, so absence is said rather than left out.
+            "rewrite": self.rewrite(),
         }
 
 
@@ -987,25 +1063,13 @@ class Anatomy:
         `ttl_write` and `prefix_write` at 0 beside a non-zero one of these is "not
         measured", never "no TTL expiry".
         """
-        def count(cause: str) -> int:
-            return sum(1 for b in self.boundaries if b.cause == cause)
-
-        def written(cause: str) -> int:
-            return sum(b.cache_write for b in self.boundaries if b.cause == cause)
-
-        return {
-            "boundaries": len(self.boundaries),
-            "ttl_boundaries": count(usage_mod.BOUNDARY_TTL),
-            "compact_boundaries": count(usage_mod.BOUNDARY_COMPACTED),
-            "undecided_boundaries": count(usage_mod.BOUNDARY_UNDECIDED),
-            "ttl_write": written(usage_mod.BOUNDARY_TTL),
-            "prefix_write": written(usage_mod.BOUNDARY_PREFIX),
-            "compact_write": written(usage_mod.BOUNDARY_COMPACTED),
-            "cache_write": sum(c.cache_write for t in self.turns for c in t.calls),
-            # CALLED, not recomputed, so the top-level `rewrite_excess` key and this one
-            # cannot drift.
-            "tokens": self.rewrite_excess(),
-        }
+        # ONE spelling of the dict, shared with `SubagentAnatomy.rewrite` (§1.1). The
+        # excess is CALLED, not recomputed, so the top-level `rewrite_excess` key and
+        # this one cannot drift.
+        return _rewrite_block(
+            self.boundaries,
+            written=sum(c.cache_write for t in self.turns for c in t.calls),
+            excess=self.rewrite_excess())
 
     def as_dict(self) -> dict[str, Any]:
         part = self.partition()
@@ -1356,7 +1420,7 @@ def read_session(session_id: str, cfg: InspectConfig | None = None, *,
     # order of these two is not a trap for the next reader (spec §4b).
     anatomy.unattached_subagents = _attach_subagents(
         turns,
-        [_read_subagent(sub, cfg, anatomy.subagent_labels)
+        [_read_subagent(sub, cfg, anatomy.subagent_labels, cold_prefix_floor)
          for path in sorted(paths) for sub in _subagent_transcripts(path)])
     # AFTER `_close_turns`, which is the only thing that knows where a turn ends: a hold
     # attached before it would be measured against a turn whose `ended` was still its
@@ -1446,7 +1510,8 @@ def _attach_boundaries(turns: Sequence[Turn],
 
 
 def _read_subagent(path: Path, cfg: InspectConfig,
-                   labels: dict[str, str]) -> SubagentAnatomy:
+                   labels: dict[str, str],
+                   cold_prefix_floor: int | None = None) -> SubagentAnatomy:
     """One subagent transcript, taken apart the way `read_session` takes the parent apart.
 
     The task id is the stem minus its `agent-` prefix — the same join `_subagent_labels`
@@ -1460,11 +1525,22 @@ def _read_subagent(path: Path, cfg: InspectConfig,
     calls = usage_mod.calls_of(path)
     _attach_calls(turns, calls)
     _close_turns(turns)
+    compactions = sorted(usage_mod.compaction_stamps(path))
     return SubagentAnatomy(
         task_id=task_id, label=labels.get(task_id, ""), turns=turns,
-        writes=classify_writes(calls, cfg.report_write_floor,
-                               sorted(usage_mod.compaction_stamps(path))),
-        deeper=len(_subagent_transcripts(path)))
+        writes=classify_writes(calls, cfg.report_write_floor, compactions),
+        deeper=len(_subagent_transcripts(path)),
+        # THRESHOLD-FREE, from the calls already in hand (spec 2026-10-02 §1.2). THE ONE
+        # PLACE a subagent transcript is opened, so the one place these are filled.
+        total_written=sum(c.cache_write for c in calls),
+        max_write=max((c.cache_write for c in calls), default=0),
+        write_floor=cfg.report_write_floor,
+        api_call_count=len(calls),
+        # REUSED, never a second classifier: the OS has one judgement about a cache read
+        # that went backwards, and `cold_prefix_floor=None` leaves the split UNDECIDED
+        # rather than reporting 0 prefix misses.
+        boundaries=usage_mod.classify_boundaries(
+            calls, compactions=compactions, cold_prefix_floor=cold_prefix_floor))
 
 
 def hung_subagent_call(subs: Sequence[SubagentAnatomy], now: float, older_than: float,
