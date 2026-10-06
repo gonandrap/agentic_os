@@ -12299,6 +12299,40 @@ NAVIGATION_NEEDS_SCOPE = (
 )
 
 
+#: What `_resolve_report_target` returns in the first slot. `_TARGET_PROJECT` is the
+#: sentinel for "no id at all" — only `jarvis navigation` can read a target that way.
+_TARGET_FEATURE = "feature_order"
+_TARGET_WORK = "work_order"
+_TARGET_PROJECT = "<project>"
+
+
+def _resolve_report_target(target: str, project: str | None = None, *,
+                           project_fallback: bool = False,
+                           ) -> tuple[str, str | None, str | None,
+                                      dict[str, Any] | None]:
+    """What one id means to a report: `(kind, project name, project path, record)`.
+
+    Feature order FIRST, then work order, written once so `jarvis inspect` and `jarvis
+    navigation` can never disagree about an id. The ONLY difference between them is
+    `project_fallback`: `navigation` has a third reading for a target that is no id at
+    all (a project name), and a time report has none, so there the work-order lookup's
+    OpsError is the answer, unchanged.
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        pass
+    else:
+        return _TARGET_FEATURE, name, path, fo
+    try:
+        name, path, wo = find_work_order(target, project)
+    except OpsError:
+        if not project_fallback:
+            raise
+        return _TARGET_PROJECT, None, None, None
+    return _TARGET_WORK, name, path, wo
+
+
 def navigation_report(target: str | None = None, project: str | None = None, *,
                       fleet: bool = False, days: int | None = None) -> dict[str, Any]:
     """How an order, a project or the fleet NAVIGATED code — `jarvis navigation`.
@@ -12321,35 +12355,34 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     scope_project = project
     session_ids: list[tuple[str, str]] = []     # (label, session id)
     if target:
-        try:
-            name, path, fo = find_feature_order(target, project)
+        # The one resolver `inspect_report` uses, plus the project reading only this
+        # command has.
+        kind, name, path, record = _resolve_report_target(
+            target, project, project_fallback=True)
+        if kind == _TARGET_FEATURE:
             store = ProjectStore(path)
             try:
                 ids = []
-                planner_id = fo.get("plan_wo_id")
+                planner_id = record.get("plan_wo_id")
                 if planner_id:
                     try:
                         ids.append(store.get_work_order(planner_id))
                     except KeyError:
                         pass
-                ids.extend(store.feature_children(fo["id"]))
+                ids.extend(store.feature_children(record["id"]))
             finally:
                 store.close()
             scope_project = scope_project or name
             session_ids = [(wo["id"], wo.get("session_id") or "") for wo in ids]
-            scope = fo["id"]
-        except OpsError:
-            try:
-                name, wo_path, wo = find_work_order(target, project)
-            except OpsError:
-                # Not an id at all: the third resolution `inspect_report` does.
-                scope_project = target
-                session_ids = []
-                scope = target
-            else:
-                scope_project = scope_project or name
-                session_ids = [(wo["id"], wo.get("session_id") or "")]
-                scope = wo["id"]
+            scope = record["id"]
+        elif kind == _TARGET_WORK:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        else:
+            scope_project = target
+            session_ids = []
+            scope = target
     else:
         scope = scope_project or "fleet"
 
@@ -12582,12 +12615,13 @@ def inspect_report(target: str, project: str | None = None, *,
                        largest_os_input=_largest_os_input(wo["id"]))
         return payload
 
-    try:
-        name, path, fo = find_feature_order(target, project)
-    except OpsError:
-        name, wo_path, wo = find_work_order(target, project)
+    # The one resolver `jarvis navigation` uses; no project reading here, so a target
+    # that is no id at all is the work-order lookup's error.
+    kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_WORK:
+        wo = record
         cfg = settings(name)
-        store = ProjectStore(wo_path)
+        store = ProjectStore(path)
         try:
             payload = unit(name, wo, store)
         finally:
@@ -12596,6 +12630,7 @@ def inspect_report(target: str, project: str | None = None, *,
                 "write_floor": cfg.report_write_floor,
                 "join_floor": cfg.report_join_floor, "units": [payload]}
 
+    fo = record
     store = ProjectStore(path)
     try:
         units = []
