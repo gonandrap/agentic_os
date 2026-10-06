@@ -10890,6 +10890,11 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # was launched with, and nothing re-reads the catalog at it — the hook must not,
     # since it runs on every Bash command.
     ("*.concision.*", "next-dispatch"),
+    # `jarvis cost --fleet` reads the catalog on every invocation, so a change is in
+    # force on the next run — stated rather than left to fall through, even though the
+    # fall-through answer is the same one. Spec §6.2:
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md
+    ("*.cost.*", "hot"),
 )
 
 APPLY_NOTES = {

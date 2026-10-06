@@ -211,6 +211,26 @@ def test_rows_carry_every_stable_key():
     json.dumps(row)
 
 
+def test_the_script_re_exports_the_package_objects_themselves():
+    """The pure core lives in `jarvis.compaction_payoff`; the script re-exports it.
+
+    Identity, not equality: two copies of `assess` would fork the arithmetic silently.
+    Spec §1 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+    import jarvis.compaction_payoff as core
+
+    assert cp.assess is core.assess
+    assert cp.Case is core.Case
+    assert cp.analyse is core.analyse
+    assert cp.summarise is core.summarise
+    assert cp.gather is core.gather
+    assert cp.connect_ro is core.connect_ro
+    assert cp.prefix_rate is core.prefix_rate
+    assert cp.ROW_KEYS is core.ROW_KEYS
+    assert cp.quantile is core.quantile
+    assert cp._parse_when is core.parse_when
+
+
 def test_gather_opens_databases_read_only(tmp_path):
     db = tmp_path / "os.db"
     conn = sqlite3.connect(db)
