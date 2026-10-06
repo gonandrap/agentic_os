@@ -305,6 +305,7 @@ def test_reading_configuration_is_not_blocked_for_a_worker(catalog, monkeypatch)
     ("projects.p.worker.effort", "next-dispatch"),
     ("projects.p.worker.autocompact_window", "next-dispatch"),
     ("projects.p.worker.tool_search", "next-dispatch"),
+    ("projects.p.worker.py_nav_hook", "next-dispatch"),
     ("os.ui.port", "restart"),
     ("projects.p.path", "restart"),
     ("projects.p.settings_overrides.hooks", "restart"),

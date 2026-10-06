@@ -1,366 +1,144 @@
-"""`jarvis navigation` — the fleet's read volume, split by side.
+"""The navigation LEAF: one strict classifier and one shell masker.
 
-Spec: docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md
-§2 and test-plan item 6.
+Spec: §3 of docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md
+(`.jarvis/features/fo-b9a3fb06/sections/wo-f4b04708.md`), Neo q1238.
 
-NO TEST HERE READS A LIVE TRANSCRIPT. Every tree is written under
-`monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, …)`, the pattern
-`tests/test_inspection.py`'s `write_transcript` fixture set, with the root `conftest.py`
-isolation gate as the floor under it.
+Stdlib only and no fixtures: `src/jarvis/navigation.py` is imported by `hooks.py` on
+every Bash PreToolUse, so it imports nothing from `jarvis` and reads nothing from disk.
+The fleet reader that used to live here is `tests/test_nav_volume.py`.
 """
 
-import json
-import os
-import time
+import ast
 
 import pytest
 
-from jarvis import navigation, usage
-from jarvis.catalog import NavigationConfig
-
-CFG = NavigationConfig()
+from jarvis import navigation
 
 
-# -- fixture plumbing ------------------------------------------------------------------
+# -- navigates_source ------------------------------------------------------------------
 
-def tool_use_row(tool_id: str, name: str, **payload) -> dict:
-    return {"type": "assistant",
-            "message": {"content": [{"type": "tool_use", "id": tool_id,
-                                     "name": name, "input": payload}]}}
-
-
-def tool_result_row(tool_id: str, content) -> dict:
-    return {"type": "user",
-            "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id,
-                                     "content": content}]}}
-
-
-@pytest.fixture()
-def tree(tmp_path, monkeypatch):
-    """A transcript root the OS reads instead of `~/.claude/projects`."""
-    root = tmp_path / "projects"
-    root.mkdir(parents=True)
-    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
-
-    def write(session_id: str, rows: list[dict], *, slug: str = "-proj",
-              subagents: dict[str, list[dict]] | None = None):
-        directory = root / slug
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{session_id}.jsonl"
-        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
-        for name, sub_rows in (subagents or {}).items():
-            sub_dir = directory / session_id / "subagents"
-            sub_dir.mkdir(parents=True, exist_ok=True)
-            (sub_dir / f"{name}.jsonl").write_text(
-                "".join(json.dumps(r) + "\n" for r in sub_rows))
-        return path
-
-    write.root = root
-    return write
+def test_a_grep_at_a_py_path_navigates_source():
+    assert navigation.navigates_source("grep -n total_for src/pricing.py",
+                                       (".py",)) is True
+    assert navigation.navigates_source("cat src/jarvis/ops.py", (".py",)) is True
+    assert navigation.navigates_source("head -40 a.py", (".py",)) is True
+    # ANY statement of a chain or pipeline navigates (§3).
+    assert navigation.navigates_source("uv run pytest && cat src/x.py",
+                                       (".py",)) is True
+    assert navigation.navigates_source("grep -n foo src/x.py | head", (".py",)) is True
+    # §3: env assignments are stripped before word 0 is read.
+    assert navigation.navigates_source("FOO=1 cat src/x.py", (".py",)) is True
 
 
-# -- the classifier: token matching, deliberately not an argument parser ---------------
+def test_a_recursive_sweep_of_the_tree_navigates_source():
+    """§3: a sweep navigates even though no token ends in a configured suffix."""
+    assert navigation.navigates_source('grep -rn "def foo" .', (".py",)) is True
+    assert navigation.navigates_source("rg foo src", (".py",)) is True
+    assert navigation.navigates_source("find . -name Makefile", (".py",)) is True
+    assert navigation.navigates_source("sudo find . -name '*.py'", (".py",)) is True
 
-@pytest.mark.parametrize("command,expected", [
-    ("sed -n 1,50p src/x.py", (True, True)),
-    ("cat README.md", (True, False)),
-    ("uv run pytest", (False, False)),
-    ("grep -rn foo src/x.py | head", (True, True)),
-    # env assignments and `sudo` are stripped before the first token is read
-    ("FOO=1 cat src/x.py", (True, True)),
-    # `sudo` is stripped; the `*.py` glob is a token ending in a configured suffix, so
-    # it targets code — token matching, by definition, and not an argument parser.
-    ("sudo find . -name '*.py'", (True, True)),
-    ("sudo find . -name Makefile", (True, False)),
-    # ANY stage of a pipeline or chain makes it navigation (§5.3's method)
-    ("uv run pytest && cat src/x.py", (True, True)),
-    ("echo hi", (False, False)),
-    ("", (False, False)),
-])
-def test_the_classifier_matches_tokens_and_nothing_cleverer(command, expected):
-    """§5.3's BEFORE numbers came from token matching; a cleverer classifier makes the
-    AFTER figure incomparable rather than better."""
-    assert navigation.classify_command(command, CFG) == expected
+
+def test_bookkeeping_reads_do_not_navigate_source():
+    for command in ("cat tool-log.jsonl",
+                    "jq . payload.json",
+                    # The trap: it ends in `.py` but word 0 is not in `NAV_COMMANDS`.
+                    "uv run pytest tests/test_x.py",
+                    "git log --oneline",
+                    "jarvis wo show wo-1",
+                    "echo hi",
+                    "cat README.md",
+                    ""):
+        assert navigation.navigates_source(command, (".py",)) is False, command
+
+
+def test_sed_counts_only_with_dash_n():
+    assert navigation.navigates_source("sed -n '1,40p' a.py", (".py",)) is True
+    assert navigation.navigates_source("sed -n 1,50p src/x.py", (".py",)) is True
+    assert navigation.navigates_source("sed -i s/x/y/ a.py", (".py",)) is False
+
+
+def test_a_py_path_inside_a_quoted_string_does_not_count():
+    """Proves the masker is applied and not merely re-exported (§3)."""
+    assert navigation.navigates_source('git commit -m "fix pricing.py"',
+                                       (".py",)) is False
+    assert navigation.navigates_source('echo "cat src/x.py"', (".py",)) is False
+
+
+def test_the_suffix_set_is_an_argument_not_a_global():
+    assert navigation.navigates_source("grep -rn x notes.md", (".py",)) is False
+    assert navigation.navigates_source("grep -rn x a.py", (".py",)) is True
+    assert navigation.navigates_source("grep -rn x notes.md", (".md",)) is True
+    # §3: the command set is an optional third argument, for the catalog-configured one.
+    assert navigation.navigates_source("bat src/x.py", (".py",), ("bat",)) is True
+    assert navigation.navigates_source("cat src/x.py", (".py",), ("bat",)) is False
 
 
 def test_a_path_is_a_code_read_only_for_a_configured_suffix():
-    cfg = NavigationConfig(code_suffixes=(".ts",))
-    assert navigation.classify_command("cat src/x.py", cfg) == (True, False)
-    assert navigation.classify_command("cat src/x.ts", cfg) == (True, True)
+    assert navigation.navigates_source("cat src/x.py", (".ts",)) is False
+    assert navigation.navigates_source("cat src/x.ts", (".ts",)) is True
 
 
-@pytest.mark.parametrize("name,expected", [
-    ("mcp__serena__find_symbol", True),
-    ("mcp__plugin_serena_serena__find_symbol", True),
-    ("find_symbol", True),
-    ("mcp__plugin_serena_serena__find_referencing_symbols", True),
-    # DELIBERATELY NOT a symbol tool: text search with a Serena name (kn-a397fb52).
-    ("mcp__serena__search_for_pattern", False),
-    ("search_for_pattern", False),
-    ("Grep", False),
-    ("Bash", False),
+def test_a_command_too_long_for_params_is_still_classified():
+    """`inspection.ParamCaps` truncates at 500/2,000/20,000; the leaf reads the raw
+    command, so length changes nothing (§3)."""
+    long_command = "grep -n " + "x" * 30_000 + " src/pricing.py"
+    assert len(long_command) > 20_000
+    assert navigation.navigates_source(long_command, (".py",)) is True
+    assert navigation.navigates_source("echo " + "y" * 30_000, (".py",)) is False
+
+
+# -- is_symbol_call --------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "mcp__serena__find_symbol",
+    "mcp__plugin_serena_serena__find_symbol",
+    "find_symbol",
+    "mcp__plugin_serena_serena__find_referencing_symbols",
+    "LSP_document_symbols",
+    "LSP",
 ])
-def test_is_symbol_tool_strips_either_server_prefix(name, expected):
-    assert navigation.is_symbol_tool(name, CFG) is expected
+def test_is_symbol_call_accepts_both_serena_prefixes(name):
+    assert navigation.is_symbol_call(name) is True
 
 
-# -- attribution: bytes land on the call that produced them ---------------------------
-
-def test_result_bytes_are_attributed_to_the_producing_tool_use(tree):
-    path = tree("s1", [
-        tool_use_row("t1", "Bash", command="cat src/x.py"),
-        tool_result_row("t1", "x" * 100),
-        tool_use_row("t2", "mcp__serena__find_symbol", name_path_pattern="f"),
-        tool_result_row("t2", "y" * 10),
-        tool_use_row("t3", "Grep", pattern="foo"),
-        tool_result_row("t3", "z" * 5),
-    ])
-
-    vol = navigation.read_transcript(path, navigation.SIDE_LEAD, CFG)
-
-    assert vol.side == navigation.SIDE_LEAD
-    assert vol.transcripts == 1
-    assert (vol.nav_bash_calls, vol.code_nav_bash_calls) == (1, 1)
-    assert (vol.symbol_calls, vol.text_search_calls) == (1, 1)
-    assert vol.result_bytes == 115
-    assert vol.nav_bash_bytes == 100
-    assert vol.code_nav_bash_bytes == 100
-    assert vol.symbol_bytes == 10
-    assert vol.unattributed_bytes == 0
-    assert vol.code_nav_share() == pytest.approx(100 / 115)
+@pytest.mark.parametrize("name", [
+    # Text search with a Serena name: counting it as a symbol call is the vacuity trap
+    # kn-a397fb52 documents.
+    "mcp__serena__search_for_pattern",
+    "search_for_pattern",
+    "Grep",
+    "Glob",
+    "Bash",
+    "",
+])
+def test_serena_text_search_is_not_a_symbol_call(name):
+    assert navigation.is_symbol_call(name) is False
+    assert "search_for_pattern" not in navigation.SYMBOL_TOOLS
 
 
-def test_an_unknown_tool_use_id_is_reported_and_never_in_a_share(tree):
-    """REPORTED, never silently dropped and never in a share's numerator."""
-    path = tree("s2", [
-        tool_use_row("t1", "Bash", command="cat src/x.py"),
-        tool_result_row("t1", "x" * 40),
-        tool_result_row("nobody-made-this", "q" * 999),
-    ])
-
-    vol = navigation.read_transcript(path, navigation.SIDE_LEAD, CFG)
-
-    assert vol.unattributed_bytes == 999
-    assert vol.result_bytes == 40
-    assert vol.code_nav_share() == pytest.approx(1.0)
+def test_the_leaf_names_exactly_the_measured_sets():
+    assert navigation.NAV_COMMANDS == ("cat", "head", "sed", "grep", "rg", "find")
+    assert navigation.SOURCE_SUFFIXES == (".py",)
+    assert navigation.TEXT_SEARCH_TOOLS == ("Grep", "Glob")
 
 
-def test_other_bash_and_read_tool_calls_are_counted_apart(tree):
-    path = tree("s3", [
-        tool_use_row("t1", "Bash", command="uv run pytest"),
-        tool_result_row("t1", "ok"),
-        tool_use_row("t2", "Read", file_path="/tmp/x.py"),
-        tool_result_row("t2", "body"),
-    ])
+# -- one masker, one leaf --------------------------------------------------------------
 
-    vol = navigation.read_transcript(path, navigation.SIDE_LEAD, CFG)
+def test_hooks_re_exports_the_moved_helpers_rather_than_copying_them():
+    """Identity, not equality: a copied body passes equality and then drifts
+    (kn-7f5f2d0d)."""
+    from jarvis import hooks
 
-    assert vol.other_bash_calls == 1
-    assert vol.nav_bash_calls == 0
-    assert vol.read_tool_calls == 1
-    assert vol.result_bytes == 6
-    assert vol.code_nav_bash_bytes == 0
-    # A zero share is a FINDING; it is not None, because the corpus was measured.
-    assert vol.code_nav_share() == 0.0
+    assert hooks._mask_shell_text is navigation._mask_shell_text
+    assert hooks._statements is navigation._statements
 
 
-# -- the side split, which comes from the PATH ----------------------------------------
-
-def test_the_side_split_comes_from_the_path_with_one_lead_and_two_subagents(tree):
-    tree("s4", [
-        tool_use_row("t1", "Bash", command="grep -rn foo src/a.py"),
-        tool_result_row("t1", "L" * 300),
-    ], subagents={
-        "agent-aaa": [tool_use_row("u1", "Bash", command="cat src/b.py"),
-                      tool_result_row("u1", "A" * 50)],
-        "agent-bbb": [tool_use_row("v1", "mcp__plugin_serena_serena__find_symbol",
-                                   name_path_pattern="x"),
-                      tool_result_row("v1", "B" * 20)],
-    })
-
-    vol = navigation.read_session("s4", CFG)
-
-    assert vol.found is True
-    lead = vol.sides[navigation.SIDE_LEAD]
-    sub = vol.sides[navigation.SIDE_SUBAGENT]
-    assert (lead.transcripts, sub.transcripts) == (1, 2)
-    assert lead.code_nav_bash_bytes == 300
-    assert sub.code_nav_bash_bytes == 50
-    assert sub.symbol_calls == 1
-    assert sub.symbol_bytes == 20
-    assert sub.result_bytes == 70
-    assert sub.code_nav_share() == pytest.approx(50 / 70)
-    # Both keys always present, so a renderer never tests for one.
-    assert set(vol.sides) == set(navigation.SIDES)
-
-
-def test_a_session_with_no_transcript_is_not_found(tree):
-    vol = navigation.read_session("nothing-here", CFG)
-
-    assert vol.found is False
-    assert vol.sides[navigation.SIDE_LEAD].transcripts == 0
-
-
-def test_an_empty_corpus_has_no_share_rather_than_a_zero_one(tree):
-    """None and NEVER 0.0: a zero share is a finding and an unmeasured one is not,
-    which is `usage.rewrite_ttl_share`'s rule."""
-    vol = navigation.read_session("nothing-here", CFG)
-
-    assert vol.sides[navigation.SIDE_LEAD].code_nav_share() is None
-    assert navigation.SideVolume(side=navigation.SIDE_LEAD).code_nav_share() is None
-    assert vol.as_dict()["sides"]["lead"]["code_nav_share"] is None
-
-
-# -- the fleet path: read_tree, and its window ----------------------------------------
-
-def test_read_tree_walks_leads_and_subagents_and_names_the_window(tree):
-    tree("s5", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                tool_result_row("t1", "x" * 10)],
-         subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="f"),
-                                  tool_result_row("u1", "y" * 7)]})
-
-    vol = navigation.read_tree(cfg=CFG, days=7)
-
-    assert vol.found is True
-    assert vol.window_days == 7
-    assert vol.sides[navigation.SIDE_LEAD].transcripts == 1
-    assert vol.sides[navigation.SIDE_SUBAGENT].transcripts == 1
-    assert vol.sides[navigation.SIDE_SUBAGENT].text_search_calls == 1
-
-
-def test_days_excludes_a_file_by_mtime_before_opening_it(tree):
-    fresh = tree("fresh", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                           tool_result_row("t1", "x" * 10)])
-    stale = tree("stale", [tool_use_row("t2", "Bash", command="cat src/b.py"),
-                           tool_result_row("t2", "x" * 9999)])
-    old = time.time() - 30 * 86400
-    os.utime(stale, (old, old))
-
-    windowed = navigation.read_tree(cfg=CFG, days=7)
-    everything = navigation.read_tree(cfg=CFG)
-
-    assert fresh.exists()
-    assert windowed.sides[navigation.SIDE_LEAD].transcripts == 1
-    assert windowed.sides[navigation.SIDE_LEAD].result_bytes == 10
-    assert everything.sides[navigation.SIDE_LEAD].transcripts == 2
-    assert everything.window_days is None
-
-
-def test_a_sibling_project_with_a_shared_slug_prefix_is_not_folded_in(tree):
-    """`slug_of` maps EVERY non-alphanumeric character to `-`, so `/ws/jarvis`'s slug is
-    a bare-`startswith` prefix of `/ws/jarvis_os`'s. PR 927 review: three of four seats.
-
-    Two layers, because `slug_of` is not injective: the separator rule rejects a slug
-    that merely shares characters, and `slug_exclude` — the catalog's other projects —
-    rejects a sibling whose own slug is longer and matches too.
-    """
-    mine = navigation.slug_of("/ws/jarvis")
-    theirs = navigation.slug_of("/ws/jarvis_os")
-    tree("lead", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                  tool_result_row("t1", "x" * 10)], slug=mine)
-    tree("wt", [tool_use_row("t2", "Bash", command="cat src/b.py"),
-                tool_result_row("t2", "x" * 20)],
-         slug=navigation.slug_of("/ws/jarvis/.claude/worktrees/wo-1"))
-    tree("sib", [tool_use_row("t3", "Bash", command="cat src/c.py"),
-                 tool_result_row("t3", "x" * 400)], slug=theirs)
-    tree("sibwt", [tool_use_row("t4", "Bash", command="cat src/d.py"),
-                   tool_result_row("t4", "x" * 800)],
-         slug=navigation.slug_of("/ws/jarvis_os/.claude/worktrees/wo-2"))
-
-    vol = navigation.read_tree(cfg=CFG, slug_prefix=mine, slug_exclude=(theirs,))
-
-    # The project's own transcript and its own worktree's — and NEITHER of the sibling's.
-    assert vol.sides[navigation.SIDE_LEAD].transcripts == 2
-    assert vol.sides[navigation.SIDE_LEAD].result_bytes == 30
-
-    # And the separator rule on its own: a prefix that is not followed by the `-` a path
-    # separator becomes is not a parent directory, it is a different path.
-    partial = navigation.read_tree(cfg=CFG, slug_prefix=navigation.slug_of("/ws/jarvi"))
-    assert partial.sides[navigation.SIDE_LEAD].transcripts == 0
-    assert partial.found is False
-
-
-def test_a_sibling_projects_slug_comes_from_the_catalog(tree, monkeypatch):
-    """The exclusion list is not guessed: it is every OTHER project the catalog names
-    whose slug would match this one's too."""
-    from jarvis import ops
-    from jarvis.catalog import Catalog, OsConfig, ProjectSpec
-    from pathlib import Path
-
-    catalog = Catalog(os=OsConfig(),
-                      projects=[ProjectSpec(name="jarvis", path=Path("/ws/jarvis")),
-                                ProjectSpec(name="jarvis_os",
-                                            path=Path("/ws/jarvis_os"))])
-    monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **k: catalog)
-    tree("lead", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                  tool_result_row("t1", "x" * 10)],
-         slug=navigation.slug_of("/ws/jarvis"))
-    tree("sib", [tool_use_row("t2", "Bash", command="cat src/c.py"),
-                 tool_result_row("t2", "x" * 400)],
-         slug=navigation.slug_of("/ws/jarvis_os"))
-
-    payload = ops.navigation_report(project="jarvis", days=7)
-
-    assert payload["sides"]["lead"]["transcripts"] == 1
-    assert payload["sides"]["lead"]["result_bytes"] == 10
-
-
-def test_both_readers_agree_about_what_a_subagent_file_is(tree):
-    """ONE pattern, named once: `_subagents_of` globbed `*.jsonl` and `read_tree`
-    `agent-*.jsonl`, so the per-order and the fleet report could disagree about the same
-    session. `agent-*.jsonl` is the layout the module docstring documents."""
-    tree("s10", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                 tool_result_row("t1", "x" * 10)],
-         subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="f"),
-                                  tool_result_row("u1", "y" * 7)],
-                    "helper": [tool_use_row("v1", "Grep", pattern="f"),
-                               tool_result_row("v1", "z" * 500)]})
-
-    session = navigation.read_session("s10", CFG)
-    fleet = navigation.read_tree(cfg=CFG, days=7)
-
-    for vol in (session, fleet):
-        sub = vol.sides[navigation.SIDE_SUBAGENT]
-        assert (sub.transcripts, sub.result_bytes) == (1, 7)
-    assert navigation.SUBAGENT_GLOB == "agent-*.jsonl"
-
-
-def test_a_missing_root_is_an_honest_absence(tmp_path, monkeypatch):
-    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path / "gone"))
-
-    vol = navigation.read_tree(cfg=CFG)
-
-    assert vol.found is False
-    assert vol.as_dict()["found"] is False
-
-
-# -- the payload: the renderer derives nothing ----------------------------------------
-
-def test_as_dict_carries_every_number_the_renderer_prints(tree):
-    tree("s6", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                tool_result_row("t1", "x" * 10)])
-
-    payload = navigation.read_session("s6", CFG).as_dict()
-
-    assert payload["scope"] == "s6"
-    assert payload["before"] == navigation.BEFORE_NOTE
-    lead = payload["sides"]["lead"]
-    for key in ("transcripts", "symbol_calls", "text_search_calls", "nav_bash_calls",
-                "code_nav_bash_calls", "other_bash_calls", "read_tool_calls",
-                "result_bytes", "nav_bash_bytes", "code_nav_bash_bytes",
-                "symbol_bytes", "unattributed_bytes", "code_nav_share"):
-        assert key in lead, key
-    assert lead["code_nav_share"] == pytest.approx(1.0)
-
-
-def test_navigation_imports_usage_and_catalog_and_nothing_else_of_jarvis():
-    """A LEAF module: a report over files on disk must not fail because a catalog or a
-    database moved. `inspection`'s constraint, for its reason."""
-    import ast
-
-    tree_src = ast.parse(open(navigation.__file__).read())
+def test_the_leaf_imports_nothing_from_jarvis():
+    """`hooks.py` imports it on every Bash PreToolUse, so an import of `catalog` here is
+    a per-command cost (§3)."""
+    parsed = ast.parse(open(navigation.__file__).read())
     local = set()
-    for node in ast.walk(tree_src):
+    for node in ast.walk(parsed):
         if isinstance(node, ast.ImportFrom) and node.level:
             if node.module:
                 local.add(node.module)
@@ -370,213 +148,26 @@ def test_navigation_imports_usage_and_catalog_and_nothing_else_of_jarvis():
             local.update(a.name.split(".")[0] for a in node.names
                          if a.name.startswith("jarvis"))
 
-    assert local == {"catalog", "usage"}
+    assert local == set()
 
 
-# -- ops and the CLI ------------------------------------------------------------------
+def test_the_catalog_defaults_are_the_leafs_sets_and_not_a_second_definition():
+    from jarvis import catalog
 
-def test_navigation_config_falls_back_to_the_defaults_not_to_none():
-    """`ops.inspect_config`'s shape: every default here is a pattern list with a
-    measured justification, and having none would mean having no report."""
-    from jarvis import ops
-
-    cfg = ops.navigation_config("no-such-project")
-
-    assert cfg.bash_commands == NavigationConfig().bash_commands
-    assert cfg.window_days == 7
+    assert catalog.DEFAULT_NAVIGATION_BASH_COMMANDS is navigation.NAV_COMMANDS
+    assert catalog.DEFAULT_NAVIGATION_SYMBOL_TOOLS is navigation.SYMBOL_TOOLS
+    assert catalog.DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS is navigation.TEXT_SEARCH_TOOLS
+    assert catalog.DEFAULT_NAVIGATION_CODE_SUFFIXES is navigation.SOURCE_SUFFIXES
 
 
-def test_the_fleet_report_requires_an_explicit_scope(tree):
-    """`~/.claude/projects` is 2.7G and 11,889 lead transcripts: a no-argument
-    `jarvis navigation` must not walk it."""
-    from jarvis import ops
+def test_the_eval_uses_the_shipped_classifier():
+    """§7: the LLM nav eval imports this leaf rather than keeping a retyped copy.
 
-    # Against the CONSTANT, not a copy of its words: the CLI and the dashboard quote
-    # that string, so a reworded refusal must fail here and nowhere else.
-    with pytest.raises(ops.OpsError) as caught:
-        ops.navigation_report()
-    assert str(caught.value) == ops.NAVIGATION_NEEDS_SCOPE
-
-    with pytest.raises(ops.OpsError) as explicit:
-        ops.navigation_report(None, None, fleet=False)
-    assert str(explicit.value) == ops.NAVIGATION_NEEDS_SCOPE
-
-
-def test_the_cli_prints_the_shares_and_the_before_line(tree, capsys):
-    from jarvis import cli
-
-    tree("s7", [tool_use_row("t1", "Bash", command="cat src/a.py"),
-                tool_result_row("t1", "x" * 10)])
-    payload = navigation.read_tree(cfg=CFG, days=7).as_dict()
-
-    cli._print_navigation(payload)
-
-    out = capsys.readouterr().out
-    assert "lead" in out and "subagent" in out
-    assert "41.3%" in out and "0 symbol calls" in out
-
-
-def test_the_cli_fleet_path_runs_end_to_end(tree, capsys):
-    from jarvis import cli
-
-    tree("s8", [tool_use_row("t1", "Bash", command="grep -rn x src/a.py"),
-                tool_result_row("t1", "x" * 10)])
-    parser = cli.build_parser()
-
-    args = parser.parse_args(["navigation", "--fleet", "--days", "7", "--json"])
-    assert cli.main(["navigation", "--fleet", "--days", "7", "--json"]) == 0
-
-    payload = json.loads(capsys.readouterr().out)
-    assert args.fleet is True
-    assert payload["scope"] == "fleet"
-    assert payload["sides"]["lead"]["code_nav_bash_calls"] == 1
-
-
-def test_both_reports_resolve_a_target_through_one_helper(monkeypatch):
-    """`jarvis inspect` and `jarvis navigation` must never disagree about what an id
-    means, so the feature-order-first lookup is written once and the ONLY difference is
-    explicit: whether a target that is no id at all may be read as a project name."""
-    from jarvis import ops
-
-    tried: list[str] = []
-
-    def no_feature(target, project=None):
-        tried.append("feature_order")
-        raise ops.OpsError("no such feature order")
-
-    def no_work_order(target, project=None):
-        tried.append("work_order")
-        raise ops.OpsError("no such work order")
-
-    monkeypatch.setattr(ops, "find_feature_order", no_feature)
-    monkeypatch.setattr(ops, "find_work_order", no_work_order)
-
-    # `navigation`'s third resolution, and it is the only thing the flag changes.
-    assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
-        ops._TARGET_PROJECT, None, None, None)
-    assert tried == ["feature_order", "work_order"]
-
-    # `inspect`'s: a target that resolves to nothing is the work-order lookup's error,
-    # unchanged, because there is no third thing a time report could mean.
-    with pytest.raises(ops.OpsError, match="no such work order"):
-        ops._resolve_report_target("proj_a", None)
-
-
-def test_a_mistyped_order_id_is_not_read_as_a_project_name(monkeypatch):
-    """`jarvis navigation wo-deadbeef` must say the work order does not exist, not that
-    there is no project of that name: `project_fallback` turned EVERY failure into the
-    project reading (PR 927 review)."""
-    from jarvis import ops
-
-    def no_feature(target, project=None):
-        raise ops.OpsError("no such feature order")
-
-    def no_work_order(target, project=None):
-        raise ops.OpsError(f"no work order {target}")
-
-    monkeypatch.setattr(ops, "find_feature_order", no_feature)
-    monkeypatch.setattr(ops, "find_work_order", no_work_order)
-
-    for mistyped in ("wo-deadbeef", "fo-deadbeef"):
-        with pytest.raises(ops.OpsError, match=f"no work order {mistyped}"):
-            ops._resolve_report_target(mistyped, None, project_fallback=True)
-
-    # A target that is no id at all still has the third reading this flag exists for.
-    assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
-        ops._TARGET_PROJECT, None, None, None)
-
-
-def test_a_non_positive_days_window_is_refused(tree):
-    """`--days 0` disabled the window the `--fleet` opt-in exists to enforce: the walk it
-    bounds is 2.7G. Against the CONSTANT, as the scope refusal is."""
-    from jarvis import ops
-
-    for days in (0, -1):
-        with pytest.raises(ops.OpsError) as caught:
-            ops.navigation_report(fleet=True, days=days)
-        assert str(caught.value) == ops.NAVIGATION_DAYS_POSITIVE
-    assert "--days" in ops.NAVIGATION_DAYS_POSITIVE
-
-    # None still means the catalog's window, unchanged.
-    assert ops.navigation_report(fleet=True)["window_days"] == 7
-
-
-def test_inspect_reads_the_transcripts_again_only_when_asked(monkeypatch):
-    """`jarvis inspect` opened every transcript twice — once in `inspection.read_session`
-    and once more through `navigation.read_session` (PR 927 review). The second pass is
-    now a caller's request, and `cli.cmd_inspect` — which PRINTS the section — is the
-    caller that makes it; the dashboard's debugging page renders nothing from it.
+    Identity, so a copy that merely passes equality fails here. The eval module imports
+    fine without `JARVIS_EVALS_LLM` — the marker only skips.
     """
-    from jarvis import navigation as nav_mod
-    from jarvis import ops
+    from evals.llm import test_navigation_judgment as ev
 
-    asked: list[str] = []
-
-    def counted(session_id, cfg, *, index=None):
-        asked.append(session_id)
-        return nav_mod.NavigationVolume(scope=session_id)
-
-    monkeypatch.setattr(nav_mod, "read_session", counted)
-
-    def resolved(target, project=None):
-        return "proj_a", "/nowhere", {"id": "wo-1", "title": "t", "status": "completed",
-                                      "session_id": "sid-1"}
-
-    monkeypatch.setattr(ops, "find_feature_order",
-                        lambda *a, **k: (_ for _ in ()).throw(ops.OpsError("no")))
-    monkeypatch.setattr(ops, "find_work_order", resolved)
-    monkeypatch.setattr(ops, "ProjectStore", lambda path: _NoStore())
-
-    quiet = ops.inspect_report("wo-1")
-    assert asked == []
-    assert "navigation" not in quiet["units"][0]
-
-    loud = ops.inspect_report("wo-1", with_navigation=True)
-    assert asked == ["sid-1"]
-    assert loud["units"][0]["navigation"]["scope"] == "sid-1"
-
-
-class _NoStore:
-    """A project store that answers the two reads `inspect_report`'s unit makes."""
-
-    def turn_starts(self, wo_id):
-        return []
-
-    def list_events(self, wo_id, limit=None):
-        return []
-
-    def list_turns(self, wo_id):
-        return []
-
-    def close(self):
-        pass
-
-
-def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, capsys):
-    """END TO END through `cmd_navigation`'s renderer, which `--json` never reaches.
-
-    The counts are asserted against the PAYLOAD as well as against literals, so a
-    renderer that derived its own number — summing both sides, or re-reading the tree —
-    fails here rather than disagreeing with the dashboard (PR 65).
-    """
-    from jarvis import cli, ops
-
-    tree("s9", [tool_use_row("t1", "mcp__serena__find_symbol", name_path_pattern="x"),
-                tool_result_row("t1", "L" * 40),
-                tool_use_row("t2", "mcp__serena__find_symbol", name_path_pattern="y"),
-                tool_result_row("t2", "L" * 60)],
-         subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="x"),
-                                  tool_result_row("u1", "A" * 20)]})
-
-    assert cli.main(["navigation", "--fleet", "--days", "7"]) == 0
-
-    out = capsys.readouterr().out
-    payload = ops.navigation_report(fleet=True, days=7)
-    lead, sub = payload["sides"]["lead"], payload["sides"]["subagent"]
-    assert (lead["symbol_calls"], sub["text_search_calls"]) == (2, 1)
-    assert "lead" in out and "subagent" in out
-    assert "fleet" in out                       # the scope line `cmd_navigation` prints
-    assert (f"{lead['transcripts']:>4} transcripts  "
-            f"{lead['symbol_calls']:>4} symbol") in out
-    assert (f"{sub['symbol_calls']:>4} symbol  "
-            f"{sub['text_search_calls']:>4} text-search") in out
+    assert ev.NAV_COMMANDS is navigation.NAV_COMMANDS
+    assert ev.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
+    assert "def bash_navigates_code" not in open(ev.__file__).read()

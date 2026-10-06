@@ -1142,6 +1142,61 @@ def test_an_old_payload_is_upgraded_from_itself_and_never_from_the_transcript(
     assert json.loads(again["autopsy_json"])["payload_v"] == autopsy.PAYLOAD_VERSION
 
 
+NAV_COMMAND = "grep -rn total_for src/pricing.py"
+
+
+def sealed_at_v1(store, spec, write_transcript, session: str, level: str) -> dict:
+    """One settled order, sealed at `level` and then aged back to a v1 payload — the
+    shape §3's upgrade exists for: a seal written before `navigates_source` was sealed."""
+    wo = store.create_work_order("an order that navigated", "")
+    store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
+                       (session, wo["id"]))
+    store.conn.commit()
+    write_transcript(session, [prompt_row(0, "You are the worker agent for wo-1"),
+                               *tool_rows(2, 4, "t1", "Bash", {"command": NAV_COMMAND}),
+                               assistant_row(10, "m1", write=30_000)])
+    store.set_status(wo["id"], "completed")
+    Daemon.seal_autopsies(Daemon.__new__(Daemon), at_level(spec, level), store)
+    row = store.get_work_order(wo["id"])
+    aged = autopsy.unseal(row)
+    aged["payload_v"] = 1
+    for turn in aged["turns"]:
+        for span in turn["spans"]:
+            span.pop("navigates_source", None)
+    store.seal_autopsy(wo["id"], db.to_json(aged))
+    return store.get_work_order(wo["id"])
+
+
+def test_an_upgraded_seal_re_derives_nav_from_the_stored_command(store, spec,
+                                                                 write_transcript):
+    """§3: at `full` the command is in the stored `params`, so the upgrade re-derives the
+    classification from the payload alone."""
+    row = sealed_at_v1(store, spec, write_transcript, "sess-nav-full", "full")
+
+    fresh = autopsy._upgrade_seal("proj_a", store.project_path, row,
+                                  autopsy.unseal(row))
+
+    assert fresh["payload_v"] == autopsy.PAYLOAD_VERSION
+    assert fresh["turns"][0]["spans"][0]["navigates_source"] is True
+    assert autopsy.from_seal(fresh, spans=[]).nav_profile() == {
+        "symbol_calls": 0, "source_nav_calls": 1, "unclassified": 0}
+
+
+def test_an_upgraded_seal_reports_unclassified_rather_than_zero(store, spec,
+                                                                write_transcript):
+    """The other half, and the lossy one: at `normal` no params were ever sealed, so the
+    command cannot be recovered and the span reports UNCLASSIFIED — absent is not zero
+    (issue #227)."""
+    row = sealed_at_v1(store, spec, write_transcript, "sess-nav-normal", "normal")
+
+    fresh = autopsy._upgrade_seal("proj_a", store.project_path, row,
+                                  autopsy.unseal(row))
+
+    assert fresh["turns"][0]["spans"][0]["navigates_source"] is None
+    assert autopsy.from_seal(fresh, spans=[]).nav_profile() == {
+        "symbol_calls": 0, "source_nav_calls": 0, "unclassified": 1}
+
+
 def test_nothing_to_upgrade_leaves_the_seal_alone(store, spec, write_transcript):
     wo = settled_with_a_session(store, write_transcript, "sess-current")
     Daemon.seal_autopsies(Daemon.__new__(Daemon), spec, store)

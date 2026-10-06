@@ -2419,6 +2419,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
             plural = "call " if row["calls"] == 1 else "calls"
             print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
                   f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+        # §3: the sentence comes from the payload (`inspection.nav_line`), which the
+        # debug page renders too — one wording, never one per renderer.
+        if unit.get("nav_line"):
+            print(f"    {unit['nav_line']}")
 
     # One reader, two surfaces (q1216): the same payload `jarvis navigation` prints,
     # after the tools it is about.
@@ -2427,7 +2431,7 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
 
 #: The two sides, spelled for the eye. Beside `PART_LABELS` for its reason: the strings
 #: live in `cli` because the dashboard reads the payload and not these words. The BEFORE
-#: figure is NOT here — it comes out of the payload (`navigation.BEFORE_NOTE`) so both
+#: figure is NOT here — it comes out of the payload (`nav_volume.BEFORE_NOTE`) so both
 #: surfaces quote the same number.
 NAV_SIDE_LABELS = {"lead": "lead", "subagent": "subagent"}
 
@@ -2436,7 +2440,7 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
     """How this scope navigated code, by side.
 
     THIS RENDERER DERIVES NOTHING. Every number and every share is a value out of
-    `navigation.NavigationVolume.as_dict()`; a renderer that computed one is one the
+    `nav_volume.NavigationVolume.as_dict()`; a renderer that computed one is one the
     dashboard would disagree with (PR 65).
     """
     if not payload:
@@ -2456,13 +2460,16 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
         # None and never 0.0: an unmeasured share is not a zero one.
         share_text = ("not measured — no tool results"
                       if share is None else f"{share * 100:.1f}%")
+        # Neo q1242: branch off the payload's flag — the per-order surface carries no
+        # call counts.
+        calls = (f"  {row['symbol_calls']:>4} symbol  "
+                 f"{row['text_search_calls']:>4} text-search  "
+                 f"{row['nav_bash_calls']:>4} bash-nav "
+                 f"({row['code_nav_bash_calls']} on code)  "
+                 f"{row['read_tool_calls']:>4} Read"
+                 if payload.get("calls_reported", True) else "")
         print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
-              f"{row['transcripts']:>4} transcripts  "
-              f"{row['symbol_calls']:>4} symbol  "
-              f"{row['text_search_calls']:>4} text-search  "
-              f"{row['nav_bash_calls']:>4} bash-nav "
-              f"({row['code_nav_bash_calls']} on code)  "
-              f"{row['read_tool_calls']:>4} Read")
+              f"{row['transcripts']:>4} transcripts{calls}")
         print(f"{indent}           code reads via bash: {share_text} of "
               f"{_tok(row['result_bytes'])} bytes of tool results"
               + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
