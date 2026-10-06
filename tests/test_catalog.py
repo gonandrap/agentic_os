@@ -628,6 +628,19 @@ def test_a_ceiling_below_the_floor_is_refused_at_boot():
             parse_catalog({"os": {"max_os_prompt_chars": bad}, "projects": []})
 
 
+def test_the_knowledge_hint_bounds_round_trip():
+    """Spec test 15 of 2026-10-02-learn-search-returns-an-index.md — a pointer, not a
+    second index, so the defaults are deliberately small and separate from the digest."""
+    from jarvis.catalog import OsConfig
+
+    assert (OsConfig().knowledge_hint_limit, OsConfig().knowledge_hint_chars) == (3, 400)
+    cat = parse_catalog({"os": {"knowledge_hint_limit": 5, "knowledge_hint_chars": 900},
+                         "projects": []})
+    assert (cat.os.knowledge_hint_limit, cat.os.knowledge_hint_chars) == (5, 900)
+    # and the digest budget is untouched by either
+    assert cat.os.knowledge_digest_chars == 4000
+
+
 def test_the_ceiling_has_no_off_switch():
     """A backstop with an off switch is not a backstop: null is refused, not honoured."""
     with pytest.raises(CatalogError, match="max_os_prompt_chars"):

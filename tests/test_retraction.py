@@ -172,6 +172,28 @@ def test_a_retracted_knowledge_entry_is_still_in_the_audit_trail(central):
         r["id"] for r in central.relevant_knowledge("proj_a", include_retired=True)}
 
 
+def test_the_retired_marker_survives_the_search_index_shape(central, capsys):
+    """Spec test 5 of 2026-10-02-learn-search-returns-an-index.md.
+
+    `jarvis learn search` prints index rows now, and a 160-char excerpt is even easier to
+    mistake for standing advice than a headline — so the one field that says the entry was
+    retracted has to survive the shape change.
+    """
+    import json
+
+    from jarvis.cli import build_parser, cmd_learn
+
+    live = central.add_knowledge("deploy from the tag, always", project="proj_a")
+    dead = central.add_knowledge("deploy from the deploy branch", project="proj_a")
+    central.retract_knowledge(dead["id"], "we deploy from tags now")
+
+    cmd_learn(build_parser().parse_args(
+        ["--json", "learn", "search", "deploy", "--project", "proj_a"]))
+    rows = {r["id"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows[dead["id"]]["retired"] == "we deploy from tags now"
+    assert "retired" not in rows[live["id"]]        # the negative control
+
+
 def test_retracting_knowledge_needs_a_reason(central):
     row = central.add_knowledge("deploy from the deploy branch", project="proj_a")
     for blank in ("", "   ", "\n\t"):
