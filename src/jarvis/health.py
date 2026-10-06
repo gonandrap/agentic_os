@@ -33,16 +33,41 @@ TRIGGERS = ("first-look", "changed", "stale", "re-assert", "account-window")
 #: records it, and a typo in either would silently buy a call or silently skip one.
 REASSERT = "re-assert"
 
+#: THE BLOCKER ID FOR EACH TRANSPORT PAUSE CAUSE — the canonical link between the two
+#: vocabularies, and the only place they meet. ONE ID PER CAUSE so a catalog can count a
+#: spent window as an explanation without also excusing an expired sign-in; `usage-limit`
+#: keeps its spelling so catalogs naming it still load (Neo q1241).
+#:
+#: The values are `holds` constant NAMES, resolved by `transport_blockers()`, because the
+#: cause literals must not be re-spelled here and they cannot be imported at module
+#: level: `catalog` imports this module, and `holds` reaches `catalog` through
+#: `worker_session`, so `from .holds import …` here is a circular import.
+_TRANSPORT_CAUSE_NAMES = {
+    "usage-limit": "PAUSE_USAGE_LIMIT",
+    "api-outage": "PAUSE_TRANSIENT",
+    "expired-login": "PAUSE_AUTH",
+}
+
+
+def transport_blockers() -> dict[str, str]:
+    """`_TRANSPORT_CAUSE_NAMES` with each name resolved to the `holds` pause cause."""
+    from . import holds
+
+    return {blocker_id: getattr(holds, name)
+            for blocker_id, name in _TRANSPORT_CAUSE_NAMES.items()}
+
+
 #: THE RE-DERIVABLE REASONS A UNIT IS STANDING STILL, in FIRST-MATCH order, and this
 #: tuple is the vocabulary rather than the policy: which of them COUNT is
 #: `SupervisorConfig.health_reassert_blockers`, a catalog setting (kn-1cec46b5).
 #:
 #: Each id is answered by the existing canonical derivation and nothing new is written —
 #: `user` by `invariants.true_blockers`, `dependency` by `ops.blocked_by`, `pull-request`
-#: by the row's own two columns, `usage-limit` by `holds.held`, `assumptions` by
+#: by the row's own two columns, the three transport ids by `holds.held` against ONE
+#: cause each (`_TRANSPORT_CAUSE_NAMES`), `assumptions` by
 #: `ProjectStore.pending_assumptions`. A reason re-derived here is how two surfaces come
 #: to disagree about one order.
-BLOCKERS = ("user", "dependency", "pull-request", "usage-limit", "assumptions")
+BLOCKERS = ("user", "dependency", "pull-request", *_TRANSPORT_CAUSE_NAMES, "assumptions")
 
 #: A FEATURE's answer, and it is not in `BLOCKERS` because it is not a reason of its own:
 #: it means every non-settled child has one of those above. Not configurable for that
@@ -142,6 +167,7 @@ def _work_order_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | Non
     from . import db, holds, invariants, ops
 
     counts = tuple(getattr(cfg, "health_reassert_blockers", BLOCKERS) or ())
+    causes = transport_blockers()
     for blocker_id in BLOCKERS:
         if blocker_id not in counts:
             continue
@@ -163,11 +189,12 @@ def _work_order_blocker(pstore: Any, row: dict[str, Any], cfg: Any) -> str | Non
         if (blocker_id == "pull-request" and row.get("status") == "waiting_pr_merge"
                 and row.get("pr_url")):
             return blocker_id
-        # All three TRANSPORT pauses, not the usage limit alone: a spent window, an API
-        # outage and an expired sign-in are the same sentence to this decision. `held`
-        # reads the OPEN/CLOSE pairs, so "held right now" is a fact and not a guess.
-        if blocker_id == "usage-limit" and any(
-                h.open and h.cause in holds.TRANSPORT
+        # ONE CAUSE PER ID, never the whole of `holds.TRANSPORT`: a catalog narrowed to
+        # `usage-limit` has explained a spent window and nothing else, so an order held
+        # by an expired sign-in pays (Neo q1241). `held` reads the OPEN/CLOSE pairs, so
+        # "held right now" is a fact and not a guess.
+        if blocker_id in causes and any(
+                h.open and h.cause == causes[blocker_id]
                 for h in holds.held(pstore, row["id"], now=db.now())):
             return blocker_id
         # LAST, and reachable only where `user` declined it: `true_blockers` suppresses

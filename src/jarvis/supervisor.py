@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Any
 
-from . import claude_cli, structured
+from . import claude_cli, health, holds, structured
 
 log = logging.getLogger("supervisor")
 
@@ -572,11 +572,16 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
 #: sentences are the OS's own, because this is a line a judge WEIGHS: alarm al-4bb82f7e
 #: said "the packet does not show why" about an order correctly waiting on a dependency,
 #: and the reason was a column the OS already held.
+#:
+#: The three TRANSPORT ids say WHICH hold it is, and the words are READ FROM
+#: `holds.HOLD_CAUSES` rather than written again here (Neo q1241): the same packet shows
+#: the hold line, and a second wording of one cause drifts from it.
 BLOCKED_SENTENCES = {
     "user": "it is waiting on a decision only the user can take",
     "dependency": "it is waiting on a dependency that has not completed",
     "pull-request": "its work is delivered and its pull request has not merged yet",
-    "usage-limit": "the account is holding it — a usage limit, an outage or a sign-in",
+    **{blocker_id: f"the account is holding it — {holds.HOLD_CAUSES[cause]}"
+       for blocker_id, cause in health.transport_blockers().items()},
     "assumptions": "an assumption of its own is still waiting to be reviewed",
     "children": "every child of it that has not settled is itself blocked",
 }

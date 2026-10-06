@@ -911,6 +911,19 @@ def test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one(
                                           if l.startswith("this session is"))) + 1
 
 
+def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
+    """Three ids, three sentences, and the words come from `holds.HOLD_CAUSES` — the one
+    place the OS says what a hold IS. Re-typed here they would drift from the hold line
+    the same packet shows (Neo q1241)."""
+    from jarvis import health, holds
+
+    for blocker_id, cause in health.transport_blockers().items():
+        assert holds.HOLD_CAUSES[cause] in supervisor.BLOCKED_SENTENCES[blocker_id]
+    assert len({supervisor.BLOCKED_SENTENCES[b]
+                for b in health.transport_blockers()}) == 3
+    assert set(supervisor.BLOCKED_SENTENCES) == {*health.BLOCKERS, health.CHILDREN}
+
+
 def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_was_not(
         started, monkeypatch, tmp_path):
     """§4 of docs/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which

@@ -1358,13 +1358,24 @@ def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
     store.update_work_order(parked, pr_url="")
     assert health.blocker(store, subject(parked), cfg) is None
 
-    # 4. `usage-limit` — an OPEN `holds.Hold` whose cause is in `holds.TRANSPORT`.
-    held = _wo(store, "held", status="running")
-    with monkeypatch.context() as m:
-        m.setattr(db_mod, "now", lambda: time.time() - 600)
-        store.add_event(held, "turn_paused",
-                        {"seq": 1, "reason": worker_session.PAUSE_USAGE_LIMIT})
-    assert health.blocker(store, subject(held), cfg) == "usage-limit"
+    # 4. ONE ID PER TRANSPORT CAUSE, each an OPEN `holds.Hold` of its own cause (Neo
+    # q1241). Collapsed under `usage-limit` they could not be narrowed apart.
+    from jarvis import holds
+
+    assert set(health.transport_blockers().values()) == holds.TRANSPORT, (
+        "a fourth transport cause fails here, not as an unexplained stall")
+    for cause, expected in ((worker_session.PAUSE_USAGE_LIMIT, "usage-limit"),
+                            (worker_session.PAUSE_TRANSIENT, "api-outage"),
+                            (worker_session.PAUSE_AUTH, "expired-login")):
+        held = _wo(store, f"held by {cause}", status="running")
+        with monkeypatch.context() as m:
+            m.setattr(db_mod, "now", lambda: time.time() - 600)
+            store.add_event(held, "turn_paused", {"seq": 1, "reason": cause})
+        assert health.blocker(store, subject(held), cfg) == expected
+        narrowed = catalog.SupervisorConfig(health_reassert_blockers=("usage-limit",))
+        assert health.blocker(store, subject(held), narrowed) == (
+            expected if expected == "usage-limit" else None), (
+            "a catalog naming only the usage limit has said nothing about the others")
 
     # 5. `assumptions` — `pstore.pending_assumptions`, where rule 1 declined it.
     asking = _wo(store, "asking", status="running")
@@ -1391,6 +1402,38 @@ def test_a_narrowed_blocker_set_buys_the_stale_call_again(
     assert len(_health_calls(fake_claude)) == 2
     assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
            ["first-look", "stale"]
+
+
+def test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login(
+        started, catalog_file, fake_claude, store, clock):
+    """WHY THE TRANSPORT BLOCKER IS THREE IDS (Neo q1241): a project that counts a spent
+    window as an explanation has said nothing about an expired sign-in, and under one
+    collapsed id that order was re-asserted free."""
+    from jarvis import health, worker_session
+
+    _enable(catalog_file, health_reassert_blockers=["usage-limit"])
+    wo_id = _wo(store, "signed out", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(wo_id, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_AUTH})
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+    # The other half of the narrowing: the cause the catalog DID name goes free.
+    spent = _wo(store, "window spent", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(spent, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_USAGE_LIMIT})
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+    assert [r["trigger"] for r in _reviews(store, subject_id=spent)] == \
+           ["first-look", health.REASSERT]
 
 
 def test_a_re_assertion_does_not_spend_a_paid_slot(

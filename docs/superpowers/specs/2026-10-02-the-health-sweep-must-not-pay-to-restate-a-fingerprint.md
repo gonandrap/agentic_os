@@ -1,7 +1,7 @@
 # The health sweep must not pay to restate a fingerprint
 
 Work order wo-deaf566b. Evidence: kn-f1ef52df (io-edacb3ea), alarm al-4bb82f7e, Neo
-questions 1040 and 1217, standing rule kn-1cec46b5.
+questions 1040, 1217 and 1241, standing rule kn-1cec46b5.
 
 ## The problem
 
@@ -77,7 +77,7 @@ It lives in `health.py` and not in `supervisor.py` because `due` is the only con
 that must stay pure, and a helper in the module that owns the spend decision cannot be
 bypassed by a caller that forgets it.
 
-Five blocker ids, evaluated in this order, FIRST MATCH WINS. Each comes from the
+Seven blocker ids, evaluated in this order, FIRST MATCH WINS. Each comes from the
 existing canonical re-derivation — nothing new is written:
 
 1. `user` — `invariants.true_blockers(pstore, row)` non-empty (invariants.py:856). That
@@ -96,17 +96,66 @@ existing canonical re-derivation — nothing new is written:
 3. `pull-request` — `row["status"] == "waiting_pr_merge"` and `row["pr_url"]` set. Pure
    row read, no network: `github.pr_view` is the daemon's poll, never an invariant's or a
    sweep's. `pr_state == 'CLOSED'` cannot reach here — the status gate plus rule 1 above.
-4. `usage-limit` — any OPEN `holds.Hold` whose `cause` is in `holds.TRANSPORT`
-   (holds.py:68, 198-209). That function is documented cheap enough to run per running
-   work order per reconcile tick (holds.py:202-204), and it reads the OPEN/CLOSE event
-   pairs rather than inferring a gap (holds.py:17-23) — so "held right now" is a fact,
-   not a guess. All three transport pauses, not just the usage limit: a spent window, an
-   API outage and an expired sign-in are the same sentence to this decision.
-5. `assumptions` — `pstore.pending_assumptions(row["id"])` non-empty
+4. `usage-limit` — an OPEN `holds.Hold` whose `cause` is `holds.PAUSE_USAGE_LIMIT`
+   (`"usage_limit"`).
+5. `api-outage` — an OPEN hold whose `cause` is `holds.PAUSE_TRANSIENT` (`"transient"`).
+6. `expired-login` — an OPEN hold whose `cause` is `holds.PAUSE_AUTH` (`"auth"`).
+7. `assumptions` — `pstore.pending_assumptions(row["id"])` non-empty
    (project_store.py:4465). Last, and reachable only where rule 1 declined it —
    `true_blockers` suppresses the assumptions line while `neo_reviews_later` holds
    (invariants.py:872-884), and an assumption with Neo is still a re-derivable reason the
    unit is still.
+
+4-6 share one read, `holds.held` (holds.py:198-209), documented cheap enough to run per
+running work order per reconcile tick (holds.py:202-204) and reading the OPEN/CLOSE event
+pairs rather than inferring a gap (holds.py:17-23) — so "held right now" is a fact, not a
+guess.
+
+**One id per transport cause, not one for all three** (Neo question 1241, Option B). The
+three `holds.TRANSPORT` causes (holds.py:68) have different remedies and different
+expected durations: a spent window clears itself on a known deadline, an API outage
+clears itself on an unknown one, and an expired sign-in clears only when a person runs
+`/login` and may therefore never clear at all (worker_session.py:1096-1108). (e) lets a
+catalog narrow the set, and a single id makes the one narrowing a project would actually
+want unsayable: *a spent window explains stillness, an expired sign-in does not.* Under
+one id those two are indistinguishable, so a project either pays to restate both or goes
+free on both.
+
+The ids are hyphenated, like `pull-request`. `usage-limit` keeps that exact spelling —
+not `usage_limit` matching the cause — because catalogs already name it and renaming it
+would break them.
+
+The link between an id and its cause is ONE module-level map in `health.py`, beside
+`blocker`, plus one resolver:
+
+```python
+_TRANSPORT_CAUSE_NAMES = {
+    "usage-limit": "PAUSE_USAGE_LIMIT",
+    "api-outage": "PAUSE_TRANSIENT",
+    "expired-login": "PAUSE_AUTH",
+}
+
+
+def transport_blockers() -> dict[str, str]:
+    """`_TRANSPORT_CAUSE_NAMES` with each name resolved to the `holds` pause cause."""
+    from . import holds
+
+    return {blocker_id: getattr(holds, name)
+            for blocker_id, name in _TRANSPORT_CAUSE_NAMES.items()}
+```
+
+The values are the `holds` constant NAMES rather than the constants themselves because a
+module-level `from .holds import …` in `health.py` CANNOT import: `catalog.py:13` does
+`from . import health as health_mod`, `holds:63` does `from .worker_session import
+PAUSE_*` and `worker_session:53` does `from .catalog import ProjectSpec`, so the chain
+raises `ImportError: cannot import name 'ProjectSpec' from partially initialized module
+'jarvis.catalog'`. `transport_blockers()` imports `holds` lazily inside the function,
+which is also why no cause literal is ever re-spelled: every consumer calls the resolver.
+
+Canonical, and the reason it is a map and not three `if` branches: its values must cover
+`holds.TRANSPORT` exactly, which is one assertion (test 7) rather than a review. The
+catalog's known-id list in (e) is derived from it too, so a fourth transport cause added
+to `holds` later fails loudly in one place instead of going silently unexplained.
 
 Feature orders. The helper takes a `subject` dict, so it must answer for
 `kind == "feature_order"` too — fo-ac00376e's triple repeat is in the evidence. Rule:
@@ -210,7 +259,7 @@ prompt or a broken transport still produces failures to count. Pinned by
 
 `supervisor.health_reassert_blockers` on `catalog.SupervisorConfig`
 (src/jarvis/catalog.py:1164-1203): a whole immutable `tuple[str, ...]` of blocker ids,
-defaulting to all five, addressed as one list the way `supervisor.probes`
+defaulting to all seven, addressed as one list the way `supervisor.probes`
 (catalog.py:1187-1191) and `supervisor.remedies.allowed` (catalog.py:1146-1161) are.
 Never a module constant — Neo question 1217's one condition, and kn-1cec46b5's standing
 rule.
@@ -220,8 +269,10 @@ Parsed by a new `_parse_blockers(raw, base, where)` alongside `_parse_remedies`
 inheritance, a non-list refused as `'"{where}" must be a list of blocker ids'`, and an
 unknown id a `CatalogError` naming the known ids — `GateConfig.parse`'s rule and
 `_parse_remedies`' reason (catalog.py:1919-1922): a permission the user believes they set,
-silently unset, is the failure the whole block exists to prevent. Wired in
-`_parse_supervisor` (catalog.py:2029-2037) beside `probes` and `remedies`.
+silently unset, is the failure the whole block exists to prevent. The known-id list
+includes the three transport ids from `health.transport_blockers()`, read from it rather
+than re-spelled. Wired in `_parse_supervisor` (catalog.py:2029-2037) beside `probes` and
+`remedies`.
 
 **The trap:** `health_reassert_blockers` MUST be added to `_SUPERVISOR_NON_NUMERIC`
 (catalog.py:1913). That set's own comment says what happens otherwise — the reflective
@@ -239,6 +290,12 @@ In `build_evidence`'s work-order section (supervisor.py:631-639), after the
 ```
 blocked: <the sentence for that id>
 ```
+
+For the three transport ids the sentence is READ FROM `holds.HOLD_CAUSES`
+(holds.py:78-87) — "a fleet usage limit", "a Claude API outage", "an expired Claude Code
+sign-in" — via `transport_blockers()`, never re-spelled here. That table exists precisely
+so "the report, the alarm and the dashboard cannot call one hold three different things"
+(holds.py:75-77), and the packet is a fourth surface.
 
 ABSENT when there is no blocker — not empty, not `blocker: none`. Two reasons: an
 unblocked order's packet keeps its current bytes, and a line asserting the absence of a
@@ -293,9 +350,13 @@ Each names what it would catch. In `tests/test_health_sweep.py` unless stated.
    through the free path.
 7. `test_each_blocker_id_comes_from_its_canonical_source` — a pure unit test per id
    against `health.blocker`: an unmet dependency, a `waiting_pr_merge` order with a
-   `pr_url`, an order with a pending assumption, a live `turn_paused`/usage-limit hold,
-   and one `true_blockers` case; plus None on a plain `running` order. Catches a reason
-   re-derived locally instead of reused, which is how two surfaces come to disagree.
+   `pr_url`, an order with a pending assumption, one `true_blockers` case, and a live
+   hold per transport cause asserted SEPARATELY — `usage_limit` yields `usage-limit`,
+   `transient` yields `api-outage`, `auth` yields `expired-login`; plus None on a plain
+   `running` order. Also asserts `set(health.transport_blockers().values()) ==
+   holds.TRANSPORT`, so a fourth transport cause added to `holds` fails here instead of
+   becoming an unexplained stall. Catches a reason re-derived locally instead of reused,
+   which is how two surfaces come to disagree, and an id wired to the wrong cause.
 8. `test_the_blocker_set_is_the_catalogs_to_narrow` — an unknown id raises `CatalogError`
    naming the known ids; a project override replaces the list field-by-field while the
    rest of `os.supervisor` is inherited; a project that disables `dependency` gets a PAID
@@ -310,11 +371,19 @@ Each names what it would catch. In `tests/test_health_sweep.py` unless stated.
    row as a dark sweep.
 10. `test_the_work_order_packet_names_a_blocker_and_stays_silent_without_one` — in
     `tests/test_supervisor.py`: the blocked order's packet contains the `blocked:` line,
-    and `EXPECTED_WORK_ORDER_PACKET` still matches byte for byte for the unblocked one.
-    Catches the `blocker: none` shape, which would reprice every cached review.
+    the sentence for a held order is the `holds.HOLD_CAUSES` string verbatim, and
+    `EXPECTED_WORK_ORDER_PACKET` still matches byte for byte for the unblocked one.
+    Catches the `blocker: none` shape, which would reprice every cached review, and a
+    hold sentence re-spelled in the packet.
 11. `test_a_re_assertion_does_not_spend_a_paid_slot` — a project at
     `health_max_units_per_tick=1` with one blocked re-assert candidate and one changed
     unit: both are handled in one tick, one call. Catches the cap starving paid looks.
+12. `test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login` — a project with
+    `health_reassert_blockers: ["usage-limit"]`; a stale unchanged `findings` order held
+    by an OPEN `auth` hold buys exactly ONE more call, and the same order held by a
+    `usage_limit` hold is re-asserted for free. This is the narrowing the split exists
+    for; catches a re-collapse of the three causes under one id, which would make both
+    halves behave the same and leave the distinction unsayable.
 
 **Note for the test author:** `catalog._parse_supervisor` refuses every supervisor
 integer below 1 (catalog.py:2038-2040), so the stale clause is unreachable by
@@ -335,6 +404,11 @@ CHECKLIST, because the sweep shares `SUPERVISOR_PERSONA` with the cost review.
 * **Raise `health_stale_minutes`.** Buys quiet by watching less. The unit then sits
   unlooked-at for longer whether or not anything is known about it, and the paid
   restatement still arrives — later, at the same price. The defect is not the cadence.
+* **One `usage-limit` id covering all three `holds.TRANSPORT` causes.** Shorter list, one
+  `in TRANSPORT` test, and it was this spec's first answer — rejected by the user and by
+  Neo question 1241. It destroys the only narrowing a project would reach for: a spent
+  window explains stillness and an expired sign-in does not, and under one id a catalog
+  cannot say so. It also lies by name, calling an outage a usage limit in the packet.
 * **Let `due` call `health.blocker` itself.** Shorter call site, and it destroys the one
   property that makes the spend decision testable without a store (health.py:98-100).
   Every `due` test would need a `pstore`.
@@ -368,6 +442,3 @@ CHECKLIST, because the sweep shares `SUPERVISOR_PERSONA` with the cost review.
    keep feature orders out of the gate entirely — always paid, never re-asserted — which
    is strictly safer and leaves part of the measured waste in place. Recommend the
    children rule; flagging it rather than burying it.
-2. Whether `usage-limit` should cover all three `holds.TRANSPORT` causes or the usage
-   limit alone. Specified as all three above; it is a one-line change either way, and the
-   catalog setting in (e) lets a project decide if the question turns out to matter.
