@@ -46,6 +46,13 @@ HEADLINE_CHARS = 160
 # base as consulted and destroy the one number that says which entries earn their place.
 AIMED_VERBS = ("show", "search")
 
+#: How many words a work-order title has to carry for a search built out of it to mean
+#: anything. Below this the query is words like "fix the", which match a large share of the
+#: base — enough to manufacture a title "match" for every short title. Used twice, by
+#: `knowledge_brief`'s hint tier and by `ops.knowledge_usage_report`'s `could_have_read`;
+#: it lives here because the store cannot import `ops` (layering runs stores upward only).
+MISSED_MIN_WORDS = 3
+
 
 def split_tags(tags: str) -> list[str]:
     return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
@@ -86,12 +93,17 @@ class KnowledgeBrief:
     entries that were curated as unmissable, `digest` carries headlines + ids so the
     worker can fetch what it needs, and `overflow` names the topics that did not fit
     so nothing is silently invisible.
+
+    `hints` is the one relevance-driven tier: entries whose text matches the work order's
+    own TITLE, which is how an entry sitting in `overflow` gets pointed at instead of
+    waiting for the worker to guess a search term.
     """
     project: str
     total: int = 0
     pinned: list[dict[str, Any]] = field(default_factory=list)
     digest: list[dict[str, Any]] = field(default_factory=list)
     overflow: list[tuple[str, int]] = field(default_factory=list)
+    hints: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def overflow_count(self) -> int:
@@ -230,6 +242,8 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     -- docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
     prompt_chars INTEGER NOT NULL DEFAULT 0,
     system_prompt_chars INTEGER NOT NULL DEFAULT 0,
+    -- How long the call took. NULLABLE — also in ADDED_COLUMNS, where the reasoning is.
+    latency_ms INTEGER,
     usage_json TEXT
 );
 -- What the OS believes is a privileged action, and what it has LEARNED is not.
@@ -486,6 +500,12 @@ ADDED_COLUMNS = {
         # pre-existing row means NOT MEASURED, never "an empty prompt".
         "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
+        # How long the call took, in milliseconds — §3 of
+        # docs/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
+        # beside it: 0 chars of prompt is impossible so 0 can safely mean "not measured"
+        # there, whereas a sub-millisecond call rounds to 0 and the report must not print
+        # "0 ms" for a call nobody timed.
+        "latency_ms": "INTEGER",
     },
 }
 
@@ -987,7 +1007,9 @@ class CentralStore:
 
     def knowledge_brief(self, project: str, pinned_limit: int = 8,
                         digest_limit: int = 40,
-                        digest_chars: int = 4000) -> KnowledgeBrief:
+                        digest_chars: int = 4000, title: str = "",
+                        hint_limit: int = 3,
+                        hint_chars: int = 400) -> KnowledgeBrief:
         """Build the bounded prompt view of the knowledge base.
 
         Cost is capped by `pinned_limit` + `digest_chars` no matter how large the base
@@ -997,6 +1019,12 @@ class CentralStore:
         entries never appear. An index headline is still the prompt — retracting a
         ruling has to remove it from the map as well as from the payload, or the worker
         reads the superseded headline and goes looking for the entry behind it.
+
+        `title` is the only relevance input the selection has — everything else is recency
+        and topic round-robin, which is exactly why a term-matched entry tends to land in
+        `overflow`. With `title == ""` this behaves as it always did, down to the byte:
+        `validation._round`'s shared prefix and `ops._index_cost` both call it positionally
+        with the project only and must keep measuring the same prompt.
         """
         brief = KnowledgeBrief(project=project, total=self.count_knowledge(project))
         if brief.total == 0:
@@ -1044,7 +1072,35 @@ class CentralStore:
             ((t, len(rows)) for t, rows in by_topic.items() if rows),
             key=lambda kv: (-kv[1], kv[0]),
         )
+        brief.hints = self._title_hints(project, title, hint_limit, hint_chars,
+                                        already={r["id"] for r in brief.pinned}
+                                        | {r["id"] for r in brief.digest})
         return brief
+
+    def _title_hints(self, project: str, title: str, hint_limit: int, hint_chars: int,
+                     already: set[str]) -> list[dict[str, Any]]:
+        """Entries whose text matches the work order's own title: headline + id, bounded.
+
+        No `ts` filter, unlike `ops.knowledge_usage_report`'s `could_have_read`. That one
+        excludes entries newer than the order so an order is not blamed for failing to read
+        what it wrote itself; at dispatch there is no "itself" yet, and filtering would drop
+        the newest lessons — the ones a fresh order most needs.
+        """
+        if not title or hint_limit <= 0 or len(title.split()) < MISSED_MIN_WORDS:
+            return []
+        hints: list[dict[str, Any]] = []
+        spent = 0
+        for row in self.search_knowledge(title, limit=hint_limit, project=project):
+            # An entry already in the index must not be printed twice, and a retracted one
+            # is not a hint — the prompt feed never carries retired entries.
+            if row.get("retired_at") or row["id"] in already:
+                continue
+            line = headline(row["content"])
+            if len(hints) >= hint_limit or spent + len(line) > hint_chars:
+                break
+            spent += len(line)
+            hints.append({**row, "headline": line})
+        return hints
 
     # -- who reads the knowledge base --------------------------------------------------
 
@@ -1705,7 +1761,8 @@ class CentralStore:
                        label: str = "", model: str = "", question_id: int | None = None,
                        ok: bool = True, session_id: str = "",
                        usage: dict[str, Any] | None = None,
-                       prompt_chars: int = 0, system_prompt_chars: int = 0) -> int:
+                       prompt_chars: int = 0, system_prompt_chars: int = 0,
+                       latency_ms: int | None = None) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
         `usage` is a `claude_cli.derive_turn_usage` envelope, or None for a call that
@@ -1713,19 +1770,23 @@ class CentralStore:
         still WORTH WRITING: it says a call was made and cost something unknown, which
         is a different fact from no call at all, and `ok=False` is what tells a reader
         which. Token columns stay zero there, so it cannot inflate a total.
+
+        `latency_ms=None` is "nobody timed this call" and stays NULL — §3 of
+        docs/specs/2026-10-01-neo-observability.md.
         """
         u = usage or {}
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,
                                         cache_write, cache_read, output,
-                                        prompt_chars, system_prompt_chars, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        prompt_chars, system_prompt_chars, latency_ms,
+                                        usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
              session_id,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
-             prompt_chars, system_prompt_chars,
+             prompt_chars, system_prompt_chars, latency_ms,
              db.to_json(usage) if usage else None),
         )
         return int(cur.lastrowid or 0)
@@ -1802,6 +1863,70 @@ class CentralStore:
                            AS cache_5m
                 FROM agent_calls {clause}
                 GROUP BY wo_id, kind, label, model""", params).fetchall())
+
+    def agent_call_totals_by_day(self, project: str | None = None,
+                                 since: float | None = None,
+                                 kinds: Sequence[str] | None = None,
+                                 ) -> list[dict[str, Any]]:
+        """`agent_call_totals`' windowed sibling, keyed on (kind, project, day, model).
+
+        A separate query rather than a widened one — §4 of
+        docs/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
+        asked on every cost report, and the key it groups on (`wo_id`) is the one this
+        report never wants. The DAY BUCKET IS SQL's, as the sums beside it already are.
+
+        `model` stays in the key because the caller prices each group at its own model's
+        list rate, which is what `_priced_group` needs and what a blended rate destroys.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        if kinds:
+            where.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT kind, project, model,
+                       strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS calls, SUM(cost_usd) AS cost_usd,
+                       SUM(input) AS input, SUM(cache_write) AS cache_write,
+                       SUM(cache_read) AS cache_read, SUM(output) AS output,
+                       SUM(1 - ok) AS failed,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
+                           AS cache_1h,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
+                           AS cache_5m
+                FROM agent_calls {clause}
+                GROUP BY kind, project, day, model
+                ORDER BY day""", params).fetchall())
+
+    def agent_call_latencies(self, project: str | None = None,
+                             since: float | None = None,
+                             kinds: Sequence[str] | None = None,
+                             ) -> list[dict[str, Any]]:
+        """One row per call in the window: its kind and its `latency_ms`, NULL included.
+
+        Percentiles are computed in Python by the caller — SQLite has none, and the row
+        count is bounded by the window (§4 of the spec above). NULL rows travel because
+        "how much of this window is blind" is a figure the report prints.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        if kinds:
+            where.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT kind, latency_ms FROM agent_calls {clause}", params).fetchall())
 
     # -- os state ----------------------------------------------------------------------
 

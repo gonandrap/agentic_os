@@ -71,6 +71,25 @@ def bash_first_env(bash_first: str) -> dict[str, str]:
     return {BASH_FIRST_ENV: "true", BASH_FIRST_VARIANT_ENV: bash_first}
 
 
+# Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full
+# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md records the probes.
+TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+
+
+def tool_search_env(tool_search: str) -> dict[str, str]:
+    """The env for one `worker.tool_search` value — spec §4.
+
+    STRINGS, every one: Claude Code's `env` is a `Record<string,string>` and an integer
+    risks the CLI rejecting the whole settings file. `cli` writes NOTHING, which is the
+    state where Jarvis leaves the vendor's own answer alone.
+    """
+    if tool_search == "cli":
+        return {}
+    if tool_search == "off":
+        return {TOOL_SEARCH_ENV: "false"}
+    return {TOOL_SEARCH_ENV: "true"}
+
+
 def serena_allow_rules() -> list[str]:
     """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
     return [f"{prefix}{tool}"
@@ -186,6 +205,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # answer is fixed at spawn, and a per-call catalog read would be a second
         # source of truth that can disagree with the settings beside it.
         "JARVIS_SERENA": "1" if serena else "0",
+        # Whether the navigation briefing may say the symbol tools are DEFERRED —
+        # `jarvis brief navigation` is a separate process and would otherwise tell the
+        # worker to make a `ToolSearch` call for tools already in its tool list. Env for
+        # `JARVIS_SERENA`'s reason (spec 2026-10-02-serena-the-cheap-path.md §4).
+        "JARVIS_TOOL_SEARCH": project.worker.tool_search,
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
         # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
@@ -231,6 +255,9 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # permission mode: the steer only exists under `auto`, and a per-mode conditional
         # would be a second source of truth about a vendor behaviour.
         **bash_first_env(project.worker.bash_first),
+        # WHETHER THIS WORKER'S SYMBOL TOOLS ARE LISTED OR DEFERRED (spec
+        # 2026-10-02-serena-the-cheap-path.md §4). Here for `MCP_TOOL_TIMEOUT`'s reason.
+        **tool_search_env(project.worker.tool_search),
         # Whether the lead must delegate its file edits to the crew (§7 of that spec).
         # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
         # write and must not parse the catalog to decide it has nothing to do.
@@ -278,8 +305,10 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         "touches what you are about to do, FETCH IT — before you act on it, and before "
         "you ask Neo or record an assumption about it:",
         "```bash",
-        f'jarvis learn search "<term>" --project {project_name}  # full text of matches',
-        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f'jarvis learn search "<term>" --project {project_name}  # finds and ranks '
+        f"matches: headline, id and a matching line",
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries — the ONLY "
+        "verb that returns a body",
         f"jarvis learn list --project {project_name} --topic <t>  # everything in a topic",
         f"jarvis learn topics --project {project_name}  # what topics exist",
         "```",
@@ -290,6 +319,21 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
         for k in brief.pinned:
             topic = f" [{k['topic']}]" if k["topic"] else ""
             lines.append(f"- ({k['project'] or 'global'}{topic}) {k['content']}")
+    if brief.hints:
+        # Above the index, because it is the most relevant thing in the section; below it
+        # this would read as a footnote. Labelled as evidence rather than as a verdict —
+        # the rule `knowledge_usage_report` already states for `could_have_read`, and
+        # without the label a lexical coincidence reads as an instruction.
+        lines += [
+            "",
+            "## Matched your work order's TITLE — a HINT, not an instruction",
+            "These entries' text matches words from your title. That is EVIDENCE they may "
+            "be relevant, NOT a verdict that they apply: read them and decide. Headline "
+            "and id only — `jarvis learn show <id>` for the body.",
+        ]
+        for k in brief.hints:
+            scope = "" if k["project"] == project_name else " (global)"
+            lines.append(f"- `{k['id']}`{scope} {k['headline']}")
     if brief.digest:
         lines += ["", "## Index — headline only, `jarvis learn show <id>` for the rest"]
         current = object()
@@ -306,7 +350,8 @@ def render_knowledge_block(brief: KnowledgeBrief, project_name: str) -> list[str
             f"## Not indexed above — {brief.overflow_count} further entries, by topic",
             f"{listed}",
             f"Reach them with `jarvis learn list --project {project_name} --topic <topic>` "
-            f"or `jarvis learn search`.",
+            f"or `jarvis learn search \"<term>\"`, which ranks matches and gives you ids to "
+            f"`jarvis learn show`.",
         ]
     return lines
 
@@ -428,7 +473,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         # Spec 2026-10-01-the-steer-that-beat-the-brief.md §3 — its own top-level block
         # after the index, never inside the core.
         *(["", *nav] if (nav := worker_brief.navigation_core(
-            wiring.serena_wired(project.wiring))) else []),
+            wiring.serena_wired(project.wiring),
+            tool_search=project.worker.tool_search)) else []),
     ]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -444,13 +490,13 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(parts)
 
 
-def _navigation_briefing(serena: bool = True) -> list[str]:
+def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[str]:
     """Serena before grep — the full text lives in `worker_brief` (single source
     with `jarvis brief navigation`); this shape survives for the planner's
     `_common_briefing` tail."""
     from . import worker_brief
 
-    return worker_brief.navigation_section(serena).splitlines()
+    return worker_brief.navigation_section(serena, tool_search=tool_search).splitlines()
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
@@ -464,7 +510,8 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     """
     from . import wiring
 
-    parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring))]
+    parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring),
+                                       tool_search=project.worker.tool_search)]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]
@@ -690,7 +737,8 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         # go and read one
         *([f"- READ the OS knowledge base before you decompose — it is indexed at the "
            f"end of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`. A plan built "
+           f"--project {project.name}` finds and ranks matching entries, then "
+           f"`jarvis learn show <id>` returns the body. A plan built "
            f"without it will hand children the lessons the fleet already paid for, "
            f"again."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
@@ -805,8 +853,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- `jarvis cost <project|wo-id|fo-id>` — what it cost, split worker vs Jarvis",
         "- `jarvis alarms [project]` — turns the OS raised while they burned",
         "- `jarvis issues [project]` — tracker issues the fleet keeps hitting",
-        "- `jarvis learn search \"<term>\"` / `jarvis learn show <id>` — what the fleet "
-        "already knows",
+        "- `jarvis learn search \"<term>\"` — which of the fleet's entries match, by "
+        "headline and id; `jarvis learn show <id>` then returns the body",
         "- `gh pr view <url>` / `gh pr diff <url>` — a pull request and what it changed",
         *(["",
            "## The evidence you were given",
@@ -884,7 +932,8 @@ def _analyst_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+           f"--project {project.name}` ranks the matching entries and gives you their "
+           f"ids, `jarvis learn show <id>` returns a body."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         "- Hit a bug in Jarvis OS itself? Use your `report-jarvis-bug` skill, then carry "
@@ -999,8 +1048,11 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "leaves the OS blind is refused.",
         "",
         "# The verdict",
-        f"Write it to `verdict.json` in your worktree root — that filename exactly, it is "
-        f"the one path you are permitted to write — and submit it with the command below, "
+        f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
+        f"that filename exactly, it is the one path you are permitted to write, and "
+        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`: a "
+        f"shell heredoc that writes a file is refused for every worker in the fleet "
+        f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
         f"settles this work order for you. `--from-file` and not inline flags, because "
         f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "
@@ -1073,7 +1125,8 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Work only inside your worktree (you start in it).",
         *([f"- READ the OS knowledge base before you diagnose — it is indexed at the end "
            f"of this prompt, not pasted into it: `jarvis learn search \"<term>\" "
-           f"--project {project.name}` and `jarvis learn show <id>`."] if knowledge else []),
+           f"--project {project.name}` ranks the matching entries and gives you their "
+           f"ids, `jarvis learn show <id>` returns a body."] if knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         "",
@@ -1202,7 +1255,8 @@ def _manager_prompt(wo: dict[str, Any], project: ProjectSpec,
         "- Do not run `jarvis wo finish` and do not open a pull request. Neither applies "
         "to you.",
         f"- Read what the fleet already knows before you decide anything: `jarvis learn "
-        f"search \"<term>\" --project {project.name}`."
+        f"search \"<term>\" --project {project.name}` for the matching headlines and ids, "
+        f"then `jarvis learn show <id>` for a body."
         if knowledge else
         f"- Record what you learn: `jarvis learn add \"...\" --project {project.name}`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
@@ -1324,6 +1378,9 @@ def dispatch_work_order(
         pinned_limit=cfg.knowledge_inject_limit,
         digest_limit=cfg.knowledge_digest_limit,
         digest_chars=cfg.knowledge_digest_chars,
+        title=wo["title"],
+        hint_limit=cfg.knowledge_hint_limit,
+        hint_chars=cfg.knowledge_hint_chars,
     )
     prompt = build_worker_prompt(wo, project, knowledge,
                                  design_doc=materialize_design_doc(store, project, wo),

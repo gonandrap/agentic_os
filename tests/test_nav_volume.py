@@ -338,8 +338,15 @@ def test_the_fleet_report_requires_an_explicit_scope(tree):
     `jarvis navigation` must not walk it."""
     from jarvis import ops
 
-    with pytest.raises(ops.OpsError, match="--fleet"):
+    # Against the CONSTANT, not a copy of its words: the CLI and the dashboard quote
+    # that string, so a reworded refusal must fail here and nowhere else.
+    with pytest.raises(ops.OpsError) as caught:
         ops.navigation_report()
+    assert str(caught.value) == ops.NAVIGATION_NEEDS_SCOPE
+
+    with pytest.raises(ops.OpsError) as explicit:
+        ops.navigation_report(None, None, fleet=False)
+    assert str(explicit.value) == ops.NAVIGATION_NEEDS_SCOPE
 
 
 def test_the_cli_prints_the_shares_and_the_before_line(tree, capsys):
@@ -401,3 +408,64 @@ def test_the_cli_fleet_path_runs_end_to_end(tree, capsys):
     assert args.fleet is True
     assert payload["scope"] == "fleet"
     assert payload["sides"]["lead"]["code_nav_bash_calls"] == 1
+
+
+def test_both_reports_resolve_a_target_through_one_helper(monkeypatch):
+    """`jarvis inspect` and `jarvis navigation` must never disagree about what an id
+    means, so the feature-order-first lookup is written once and the ONLY difference is
+    explicit: whether a target that is no id at all may be read as a project name."""
+    from jarvis import ops
+
+    tried: list[str] = []
+
+    def no_feature(target, project=None):
+        tried.append("feature_order")
+        raise ops.OpsError("no such feature order")
+
+    def no_work_order(target, project=None):
+        tried.append("work_order")
+        raise ops.OpsError("no such work order")
+
+    monkeypatch.setattr(ops, "find_feature_order", no_feature)
+    monkeypatch.setattr(ops, "find_work_order", no_work_order)
+
+    # `navigation`'s third resolution, and it is the only thing the flag changes.
+    assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
+        ops._TARGET_PROJECT, None, None, None)
+    assert tried == ["feature_order", "work_order"]
+
+    # `inspect`'s: a target that resolves to nothing is the work-order lookup's error,
+    # unchanged, because there is no third thing a time report could mean.
+    with pytest.raises(ops.OpsError, match="no such work order"):
+        ops._resolve_report_target("proj_a", None)
+
+
+def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, capsys):
+    """END TO END through `cmd_navigation`'s renderer, which `--json` never reaches.
+
+    The counts are asserted against the PAYLOAD as well as against literals, so a
+    renderer that derived its own number — summing both sides, or re-reading the tree —
+    fails here rather than disagreeing with the dashboard (PR 65). The FLEET surface,
+    because only that payload carries call counts (`calls_reported`, Neo q1242).
+    """
+    from jarvis import cli, ops
+
+    tree("s9", [tool_use_row("t1", "mcp__serena__find_symbol", name_path_pattern="x"),
+                tool_result_row("t1", "L" * 40),
+                tool_use_row("t2", "mcp__serena__find_symbol", name_path_pattern="y"),
+                tool_result_row("t2", "L" * 60)],
+         subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="x"),
+                                  tool_result_row("u1", "A" * 20)]})
+
+    assert cli.main(["navigation", "--fleet", "--days", "7"]) == 0
+
+    out = capsys.readouterr().out
+    payload = ops.navigation_report(fleet=True, days=7)
+    lead, sub = payload["sides"]["lead"], payload["sides"]["subagent"]
+    assert (lead["symbol_calls"], sub["text_search_calls"]) == (2, 1)
+    assert "lead" in out and "subagent" in out
+    assert "fleet" in out                       # the scope line `cmd_navigation` prints
+    assert (f"{lead['transcripts']:>4} transcripts  "
+            f"{lead['symbol_calls']:>4} symbol") in out
+    assert (f"{sub['symbol_calls']:>4} symbol  "
+            f"{sub['text_search_calls']:>4} text-search") in out

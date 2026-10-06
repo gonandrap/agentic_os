@@ -387,6 +387,13 @@ jarvis neo list                            # Neo's Q&A: pending reviews + escala
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
 jarvis neo learnings [--project p]         # what Neo has been taught, with ids
+jarvis neo stats [--project p] [--days n]  # IS NEO EARNING ITS KEEP: volume, outcomes,
+                                           # the escalation rate day by day, what it
+                                           # escalates FOR, per-order averages, spend and
+                                           # latency. The causes read as three answers to
+                                           # "who decided": Neo handed it back, Neo
+                                           # answered and the OS overrode it, or Neo never
+                                           # answered. Same report at /neo/stats
 jarvis neo retract <id> --reason "…"       # retire a ruling the user has REVERSED. Both
                                            # ledgers are append-only, so without this a
                                            # superseded ruling stays in every prompt

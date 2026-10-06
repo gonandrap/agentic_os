@@ -362,6 +362,9 @@ def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, 
     assert f"over the cap of {plans.CHILD_CAP}" in fo["attention_reason"]
     assert "approve" in fo["attention_reason"]  # Neo's reading, attached
     assert store.feature_children(fo["id"]) == []
+    # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo —
+    # docs/specs/2026-10-01-neo-observability.md §1.
+    assert question(fo["plan_question_id"])["escalation_cause"] == "scope-over-cap"
 
 
 def test_a_plan_under_the_cap_is_released_by_neo_alone(planning, store):

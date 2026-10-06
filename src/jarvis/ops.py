@@ -46,7 +46,7 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import CentralStore
+from .central_store import MISSED_MIN_WORDS, CentralStore
 from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
@@ -4142,7 +4142,8 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
 
 
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any], status: str = "") -> bool:
+                         payload: dict[str, Any], status: str = "",
+                         assumption: dict[str, Any] | None = None) -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -4171,9 +4172,20 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     hold from either is dropped once the order reaches either status. Both mis-drops lose a
     stale sentence about a pass that no longer owns the row, while the pass that does own
     it writes its own events on the next tick — never a lost live one.
+
+    THE ASSUMPTION CLAUSE IS CODE-AGNOSTIC AND IS TESTED FIRST
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.3, Neo question 1196 Option A): a hold naming a row that is no longer
+    `pending` is stale whatever its code, because every per-assumption code claims
+    something about that row. `assumption` is the row the payload names, or `None` — a
+    payload with no `assumption_id` is an ORDER-LEVEL hold and this clause cannot answer
+    about it.
     """
     from . import autoreview
 
+    if int(payload.get("assumption_id") or 0) and assumption is not None:
+        if str(assumption.get("status") or "") != "pending":
+            return True
     if str(payload.get("code") or "") == autoreview.HELD_STATUS:
         return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
@@ -4194,26 +4206,38 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = N
     the row passes it rather than making this read the row again, and one that holds only
     the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
     of that code turns up.
+
+    The assumption rows are cached BY `assumption_id` and read only when a hold naming one
+    turns up (2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.3): one
+    closure is built per order and run over every row's events, so a single slot would
+    answer the second assumption with the first one's status.
     """
     from . import autoreview
 
     cache: dict[str, Any] = {}
+    rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
         code = str(payload.get("code") or "")
+        aid = int(payload.get("assumption_id") or 0)
+        if aid and aid not in rows:
+            rows[aid] = store.get_assumption(aid)
+        row = rows.get(aid)
+        # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of
+        # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md.
         if code not in codes:
-            return False
+            return _panel_hold_is_stale(None, payload, "", row)
         if "status" not in cache:
             cache["status"] = (status if status is not None
                               else str(store.get_work_order(wo_id)["status"] or ""))
         if code == autoreview.HELD_STATUS:
-            return _panel_hold_is_stale(None, payload, cache["status"])
+            return _panel_hold_is_stale(None, payload, cache["status"], row)
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"], row)
 
     return stale
 
@@ -6300,7 +6324,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             return {"project": name, "wo_id": wo_id, "status": deferred,
                     **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
-        if validation_applies(cfg, fresh):
+        # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01
+        # spec §2, a-release-that-authored-files-is-judged-like-any-other).
+        submits = validation_applies(cfg, {**fresh, "pr_url": pr_url}, store)
+        if submits:
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
             # None means BOUNCED, and only here: with validation off no submission was
@@ -6316,10 +6343,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's — but a
             # BOUNCE is told to it rather than re-derived from the latest round, which
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
-            # A release order opened no round at all, so the join is TOLD rather than
-            # left to re-read one that was never opened (§2).
+            # An exempt submission opened no round at all, so the join is TOLD rather than
+            # left to re-read one that was never opened (2026-10-01 spec §3).
             status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
-                                       panel_cleared=release.is_release_order(fresh))
+                                       panel_cleared=not submits)
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -7626,23 +7653,59 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     parked in `needs_review` when it shipped do not, and deleting this would send them to
     the merge queue unjudged.
     """
-    return (validation_applies(cfg, store.get_work_order(wo_id))
+    return (validation_applies(cfg, store.get_work_order(wo_id), store)
             and store.latest_validation_round(wo_id=wo_id) is None)
 
 
-def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
+def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this submission one no panel round may open over? ONE body, three call sites.
+
+    §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+    investigator.md, shape ruled by Neo question 1195 on the precedent of 1169: the KIND
+    narrows who may claim the exemption and the PREMISE still has to hold, which is what
+    `release.is_release_order` already does one line below. An investigator with its
+    verdict filed has submitted no diff, so `evidence.nothing_to_judge` would escalate the
+    round with "nothing to review" and `autoreview.HELD_PANEL_GAVE_UP` would put a hold
+    not even Neo could clear; one still working has filed nothing and claims nothing.
+
+    Spent at all three sites and not just at `validation_applies`, because
+    `land_when_cleared` re-READS the latest round when `panel_cleared` is false: an order
+    for which no round was ever opened would park in `validating` for ever or land on a
+    stale verdict (kn-9256fcb9's lockstep trap).
+    """
+    from . import verdicts
+
+    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+
+
+def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
     """Does a validation round open over THIS submission? One predicate, two call sites.
 
     `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
-    and a RELEASE ORDER is never one of them: it authors no files and stages no tag, so
-    `evidence.nothing_to_judge` escalated it with "nothing to review" and
-    `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
-    post-condition a release owes already exists and is a machine check
+    and a RELEASE ORDER THAT DELIVERED NO PULL REQUEST is never one of them: it authors no
+    files and stages no tag, so `evidence.nothing_to_judge` escalated it with "nothing to
+    review" and `autoreview.HELD_PANEL_GAVE_UP` put a hold even Neo could not clear. The
+    post-condition such a release owes already exists and is a machine check
     (`Daemon.settle_shipped_releases`: a `jarvis-*` tag containing every payload commit
     AND production running it), so a seat reading a release worker's prose adds nothing
     to it (2026-09-29 spec §2).
+
+    THE EXEMPTION'S GROUND IS THE ABSENT PULL REQUEST, and `is_release_order` only
+    narrows which orders may claim it. One that finished with `--pr` submits like any
+    code-bearing order — wo-33e1d0b4 changed `scripts/shipit.sh` under the old kind-keyed
+    predicate, reached no panel, and could never clear `automerge`'s `validated_head`
+    condition. `wo["pr_url"]` is the one source: a second argument would be a second
+    answer to "was there a diff". Callers holding a dict whose column is not yet written
+    overlay it (`finish`).
+
+    docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md §1
+
+    An INVESTIGATOR is the second exclusion, and for a stricter reason: it authors nothing
+    at all. See `exempt_from_validation`.
     """
-    return cfg is not None and cfg.enabled and not release.is_release_order(wo)
+    return (cfg is not None and cfg.enabled
+            and not (release.is_release_order(wo) and not str(wo.get("pr_url") or ""))
+            and not exempt_from_validation(store, wo))
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -7669,8 +7732,9 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
-    # Told, not re-read: a release order opened no round here either (§2).
-    cleared = release.is_release_order(fresh)
+    # Told, not re-read: an exempt submission opened no round here either, release or
+    # investigator — the two move in lockstep (2026-10-01 spec §3, kn-9256fcb9).
+    cleared = not validation_applies(cfg, store.get_work_order(wo_id), store)
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
@@ -8718,7 +8782,22 @@ def submit_verdict(inv_id: str, doc: Any,
     * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
       re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
       classification: `gh` unreachable keeps the order `planning` so the verdict can be
-      resubmitted.
+      resubmitted. `Daemon.clear_answered_investigations` is the only thing that takes it
+      down, and it may only ever take it down.
+
+    **THE INVESTIGATOR IS SETTLED HERE, with `close_out` and never `finish`** — §2.1 of
+    docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+    GitHub issue 906. `finish` is the contract for an order that authored code: it opens a
+    validation round, joins on the landing and leaves the worker typing, and all three
+    re-decide something this function has already decided. Nothing is left to judge, to
+    land or to defer, so the three things wanted are exactly `close_out`'s — stop the
+    session, write `completed`, clear the flag.
+
+    UNCONDITIONAL ON STATUS, and inside the `try` so it shares this connection. A row
+    already `completed` costs one event and a stop of a session already gone, which is
+    cheaper than a status race; the only case skipped is a DELETED row. A PENDING
+    ASSUMPTION stays `pending` and holds nothing: only the user or Neo decides one, and
+    settling over it would be the silent acceptance `mark_done` refuses.
     """
     from . import bugreport, verdicts
 
@@ -8792,7 +8871,7 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
-        investigator_open = False
+        settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
@@ -8800,10 +8879,16 @@ def submit_verdict(inv_id: str, doc: Any,
                 "filed": (verdict.get("filed") or {}).get("issue_url"),
             })
             try:
-                investigator_open = store.get_work_order(
-                    fo["plan_wo_id"])["status"] in OPEN_STATUSES
+                investigator = store.get_work_order(fo["plan_wo_id"])
             except KeyError:
-                investigator_open = False  # deleted; the link was released
+                investigator = None  # deleted; the link was released
+            if investigator is not None:
+                summary = f"submitted a {classification} verdict for {inv_id}"
+                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
+                settled = close_out(
+                    store, investigator, "verdict_submitted_settled", why=summary,
+                    payload={"investigation": inv_id,
+                             "classification": classification})
     finally:
         store.close()
 
@@ -8813,11 +8898,9 @@ def submit_verdict(inv_id: str, doc: Any,
         "classified_by": verdict["classified_by"],
         "note": "the investigation is settled — end your turn.",
     }
-    if investigator_open:
-        # Conditional for `submit_findings`' reason: settling an already-settled work
-        # order is not an idempotent no-op in this codebase.
-        out["investigator"] = finish(
-            fo["plan_wo_id"], f"submitted a {classification} verdict for {inv_id}")
+    if settled is not None:
+        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
+                               "session_stopped": settled["stopped"]}
     return out
 
 
@@ -10791,6 +10874,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # already holds the system prompt it was launched with. Spec §1:
     # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
     ("*.bash_first", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's
+    # tool list cannot change mid-conversation. Spec §4:
+    # docs/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.tool_search", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -12212,6 +12299,40 @@ NAVIGATION_NEEDS_SCOPE = (
 )
 
 
+#: What `_resolve_report_target` returns in the first slot. `_TARGET_PROJECT` is the
+#: sentinel for "no id at all" — only `jarvis navigation` can read a target that way.
+_TARGET_FEATURE = "feature_order"
+_TARGET_WORK = "work_order"
+_TARGET_PROJECT = "<project>"
+
+
+def _resolve_report_target(target: str, project: str | None = None, *,
+                           project_fallback: bool = False,
+                           ) -> tuple[str, str | None, str | None,
+                                      dict[str, Any] | None]:
+    """What one id means to a report: `(kind, project name, project path, record)`.
+
+    Feature order FIRST, then work order, written once so `jarvis inspect` and `jarvis
+    navigation` can never disagree about an id. The ONLY difference between them is
+    `project_fallback`: `navigation` has a third reading for a target that is no id at
+    all (a project name), and a time report has none, so there the work-order lookup's
+    OpsError is the answer, unchanged.
+    """
+    try:
+        name, path, fo = find_feature_order(target, project)
+    except OpsError:
+        pass
+    else:
+        return _TARGET_FEATURE, name, path, fo
+    try:
+        name, path, wo = find_work_order(target, project)
+    except OpsError:
+        if not project_fallback:
+            raise
+        return _TARGET_PROJECT, None, None, None
+    return _TARGET_WORK, name, path, wo
+
+
 def navigation_report(target: str | None = None, project: str | None = None, *,
                       fleet: bool = False, days: int | None = None) -> dict[str, Any]:
     """How an order, a project or the fleet NAVIGATED code — `jarvis navigation`.
@@ -12234,35 +12355,34 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     scope_project = project
     session_ids: list[tuple[str, str]] = []     # (label, session id)
     if target:
-        try:
-            name, path, fo = find_feature_order(target, project)
+        # The one resolver `inspect_report` uses, plus the project reading only this
+        # command has.
+        kind, name, path, record = _resolve_report_target(
+            target, project, project_fallback=True)
+        if kind == _TARGET_FEATURE:
             store = ProjectStore(path)
             try:
                 ids = []
-                planner_id = fo.get("plan_wo_id")
+                planner_id = record.get("plan_wo_id")
                 if planner_id:
                     try:
                         ids.append(store.get_work_order(planner_id))
                     except KeyError:
                         pass
-                ids.extend(store.feature_children(fo["id"]))
+                ids.extend(store.feature_children(record["id"]))
             finally:
                 store.close()
             scope_project = scope_project or name
             session_ids = [(wo["id"], wo.get("session_id") or "") for wo in ids]
-            scope = fo["id"]
-        except OpsError:
-            try:
-                name, wo_path, wo = find_work_order(target, project)
-            except OpsError:
-                # Not an id at all: the third resolution `inspect_report` does.
-                scope_project = target
-                session_ids = []
-                scope = target
-            else:
-                scope_project = scope_project or name
-                session_ids = [(wo["id"], wo.get("session_id") or "")]
-                scope = wo["id"]
+            scope = record["id"]
+        elif kind == _TARGET_WORK:
+            scope_project = scope_project or name
+            session_ids = [(record["id"], record.get("session_id") or "")]
+            scope = record["id"]
+        else:
+            scope_project = target
+            session_ids = []
+            scope = target
     else:
         scope = scope_project or "fleet"
 
@@ -12495,12 +12615,13 @@ def inspect_report(target: str, project: str | None = None, *,
                        largest_os_input=_largest_os_input(wo["id"]))
         return payload
 
-    try:
-        name, path, fo = find_feature_order(target, project)
-    except OpsError:
-        name, wo_path, wo = find_work_order(target, project)
+    # The one resolver `jarvis navigation` uses; no project reading here, so a target
+    # that is no id at all is the work-order lookup's error.
+    kind, name, path, record = _resolve_report_target(target, project)
+    if kind == _TARGET_WORK:
+        wo = record
         cfg = settings(name)
-        store = ProjectStore(wo_path)
+        store = ProjectStore(path)
         try:
             payload = unit(name, wo, store)
         finally:
@@ -12509,6 +12630,7 @@ def inspect_report(target: str, project: str | None = None, *,
                 "write_floor": cfg.report_write_floor,
                 "join_floor": cfg.report_join_floor, "units": [payload]}
 
+    fo = record
     store = ProjectStore(path)
     try:
         units = []
@@ -13278,10 +13400,10 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # -- what the knowledge base costs, and who actually reads it -----------------------------
 
-#: How much of a work order's own title has to survive into a search for the "it could
-#: have looked" signal to mean anything. Below this the query is words like "fix the",
-#: which match half the base and would manufacture a miss for every silent order.
-MISSED_MIN_WORDS = 3
+#: `MISSED_MIN_WORDS` — how much of a work order's own title has to survive into a search
+#: for a title match to mean anything — is defined in `central_store` and imported at the
+#: top of this module: the dispatch hint tier applies the same rule to the same query, and
+#: two copies of that threshold would drift.
 
 
 def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:
@@ -13718,6 +13840,297 @@ def knowledge_usage_report(project: str | None = None, days: int | None = None,
         "never_read_count": sum(1 for e in top if e["reads"] == 0),
         "silent_orders": silent[:limit], "silent_order_count": len(silent),
         "could_have_read": missed[:limit], "could_have_read_count": len(missed),
+    }
+
+
+def _local_day(ts: float) -> str:
+    """The same bucket SQLite's `strftime(..., 'localtime')` produces, in Python.
+
+    Used only to fill the days inside a window that have NO rows: the buckets themselves
+    are SQL's, and two different spellings of "which day is this" would disagree at a
+    boundary.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+#: What `by_kind` cannot say, carried beside it rather than left for a reader to assume —
+#: §"What this does NOT do" of docs/specs/2026-10-01-neo-observability.md.
+NEO_ASSUMPTION_KIND_NOTE = (
+    "`assumption` covers BOTH auto-review passes: which pass filed one is only on the "
+    "project store's `autoreview_asked` event, and splitting on it means opening every "
+    "project database and walking events per question"
+)
+
+#: THE ESCALATION CLASS THESE COUNTS CANNOT SHOW, named rather than left to vanish —
+#: Neo's ruling on question 1170. `stakes.HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach
+#: `autoreview.HELD_HIGH_STAKES`, which holds the review before a Neo question row exists,
+#: so the two `classifier-*` members were dropped from the enum. Worded as what the reader
+#: cannot see here and NOT as a zero: a zero would be a measured figure, and this
+#: population is simply absent from the table.
+NEO_ESCALATION_INVISIBLE_NOTE = (
+    "an assumption the OS held because the stakes classifier could not be reached, or "
+    "could not be read, never became a Neo question at all — so those are not in these "
+    "counts, in any class"
+)
+
+
+def _escalation_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """`escalated` ALONE over SETTLED questions, `None` — never `0.0` — with no denominator.
+
+    UNREACHABLE IS NEVER BLENDED IN and is reported as its own figure
+    (`_unreachable_rate`), because a crash is not a decision: a question Neo was never
+    reached for reads as unreachable and never as escalated (cli.py:1577-1584, cli.py:4526).
+    Open questions have no outcome yet, and including them would make the rate fall
+    whenever the queue is busy. Absent is not zero (spec §4's zero rule).
+    """
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round(escalated / settled, 4)
+
+
+def _unreachable_rate(answered: int, escalated: int, failed: int) -> float | None:
+    """`_escalation_rate`'s sibling: `failed` over the same settled denominator."""
+    settled = answered + escalated + failed
+    if not settled:
+        return None
+    return round(failed / settled, 4)
+
+
+def _neo_outcome_bucket() -> dict[str, Any]:
+    return {"asked": 0, "answered": 0, "escalated": 0, "failed": 0,
+            "escalation_rate": None, "unreachable_rate": None}
+
+
+def _neo_spend_bucket() -> dict[str, Any]:
+    return {"calls": 0, "input": 0, "cache_write": 0, "cache_read": 0, "output": 0,
+            "recorded_cost_usd": 0.0, "list_cost_usd": 0.0}
+
+
+def _percentile(sorted_values: list[int], fraction: float) -> int | None:
+    """Nearest-rank percentile over a sample, or None when the sample is empty.
+
+    In Python because SQLite has none, and the row count is bounded by the window (spec
+    §4). None, not 0: a kind nobody timed has no percentile.
+    """
+    if not sorted_values:
+        return None
+    index = min(len(sorted_values) - 1,
+                max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return int(sorted_values[index])
+
+
+def neo_stats_report(project: str | None = None, days: int | None = None,
+                     limit: int = 20) -> dict[str, Any]:
+    """Neo's volume, outcomes, escalation causes, spend and latency — spec §4,
+    docs/specs/2026-10-01-neo-observability.md.
+
+    `knowledge_usage_report`'s shape above: `project` + `days` in, one plain dict out, no
+    rendering — the CLI and the dashboard render the same dict, so neither can show a
+    figure the other cannot.
+
+    Reads BOTH databases, which is the only way the question can be answered: `neo.db`
+    holds the questions and `os.db` holds what answering them cost.
+
+    THE ZERO RULE IS TWO RULES. `questions` is a census, so a count of zero is measured
+    and prints `0`; every RATIO is `None` when its denominator is empty and renders "not
+    recorded". `spend` and `latency` are a floored sample — `agent_usage.record` never
+    raises, so a missing row is possible — and `latency.unmeasured` says how much of the
+    window predates §3's measurement.
+
+    `limit` bounds the day SERIES (the newest `limit` days of it), not the counts: every
+    total above is over the whole window.
+    """
+    from . import agent_usage
+    from . import usage as usage_mod
+    from .neo_store import (ESCALATION_CAUSES_CHOSEN, ESCALATION_CAUSES_FAILED,
+                            ESCALATION_CAUSES_OVERRIDDEN, NEO_HELD_Q_STATUSES,
+                            NeoStore)
+
+    since = db.now() - days * 86400 if days else None
+    paths = registered_project_paths()
+    if project and project not in paths:
+        raise OpsError(f"project {project!r} not registered (known: {sorted(paths)})")
+    scope = {project: paths[project]} if project else paths
+
+    questions = {"asked": 0, "answered": 0, "escalated": 0, "failed": 0, "open": 0,
+                 "superseded": 0, "escalation_rate": None, "unreachable_rate": None}
+    by_kind: dict[str, dict[str, Any]] = {}
+    by_project: dict[str, dict[str, Any]] = {}
+    by_day: dict[str, dict[str, Any]] = {}
+
+    neo = NeoStore()
+    try:
+        outcomes = neo.question_outcomes(project or "", since)
+        cause_rows = neo.escalation_cause_counts(project or "", since)
+        order_rows = neo.questions_per_order(project or "", since)
+    finally:
+        neo.close()
+
+    for row in outcomes:
+        n = int(row["n"] or 0)
+        kind = row["kind"] or "question"
+        buckets = [questions,
+                   by_kind.setdefault(kind, _neo_outcome_bucket()),
+                   by_project.setdefault(row["project"] or "", _neo_outcome_bucket()),
+                   by_day.setdefault(row["day"], {**_neo_outcome_bucket(),
+                                                  "day": row["day"]})]
+        for bucket in buckets:
+            bucket["asked"] += n
+        if row["status"] == "answered" and row["answered_by"] == "neo":
+            for bucket in buckets:
+                bucket["answered"] += n
+        elif row["status"] == "answered" and row["answered_by"] == "os":
+            # `NeoStore.supersede`: decided somewhere else, so neither Neo answering nor
+            # Neo handing back. Out of the rate's denominator.
+            questions["superseded"] += n
+        elif row["status"] in ("escalated", "failed"):
+            for bucket in buckets:
+                bucket[row["status"]] += n
+        if row["status"] in NEO_HELD_Q_STATUSES:
+            questions["open"] += n
+
+    for bucket in (questions, *by_kind.values(), *by_project.values(),
+                   *by_day.values()):
+        bucket["escalation_rate"] = _escalation_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
+        bucket["unreachable_rate"] = _unreachable_rate(
+            bucket["answered"], bucket["escalated"], bucket["failed"])
+
+    # A day inside the window with no questions is a measured zero and appears; days
+    # outside it do not (spec §4).
+    if since is not None:
+        for step in range(int(days or 0) + 1):
+            day = _local_day(since + step * 86400)
+            by_day.setdefault(day, {**_neo_outcome_bucket(), "day": day,
+                                    "escalation_rate": None,
+                                    "unreachable_rate": None})
+    question_days = [by_day[day] for day in sorted(by_day)][-limit:]
+
+    chosen: dict[str, int] = {}
+    overridden_causes: dict[str, int] = {}
+    failed_causes: dict[str, int] = {}
+    not_recorded = 0
+    for row in cause_rows:
+        cause, n = row["cause"], int(row["n"] or 0)
+        if cause in ESCALATION_CAUSES_CHOSEN:
+            chosen[cause] = chosen.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_OVERRIDDEN:
+            # The third answer to "who decided": Neo answered and the OS did not take it.
+            overridden_causes[cause] = overridden_causes.get(cause, 0) + n
+        elif cause in ESCALATION_CAUSES_FAILED:
+            failed_causes[cause] = failed_causes.get(cause, 0) + n
+        else:
+            # NULL, '' or a member a later release removed. Counted here rather than
+            # given a bucket of its own: an invented bucket reads as a cause.
+            not_recorded += n
+
+    central = CentralStore()
+    try:
+        groups = central.agent_call_totals_by_day(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+        latency_rows = central.agent_call_latencies(
+            project, since, kinds=sorted(agent_usage.NEO_KINDS))
+    finally:
+        central.close()
+
+    spend_totals = _neo_spend_bucket()
+    spend_by_kind: dict[str, dict[str, Any]] = {}
+    spend_by_project: dict[str, dict[str, Any]] = {}
+    spend_by_day: dict[str, dict[str, Any]] = {}
+    for g in groups:
+        # Priced PER MODEL GROUP through the same path `cost_report` uses: a digest on
+        # Haiku is not Opus waste, and a blended rate would hide it.
+        priced = _priced_group(usage_mod, g)
+        targets = [spend_totals,
+                   spend_by_kind.setdefault(g["kind"], _neo_spend_bucket()),
+                   spend_by_project.setdefault(g["project"] or "",
+                                               _neo_spend_bucket()),
+                   spend_by_day.setdefault(g["day"], {**_neo_spend_bucket(),
+                                                      "day": g["day"]})]
+        for bucket in targets:
+            bucket["calls"] += int(g["calls"] or 0)
+            for token in ("input", "cache_write", "cache_read", "output"):
+                bucket[token] += int(g[token] or 0)
+            bucket["recorded_cost_usd"] = round(
+                bucket["recorded_cost_usd"] + (g["cost_usd"] or 0.0), 6)
+            bucket["list_cost_usd"] = round(
+                bucket["list_cost_usd"] + priced.list_cost_usd, 6)
+
+    latency_by_kind: dict[str, dict[str, Any]] = {}
+    samples: dict[str, list[int]] = {}
+    unmeasured = 0
+    for row in latency_rows:
+        kind = row["kind"]
+        entry = latency_by_kind.setdefault(
+            kind, {"calls": 0, "measured": 0, "p50_ms": None, "p90_ms": None,
+                   "max_ms": None})
+        entry["calls"] += 1
+        if row["latency_ms"] is None:
+            unmeasured += 1
+            continue
+        entry["measured"] += 1
+        samples.setdefault(kind, []).append(int(row["latency_ms"]))
+    for kind, entry in latency_by_kind.items():
+        values = sorted(samples.get(kind, []))
+        entry["p50_ms"] = _percentile(values, 0.5)
+        entry["p90_ms"] = _percentile(values, 0.9)
+        entry["max_ms"] = max(values) if values else None
+
+    asked_by_wo = {(row["project"], row["wo_id"]): int(row["n"] or 0)
+                   for row in order_rows}
+    work_orders = feature_orders = 0
+    wo_questions = fo_questions = 0
+    for name, path in sorted(scope.items()):
+        store = ProjectStore(path)
+        try:
+            orders = [wo for wo in store.list_work_orders(limit=10_000,
+                                                          include_hidden=True)
+                      if since is None or (wo["created_at"] or 0) >= since]
+            features = [fo for fo in store.list_feature_orders(kind="feature",
+                                                               limit=10_000)
+                        if since is None or (fo["created_at"] or 0) >= since]
+        finally:
+            store.close()
+        # Hidden orders INCLUDED, `cost_report`'s reason: hiding is a gesture about
+        # attention, and the order still asked its questions.
+        work_orders += len(orders)
+        feature_orders += len(features)
+        feature_ids = {fo["id"] for fo in features}
+        # A feature order's questions are its planner's and its children's — those are
+        # the sessions that ask anything.
+        family = {fo["plan_wo_id"] for fo in features if fo.get("plan_wo_id")}
+        for wo in orders:
+            asked = asked_by_wo.get((name, wo["id"]), 0)
+            wo_questions += asked
+            if wo.get("parent_id") in feature_ids or wo["id"] in family:
+                fo_questions += asked
+    per_order = {
+        "work_orders": work_orders,
+        "questions_per_wo": (round(wo_questions / work_orders, 2)
+                             if work_orders else None),
+        "feature_orders": feature_orders,
+        "questions_per_fo": (round(fo_questions / feature_orders, 2)
+                             if feature_orders else None),
+    }
+
+    return {
+        "scope": project or "fleet", "days": days, "since": since,
+        "questions": questions,
+        "by_kind": by_kind, "by_kind_note": NEO_ASSUMPTION_KIND_NOTE,
+        "by_project": by_project,
+        "by_day": question_days,
+        "causes": {"chosen": chosen, "overridden": overridden_causes,
+                   "failed": failed_causes, "not_recorded": not_recorded},
+        "causes_note": NEO_ESCALATION_INVISIBLE_NOTE,
+        "per_order": per_order,
+        "spend": {"totals": spend_totals, "by_kind": spend_by_kind,
+                  "by_project": spend_by_project,
+                  "by_day": [spend_by_day[day] for day in sorted(spend_by_day)][-limit:]},
+        "latency": {"by_kind": latency_by_kind, "unmeasured": unmeasured},
+        "floor": True, "floor_reason": COST_FLOOR_NOTE,
     }
 
 

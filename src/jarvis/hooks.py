@@ -17,7 +17,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import concision
 # §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
@@ -27,6 +27,11 @@ from .project_store import ProjectStore
 # A Bash command every worker must be able to run without a permission prompt:
 # a chain of `cd <dir>` / `jarvis …` segments joined by &&, nothing else.
 _SHELL_DANGEROUS = re.compile(r"[|;`$<>]")
+
+#: The same characters split by quote kind for `jarvis_verbs`
+#: (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md).
+_SHELL_STRUCTURE = re.compile(r"[|;<>]")
+_SHELL_SUBSTITUTION = re.compile(r"\$\(|`")
 
 
 def is_jarvis_command_chain(command: str) -> bool:
@@ -53,17 +58,40 @@ def jarvis_verbs(command: str) -> tuple[tuple[str, str], ...]:
     A SIBLING of `is_jarvis_command_chain`, which stays untouched: that one answers "is
     this a chain of `cd`/`jarvis` segments", which for every other kind is the right
     question, and narrowing it would change every kind's behaviour (§2.6 of
-    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `_SHELL_DANGEROUS`
-    and `shlex` parse, so the two cannot disagree about what a segment is.
+    docs/superpowers/specs/2026-09-27-investigation-orders.md). Same `shlex` parse, so
+    the two cannot disagree about what a segment IS — only about which characters count
+    as structure: this one judges STRUCTURE, not raw text, because every write it must
+    clear carries prose in quotes (docs/superpowers/specs/2026-10-01-investigator-writes-
+    unreachable.md). Quotes do not make every expansion inert: `${` is refused wherever
+    the shell would expand it, double quotes included (DELTA 3 of that spec).
 
     An empty tuple means "no `jarvis` verb this can vouch for": not a jarvis chain, a
     command carrying shell metacharacters, or one shlex cannot parse. The caller decides
     what that means — for the investigator it means the allowlist cannot clear it.
     """
-    if _SHELL_DANGEROUS.search(command):
+    scan = _scan_shell_quotes(command)
+    # An unterminated quote has no knowable structure, so fail closed (spec DELTA 2).
+    if not scan.terminated:
+        return ()
+    masked = scan.full
+    # Literal inside EITHER quote kind, so judged on fully masked text (spec §The
+    # mechanism, 1).
+    if _SHELL_STRUCTURE.search(masked):
+        return ()
+    # The shell INTERPOLATES inside double quotes, so these two are judged with only
+    # single quotes masked (spec §The mechanism, 2).
+    if _SHELL_SUBSTITUTION.search(scan.single_only):
+        return ()
+    # `${...}` ASSIGNS, prompt-expands and evaluates arithmetic, so it is not a value
+    # even inside double quotes (spec DELTA 3).
+    if "${" in scan.single_only:
+        return ()
+    # A bare `$NAME` yields a VALUE inside quotes; unquoted, `$` stays dangerous (spec
+    # DELTA 1, narrowed by DELTA 3).
+    if "$" in masked:
         return ()
     out: list[tuple[str, str]] = []
-    for segment in command.split("&&"):
+    for segment in _and_segments(command, masked):
         try:
             words = shlex.split(segment.strip())
         except ValueError:
@@ -474,6 +502,85 @@ LONG_SEATS = ("jarvis-implementer", "jarvis-spec-writer")
 #: position only, so `grep -r nohup src/` is not a detached job.
 _BACKGROUNDING_WORD = re.compile(
     r"(?:^|[;&|(\n])\s*(?:\w+=\S+\s+)*(nohup|setsid|disown)\b")
+
+
+class _QuoteMasks(NamedTuple):
+    """One escape-aware scan of a command, as the two masks `jarvis_verbs` judges on.
+
+    `full`: single- AND double-quoted content blanked. `single_only`: only single-quoted
+    content blanked, because the shell still interpolates inside double quotes. Escape
+    pairs (`\\;`, `\\"`, `\\$`) are blanked in BOTH: they are literal characters, not
+    structure. `terminated` is False when a quote never closed — the caller fails closed
+    (docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md, DELTA 2).
+    """
+
+    full: str
+    single_only: str
+    terminated: bool
+
+
+def _scan_shell_quotes(command: str) -> _QuoteMasks:
+    """Quote state of `command`, tracking backslash escapes, positions preserved.
+
+    A regex span cannot do this: it reads `\\"` as the start of a quoted span and masks
+    the real structure after it (spec DELTA 2, review round 1).
+    """
+    full: list[str] = []
+    single_only: list[str] = []
+    state = ""  # "" = outside quotes, "'" = single, '"' = double
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if state == "'":
+            full.append(" ")
+            single_only.append(" ")
+            if char == "'":
+                state = ""
+            i += 1
+            continue
+        if char == "\\" and state != "'":
+            # Outside quotes `\` escapes anything; inside double quotes only $ ` " \ and
+            # newline — every character special there — so blanking the pair cannot hide
+            # structure either way (spec DELTA 3).
+            width = 2 if i + 1 < len(command) else 1
+            full.append(" " * width)
+            single_only.append(" " * width)
+            i += width
+            continue
+        if state == '"':
+            full.append(" ")
+            single_only.append(char)
+            if char == '"':
+                state = ""
+            i += 1
+            continue
+        if char == "'":
+            state = "'"
+            full.append(" ")
+            single_only.append(" ")
+        elif char == '"':
+            state = '"'
+            full.append(" ")
+            single_only.append(char)
+        else:
+            full.append(char)
+            single_only.append(char)
+        i += 1
+    return _QuoteMasks("".join(full), "".join(single_only), state == "")
+
+
+def _and_segments(command: str, masked: str) -> list[str]:
+    """`command` split on its `&&` offsets taken from `masked`, so a quoted one is prose.
+
+    docs/superpowers/specs/2026-10-01-investigator-writes-unreachable.md.
+    """
+    out: list[str] = []
+    start = 0
+    for found in re.finditer(r"&&", masked):
+        out.append(command[start:found.start()])
+        start = found.end()
+    out.append(command[start:])
+    return out
 
 
 def backgrounds_through_shell(command: str) -> bool:
@@ -1030,6 +1137,22 @@ _HEREDOC_DENY = (
     "request was filed. Write the file with `Edit`/`Write` and carry on."
 )
 
+#: The same refusal for an INVESTIGATOR, which `_HEREDOC_DENY` misleads: `Edit` is refused
+#: on every path and `Write` on every path but one, so "use `Edit` or `Write`" sent four
+#: sessions on 2026-10-01 looking for a remedy they did not have. §2.6 of
+#: docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+#: and kn-832967f3's sibling fix: the enforcement was right, the message cost the turns.
+_HEREDOC_DENY_INVESTIGATOR = (
+    "Refused: this command writes a file through a heredoc, which is refused for every "
+    f"worker in the fleet — a heredoc's CONTENT reaches the command classifier. You are "
+    f"an INVESTIGATOR, so the remedy is one specific tool call: use the `Write` tool on "
+    f"`{VERDICT_FILE}` in your worktree root, whole, then submit it with\n\n"
+    f"    jarvis investigate verdict <inv-id> --from-file {VERDICT_FILE}\n\n"
+    f"That `Write` is the single write you are permitted; `Edit` is refused on every path, "
+    f"including this one. Nothing was recorded against you and no approval request was "
+    f"filed."
+)
+
 
 def _heredoc_owner_programs(command: str) -> tuple[list[str], list[tuple[int, int]]]:
     """The program names in `command`, and the heredoc bodies it contains.
@@ -1143,7 +1266,10 @@ def heredoc_write_decision(payload: dict[str, Any],
     path outside the worktree is not this rule's business.
 
     NO ALLOW BRANCH, EVER. It denies or it returns None, which is what makes it legal to
-    run BEFORE `gate_decision` — see `preflight_decision`'s docstring.
+    run BEFORE `gate_decision` — see `preflight_decision`'s docstring. An investigator's
+    `verdict.json` is no exception: the remedy is the `Write` tool, which the DENIAL now
+    names (`_HEREDOC_DENY_INVESTIGATOR`), and an allow branch here would move a
+    security-ordering argument to save one tool call.
     """
     if payload.get("tool_name") != "Bash" or not env.get("JARVIS_WO_ID"):
         return None
@@ -1177,6 +1303,10 @@ def heredoc_write_decision(payload: dict[str, Any],
                 store.close()
         except Exception:  # noqa: BLE001 — the refusal stands whether or not it recorded
             pass
+    # The classifier, the parse and the event above are kind-blind; only the sentence the
+    # session reads is chosen here (§2.6 of the 2026-10-01 spec).
+    if env.get(WO_KIND_ENV) == "investigator":
+        return _deny(_HEREDOC_DENY_INVESTIGATOR)
     return _deny(_HEREDOC_DENY)
 
 
@@ -2730,6 +2860,35 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
                         {"marked": marked, "skipped": skipped, "failed": failed})
 
 
+def serena_activation_context(cwd: Path) -> str:
+    """The one call a worker must make before its first Serena call, path filled in.
+
+    The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
+    `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
+    dispatched worker's first `find_symbol` fails with `No active project` and it falls
+    back to a text search. Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+
+    BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
+    entries: a plugin install produces the long prefix, `claude mcp add serena` the short
+    one, and Jarvis configures no MCP server itself so it cannot know which.
+
+    `session_id` is any string — verified live, `00000000` activated — so this needs no
+    `initial_instructions` round-trip first. The ABSOLUTE path is what makes it
+    unambiguous (108 registry entries share the name `jarvis-os`), and `activate_project`
+    writes the registry entry and `.serena/project.yml` itself when they are absent.
+
+    A few lines, because it rides every turn.
+    """
+    return (
+        "\n\nBefore your first code-navigation call, make exactly ONE call:\n"
+        f"`mcp__plugin_serena_serena__activate_project` with `project` = `{cwd}` and any "
+        "string as `session_id` (it is not validated).\n"
+        "On a hand-added install the tool is spelled `mcp__serena__activate_project`.\n"
+        "Skip it and every Serena call fails with `No active project`: the MCP server is "
+        "started with no project argument.\n"
+    )
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -2817,10 +2976,20 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             #
             # It appends after the cached conversation rather than editing the system
             # prompt, so it does not move the prefix `note_prefix` just fingerprinted.
+            #
+            # ...and the Serena activation call, appended AFTER the house style so the
+            # existing cached shape is unchanged. Gated on `JARVIS_SERENA` alone — the
+            # key `dispatch._write_worker_settings` already writes from
+            # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
+            # `activate_project` writes itself (Neo q1259).
+            # Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+            context = concision.house_style()
+            if env.get("JARVIS_SERENA") != "0":
+                context += serena_activation_context(cwd)
             return {"wo_id": wo_id, "event": event,
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": concision.house_style(),
+                        "additionalContext": context,
                     }}
 
         elif not _is_current_session(store, wo_id, session_id):

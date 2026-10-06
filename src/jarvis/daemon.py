@@ -904,6 +904,12 @@ class Daemon:
                 # ever opening a pull request.
                 self.settle_features(project, store)
                 if reconcile:
+                    # Immediately after the settlement above, because the merge that
+                    # clears the subject's last blocker is settled on that same tick — so
+                    # an investigation's WAITING_ON_USER flag goes down on the tick its
+                    # cause goes away rather than one interval later. Reconcile cadence:
+                    # one read per flagged investigation, and nothing waits on it (§2.5).
+                    self.clear_answered_investigations(project, store)
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
                     # handed and no others.
@@ -1334,6 +1340,75 @@ class Daemon:
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def clear_answered_investigations(self, project: ProjectSpec,
+                                      store: ProjectStore) -> None:
+        """Take down a `WAITING_ON_USER` flag once its subject owes the user nothing.
+
+        §2.5 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+        investigator.md, GitHub issue 906: the flag was raised once at the transition
+        (`ops.submit_verdict`) and nothing was ever written to lower it, so the warning
+        sign stayed up after the user acted and the subject merged.
+
+        **CLEAR-ONLY. A tick may lower this flag; a tick may NEVER raise it.** That
+        asymmetry is the whole design and it is what keeps kn-089de524 satisfied: a flag
+        re-derived every tick overwrites the user's own `jarvis wo ack` and re-notifies
+        for ever. The raise stays at the transition, and this pass is the only reader that
+        writes.
+
+        Flagged once by construction, `settle_features`' argument run in reverse: the
+        clear leaves the row out of the population, so the event is written once however
+        many ticks follow.
+
+        `invariants.true_blockers` answers the subject half, because it is the single
+        source of truth for "what does this order want from me" and already subtracts what
+        the user acknowledged. A subject that no longer exists owes nothing.
+        """
+        from . import ops
+
+        for fo in store.list_feature_orders(statuses=("completed",),
+                                            kind="investigation"):
+            if not fo["needs_attention"]:
+                continue
+            plan = db.from_json(fo.get("plan"), {}) or {}
+            if plan.get("classification") != "WAITING_ON_USER":
+                continue
+            subject = str((db.from_json(fo.get("metadata"), {}) or {}).get(
+                ops.SUBJECT_KEY) or "")
+            try:
+                if not self._subject_is_clear(store, subject):
+                    continue
+            except Exception:  # noqa: BLE001 — one investigation must not stop the rest
+                log.exception("[%s] could not read %s's subject", project.name, fo["id"])
+                continue
+            store.clear_feature_attention(fo["id"])
+            # The investigator carries the record: `ops.feature_event` is manager-only and
+            # an investigation has no manager (`carrier_for_feature` is the general rule).
+            carrier = store.carrier_for_feature(fo["id"])
+            if carrier is not None:
+                store.add_event(carrier["id"], "investigation_attention_cleared", {
+                    "investigation": fo["id"], "subject": subject,
+                    "why": f"{subject or 'the subject'} no longer needs the user",
+                })
+            log.info("[%s] %s: the user has dealt with %s", project.name, fo["id"],
+                     subject)
+
+    @staticmethod
+    def _subject_is_clear(store: ProjectStore, subject: str) -> bool:
+        """Does the investigated order still owe the user anything? §2.5's predicate.
+
+        A work order is asked through `true_blockers`; a feature or improvement order has
+        no such derivation, so its own `needs_attention` is the equivalent read.
+        """
+        if not subject:
+            return True
+        try:
+            if subject.startswith("wo-"):
+                return not invariants_mod.true_blockers(store,
+                                                        store.get_work_order(subject))
+            return not store.get_feature_order(subject)["needs_attention"]
+        except KeyError:
+            return True   # gone, so nothing is owed on it
 
     def _route_to_validation(self, project: ProjectSpec, store: ProjectStore,
                              fo: dict) -> bool:
@@ -3738,6 +3813,7 @@ class Daemon:
         a nine-node dependency graph with no read on it, which is the most expensive
         thing to review unaided.
         """
+        from . import autoreview
         from . import db as db_mod
         from . import plans
 
@@ -3779,8 +3855,11 @@ class Daemon:
                       f"Neo's reading: {verdict.get('verdict', '?')} — {reason}")
             # Neo answered, but the answer is not what happens. Re-marking the question
             # keeps `jarvis neo list` and `jarvis status` telling the same story: this
-            # is now the user's to decide.
-            neo_store.mark(q["id"], "escalated", reason=reason)
+            # is now the user's to decide — with WHICH fact overrode it, so the report
+            # can group it (§1 of docs/specs/2026-10-01-neo-observability.md).
+            neo_store.mark(q["id"], "escalated", reason=reason,
+                           cause=autoreview.escalation_cause(
+                               over_cap=True, escalate=bool(verdict["escalate"])))
         pstore.flag_feature_attention(fo["id"], f"plan needs your review: {reason[:160]}")
         central.add_inbox(
             project=q["project"], level="warning",
@@ -4243,9 +4322,12 @@ class Daemon:
             # and counts it. `due` compares the fingerprint against the first and floors
             # the spend on the second — see issue #216.
             attempt = pstore.last_health_attempt_ts(subject["kind"], row["id"])
+            # The blocker is computed BESIDE the fingerprint and passed in: `due` is the
+            # whole spend decision and reads no state itself (see its docstring).
             trigger = health.due(last, health.fingerprint(pstore, subject), cfg, now,
                                  float(row.get("created_at") or 0.0),
-                                 last_attempt=attempt)
+                                 last_attempt=attempt,
+                                 blocker=health.blocker(pstore, subject, cfg))
             if trigger:
                 out.append((float(last["ts"]) if last else 0.0, subject, trigger))
         out.sort(key=lambda c: c[0])
@@ -4259,6 +4341,7 @@ class Daemon:
         project — a recorded hold that nobody reads is just a quieter retry storm (spec
         docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §3).
         """
+        from . import health
         from . import supervisor as supervisor_mod
         from .neo_store import NeoStore
 
@@ -4278,8 +4361,18 @@ class Daemon:
                         log.debug("[%s] health sweep held until %s: %s",
                                   project.name, hold[0], hold[1])
                         continue
-                    for _, subject, trigger in self._health_candidates(
-                            pstore, cfg)[:cfg.health_max_units_per_tick]:
+                    candidates = self._health_candidates(pstore, cfg)
+                    # THE CAP BOUNDS SPEND, so it bounds the PAID triggers only and every
+                    # due re-assertion is processed. Otherwise a mostly-parked project
+                    # would spend its whole cap on free rows and starve the paid looks
+                    # the cap's rotation exists to guarantee.
+                    free = [c for c in candidates if c[2] == health.REASSERT]
+                    paid = [c for c in candidates
+                            if c[2] != health.REASSERT][:cfg.health_max_units_per_tick]
+                    for _, subject, trigger in free + paid:
+                        if trigger == health.REASSERT:
+                            supervisor_mod.reassert_health(pstore, project.name, subject)
+                            continue
                         supervisor_mod.review_health(
                             pstore, neo_store, project.name, subject, cfg.probes, cfg,
                             trigger, inspect_cfg=project.inspect)
@@ -5945,6 +6038,13 @@ class Daemon:
         candidates: list[tuple[dict, list[dict], bool]] = []
         for early, status in ((False, "needs_review"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
+                if wo.get("kind") == "investigator":
+                    # A diagnosis is not a submission and nothing is gated on it: §2.3 of
+                    # docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-
+                    # its-investigator.md. Here rather than in `decide`/`decide_early`,
+                    # which would be two hold codes and a third `_holds_not_recorded`
+                    # entry for one rule.
+                    continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"
                        and not (early and a.get("provisional_verdict"))
@@ -6161,6 +6261,10 @@ class Daemon:
         kinds at once — §5 judges what it can while the worker runs — so that branch is
         per assumption and not per order. **The confirmation branch belongs to the parked
         pass only**: until the work is delivered there is no result to confirm against.
+
+        A row that is no longer `pending` is SKIPPED, whichever branch it would take:
+        docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+        assumption.md §3.1.
         """
         from . import autoreview, ops
 
@@ -6187,6 +6291,9 @@ class Daemon:
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
+            # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1.
+            if str(a.get("status") or "") != "pending":
+                continue
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):
@@ -6570,8 +6677,10 @@ class Daemon:
                 # the user's to decide — `_deliver_plan_verdict`'s over-cap branch, for
                 # the same reason. Both shapes reach here: a `deny` (there is no machine
                 # rejection, so it becomes an escalation) and an acceptance this module
-                # overrode on stakes.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # overrode on stakes — and WHICH of the two, as the groupable cause.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             payload = {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,
@@ -6640,7 +6749,18 @@ class Daemon:
                 # re-mark the non-acceptance branch above does, for the same reason. The
                 # hold event is what puts the WHY on the work order, where
                 # `ops.autoreview_state` renders it as the one `⚙ auto-review:` line.
-                neo_store.mark(q["id"], "escalated", reason=still.reason)
+                #
+                # AND THE CAUSE COMES OUT NULL, which `escalation_cause` below DERIVES
+                # rather than this site omitting. Neo's ruling ACCEPTED here — that is the
+                # branch this is inside — so nothing in its reply caused this escalation:
+                # the condition table re-running at the settle did, and `still.code` is
+                # where that fact is recorded, on the work order. `escalation_cause`
+                # returns `""` for an acceptance and the NULL is the honest answer; a
+                # member of the enum would claim a stakes word or a denial that did not
+                # happen (§1's rule that a guessed label is worse than none).
+                neo_store.mark(q["id"], "escalated", reason=still.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             self._note_autoreview_held(pstore, wo["id"], still, settling=True)
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": numbered.get("n"),
@@ -6753,8 +6873,11 @@ class Daemon:
         if not (ruling.accept or objected):
             if not verdict.get("escalate"):
                 # `_deliver_assumption_verdict`'s branch, for its reason: Neo answered and
-                # the answer is not what happens, so the record has to say whose this is.
-                neo_store.mark(q["id"], "escalated", reason=ruling.reason)
+                # the answer is not what happens, so the record has to say whose this
+                # is — and which fact made it theirs.
+                neo_store.mark(q["id"], "escalated", reason=ruling.reason,
+                               cause=autoreview.escalation_cause(
+                                   ruling, escalate=bool(verdict.get("escalate"))))
             pstore.add_event(wo["id"], "autoreview_escalated", {
                 "assumption_id": assumption["id"], "n": assumption.get("n"),
                 "reason": ruling.reason, "stakes": ruling.stakes,

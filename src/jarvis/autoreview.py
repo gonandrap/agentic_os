@@ -950,6 +950,11 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     §7. A provisional approval is an opinion about an intention; at `needs_review` the
     intention has become a diff and a result summary, and only then may it settle.
 
+    A SETTLED ROW IS HELD BEFORE THE GATES, `decide`'s own clause byte for byte
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.2): the `confirm_question_id` gate short-circuits below it, so a
+    guard reached only at the tail call never runs on that path.
+
     Four gates of its own, then **`decide` itself, unchanged and in full**. A provisional
     verdict is not a ticket past any of its seven conditions: the early pass judged an
     intention, so it cannot buy the order past a panel that gave up, a permission the
@@ -995,6 +1000,10 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     aid = int(assumption.get("id") or 0)
     n = int(assumption.get("n") or 0)
     fields = {"assumption_id": aid, "n": n}
+    # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.2.
+    if str(assumption.get("status") or "") != "pending":
+        return _held(HELD_SETTLED,
+                     f"assumption #{n} is already {assumption.get('status')}", **fields)
     if not verdict:
         return _held(HELD_UNJUDGED,
                      f"assumption #{n} carries no early verdict — there is nothing to "
@@ -1188,6 +1197,46 @@ def read_ruling(verdict: dict[str, Any], default_model: str = "") -> Ruling:
     return Ruling(accept=accept, stakes=stakes, model=model, reason=reason)
 
 
+def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
+                     over_cap: bool = False) -> str:
+    """WHY THE OS ESCALATED A QUESTION NEO HAD ALREADY ANSWERED, as one groupable label.
+
+    `neo_store.ESCALATION_CAUSES_OVERRIDDEN` or `""`, and `""` means NOTHING IS WRITTEN:
+    a NULL reads "not recorded", and a label that does not match the fact that caused the
+    escalation is worse than none — it cannot be told apart from a measured one (Neo,
+    question 1161). So every branch here is a fact the caller already holds, and there is
+    no "closest member" fallback.
+
+    PURE and in this module because `Ruling` and the stakes vocabulary are, and because
+    ONE derivation is what keeps the four daemon call sites from drifting apart (§1 of
+    docs/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
+    are spelled as literals rather than imported: this module depends on no store, and
+    `tests/test_autoreview.py` pins what it returns against the enum instead.
+
+    `escalate` is the model's own `escalate` flag: when Neo escalated of its own accord
+    the cause is the CHOSEN label off its reply, which `neo.drain_queue` has already
+    written, and nothing here may overwrite it. `over_cap` is the plan path, which has no
+    `Ruling` at all — the child cap outranks whatever Neo said.
+
+    A `ruling` that ACCEPTED is not an override, so it gets `""`: an escalation that
+    follows one (the settle-time re-run dropping the OS's own ruling) was caused by the
+    condition table, not by anything in Neo's reply.
+    """
+    if over_cap:
+        return "" if escalate else "scope-over-cap"
+    if ruling is None or escalate:
+        return ""
+    if ruling.overridden:
+        if ruling.stakes == STAKES_HIGH:
+            return "stakes-high"
+        if ruling.stakes == STAKES_UNCLASSIFIED:
+            return "stakes-unclassified"
+        # `read_ruling`'s third `said` branch: a word that is neither, and not routine.
+        return "" if ruling.stakes in ROUTINE_STAKES else "stakes-unreadable"
+    # `verdict: deny` with no machine rejection behind it (module docstring).
+    return "" if ruling.accept else "neo-denied"
+
+
 # -- the reviewer ----------------------------------------------------------------------
 
 
@@ -1263,6 +1312,10 @@ why the call was routine and the user reads it on the record. On an escalation i
 what the user has to decide. **On an objection the WORKER reads it, mid-task** — so write
 it to that reader: say what is wrong with the call and what to do instead, in the
 imperative, with no preamble and nothing about the machinery that sent it.
+
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+high-stakes | no-learning-applies | evidence-insufficient>"
 """
 
 
