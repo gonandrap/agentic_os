@@ -1396,9 +1396,16 @@ def create_app() -> FastAPI:
             report = ops.cost_report(project=project or None)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        # The distribution is a SECTION of this page, so a failure to build it must not
+        # take the listing down with it: the two read different databases and the
+        # listing is the older, load-bearing half.
+        try:
+            fleet = ops.fleet_cost(project=project or None)["fleet"]
+        except Exception:                                   # noqa: BLE001
+            fleet = None
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project,
+                      project=project, fleet=fleet,
                       projects=sorted(ops.registered_project_paths()))
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)

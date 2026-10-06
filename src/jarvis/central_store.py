@@ -1819,7 +1819,9 @@ class CentralStore:
             (wo_id,)).fetchone()
         return float(row["c"] or 0.0)
 
-    def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
+    def agent_call_totals(self, project: str | None = None, *,
+                          since: float | None = None,
+                          until: float | None = None) -> list[dict[str, Any]]:
         """Every work order's recorded spend, summed in SQL, grouped by kind/label/model.
 
         Grouped rather than flat because every consumer needs the grouping: the report
@@ -1849,8 +1851,22 @@ class CentralStore:
         sizes is a meaningless number (spec §3,
         docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
         """
-        clause = "WHERE project=?" if project else ""
-        params = (project,) if project else ()
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        # ADDITIVE, and `None` must keep the whole-table behaviour exactly: `cost_report`
+        # asks "what has the fleet spent, ever" and `fleetcost` asks the same question of
+        # one usage week (spec §2 of the fleet-cost-distribution spec). Half-open, like
+        # every other window in the OS: `ts >= since` and `ts < until`, so two adjacent
+        # windows can neither double-count a call nor lose one.
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        if until is not None:
+            where.append("ts<?")
+            params.append(until)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
             f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
@@ -1862,7 +1878,7 @@ class CentralStore:
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
                            AS cache_5m
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, label, model""", params).fetchall())
+                GROUP BY wo_id, kind, label, model""", tuple(params)).fetchall())
 
     def agent_call_totals_by_day(self, project: str | None = None,
                                  since: float | None = None,

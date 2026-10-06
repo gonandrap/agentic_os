@@ -12037,6 +12037,24 @@ def bill(target: str, project: str | None = None, *,
     return build(target, project, live=live)
 
 
+def fleet_cost(**kwargs: Any) -> dict[str, Any]:
+    """What a TYPICAL order costs, over a window — see `jarvis.fleetcost`.
+
+    `cost_report` says which orders cost the MOST and has no place to put a population
+    statistic; this says what normal looks like, so "is this order an outlier" and "did
+    last week get dearer" become answerable. One thin wrapper rather than a second
+    import path, exactly like `bill` above, so the CLI and the dashboard reach it the way
+    they reach everything else in the OS.
+
+    Imported lazily because `fleetcost` must never touch `ProjectStore` — it opens every
+    database `mode=ro` — and keeping it out of this module's import graph is what keeps
+    that true.
+    """
+    from . import fleetcost
+
+    return fleetcost.report(**kwargs)
+
+
 def cost_report(project: str | None = None, target: str | None = None,
                 limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.

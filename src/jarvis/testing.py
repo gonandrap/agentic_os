@@ -16,8 +16,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
@@ -2767,6 +2768,180 @@ class FaultyAnswerer:
             return dict(self.verdict)
         raise_fault(self.fault, self.reset_at)
         raise AssertionError(f"{self.fault} did not raise")
+
+
+class FleetCostFixture:
+    """Synthetic fleet state for `jarvis.fleetcost` — chosen timestamps, no real agent.
+
+    Every writer goes through the real schema (`ProjectStore`, `CentralStore`,
+    `NeoStore`) and then rewrites the timestamp columns, because the stores stamp
+    `db.now()` and a distribution report is entirely about WHEN a turn ran. The report
+    itself never opens any of these stores: it reads the same files `mode=ro`, which is
+    what `test_read_only` asserts.
+
+    Spec §7 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+
+    def __init__(self, home: Path, project_path: Path, root: Path, catalog: Path,
+                 name: str = "proj_a") -> None:
+        self.home = home
+        self.project_path = project_path
+        self.transcript_root = root
+        self.catalog_path = catalog
+        self.name = name
+        self.db = paths.project_db_path(project_path)
+        self.os_db = paths.central_db_path()
+
+    # -- the project store ------------------------------------------------------
+
+    def _store(self) -> Any:
+        from .project_store import ProjectStore
+
+        return ProjectStore(self.project_path)
+
+    def order(self, title: str = "an order", *, status: str = "completed",
+              session_id: str = "", wo_id: str | None = None) -> str:
+        store = self._store()
+        try:
+            wo = store.create_work_order(title, "", wo_id=wo_id, status=status)
+            store.conn.execute("UPDATE work_orders SET session_id=? WHERE id=?",
+                               (session_id, wo["id"]))
+            store.conn.commit()
+            return str(wo["id"])
+        finally:
+            store.close()
+
+    def turn(self, wo_id: str, *, started_at: float, ended_at: float | None = None,
+             kind: str = "dispatch", cost_usd: float | None = None,
+             cost_source: str | None = "envelope",
+             usage: dict[str, Any] | None = None, state: str = "done") -> int:
+        """One settled (or still-running, with `ended_at=None`) turn at a chosen time."""
+        store = self._store()
+        try:
+            seq = store.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?",
+                (wo_id,)).fetchone()["n"]
+            cur = store.conn.execute(
+                """INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at,
+                                         ended_at, cost_usd, cost_source, usage_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (wo_id, seq, kind, "go", state, started_at, ended_at, cost_usd,
+                 cost_source if cost_usd is not None else None,
+                 json.dumps(usage) if usage else None))
+            store.conn.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            store.close()
+
+    def validation_round(self, wo_id: str, *, ts: float, round: int = 1) -> None:
+        store = self._store()
+        try:
+            store.conn.execute(
+                """INSERT INTO validation_rounds (wo_id, round, ts, fingerprint)
+                   VALUES (?,?,?,?)""", (wo_id, round, ts, f"fp-{round}"))
+            store.conn.commit()
+        finally:
+            store.close()
+
+    # -- the central and neo stores ---------------------------------------------
+
+    def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
+                label: str = "", model: str = "claude-opus-5",
+                project: str | None = None) -> None:
+        from .central_store import CentralStore
+
+        central = CentralStore()
+        try:
+            central.conn.execute(
+                """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
+                                            cost_usd, input, cache_write, cache_read,
+                                            output)
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0)""",
+                (ts, self.name if project is None else project, wo_id, kind, label,
+                 model, cost_usd))
+            central.conn.commit()
+        finally:
+            central.close()
+
+    def neo_question(self, wo_id: str, *, ts: float, question: str = "which way?") -> None:
+        from .neo_store import NeoStore
+
+        neo = NeoStore()
+        try:
+            neo.conn.execute(
+                "INSERT INTO questions (ts, project, wo_id, question) VALUES (?,?,?,?)",
+                (ts, self.name, wo_id, question))
+            neo.conn.commit()
+        finally:
+            neo.close()
+
+    # -- transcripts ------------------------------------------------------------
+
+    def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
+                 input: int = 0, mid: str = "", model: str = "claude-opus-5") -> dict:
+        """One assistant message — `usage.calls_of` reads one API call per row."""
+        return {
+            "type": "assistant",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"id": mid or f"m-{at}-{read}-{write}", "model": model,
+                        "usage": {"input_tokens": input,
+                                  "cache_creation_input_tokens": write,
+                                  "cache_read_input_tokens": read,
+                                  "output_tokens": out}},
+        }
+
+    def compact_row(self, *, at: float, pre: int = 200_000, post: int = 5_000) -> dict:
+        return {
+            "type": "system", "subtype": "compact_boundary",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post},
+        }
+
+    def transcript(self, session_id: str, rows: Sequence[dict],
+                   subagents: Sequence[Sequence[dict]] = ()) -> None:
+        directory = self.transcript_root / "-proj"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{session_id}.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in rows))
+        for i, sub in enumerate(subagents):
+            sub_dir = directory / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            (sub_dir / f"agent-{i}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in sub))
+
+
+@pytest.fixture()
+def fleet_fixture(jarvis_home, tmp_path, monkeypatch, claude_json):
+    """A registered project, a catalog, an `os.db` and a transcript root — all empty.
+
+    In `jarvis.testing` rather than a conftest so the eval and browser suites can reuse
+    it (mem:testing). The catalog is not decoration: classifying a cold boundary needs
+    `os.cold_prefix_floor`, which has no default anywhere.
+    """
+    from .central_store import CentralStore
+
+    project_path = make_git_project(tmp_path, "proj_a")
+    claude_json(project_path)
+    root = tmp_path / "transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({
+        "os": {"cold_prefix_floor": 5_000},
+        "projects": [{"name": "proj_a", "path": str(project_path)}],
+    }))
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project_path), "test project")
+        central.set_state("catalog_path", str(catalog))
+        central.conn.commit()
+    finally:
+        central.close()
+    return FleetCostFixture(jarvis_home, project_path, root, catalog)
 
 
 class Recorder:
