@@ -21,7 +21,8 @@ from typing import Any, NamedTuple
 
 from . import concision
 # §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
-from .navigation import _mask_shell_text, _statements
+# `navigates_source` joins it for §6 of 2026-10-02-serena-the-cheap-path.md.
+from .navigation import _mask_shell_text, _statements, navigates_source
 from .project_store import ProjectStore
 
 # A Bash command every worker must be able to run without a permission prompt:
@@ -1399,6 +1400,57 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
+#: This hook's OWN suffix set, narrower than `navigation.SOURCE_SUFFIXES` (the
+#: counter's): §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+PY_NAV_SUFFIXES = (".py",)
+
+#: The refusal IS the mitigation, so it names the call to make instead and the
+#: activation fallback — both Serena spellings, as `serena_activation_context` does.
+_PY_NAV_DENY = (
+    "Refused: read Python with SYMBOLS, not text. Call "
+    "`mcp__plugin_serena_serena__find_symbol` — or `get_symbols_overview` for a file, "
+    "`find_referencing_symbols` for the callers. On a hand-added install the prefix is "
+    "`mcp__serena__`. If a symbol call answers `No active project`, call "
+    "`activate_project` with your worktree root and retry it."
+)
+
+
+def py_nav_decision(payload: dict[str, Any],
+                    env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call.
+
+    §6 of docs/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
+    DEFAULT OFF: a hook nobody has enabled cannot strand a worker.
+
+    POSITION: in the Bash chain of `preflight_decision`, immediately after
+    `investigator_bash_decision` and BEFORE the `is_jarvis_command_chain` auto-allow.
+    That auto-allow returns an allow, so an arm placed after it is unreachable in
+    production however green its unit test.
+
+    NO `_allow` BRANCH, EVER. It denies or it returns None, so it can hand out nothing.
+
+    Gated on `JARVIS_WO_ID`, so an interactive session in a managed project is
+    untouched, and on `.serena/project.yml` existing at the project root: a repo with no
+    symbol index must keep grep or the worker cannot read code at all.
+    """
+    if payload.get("tool_name") != "Bash":
+        return None
+    if env.get("JARVIS_PY_NAV_HOOK") != "on":
+        return None
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    cwd = payload.get("cwd") or ""
+    if not command or not cwd:
+        return None
+    root = find_project_root(Path(cwd))
+    if root is None or not (root / ".serena" / "project.yml").exists():
+        return None
+    if not navigates_source(command, PY_NAV_SUFFIXES):
+        return None
+    return _deny(_PY_NAV_DENY)
+
+
 def _investigator_git_read(segment: str) -> bool:
     """Whether one SEGMENT is an allowlisted `git`/`gh` read and nothing more.
 
@@ -2076,6 +2128,11 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         mutating = investigator_bash_decision(payload, env)
         if mutating is not None:
             return mutating
+        # Before the auto-allow for the ordering reason above (§6 of
+        # docs/specs/2026-10-02-serena-the-cheap-path.md).
+        text_read = py_nav_decision(payload, env)
+        if text_read is not None:
+            return text_read
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None

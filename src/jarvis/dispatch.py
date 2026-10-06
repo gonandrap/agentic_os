@@ -210,6 +210,9 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # worker to make a `ToolSearch` call for tools already in its tool list. Env for
         # `JARVIS_SERENA`'s reason (spec 2026-10-02-serena-the-cheap-path.md §4).
         "JARVIS_TOOL_SEARCH": project.worker.tool_search,
+        # Whether `hooks.py_nav_decision` refuses a source-navigating Bash call at a
+        # `.py` path (spec 2026-10-02-serena-the-cheap-path.md §6).
+        "JARVIS_PY_NAV_HOOK": project.worker.py_nav_hook,
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
         # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog

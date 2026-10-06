@@ -10878,6 +10878,9 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # tool list cannot change mid-conversation. Spec §4:
     # docs/specs/2026-10-02-serena-the-cheap-path.md
     ("*.tool_search", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, which is where the hook reads
+    # it. Spec §6: docs/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.py_nav_hook", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
