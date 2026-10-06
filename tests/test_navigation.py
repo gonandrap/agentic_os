@@ -158,3 +158,16 @@ def test_the_catalog_defaults_are_the_leafs_sets_and_not_a_second_definition():
     assert catalog.DEFAULT_NAVIGATION_SYMBOL_TOOLS is navigation.SYMBOL_TOOLS
     assert catalog.DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS is navigation.TEXT_SEARCH_TOOLS
     assert catalog.DEFAULT_NAVIGATION_CODE_SUFFIXES is navigation.SOURCE_SUFFIXES
+
+
+def test_the_eval_uses_the_shipped_classifier():
+    """§7: the LLM nav eval imports this leaf rather than keeping a retyped copy.
+
+    Identity, so a copy that merely passes equality fails here. The eval module imports
+    fine without `JARVIS_EVALS_LLM` — the marker only skips.
+    """
+    from evals.llm import test_navigation_judgment as ev
+
+    assert ev.NAV_COMMANDS is navigation.NAV_COMMANDS
+    assert ev.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
+    assert "def bash_navigates_code" not in open(ev.__file__).read()
