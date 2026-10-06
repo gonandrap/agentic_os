@@ -242,6 +242,8 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     -- docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
     prompt_chars INTEGER NOT NULL DEFAULT 0,
     system_prompt_chars INTEGER NOT NULL DEFAULT 0,
+    -- How long the call took. NULLABLE — also in ADDED_COLUMNS, where the reasoning is.
+    latency_ms INTEGER,
     usage_json TEXT
 );
 -- What the OS believes is a privileged action, and what it has LEARNED is not.
@@ -498,6 +500,12 @@ ADDED_COLUMNS = {
         # pre-existing row means NOT MEASURED, never "an empty prompt".
         "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
+        # How long the call took, in milliseconds — §3 of
+        # docs/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
+        # beside it: 0 chars of prompt is impossible so 0 can safely mean "not measured"
+        # there, whereas a sub-millisecond call rounds to 0 and the report must not print
+        # "0 ms" for a call nobody timed.
+        "latency_ms": "INTEGER",
     },
 }
 
@@ -1753,7 +1761,8 @@ class CentralStore:
                        label: str = "", model: str = "", question_id: int | None = None,
                        ok: bool = True, session_id: str = "",
                        usage: dict[str, Any] | None = None,
-                       prompt_chars: int = 0, system_prompt_chars: int = 0) -> int:
+                       prompt_chars: int = 0, system_prompt_chars: int = 0,
+                       latency_ms: int | None = None) -> int:
         """Record one Claude call the OS made itself. See the `agent_calls` schema.
 
         `usage` is a `claude_cli.derive_turn_usage` envelope, or None for a call that
@@ -1761,19 +1770,23 @@ class CentralStore:
         still WORTH WRITING: it says a call was made and cost something unknown, which
         is a different fact from no call at all, and `ok=False` is what tells a reader
         which. Token columns stay zero there, so it cannot inflate a total.
+
+        `latency_ms=None` is "nobody timed this call" and stays NULL — §3 of
+        docs/specs/2026-10-01-neo-observability.md.
         """
         u = usage or {}
         cur = self.conn.execute(
             """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model,
                                         question_id, ok, session_id, cost_usd, input,
                                         cache_write, cache_read, output,
-                                        prompt_chars, system_prompt_chars, usage_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                        prompt_chars, system_prompt_chars, latency_ms,
+                                        usage_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (db.now(), project, wo_id, kind, label, model, question_id, 1 if ok else 0,
              session_id,
              u.get("total_cost_usd"), u.get("input") or 0, u.get("cache_write") or 0,
              u.get("cache_read") or 0, u.get("output") or 0,
-             prompt_chars, system_prompt_chars,
+             prompt_chars, system_prompt_chars, latency_ms,
              db.to_json(usage) if usage else None),
         )
         return int(cur.lastrowid or 0)
@@ -1850,6 +1863,70 @@ class CentralStore:
                            AS cache_5m
                 FROM agent_calls {clause}
                 GROUP BY wo_id, kind, label, model""", params).fetchall())
+
+    def agent_call_totals_by_day(self, project: str | None = None,
+                                 since: float | None = None,
+                                 kinds: Sequence[str] | None = None,
+                                 ) -> list[dict[str, Any]]:
+        """`agent_call_totals`' windowed sibling, keyed on (kind, project, day, model).
+
+        A separate query rather than a widened one — §4 of
+        docs/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
+        asked on every cost report, and the key it groups on (`wo_id`) is the one this
+        report never wants. The DAY BUCKET IS SQL's, as the sums beside it already are.
+
+        `model` stays in the key because the caller prices each group at its own model's
+        list rate, which is what `_priced_group` needs and what a blended rate destroys.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        if kinds:
+            where.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT kind, project, model,
+                       strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS calls, SUM(cost_usd) AS cost_usd,
+                       SUM(input) AS input, SUM(cache_write) AS cache_write,
+                       SUM(cache_read) AS cache_read, SUM(output) AS output,
+                       SUM(1 - ok) AS failed,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_1h'), 0))
+                           AS cache_1h,
+                       SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
+                           AS cache_5m
+                FROM agent_calls {clause}
+                GROUP BY kind, project, day, model
+                ORDER BY day""", params).fetchall())
+
+    def agent_call_latencies(self, project: str | None = None,
+                             since: float | None = None,
+                             kinds: Sequence[str] | None = None,
+                             ) -> list[dict[str, Any]]:
+        """One row per call in the window: its kind and its `latency_ms`, NULL included.
+
+        Percentiles are computed in Python by the caller — SQLite has none, and the row
+        count is bounded by the window (§4 of the spec above). NULL rows travel because
+        "how much of this window is blind" is a figure the report prints.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        if kinds:
+            where.append(f"kind IN ({','.join('?' for _ in kinds)})")
+            params.extend(kinds)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"SELECT kind, latency_ms FROM agent_calls {clause}", params).fetchall())
 
     # -- os state ----------------------------------------------------------------------
 

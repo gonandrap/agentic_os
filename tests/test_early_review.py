@@ -297,6 +297,25 @@ def test_a_verdict_the_os_cannot_form_records_nothing_and_leaves_it_pending(
     nothing_settled(store, wo["id"])
 
 
+def test_an_override_in_the_early_pass_records_why_the_os_escalated(started,
+                                                                   no_settling):
+    """Neo ANSWERED and the OS re-marked the question, so without a cause this escalation
+    renders "not recorded" for ever — docs/specs/2026-10-01-neo-observability.md §1."""
+    store, _wo = running(started, assumptions=(f"FORCE_ACCEPT_HIGH — {ROUTINE}",))
+
+    ask(started, store)
+    (q,) = questions()
+    drain(started)
+
+    neo_store = NeoStore()
+    try:
+        row = neo_store.get(q["id"])
+    finally:
+        neo_store.close()
+    assert row["status"] == "escalated"
+    assert row["escalation_cause"] == "stakes-high"
+
+
 def test_a_worker_that_finishes_while_neo_thinks_does_not_turn_the_ruling_into_a_settle(
         started, no_settling):
     """THE RACE, and it is why the pass that asked is read off the record rather than

@@ -127,6 +127,36 @@ def test_the_input_size_is_taken_off_a_plain_envelope_too(jarvis_home):
     assert (row["prompt_chars"], row["system_prompt_chars"]) == (4_200, 700)
 
 
+def test_the_latency_is_taken_off_a_headless_result(jarvis_home):
+    """How long the model took, recorded with the call. Spec §3,
+    docs/specs/2026-10-01-neo-observability.md."""
+    result = claude_cli.HeadlessResult(text="{}", usage={"output": 9},
+                                       model="claude-haiku-4-5", latency_ms=2_400)
+    agent_usage.record("neo_answer", usage=result, wo_id="wo-lat-1")
+
+    (row,) = calls(wo_id="wo-lat-1")
+    assert row["latency_ms"] == 2_400
+
+
+def test_the_latency_is_taken_off_a_plain_envelope_too(jarvis_home):
+    """The load-bearing half: `structured.request` and `panel._record` pass
+    `usage=result.usage`, a plain dict, and would otherwise record nothing."""
+    agent_usage.record("panel_seat", usage={"output": 9, "latency_ms": 1_750},
+                       wo_id="wo-lat-2")
+
+    (row,) = calls(wo_id="wo-lat-2")
+    assert row["latency_ms"] == 1_750
+
+
+def test_a_call_nobody_timed_records_no_latency_at_all(jarvis_home):
+    """NULL, never 0: the report must not print "0 ms" for a call that was not measured."""
+    agent_usage.record("neo_answer", usage={"output": 9}, wo_id="wo-lat-3")
+    agent_usage.record("neo_answer", usage=None, wo_id="wo-lat-4")
+
+    assert [row["latency_ms"] for row in calls(wo_id="wo-lat-3")] == [None]
+    assert [row["latency_ms"] for row in calls(wo_id="wo-lat-4")] == [None]
+
+
 def test_a_call_with_no_usage_records_no_size_and_keeps_its_failure(jarvis_home):
     """0/0 is what "not measured" reads as, and `ok=False` still says the call failed."""
     agent_usage.record("neo_answer", usage=None, wo_id="wo-size-3", ok=False)
