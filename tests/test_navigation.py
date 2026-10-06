@@ -246,6 +246,85 @@ def test_days_excludes_a_file_by_mtime_before_opening_it(tree):
     assert everything.window_days is None
 
 
+def test_a_sibling_project_with_a_shared_slug_prefix_is_not_folded_in(tree):
+    """`slug_of` maps EVERY non-alphanumeric character to `-`, so `/ws/jarvis`'s slug is
+    a bare-`startswith` prefix of `/ws/jarvis_os`'s. PR 927 review: three of four seats.
+
+    Two layers, because `slug_of` is not injective: the separator rule rejects a slug
+    that merely shares characters, and `slug_exclude` — the catalog's other projects —
+    rejects a sibling whose own slug is longer and matches too.
+    """
+    mine = navigation.slug_of("/ws/jarvis")
+    theirs = navigation.slug_of("/ws/jarvis_os")
+    tree("lead", [tool_use_row("t1", "Bash", command="cat src/a.py"),
+                  tool_result_row("t1", "x" * 10)], slug=mine)
+    tree("wt", [tool_use_row("t2", "Bash", command="cat src/b.py"),
+                tool_result_row("t2", "x" * 20)],
+         slug=navigation.slug_of("/ws/jarvis/.claude/worktrees/wo-1"))
+    tree("sib", [tool_use_row("t3", "Bash", command="cat src/c.py"),
+                 tool_result_row("t3", "x" * 400)], slug=theirs)
+    tree("sibwt", [tool_use_row("t4", "Bash", command="cat src/d.py"),
+                   tool_result_row("t4", "x" * 800)],
+         slug=navigation.slug_of("/ws/jarvis_os/.claude/worktrees/wo-2"))
+
+    vol = navigation.read_tree(cfg=CFG, slug_prefix=mine, slug_exclude=(theirs,))
+
+    # The project's own transcript and its own worktree's — and NEITHER of the sibling's.
+    assert vol.sides[navigation.SIDE_LEAD].transcripts == 2
+    assert vol.sides[navigation.SIDE_LEAD].result_bytes == 30
+
+    # And the separator rule on its own: a prefix that is not followed by the `-` a path
+    # separator becomes is not a parent directory, it is a different path.
+    partial = navigation.read_tree(cfg=CFG, slug_prefix=navigation.slug_of("/ws/jarvi"))
+    assert partial.sides[navigation.SIDE_LEAD].transcripts == 0
+    assert partial.found is False
+
+
+def test_a_sibling_projects_slug_comes_from_the_catalog(tree, monkeypatch):
+    """The exclusion list is not guessed: it is every OTHER project the catalog names
+    whose slug would match this one's too."""
+    from jarvis import ops
+    from jarvis.catalog import Catalog, OsConfig, ProjectSpec
+    from pathlib import Path
+
+    catalog = Catalog(os=OsConfig(),
+                      projects=[ProjectSpec(name="jarvis", path=Path("/ws/jarvis")),
+                                ProjectSpec(name="jarvis_os",
+                                            path=Path("/ws/jarvis_os"))])
+    monkeypatch.setattr(ops, "resolve_catalog", lambda *a, **k: catalog)
+    tree("lead", [tool_use_row("t1", "Bash", command="cat src/a.py"),
+                  tool_result_row("t1", "x" * 10)],
+         slug=navigation.slug_of("/ws/jarvis"))
+    tree("sib", [tool_use_row("t2", "Bash", command="cat src/c.py"),
+                 tool_result_row("t2", "x" * 400)],
+         slug=navigation.slug_of("/ws/jarvis_os"))
+
+    payload = ops.navigation_report(project="jarvis", days=7)
+
+    assert payload["sides"]["lead"]["transcripts"] == 1
+    assert payload["sides"]["lead"]["result_bytes"] == 10
+
+
+def test_both_readers_agree_about_what_a_subagent_file_is(tree):
+    """ONE pattern, named once: `_subagents_of` globbed `*.jsonl` and `read_tree`
+    `agent-*.jsonl`, so the per-order and the fleet report could disagree about the same
+    session. `agent-*.jsonl` is the layout the module docstring documents."""
+    tree("s10", [tool_use_row("t1", "Bash", command="cat src/a.py"),
+                 tool_result_row("t1", "x" * 10)],
+         subagents={"agent-aaa": [tool_use_row("u1", "Grep", pattern="f"),
+                                  tool_result_row("u1", "y" * 7)],
+                    "helper": [tool_use_row("v1", "Grep", pattern="f"),
+                               tool_result_row("v1", "z" * 500)]})
+
+    session = navigation.read_session("s10", CFG)
+    fleet = navigation.read_tree(cfg=CFG, days=7)
+
+    for vol in (session, fleet):
+        sub = vol.sides[navigation.SIDE_SUBAGENT]
+        assert (sub.transcripts, sub.result_bytes) == (1, 7)
+    assert navigation.SUBAGENT_GLOB == "agent-*.jsonl"
+
+
 def test_a_missing_root_is_an_honest_absence(tmp_path, monkeypatch):
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(tmp_path / "gone"))
 
@@ -381,6 +460,96 @@ def test_both_reports_resolve_a_target_through_one_helper(monkeypatch):
     # unchanged, because there is no third thing a time report could mean.
     with pytest.raises(ops.OpsError, match="no such work order"):
         ops._resolve_report_target("proj_a", None)
+
+
+def test_a_mistyped_order_id_is_not_read_as_a_project_name(monkeypatch):
+    """`jarvis navigation wo-deadbeef` must say the work order does not exist, not that
+    there is no project of that name: `project_fallback` turned EVERY failure into the
+    project reading (PR 927 review)."""
+    from jarvis import ops
+
+    def no_feature(target, project=None):
+        raise ops.OpsError("no such feature order")
+
+    def no_work_order(target, project=None):
+        raise ops.OpsError(f"no work order {target}")
+
+    monkeypatch.setattr(ops, "find_feature_order", no_feature)
+    monkeypatch.setattr(ops, "find_work_order", no_work_order)
+
+    for mistyped in ("wo-deadbeef", "fo-deadbeef"):
+        with pytest.raises(ops.OpsError, match=f"no work order {mistyped}"):
+            ops._resolve_report_target(mistyped, None, project_fallback=True)
+
+    # A target that is no id at all still has the third reading this flag exists for.
+    assert ops._resolve_report_target("proj_a", None, project_fallback=True) == (
+        ops._TARGET_PROJECT, None, None, None)
+
+
+def test_a_non_positive_days_window_is_refused(tree):
+    """`--days 0` disabled the window the `--fleet` opt-in exists to enforce: the walk it
+    bounds is 2.7G. Against the CONSTANT, as the scope refusal is."""
+    from jarvis import ops
+
+    for days in (0, -1):
+        with pytest.raises(ops.OpsError) as caught:
+            ops.navigation_report(fleet=True, days=days)
+        assert str(caught.value) == ops.NAVIGATION_DAYS_POSITIVE
+    assert "--days" in ops.NAVIGATION_DAYS_POSITIVE
+
+    # None still means the catalog's window, unchanged.
+    assert ops.navigation_report(fleet=True)["window_days"] == 7
+
+
+def test_inspect_reads_the_transcripts_again_only_when_asked(monkeypatch):
+    """`jarvis inspect` opened every transcript twice — once in `inspection.read_session`
+    and once more through `navigation.read_session` (PR 927 review). The second pass is
+    now a caller's request, and `cli.cmd_inspect` — which PRINTS the section — is the
+    caller that makes it; the dashboard's debugging page renders nothing from it.
+    """
+    from jarvis import navigation as nav_mod
+    from jarvis import ops
+
+    asked: list[str] = []
+
+    def counted(session_id, cfg, *, index=None):
+        asked.append(session_id)
+        return nav_mod.NavigationVolume(scope=session_id)
+
+    monkeypatch.setattr(nav_mod, "read_session", counted)
+
+    def resolved(target, project=None):
+        return "proj_a", "/nowhere", {"id": "wo-1", "title": "t", "status": "completed",
+                                      "session_id": "sid-1"}
+
+    monkeypatch.setattr(ops, "find_feature_order",
+                        lambda *a, **k: (_ for _ in ()).throw(ops.OpsError("no")))
+    monkeypatch.setattr(ops, "find_work_order", resolved)
+    monkeypatch.setattr(ops, "ProjectStore", lambda path: _NoStore())
+
+    quiet = ops.inspect_report("wo-1")
+    assert asked == []
+    assert "navigation" not in quiet["units"][0]
+
+    loud = ops.inspect_report("wo-1", with_navigation=True)
+    assert asked == ["sid-1"]
+    assert loud["units"][0]["navigation"]["scope"] == "sid-1"
+
+
+class _NoStore:
+    """A project store that answers the two reads `inspect_report`'s unit makes."""
+
+    def turn_starts(self, wo_id):
+        return []
+
+    def list_events(self, wo_id, limit=None):
+        return []
+
+    def list_turns(self, wo_id):
+        return []
+
+    def close(self):
+        pass
 
 
 def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, capsys):

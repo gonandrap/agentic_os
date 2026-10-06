@@ -23,7 +23,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .catalog import NavigationConfig
 from . import usage
@@ -50,6 +50,12 @@ STAGE_SEPARATORS = ("&&", "||", "|", ";", "\n")
 #: The `Read` tool, counted apart: it is navigation the OS does not classify by command,
 #: and keeping it separate is what lets the Bash share be read as a Bash share.
 READ_TOOL = "Read"
+
+#: What a SUBAGENT transcript is called, named ONCE and used by both readers: the
+#: per-order path and the wide walk disagreeing about this made the two reports
+#: incomparable for the same session (PR 927 review). The layout this module's docstring
+#: documents, and `usage.read_session`'s.
+SUBAGENT_GLOB = "agent-*.jsonl"
 
 
 @dataclass
@@ -260,7 +266,7 @@ def _subagents_of(path: Path) -> list[Path]:
     directory = path.with_suffix("") / "subagents"
     if not directory.is_dir():
         return []
-    return sorted(directory.glob("*.jsonl"))
+    return sorted(directory.glob(SUBAGENT_GLOB))
 
 
 def read_session(session_id: str, cfg: NavigationConfig, *,
@@ -293,13 +299,42 @@ def slug_of(path: Path | str) -> str:
     `/home/x/.claude/jobs` read as `-home-x--claude-jobs` on disk. Used to scope a wide
     walk to ONE project: a worker's worktree lives under the project path, so the
     project's slug is a prefix of its workers' slugs.
+
+    THE PREFIX IS NOT A SUFFICIENT TEST, and `in_slug_scope` is what read_tree uses
+    instead. This mapping is not injective: `_` and `/` both become `-`, so
+    `/ws/jarvis_os` and `/ws/jarvis/os` have the SAME slug, and a bare `startswith`
+    folded a sibling project's leads and subagents into its neighbour's report (PR 927
+    review). Nothing derived from the slug alone can separate that pair.
     """
     return "".join(c if c.isalnum() else "-" for c in str(path))
 
 
+def in_slug_scope(name: str, slug: str, exclude: Sequence[str] = ()) -> bool:
+    """Does the transcript directory `name` belong to the project whose cwd slug is `slug`?
+
+    TWO LAYERS, because `slug_of` is not injective (see its docstring):
+
+    1. The slug EXACTLY, or the slug followed by the `-` a path separator becomes — so
+       `-ws-jarvisx` is no longer read as a subdirectory of `-ws-jarvis`.
+    2. Not a closer match for one of `exclude`, the slugs of the OTHER projects the
+       catalog names. `/ws/jarvis_os` slugifies to `/ws/jarvis`'s slug plus `-os`, which
+       layer 1 cannot tell from a subdirectory; the sibling's own longer slug can.
+
+    An empty `slug` is the fleet scope and matches everything.
+    """
+    if not slug:
+        return True
+    if not (name == slug or name.startswith(slug + "-")):
+        return False
+    return not any(len(other) > len(slug)
+                   and (name == other or name.startswith(other + "-"))
+                   for other in exclude)
+
+
 def read_tree(root: Path | None = None, cfg: NavigationConfig | None = None, *,
               days: int | None = None,
-              slug_prefix: str = "") -> NavigationVolume:
+              slug_prefix: str = "",
+              slug_exclude: Sequence[str] = ()) -> NavigationVolume:
     """Every transcript under one root, split by side — the wide path.
 
     `days` filters by file mtime BEFORE anything is opened: `~/.claude/projects` is 2.7G
@@ -309,6 +344,8 @@ def read_tree(root: Path | None = None, cfg: NavigationConfig | None = None, *,
     `slug_prefix` is how a PROJECT scope is read without enumerating its orders: the
     record cannot name a session whose worktree is gone (`usage.index_sessions`' reason),
     but the slug a transcript lives under still carries the cwd it was created in.
+    Matched through `in_slug_scope` and never with a bare `startswith`; `slug_exclude`
+    is the other projects' slugs, for the pair `in_slug_scope`'s layer 1 cannot split.
     """
     cfg = cfg or NavigationConfig()
     root = Path(root) if root is not None else usage.transcript_root()
@@ -328,15 +365,17 @@ def read_tree(root: Path | None = None, cfg: NavigationConfig | None = None, *,
     for project_dir in sorted(root.iterdir()):
         if not project_dir.is_dir():
             continue
-        if slug_prefix and not project_dir.name.startswith(slug_prefix):
+        if not in_slug_scope(project_dir.name, slug_prefix, slug_exclude):
             continue
         for path in sorted(project_dir.glob("*.jsonl")):
             if fresh(path):
                 vol.found = True
                 _merge(vol.sides[SIDE_LEAD], read_transcript(path, SIDE_LEAD, cfg))
-        for sub in sorted(project_dir.glob("*/subagents/agent-*.jsonl")):
-            if fresh(sub):
-                vol.found = True
-                _merge(vol.sides[SIDE_SUBAGENT],
-                       read_transcript(sub, SIDE_SUBAGENT, cfg))
+            # `_subagents_of` and nothing of its own: one pattern, so this report and
+            # `read_session`'s cannot disagree about one session (PR 927 review).
+            for sub in _subagents_of(path):
+                if fresh(sub):
+                    vol.found = True
+                    _merge(vol.sides[SIDE_SUBAGENT],
+                           read_transcript(sub, SIDE_SUBAGENT, cfg))
     return vol

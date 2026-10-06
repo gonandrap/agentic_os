@@ -12299,11 +12299,26 @@ NAVIGATION_NEEDS_SCOPE = (
 )
 
 
+#: Why `jarvis navigation --days 0` refuses. `days=0` used to read as "no window" and
+#: therefore walked the whole 2.7G the window exists to bound — the opposite of what
+#: narrowing a window asks for (PR 927 review).
+NAVIGATION_DAYS_POSITIVE = (
+    "--days must be a positive number of days. `--days 0` would REMOVE the window "
+    "rather than narrow it, and walk every transcript Claude Code has ever written "
+    "(2.7G, 11,889 lead files on this box). Omit --days for the project's configured "
+    "window."
+)
+
+
 #: What `_resolve_report_target` returns in the first slot. `_TARGET_PROJECT` is the
 #: sentinel for "no id at all" — only `jarvis navigation` can read a target that way.
 _TARGET_FEATURE = "feature_order"
 _TARGET_WORK = "work_order"
 _TARGET_PROJECT = "<project>"
+
+#: How an order id is spelled, taken from `_resolve_order_id` (ops.py:239) and
+#: `create_investigation`'s "the wo-/fo-/io- id" rather than invented here.
+_ORDER_ID_PREFIXES = ("wo-", "fo-")
 
 
 def _resolve_report_target(target: str, project: str | None = None, *,
@@ -12317,6 +12332,10 @@ def _resolve_report_target(target: str, project: str | None = None, *,
     `project_fallback`: `navigation` has a third reading for a target that is no id at
     all (a project name), and a time report has none, so there the work-order lookup's
     OpsError is the answer, unchanged.
+
+    A target that LOOKS like an order id takes the lookup's error even under the flag: a
+    mistyped `jarvis navigation wo-deadbeef` used to answer "no project named
+    'wo-deadbeef'", which names the wrong record entirely (PR 927 review).
     """
     try:
         name, path, fo = find_feature_order(target, project)
@@ -12327,7 +12346,7 @@ def _resolve_report_target(target: str, project: str | None = None, *,
     try:
         name, path, wo = find_work_order(target, project)
     except OpsError:
-        if not project_fallback:
+        if not project_fallback or target.startswith(_ORDER_ID_PREFIXES):
             raise
         return _TARGET_PROJECT, None, None, None
     return _TARGET_WORK, name, path, wo
@@ -12351,6 +12370,8 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
 
     if not target and not project and not fleet:
         raise OpsError(NAVIGATION_NEEDS_SCOPE)
+    if days is not None and days <= 0:
+        raise OpsError(NAVIGATION_DAYS_POSITIVE)
 
     scope_project = project
     session_ids: list[tuple[str, str]] = []     # (label, session id)
@@ -12403,10 +12424,17 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     # path, so the project's slug is a prefix of its workers'. A project the catalog does
     # not name is refused rather than silently answered with the whole fleet.
     prefix = ""
+    siblings: list[str] = []
     if scope_project:
-        prefix = navigation.slug_of(
-            project_spec(resolve_catalog(), scope_project).path)
-    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix)
+        catalog = resolve_catalog()
+        prefix = navigation.slug_of(project_spec(catalog, scope_project).path)
+        # The OTHER projects' slugs: `slug_of` is not injective, so `/ws/jarvis_os`
+        # slugifies to `/ws/jarvis`'s slug plus a dash and cannot be told from a
+        # subdirectory without them (`navigation.in_slug_scope`, PR 927 review).
+        siblings = [navigation.slug_of(spec.path) for spec in catalog.projects
+                    if spec.name != scope_project]
+    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix,
+                                  slug_exclude=siblings)
     payload = volume.as_dict()
     payload["scope"] = scope
     return payload
@@ -12541,7 +12569,8 @@ def messaging_config_at(project_path: Path) -> Any:
 @observability.metered(OBSERVE_INSPECT, target="target", project="project")
 def inspect_report(target: str, project: str | None = None, *,
                    write_floor: int | None = None,
-                   join_floor: int | None = None) -> dict[str, Any]:
+                   join_floor: int | None = None,
+                   with_navigation: bool = False) -> dict[str, Any]:
     """Where a work order's or a feature order's TIME went — `jarvis cost`'s other half.
 
     Resolves the target exactly the way `_cost_for_target` does, feature order first and
@@ -12552,6 +12581,14 @@ def inspect_report(target: str, project: str | None = None, *,
     unit whose transcript has expired is reported with `found: false`, the same honest
     gap `jarvis cost` reports, because an unmeasurable clock and an idle one are
     different answers.
+
+    `with_navigation` adds the per-order navigation volume, and is OFF by default
+    because it is a SECOND pass over every transcript of every unit: `inspection` has
+    already opened them for the anatomy, and on a feature order with many children that
+    doubled the disk read of a report the dashboard's debugging page never rendered (PR
+    927 review). `cli.cmd_inspect` asks for it — it prints the section — and the
+    dashboard does not. The key's shape when asked for is unchanged:
+    `navigation.NavigationVolume.as_dict()`.
     """
     from dataclasses import replace
 
@@ -12601,12 +12638,14 @@ def inspect_report(target: str, project: str | None = None, *,
             wo, cfg, spans=spans, index=index,
             turn_starts=store.turn_starts(wo["id"]), cold_prefix_floor=floor)
         payload = anatomy.as_dict()
+        if with_navigation:
+            # §2.2: the per-order navigation volume, same reader as `jarvis
+            # navigation`'s. Read from the transcript, so an order whose session is gone
+            # reports `found: false` rather than zeros. A SECOND pass over every
+            # transcript, so only when a caller asks (see the docstring).
+            payload["navigation"] = navigation.read_session(
+                session, nav_settings(project_name), index=index).as_dict()
         payload.update(provenance=provenance,
-                       # §2.2: the per-order navigation volume, same reader as
-                       # `jarvis navigation`'s. Read from the transcript, so an order
-                       # whose session is gone reports `found: false` rather than zeros.
-                       navigation=navigation.read_session(
-                           session, nav_settings(project_name), index=index).as_dict(),
                        wo_id=wo["id"], project=project_name, title=wo["title"],
                        status=wo["status"], kind=wo.get("kind") or "worker",
                        # The biggest input Jarvis itself sent on this order's behalf

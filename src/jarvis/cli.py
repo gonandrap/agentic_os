@@ -577,7 +577,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="every project's transcripts, within --days")
     sp.add_argument("--days", type=int, metavar="N",
                     help="only transcripts modified in the last N days, for a project "
-                         "or --fleet (default: the project's os.navigation.window_days, "
+                         "or --fleet; N must be positive (default: the project's "
+                         "os.navigation.window_days, "
                          f"{catalog.DEFAULT_NAVIGATION_WINDOW_DAYS})")
     sp.add_argument("--json", action="store_true")
 
@@ -2485,8 +2486,11 @@ def cmd_navigation(args: argparse.Namespace) -> int:
 def cmd_inspect(args: argparse.Namespace) -> int:
     from . import ops
 
+    # `with_navigation`: this renderer PRINTS that section, so this is the caller that
+    # pays for its second pass over the transcripts (`ops.inspect_report`'s docstring).
     res = ops.inspect_report(args.target, args.project,
-                             write_floor=args.writes_over, join_floor=args.joins_over)
+                             write_floor=args.writes_over, join_floor=args.joins_over,
+                             with_navigation=True)
     if args.json:
         _print(res, True)
         return 0
