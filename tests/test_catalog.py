@@ -116,16 +116,18 @@ def test_absent_and_null_are_different():
 
 def test_tool_search_defaults_and_overrides_per_project():
     """§4 of docs/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
-    fleet-wide with a per-project override. The default is the SHIPPED state — this key
-    arriving must not change any worker's tool list; §7 owns the flip."""
+    fleet-wide with a per-project override. The default PINS DEFERRAL ON — deferral is
+    what makes a worker's first navigation call a symbol call (7/7 deferred against 1/10
+    with the tools present, wo-ab5d81db), so `cli` would leave that outcome to a vendor
+    default and `off` is a measured regression on it."""
     from jarvis.catalog import DEFAULT_WORKER_TOOL_SEARCH, VALID_TOOL_SEARCH
 
-    assert DEFAULT_WORKER_TOOL_SEARCH == "cli"
+    assert DEFAULT_WORKER_TOOL_SEARCH == "on"
     assert VALID_TOOL_SEARCH == ("off", "on", "cli")
 
     cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
-    assert cat.os.default_tool_search == "cli"
-    assert cat.projects[0].worker.tool_search == "cli"
+    assert cat.os.default_tool_search == "on"
+    assert cat.projects[0].worker.tool_search == "on"
 
     cat = parse_catalog({
         "os": {"defaults": {"tool_search": "off"}},
@@ -153,7 +155,9 @@ def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
 def test_py_nav_hook_defaults_off_and_overrides_per_project():
     """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
     `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
-    entirely Jarvis's own. Default OFF: a hook nobody enabled cannot strand a worker."""
+    entirely Jarvis's own. Default OFF: the hook measures ZERO contribution to first-call
+    order, and on fleet-wide a worker cannot search the tree for ANY text (issue 936);
+    wo-d2d777dc owns that fix and the flip is sequenced behind it (wo-ab5d81db)."""
     from jarvis.catalog import DEFAULT_WORKER_PY_NAV_HOOK, VALID_PY_NAV_HOOK
 
     assert DEFAULT_WORKER_PY_NAV_HOOK == "off"
