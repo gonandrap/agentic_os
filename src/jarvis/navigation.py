@@ -19,11 +19,12 @@ import re
 from pathlib import Path
 
 #: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no
-#: more: the BEFORE figure (41.3%) was measured with these six, and a wider set makes
-#: the AFTER figure incomparable rather than better.
+#: more: `nav_volume.BEFORE_NOTE`'s restated baseline was measured with these six, and a
+#: wider set makes the AFTER figure incomparable rather than better.
 NAV_COMMANDS = ("cat", "head", "sed", "grep", "rg", "find")
 
-#: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
+#: Which files make a read a CODE read. `.py` is what `nav_volume.BEFORE_NOTE`'s
+#: restated baseline measured.
 SOURCE_SUFFIXES = (".py",)
 
 #: Symbol tools, BARE — `is_symbol_call` strips the `mcp__<server>__` prefix, because

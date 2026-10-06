@@ -2452,13 +2452,16 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
         # None and never 0.0: an unmeasured share is not a zero one.
         share_text = ("not measured — no tool results"
                       if share is None else f"{share * 100:.1f}%")
+        # Neo q1242: branch off the payload's flag — the per-order surface carries no
+        # call counts.
+        calls = (f"  {row['symbol_calls']:>4} symbol  "
+                 f"{row['text_search_calls']:>4} text-search  "
+                 f"{row['nav_bash_calls']:>4} bash-nav "
+                 f"({row['code_nav_bash_calls']} on code)  "
+                 f"{row['read_tool_calls']:>4} Read"
+                 if payload.get("calls_reported", True) else "")
         print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
-              f"{row['transcripts']:>4} transcripts  "
-              f"{row['symbol_calls']:>4} symbol  "
-              f"{row['text_search_calls']:>4} text-search  "
-              f"{row['nav_bash_calls']:>4} bash-nav "
-              f"({row['code_nav_bash_calls']} on code)  "
-              f"{row['read_tool_calls']:>4} Read")
+              f"{row['transcripts']:>4} transcripts{calls}")
         print(f"{indent}           code reads via bash: {share_text} of "
               f"{_tok(row['result_bytes'])} bytes of tool results"
               + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"

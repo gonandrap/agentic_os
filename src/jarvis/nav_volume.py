@@ -4,7 +4,8 @@
 docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md,
 and the successor to the hand-run script of
 docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md §5.3, whose BEFORE
-figures were 0 symbol calls and 41.3% of 14,558 MB of read volume.
+figures do not reproduce (Neo q1246) — `BEFORE_NOTE` carries the restatement under the
+strict classifier.
 
 A LEAF MODULE. It imports `usage`, `catalog` and the stdlib-only `navigation` and
 nothing else: it never opens the OS database and never imports `ops`, `project_store` or
@@ -39,8 +40,14 @@ SIDES = (SIDE_LEAD, SIDE_SUBAGENT)
 #: The figure every reading of this report is a comparison against, carried in the
 #: PAYLOAD and not only in a renderer's prose: a share with nothing to compare it to is
 #: a number, and the question after `worker.bash_first: off` is the trend.
-BEFORE_NOTE = ("before `worker.bash_first: off`: 0 symbol calls, 41.3% of 14,558 MB of "
-               "read volume (spec 2026-10-01 §5.3)")
+BEFORE_NOTE = (
+    "baseline restated under the strict classifier over a DIFFERENT corpus from spec "
+    "2026-10-01 §5.3, whose 41.3% of 14,558 MB over 276 transcripts does not "
+    "reproduce (Neo q1246) — `jarvis navigation --project jarvis_os --days 36500`, "
+    "all history, measured 2026-10-05: lead 1 symbol call, 38.2% of 72.2 MB of "
+    "tool-result bytes over 351 transcripts; subagent 1,148 symbol calls, 34.7% of "
+    "58.6 MB over 439 transcripts"
+)
 
 #: `mcp__<server>__` — stripped before a tool name is matched, because both
 #: `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet
@@ -82,15 +89,18 @@ class SideVolume:
             return None
         return self.code_nav_bash_bytes / self.result_bytes
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self, *, calls_reported: bool = True) -> dict[str, Any]:
+        # Neo q1242: per-order call counts are `inspection.nav_profile`'s sealed-span
+        # ones, so the per-order projection omits these six.
+        calls = {"symbol_calls": self.symbol_calls,
+                 "text_search_calls": self.text_search_calls,
+                 "nav_bash_calls": self.nav_bash_calls,
+                 "code_nav_bash_calls": self.code_nav_bash_calls,
+                 "other_bash_calls": self.other_bash_calls,
+                 "read_tool_calls": self.read_tool_calls} if calls_reported else {}
         return {"side": self.side,
                 "transcripts": self.transcripts,
-                "symbol_calls": self.symbol_calls,
-                "text_search_calls": self.text_search_calls,
-                "nav_bash_calls": self.nav_bash_calls,
-                "code_nav_bash_calls": self.code_nav_bash_calls,
-                "other_bash_calls": self.other_bash_calls,
-                "read_tool_calls": self.read_tool_calls,
+                **calls,
                 "result_bytes": self.result_bytes,
                 "nav_bash_bytes": self.nav_bash_bytes,
                 "code_nav_bash_bytes": self.code_nav_bash_bytes,
@@ -112,6 +122,9 @@ class NavigationVolume:
     found: bool = False
     sides: dict[str, SideVolume] = field(default_factory=_empty_sides)
     window_days: int | None = None
+    #: Neo q1242: false on the PER-ORDER reader, whose call counts are the sealed-span
+    #: ones in `inspection.nav_profile`.
+    calls_reported: bool = True
 
     def fold(self, other: NavigationVolume) -> None:
         """Add another scope's reading into this one, side by side.
@@ -121,6 +134,8 @@ class NavigationVolume:
         rollup unmeasured.
         """
         self.found = self.found or other.found
+        # Neo q1242: a rollup of per-order volumes is still per-order.
+        self.calls_reported = self.calls_reported and other.calls_reported
         for side in SIDES:
             _merge(self.sides[side], other.sides[side])
 
@@ -128,7 +143,9 @@ class NavigationVolume:
         return {"scope": self.scope,
                 "found": self.found,
                 "window_days": self.window_days,
-                "sides": {side: self.sides[side].as_dict() for side in SIDES},
+                "calls_reported": self.calls_reported,
+                "sides": {side: self.sides[side].as_dict(
+                    calls_reported=self.calls_reported) for side in SIDES},
                 "before": BEFORE_NOTE}
 
 
@@ -225,7 +242,8 @@ def read_session(session_id: str, cfg: NavigationConfig, *,
     session id is a UUID but the directory it lives under is the slugified cwd it was
     created in, which Jarvis cannot reconstruct once a worktree is gone.
     """
-    vol = NavigationVolume(scope=session_id)
+    # Neo q1242: the per-order surface carries byte volumes and the side split only.
+    vol = NavigationVolume(scope=session_id, calls_reported=False)
     if index is None:
         index = usage.index_sessions()
     paths = index.get(session_id) or []
