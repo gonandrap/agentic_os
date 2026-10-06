@@ -904,6 +904,12 @@ class Daemon:
                 # ever opening a pull request.
                 self.settle_features(project, store)
                 if reconcile:
+                    # Immediately after the settlement above, because the merge that
+                    # clears the subject's last blocker is settled on that same tick — so
+                    # an investigation's WAITING_ON_USER flag goes down on the tick its
+                    # cause goes away rather than one interval later. Reconcile cadence:
+                    # one read per flagged investigation, and nothing waits on it (§2.5).
+                    self.clear_answered_investigations(project, store)
                     # The agents roster holds ONLY the user's own sessions: workers are
                     # headless and never enter it. Jarvis looks at the ones it was
                     # handed and no others.
@@ -1334,6 +1340,75 @@ class Daemon:
                 self._complete_feature(store, fo)
                 log.info("[%s] feature %s completed (%d work orders)", project.name,
                          fo["id"], len(children))
+
+    def clear_answered_investigations(self, project: ProjectSpec,
+                                      store: ProjectStore) -> None:
+        """Take down a `WAITING_ON_USER` flag once its subject owes the user nothing.
+
+        §2.5 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+        investigator.md, GitHub issue 906: the flag was raised once at the transition
+        (`ops.submit_verdict`) and nothing was ever written to lower it, so the warning
+        sign stayed up after the user acted and the subject merged.
+
+        **CLEAR-ONLY. A tick may lower this flag; a tick may NEVER raise it.** That
+        asymmetry is the whole design and it is what keeps kn-089de524 satisfied: a flag
+        re-derived every tick overwrites the user's own `jarvis wo ack` and re-notifies
+        for ever. The raise stays at the transition, and this pass is the only reader that
+        writes.
+
+        Flagged once by construction, `settle_features`' argument run in reverse: the
+        clear leaves the row out of the population, so the event is written once however
+        many ticks follow.
+
+        `invariants.true_blockers` answers the subject half, because it is the single
+        source of truth for "what does this order want from me" and already subtracts what
+        the user acknowledged. A subject that no longer exists owes nothing.
+        """
+        from . import ops
+
+        for fo in store.list_feature_orders(statuses=("completed",),
+                                            kind="investigation"):
+            if not fo["needs_attention"]:
+                continue
+            plan = db.from_json(fo.get("plan"), {}) or {}
+            if plan.get("classification") != "WAITING_ON_USER":
+                continue
+            subject = str((db.from_json(fo.get("metadata"), {}) or {}).get(
+                ops.SUBJECT_KEY) or "")
+            try:
+                if not self._subject_is_clear(store, subject):
+                    continue
+            except Exception:  # noqa: BLE001 — one investigation must not stop the rest
+                log.exception("[%s] could not read %s's subject", project.name, fo["id"])
+                continue
+            store.clear_feature_attention(fo["id"])
+            # The investigator carries the record: `ops.feature_event` is manager-only and
+            # an investigation has no manager (`carrier_for_feature` is the general rule).
+            carrier = store.carrier_for_feature(fo["id"])
+            if carrier is not None:
+                store.add_event(carrier["id"], "investigation_attention_cleared", {
+                    "investigation": fo["id"], "subject": subject,
+                    "why": f"{subject or 'the subject'} no longer needs the user",
+                })
+            log.info("[%s] %s: the user has dealt with %s", project.name, fo["id"],
+                     subject)
+
+    @staticmethod
+    def _subject_is_clear(store: ProjectStore, subject: str) -> bool:
+        """Does the investigated order still owe the user anything? §2.5's predicate.
+
+        A work order is asked through `true_blockers`; a feature or improvement order has
+        no such derivation, so its own `needs_attention` is the equivalent read.
+        """
+        if not subject:
+            return True
+        try:
+            if subject.startswith("wo-"):
+                return not invariants_mod.true_blockers(store,
+                                                        store.get_work_order(subject))
+            return not store.get_feature_order(subject)["needs_attention"]
+        except KeyError:
+            return True   # gone, so nothing is owed on it
 
     def _route_to_validation(self, project: ProjectSpec, store: ProjectStore,
                              fo: dict) -> bool:
@@ -5959,6 +6034,13 @@ class Daemon:
         candidates: list[tuple[dict, list[dict], bool]] = []
         for early, status in ((False, "needs_review"), (True, "running")):
             for wo in store.list_work_orders(statuses=(status,)):
+                if wo.get("kind") == "investigator":
+                    # A diagnosis is not a submission and nothing is gated on it: §2.3 of
+                    # docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-
+                    # its-investigator.md. Here rather than in `decide`/`decide_early`,
+                    # which would be two hold codes and a third `_holds_not_recorded`
+                    # entry for one rule.
+                    continue
                 rows = store.all_assumptions(wo["id"])
                 if any(a["status"] == "pending"
                        and not (early and a.get("provisional_verdict"))
@@ -6175,6 +6257,10 @@ class Daemon:
         kinds at once — §5 judges what it can while the worker runs — so that branch is
         per assumption and not per order. **The confirmation branch belongs to the parked
         pass only**: until the work is delivered there is no result to confirm against.
+
+        A row that is no longer `pending` is SKIPPED, whichever branch it would take:
+        docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+        assumption.md §3.1.
         """
         from . import autoreview, ops
 
@@ -6201,6 +6287,9 @@ class Daemon:
         rule = autoreview.decide_early if early else autoreview.decide
         suppress = _holds_not_recorded(early)
         for a in assumptions:
+            # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.1.
+            if str(a.get("status") or "") != "pending":
+                continue
             # `not early` is the third guard on this branch, after `auto_review`'s
             # candidate filter and `decide_early`'s `HELD_JUDGED` (spec §7).
             if not early and str(a.get("provisional_verdict") or ""):

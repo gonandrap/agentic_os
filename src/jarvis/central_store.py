@@ -46,6 +46,13 @@ HEADLINE_CHARS = 160
 # base as consulted and destroy the one number that says which entries earn their place.
 AIMED_VERBS = ("show", "search")
 
+#: How many words a work-order title has to carry for a search built out of it to mean
+#: anything. Below this the query is words like "fix the", which match a large share of the
+#: base — enough to manufacture a title "match" for every short title. Used twice, by
+#: `knowledge_brief`'s hint tier and by `ops.knowledge_usage_report`'s `could_have_read`;
+#: it lives here because the store cannot import `ops` (layering runs stores upward only).
+MISSED_MIN_WORDS = 3
+
 
 def split_tags(tags: str) -> list[str]:
     return [t for t in (s.strip() for s in (tags or "").split(",")) if t]
@@ -86,12 +93,17 @@ class KnowledgeBrief:
     entries that were curated as unmissable, `digest` carries headlines + ids so the
     worker can fetch what it needs, and `overflow` names the topics that did not fit
     so nothing is silently invisible.
+
+    `hints` is the one relevance-driven tier: entries whose text matches the work order's
+    own TITLE, which is how an entry sitting in `overflow` gets pointed at instead of
+    waiting for the worker to guess a search term.
     """
     project: str
     total: int = 0
     pinned: list[dict[str, Any]] = field(default_factory=list)
     digest: list[dict[str, Any]] = field(default_factory=list)
     overflow: list[tuple[str, int]] = field(default_factory=list)
+    hints: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def overflow_count(self) -> int:
@@ -987,7 +999,9 @@ class CentralStore:
 
     def knowledge_brief(self, project: str, pinned_limit: int = 8,
                         digest_limit: int = 40,
-                        digest_chars: int = 4000) -> KnowledgeBrief:
+                        digest_chars: int = 4000, title: str = "",
+                        hint_limit: int = 3,
+                        hint_chars: int = 400) -> KnowledgeBrief:
         """Build the bounded prompt view of the knowledge base.
 
         Cost is capped by `pinned_limit` + `digest_chars` no matter how large the base
@@ -997,6 +1011,12 @@ class CentralStore:
         entries never appear. An index headline is still the prompt — retracting a
         ruling has to remove it from the map as well as from the payload, or the worker
         reads the superseded headline and goes looking for the entry behind it.
+
+        `title` is the only relevance input the selection has — everything else is recency
+        and topic round-robin, which is exactly why a term-matched entry tends to land in
+        `overflow`. With `title == ""` this behaves as it always did, down to the byte:
+        `validation._round`'s shared prefix and `ops._index_cost` both call it positionally
+        with the project only and must keep measuring the same prompt.
         """
         brief = KnowledgeBrief(project=project, total=self.count_knowledge(project))
         if brief.total == 0:
@@ -1044,7 +1064,35 @@ class CentralStore:
             ((t, len(rows)) for t, rows in by_topic.items() if rows),
             key=lambda kv: (-kv[1], kv[0]),
         )
+        brief.hints = self._title_hints(project, title, hint_limit, hint_chars,
+                                        already={r["id"] for r in brief.pinned}
+                                        | {r["id"] for r in brief.digest})
         return brief
+
+    def _title_hints(self, project: str, title: str, hint_limit: int, hint_chars: int,
+                     already: set[str]) -> list[dict[str, Any]]:
+        """Entries whose text matches the work order's own title: headline + id, bounded.
+
+        No `ts` filter, unlike `ops.knowledge_usage_report`'s `could_have_read`. That one
+        excludes entries newer than the order so an order is not blamed for failing to read
+        what it wrote itself; at dispatch there is no "itself" yet, and filtering would drop
+        the newest lessons — the ones a fresh order most needs.
+        """
+        if not title or hint_limit <= 0 or len(title.split()) < MISSED_MIN_WORDS:
+            return []
+        hints: list[dict[str, Any]] = []
+        spent = 0
+        for row in self.search_knowledge(title, limit=hint_limit, project=project):
+            # An entry already in the index must not be printed twice, and a retracted one
+            # is not a hint — the prompt feed never carries retired entries.
+            if row.get("retired_at") or row["id"] in already:
+                continue
+            line = headline(row["content"])
+            if len(hints) >= hint_limit or spent + len(line) > hint_chars:
+                break
+            spent += len(line)
+            hints.append({**row, "headline": line})
+        return hints
 
     # -- who reads the knowledge base --------------------------------------------------
 

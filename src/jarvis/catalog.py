@@ -1344,6 +1344,12 @@ class OsConfig:
     knowledge_inject_limit: int = 8      # max pinned entries injected verbatim
     knowledge_digest_limit: int = 40     # max index lines
     knowledge_digest_chars: int = 4000   # hard char budget for those lines
+    # Entries matching the work order's own TITLE, surfaced as a pointer into the overflow.
+    # A budget of its own, deliberately small and never taken out of the digest's: hints
+    # eating the index would make the same base produce a different index size per title,
+    # and `ops._index_cost` would stop being comparable across orders.
+    knowledge_hint_limit: int = 3         # max title-matched hint lines
+    knowledge_hint_chars: int = 400       # hard char budget for those lines
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
@@ -2130,6 +2136,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         knowledge_inject_limit=int(os_raw.get("knowledge_inject_limit", 8)),
         knowledge_digest_limit=int(os_raw.get("knowledge_digest_limit", 40)),
         knowledge_digest_chars=int(os_raw.get("knowledge_digest_chars", 4000)),
+        knowledge_hint_limit=int(os_raw.get("knowledge_hint_limit", 3)),
+        knowledge_hint_chars=int(os_raw.get("knowledge_hint_chars", 400)),
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),

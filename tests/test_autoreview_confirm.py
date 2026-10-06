@@ -196,6 +196,20 @@ def test_a_confirmation_genuinely_in_flight_still_reads_as_the_pass_working():
     assert confirm(assumption=a, confirmation_open=True).code == autoreview.HELD_CONFIRMING
 
 
+def test_a_row_neo_already_settled_is_never_told_its_confirmation_is_spent():
+    """§3.2 of docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-
+    settled-assumption.md: the guard `decide` and `decide_early` open with, ahead of the
+    four gates — the `confirm_question_id` gate is what short-circuits on the defect's
+    own path. The pending sibling says where the guard does NOT reach."""
+    settled = judged(status="accepted", confirm_question_id=920)
+    pending = judged(confirm_question_id=920)
+
+    assert confirm(assumption=settled,
+                   confirmation_open=False).code == autoreview.HELD_SETTLED
+    assert confirm(assumption=pending,
+                   confirmation_open=False).code == autoreview.HELD_CONFIRM_SPENT
+
+
 def test_a_dead_question_is_re_asked_rather_than_reported_as_spent():
     """§6: `unreachable_question_ids` is checked FIRST — a `failed` question is an outage
     (2026-09-26 spec §4), not a decision handed back."""
@@ -594,6 +608,33 @@ def test_a_confirmation_nothing_flips_under_settles_on_one_ask(started):
     assert autoreview.HELD_CONFIRM_SPENT not in codes
     assert autoreview.HELD_ROUND_OPEN not in codes
     assert store.all_assumptions(wo["id"])[0]["status"] == "accepted"
+
+
+def test_the_parked_pass_writes_no_hold_about_the_row_it_already_accepted(started):
+    """§3.1 of docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-
+    settled-assumption.md: one pending row drags every accepted sibling through the pass,
+    and an accepted row keeps its `provisional_verdict`, so the confirmation branch was
+    entered on it for ever. The pending sibling is asserted too: the skip is per row and
+    not a dead pass."""
+    store, wo = with_diff(started, assumptions=(f"FORCE_ACCEPT — {ROUTINE}",))
+    provisional(store, wo)
+    ask(started, store)
+    # The sibling arrives after the confirmation is filed, so one drain settles one row
+    # and leaves the order at `needs_review` with something still pending — the shape of
+    # wo-764454c5, wo-8fd40f1a and wo-9f00e3b5.
+    still_pending = store.add_assumption(wo["id"], "put the helper at the bottom")
+
+    drain(started)
+
+    accepted = store.all_assumptions(wo["id"])[0]
+    assert accepted["status"] == "accepted" and accepted["confirm_question_id"]
+
+    ask(started, store)
+
+    held = events(store, wo["id"], "autoreview_held")
+    assert [h for h in held if h.get("assumption_id") == accepted["id"]] == []
+    asked = events(store, wo["id"], "autoreview_asked")
+    assert [a["assumption_id"] for a in asked if a["assumption_id"] == still_pending]
 
 
 def test_a_verdict_that_does_not_confirm_leaves_the_assumption_with_the_user(started):
