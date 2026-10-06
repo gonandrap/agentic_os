@@ -1,381 +1,170 @@
-"""How the fleet NAVIGATES code, measured by side — `jarvis navigation`.
+"""What counts as SOURCE NAVIGATION — one classifier, one shell masker.
 
-§2 of
-docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md,
-and the successor to the hand-run script of
-docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md §5.3, whose BEFORE
-figures were 0 symbol calls and 41.3% of 14,558 MB of read volume.
+§3 of
+docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md
+(`.jarvis/features/fo-b9a3fb06/sections/wo-f4b04708.md`), Neo q1238.
 
-A LEAF MODULE. It imports `usage` and `catalog` and nothing else: it never opens the OS
-database and never imports `ops`, `project_store` or `inspection` — `inspection`'s
-constraint, for its reason, that a report over files on disk must not fail because a
-catalog or a database moved.
+A STDLIB-ONLY LEAF. It imports NOTHING from `jarvis`: `hooks.py` imports it on every
+Bash `PreToolUse`, so an import of `catalog` here is a per-command cost. The fleet
+reader that reads transcripts against these predicates is `nav_volume.py`.
 
-**The side comes from the PATH.** No transcript row carries `isSidechain`:
-`<slug>/<uuid>.jsonl` is a LEAD and `<slug>/<uuid>/subagents/agent-*.jsonl` is a
-SUBAGENT, which is the layout `usage.read_session` already relies on. Nothing is
-inferred from content and no vendor field is invented.
+`_mask_shell_text` and `_statements` live here and `hooks` re-exports them BY IDENTITY.
+There is exactly ONE masker in the tree: a copied body passes equality and then drifts
+(kn-7f5f2d0d).
 """
 
 from __future__ import annotations
 
-import json
-import time
-from dataclasses import dataclass, field
+import re
 from pathlib import Path
-from typing import Any, Sequence
 
-from .catalog import NavigationConfig
-from . import usage
+#: Bash commands that count as reading or searching code. EXACTLY §5.3's set and no
+#: more: `nav_volume.BEFORE_NOTE`'s restated baseline was measured with these six, and a
+#: wider set makes the AFTER figure incomparable rather than better.
+NAV_COMMANDS = ("cat", "head", "sed", "grep", "rg", "find")
 
-SIDE_LEAD = "lead"
-SIDE_SUBAGENT = "subagent"
-SIDES = (SIDE_LEAD, SIDE_SUBAGENT)
+#: Which files make a read a CODE read. `.py` is what `nav_volume.BEFORE_NOTE`'s
+#: restated baseline measured.
+SOURCE_SUFFIXES = (".py",)
 
-#: The figure every reading of this report is a comparison against, carried in the
-#: PAYLOAD and not only in a renderer's prose: a share with nothing to compare it to is
-#: a number, and the question after `worker.bash_first: off` is the trend.
-BEFORE_NOTE = ("before `worker.bash_first: off`: 0 symbol calls, 41.3% of 14,558 MB of "
-               "read volume (spec 2026-10-01 §5.3)")
+#: Symbol tools, BARE — `is_symbol_call` strips the `mcp__<server>__` prefix, because
+#: both `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet.
+#: `search_for_pattern` is DELIBERATELY ABSENT: it is text search with a Serena name,
+#: and counting it as a symbol call is the vacuity trap kn-a397fb52 documents.
+SYMBOL_TOOLS = ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                "find_declaration", "find_implementations")
 
-#: `mcp__<server>__` — stripped before a tool name is matched, because both
-#: `mcp__serena__` and `mcp__plugin_serena_serena__` exist in this fleet
-#: (`dispatch.SERENA_TOOL_PREFIXES`).
+#: The TOOLS that are text search. `Bash` is not here and must not be — a worker runs
+#: all sorts of legitimate shell; the COMMAND is classified instead.
+TEXT_SEARCH_TOOLS = ("Grep", "Glob")
+
+#: `mcp__<server>__` — stripped before a tool name is matched.
 MCP_PREFIX = "mcp__"
 
-#: Where one shell command ends and the next begins. A pipeline or chain is navigation if
-#: ANY stage is, which is §5.3's method.
-STAGE_SEPARATORS = ("&&", "||", "|", ";", "\n")
+#: A Pyright/LSP symbol tool, whatever the rest of its name.
+LSP_PREFIX = "LSP"
 
-#: The `Read` tool, counted apart: it is navigation the OS does not classify by command,
-#: and keeping it separate is what lets the Bash share be read as a Bash share.
-READ_TOOL = "Read"
+#: The three commands that can sweep the tree without naming a file.
+_SWEEP_COMMANDS = ("grep", "rg", "find")
 
-#: What a SUBAGENT transcript is called, named ONCE and used by both readers: the
-#: per-order path and the wide walk disagreeing about this made the two reports
-#: incomparable for the same session (PR 927 review). The layout this module's docstring
-#: documents, and `usage.read_session`'s.
-SUBAGENT_GLOB = "agent-*.jsonl"
+#: Wrappers that run another command, so the word after them is still in command
+#: position. `_statements` already drops `time` and every env assignment.
+_WRAPPERS = ("sudo", "command", "env", "nohup", "setsid", "time")
 
+#: `sed` reads a file only with `-n`; without it, it is an edit.
+_SED_READ_FLAGS = ("--quiet", "--silent")
 
-@dataclass
-class SideVolume:
-    """One side's navigation behaviour over one or more transcripts."""
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"", re.DOTALL)
+_SHELL_COMMENT = re.compile(r"(?:(?<=^)|(?<=\s))#[^\n]*")
 
-    side: str
-    transcripts: int = 0
-    symbol_calls: int = 0          # Serena symbol tools, either prefix
-    text_search_calls: int = 0     # the `Grep`/`Glob` TOOLS
-    nav_bash_calls: int = 0        # Bash whose command is a read/search
-    code_nav_bash_calls: int = 0   # ...of a path with a configured code suffix
-    other_bash_calls: int = 0
-    read_tool_calls: int = 0       # the `Read` tool
-    result_bytes: int = 0          # every attributed `tool_result`
-    nav_bash_bytes: int = 0
-    code_nav_bash_bytes: int = 0
-    symbol_bytes: int = 0
-    #: `tool_result` bytes whose `tool_use_id` matched no `tool_use` in the same file.
-    #: REPORTED, never silently dropped and never in a share's numerator.
-    unattributed_bytes: int = 0
-
-    def code_nav_share(self) -> float | None:
-        """`code_nav_bash_bytes / result_bytes`, or None on an empty corpus.
-
-        None and NEVER 0.0: a zero share is a finding and an unmeasured one is not,
-        which is `usage.rewrite_ttl_share`'s rule.
-        """
-        if not self.result_bytes:
-            return None
-        return self.code_nav_bash_bytes / self.result_bytes
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"side": self.side,
-                "transcripts": self.transcripts,
-                "symbol_calls": self.symbol_calls,
-                "text_search_calls": self.text_search_calls,
-                "nav_bash_calls": self.nav_bash_calls,
-                "code_nav_bash_calls": self.code_nav_bash_calls,
-                "other_bash_calls": self.other_bash_calls,
-                "read_tool_calls": self.read_tool_calls,
-                "result_bytes": self.result_bytes,
-                "nav_bash_bytes": self.nav_bash_bytes,
-                "code_nav_bash_bytes": self.code_nav_bash_bytes,
-                "symbol_bytes": self.symbol_bytes,
-                "unattributed_bytes": self.unattributed_bytes,
-                "code_nav_share": self.code_nav_share()}
+#: Shell words that open a compound statement, so the command after them is still in
+#: command position: `; do sleep 30; done`.
+_KEYWORDS = frozenset({"do", "then", "else", "elif", "{", "(", "!", "time"})
 
 
-def _empty_sides() -> dict[str, SideVolume]:
-    """Both keys always present, so a renderer never tests for one."""
-    return {side: SideVolume(side=side) for side in SIDES}
+def _mask_shell_text(command: str) -> str:
+    """The command with quoted spans and comments blanked, positions preserved.
 
-
-@dataclass
-class NavigationVolume:
-    """One scope's navigation, split by side."""
-
-    scope: str
-    found: bool = False
-    sides: dict[str, SideVolume] = field(default_factory=_empty_sides)
-    window_days: int | None = None
-
-    def fold(self, other: NavigationVolume) -> None:
-        """Add another scope's reading into this one, side by side.
-
-        What a feature order needs: one report over a planner and every child, with the
-        sides still apart. `found` is an OR — one unmeasurable unit does not make the
-        rollup unmeasured.
-        """
-        self.found = self.found or other.found
-        for side in SIDES:
-            _merge(self.sides[side], other.sides[side])
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"scope": self.scope,
-                "found": self.found,
-                "window_days": self.window_days,
-                "sides": {side: self.sides[side].as_dict() for side in SIDES},
-                "before": BEFORE_NOTE}
-
-
-def _merge(dst: SideVolume, src: SideVolume) -> None:
-    """Add one transcript's reading into a side's running total."""
-    for name, value in vars(src).items():
-        if name == "side":
-            continue
-        setattr(dst, name, getattr(dst, name) + value)
-
-
-def is_symbol_tool(name: str, cfg: NavigationConfig) -> bool:
-    """Is this tool call a SYMBOL lookup?
-
-    Strips a leading `mcp__<server>__` and matches the bare name, so
-    `mcp__serena__find_symbol` and `mcp__plugin_serena_serena__find_symbol` both count.
-    `search_for_pattern` is deliberately not in the configured set.
+    An `&` inside a string or a comment is prose. This is the whole difficulty of the
+    shell half of §4 of docs/superpowers/specs/2026-09-23-the-crew-a-worker-must-use.md.
     """
-    bare = name.rsplit("__", 1)[-1] if name.startswith(MCP_PREFIX) else name
-    return bare in tuple(cfg.symbol_tools)
+    masked = _QUOTED_SPAN.sub(lambda m: " " * len(m.group(0)), command)
+    return _SHELL_COMMENT.sub(lambda m: " " * len(m.group(0)), masked)
 
 
-def _stages(command: str) -> list[str]:
-    parts = [command]
-    for sep in STAGE_SEPARATORS:
-        parts = [piece for part in parts for piece in part.split(sep)]
-    return [p.strip() for p in parts if p.strip()]
+def _statements(masked: str) -> list[list[str]]:
+    """The masked command as word lists, one per statement, keywords stripped.
+
+    Command position is what every arm below tests, and a `;`, `|`, `&` or newline is
+    where the next one starts — the same reading `_BACKGROUNDING_WORD` does with a regex.
+    """
+    out: list[list[str]] = []
+    for part in re.split(r"[;&|()\n]", masked):
+        words = part.split()
+        while words and (words[0] in _KEYWORDS or "=" in words[0]):
+            words = words[1:]
+        if words:
+            out.append(words)
+    return out
 
 
-def _head(stage: str) -> str:
-    """The command a stage actually runs, past env assignments and `sudo`."""
-    for token in stage.split():
-        if "=" in token.split("/")[0] and not token.startswith("-"):
-            continue            # FOO=1 cat …
-        if token in ("sudo", "command", "env", "time", "nohup"):
+def _command_word(words: list[str]) -> str:
+    """What this statement actually runs, past a wrapper and past a path."""
+    for index, word in enumerate(words):
+        if word in _WRAPPERS:
             continue
-        return Path(token.strip("\"'")).name
+        return Path(word).name if index or "/" in word else word
     return ""
 
 
-def classify_command(command: str, cfg: NavigationConfig) -> tuple[bool, bool]:
-    """`(is_navigation, targets_code)` for one Bash command.
+def _recursive_flag(args: list[str]) -> bool:
+    return any(arg == "--recursive"
+               or (arg.startswith("-") and not arg.startswith("--")
+                   and ("r" in arg or "R" in arg))
+               for arg in args)
 
-    DELIBERATELY NOT AN ARGUMENT PARSER: §5.3's BEFORE numbers came from token matching,
-    and a cleverer classifier makes the AFTER figure incomparable rather than better. A
-    pipeline or `&&` chain is navigation if ANY stage is; `targets_code` is any
-    whitespace-split token ending in a configured suffix.
+
+def _sweeps_the_tree(word: str, words: list[str]) -> bool:
+    """A `grep`/`rg`/`find` over the tree rather than over one named file.
+
+    §3: a sweep navigates source even though no token ends in a configured suffix.
+    NOT an argument parser — a flag's value is read as a positional, which is what keeps
+    `find . -name Makefile` a sweep and `grep -rn x notes.md` a single-file read.
+    """
+    if word not in _SWEEP_COMMANDS:
+        return False
+    args = words[1:]
+    positional = [arg for arg in args if not arg.startswith("-")]
+    if word != "find" and positional:
+        positional = positional[1:]     # `grep`/`rg` read a PATTERN first
+    named_files = [arg for arg in positional if Path(arg).suffix]
+    if named_files:
+        return False
+    return bool(positional) or _recursive_flag(args)
+
+
+def _reads_with_sed(args: list[str]) -> bool:
+    return any(arg in _SED_READ_FLAGS
+               or (arg.startswith("-") and not arg.startswith("--") and "n" in arg)
+               for arg in args)
+
+
+def navigates_source(command: str, suffixes: tuple[str, ...],
+                     commands: tuple[str, ...] = NAV_COMMANDS) -> bool:
+    """Whether this Bash command reads or searches SOURCE.
+
+    `suffixes` and `commands` are arguments and never globals, so the fleet reader can
+    pass its catalog-configured sets and re-measuring needs no release (§2.3). A chain
+    or a pipeline navigates when ANY statement does.
+
+    Masked FIRST: a `.py` inside a quoted string is prose, so
+    `git commit -m "fix pricing.py"` is False.
     """
     if not command:
-        return (False, False)
-    commands = tuple(cfg.bash_commands)
-    navigation = any(_head(stage) in commands for stage in _stages(command))
-    suffixes = tuple(cfg.code_suffixes)
-    targets_code = any(token.strip("\"'`)").endswith(suffixes)
-                       for token in command.split())
-    return (navigation, targets_code)
-
-
-def _content_bytes(block: dict[str, Any]) -> int:
-    """How much a `tool_result` block put back into the conversation.
-
-    A result's `content` is a string on most tools and a list of blocks on some; both
-    are real and neither is an error, so the list is serialised rather than skipped.
-    """
-    content = block.get("content")
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return len(content)
-    return len(json.dumps(content, separators=(",", ":"), default=str))
-
-
-def read_transcript(path: Path, side: str, cfg: NavigationConfig) -> SideVolume:
-    """One transcript's navigation, in ONE pass.
-
-    One pass and no `needle`: both row kinds are needed — the `tool_use` blocks name the
-    call and the `tool_result` blocks carry the volume — and two filtered passes read the
-    file twice.
-    """
-    vol = SideVolume(side=side, transcripts=1)
-    produced: dict[str, tuple[str, bool, bool]] = {}
-    for row in usage.rows(path):
-        kind = row.get("type")
-        if kind == "assistant":
-            for block in usage.blocks_of(row, "tool_use"):
-                tool_id = str(block.get("id") or "")
-                name = str(block.get("name") or "")
-                is_nav = is_code = False
-                if is_symbol_tool(name, cfg):
-                    vol.symbol_calls += 1
-                elif name in tuple(cfg.text_search_tools):
-                    vol.text_search_calls += 1
-                elif name == READ_TOOL:
-                    vol.read_tool_calls += 1
-                elif name == "Bash":
-                    command = str((block.get("input") or {}).get("command") or "")
-                    is_nav, is_code = classify_command(command, cfg)
-                    if is_nav:
-                        vol.nav_bash_calls += 1
-                        if is_code:
-                            vol.code_nav_bash_calls += 1
-                    else:
-                        vol.other_bash_calls += 1
-                if tool_id:
-                    produced[tool_id] = (name, is_nav, is_code)
-            continue
-        for block in usage.blocks_of(row, "tool_result"):
-            size = _content_bytes(block)
-            if not size:
-                continue
-            origin = produced.get(str(block.get("tool_use_id") or ""))
-            if origin is None:
-                # Never dropped and never in a share's numerator.
-                vol.unattributed_bytes += size
-                continue
-            name, is_nav, is_code = origin
-            vol.result_bytes += size
-            if is_nav:
-                vol.nav_bash_bytes += size
-                if is_code:
-                    vol.code_nav_bash_bytes += size
-            if is_symbol_tool(name, cfg):
-                vol.symbol_bytes += size
-    return vol
-
-
-def _subagents_of(path: Path) -> list[Path]:
-    """The subagent transcripts Claude Code wrote beside one lead file."""
-    directory = path.with_suffix("") / "subagents"
-    if not directory.is_dir():
-        return []
-    return sorted(directory.glob(SUBAGENT_GLOB))
-
-
-def read_session(session_id: str, cfg: NavigationConfig, *,
-                 index: dict[str, list[Path]] | None = None) -> NavigationVolume:
-    """One session's navigation — the per-order path, and `jarvis inspect`'s section.
-
-    `index` is `usage.index_sessions()`, passed in by a caller that already holds it: a
-    session id is a UUID but the directory it lives under is the slugified cwd it was
-    created in, which Jarvis cannot reconstruct once a worktree is gone.
-    """
-    vol = NavigationVolume(scope=session_id)
-    if index is None:
-        index = usage.index_sessions()
-    paths = index.get(session_id) or []
-    if not paths:
-        return vol
-    vol.found = True
-    for path in sorted(paths):
-        _merge(vol.sides[SIDE_LEAD], read_transcript(path, SIDE_LEAD, cfg))
-        for sub in _subagents_of(path):
-            _merge(vol.sides[SIDE_SUBAGENT],
-                   read_transcript(sub, SIDE_SUBAGENT, cfg))
-    return vol
-
-
-def slug_of(path: Path | str) -> str:
-    """The directory name Claude Code derives from a cwd.
-
-    Every non-alphanumeric character becomes a dash, which is what makes
-    `/home/x/.claude/jobs` read as `-home-x--claude-jobs` on disk. Used to scope a wide
-    walk to ONE project: a worker's worktree lives under the project path, so the
-    project's slug is a prefix of its workers' slugs.
-
-    THE PREFIX IS NOT A SUFFICIENT TEST, and `in_slug_scope` is what read_tree uses
-    instead. This mapping is not injective: `_` and `/` both become `-`, so
-    `/ws/jarvis_os` and `/ws/jarvis/os` have the SAME slug, and a bare `startswith`
-    folded a sibling project's leads and subagents into its neighbour's report (PR 927
-    review). Nothing derived from the slug alone can separate that pair.
-    """
-    return "".join(c if c.isalnum() else "-" for c in str(path))
-
-
-def in_slug_scope(name: str, slug: str, exclude: Sequence[str] = ()) -> bool:
-    """Does the transcript directory `name` belong to the project whose cwd slug is `slug`?
-
-    TWO LAYERS, because `slug_of` is not injective (see its docstring):
-
-    1. The slug EXACTLY, or the slug followed by the `-` a path separator becomes — so
-       `-ws-jarvisx` is no longer read as a subdirectory of `-ws-jarvis`.
-    2. Not a closer match for one of `exclude`, the slugs of the OTHER projects the
-       catalog names. `/ws/jarvis_os` slugifies to `/ws/jarvis`'s slug plus `-os`, which
-       layer 1 cannot tell from a subdirectory; the sibling's own longer slug can.
-
-    An empty `slug` is the fleet scope and matches everything.
-    """
-    if not slug:
-        return True
-    if not (name == slug or name.startswith(slug + "-")):
         return False
-    return not any(len(other) > len(slug)
-                   and (name == other or name.startswith(other + "-"))
-                   for other in exclude)
-
-
-def read_tree(root: Path | None = None, cfg: NavigationConfig | None = None, *,
-              days: int | None = None,
-              slug_prefix: str = "",
-              slug_exclude: Sequence[str] = ()) -> NavigationVolume:
-    """Every transcript under one root, split by side — the wide path.
-
-    `days` filters by file mtime BEFORE anything is opened: `~/.claude/projects` is 2.7G
-    with 11,889 lead transcripts, so the window is what makes a wide scope affordable at
-    all. None reads everything, which is what a caller asking for all history means.
-
-    `slug_prefix` is how a PROJECT scope is read without enumerating its orders: the
-    record cannot name a session whose worktree is gone (`usage.index_sessions`' reason),
-    but the slug a transcript lives under still carries the cwd it was created in.
-    Matched through `in_slug_scope` and never with a bare `startswith`; `slug_exclude`
-    is the other projects' slugs, for the pair `in_slug_scope`'s layer 1 cannot split.
-    """
-    cfg = cfg or NavigationConfig()
-    root = Path(root) if root is not None else usage.transcript_root()
-    vol = NavigationVolume(scope="fleet", window_days=days)
-    if not root.is_dir():
-        return vol
-    cutoff = (time.time() - days * 86400) if days else None
-
-    def fresh(path: Path) -> bool:
-        if cutoff is None:
+    for words in _statements(_mask_shell_text(command)):
+        word = _command_word(words)
+        if word not in commands:
+            continue
+        args = words[1:]
+        if word == "sed" and not _reads_with_sed(args):
+            continue
+        if suffixes and any(arg.endswith(suffixes) for arg in args):
             return True
-        try:
-            return path.stat().st_mtime >= cutoff
-        except OSError:
-            return False
+        if _sweeps_the_tree(word, words):
+            return True
+    return False
 
-    for project_dir in sorted(root.iterdir()):
-        if not project_dir.is_dir():
-            continue
-        if not in_slug_scope(project_dir.name, slug_prefix, slug_exclude):
-            continue
-        for path in sorted(project_dir.glob("*.jsonl")):
-            if fresh(path):
-                vol.found = True
-                _merge(vol.sides[SIDE_LEAD], read_transcript(path, SIDE_LEAD, cfg))
-            # `_subagents_of` and nothing of its own: one pattern, so this report and
-            # `read_session`'s cannot disagree about one session (PR 927 review).
-            for sub in _subagents_of(path):
-                if fresh(sub):
-                    vol.found = True
-                    _merge(vol.sides[SIDE_SUBAGENT],
-                           read_transcript(sub, SIDE_SUBAGENT, cfg))
-    return vol
+
+def is_symbol_call(tool_name: str, symbol_tools: tuple[str, ...] = SYMBOL_TOOLS) -> bool:
+    """Is this tool call a SYMBOL lookup?
+
+    Strips a leading `mcp__<server>__`, so `mcp__serena__find_symbol` and
+    `mcp__plugin_serena_serena__find_symbol` both count. `search_for_pattern` is not in
+    the set and `Grep`/`Glob` are text search, not symbols.
+    """
+    if not tool_name:
+        return False
+    bare = tool_name.rsplit("__", 1)[-1] if tool_name.startswith(MCP_PREFIX) \
+        else tool_name
+    return bare in symbol_tools or bare.startswith(LSP_PREFIX)

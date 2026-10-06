@@ -88,6 +88,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from . import navigation
 from . import usage as usage_mod
 from .catalog import (DEFAULT_INSPECT_REPORT_JOIN_FLOOR,
                       DEFAULT_INSPECT_REPORT_WRITE_FLOOR, InspectConfig)
@@ -491,6 +492,10 @@ class ToolSpan:
     #: `tool_use` input, never from `params`: those are redacted strings capped by
     #: `ParamCaps`, so a dropped key would silently reclassify a join (spec §1).
     backgrounded: bool = False
+    #: Does this Bash call read or search SOURCE? TRI-STATE, and `None` is the reading
+    #: that could not be taken: no command text was available, so the call is
+    #: UNCLASSIFIED and never a measured False (§3, Neo q1237, kn-4d32fe12).
+    navigates_source: bool | None = None
 
     @property
     def finished(self) -> bool:
@@ -903,6 +908,25 @@ class SubagentAnatomy:
         }
 
 
+#: The navigation reading's WORDING, in ONE place: `jarvis inspect` and the debug page
+#: both render from here, so the two cannot disagree about one figure (kn-77a8431d).
+NAV_LABELS = {"symbol_calls": "symbol", "source_nav_calls": "source nav",
+              "unclassified": "unclassified"}
+
+
+def nav_line(nav: dict[str, int]) -> str:
+    """The three counts as three SEPARATE numbers — §3.
+
+    `unclassified` is printed only when there IS one: a `0 unclassified` would read as a
+    measured zero, which is the claim the tri-state exists to avoid (issue #227).
+    """
+    line = (f"navigation — {nav.get('symbol_calls', 0)} {NAV_LABELS['symbol_calls']}, "
+            f"{nav.get('source_nav_calls', 0)} {NAV_LABELS['source_nav_calls']}")
+    if nav.get("unclassified"):
+        line += f", {nav['unclassified']} {NAV_LABELS['unclassified']}"
+    return line
+
+
 @dataclass
 class Anatomy:
     """One session, taken apart. `found` is false when no transcript exists for it.
@@ -1006,6 +1030,27 @@ class Anatomy:
             row["mean"] = row["seconds"] / timed if timed else 0.0
         return sorted(by_name.values(), key=lambda r: r["seconds"], reverse=True)
 
+    def nav_profile(self) -> dict[str, int]:
+        """How this session navigated code: symbol calls, source-navigation Bash calls.
+
+        §3's CONTRACT — these three key names are read by other surfaces. A SIBLING of
+        `tool_profile()` and never a replacement for it. A span that is neither a symbol
+        call nor Bash (`Read`, `Write`, `Edit`, `Task`, `Grep`, `Glob`) is in none of the
+        three, and `search_for_pattern` is text search rather than a symbol call.
+
+        `unclassified` is Bash spans whose command text was not available, kept apart
+        from a measured zero: absent is not zero (issue #227, kn-4d32fe12).
+        """
+        profile = {"symbol_calls": 0, "source_nav_calls": 0, "unclassified": 0}
+        for span in self.spans:
+            if navigation.is_symbol_call(span.name):
+                profile["symbol_calls"] += 1
+            elif span.navigates_source is True:
+                profile["source_nav_calls"] += 1
+            elif span.name == "Bash" and span.navigates_source is None:
+                profile["unclassified"] += 1
+        return profile
+
     def partition(self) -> dict[str, float]:
         """The whole session's clock, summed over its turns.
 
@@ -1073,6 +1118,7 @@ class Anatomy:
 
     def as_dict(self) -> dict[str, Any]:
         part = self.partition()
+        nav = self.nav_profile()
         wall = part["wall"] or 1.0
         return {
             "session_id": self.session_id,
@@ -1100,6 +1146,10 @@ class Anatomy:
             "writes": [w.as_dict() for w in self.writes],
             "joins": [s.as_dict() for s in self.joins()],
             "tools": self.tool_profile(),
+            # ADDITIVE and a SIBLING of `tools` above: §3's three-key contract, and its
+            # one wording carried WITH the reading (`hold_causes`' rule, kn-77a8431d).
+            "nav": nav,
+            "nav_line": nav_line(nav),
             # ADDITIVE, and `subagent_depth_read` is stated for the reason the floors and
             # the caps are: silence here would read as "there were none deeper".
             "unattached_subagents": [s.as_dict()
@@ -1111,6 +1161,21 @@ class Anatomy:
 
 
 # -- reading a transcript --------------------------------------------------------------
+
+
+def _navigates(block: dict[str, Any]) -> bool | None:
+    """Does this `tool_use` block read or search source? None when it cannot be said.
+
+    §3: read from the RAW input, the same read `backgrounded` does. A non-`Bash` call is
+    None here and is classified by TOOL NAME in `Anatomy.nav_profile`; a `Bash` call with
+    no command text is UNCLASSIFIED rather than False (issue #227).
+    """
+    if str(block.get("name") or "") != "Bash":
+        return None
+    command = str((block.get("input") or {}).get("command") or "")
+    if not command:
+        return None
+    return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
 
 
 def _detail_of(payload: Any, limit: int) -> str:
@@ -1261,7 +1326,10 @@ def read_transcript(path: Path | str,
                             # The RAW block, the same read `background._scan_calls` does
                             # and for the same reason (spec §1).
                             backgrounded=bool((block.get("input") or {}).get(
-                                "run_in_background")))
+                                "run_in_background")),
+                            # §3: the RAW command, never `detail` (prose) or `params`
+                            # (capped) — and None when there is no command to read.
+                            navigates_source=_navigates(block))
             pending[tool_id] = span
             # Charged to the turn that ASKED for it. A span whose result lands after the
             # next turn starts still belongs to the turn that spent the seconds.

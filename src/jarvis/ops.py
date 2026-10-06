@@ -10878,6 +10878,9 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # tool list cannot change mid-conversation. Spec §4:
     # docs/specs/2026-10-02-serena-the-cheap-path.md
     ("*.tool_search", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, which is where the hook reads
+    # it. Spec §6: docs/specs/2026-10-02-serena-the-cheap-path.md
+    ("*.py_nav_hook", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -12365,7 +12368,7 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     which is `usage.index_sessions`' reason, so a wide scope is a walk and therefore
     windowed.
     """
-    from . import navigation
+    from . import nav_volume
     from . import usage as usage_mod
 
     if not target and not project and not fleet:
@@ -12412,11 +12415,11 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
 
     if session_ids:
         index = usage_mod.index_sessions()
-        rolled = navigation.NavigationVolume(scope=scope)
+        rolled = nav_volume.NavigationVolume(scope=scope)
         for _label, session in session_ids:
             if not session:
                 continue
-            rolled.fold(navigation.read_session(session, cfg, index=index))
+            rolled.fold(nav_volume.read_session(session, cfg, index=index))
         return rolled.as_dict()
 
     # A project or the fleet: the tree, within the window. A project is scoped by the
@@ -12427,13 +12430,13 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     siblings: list[str] = []
     if scope_project:
         catalog = resolve_catalog()
-        prefix = navigation.slug_of(project_spec(catalog, scope_project).path)
+        prefix = nav_volume.slug_of(project_spec(catalog, scope_project).path)
         # The OTHER projects' slugs: `slug_of` is not injective, so `/ws/jarvis_os`
         # slugifies to `/ws/jarvis`'s slug plus a dash and cannot be told from a
-        # subdirectory without them (`navigation.in_slug_scope`, PR 927 review).
-        siblings = [navigation.slug_of(spec.path) for spec in catalog.projects
+        # subdirectory without them (`nav_volume.in_slug_scope`, PR 927 review).
+        siblings = [nav_volume.slug_of(spec.path) for spec in catalog.projects
                     if spec.name != scope_project]
-    volume = navigation.read_tree(None, cfg, days=window, slug_prefix=prefix,
+    volume = nav_volume.read_tree(None, cfg, days=window, slug_prefix=prefix,
                                   slug_exclude=siblings)
     payload = volume.as_dict()
     payload["scope"] = scope
@@ -12588,11 +12591,11 @@ def inspect_report(target: str, project: str | None = None, *,
     doubled the disk read of a report the dashboard's debugging page never rendered (PR
     927 review). `cli.cmd_inspect` asks for it — it prints the section — and the
     dashboard does not. The key's shape when asked for is unchanged:
-    `navigation.NavigationVolume.as_dict()`.
+    `nav_volume.NavigationVolume.as_dict()`.
     """
     from dataclasses import replace
 
-    from . import autopsy, holds, navigation
+    from . import autopsy, holds, nav_volume
     from . import usage as usage_mod
 
     index = usage_mod.index_sessions()
@@ -12643,7 +12646,7 @@ def inspect_report(target: str, project: str | None = None, *,
             # navigation`'s. Read from the transcript, so an order whose session is gone
             # reports `found: false` rather than zeros. A SECOND pass over every
             # transcript, so only when a caller asks (see the docstring).
-            payload["navigation"] = navigation.read_session(
+            payload["navigation"] = nav_volume.read_session(
                 session, nav_settings(project_name), index=index).as_dict()
         payload.update(provenance=provenance,
                        wo_id=wo["id"], project=project_name, title=wo["title"],

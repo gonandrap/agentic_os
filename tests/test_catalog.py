@@ -150,6 +150,41 @@ def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
         assert value in str(e.value)
 
 
+def test_py_nav_hook_defaults_off_and_overrides_per_project():
+    """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
+    `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
+    entirely Jarvis's own. Default OFF: a hook nobody enabled cannot strand a worker."""
+    from jarvis.catalog import DEFAULT_WORKER_PY_NAV_HOOK, VALID_PY_NAV_HOOK
+
+    assert DEFAULT_WORKER_PY_NAV_HOOK == "off"
+    assert VALID_PY_NAV_HOOK == ("off", "on")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_py_nav_hook == "off"
+    assert cat.projects[0].worker.py_nav_hook == "off"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"py_nav_hook": "on"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"py_nav_hook": "off"}},
+        ],
+    })
+    assert cat.os.default_py_nav_hook == "on"
+    assert cat.projects[0].worker.py_nav_hook == "on"       # inherits the fleet value
+    assert cat.projects[1].worker.py_nav_hook == "off"
+
+
+def test_an_invalid_py_nav_hook_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows (spec §6)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"py_nav_hook": "true"}}]})
+    assert "worker.py_nav_hook" in str(e.value)
+    for value in ("off", "on"):
+        assert value in str(e.value)
+
+
 def test_bash_first_defaults_off_and_overrides_per_project():
     """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
     enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
@@ -202,6 +237,9 @@ def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
     ({"projects": [{"name": "a", "path": "/x", "worker": {"tool_search": "yes"}}]},
      "tool_search"),
     ({"os": {"defaults": {"tool_search": "relaxed"}}}, "os.defaults.tool_search"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"py_nav_hook": "cli"}}]},
+     "py_nav_hook"),
+    ({"os": {"defaults": {"py_nav_hook": "yes"}}}, "os.defaults.py_nav_hook"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
