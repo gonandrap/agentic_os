@@ -871,6 +871,76 @@ def test_a_status_hold_stops_being_shown_once_a_review_is_owed_again(started):
     assert rulings(store, wo["id"]) == [""]
 
 
+# docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+# assumption.md §3.3. Every per-assumption hold claims something about a row, and the
+# claim is untrue once that row is decided — whatever the code says.
+
+SETTLED_SPENT = ("assumption #1 is yours — the OS asked Neo to confirm its early reading "
+                 "(question 920) and that question is no longer open")
+
+
+def settled_pair(started):
+    """A parked order with one row Neo ACCEPTED and one still pending — §1.1's shape."""
+    store, wo = park(started, auto_review=True,
+                     assumptions=(ROUTINE, "put the helper at the bottom"))
+    first, second = store.all_assumptions(wo["id"])
+    store.review_assumption(first["id"], "accepted", decided_by="neo")
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_CONFIRM_SPENT, "reason": SETTLED_SPENT,
+                     "assumption_id": first["id"], "n": 1})
+    return store, wo, first, second
+
+
+def test_a_hold_about_a_row_that_has_since_settled_is_not_the_summary_line(started):
+    """§3.3: the three observed orders' stored state, which no write-side change reaches.
+    The claim is withdrawn; the event stays on the timeline."""
+    store, wo, first, second = settled_pair(started)
+
+    assert ops.autoreview_state(store, store.get_work_order(wo["id"])) is None
+    assert [e["code"] for e in events(store, wo["id"], "autoreview_held")] \
+        == [autoreview.HELD_CONFIRM_SPENT]
+
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_HIGH_STAKES,
+                     "reason": "assumption #2 mentions 'production'",
+                     "assumption_id": second["id"], "n": 2})
+
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))
+    assert state["code"] == autoreview.HELD_HIGH_STAKES
+    assert state["assumption_id"] == second["id"]
+
+
+def test_the_freshness_of_a_hold_is_answered_per_assumption_not_per_order(started):
+    """§3.3's cache: one `stale` closure runs over every row of the order, so a single
+    status slot would answer the pending row with the accepted row's status."""
+    store, wo, first, second = settled_pair(started)
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_HIGH_STAKES,
+                     "reason": "assumption #2 mentions 'production'",
+                     "assumption_id": second["id"], "n": 2})
+
+    rows = ops.assumptions_with_rulings(store, wo["id"])
+
+    assert rows[0]["os_ruling"] is None
+    assert rows[1]["os_ruling"]["code"] == autoreview.HELD_HIGH_STAKES
+
+
+def test_an_order_level_hold_names_no_row_and_is_never_dropped_by_one(started):
+    """§3.3's first bullet: a payload with no `assumption_id` makes no claim about a row,
+    so the clause cannot answer about it and must leave it alone."""
+    store, wo = park(started, auto_review=True)
+    (row,) = store.all_assumptions(wo["id"])
+    store.review_assumption(row["id"], "accepted", decided_by="neo")
+    store.add_event(wo["id"], "autoreview_held",
+                    {"code": autoreview.HELD_DISABLED,
+                     "reason": "this project has not given the OS permission to decide "
+                               "its assumptions (`validation.auto_review`)"})
+
+    state = ops.autoreview_state(store, store.get_work_order(wo["id"]))
+
+    assert state["code"] == autoreview.HELD_DISABLED
+
+
 # -- the daemon: ruling ----------------------------------------------------------------
 
 

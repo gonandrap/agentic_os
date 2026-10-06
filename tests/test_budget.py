@@ -1053,3 +1053,74 @@ def test_the_post_condition_exempts_the_window_the_settler_declines(started, sto
     assert [v.invariant for v in check_budgets_are_enforced(store)] == [
         "INV-BUDGET-OVERSPENT"]
 
+
+# -- nothing is owed on work that is over ---------------------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md
+# §2.2, GitHub issue 906. `ops.submit_verdict` writing `completed` is necessary and not
+# sufficient: the turn is still running when the verdict is stored, so the cap can be
+# crossed AFTER the status write, and `Daemon._deliver` escalates whatever the status is.
+
+
+WHY = ("wo-11111111 has been `validating` for six hours with no turn in flight. Find "
+       "out what is holding it.")
+
+
+def _investigator(store, *, verdict: bool) -> str:
+    """An investigator work order, with its verdict filed or still being worked on."""
+    from jarvis.testing import a_verdict
+
+    subject = store.create_work_order("ship the CSV export", description="the ask")
+    inv = ops.create_investigation_order("proj_a", subject["id"], WHY)
+    child = store.create_work_order(f"investigate {inv['id']}", kind="investigator",
+                                    parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    if verdict:
+        ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject["id"]))
+    else:
+        store.update_work_order(child["id"], status="running")
+    return child["id"]
+
+
+def over_its_cap(started, store, wo_id: str) -> budget.Exhaustion:
+    """Past the cap on the accounting, which is the only thing `escalate` acts on."""
+    store.update_work_order(wo_id, budget_usd=2.0)
+    bill_the_turn(store, wo_id, 5.0)
+    out = budget.exhaustion(store, started.central, store.get_work_order(wo_id))
+    assert out is not None, "`exhaustion` is untouched by §2.2 — only the parking is"
+    return out
+
+
+def test_a_settled_investigator_is_never_parked_on_its_budget(started, store):
+    from jarvis.central_store import CentralStore
+
+    investigator = _investigator(store, verdict=True)
+    out = over_its_cap(started, store, investigator)
+
+    assert not budget.escalate(store, store.get_work_order(investigator), out)
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    assert store.events_of_kind(investigator, "budget_exhausted") == []
+    central = CentralStore()
+    try:
+        assert [i for i in central.unacked_inbox() if i["wo_id"] == investigator] == []
+    finally:
+        central.close()
+
+
+def test_a_live_investigator_with_no_verdict_still_parks(started, store):
+    """The control for the guard above, so it cannot widen into "investigators never run
+    out of money": the §2.8 cap on a diagnosis still in progress is doing its job."""
+    investigator = _investigator(store, verdict=False)
+    out = over_its_cap(started, store, investigator)
+
+    assert budget.escalate(store, store.get_work_order(investigator), out)
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == budget.EXHAUSTED
+    assert row["needs_attention"]
+    assert len(store.events_of_kind(investigator, "budget_exhausted")) == 1
+

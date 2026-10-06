@@ -950,6 +950,11 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     §7. A provisional approval is an opinion about an intention; at `needs_review` the
     intention has become a diff and a result summary, and only then may it settle.
 
+    A SETTLED ROW IS HELD BEFORE THE GATES, `decide`'s own clause byte for byte
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.2): the `confirm_question_id` gate short-circuits below it, so a
+    guard reached only at the tail call never runs on that path.
+
     Four gates of its own, then **`decide` itself, unchanged and in full**. A provisional
     verdict is not a ticket past any of its seven conditions: the early pass judged an
     intention, so it cannot buy the order past a panel that gave up, a permission the
@@ -995,6 +1000,10 @@ def decide_confirm(assumption: dict[str, Any], wo: dict[str, Any], cfg: Any, *,
     aid = int(assumption.get("id") or 0)
     n = int(assumption.get("n") or 0)
     fields = {"assumption_id": aid, "n": n}
+    # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.2.
+    if str(assumption.get("status") or "") != "pending":
+        return _held(HELD_SETTLED,
+                     f"assumption #{n} is already {assumption.get('status')}", **fields)
     if not verdict:
         return _held(HELD_UNJUDGED,
                      f"assumption #{n} carries no early verdict — there is nothing to "
