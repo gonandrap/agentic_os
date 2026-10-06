@@ -114,8 +114,55 @@ def test_absent_and_null_are_different():
     assert cat.projects[1].worker.autocompact_window is None
 
 
+def test_bash_first_defaults_off_and_overrides_per_project():
+    """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
+    enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
+    a softer copy of the instruction that already beat the brief at a measured 0% hit
+    rate."""
+    from jarvis.catalog import DEFAULT_WORKER_BASH_FIRST, VALID_BASH_FIRST
+
+    assert DEFAULT_WORKER_BASH_FIRST == "off"
+    assert VALID_BASH_FIRST == ("off", "relaxed", "strict", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_bash_first == "off"
+    assert cat.projects[0].worker.bash_first == "off"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"bash_first": "relaxed"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"bash_first": "cli"}},
+        ],
+    })
+    assert cat.os.default_bash_first == "relaxed"
+    assert cat.projects[0].worker.bash_first == "relaxed"   # inherits the fleet value
+    assert cat.projects[1].worker.bash_first == "cli"
+
+
+@pytest.mark.parametrize("value", ["off", "relaxed", "strict", "cli"])
+def test_every_bash_first_value_parses(value):
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                       "worker": {"bash_first": value}}]})
+    assert cat.projects[0].worker.bash_first == value
+
+
+def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
+    re-parses the document to validate (spec §1)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"bash_first": "true"}}]})
+    assert "worker.bash_first" in str(e.value)
+    for value in ("off", "relaxed", "strict", "cli"):
+        assert value in str(e.value)
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({"projects": "nope"}, "projects"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"bash_first": "yes"}}]},
+     "bash_first"),
+    ({"os": {"defaults": {"bash_first": "on"}}}, "os.defaults.bash_first"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
@@ -579,6 +626,19 @@ def test_a_ceiling_below_the_floor_is_refused_at_boot():
     for bad in ("400000", True, 0, -1, MAX_OS_PROMPT_CHARS_MIN - 1):
         with pytest.raises(CatalogError, match="max_os_prompt_chars"):
             parse_catalog({"os": {"max_os_prompt_chars": bad}, "projects": []})
+
+
+def test_the_knowledge_hint_bounds_round_trip():
+    """Spec test 15 of 2026-10-02-learn-search-returns-an-index.md — a pointer, not a
+    second index, so the defaults are deliberately small and separate from the digest."""
+    from jarvis.catalog import OsConfig
+
+    assert (OsConfig().knowledge_hint_limit, OsConfig().knowledge_hint_chars) == (3, 400)
+    cat = parse_catalog({"os": {"knowledge_hint_limit": 5, "knowledge_hint_chars": 900},
+                         "projects": []})
+    assert (cat.os.knowledge_hint_limit, cat.os.knowledge_hint_chars) == (5, 900)
+    # and the digest budget is untouched by either
+    assert cat.os.knowledge_digest_chars == 4000
 
 
 def test_the_ceiling_has_no_off_switch():

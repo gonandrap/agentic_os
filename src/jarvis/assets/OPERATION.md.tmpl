@@ -64,8 +64,10 @@ While handling work order `$JARVIS_WO_ID`, you MUST:
   to touch:
   `jarvis learn search "<term>" --project {project_name}` · `jarvis learn show <id>` ·
   `jarvis learn list --project {project_name} --topic <t>` · `jarvis learn topics`
-  A past worker probably already paid for the lesson. Never assume an index headline is
-  the whole entry.
+  `search` says which entries match — headline, id and one matching line each;
+  `show <id>` is the only verb that returns a body.
+  A past worker probably already paid for the lesson. Never assume an index headline or a
+  quoted line is the whole entry.
 - **Report reusable learnings** (patterns, gotchas, good practices) to the OS knowledge
   base so other projects benefit:
   `jarvis learn add "<what you learned>" --project {project_name} --topic "<topic>"`

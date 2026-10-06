@@ -182,6 +182,24 @@ def test_the_write_denial_is_reachable_through_preflight(worktree):
         _write(worktree, "verdict.json"), _env())) == "allow"
 
 
+def test_the_heredoc_refusal_tells_an_investigator_how_to_write_its_verdict(worktree):
+    """§2.6 of the 2026-10-01 spec: the enforcement was right, the message pointed
+    elsewhere — `Edit` is refused on every path and `Write` on every path but one."""
+    heredoc = f"cat > {worktree / hooks.VERDICT_FILE} <<'EOF'\n{{}}\nEOF"
+    denied = hooks.heredoc_write_decision(_bash(heredoc, worktree), _env())
+    assert _decision(denied) == "deny"
+    reason = _reason(denied)
+    assert "`Write`" in reason
+    assert f"--from-file {hooks.VERDICT_FILE}" in reason
+    # `Edit` may be NAMED as refused; it may never be offered as the remedy.
+    assert "Use `Edit` or `Write`" not in reason
+    assert "`Edit` is refused" in reason
+    # The control: an ordinary worker keeps the existing text.
+    worker = hooks.heredoc_write_decision(_bash(heredoc, worktree), _env("worker"))
+    assert _decision(worker) == "deny"
+    assert _reason(worker) == hooks._HEREDOC_DENY
+
+
 def test_jarvis_verbs_reads_each_segment_and_leaves_the_chain_predicate_alone():
     assert hooks.jarvis_verbs("cd /tmp && jarvis wo show wo-1") == (("wo", "show"),)
     assert hooks.jarvis_verbs("jarvis status") == (("status", ""),)
@@ -839,6 +857,229 @@ def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_orde
         ops.show_investigation_order(improvement_order["id"])
 
 
+# -- a submitted verdict settles its investigator too ---------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+# GitHub issue 906. The verdict settled the investigation and handed the INVESTIGATOR to
+# `ops.finish` — the contract for an order that authored code — so five mechanisms built
+# for a submission that must be judged, landed and funded acted on an order whose output
+# was already stored.
+
+
+def _panel_on(catalog_file) -> None:
+    """Validation on in the catalog FILE, which is the copy `ops.finish` reads.
+
+    Written rather than set through `ops.set_config`, which a worker session is refused
+    (`_refuse_worker_write`) — the suite runs inside one.
+    """
+    data = json.loads(Path(catalog_file).read_text())
+    data["projects"][0]["validation"] = {"enabled": True}
+    Path(catalog_file).write_text(json.dumps(data))
+
+
+def test_a_verdict_settles_the_investigator_completed_and_stops_it(
+        started, store, catalog_file, fake_claude):
+    """§2.1: `close_out`, not `finish` — completed, flag down, session dead."""
+    from jarvis.daemon import Daemon
+
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    fake_claude.hold_turns()
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.tick()
+    investigator = _investigators(store)[0]["id"]
+    turn = store.latest_turn(investigator)
+    assert claude_cli.process_alive(turn["pid"])
+
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    assert row["result_summary"]
+    kinds = [e["kind"] for e in store.list_events(investigator)]
+    assert "verdict_submitted_settled" in kinds
+    assert "session_stopped" in kinds
+    assert not claude_cli.process_alive(turn["pid"])
+    assert store.validation_rounds(wo_id=investigator) == []
+
+
+def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, store,
+                                                                  catalog_file):
+    """§2.1, wo-1aa88b2f exactly: the row stays pending and holds nothing."""
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    store.add_assumption(investigator,
+                         f"read {subject}'s prompt as truncated at 200 chars")
+
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    pending = store.pending_assumptions(investigator)
+    assert len(pending) == 1 and pending[0]["status"] == "pending"
+
+
+def test_an_investigator_assumption_is_never_put_to_neo(started, store, catalog_file):
+    """§2.3: one kind test beside the status test covers both passes."""
+    from jarvis.daemon import Daemon
+    from jarvis.neo_store import NeoStore
+
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.project("proj_a")
+    spec.validation.enabled = True
+    spec.validation.auto_review = True
+    for status in ("needs_review", "running"):
+        wo = store.create_work_order(f"investigate ({status})", kind="investigator")
+        store.update_work_order(wo["id"], status=status)
+        store.add_assumption(wo["id"], "the hold is never re-derived, so it is stale")
+
+    daemon.auto_review(spec, store)
+
+    neo = NeoStore()
+    try:
+        assert [q for q in neo.list_questions() if q["kind"] == "assumption"] == []
+    finally:
+        neo.close()
+    for wo in _investigators(store):
+        assert [e for e in store.list_events(wo["id"])
+                if e["kind"] == "autoreview_asked"] == []
+
+
+def test_no_validation_round_opens_over_an_investigator(started, store, catalog_file):
+    """§2.4, first of the three call sites."""
+    _panel_on(catalog_file)
+    cfg = load_catalog(catalog_file).project("proj_a").validation
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    assert not ops.validation_applies(cfg, store.get_work_order(investigator), store)
+    assert store.validation_rounds(wo_id=investigator) == []
+    # The control, in the same breath: an ordinary worker still goes to the panel.
+    worker = store.create_work_order("ship the exporter")
+    assert ops.validation_applies(cfg, store.get_work_order(worker["id"]), store)
+
+
+def test_a_release_order_still_skips_the_panel(started, store, catalog_file):
+    """§2.4's regression guard on the SHARED predicate: a release order's own exemption is
+    untouched by the investigator one beside it. The landing halves are
+    tests/test_validation_release_skip.py's; this is the predicate."""
+    from jarvis import release
+
+    _panel_on(catalog_file)
+    cfg = load_catalog(catalog_file).project("proj_a").validation
+    rel = store.create_work_order("Ship the fix", metadata={
+        release.BATCH_KEY: ["https://github.com/acme/proj/issues/826"]})
+
+    row = store.get_work_order(rel["id"])
+    assert release.is_release_order(row)
+    assert not ops.validation_applies(cfg, row, store)
+    assert not ops.exempt_from_validation(store, row), "a release claims the OTHER one"
+
+
+def test_an_investigator_is_not_parked_in_validating_by_the_join(started, store,
+                                                                catalog_file):
+    """§2.4's lockstep half: the landing is TOLD, so it re-reads no round."""
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    store.add_assumption(investigator, "the subject's own hold is the stale one")
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    out = ops.review_work_order(investigator, accept=True)
+
+    assert out["status"] == "completed"
+    assert store.get_work_order(investigator)["status"] == "completed"
+    assert store.validation_rounds(wo_id=investigator) == []
+
+
+# -- §2.5: the WAITING_ON_USER flag comes down when the subject is clear ---------------
+
+
+def _blocked_subject(store) -> str:
+    """A subject that genuinely owes the user: `failed` is one `true_blockers` derives."""
+    wo = store.create_work_order("ship the CSV export", description="the ask")
+    store.update_work_order(wo["id"], status="failed")
+    return wo["id"]
+
+
+def _waiting_on_user(started, store, subject: str) -> tuple[str, str]:
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+    assert store.get_feature_order(inv["id"])["needs_attention"]
+    return inv["id"], investigator
+
+
+def _cleared_events(store, investigator: str) -> list[dict]:
+    return [e for e in store.list_events(investigator)
+            if e["kind"] == "investigation_attention_cleared"]
+
+
+def test_a_waiting_on_user_flag_clears_once_the_subject_is_clear(started, store,
+                                                                catalog_file):
+    from jarvis.daemon import RECONCILE_EVERY_TICKS, Daemon
+
+    subject = _blocked_subject(store)
+    inv_id, investigator = _waiting_on_user(started, store, subject)
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.tick()
+    assert store.get_feature_order(inv_id)["needs_attention"], "the subject still owes"
+
+    store.set_status(subject, "completed")
+    # Through `tick`, so the wiring is asserted and not just the method — on the
+    # reconcile cadence, which is where §2.5 puts it.
+    for _ in range(RECONCILE_EVERY_TICKS):
+        daemon.tick()
+
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"]
+    assert not row["attention_reason"]
+    (event,) = _cleared_events(store, investigator)
+    assert json.loads(event["payload"])["subject"] == subject
+
+
+def test_a_tick_never_re_raises_a_cleared_investigation_flag(started, store,
+                                                            catalog_file):
+    """kn-089de524: the sweep is CLEAR-ONLY — a tick may lower this flag, never raise it."""
+    from jarvis.daemon import Daemon
+
+    subject = _blocked_subject(store)
+    inv_id, investigator = _waiting_on_user(started, store, subject)
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.project("proj_a")
+
+    # The user acked it while the subject is still blocked.
+    store.clear_feature_attention(inv_id)
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+    assert _cleared_events(store, investigator) == []
+
+    # ...and with the flag up and the subject still blocked, nothing is re-stated.
+    store.flag_feature_attention(inv_id, "as-4: the user owes something")
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    row = store.get_feature_order(inv_id)
+    assert row["needs_attention"]
+    assert row["attention_reason"] == "as-4: the user owes something"
+    assert _cleared_events(store, investigator) == []
+
+    # One clear, and one event, however many ticks follow it.
+    store.set_status(subject, "completed")
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+    assert len(_cleared_events(store, investigator)) == 1
+
+
 # -- §2.7: the daemon seam ------------------------------------------------------------
 
 
@@ -1046,6 +1287,15 @@ def test_every_write_the_prompt_promises_clears_the_hook(store, project_spec):
         command = command.replace("...", "a stale hold parks an order")
         assert _decision(hooks.investigator_bash_decision(
             _bash(command), _env())) == "allow", command
+
+
+def test_the_prompt_names_the_write_tool_for_the_verdict(store, project_spec):
+    """§2.6 of the 2026-10-01 spec: "Write it to `verdict.json`" reads as prose, and the
+    session spent turns being refused a heredoc instead."""
+    prompt = _prompt(store, "investigator", project_spec)
+    assert "`Write` tool" in prompt
+    assert "heredoc" in prompt
+    assert "--from-file verdict.json" in prompt
 
 
 def test_serena_reaches_the_investigator_read_only():
