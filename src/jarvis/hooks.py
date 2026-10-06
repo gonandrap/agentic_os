@@ -2784,6 +2784,35 @@ def mark_tool_managed_paths(env: dict[str, str], root: Path, store: ProjectStore
                         {"marked": marked, "skipped": skipped, "failed": failed})
 
 
+def serena_activation_context(cwd: Path) -> str:
+    """The one call a worker must make before its first Serena call, path filled in.
+
+    The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
+    `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
+    dispatched worker's first `find_symbol` fails with `No active project` and it falls
+    back to a text search. Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+
+    BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
+    entries: a plugin install produces the long prefix, `claude mcp add serena` the short
+    one, and Jarvis configures no MCP server itself so it cannot know which.
+
+    `session_id` is any string — verified live, `00000000` activated — so this needs no
+    `initial_instructions` round-trip first. The ABSOLUTE path is what makes it
+    unambiguous (108 registry entries share the name `jarvis-os`), and `activate_project`
+    writes the registry entry and `.serena/project.yml` itself when they are absent.
+
+    A few lines, because it rides every turn.
+    """
+    return (
+        "\n\nBefore your first code-navigation call, make exactly ONE call:\n"
+        f"`mcp__plugin_serena_serena__activate_project` with `project` = `{cwd}` and any "
+        "string as `session_id` (it is not validated).\n"
+        "On a hand-added install the tool is spelled `mcp__serena__activate_project`.\n"
+        "Skip it and every Serena call fails with `No active project`: the MCP server is "
+        "started with no project argument.\n"
+    )
+
+
 def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] | None:
     event = payload.get("hook_event_name", "")
     session_id = payload.get("session_id", "")
@@ -2871,10 +2900,20 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             #
             # It appends after the cached conversation rather than editing the system
             # prompt, so it does not move the prefix `note_prefix` just fingerprinted.
+            #
+            # ...and the Serena activation call, appended AFTER the house style so the
+            # existing cached shape is unchanged. Gated on `JARVIS_SERENA` alone — the
+            # key `dispatch._write_worker_settings` already writes from
+            # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
+            # `activate_project` writes itself (Neo q1259).
+            # Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+            context = concision.house_style()
+            if env.get("JARVIS_SERENA") != "0":
+                context += serena_activation_context(cwd)
             return {"wo_id": wo_id, "event": event,
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": concision.house_style(),
+                        "additionalContext": context,
                     }}
 
         elif not _is_current_session(store, wo_id, session_id):
