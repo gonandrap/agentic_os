@@ -71,6 +71,25 @@ def bash_first_env(bash_first: str) -> dict[str, str]:
     return {BASH_FIRST_ENV: "true", BASH_FIRST_VARIANT_ENV: bash_first}
 
 
+# Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full
+# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md records the probes.
+TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+
+
+def tool_search_env(tool_search: str) -> dict[str, str]:
+    """The env for one `worker.tool_search` value — spec §4.
+
+    STRINGS, every one: Claude Code's `env` is a `Record<string,string>` and an integer
+    risks the CLI rejecting the whole settings file. `cli` writes NOTHING, which is the
+    state where Jarvis leaves the vendor's own answer alone.
+    """
+    if tool_search == "cli":
+        return {}
+    if tool_search == "off":
+        return {TOOL_SEARCH_ENV: "false"}
+    return {TOOL_SEARCH_ENV: "true"}
+
+
 def serena_allow_rules() -> list[str]:
     """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
     return [f"{prefix}{tool}"
@@ -186,6 +205,11 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # answer is fixed at spawn, and a per-call catalog read would be a second
         # source of truth that can disagree with the settings beside it.
         "JARVIS_SERENA": "1" if serena else "0",
+        # Whether the navigation briefing may say the symbol tools are DEFERRED —
+        # `jarvis brief navigation` is a separate process and would otherwise tell the
+        # worker to make a `ToolSearch` call for tools already in its tool list. Env for
+        # `JARVIS_SERENA`'s reason (spec 2026-10-02-serena-the-cheap-path.md §4).
+        "JARVIS_TOOL_SEARCH": project.worker.tool_search,
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
         # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
@@ -231,6 +255,9 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # permission mode: the steer only exists under `auto`, and a per-mode conditional
         # would be a second source of truth about a vendor behaviour.
         **bash_first_env(project.worker.bash_first),
+        # WHETHER THIS WORKER'S SYMBOL TOOLS ARE LISTED OR DEFERRED (spec
+        # 2026-10-02-serena-the-cheap-path.md §4). Here for `MCP_TOOL_TIMEOUT`'s reason.
+        **tool_search_env(project.worker.tool_search),
         # Whether the lead must delegate its file edits to the crew (§7 of that spec).
         # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
         # write and must not parse the catalog to decide it has nothing to do.
@@ -446,7 +473,8 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         # Spec 2026-10-01-the-steer-that-beat-the-brief.md §3 — its own top-level block
         # after the index, never inside the core.
         *(["", *nav] if (nav := worker_brief.navigation_core(
-            wiring.serena_wired(project.wiring))) else []),
+            wiring.serena_wired(project.wiring),
+            tool_search=project.worker.tool_search)) else []),
     ]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -462,13 +490,13 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
     return "\n".join(parts)
 
 
-def _navigation_briefing(serena: bool = True) -> list[str]:
+def _navigation_briefing(serena: bool = True, tool_search: str = "cli") -> list[str]:
     """Serena before grep — the full text lives in `worker_brief` (single source
     with `jarvis brief navigation`); this shape survives for the planner's
     `_common_briefing` tail."""
     from . import worker_brief
 
-    return worker_brief.navigation_section(serena).splitlines()
+    return worker_brief.navigation_section(serena, tool_search=tool_search).splitlines()
 
 
 def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
@@ -482,7 +510,8 @@ def _common_briefing(parts: list[str], wo: dict[str, Any], project: ProjectSpec,
     """
     from . import wiring
 
-    parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring))]
+    parts += ["", *_navigation_briefing(wiring.serena_wired(project.wiring),
+                                       tool_search=project.worker.tool_search)]
     pre_approved = _pre_approval(wo)
     if pre_approved:
         parts += ["", *_pre_approved_briefing(pre_approved)]

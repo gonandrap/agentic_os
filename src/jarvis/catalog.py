@@ -83,6 +83,15 @@ DEFAULT_PERMISSION_MODE = "auto"
 VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
 
+# Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
+# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+#
+# A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
+# behaviour Jarvis does not own, and writes no key. `cli` IS the shipped default — §7
+# owns the flip, so this key arriving changes no worker's tool list.
+VALID_TOOL_SEARCH = ("off", "on", "cli")
+DEFAULT_WORKER_TOOL_SEARCH = "cli"
+
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
 # through to `claude --model`, so it accepts a full model id (pinned, as here) or an
@@ -425,6 +434,8 @@ class WorkerDefaults:
     permission_mode: str = DEFAULT_PERMISSION_MODE
     # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -1308,6 +1319,8 @@ class OsConfig:
     default_permission_mode: str = DEFAULT_PERMISSION_MODE
     # Spec 2026-10-01-the-steer-that-beat-the-brief.md §1 — see VALID_BASH_FIRST.
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
+    # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
+    default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -2110,6 +2123,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_effort=defaults.get("effort"),
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
+        default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2156,6 +2170,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_bash_first not in VALID_BASH_FIRST:
         raise _err(f"os.defaults.bash_first {os_cfg.default_bash_first!r} not in "
                    f"{sorted(VALID_BASH_FIRST)}")
+    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
+        raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
+                   f"{sorted(VALID_TOOL_SEARCH)}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2194,6 +2212,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if bash_first not in VALID_BASH_FIRST:
             raise _err(f"project {name}: worker.bash_first {bash_first!r} not in "
                        f"{sorted(VALID_BASH_FIRST)}")
+        # Spec 2026-10-02-serena-the-cheap-path.md §4 — this message IS what
+        # `jarvis config set <project> worker.tool_search` shows.
+        tool_search = w.get("tool_search", os_cfg.default_tool_search)
+        if tool_search not in VALID_TOOL_SEARCH:
+            raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
+                       f"{sorted(VALID_TOOL_SEARCH)}")
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2212,6 +2236,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             effort=w.get("effort", os_cfg.default_effort),
             permission_mode=pmode,
             bash_first=bash_first,
+            tool_search=tool_search,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
