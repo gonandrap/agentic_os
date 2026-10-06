@@ -1905,6 +1905,59 @@ def test_a_dismissal_stalls_the_order_and_flags_identically(started, project, fa
         invariants.AUTOMERGE_DENIED_BLOCKER
 
 
+# -- a give-up the merge side holds for ever -------------------------------------------
+# docs/superpowers/specs/2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md
+
+
+def test_a_parked_order_the_panel_gave_up_on_asks_the_user_for_something(
+        started, project, fake_gh):
+    """Row 1 end to end: the poll holds on `not_passed` every tick and nothing re-judges
+    it, so the hold itself is what the user has to be told about."""
+    store, wo = arm(started, project, auto_merge=True, outcome="escalated")
+    fake_gh.set_pr(PR, "OPEN", checks=GREEN, merge_state="CLEAN", head_oid=JUDGED)
+
+    poll(started, store)
+
+    hold = db.from_json(store.events_of_kind(wo["id"], "automerge_held")[-1]["payload"],
+                        {})
+    assert hold["code"] == automerge.HELD_NOT_PASSED
+    row = store.get_work_order(wo["id"])
+    assert row["status"] == "waiting_pr_merge"
+    assert invariants.parked_on_a_give_up(store, row)
+    assert invariants.PARKED_GIVE_UP_BLOCKER in invariants.true_blockers(store, row)
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == invariants.PARKED_GIVE_UP_BLOCKER
+
+
+def test_a_refused_merge_is_the_other_sentence_and_only_that(started, project, fake_gh):
+    """Row 10: `automerge_denied` needs a `validated_head`, which only a PASSED round
+    has, so the two are exclusive on the round alone."""
+    store, wo = refused(started, project, fake_gh)
+
+    row = store.get_work_order(wo["id"])
+    blockers = invariants.true_blockers(store, row)
+    assert invariants.AUTOMERGE_DENIED_BLOCKER in blockers
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+    assert invariants.parked_on_a_give_up(store, row) is False
+
+
+def test_the_parked_give_up_sentence_names_the_routes_that_exist_here():
+    """Row 11: `ack_attention` stores it verbatim and INV-ATTENTION-REASON compares it,
+    so the sentence carries no sha and no clock — and `jarvis wo review` is the
+    `needs_review` wording, refused here with nothing pending (kn-b6977de3)."""
+    sentence = invariants.PARKED_GIVE_UP_BLOCKER
+
+    for route in ("merge it yourself", "jarvis validation force",
+                  "validation.max_rounds"):
+        assert route in sentence
+    assert "jarvis wo review" not in sentence
+    assert JUDGED not in sentence
+    for clock in ("hour", "minute", "ago", "for "):
+        assert clock not in sentence
+
+
 def test_an_escalated_request_is_flagged_once_and_never_twice(started, project, fake_gh):
     """An escalation writes no `automerge_decided` row and already reaches the user
     through `store.escalated_approvals`."""

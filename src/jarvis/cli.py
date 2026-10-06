@@ -306,19 +306,49 @@ def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
     # read as a measurement (spec §3, Neo's ruling).
     if payload.get("approximate"):
         lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    held_now = payload.get("held_now")
     for total in payload.get("totals") or []:
         entries = total["entries"]
         word = "entry" if entries == 1 else "entries"
+        held = float(total.get("held_seconds") or 0.0)
+        current = bool(total["status"]) and total["status"] == payload.get(
+            "current_status")
+        # The HEADLINE is active and wall is never deleted (Neo 1130, spec §3); a status
+        # never held renders byte for byte as it did before holds were read at all.
+        duration = total["active_human"] if held else total["seconds_human"]
         line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
-                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{duration:>7}  {entries} {word:<8} "
                 f"{total['share'] * 100:>3.0f}%")
-        if total["status"] and total["status"] == payload.get("current_status"):
+        if held and not (current and held_now):
+            breakdown = ((payload.get("current_status_held_by") if current
+                          else total.get("held_by")) or [])
+            line += (f"   ({total['held_human']} held by {_held_phrase(breakdown)}, "
+                     f"{total['seconds_human']} wall)")
+        if current and held_now:
+            line += (f"   ← HELD {held_now['seconds_human']} by {held_now['phrase']}, "
+                     f"running {payload['current_status_active_age_human']} of "
+                     f"{payload['current_status_age_human']}")
+        elif current:
             idle = payload.get("last_activity_age_human")
             since = (f"nothing since {idle} ago" if idle
                      else "nothing on the record at all")
             line += f"   ← now, {payload['current_status_age_human']}, {since}"
         lines.append(line)
     return lines
+
+
+def _held_phrase(held_by: list[dict[str, Any]]) -> str:
+    """"a fleet usage limit and 2 others" — `holds.Hold.phrase` verbatim, biggest first.
+
+    Spec §3: the OS's own sentence for the cause, never a second spelling of it.
+    """
+    if not held_by:
+        return "a hold"
+    others = len(held_by) - 1
+    if not others:
+        return str(held_by[0]["phrase"])
+    return (f"{held_by[0]['phrase']} and {others} "
+            f"{'other' if others == 1 else 'others'}")
 
 
 def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
@@ -1315,7 +1345,8 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--topic")
     k.add_argument("--full", action="store_true", help="full text instead of headlines")
     k.add_argument("--limit", type=int, default=100)
-    k = kn.add_parser("search", help="full text of entries matching a term")
+    k = kn.add_parser("search", help="which entries match a term: headline, id, one "
+                                     "matching line (`learn show` for a body)")
     k.add_argument("term")
     k.add_argument("--project", help="this project + global entries")
     k.add_argument("--topic")
@@ -4260,6 +4291,28 @@ def cmd_learn(args: argparse.Namespace) -> int:
             out.append(row)
         return out
 
+    def excerpted(rows: list[dict[str, Any]], term: str) -> list[dict[str, Any]]:
+        """`search`'s index form: `digested` plus what a reader needs to choose.
+
+        `chars` prices `jarvis learn show <id>` before it is paid for, and `excerpt` quotes
+        the first body line a query word appears in — bounded by `headline()`, which IS the
+        bound, so no truncated body ever leaves here. Omitted when the only match is the
+        first line (the headline already shows it) or when nothing in the body matched (an
+        FTS5 stem hit, or a hit on `topic`/`tags`): the row is still a hit, it just has
+        nothing to quote.
+        """
+        words = [w.lower() for w in (term or "").split() if any(c.isalnum() for c in w)]
+        out = []
+        for row, r in zip(digested(rows), rows, strict=True):
+            row["chars"] = len(r["content"] or "")
+            for line in (r["content"] or "").split("\n")[1:]:
+                low = line.lower()
+                if any(w in low for w in words) and headline(line):
+                    row["excerpt"] = headline(line)
+                    break
+            out.append(row)
+        return out
+
     central = CentralStore()
     try:
         if args.kn_cmd == "add":
@@ -4285,12 +4338,22 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "search":
             rows = central.search_knowledge(args.term, limit=args.limit,
                                             project=args.project, topic=args.topic)
-            central.record_knowledge_read("search", rows, term=args.term,
-                                          project=reader_project, wo_id=acting_wo)
+            index = excerpted(rows, args.term)
+            # Charged for what was PRINTED, like the `list` branch above: the index rows,
+            # not the bodies they point at. Without this `jarvis learn stats` keeps
+            # reporting text nobody received (spec
+            # docs/superpowers/specs/2026-10-02-learn-search-returns-an-index.md).
+            central.record_knowledge_read(
+                "search", rows, term=args.term, project=reader_project, wo_id=acting_wo,
+                chars=sum(len(r["headline"]) + len(r.get("excerpt", "")) for r in index))
             if not rows and not args.json:
                 print(f"no knowledge matching {args.term!r} — "
                       f"try `jarvis learn topics` for what is recorded")
-            _print(rows, args.json)
+            elif not args.json:
+                print("index only — `excerpt` is ONE quoted matching line, never the "
+                      "entry; `jarvis learn show <id>` for a body "
+                      "(`chars` prices it first)")
+            _print(index, args.json)
         elif args.kn_cmd == "show":
             rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
             central.record_knowledge_read("show", rows, term=" ".join(args.ids),

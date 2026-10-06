@@ -26,6 +26,7 @@ log = logging.getLogger("jarvis.ops")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from . import landing
+    from .holds import Hold
 
 from .bootstrap import BootstrapReport, bootstrap_project, settings_drift
 from .catalog import (
@@ -45,7 +46,7 @@ from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
-from .central_store import CentralStore
+from .central_store import MISSED_MIN_WORDS, CentralStore
 from .daemon import daemon_running
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
@@ -1774,6 +1775,11 @@ class StateDurations:
     #: a caller names none — so `.as_dict()` on the CLI path and `.as_dict(now)` in a test
     #: are the same document.
     asof: float = 0.0
+    #: Every interval `holds` says the order was not permitted to run. The `Hold` objects
+    #: and not pre-computed seconds, because neither this dataclass nor `Hold` bakes in a
+    #: `now`. Spec §1 of
+    #: docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    holds: tuple[Hold, ...] = ()
 
     def label(self, status: str) -> str:
         if self.order_kind == "fo":
@@ -1788,15 +1794,52 @@ class StateDurations:
             end = self.spans[-1].left
         lifetime = max(0.0, end - self.spans[0].entered) if self.spans else 0.0
 
+        # Spec §1: the subtraction is the READER's, per span, off the holds this reading
+        # already carries.
+        from . import holds as holds_mod
+
+        def held_in(start: float, end: float) -> float:
+            return sum(h.overlap(start, end, now) for h in self.holds)
+
+        def held_of(span: Span) -> float:
+            return held_in(span.entered, now if span.left is None else span.left)
+
+        total_held = held_in(self.spans[0].entered, end) if self.spans else 0.0
+        lifetime_active = max(0.0, lifetime - total_held)
+
         def share(seconds: float) -> float:
             return round(seconds / lifetime, 4) if lifetime else 0.0
+
+        # Spec §4: `share` stays wall over wall, because the Gantt's offsets are wall
+        # positions; `active_share` is the active basis, internally consistent on its own.
+        def active_share(seconds: float) -> float:
+            return round(seconds / lifetime_active, 4) if lifetime_active else 0.0
+
+        def by_cause(windows: Sequence[tuple[float, float]]) -> list[dict[str, Any]]:
+            """Biggest cause first — summed per window, so a re-entered status counts each
+            of its own spans and nothing between them (spec §2)."""
+            totals: dict[str, float] = {}
+            for start, stop in windows:
+                for cause, seconds in holds_mod.by_cause(self.holds, start, stop,
+                                                         now=now).items():
+                    totals[cause] = totals.get(cause, 0.0) + seconds
+            return [{"cause": cause, "phrase": holds_mod.HOLD_CAUSES.get(cause, cause),
+                     "seconds": round(seconds, 2), "seconds_human": ago_phrase(seconds)}
+                    for cause, seconds in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+        def basis(seconds: float, held: float) -> dict[str, Any]:
+            active = max(0.0, seconds - held)
+            return {"held_seconds": round(held, 2), "held_human": ago_phrase(held),
+                    "active_seconds": round(active, 2),
+                    "active_human": ago_phrase(active),
+                    "active_share": active_share(active)}
 
         spans = [{"status": s.status, "label": self.label(s.status), "entered": s.entered,
                   "left": s.left, "open": s.left is None,
                   "seconds": round(s.seconds(now), 2),
                   "seconds_human": ago_phrase(s.seconds(now)),
                   "share": share(s.seconds(now)), "trigger": s.trigger,
-                  "approximate": s.approximate}
+                  "approximate": s.approximate, **basis(s.seconds(now), held_of(s))}
                  for s in self.spans]
         totals = []
         for status in order:
@@ -1804,13 +1847,27 @@ class StateDurations:
             if not mine:
                 continue
             seconds = round(sum(s.seconds(now) for s in mine), 2)
+            # Summed per span and never over a synthetic window: a status entered twice
+            # must not claim a hold that sits between its entries (spec §2).
+            held = sum(held_of(s) for s in mine)
             totals.append({"status": status, "label": self.label(status),
                            "seconds": seconds, "seconds_human": ago_phrase(seconds),
-                           "entries": len(mine), "share": share(seconds)})
+                           "entries": len(mine), "share": share(seconds),
+                           **basis(seconds, held),
+                           "held_by": by_cause([(s.entered,
+                                                 now if s.left is None else s.left)
+                                                for s in mine])})
         age = (round(now - self.current_status_since, 2)
                if self.current_status_since is not None else None)
         idle = (round(max(0.0, now - self.last_activity_ts), 2)
                 if self.last_activity_ts is not None else None)
+        # The current status' own hold, and the open one if there is one: `None` and never
+        # a zero-filled dict, because a missing figure is not a zero (issue #227).
+        since = self.current_status_since
+        status_held = round(held_in(since, now), 2) if since is not None else None
+        active_age = (None if age is None or status_held is None
+                      else round(max(0.0, age - status_held), 2))
+        open_hold = ([h for h in self.holds if h.open] or [None])[-1]
         return {
             "order_id": self.order_id, "order_kind": self.order_kind, "now": now,
             "approximate": self.approximate,
@@ -1826,6 +1883,21 @@ class StateDurations:
             "last_activity_age": idle,
             "last_activity_age_human": None if idle is None else ago_phrase(idle),
             "notes": list(self.notes),
+            "lifetime_held_seconds": round(total_held, 2),
+            "lifetime_active_seconds": round(lifetime_active, 2),
+            "lifetime_active_human": ago_phrase(lifetime_active),
+            "current_status_held_seconds": status_held,
+            "current_status_active_age": active_age,
+            "current_status_active_age_human": (None if active_age is None
+                                                else ago_phrase(active_age)),
+            "held_now": (None if open_hold is None else {
+                "cause": open_hold.cause, "phrase": open_hold.phrase,
+                "since": open_hold.started,
+                "seconds": round(open_hold.finish(now) - open_hold.started, 2),
+                "seconds_human": ago_phrase(open_hold.finish(now)
+                                            - open_hold.started)}),
+            "current_status_held_by": ([] if since is None
+                                       else by_cause([(since, now)])),
         }
 
 
@@ -1912,6 +1984,24 @@ def _activity_of(store: ProjectStore, wo_id: str) -> list[tuple[float, str]]:
     return found
 
 
+def _family_of(store: ProjectStore, fo_id: str) -> list[str]:
+    """Every work order a feature is made of: its children, its planner, its manager.
+
+    ONE walk, read by both `_last_activity` and `state_durations`' holds, so the two can
+    never disagree about what a feature is (spec §1 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    and trap 3 of kn-b7591ab3: never `carrier_for_feature`).
+    """
+    family = [c["id"] for c in store.feature_children(fo_id)]
+    fo = store.get_feature_order(fo_id)
+    if fo.get("plan_wo_id"):
+        family.append(str(fo["plan_wo_id"]))
+    manager = store.manager_work_order(fo_id)
+    if manager:
+        family.append(str(manager["id"]))
+    return family
+
+
 def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float, str]:
     """`(ts, source)` for the newest thing that happened, `(0.0, '')` when nothing did.
 
@@ -1922,14 +2012,8 @@ def _last_activity(store: ProjectStore, kind: str, order_id: str) -> tuple[float
     if kind == "wo":
         found = _activity_of(store, order_id)
     else:
-        family = [c["id"] for c in store.feature_children(order_id)]
-        fo = store.get_feature_order(order_id)
-        if fo.get("plan_wo_id"):
-            family.append(str(fo["plan_wo_id"]))
-        manager = store.manager_work_order(order_id)
-        if manager:
-            family.append(str(manager["id"]))
-        found = [seen for child in family for seen in _activity_of(store, child)]
+        found = [seen for child in _family_of(store, order_id)
+                 for seen in _activity_of(store, child)]
         row = store.conn.execute(
             "SELECT MAX(ts) FROM validation_rounds WHERE fo_id=?", (order_id,)).fetchone()
         if row and row[0] is not None:
@@ -1951,9 +2035,15 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
     """
     if bool(wo_id) == bool(fo_id):
         raise OpsError("state_durations takes exactly one of wo_id= or fo_id=")
+    from . import holds as holds_mod
+
     now = time.time() if now is None else now
     kind = "wo" if wo_id else "fo"
     order_id = wo_id or fo_id
+    # THE READER SUBTRACTS, not its five callers: an optional `spans=` would reproduce
+    # issue 887 for every caller that forgot to opt in (spec §1).
+    episodes = (holds_mod.held(store, order_id, now=now) if kind == "wo"
+                else holds_mod.held_family(store, _family_of(store, order_id), now=now))
     terminal = TERMINAL_STATUSES if kind == "wo" else FO_TERMINAL_STATUSES
     row_kind = ""
     # The order's own row, for `wo` too now: its `status` column is the status, and the
@@ -2006,7 +2096,7 @@ def state_durations(store: ProjectStore, *, wo_id: str = "", fo_id: str = "",
                               if open_span is not None and not behind else None),
         last_activity_ts=activity_ts if activity_kind else None,
         last_activity_kind=activity_kind, approximate=approximate,
-        notes=tuple(notes), row_kind=row_kind, asof=now,
+        notes=tuple(notes), row_kind=row_kind, asof=now, holds=tuple(episodes),
     )
 
 #: Pinned rule `kn-40db1828`, applied with full force (spec §6.4). A call that errored,
@@ -4052,7 +4142,8 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
 
 
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any], status: str = "") -> bool:
+                         payload: dict[str, Any], status: str = "",
+                         assumption: dict[str, Any] | None = None) -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -4081,9 +4172,20 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     hold from either is dropped once the order reaches either status. Both mis-drops lose a
     stale sentence about a pass that no longer owns the row, while the pass that does own
     it writes its own events on the next tick — never a lost live one.
+
+    THE ASSUMPTION CLAUSE IS CODE-AGNOSTIC AND IS TESTED FIRST
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.3, Neo question 1196 Option A): a hold naming a row that is no longer
+    `pending` is stale whatever its code, because every per-assumption code claims
+    something about that row. `assumption` is the row the payload names, or `None` — a
+    payload with no `assumption_id` is an ORDER-LEVEL hold and this clause cannot answer
+    about it.
     """
     from . import autoreview
 
+    if int(payload.get("assumption_id") or 0) and assumption is not None:
+        if str(assumption.get("status") or "") != "pending":
+            return True
     if str(payload.get("code") or "") == autoreview.HELD_STATUS:
         return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
@@ -4104,26 +4206,38 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = N
     the row passes it rather than making this read the row again, and one that holds only
     the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
     of that code turns up.
+
+    The assumption rows are cached BY `assumption_id` and read only when a hold naming one
+    turns up (2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.3): one
+    closure is built per order and run over every row's events, so a single slot would
+    answer the second assumption with the first one's status.
     """
     from . import autoreview
 
     cache: dict[str, Any] = {}
+    rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
         code = str(payload.get("code") or "")
+        aid = int(payload.get("assumption_id") or 0)
+        if aid and aid not in rows:
+            rows[aid] = store.get_assumption(aid)
+        row = rows.get(aid)
+        # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of
+        # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md.
         if code not in codes:
-            return False
+            return _panel_hold_is_stale(None, payload, "", row)
         if "status" not in cache:
             cache["status"] = (status if status is not None
                               else str(store.get_work_order(wo_id)["status"] or ""))
         if code == autoreview.HELD_STATUS:
-            return _panel_hold_is_stale(None, payload, cache["status"])
+            return _panel_hold_is_stale(None, payload, cache["status"], row)
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"], row)
 
     return stale
 
@@ -6212,7 +6326,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
         opened = bounced = None
         # The overlay: `pr_url` is not written until `land_when_cleared` below (2026-10-01
         # spec §2, a-release-that-authored-files-is-judged-like-any-other).
-        submits = validation_applies(cfg, {**fresh, "pr_url": pr_url})
+        submits = validation_applies(cfg, {**fresh, "pr_url": pr_url}, store)
         if submits:
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
@@ -6229,8 +6343,8 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # ...and the status is the JOIN's to decide, not this branch's — but a
             # BOUNCE is told to it rather than re-derived from the latest round, which
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
-            # An exempt release order opened no round at all, so the join is TOLD rather
-            # than left to re-read one that was never opened (2026-10-01 spec §3).
+            # An exempt submission opened no round at all, so the join is TOLD rather than
+            # left to re-read one that was never opened (2026-10-01 spec §3).
             status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
                                        panel_cleared=not submits)
     finally:
@@ -7539,11 +7653,32 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     parked in `needs_review` when it shipped do not, and deleting this would send them to
     the merge queue unjudged.
     """
-    return (validation_applies(cfg, store.get_work_order(wo_id))
+    return (validation_applies(cfg, store.get_work_order(wo_id), store)
             and store.latest_validation_round(wo_id=wo_id) is None)
 
 
-def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
+def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this submission one no panel round may open over? ONE body, three call sites.
+
+    §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+    investigator.md, shape ruled by Neo question 1195 on the precedent of 1169: the KIND
+    narrows who may claim the exemption and the PREMISE still has to hold, which is what
+    `release.is_release_order` already does one line below. An investigator with its
+    verdict filed has submitted no diff, so `evidence.nothing_to_judge` would escalate the
+    round with "nothing to review" and `autoreview.HELD_PANEL_GAVE_UP` would put a hold
+    not even Neo could clear; one still working has filed nothing and claims nothing.
+
+    Spent at all three sites and not just at `validation_applies`, because
+    `land_when_cleared` re-READS the latest round when `panel_cleared` is false: an order
+    for which no round was ever opened would park in `validating` for ever or land on a
+    stale verdict (kn-9256fcb9's lockstep trap).
+    """
+    from . import verdicts
+
+    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+
+
+def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
     """Does a validation round open over THIS submission? One predicate, two call sites.
 
     `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
@@ -7556,17 +7691,21 @@ def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
     to it (2026-09-29 spec §2).
 
     THE EXEMPTION'S GROUND IS THE ABSENT PULL REQUEST, and `is_release_order` only
-    narrows which orders may claim it. One that finished with `--pr` authored a diff, so
-    `nothing_to_judge` does not apply to it and it submits like any code-bearing order —
-    wo-33e1d0b4 changed `scripts/shipit.sh` under the old kind-keyed predicate, reached no
-    panel, and could never clear `automerge`'s `validated_head` condition. `wo["pr_url"]`
-    is the one source: a second argument would be a second answer to "was there a diff".
-    Callers holding a dict whose column is not yet written overlay it (`finish`).
+    narrows which orders may claim it. One that finished with `--pr` submits like any
+    code-bearing order — wo-33e1d0b4 changed `scripts/shipit.sh` under the old kind-keyed
+    predicate, reached no panel, and could never clear `automerge`'s `validated_head`
+    condition. `wo["pr_url"]` is the one source: a second argument would be a second
+    answer to "was there a diff". Callers holding a dict whose column is not yet written
+    overlay it (`finish`).
 
     docs/superpowers/specs/2026-10-01-a-release-that-authored-files-is-judged-like-any-other.md §1
+
+    An INVESTIGATOR is the second exclusion, and for a stricter reason: it authors nothing
+    at all. See `exempt_from_validation`.
     """
     return (cfg is not None and cfg.enabled
-            and not (release.is_release_order(wo) and not str(wo.get("pr_url") or "")))
+            and not (release.is_release_order(wo) and not str(wo.get("pr_url") or ""))
+            and not exempt_from_validation(store, wo))
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -7593,9 +7732,9 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
-    # Told, not re-read: an exempt release order opened no round here either. The
-    # UNBLANKED row, never `fresh` (2026-10-01 spec §3).
-    cleared = not validation_applies(cfg, store.get_work_order(wo_id))
+    # Told, not re-read: an exempt submission opened no round here either, release or
+    # investigator — the two move in lockstep (2026-10-01 spec §3, kn-9256fcb9).
+    cleared = not validation_applies(cfg, store.get_work_order(wo_id), store)
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
@@ -8643,7 +8782,22 @@ def submit_verdict(inv_id: str, doc: Any,
     * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
       re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
       classification: `gh` unreachable keeps the order `planning` so the verdict can be
-      resubmitted.
+      resubmitted. `Daemon.clear_answered_investigations` is the only thing that takes it
+      down, and it may only ever take it down.
+
+    **THE INVESTIGATOR IS SETTLED HERE, with `close_out` and never `finish`** — §2.1 of
+    docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+    GitHub issue 906. `finish` is the contract for an order that authored code: it opens a
+    validation round, joins on the landing and leaves the worker typing, and all three
+    re-decide something this function has already decided. Nothing is left to judge, to
+    land or to defer, so the three things wanted are exactly `close_out`'s — stop the
+    session, write `completed`, clear the flag.
+
+    UNCONDITIONAL ON STATUS, and inside the `try` so it shares this connection. A row
+    already `completed` costs one event and a stop of a session already gone, which is
+    cheaper than a status race; the only case skipped is a DELETED row. A PENDING
+    ASSUMPTION stays `pending` and holds nothing: only the user or Neo decides one, and
+    settling over it would be the silent acceptance `mark_done` refuses.
     """
     from . import bugreport, verdicts
 
@@ -8717,7 +8871,7 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
-        investigator_open = False
+        settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
@@ -8725,10 +8879,16 @@ def submit_verdict(inv_id: str, doc: Any,
                 "filed": (verdict.get("filed") or {}).get("issue_url"),
             })
             try:
-                investigator_open = store.get_work_order(
-                    fo["plan_wo_id"])["status"] in OPEN_STATUSES
+                investigator = store.get_work_order(fo["plan_wo_id"])
             except KeyError:
-                investigator_open = False  # deleted; the link was released
+                investigator = None  # deleted; the link was released
+            if investigator is not None:
+                summary = f"submitted a {classification} verdict for {inv_id}"
+                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
+                settled = close_out(
+                    store, investigator, "verdict_submitted_settled", why=summary,
+                    payload={"investigation": inv_id,
+                             "classification": classification})
     finally:
         store.close()
 
@@ -8738,11 +8898,9 @@ def submit_verdict(inv_id: str, doc: Any,
         "classified_by": verdict["classified_by"],
         "note": "the investigation is settled — end your turn.",
     }
-    if investigator_open:
-        # Conditional for `submit_findings`' reason: settling an already-settled work
-        # order is not an idempotent no-op in this codebase.
-        out["investigator"] = finish(
-            fo["plan_wo_id"], f"submitted a {classification} verdict for {inv_id}")
+    if settled is not None:
+        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
+                               "session_stopped": settled["stopped"]}
     return out
 
 
@@ -10712,6 +10870,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.model", "next-dispatch"),
     ("*.effort", "next-dispatch"),
     ("*.permission_mode", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the system prompt it was launched with. Spec §1:
+    # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+    ("*.bash_first", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -13078,10 +13240,10 @@ def _subproc_detail(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 # -- what the knowledge base costs, and who actually reads it -----------------------------
 
-#: How much of a work order's own title has to survive into a search for the "it could
-#: have looked" signal to mean anything. Below this the query is words like "fix the",
-#: which match half the base and would manufacture a miss for every silent order.
-MISSED_MIN_WORDS = 3
+#: `MISSED_MIN_WORDS` — how much of a work order's own title has to survive into a search
+#: for a title match to mean anything — is defined in `central_store` and imported at the
+#: top of this module: the dispatch hint tier applies the same rule to the same query, and
+#: two copies of that threshold would drift.
 
 
 def _index_cost(central: CentralStore, name: str, path: Path) -> dict[str, Any]:

@@ -92,6 +92,23 @@ def test_a_headline_list_is_not_charged_for_bodies_it_never_printed(base, capsys
     assert 0 < headlines < full
 
 
+def test_a_search_is_charged_for_the_index_it_printed_not_the_bodies(base, capsys):
+    """Spec test 2 of 2026-10-02-learn-search-returns-an-index.md.
+
+    Without the `chars=` override at the search call site, `jarvis learn stats` keeps
+    reporting bodies nobody received and the done-when condition is unmeasurable.
+    """
+    import json
+
+    cmd_learn(build_parser().parse_args(["--json", "learn", "search", "DEPLOY"]))
+    rows = json.loads(capsys.readouterr().out)
+    read = base.knowledge_reads()[0]
+    printed = sum(len(r["headline"]) + len(r.get("excerpt", "")) for r in rows)
+    assert read["chars"] == printed
+    bodies = sum(len(r["content"]) for r in base.search_knowledge("DEPLOY"))
+    assert read["chars"] * 2 < bodies
+
+
 def test_topics_is_recorded_without_touching_any_entry(base, capsys):
     run("topics")
     capsys.readouterr()

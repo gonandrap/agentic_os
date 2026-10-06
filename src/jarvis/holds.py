@@ -209,6 +209,28 @@ def held(store: ProjectStore, wo_id: str, *,
     return _merge(spans, now)
 
 
+def held_family(store: ProjectStore, wo_ids: Sequence[str], *,
+                now: float | None = None) -> list[Hold]:
+    """Every interval NO member of this family could run — a feature order's hold.
+
+    A feature has no timeline of its own (`wo_events.wo_id` is a foreign key into
+    `work_orders`), so its hold is its family's, exactly as `ops._last_activity` reads its
+    activity. The three steps are not interchangeable: the raw `_episodes` of every member
+    are clipped against the UNION of every member's turns — a child held by the usage limit
+    while a sibling types is not a held feature — and only then merged, so two children
+    held by the same fleet limit count once. Spec §1 of
+    docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md
+    """
+    now = time.time() if now is None else now
+    episodes: list[Hold] = []
+    turns: list[dict[str, Any]] = []
+    for wo_id in wo_ids:
+        episodes.extend(_episodes(store.list_events(wo_id, limit=_EVENT_LIMIT)))
+        turns.extend(store.list_turns(wo_id))
+    episodes.sort(key=lambda h: h.started)
+    return _merge(_outside(episodes, _working(turns, now), now), now)
+
+
 #: Enough timeline for any conversation the fleet has run. `list_events` takes the OLDEST
 #: `limit` rows, so a cap that bit would drop the RECENT holds — the ones a live alarm is
 #: judged against — and report a busy work order as never held at all.
