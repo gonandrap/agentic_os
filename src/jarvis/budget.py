@@ -61,6 +61,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from . import verdicts
 from .claude_cli import USAGE_SCHEMA_VERSION
 from .project_store import (
     FO_TERMINAL_STATUSES,
@@ -556,8 +557,20 @@ def escalate(store: ProjectStore, wo: dict[str, Any], out: Exhaustion) -> bool:
     which is the rule this codebase states for any new attention reason, because the
     reconciler rewrites `needs_attention` from state on every tick and a flag only this
     function set would be wiped on the next one.
+
+    NOTHING IS OWED ON WORK THAT IS OVER, and the two guards below are at this funnel
+    because all five callers pass through it — `Daemon._deliver` deliberately relaunches
+    a SETTLED order, so a queued message arriving after the work ended is enough on its
+    own (§2.2 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+    investigator.md). The verdict clause is the one that survives the race: it is true
+    before the status write and before the turn exits. `exhaustion` keeps no such guard —
+    the order IS over its cap, and only the parking was wrong.
     """
     if wo["status"] == EXHAUSTED:
+        return False
+    if wo["status"] in TERMINAL_STATUSES:
+        return False
+    if verdicts.verdict_stored(store, wo):
         return False
     store.set_status(wo["id"], EXHAUSTED)
     store.flag_attention(wo["id"], out.reason)

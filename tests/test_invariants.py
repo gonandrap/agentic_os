@@ -1291,6 +1291,134 @@ def test_a_decline_written_before_the_cause_existed_is_a_budget_decline(project)
 
     assert invariants.rejudge_exhausted(store, old) is True
     assert invariants.rebind_exhausted(store, old) is False
+
+
+# -- a panel give-up that survived into `waiting_pr_merge` ----------------------------
+# docs/superpowers/specs/2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md
+
+
+def _parked_on_an_escalation(store: ProjectStore, *, outcome: str = "escalated",
+                             hold: str | None = invariants.HELD_NOT_PASSED,
+                             status: str = "waiting_pr_merge") -> dict:
+    """A work order parked behind its pull request with the panel's last word on it."""
+    wo = store.create_work_order("add feature X")
+    store.update_work_order(wo["id"], pr_url="https://github.com/acme/proj/pull/7",
+                            result_summary="opened a PR")
+    row = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(row["id"], "aaaa1111aaaa2222")
+    store.close_validation_round(row["id"], outcome, "")
+    store.set_status(wo["id"], status)
+    if hold is not None:
+        store.add_event(wo["id"], "automerge_held", {"code": hold, "round": 1})
+    return store.get_work_order(wo["id"])
+
+
+def test_a_give_up_parked_behind_a_held_merge_is_the_users(project):
+    """Row 1: the live stall on wo-3615faf7 — nothing automatic is left and the OS said
+    nothing for 47h."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+
+    assert invariants.parked_on_a_give_up(store, wo) is True
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+    # DERIVED, never written at the hold site (kn-089de524).
+    assert not wo["needs_attention"]
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == invariants.PARKED_GIVE_UP_BLOCKER
+
+
+def test_a_hold_with_another_cause_is_not_this_stall(project):
+    """Row 2: the merge is held by something with its own machinery behind it."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold="checks_running")  # any other code
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_project_merging_by_hand_is_not_flagged_at_all(project):
+    """Row 3: `auto_merge` off writes no hold ever, and there the pull request merges on
+    GitHub — flagging it would be reporting a working flow as the user's problem."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, hold=None)
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_round_still_open_owes_nobody_anything(project):
+    """Row 4: `validation_escalated` is False while the panel is still deliberating."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, outcome="pending")
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_passed_round_held_for_some_other_reason_is_not_a_give_up(project):
+    """Row 5."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, outcome="passed")
+
+    assert invariants.parked_on_a_give_up(store, wo) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, wo)
+
+
+def test_a_later_round_that_passes_clears_it_without_a_new_hold(project):
+    """Row 6: self-clearing on fact 1 alone, on the same tick — it does not wait for the
+    next `automerge_held` event to be rewritten."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    assert invariants.PARKED_GIVE_UP_BLOCKER in true_blockers(store, wo)
+
+    later = store.open_validation_round(wo_id=wo["id"], fingerprint="fp2")
+    store.set_validation_head(later["id"], "bbbb1111bbbb2222")
+    store.close_validation_round(later["id"], "passed", "")
+
+    row = store.get_work_order(wo["id"])
+    assert invariants.parked_on_a_give_up(store, row) is False
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, row)
+
+
+def test_an_ack_of_a_parked_give_up_stays_down(project):
+    """Row 7: kn-089de524 — the hold is rewritten every poll, so a flag written there
+    would overwrite `jarvis wo ack` for ever."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store)
+    list(invariants.check_blocked_work_is_surfaced(store))
+    row = store.get_work_order(wo["id"])
+    store.ack_attention(row["id"], true_blockers(store, row))
+
+    row = store.get_work_order(wo["id"])
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in true_blockers(store, row)
+    list(invariants.check_attention_reason_is_true(store))
+    list(invariants.check_blocked_work_is_surfaced(store))
+    assert not store.get_work_order(wo["id"])["needs_attention"]
+
+
+def test_the_needs_review_arm_is_untouched(project):
+    """Row 8: the upstream sentence still answers the status it was written for, and the
+    parked twin does not double up on it."""
+    store = ProjectStore(project)
+    wo = _parked_on_an_escalation(store, status="needs_review")
+
+    blockers = true_blockers(store, wo)
+    assert VALIDATION_STUCK_BLOCKER in blockers
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
+
+
+def test_a_moved_head_decline_is_the_other_sentence_and_only_that(project):
+    """Row 9: one newest hold carries one code, so the two can never co-occur."""
+    from jarvis import ops as ops_mod
+
+    store = ProjectStore(project)
+    moved = _declined_on_a_moved_head(store, cause=ops_mod.REJUDGE_BUDGET_SPENT)
+
+    blockers = true_blockers(store, moved)
+    assert invariants.SHA_MOVED_BLOCKER in blockers
+    assert invariants.PARKED_GIVE_UP_BLOCKER not in blockers
 # -- is somebody ELSE holding this, or is anything out at all? -------------------------
 # Fix 2 of docs/superpowers/specs/2026-09-29-a-heredoc-edit-is-not-a-merge.md: two
 # questions, two resolvers, side by side so they cannot drift (kn-4ea33fe6).

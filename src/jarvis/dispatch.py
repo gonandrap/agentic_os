@@ -49,6 +49,28 @@ SERENA_READ_TOOLS = (
 SERENA_TOOL_PREFIXES = ("mcp__serena__", "mcp__plugin_serena_serena__")
 
 
+# The two undocumented keys in the 2.1.284 binary that decide `auto` mode's bash-first
+# steer: `CLAUDE_CODE_THRIFTY_SONIC` whether it exists at all (the env value wins over
+# the statsig cohort when defined), `CLAUDE_CODE_COZY_TEAPOT` which variant. §2 of
+# docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md records the probes.
+BASH_FIRST_ENV = "CLAUDE_CODE_THRIFTY_SONIC"
+BASH_FIRST_VARIANT_ENV = "CLAUDE_CODE_COZY_TEAPOT"
+
+
+def bash_first_env(bash_first: str) -> dict[str, str]:
+    """The env for one `worker.bash_first` value — spec §2.
+
+    STRINGS, every one: Claude Code's `env` is a `Record<string,string>` and an integer
+    risks the CLI rejecting the whole settings file. `cli` writes NOTHING, which is the
+    state where Jarvis leaves the vendor's cohort draw alone.
+    """
+    if bash_first == "cli":
+        return {}
+    if bash_first == "off":
+        return {BASH_FIRST_ENV: "false"}
+    return {BASH_FIRST_ENV: "true", BASH_FIRST_VARIANT_ENV: bash_first}
+
+
 def serena_allow_rules() -> list[str]:
     """`permissions.allow` entries for every read-only Serena tool, under both prefixes."""
     return [f"{prefix}{tool}"
@@ -202,6 +224,13 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # STRING like every value in this dict: Claude Code's `env` is a
         # `Record<string,string>` and an integer risks the CLI rejecting the whole file.
         "MCP_TOOL_TIMEOUT": str(project.worker.mcp_tool_timeout_ms),
+        # WHETHER `auto` MODE'S BASH-FIRST STEER REACHES THIS WORKER (spec §2, same
+        # file). Here and not in `settings.base.json` for `MCP_TOOL_TIMEOUT`'s reason —
+        # this `env.update` beats both the asset and `settings_overrides`, so a value the
+        # asset carried could not be overridden from the catalog. Written in EVERY
+        # permission mode: the steer only exists under `auto`, and a per-mode conditional
+        # would be a second source of truth about a vendor behaviour.
+        **bash_first_env(project.worker.bash_first),
         # Whether the lead must delegate its file edits to the crew (§7 of that spec).
         # Env for `JARVIS_GATES`' reason: `hooks.crew_edit_decision` runs on every file
         # write and must not parse the catalog to decide it has nothing to do.
@@ -396,6 +425,10 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
         "",
         *worker_brief.section_index(wo["id"], gated=bool(project.gates),
                                     serena=wiring.serena_wired(project.wiring)),
+        # Spec 2026-10-01-the-steer-that-beat-the-brief.md §3 — its own top-level block
+        # after the index, never inside the core.
+        *(["", *nav] if (nav := worker_brief.navigation_core(
+            wiring.serena_wired(project.wiring))) else []),
     ]
     pre_approved = _pre_approval(wo)
     if pre_approved:
@@ -966,8 +999,11 @@ def _investigator_prompt(wo: dict[str, Any], project: ProjectSpec,
         "leaves the OS blind is refused.",
         "",
         "# The verdict",
-        f"Write it to `verdict.json` in your worktree root — that filename exactly, it is "
-        f"the one path you are permitted to write — and submit it with the command below, "
+        f"Create it with the **`Write` tool** on `verdict.json` in your worktree root — "
+        f"that filename exactly, it is the one path you are permitted to write, and "
+        f"`Write` is the one tool that may. Not `cat >`, not a heredoc, not `python3 -`: a "
+        f"shell heredoc that writes a file is refused for every worker in the fleet "
+        f"(`hooks.heredoc_write_decision`). Submit it with the command below, "
         f"which IS your finish. Do not call `jarvis wo finish`: submitting the verdict "
         f"settles this work order for you. `--from-file` and not inline flags, because "
         f"the gate classifier's quote-blanking fails on nested and mixed quoting and a "

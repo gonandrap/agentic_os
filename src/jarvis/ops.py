@@ -4160,7 +4160,8 @@ def _automerge_hold_is_stale(wo: dict[str, Any], latest_round: dict[str, Any] | 
 
 
 def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
-                         payload: dict[str, Any], status: str = "") -> bool:
+                         payload: dict[str, Any], status: str = "",
+                         assumption: dict[str, Any] | None = None) -> bool:
     """Has the round this `panel_gave_up` hold is about been overtaken?
 
     docs/superpowers/specs/2026-09-26-a-panel-gave-up-hold-says-which-round-and-stops-
@@ -4189,9 +4190,20 @@ def _panel_hold_is_stale(latest_round: dict[str, Any] | None,
     hold from either is dropped once the order reaches either status. Both mis-drops lose a
     stale sentence about a pass that no longer owns the row, while the pass that does own
     it writes its own events on the next tick — never a lost live one.
+
+    THE ASSUMPTION CLAUSE IS CODE-AGNOSTIC AND IS TESTED FIRST
+    (docs/superpowers/specs/2026-10-01-a-confirmation-is-not-re-run-on-a-settled-
+    assumption.md §3.3, Neo question 1196 Option A): a hold naming a row that is no longer
+    `pending` is stale whatever its code, because every per-assumption code claims
+    something about that row. `assumption` is the row the payload names, or `None` — a
+    payload with no `assumption_id` is an ORDER-LEVEL hold and this clause cannot answer
+    about it.
     """
     from . import autoreview
 
+    if int(payload.get("assumption_id") or 0) and assumption is not None:
+        if str(assumption.get("status") or "") != "pending":
+            return True
     if str(payload.get("code") or "") == autoreview.HELD_STATUS:
         return status in autoreview.REVIEW_PASS_STATUSES
     if str(payload.get("code") or "") != autoreview.HELD_PANEL_GAVE_UP:
@@ -4212,26 +4224,38 @@ def _stale_panel_hold(store: ProjectStore, wo_id: str, *, status: str | None = N
     the row passes it rather than making this read the row again, and one that holds only
     the id (`assumptions_with_rulings`) leaves it to be read here, once, and only if a hold
     of that code turns up.
+
+    The assumption rows are cached BY `assumption_id` and read only when a hold naming one
+    turns up (2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md §3.3): one
+    closure is built per order and run over every row's events, so a single slot would
+    answer the second assumption with the first one's status.
     """
     from . import autoreview
 
     cache: dict[str, Any] = {}
+    rows: dict[int, dict[str, Any] | None] = {}
     codes = (autoreview.HELD_PANEL_GAVE_UP, autoreview.HELD_STATUS)
 
     def stale(kind: str, payload: dict[str, Any]) -> bool:
         if kind != "autoreview_held":
             return False
         code = str(payload.get("code") or "")
+        aid = int(payload.get("assumption_id") or 0)
+        if aid and aid not in rows:
+            rows[aid] = store.get_assumption(aid)
+        row = rows.get(aid)
+        # The `codes` gate is the ROUND/STATUS clauses' alone: spec §3.3 of
+        # 2026-10-01-a-confirmation-is-not-re-run-on-a-settled-assumption.md.
         if code not in codes:
-            return False
+            return _panel_hold_is_stale(None, payload, "", row)
         if "status" not in cache:
             cache["status"] = (status if status is not None
                               else str(store.get_work_order(wo_id)["status"] or ""))
         if code == autoreview.HELD_STATUS:
-            return _panel_hold_is_stale(None, payload, cache["status"])
+            return _panel_hold_is_stale(None, payload, cache["status"], row)
         if "round" not in cache:
             cache["round"] = store.latest_validation_round(wo_id=wo_id)
-        return _panel_hold_is_stale(cache["round"], payload, cache["status"])
+        return _panel_hold_is_stale(cache["round"], payload, cache["status"], row)
 
     return stale
 
@@ -6318,7 +6342,7 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             return {"project": name, "wo_id": wo_id, "status": deferred,
                     **({"pr_url": pr_url} if pr_url else {})}
         opened = bounced = None
-        if validation_applies(cfg, fresh):
+        if validation_applies(cfg, fresh, store):
             opened = submit_for_validation(store, path, fresh, declared=evidence,
                                            cfg=cfg)
             # None means BOUNCED, and only here: with validation off no submission was
@@ -6336,8 +6360,10 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
             # is not the row the bounce read. See `land_when_cleared`'s `panel_open`.
             # A release order opened no round at all, so the join is TOLD rather than
             # left to re-read one that was never opened (§2).
-            status = land_when_cleared(store, fresh, pr_url, panel_open=bool(bounced),
-                                       panel_cleared=release.is_release_order(fresh))
+            status = land_when_cleared(
+                store, fresh, pr_url, panel_open=bool(bounced),
+                panel_cleared=(release.is_release_order(fresh)
+                               or exempt_from_validation(store, fresh)))
     finally:
         store.close()
     return {"project": name, "wo_id": wo_id, "status": status,
@@ -7644,11 +7670,32 @@ def _validates_on_review(store: ProjectStore, wo_id: str, cfg: Any) -> bool:
     parked in `needs_review` when it shipped do not, and deleting this would send them to
     the merge queue unjudged.
     """
-    return (validation_applies(cfg, store.get_work_order(wo_id))
+    return (validation_applies(cfg, store.get_work_order(wo_id), store)
             and store.latest_validation_round(wo_id=wo_id) is None)
 
 
-def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
+def exempt_from_validation(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is this submission one no panel round may open over? ONE body, three call sites.
+
+    §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-
+    investigator.md, shape ruled by Neo question 1195 on the precedent of 1169: the KIND
+    narrows who may claim the exemption and the PREMISE still has to hold, which is what
+    `release.is_release_order` already does one line below. An investigator with its
+    verdict filed has submitted no diff, so `evidence.nothing_to_judge` would escalate the
+    round with "nothing to review" and `autoreview.HELD_PANEL_GAVE_UP` would put a hold
+    not even Neo could clear; one still working has filed nothing and claims nothing.
+
+    Spent at all three sites and not just at `validation_applies`, because
+    `land_when_cleared` re-READS the latest round when `panel_cleared` is false: an order
+    for which no round was ever opened would park in `validating` for ever or land on a
+    stale verdict (kn-9256fcb9's lockstep trap).
+    """
+    from . import verdicts
+
+    return wo.get("kind") == "investigator" and verdicts.verdict_stored(store, wo)
+
+
+def validation_applies(cfg: Any, wo: dict[str, Any], store: ProjectStore) -> bool:
     """Does a validation round open over THIS submission? One predicate, two call sites.
 
     `os.validation.enabled` is read at the submission sites only (`finish`'s docstring),
@@ -7659,8 +7706,13 @@ def validation_applies(cfg: Any, wo: dict[str, Any]) -> bool:
     (`Daemon.settle_shipped_releases`: a `jarvis-*` tag containing every payload commit
     AND production running it), so a seat reading a release worker's prose adds nothing
     to it (2026-09-29 spec §2).
+
+    An INVESTIGATOR is the second exclusion, and for a stricter reason: it authors nothing
+    at all. See `exempt_from_validation`.
     """
-    return cfg is not None and cfg.enabled and not release.is_release_order(wo)
+    return (cfg is not None and cfg.enabled
+            and not release.is_release_order(wo)
+            and not exempt_from_validation(store, wo))
 
 
 def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
@@ -7687,8 +7739,9 @@ def _land_after_acceptance(store: ProjectStore, path: Path, wo_id: str,
     # says why.
     if not _awaiting_merge(fresh):
         fresh = {**fresh, "pr_url": ""}
-    # Told, not re-read: a release order opened no round here either (§2).
-    cleared = release.is_release_order(fresh)
+    # Told, not re-read: a release order opened no round here either (§2), and neither did
+    # an investigator (§2.4 of the 2026-10-01 spec — the two move in lockstep).
+    cleared = release.is_release_order(fresh) or exempt_from_validation(store, fresh)
     # The assumption gate has cleared; whether the work order lands now is the panel's
     # half of the join to answer. NOTE that landing through `land_finished` also CLOSES
     # THE BACKLOG ITEM on the `completed` branch, which the inline landing this replaced
@@ -8826,7 +8879,22 @@ def submit_verdict(inv_id: str, doc: Any,
     * **Attention for `WAITING_ON_USER` only**, raised HERE at the transition and never
       re-derived on a tick (kn-089de524). A FILING FAILURE also raises it, and is not a
       classification: `gh` unreachable keeps the order `planning` so the verdict can be
-      resubmitted.
+      resubmitted. `Daemon.clear_answered_investigations` is the only thing that takes it
+      down, and it may only ever take it down.
+
+    **THE INVESTIGATOR IS SETTLED HERE, with `close_out` and never `finish`** — §2.1 of
+    docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+    GitHub issue 906. `finish` is the contract for an order that authored code: it opens a
+    validation round, joins on the landing and leaves the worker typing, and all three
+    re-decide something this function has already decided. Nothing is left to judge, to
+    land or to defer, so the three things wanted are exactly `close_out`'s — stop the
+    session, write `completed`, clear the flag.
+
+    UNCONDITIONAL ON STATUS, and inside the `try` so it shares this connection. A row
+    already `completed` costs one event and a stop of a session already gone, which is
+    cheaper than a status race; the only case skipped is a DELETED row. A PENDING
+    ASSUMPTION stays `pending` and holds nothing: only the user or Neo decides one, and
+    settling over it would be the silent acceptance `mark_done` refuses.
     """
     from . import bugreport, verdicts
 
@@ -8900,7 +8968,7 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
-        investigator_open = False
+        settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
                 "investigation": inv_id, "classification": classification,
@@ -8908,10 +8976,16 @@ def submit_verdict(inv_id: str, doc: Any,
                 "filed": (verdict.get("filed") or {}).get("issue_url"),
             })
             try:
-                investigator_open = store.get_work_order(
-                    fo["plan_wo_id"])["status"] in OPEN_STATUSES
+                investigator = store.get_work_order(fo["plan_wo_id"])
             except KeyError:
-                investigator_open = False  # deleted; the link was released
+                investigator = None  # deleted; the link was released
+            if investigator is not None:
+                summary = f"submitted a {classification} verdict for {inv_id}"
+                store.update_work_order(fo["plan_wo_id"], result_summary=summary)
+                settled = close_out(
+                    store, investigator, "verdict_submitted_settled", why=summary,
+                    payload={"investigation": inv_id,
+                             "classification": classification})
     finally:
         store.close()
 
@@ -8921,11 +8995,9 @@ def submit_verdict(inv_id: str, doc: Any,
         "classified_by": verdict["classified_by"],
         "note": "the investigation is settled — end your turn.",
     }
-    if investigator_open:
-        # Conditional for `submit_findings`' reason: settling an already-settled work
-        # order is not an idempotent no-op in this codebase.
-        out["investigator"] = finish(
-            fo["plan_wo_id"], f"submitted a {classification} verdict for {inv_id}")
+    if settled is not None:
+        out["investigator"] = {"wo_id": fo["plan_wo_id"], "status": "completed",
+                               "session_stopped": settled["stopped"]}
     return out
 
 
@@ -10895,6 +10967,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.model", "next-dispatch"),
     ("*.effort", "next-dispatch"),
     ("*.permission_mode", "next-dispatch"),
+    # Read once per spawn into the worker's settings file, and a running worker's session
+    # already holds the system prompt it was launched with. Spec §1:
+    # docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+    ("*.bash_first", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`

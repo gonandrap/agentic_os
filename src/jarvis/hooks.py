@@ -1061,6 +1061,22 @@ _HEREDOC_DENY = (
     "request was filed. Write the file with `Edit`/`Write` and carry on."
 )
 
+#: The same refusal for an INVESTIGATOR, which `_HEREDOC_DENY` misleads: `Edit` is refused
+#: on every path and `Write` on every path but one, so "use `Edit` or `Write`" sent four
+#: sessions on 2026-10-01 looking for a remedy they did not have. §2.6 of
+#: docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+#: and kn-832967f3's sibling fix: the enforcement was right, the message cost the turns.
+_HEREDOC_DENY_INVESTIGATOR = (
+    "Refused: this command writes a file through a heredoc, which is refused for every "
+    f"worker in the fleet — a heredoc's CONTENT reaches the command classifier. You are "
+    f"an INVESTIGATOR, so the remedy is one specific tool call: use the `Write` tool on "
+    f"`{VERDICT_FILE}` in your worktree root, whole, then submit it with\n\n"
+    f"    jarvis investigate verdict <inv-id> --from-file {VERDICT_FILE}\n\n"
+    f"That `Write` is the single write you are permitted; `Edit` is refused on every path, "
+    f"including this one. Nothing was recorded against you and no approval request was "
+    f"filed."
+)
+
 
 def _heredoc_owner_programs(command: str) -> tuple[list[str], list[tuple[int, int]]]:
     """The program names in `command`, and the heredoc bodies it contains.
@@ -1174,7 +1190,10 @@ def heredoc_write_decision(payload: dict[str, Any],
     path outside the worktree is not this rule's business.
 
     NO ALLOW BRANCH, EVER. It denies or it returns None, which is what makes it legal to
-    run BEFORE `gate_decision` — see `preflight_decision`'s docstring.
+    run BEFORE `gate_decision` — see `preflight_decision`'s docstring. An investigator's
+    `verdict.json` is no exception: the remedy is the `Write` tool, which the DENIAL now
+    names (`_HEREDOC_DENY_INVESTIGATOR`), and an allow branch here would move a
+    security-ordering argument to save one tool call.
     """
     if payload.get("tool_name") != "Bash" or not env.get("JARVIS_WO_ID"):
         return None
@@ -1208,6 +1227,10 @@ def heredoc_write_decision(payload: dict[str, Any],
                 store.close()
         except Exception:  # noqa: BLE001 — the refusal stands whether or not it recorded
             pass
+    # The classifier, the parse and the event above are kind-blind; only the sentence the
+    # session reads is chosen here (§2.6 of the 2026-10-01 spec).
+    if env.get(WO_KIND_ENV) == "investigator":
+        return _deny(_HEREDOC_DENY_INVESTIGATOR)
     return _deny(_HEREDOC_DENY)
 
 

@@ -81,7 +81,13 @@ def test_core_contract_is_under_the_budget():
         f"{worker_brief.CORE_BUDGET_CHARS} budget")
     # The whole bare prompt shrank: it measured 6032 chars before the split. 4500 until
     # the crew block (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) bought its place.
-    assert len(p) < 5000, f"bare worker prompt is {len(p)} chars"
+    # Raised 5000 -> 5900 for the inlined navigation block (spec
+    # 2026-10-01-the-steer-that-beat-the-brief.md SS3): 4911 before, 5846 after. 935 of
+    # that, not the ~500 the spec estimated, because SELECT_LINE names BOTH tool prefixes
+    # in one select — 325 chars of tool names, and the probe that made one line correct is
+    # what bought back the retry sentence. The CORE budget above is untouched: this block
+    # is after the index, which is the whole reason it goes there.
+    assert len(p) < 5900, f"bare worker prompt is {len(p)} chars"
 
 
 def test_the_core_says_to_pass_a_reference_and_never_a_payload():
@@ -259,8 +265,77 @@ def test_navigation_section_is_the_full_navigation_briefing():
     from jarvis import worker_brief
     text = worker_brief.render_section("navigation")
     for phrase in ("Serena first, grep second", "find_referencing_symbols",
-                   "If this project has Serena", "no Serena", "read_memory"):
+                   "DEFERRED", "read_memory"):
         assert phrase in text, f"lost from the navigation section: {phrase!r}"
+    # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md:
+    # the symbol tools are DEFERRED behind `ToolSearch`, so "appear in your tool list"
+    # reads FALSE at the moment the worker reads it — a test it fails by design.
+    assert "appear in your tool list" not in text
+    assert "If this project has Serena" not in text
+
+
+# -- the inlined navigation block (spec 2026-10-01-the-steer-that-beat-the-brief.md §3) --
+
+#: The recovery call, asserted as a literal because it is the one call the block is
+#: allowed to cost and a typo in a tool name spends it for nothing. Both prefixes in one
+#: select: `mcp__serena__` from `claude mcp add serena`, `mcp__plugin_serena_serena__`
+#: from a plugin install, and an absent name is silently ignored — probed on 2.1.284,
+#: where a select naming both spellings of `find_symbol` on a plugin install returned
+#: only `mcp__plugin_serena_serena__find_symbol` and the rest of the select survived.
+SELECT_LINE = (
+    "select:mcp__serena__find_symbol,mcp__plugin_serena_serena__find_symbol,"
+    "mcp__serena__find_referencing_symbols,"
+    "mcp__plugin_serena_serena__find_referencing_symbols,"
+    "mcp__serena__get_symbols_overview,"
+    "mcp__plugin_serena_serena__get_symbols_overview,"
+    "mcp__serena__activate_project,mcp__plugin_serena_serena__activate_project")
+
+
+def test_the_navigation_block_is_inlined_after_the_section_index():
+    """Cause 3 of the defect: an ordinary lead is never told the posture at all — it gets
+    one index line pointing at `jarvis brief navigation`, and the measured fetch
+    behaviour is that it does not fetch. So the block is INLINE.
+
+    After the index, not inside `# Operating contract`: the core has 38 chars of headroom
+    against CORE_BUDGET_CHARS, and every sentence in it is A/B-graded as a unit by
+    evals/llm/test_worker_contract_ab.py (§3, rejected alternative 7)."""
+    p = _prompt()
+    assert SELECT_LINE in p, "the ToolSearch recovery call is not in the bare prompt"
+    assert p.index("# Full briefings on demand") < p.index(SELECT_LINE)
+
+
+def test_the_navigation_block_says_the_tools_are_deferred_not_absent():
+    p = _prompt()
+    assert "DEFERRED" in p
+    assert "appear in your tool list" not in p
+
+
+def test_the_navigation_block_overrides_the_bash_first_steer():
+    """Belt and braces on §1: it survives a project setting `relaxed` or `cli`, and it
+    survives the per-session cohort draw if a future CLI re-introduces the steer under a
+    different name."""
+    assert "does NOT govern code navigation" in _prompt()
+
+
+def test_the_navigation_block_ranks_the_calls_by_what_grep_cannot_do():
+    p = _prompt()
+    for call in ("find_referencing_symbols", "get_symbols_overview", "find_symbol",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+
+
+def test_the_navigation_block_is_absent_when_serena_is_deselected():
+    """`section_index` already swaps in NO_SERENA_HOOK and the fetched section already
+    carries the grep posture, so a block recommending a server this same dispatch removed
+    would be the incoherence `wiring.serena_wired` exists to prevent."""
+    from jarvis.catalog import WiringConfig
+    unwired = ProjectSpec(
+        name="p1", path=Path("/tmp/p1"),
+        wiring=WiringConfig(disabled_plugins=("serena@claude-plugins-official",)))
+    p = _prompt(unwired)
+    assert SELECT_LINE not in p
+    assert "mcp__serena__" not in p
+    assert "DEFERRED" not in p
 
 
 def test_gates_section_is_the_full_gate_briefing():

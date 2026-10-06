@@ -37,9 +37,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import findings, gaps
+
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .project_store import ProjectStore
 
 #: The four decisions an investigation can reach about its subject. A classification is a
 #: decision about THE SUBJECT, not about the codebase in general.
@@ -308,6 +312,30 @@ def _parse_unsticks(raw: Any, problems: list[str]) -> dict[str, str]:
                 f"silently, so the record has to say what clears the subject and when")
         out[name] = value
     return out
+
+
+def verdict_stored(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is THIS investigator's verdict already filed? One premise, two readers.
+
+    §2.2 and §2.4 of docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-
+    its-investigator.md. HERE and not in `ops`, because `budget.escalate` is the other
+    reader and `budget` importing `ops` is a cycle; the store is an argument so this
+    stays a question about rows.
+
+    TRUE THE INSTANT `update_feature_order(plan=…)` COMMITS, which is what makes it
+    survive the race §2.2 is about: the verdict is stored before the status is written
+    and before the turn exits, so a cap crossed in between is still a cap crossed on
+    work that is already over.
+    """
+    from . import db
+
+    if wo.get("kind") != "investigator" or not wo.get("parent_id"):
+        return False
+    try:
+        fo = store.get_feature_order(str(wo["parent_id"]))
+    except KeyError:
+        return False
+    return bool((db.from_json(fo.get("plan"), {}) or {}).get("classification"))
 
 
 def settle_headline(inv_id: str, verdict: dict[str, Any]) -> str:
