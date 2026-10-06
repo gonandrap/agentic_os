@@ -17,7 +17,7 @@ import logging
 import time
 from typing import Any
 
-from . import claude_cli, structured
+from . import claude_cli, health, holds, structured
 
 log = logging.getLogger("supervisor")
 
@@ -568,6 +568,25 @@ def _said_lines(pstore: Any, wo_id: str | None, cfg: Any) -> list[str]:
     return said
 
 
+#: What `blocked: …` says for each `health.BLOCKERS` id, plus the feature answer. The
+#: sentences are the OS's own, because this is a line a judge WEIGHS: alarm al-4bb82f7e
+#: said "the packet does not show why" about an order correctly waiting on a dependency,
+#: and the reason was a column the OS already held.
+#:
+#: The three TRANSPORT ids say WHICH hold it is, and the words are READ FROM
+#: `holds.HOLD_CAUSES` rather than written again here (Neo q1241): the same packet shows
+#: the hold line, and a second wording of one cause drifts from it.
+BLOCKED_SENTENCES = {
+    "user": "it is waiting on a decision only the user can take",
+    "dependency": "it is waiting on a dependency that has not completed",
+    "pull-request": "its work is delivered and its pull request has not merged yet",
+    **{blocker_id: f"the account is holding it — {holds.HOLD_CAUSES[cause]}"
+       for blocker_id, cause in health.transport_blockers().items()},
+    "assumptions": "an assumption of its own is still waiting to be reviewed",
+    "children": "every child of it that has not settled is itself blocked",
+}
+
+
 def build_evidence(pstore: Any, subject: dict[str, Any],
                    alarm: dict[str, Any] | None,
                    cfg: Any = None, inspect_cfg: Any = None) -> str:
@@ -629,11 +648,19 @@ def build_evidence(pstore: Any, subject: dict[str, Any],
                               // (len(sections) + len(rest) + 1))]
         sections += [rest[0], tree, *rest[1:]]
     else:
+        from . import health
+
+        # ABSENT when there is no blocker, never `blocked: none`: an unblocked order's
+        # packet keeps its current bytes (it is the cached prefix of every review), and a
+        # line asserting the absence of a blocker is a claim the judge would weigh where
+        # silence is the status quo it already reads.
+        blocked = health.blocker(pstore, subject, cfg)
         sections.append([
             "# The work order",
             f"{row.get('id')} [{row.get('status')}] on "
             f"{row.get('model') or '(default model)'}",
             f"this session is {_what_it_is(row)}",
+            *([f"blocked: {BLOCKED_SENTENCES.get(blocked, blocked)}"] if blocked else []),
             f"title: {row.get('title')}",
             f"brief: {_clip(str(row.get('description') or ''), cfg.description_chars)}",
         ])
@@ -1004,6 +1031,42 @@ def review_health(pstore: Any, neo_store: Any, project: str, subject: dict[str, 
             if kind == "feature_order"
             else HEALTH_BLOCKER.format(reason=first["reason"])))
     return {**reply, "raised": raised, "outcome": outcome}
+
+
+def reassert_health(pstore: Any, project: str, subject: dict[str, Any]) -> dict[str, Any]:
+    """Carry the prior judgement forward at an unchanged fingerprint — ONE ROW, NO CALL.
+
+    A sibling of `review_health` because the thing it writes is the thing `review_health`
+    writes, and a second writer of `health_reviews` belongs beside the first. The spend
+    decision is `health.due`'s (trigger `re-assert`); all this does is record it.
+
+    THE FINGERPRINT IS COMPUTED HERE, `review_health`'s reason: the row must record the
+    state actually judged. NO ALARM, NO `health_finding`, NO `flag_attention` and no
+    `health_reviewed` event — the fingerprint is identical, so `probes_reported_at`
+    already returns every probe the prior review named and `review_health` would have
+    deduped all of them. The event means "a judge looked", and none did.
+
+    The row IS counted by `last_health_review` and by `last_health_attempt_ts`,
+    deliberately in both cases: the first slides the stale window forward, so a
+    re-assertion costs at most one row per window, and the second floors the next look
+    exactly as a paid stale review does.
+    """
+    from . import health
+
+    kind, subject_id = subject["kind"], subject["row"]["id"]
+    prior = pstore.last_health_review(kind, subject_id)
+    if prior is None:
+        # Unreachable through `due`, which only answers `re-assert` with a prior
+        # `findings` row. Refused rather than invented: this function copies a judgement
+        # and never makes one.
+        log.warning("[%s] nothing to re-assert about %s", project, subject_id)
+        return {"outcome": None, "trigger": health.REASSERT}
+    pstore.record_health_review(
+        kind, subject_id, fingerprint=health.fingerprint(pstore, subject),
+        trigger=health.REASSERT, outcome=prior["outcome"],
+        findings=prior["findings"], detail=prior["detail"])
+    log.debug("[%s] re-asserted the last judgement of %s for free", project, subject_id)
+    return {"outcome": prior["outcome"], "trigger": health.REASSERT}
 
 
 def escalation_context(evidence: str, verdict: dict[str, Any]) -> str:

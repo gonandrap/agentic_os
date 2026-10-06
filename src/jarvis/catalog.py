@@ -10,6 +10,7 @@ from typing import Any
 
 from . import claude_cli
 from . import concision
+from . import health as health_mod
 from . import probes as probes_mod
 # The ceiling's constants live in `claude_cli` and are imported HERE, not the other way
 # round: catalog -> project_store -> claude_cli is already a chain, so the reverse
@@ -1194,6 +1195,11 @@ class SupervisorConfig:
     health_min_interval_minutes: int = DEFAULT_SUPERVISOR_HEALTH_MIN_INTERVAL_MINUTES
     health_stale_minutes: int = DEFAULT_SUPERVISOR_HEALTH_STALE_MINUTES
     health_max_units_per_tick: int = DEFAULT_SUPERVISOR_HEALTH_MAX_UNITS_PER_TICK
+    # Which re-derivable reasons count as explaining a still unit, so a stale look at it
+    # is a free re-assertion rather than a model call. A whole immutable list, addressed
+    # at once for `probes`' reason, and a SETTING rather than a module constant: Neo
+    # q1217's one condition and kn-1cec46b5's standing rule.
+    health_reassert_blockers: tuple[str, ...] = health_mod.BLOCKERS
     max_enabled_probes: int = DEFAULT_SUPERVISOR_MAX_ENABLED_PROBES
     probe_prompt_chars: int = DEFAULT_SUPERVISOR_PROBE_PROMPT_CHARS
 
@@ -1916,7 +1922,8 @@ def _parse_schedule(raw: Any, base: ScheduleConfig | None = None,
 #: casts everything else with `int()`, so a non-numeric field missing from this set is a
 #: `TypeError` on every catalog load — or, for a bool, a silent `int(False) == 0` that
 #: trips the `>= 1` floor instead and blames the wrong key.
-_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies")
+_SUPERVISOR_NON_NUMERIC = ("enabled", "model", "probes", "health_enabled", "remedies",
+                           "health_reassert_blockers")
 
 
 def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
@@ -1942,6 +1949,25 @@ def _parse_remedies(raw: Any, base: RemedyConfig, where: str) -> RemedyConfig:
             raise _err(f"{where}.allowed names unknown remedy {remedy_id!r} — "
                        f"known: {', '.join(remedies_mod.SHIPPED_REMEDIES)}")
     return RemedyConfig(enabled=bool(raw.get("enabled", base.enabled)), allowed=allowed)
+
+
+def _parse_blockers(raw: Any, base: tuple[str, ...], where: str) -> tuple[str, ...]:
+    """`supervisor.health_reassert_blockers`, or a project's override — field-level.
+
+    `_parse_remedies`' shape exactly, including the refusal of an unknown id with the
+    known ones named: a setting the user believes they changed, silently unset, is the
+    failure this block exists to prevent.
+    """
+    if raw is None:
+        return tuple(base)
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise _err(f'"{where}" must be a list of blocker ids')
+    ids = tuple(str(item) for item in raw)
+    for blocker_id in ids:
+        if blocker_id not in health_mod.BLOCKERS:
+            raise _err(f"{where} names unknown blocker {blocker_id!r} — "
+                       f"known: {', '.join(health_mod.BLOCKERS)}")
+    return ids
 
 
 def _parse_probes(raw: Any, base: tuple[probes_mod.HealthProbe, ...],
@@ -2037,6 +2063,9 @@ def _parse_supervisor(raw: Any, base: SupervisorConfig | None = None,
         model=str(raw.get("model", base.model) or base.model),
         health_enabled=bool(raw.get("health_enabled", base.health_enabled)),
         probes=_parse_probes(raw.get("probes"), base.probes, f"{where}.probes"),
+        health_reassert_blockers=_parse_blockers(
+            raw.get("health_reassert_blockers"), base.health_reassert_blockers,
+            f"{where}.health_reassert_blockers"),
         remedies=_parse_remedies(raw.get("remedies"), base.remedies,
                                  f"{where}.remedies"),
         **{k: int(raw.get(k, v)) for k, v in numbers.items()},
