@@ -139,7 +139,13 @@ def prefix_rate(call: Call, previous: Call | None, first: bool) -> tuple[str, fl
     return RATE_READ, usage.CACHE_READ_RATE
 
 
-def _per_token(model: str) -> float:
+def per_token(model: str) -> float:
+    """One input token at list price. Public for `quantile`'s reason: a second caller.
+
+    `fleetcost.tool_costs` prices a tool result's share of every later call it rode
+    along in, and that share is `result_tokens * rate * per_token(model)` — the same
+    arithmetic this module's own savings use, so it is reused rather than restated.
+    """
     return usage.price_for(model)[0] / 1_000_000
 
 
@@ -197,14 +203,14 @@ def assess(case: Case) -> dict[str, Any]:
             notes.append(f"counterfactual context {call.context + removed:,} > window "
                          f"{case.window:,}: Claude Code would have auto-compacted")
             continue
-        extra = removed * mult * _per_token(call.model)
+        extra = removed * mult * per_token(call.model)
         savings[kind] += extra
         per_call.append((call.ts, extra))
 
     next_extra = 0.0
     if removed and not capped and math.isfinite(end):
         model = after[-1].model if after else case.model
-        next_extra = removed * 1.0 * _per_token(model)
+        next_extra = removed * 1.0 * per_token(model)
         per_call.append((end, next_extra))
 
     # Turns after C, and the turn by which C had paid for itself.

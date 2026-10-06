@@ -2875,11 +2875,28 @@ class FleetCostFixture:
         finally:
             neo.close()
 
+    def set_cost(self, **keys: Any) -> None:
+        """Override `os.cost.*` in the catalog this fixture registered.
+
+        The cap on orders walked and the row cap of the tool table are catalog settings
+        (Neo's rider: no module constant for anything tunable), so a test that wants to
+        see the cap BITE has to write one.
+        """
+        data = json.loads(self.catalog_path.read_text())
+        data["os"].setdefault("cost", {}).update(keys)
+        self.catalog_path.write_text(json.dumps(data))
+
     # -- transcripts ------------------------------------------------------------
 
     def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
-                 input: int = 0, mid: str = "", model: str = "claude-opus-5") -> dict:
-        """One assistant message — `usage.calls_of` reads one API call per row."""
+                 input: int = 0, mid: str = "", model: str = "claude-opus-5",
+                 tools: Sequence[tuple[str, str, dict]] = ()) -> dict:
+        """One assistant message — `usage.calls_of` reads one API call per row.
+
+        `tools` is (tool_use_id, name, input) triples, and SEVERAL on one row is how
+        Claude Code writes a parallel tool call: that is the case the char-proportional
+        split of one exact context delta exists for (§10.2).
+        """
         return {
             "type": "assistant",
             "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
@@ -2888,7 +2905,26 @@ class FleetCostFixture:
                         "usage": {"input_tokens": input,
                                   "cache_creation_input_tokens": write,
                                   "cache_read_input_tokens": read,
-                                  "output_tokens": out}},
+                                  "output_tokens": out},
+                        "content": [{"type": "tool_use", "id": tid, "name": name,
+                                     "input": arguments}
+                                    for tid, name, arguments in tools]},
+        }
+
+    def result_row(self, *results: tuple[str, str], at: float,
+                   is_error: bool = False) -> dict:
+        """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs.
+
+        A `user` row, which is why `usage._assistant_messages` never saw one: it has no
+        `usage` object, so the ledger keyed by API call has no place to charge it.
+        """
+        return {
+            "type": "user",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                     "content": text, "is_error": is_error}
+                                    for tid, text in results]},
         }
 
     def compact_row(self, *, at: float, pre: int = 200_000, post: int = 5_000) -> dict:

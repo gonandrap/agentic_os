@@ -37,8 +37,11 @@ And three the spec states that are easy to lose in a refactor:
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
+import re
+import shlex
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -523,6 +526,425 @@ def _neo_questions(since: float, until: float, project: str | None) -> dict[str,
 
 
 # ---------------------------------------------------------------------------------------
+# What a TOOL cost — §10
+#
+# The fleet's largest avoidable token line is tool output, and until this section no
+# surface in the OS could see it: the ledger above is keyed by API CALL, and a tool
+# result is not a call — it is a payload that rides along inside every SUBSEQUENT call's
+# prefix. That quantity is `carried cost`, and it is why counting result bytes
+# understates the problem: a 20k-token `sed -n` dump read 30 more times costs 600k
+# token-reads, not 20k.
+#
+# The WALK is `usage.tool_results` (a leaf: transcripts and prices, no store, no
+# catalog). Everything here is the aggregation: the command-shape classifier, the
+# carried-cost arithmetic and the fleet denominators.
+#
+# Spec §10 of docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md.
+# ---------------------------------------------------------------------------------------
+
+#: The Bash command SHAPES, in the order `classify_command` tests them. The axis is what
+#: PRODUCED the bytes, never what clipped them, so every producer is tested before
+#: `stream_head_tail` — which is the residual "output already clipped" bucket and the
+#: ~167 tok/call population the motivating measurement found was already fine.
+SHAPE_PYTEST = "pytest"
+SHAPE_JARVIS = "jarvis"
+SHAPE_GIT_READ = "git_read"
+SHAPE_SED_RANGE = "sed_range"
+SHAPE_CAT_FILE = "cat_file"
+SHAPE_SEARCH = "search"
+SHAPE_STREAM = "stream_head_tail"
+SHAPE_OTHER = "other"
+SHAPES = (SHAPE_PYTEST, SHAPE_JARVIS, SHAPE_GIT_READ, SHAPE_SED_RANGE, SHAPE_CAT_FILE,
+          SHAPE_SEARCH, SHAPE_STREAM, SHAPE_OTHER)
+
+#: Shell operators that CUT a command into segments, as standalone tokens.
+_OPERATORS = frozenset({"|", "||", "&&", ";", "|&", "&"})
+
+#: Stripped off the front of a segment before its head word is read. `uv` and `poetry`
+#: only with a following `run`: `uv sync` is not a wrapper around anything.
+_WRAPPERS = frozenset({"sudo", "time", "env", "nohup", "xargs"})
+_RUNNERS = frozenset({"uv", "poetry"})
+
+#: `python -m pytest`, where the head word is the interpreter and `pytest` is a token.
+_INTERPRETERS = frozenset({"python", "python3", "uv", "poetry"})
+
+_GIT_READ_VERBS = frozenset({"diff", "show", "log", "blame"})
+_CAT_HEADS = frozenset({"cat", "bat"})
+_SEARCH_HEADS = frozenset({"grep", "egrep", "fgrep", "rg", "ag", "find"})
+_CLIP_HEADS = frozenset({"head", "tail"})
+
+#: A `sed -n` ADDRESS: `50p`, `1,50p`, `1,$p`. Quotes are optional because the
+#: whitespace fallback (an unbalanced quote) does not strip them.
+_SED_ADDRESS = re.compile(r"""^['"]?\d+(,(\d+|\$))?p?['"]?$""")
+
+
+def classify_command(command: str) -> str:
+    """One Bash command's SHAPE: what produced its bytes. Pure, total, deterministic.
+
+    Never shells out and never touches the filesystem — no `os.path.exists`, no glob
+    expansion — because the path may be in a worktree that is gone (the reason
+    `usage.index_sessions` exists) and a classifier whose answer depends on the disk is
+    not reproducible. Never raises: an unbalanced quote falls back to whitespace
+    splitting, and anything unrecognised is `other`, the total last rule.
+
+    §10.5's ordered rule list, first match wins.
+    """
+    if not isinstance(command, str):
+        return SHAPE_OTHER
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        # An unbalanced quote. The shape is still worth having, so the cheaper
+        # tokenizing is used rather than the call being dropped.
+        tokens = command.split()
+    segments = [s for s in _segments(tokens) if s]
+    if not segments:
+        return SHAPE_OTHER
+    heads = [_head_word(s) for s in segments]
+
+    # 1-2: scanned over EVERY segment, so neither is ever hidden behind a pipe. A
+    # `jarvis` call is a thing the user asks about by name, and a test run is the one
+    # population already known to be cheap per call.
+    for segment, head in zip(segments, heads):
+        if head == SHAPE_PYTEST or (head in _INTERPRETERS and SHAPE_PYTEST in segment):
+            return SHAPE_PYTEST
+    if SHAPE_JARVIS in heads:
+        return SHAPE_JARVIS
+
+    first, head = segments[0], heads[0]
+    rest = first[first.index(head) + 1:] if head in first else []
+    if head == "git" and rest and rest[0] in _GIT_READ_VERBS:
+        return SHAPE_GIT_READ
+    if head == "sed" and "-n" in first and any(_SED_ADDRESS.match(t) for t in rest):
+        return SHAPE_SED_RANGE
+    if head in _CAT_HEADS:
+        return SHAPE_CAT_FILE
+    if head in _SEARCH_HEADS:
+        return SHAPE_SEARCH
+    # 7: the LAST segment, which covers both `cmd | head` and a bare `head -50 file`.
+    if heads[-1] in _CLIP_HEADS:
+        return SHAPE_STREAM
+    return SHAPE_OTHER
+
+
+def _segments(tokens: Sequence[str]) -> list[list[str]]:
+    """Cut a token list on the shell operators found as standalone tokens."""
+    out: list[list[str]] = [[]]
+    for token in tokens:
+        if token in _OPERATORS:
+            out.append([])
+        else:
+            out[-1].append(token)
+    return out
+
+
+#: Said in the payload rather than in a renderer, the same rule `NOTES` follows. The six
+#: KNOWN INACCURACIES of §10.4 plus the one thing a reader would otherwise add up wrong.
+TOOL_NOTES = (
+    "a tool result's size is DERIVED and never reported by the API: context-delta is "
+    "exact to the token for a single result between two clean calls, a parallel batch "
+    "is a char-proportional split of an exact total, and chars is an estimate whose "
+    "divisor is cost.chars_per_token — the counts are in token_basis",
+    "a call's output count is a GENERATION count, not an input count: the assistant "
+    "message is re-sent as input on the next call and the two tokenizations need not "
+    "agree, so any difference lands on the tool result under context-delta",
+    "carried cost assumes the result survives in the prefix until the next compaction, "
+    "so it is an OVER-estimate wherever context-window truncation ended the ride "
+    "earlier — compact_boundary is the only replacement event a transcript records",
+    "the pricing of a result's share of a call is exact and its size is not: one call "
+    "pays one rate for its whole prefix, so result_tokens x rate x per_token blends "
+    "nothing",
+    "a result that was never carried still cost its own round trip: the last tool call "
+    "of a session has carried_calls 0 and carried_usd 0.0, and its result_tokens are "
+    "still reported",
+    "the chars estimator's divisor (cost.chars_per_token) is UNCALIBRATED against the "
+    "fleet: the default is 4.0, it is overridable per project, and the token_basis "
+    "counts say how many calls depend on it",
+    "the carried dollars are a SHARE of money already counted in cost_per_order_usd, "
+    "not an addition to it: the two are different decompositions of overlapping tokens "
+    "and summing them would double-count",
+)
+
+
+def _head_word(segment: Sequence[str]) -> str:
+    """A segment's first token, with `VAR=value` assignments and wrappers stripped."""
+    i = 0
+    while i < len(segment):
+        token = segment[i]
+        if token in _WRAPPERS or ("=" in token and not token.startswith("-")
+                                  and token.split("=", 1)[0].isidentifier()):
+            i += 1
+            continue
+        if token in _RUNNERS and i + 1 < len(segment) and segment[i + 1] == "run":
+            i += 2
+            continue
+        return token
+    return ""
+
+
+#: The one tool whose NAME says nothing about what it read. Every other tool is keyed by
+#: `tool_use.name` verbatim — no normalization, no prefix stripping, because two
+#: spellings of one tool is how a reader loses a row. The render elides for display only.
+BASH_TOOL = "Bash"
+
+
+@dataclass
+class _Chain:
+    """One conversation's calls, with the running price of carrying ONE token in them.
+
+    A result's carried cost is its size times what every LATER call in the SAME CHAIN
+    paid to carry a token — so the per-token price is accumulated once per chain and
+    read off by timestamp, rather than re-walked per result. The main chain is
+    `session_calls` (every segment of the session: a result keeps riding across a
+    segment boundary because the conversation did); a subagent file is its own chain,
+    and a lead call is never in a subagent's denominator nor the reverse.
+    """
+
+    stamps: list[float] = field(default_factory=list)
+    #: Cumulative (all, read, ttl-rewrite, prefix-rewrite) dollars per carried token.
+    #: `len(stamps) + 1` entries, so a half-open range of calls is one subtraction.
+    cumulative: list[tuple[float, float, float, float]] = field(
+        default_factory=lambda: [(0.0, 0.0, 0.0, 0.0)])
+    compactions: list[float] = field(default_factory=list)
+
+    def carried(self, ts: float) -> tuple[int, tuple[float, float, float, float]]:
+        """(later calls, dollars per carried token) for a result that landed at `ts`.
+
+        The window ENDS at the first compaction after `ts`: a compaction replaces the
+        conversation, so the result stops being carried there.
+        """
+        start = bisect.bisect_right(self.stamps, ts)
+        stop = next((c for c in self.compactions if c > ts), None)
+        end = (len(self.stamps) if stop is None
+               else bisect.bisect_left(self.stamps, stop))
+        if end <= start:
+            return (0, (0.0, 0.0, 0.0, 0.0))
+        before, after = self.cumulative[start], self.cumulative[end]
+        return (end - start,
+                (after[0] - before[0], after[1] - before[1],
+                 after[2] - before[2], after[3] - before[3]))
+
+
+def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
+           floor: int | None) -> _Chain:
+    """Price carrying one token in every call of a chain, split by what it was billed as.
+
+    `compaction_payoff.prefix_rate` is REUSED, not reimplemented: it returns the multiple
+    of base input price one call paid *for the prefix it carried*, which is precisely the
+    rate a result inside that prefix was billed at. The CAUSE of a write comes from
+    `usage.classify_boundaries`, joined to the call by `Boundary.ts` — TTL expiry and a
+    prefix miss cost the same and have completely different fixes.
+    """
+    ordered = sorted(calls, key=lambda c: c.ts)
+    stamps = sorted(compactions)
+    causes = {b.ts: b.cause for b in usage.classify_boundaries(
+        ordered, compactions=stamps, cold_prefix_floor=floor)}
+    chain = _Chain(compactions=stamps)
+    previous: usage.Call | None = None
+    for i, call in enumerate(ordered):
+        kind, rate = compaction_payoff.prefix_rate(call, previous, i == 0)
+        unit = compaction_payoff.per_token(call.model) * rate
+        read = unit if kind == compaction_payoff.RATE_READ else 0.0
+        # Everything that is not a cache READ was re-written (or paid full input price,
+        # which is the same thing for a reader asking what the re-write tax cost). With
+        # no floor the boundary is UNDECIDED and lands in the prefix bucket, never TTL.
+        ttl = unit if (not read and causes.get(call.ts) == usage.BOUNDARY_TTL) else 0.0
+        running = chain.cumulative[-1]
+        chain.cumulative.append((running[0] + unit, running[1] + read,
+                                 running[2] + ttl,
+                                 running[3] + unit - read - ttl))
+        chain.stamps.append(call.ts)
+        previous = call
+    return chain
+
+
+@dataclass
+class ToolCost:
+    """What one tool (or one Bash shape, or one caller of either) cost in a window.
+
+    ONE shape at every level of `fleet.tools`, and `by_caller` is a PARTITION of the
+    level above it rather than an addend (kn-7a2180ba): `main.calls + subagent.calls ==
+    calls`, and the same for every additive field.
+    """
+
+    calls: int = 0
+    errors: int = 0
+    result_tokens: int = 0
+    carried_calls: int = 0
+    carried_tokens: int = 0
+    carried_usd: float = 0.0
+    carried_read_usd: float = 0.0
+    carried_rewrite_ttl_usd: float = 0.0
+    carried_rewrite_prefix_usd: float = 0.0
+    basis_context_delta: int = 0
+    basis_chars: int = 0
+    #: Every result's size, for the p90 and the max. Nearest-rank, so both are figures
+    #: some call actually came back with.
+    sizes: list[int] = field(default_factory=list)
+    by_caller: dict[str, ToolCost] = field(default_factory=dict)
+    shapes: dict[str, ToolCost] = field(default_factory=dict)
+
+    def add(self, result: usage.ToolResult, later: int,
+            money: tuple[float, float, float, float]) -> None:
+        self.calls += 1
+        self.errors += 1 if result.is_error else 0
+        self.result_tokens += result.tokens
+        self.sizes.append(result.tokens)
+        self.carried_calls += later
+        self.carried_tokens += result.tokens * later
+        self.carried_usd += result.tokens * money[0]
+        self.carried_read_usd += result.tokens * money[1]
+        self.carried_rewrite_ttl_usd += result.tokens * money[2]
+        self.carried_rewrite_prefix_usd += result.tokens * money[3]
+        if result.token_basis == usage.BASIS_CONTEXT_DELTA:
+            self.basis_context_delta += 1
+        else:
+            self.basis_chars += 1
+
+    def as_dict(self, *, percentile: float, totals: ToolCost, ttl_known: bool,
+                callers: bool = True, shapes: bool = True) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "calls": self.calls,
+            "errors": self.errors,
+            "result_tokens": self.result_tokens,
+            "result_tokens_avg": round(self.result_tokens / self.calls, 6
+                                       ) if self.calls else 0.0,
+            "result_tokens_p90": int(quantile(
+                [float(s) for s in self.sizes], percentile) or 0),
+            "result_tokens_max": max(self.sizes, default=0),
+            "carried_calls": self.carried_calls,
+            "carried_tokens": self.carried_tokens,
+            "carried_usd": round(self.carried_usd, 6),
+            "carried_read_usd": round(self.carried_read_usd, 6),
+            # Never 0.00 when no floor could decide: a renderer would print that as "no
+            # TTL expiry", which is a claim the configuration did not support.
+            "carried_rewrite_ttl_usd": (round(self.carried_rewrite_ttl_usd, 6)
+                                        if ttl_known else None),
+            "carried_rewrite_prefix_usd": round(self.carried_rewrite_prefix_usd, 6),
+            "token_basis": {"context_delta": self.basis_context_delta,
+                            "chars": self.basis_chars},
+            "share_of_result_tokens": _share(self.result_tokens, totals.result_tokens),
+            "share_of_carried_usd": _share(self.carried_usd, totals.carried_usd),
+        }
+        if callers:
+            out["by_caller"] = {
+                name: self.by_caller.get(name, ToolCost()).as_dict(
+                    percentile=percentile, totals=totals, ttl_known=ttl_known,
+                    callers=False, shapes=False)
+                for name in (usage.CALLER_MAIN, usage.CALLER_SUBAGENT)}
+        if shapes and self.shapes:
+            out["shapes"] = {
+                name: cost.as_dict(percentile=percentile, totals=totals,
+                                   ttl_known=ttl_known, shapes=False)
+                for name, cost in sorted(self.shapes.items())}
+        return out
+
+
+def _share(part: float, whole: float) -> float:
+    return round(part / whole, 6) if whole else 0.0
+
+
+def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | None,
+               index: dict[str, list[Path]] | None = None,
+               orders_capped: int = 0) -> dict[str, Any]:
+    """`fleet.tools`: what every tool cost in the window, and what it CARRIED.
+
+    Bounded by `cost.max_orders` one level up — the orders `fleetcost` already selected
+    for the window are the sessions walked, and `excluded` publishes what the cap did.
+    No cache in this stage: `--fleet` is an on-demand report, not a 15s pulse (§10.9).
+
+    Read-only and deterministic: two passes per transcript, no store, no model call.
+    """
+    index = usage.index_sessions() if index is None else index
+    totals = ToolCost()
+    by_tool: dict[str, ToolCost] = {}
+    unmatched = no_transcript = walked = 0
+    for order in orders:
+        files = sorted(index.get(order.session_id) or []) if order.session_id else []
+        if not files:
+            # Counted, never dropped: a share needs a denominator a reader can check.
+            no_transcript += 1
+            continue
+        main = _chain(usage.session_calls(order.session_id, index=index),
+                      [c for path in files for c in usage.compaction_stamps(path)],
+                      floor)
+        for path in files:
+            unmatched += _walk_tools(path, main, cfg, totals, by_tool)
+            walked += 1
+            sub_dir = path.with_suffix("") / "subagents"
+            if not sub_dir.is_dir():
+                continue
+            for sub in sorted(sub_dir.glob("*.jsonl")):
+                unmatched += _walk_tools(
+                    sub, _chain(usage.calls_of(sub), usage.compaction_stamps(sub),
+                                floor),
+                    cfg, totals, by_tool)
+                walked += 1
+    ttl_known = floor is not None
+    detail = {"percentile": cfg.percentile, "totals": totals, "ttl_known": ttl_known}
+    return {
+        "version": PAYLOAD_VERSION,
+        "totals": totals.as_dict(**detail),
+        "by_tool": {name: cost.as_dict(**detail)
+                    for name, cost in sorted(by_tool.items())},
+        "excluded": {"unmatched_calls": unmatched, "no_transcript": no_transcript,
+                     "orders_capped": orders_capped, "sessions_walked": walked},
+        "row_limit": cfg.tool_rows,
+        "notes": list(TOOL_NOTES),
+    }
+
+
+def tool_table(tools: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """The tool table's rows, in §10.7's total order: carried $, tokens, then name.
+
+    HERE rather than in either renderer, for the reason the partial already states: a
+    figure — or an order — computed in a renderer is one the other renderer disagrees
+    with. `jarvis cost --fleet` and the dashboard both call this.
+
+    Bash is one row PER SHAPE and never also a Bash total line: the total is recoverable
+    from the shapes, and two rows that sum to a third invite the reader to add the wrong
+    pair. Sorting on carried cost rather than calls is the whole point of §10.4 —
+    `pytest` at ~167 tok/call must not outrank a `sed -n` dump for being frequent. The
+    order is TOTAL, so the table is reproducible run to run.
+    """
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for name, cost in (tools.get("by_tool") or {}).items():
+        if cost.get("shapes"):
+            rows.extend((f"{name} · {shape}", shape_cost)
+                        for shape, shape_cost in cost["shapes"].items())
+        else:
+            rows.append((name, cost))
+    rows.sort(key=lambda row: (-row[1]["carried_usd"], -row[1]["result_tokens"], row[0]))
+    return rows
+
+
+def _walk_tools(path: Path, chain: _Chain, cfg: CostConfig, totals: ToolCost,
+                by_tool: dict[str, ToolCost]) -> int:
+    """Fold one transcript's tool calls into the accumulators. Returns the unmatched.
+
+    An UNMATCHED call — the turn was killed between the `tool_use` and its result —
+    contributes no tokens and no carried cost and is never zero-filled: a call that
+    produced nothing must not pull a tool's average down as though it had.
+    """
+    unmatched = 0
+    for result in usage.tool_results(path, chars_per_token=cfg.chars_per_token):
+        if not result.matched:
+            unmatched += 1
+            continue
+        later, money = chain.carried(result.ts)
+        tool = by_tool.setdefault(result.name, ToolCost())
+        buckets = [totals, tool]
+        if result.name == BASH_TOOL:
+            shape = classify_command(str(result.input.get("command") or ""))
+            buckets.append(tool.shapes.setdefault(shape, ToolCost()))
+        for bucket in buckets:
+            bucket.add(result, later, money)
+            bucket.by_caller.setdefault(result.caller, ToolCost()).add(
+                result, later, money)
+    return unmatched
+
+
+# ---------------------------------------------------------------------------------------
 # The report
 # ---------------------------------------------------------------------------------------
 
@@ -595,6 +1017,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
     # The cap is on orders WALKED, so it is applied before anything reads a transcript,
     # and it keeps the most recent: an old order's distribution is the one a reader is
     # least likely to be asking about.
+    capped = max(0, len(orders) - cfg.max_orders)
     if len(orders) > cfg.max_orders:
         keep = sorted(orders.values(),
                       key=lambda o: max(t.started_at for t in
@@ -624,6 +1047,11 @@ def report(*, project: str | None = None, since: float | str | None = None,
                             cfg=cfg, floor=floor, index=index),
         "os_cost_by_kind": kinds,
         "os_unattributed": unattributed,
+        # ADDITIVE, and `version` above stays 1: §10.6's rule, the one `cost_report`
+        # already applies. The subtree carries its own version so a later re-shaping of
+        # it is detectable without bumping the parent.
+        "tools": tool_costs(orders.values(), cfg=cfg, floor=floor, index=index,
+                            orders_capped=capped),
         "compaction_payoff": compaction_payoff.summarise(compaction_payoff.analyse(
             compaction_payoff.gather(home, since=start, until=end, project=project,
                                      index=index))),

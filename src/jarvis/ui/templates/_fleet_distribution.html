@@ -84,6 +84,80 @@
   </p>
   {% endif %}
 
+  {# §10.7: the same table the CLI prints, off the same `fleet.tools` payload. Bash is
+     one row PER SHAPE and never also a Bash total line, rows are carried-dollars
+     descending, and at most `cost.tool_rows` of them — `row_limit` in the payload,
+     so neither renderer decides it. #}
+  {% if fleet.tools and fleet.tools.totals.calls %}
+  {% set tools = fleet.tools %}
+  {% set rows = tool_table(tools) %}
+  <p class="kv" style="margin: 14px 0 4px;">
+    <strong>What the tools cost</strong> — a result is not an API call, it is a payload
+    that rides inside every LATER call's prefix, so the column that ranks them is
+    <span class="mono">carried $</span>: {{ tools.totals.calls }} call{{
+    's' if tools.totals.calls != 1 }} ·
+    {{ fmt_tok(tools.totals.result_tokens) }} result tok ·
+    {{ fmt_tok(tools.totals.carried_tokens) }} carried tok ·
+    ${{ '%.2f'|format(tools.totals.carried_usd) }} carried.
+  </p>
+  <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <tr class="sub">
+      <th style="text-align: left;">tool</th>
+      <th style="text-align: right;">calls</th>
+      <th style="text-align: right;">result tok</th>
+      <th style="text-align: right;">carried tok</th>
+      <th style="text-align: right;">carried $</th>
+      <th style="text-align: right;">main / sub</th>
+    </tr>
+    {% for label, cost in rows %}
+    {% if loop.index <= tools.row_limit %}
+    <tr>
+      <td title="{{ label }}">{{ label }}</td>
+      <td style="text-align: right;">{{ cost.calls }}</td>
+      <td style="text-align: right;">{{ fmt_tok(cost.result_tokens) }}</td>
+      <td style="text-align: right;">{{ fmt_tok(cost.carried_tokens) }}</td>
+      <td style="text-align: right;">${{ '%.2f'|format(cost.carried_usd) }}</td>
+      <td style="text-align: right;" class="sub">
+        {%- set main = cost.by_caller.main.carried_usd %}
+        {%- set sub = cost.by_caller.subagent.carried_usd %}
+        {%- if main + sub > 0 %}
+          {{ '%.0f'|format(100 * main / (main + sub)) }}% /
+          {{ '%.0f'|format(100 * sub / (main + sub)) }}%
+        {%- else %}—{% endif -%}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  {% if rows|length > tools.row_limit %}
+  <p class="sub mono" style="margin: 4px 0 0;">
+    ({{ rows|length - tools.row_limit }} more
+    tool{{ 's' if rows|length - tools.row_limit != 1 }},
+    {{ fmt_tok(rows[tools.row_limit:]|map(attribute='1.result_tokens')|sum) }}
+    result tok,
+    ${{ '%.2f'|format(rows[tools.row_limit:]
+        |map(attribute='1.carried_usd')|sum) }} carried)
+  </p>
+  {% endif %}
+  <p class="sub mono" style="margin: 4px 0 0;">
+    carried $ by cause: cache read
+    ${{ '%.2f'|format(tools.totals.carried_read_usd) }} · ttl-expiry re-write
+    {# `undecided` and never $0.00: with no `cold_prefix_floor` the split is left open,
+       and printing a zero there would read as "no TTL expiry". #}
+    {%- if tools.totals.carried_rewrite_ttl_usd is none %} undecided
+    {%- else %} ${{ '%.2f'|format(tools.totals.carried_rewrite_ttl_usd) }}{% endif %} ·
+    prefix-miss re-write
+    ${{ '%.2f'|format(tools.totals.carried_rewrite_prefix_usd) }} ·
+    {{ tools.totals.token_basis.context_delta }} sizes measured exactly,
+    {{ tools.totals.token_basis.chars }} estimated from characters ·
+    {{ tools.excluded.sessions_walked }}
+    transcript{{ 's' if tools.excluded.sessions_walked != 1 }} read
+  </p>
+  {% for note in tools.notes %}
+  <p class="sub" style="margin: 4px 0 0;">{{ note[0]|upper }}{{ note[1:] }}.</p>
+  {% endfor %}
+  {% endif %}
+
   {% if fleet.compaction_payoff.count %}
   <p class="kv" style="margin: 12px 0 0;">
     <strong>Did the compactions pay off?</strong>

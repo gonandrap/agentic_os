@@ -755,6 +755,28 @@ def test_cost_defaults_ship_on_both_config_objects(tmp_path):
         assert cfg.week_reset_zone == "America/Los_Angeles"
         assert cfg.percentile == 0.9
         assert cfg.max_orders == 500
+        # §10.10 of the per-tool addendum: the `chars` estimator's divisor and the row
+        # cap of the tool table, both catalog settings for the same stated reason.
+        assert cfg.chars_per_token == 4.0
+        assert cfg.tool_rows == 20
+
+
+def test_a_non_positive_chars_per_token_is_refused():
+    """Zero or less is not a divisor, and a negative one would report negative tokens."""
+    for bad in (0, -1, -0.5):
+        with pytest.raises(CatalogError, match="chars_per_token"):
+            parse_catalog({"os": {"cost": {"chars_per_token": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"chars_per_token": 3.5}},
+                          "projects": []}).os.cost.chars_per_token == 3.5
+
+
+def test_a_cost_tool_rows_below_one_is_refused():
+    """Zero rows is a table with a truncation line and nothing above it."""
+    for bad in (0, -5):
+        with pytest.raises(CatalogError, match="tool_rows"):
+            parse_catalog({"os": {"cost": {"tool_rows": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"tool_rows": 1}},
+                          "projects": []}).os.cost.tool_rows == 1
 
 
 def test_a_project_overrides_one_cost_key_and_inherits_the_rest(tmp_path):

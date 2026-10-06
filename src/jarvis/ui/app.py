@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, github, invariants, ops, specs, uilog, wiring
+from .. import bill, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -807,6 +807,10 @@ def create_app() -> FastAPI:
         # page and `jarvis cost` both — it was spelled out in each until §10 needed a
         # fourth sentence, and a caveat worded two ways is one the reader stops trusting.
         absent_notes=bill.absent_notes,
+        # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason
+        # the partial already gives about figures: an order computed in a renderer is
+        # one the other renderer disagrees with (§10.7).
+        tool_table=fleetcost.tool_table,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,

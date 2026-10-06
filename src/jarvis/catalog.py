@@ -903,6 +903,11 @@ DEFAULT_COST_WEEK_RESET_HOUR = 21
 DEFAULT_COST_WEEK_RESET_ZONE = "America/Los_Angeles"
 DEFAULT_COST_PERCENTILE = 0.9
 DEFAULT_COST_MAX_ORDERS = 500
+#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply.
+#: A model-family property the OS does not control, and UNCALIBRATED against the fleet —
+#: which is why every figure derived from it reports its `token_basis` counts beside it.
+DEFAULT_COST_CHARS_PER_TOKEN = 4.0
+DEFAULT_COST_TOOL_ROWS = 20
 
 
 @dataclass
@@ -912,10 +917,12 @@ class CostConfig:
     Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
     project naming one key keeps the OS answer for the rest. Neo's rider on
     wo-38456776 — no module constant for anything tunable — and the reason is that all
-    five of these move: a DST shift and an Anthropic policy change both move the reset,
-    and what counts as the tail of the distribution differs by project.
+    seven of these move: a DST shift and an Anthropic policy change both move the reset,
+    what counts as the tail of the distribution differs by project, and the tokens-per-
+    character of a model family is Anthropic's to change.
 
-    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md, and §10.10
+    of its per-tool addendum for the last two.
     """
 
     week_reset_weekday: int = DEFAULT_COST_WEEK_RESET_WEEKDAY
@@ -923,6 +930,8 @@ class CostConfig:
     week_reset_zone: str = DEFAULT_COST_WEEK_RESET_ZONE
     percentile: float = DEFAULT_COST_PERCENTILE
     max_orders: int = DEFAULT_COST_MAX_ORDERS
+    chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
+    tool_rows: int = DEFAULT_COST_TOOL_ROWS
 
 
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
@@ -1800,7 +1809,9 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
     report already carries beside it. A COUNT of orders to walk is refused below 1, where
     zero would report an empty distribution rather than fail. A ZONE must construct a
     `ZoneInfo` or the window is silently wrong every week, so it is refused naming the
-    value typed.
+    value typed. A DIVISOR (`chars_per_token`) is refused at or below zero, where the
+    rule is not ">= 1" because 3.5 characters per token is a legal belief about a model
+    family; a ROW COUNT (`tool_rows`) takes the count rule.
 
     Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
     """
@@ -1813,6 +1824,8 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
         week_reset_zone=str(raw.get("week_reset_zone", base.week_reset_zone)),
         percentile=float(raw.get("percentile", base.percentile)),
         max_orders=int(raw.get("max_orders", base.max_orders)),
+        chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
+        tool_rows=int(raw.get("tool_rows", base.tool_rows)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -1826,6 +1839,11 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                    f"the report already reports beside it")
     if cfg.max_orders < 1:
         raise _err(f"{where}.max_orders must be >= 1")
+    if cfg.chars_per_token <= 0:
+        raise _err(f"{where}.chars_per_token must be > 0 — {cfg.chars_per_token} is not "
+                   f"a divisor, and a negative one would report negative tokens")
+    if cfg.tool_rows < 1:
+        raise _err(f"{where}.tool_rows must be >= 1")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:

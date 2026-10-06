@@ -319,6 +319,9 @@ def test_records_are_counted_not_priced(fleet_fixture):
 FLEET_KEYS = {
     "version", "window", "scope", "orders", "metrics", "os_cost_by_kind",
     "os_unattributed", "compaction_payoff", "floor", "floor_reason", "notes",
+    # §10.6: ADDITIVE under the existing key, and `version` stays 1 — the subtree
+    # carries its own.
+    "tools",
 }
 METRIC_KEYS = {
     "turns_per_order", "cost_per_turn_usd", "cost_per_turn_usd_transcript_floor",
@@ -429,3 +432,418 @@ def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, cap
 
     assert "subproc" in header and "subagent" in header
     assert " sub " not in header, "the ambiguous name is gone"
+
+
+# -- 9. §10.5: the Bash command-shape classifier ---------------------------------------
+#
+# A TABLE, because the rules are ordered and first-match-wins: what breaks is never one
+# rule, it is two rules in the wrong order. The tie-break axis is WHAT PRODUCED THE
+# BYTES, not what clipped them, so every clipped variant below still names its producer.
+
+CLASSIFIER_CASES = [
+    # one per shape the §10.5 table names, in rule order
+    ("uv run pytest -q tests/test_fleetcost.py", "pytest"),
+    ("python -m pytest -x", "pytest"),
+    ("jarvis wo show wo-1", "jarvis"),
+    ("git diff --stat", "git_read"),
+    ("sed -n '1,50p' src/jarvis/usage.py", "sed_range"),
+    ("cat src/jarvis/usage.py", "cat_file"),
+    ("grep -rn needle src/", "search"),
+    ("rg --json needle", "search"),
+    ("head -50 src/jarvis/usage.py", "stream_head_tail"),
+    ("ls -la", "other"),
+    # the six tie-breaks of §10.5, verbatim
+    ("sed -n '1,50p' f | head -20", "sed_range"),
+    ("cat f | head", "cat_file"),
+    ("git log | head -5", "git_read"),
+    ("jarvis cost --json | head -40", "jarvis"),
+    ("uv run pytest -q 2>&1 | tail -40", "pytest"),
+    ("./build.sh | head", "stream_head_tail"),
+    # §10.5's "other by construction" list
+    ("git status", "other"),
+    ("git commit -m wip", "other"),
+    ("sed -i s/a/b/ f", "other"),
+    ("sed -n p f", "other"),
+    ("sudo systemctl restart jarvisd", "other"),
+    # wrappers and assignments are stripped before the head word is read
+    ("time cat f", "cat_file"),
+    ("JARVIS_HOME=/tmp/h jarvis status", "jarvis"),
+]
+
+
+@pytest.mark.parametrize("command,shape", CLASSIFIER_CASES)
+def test_classify_command_table(command, shape):
+    assert fleetcost.classify_command(command) == shape
+
+
+def test_classify_command_adversarial_strings():
+    """Two strings that break a naive classifier, and neither may raise.
+
+    A quoted ARGUMENT that reads like a `sed -n` range is not a file dump — posix
+    tokenizing is what keeps it out — and an UNBALANCED quote must fall back to
+    whitespace splitting rather than let `shlex`'s `ValueError` out into a report.
+    """
+    assert fleetcost.classify_command('git commit -m "use sed -n 1,5p"') == "other"
+    assert fleetcost.classify_command("cat 'f.py | head") == "cat_file"
+    # Total: every string has a shape, and the degenerate ones are not a crash.
+    for odd in ("", "   ", "|", "&& ||", "sed", 'echo "unclosed', "\x01\x02"):
+        assert fleetcost.classify_command(odd) in fleetcost.SHAPES
+
+
+# -- 10. §10.4/§10.6: what a tool cost, and what it CARRIED ----------------------------
+#
+# The quantity under test is not the result's size: it is the size times the number of
+# later API calls it rode along in. A 20k-token dump read 30 more times is a 600k-token
+# charge, which is why `carried_usd` is what the table sorts on.
+
+#: One input token at list price for the fixture's model, and the two rates a carried
+#: result can be billed at. Read off `usage` rather than written down, for the same
+#: reason §10.4 reuses `prefix_rate`: a second copy of a price is a second answer.
+OPUS = 5.0 / 1e6
+READ_RATE = 0.10
+WRITE_RATE = 1.25
+
+
+def order_stats(session_id: str, wo_id: str = "wo-1") -> fleetcost.OrderStats:
+    return fleetcost.OrderStats(wo_id=wo_id, project="proj_a", title="t",
+                                status="completed", session_id=session_id)
+
+
+def tool_costs(sessions, *, floor=5_000, **cfg_keys):
+    cfg = catalog.CostConfig(**cfg_keys)
+    return fleetcost.tool_costs([order_stats(s, f"wo-{i}")
+                                 for i, s in enumerate(sessions)],
+                                cfg=cfg, floor=floor)
+
+
+def test_carried_cost_stops_at_the_next_compaction(fleet_fixture):
+    """A compaction REPLACES the conversation, so the result stops being carried."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+        f.call_row(at=T0 + 3, read=1_250, mid="m3"),
+        f.compact_row(at=T0 + 4),
+        f.call_row(at=T0 + 5, read=100, write=500, mid="m4"),
+        f.call_row(at=T0 + 6, read=600, mid="m5"),
+    ])
+
+    tools = tool_costs(["sess-a"])
+    read = tools["by_tool"]["Read"]
+
+    assert read["result_tokens"] == 150, "1200 - 1000 - 50, token-exact"
+    assert read["token_basis"] == {"context_delta": 1, "chars": 0}
+    assert read["carried_calls"] == 2, "the two calls before the compaction"
+    assert read["carried_tokens"] == 300
+    assert tools["totals"]["carried_calls"] == 2
+
+
+def test_carried_cost_splits_read_ttl_and_prefix(fleet_fixture):
+    """TTL expiry and a prefix miss cost the same and have different fixes (§10.4)."""
+    f = fleet_fixture
+    dump = "sed -n '1,50p' src/jarvis/usage.py"
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100,
+                   tools=[("t1", "Bash", {"command": dump})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=200, out=100, mid="m2"),   # read
+        f.call_row(at=T0 + 620, read=100, write=40_000, out=100, mid="m3"),  # ttl
+        f.call_row(at=T0 + 630, read=40_000, out=100, mid="m4"),             # read
+        f.call_row(at=T0 + 640, read=100, write=40_000, out=100, mid="m5"),  # prefix
+    ])
+
+    shape = tool_costs(["sess-a"])["by_tool"]["Bash"]["shapes"]["sed_range"]
+
+    assert shape["result_tokens"] == 100, "50200 - 50000 - 100"
+    assert shape["carried_calls"] == 4
+    assert shape["carried_usd"] == pytest.approx(
+        100 * OPUS * (2 * READ_RATE + 2 * WRITE_RATE))
+    assert shape["carried_read_usd"] == pytest.approx(100 * OPUS * 2 * READ_RATE)
+    assert shape["carried_rewrite_ttl_usd"] == pytest.approx(100 * OPUS * WRITE_RATE)
+    assert shape["carried_rewrite_prefix_usd"] == pytest.approx(100 * OPUS * WRITE_RATE)
+    assert shape["carried_read_usd"] + shape["carried_rewrite_ttl_usd"] + shape[
+        "carried_rewrite_prefix_usd"] == pytest.approx(shape["carried_usd"])
+
+    # No floor configured: the TTL split is left OPEN. The field is None — never 0.00,
+    # which a renderer would print as "no TTL expiry" (usage.py's standing rule).
+    open_split = tool_costs(["sess-a"], floor=None)["by_tool"]["Bash"]
+    assert open_split["carried_rewrite_ttl_usd"] is None
+    assert open_split["carried_rewrite_prefix_usd"] == pytest.approx(
+        100 * OPUS * 2 * WRITE_RATE)
+    assert open_split["carried_usd"] == pytest.approx(shape["carried_usd"])
+
+
+def test_main_and_subagent_are_a_partition(fleet_fixture):
+    """And a subagent's result rides on the SUBAGENT's calls, never the lead's."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+        f.call_row(at=T0 + 20, read=1_300, mid="m3"),
+    ], subagents=[[
+        f.call_row(at=T0 + 10, write=500, out=10, mid="s1",
+                   tools=[("u1", "Grep", {})]),
+        f.result_row(("u1", "y" * 8), at=T0 + 11),
+        f.call_row(at=T0 + 12, read=600, mid="s2"),
+    ]])
+
+    tools = tool_costs(["sess-a"])
+    totals, by_caller = tools["totals"], tools["totals"]["by_caller"]
+
+    assert totals["calls"] == 2 and totals["result_tokens"] == 240
+    assert by_caller["main"]["calls"] + by_caller["subagent"]["calls"] == totals["calls"]
+    assert (by_caller["main"]["result_tokens"]
+            + by_caller["subagent"]["result_tokens"]) == totals["result_tokens"]
+    assert by_caller["subagent"]["result_tokens"] == 90, "600 - 500 - 10"
+    # m3 at T0+20 is a LEAD call after the subagent's last one: not in its denominator.
+    assert tools["by_tool"]["Grep"]["carried_calls"] == 1
+    assert tools["by_tool"]["Read"]["carried_calls"] == 2
+    assert "by_caller" not in by_caller["main"], "two levels deep, never recursive"
+
+
+def test_error_results_are_counted_and_not_averaged_away(fleet_fixture):
+    """A refused call returns a two-line refusal: counted, never averaged in silently."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[
+            ("t1", "Bash", {"command": "cat big.py"}),
+            ("t2", "Bash", {"command": "cat other.py"}),
+            ("t3", "Bash", {"command": "cat third.py"})]),
+        f.result_row(("t1", "Error: refused"), at=T0 + 1),
+        f.result_row(("t2", "boom"), at=T0 + 2, is_error=True),
+        f.result_row(("t3", "x" * 40), at=T0 + 3),
+        f.call_row(at=T0 + 4, read=1_200, mid="m2"),
+    ])
+
+    bash = tool_costs(["sess-a"])["by_tool"]["Bash"]
+
+    assert bash["calls"] == 3 and bash["errors"] == 2
+    assert bash["result_tokens_max"] > bash["result_tokens_avg"]
+    assert bash["shapes"]["cat_file"]["calls"] == 3
+
+
+def test_an_unmatched_call_is_excluded_not_zero_filled(fleet_fixture):
+    """The turn was killed between the `tool_use` and its result."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2", tools=[("t2", "Read", {})]),
+    ])
+
+    tools = tool_costs(["sess-a"])
+
+    assert tools["excluded"]["unmatched_calls"] == 1
+    assert tools["by_tool"]["Read"]["calls"] == 1, "the killed call is not a call"
+    assert tools["by_tool"]["Read"]["result_tokens_avg"] == 150.0
+
+
+def test_shapes_partition_bash_calls_exactly_once(fleet_fixture):
+    f = fleet_fixture
+    commands = ["sed -n '1,50p' f", "cat f | head", "git log | head -5",
+                "uv run pytest -q", "jarvis status", "grep -rn x .", "./b.sh | head",
+                "ls", "echo hi"]
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50,
+                   tools=[(f"t{i}", "Bash", {"command": c})
+                          for i, c in enumerate(commands)]),
+        *[f.result_row((f"t{i}", "x" * 40), at=T0 + 1 + i)
+          for i in range(len(commands))],
+        f.call_row(at=T0 + 50, read=1_200, mid="m2"),
+    ])
+
+    bash = tool_costs(["sess-a"])["by_tool"]["Bash"]
+
+    assert bash["calls"] == len(commands)
+    assert sum(s["calls"] for s in bash["shapes"].values()) == bash["calls"]
+    assert sum(s["result_tokens"] for s in bash["shapes"].values()) == bash[
+        "result_tokens"]
+    assert set(bash["shapes"]) <= set(fleetcost.SHAPES)
+    assert bash["shapes"]["other"]["calls"] == 2, "ls and echo"
+
+
+TOOLS_KEYS = {"version", "totals", "by_tool", "excluded", "notes", "row_limit"}
+TOOL_COST_KEYS = {
+    "calls", "errors", "result_tokens", "result_tokens_avg", "result_tokens_p90",
+    "result_tokens_max", "carried_calls", "carried_tokens", "carried_usd",
+    "carried_read_usd", "carried_rewrite_ttl_usd", "carried_rewrite_prefix_usd",
+    "token_basis", "share_of_result_tokens", "share_of_carried_usd", "by_caller",
+}
+
+
+def test_tools_payload_keys_stable(fleet_fixture):
+    """§7.9's guard, one level down: a renderer must not be able to rename a field."""
+    f = fleet_fixture
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50,
+                   tools=[("t1", "Bash", {"command": "cat f"})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+    ])
+
+    fleet = report()
+    tools = fleet["tools"]
+
+    assert "tools" in set(fleet) == FLEET_KEYS, "additive under the existing key"
+    assert fleet["version"] == 1, "§10.6: the parent version is NOT bumped"
+    assert tools["version"] == 1
+    assert set(tools) == TOOLS_KEYS
+    assert set(tools["excluded"]) == {"unmatched_calls", "no_transcript",
+                                      "orders_capped", "sessions_walked"}
+    assert set(tools["totals"]) == TOOL_COST_KEYS
+    bash = tools["by_tool"]["Bash"]
+    assert set(bash) == TOOL_COST_KEYS | {"shapes"}, "shapes are Bash's alone"
+    # A shape keeps `by_caller` — the table has a main/sub column on every row — and
+    # the caller level carries neither, so the structure cannot recurse.
+    assert set(bash["shapes"]["cat_file"]) == TOOL_COST_KEYS
+    assert set(bash["by_caller"]["main"]) == TOOL_COST_KEYS - {"by_caller"}
+    assert "shapes" not in tools["by_tool"]["Bash"]["by_caller"]["main"]
+    assert bash["share_of_result_tokens"] == 1.0
+    assert len(tools["notes"]) >= 6, "the known inaccuracies ride in the payload"
+
+
+def test_tools_respects_max_orders(fleet_fixture):
+    """The cap is `cost.max_orders`, applied before anything reads a transcript."""
+    f = fleet_fixture
+    f.set_cost(max_orders=1)
+    for i in range(3):
+        wo = f.order(session_id=f"sess-{i}")
+        f.turn(wo, started_at=T0 + i * 10, ended_at=T0 + i * 10 + 5, cost_usd=1.0)
+        f.transcript(f"sess-{i}", [
+            f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+            f.result_row(("t1", "x" * 40), at=T0 + 1),
+            f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+        ])
+
+    tools = report()["tools"]
+
+    assert tools["excluded"]["orders_capped"] == 2
+    assert tools["excluded"]["sessions_walked"] == 1
+    assert tools["totals"]["calls"] == 1
+
+
+def test_an_order_with_no_transcript_is_counted_not_dropped(fleet_fixture):
+    f = fleet_fixture
+    wo = f.order(session_id="sess-gone")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+
+    tools = report()["tools"]
+
+    assert tools["excluded"]["no_transcript"] == 1
+    assert tools["excluded"]["sessions_walked"] == 0
+    assert tools["totals"]["calls"] == 0 and tools["by_tool"] == {}
+
+
+def test_tools_read_only(fleet_fixture, monkeypatch):
+    """Not one byte written to a project DB or to a transcript the report measures."""
+    f = fleet_fixture
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+    ])
+    transcript = f.transcript_root / "-proj" / "sess-a.jsonl"
+
+    from jarvis import project_store
+
+    def refuse(*_a, **_k):
+        raise AssertionError("fleetcost constructed a ProjectStore")
+
+    monkeypatch.setattr(project_store.ProjectStore, "__init__", refuse)
+    before = (f.db.stat().st_mtime_ns, transcript.stat().st_mtime_ns)
+
+    tools = report()["tools"]
+
+    assert tools["totals"]["result_tokens"] == 150
+    assert (f.db.stat().st_mtime_ns, transcript.stat().st_mtime_ns) == before
+
+
+# -- 11. §10.7: the render --------------------------------------------------------------
+
+
+def test_the_cli_renders_the_tool_table(fleet_fixture, capsys):
+    from jarvis import cli
+
+    f = fleet_fixture
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100, tools=[
+            ("t1", "Bash", {"command": "sed -n '1,900p' f"}),
+            ("t2", "Read", {})]),
+        f.result_row(("t1", "x" * 4_000), ("t2", "y" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=20_000, out=100, mid="m2"),
+    ])
+
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
+    out = capsys.readouterr().out
+
+    assert "tool cost" in out
+    rows = [line for line in out.splitlines() if line.startswith(("Bash", "Read"))]
+    assert rows[0].startswith("Bash · sed_range"), "carried $ descending"
+    assert "main/sub" in out
+    # Bash is one row PER SHAPE and never also a total line: two rows that sum to a
+    # third invite the reader to add the wrong pair (§10.7).
+    assert not any(line.strip() == "Bash" for line in out.splitlines())
+
+
+def test_the_render_truncates_at_cost_tool_rows(fleet_fixture, capsys):
+    """At most `cost.tool_rows` rows, and a long tool name is elided for DISPLAY only:
+    the `--json` payload always carries it in full."""
+    from jarvis import cli
+
+    f = fleet_fixture
+    f.set_cost(tool_rows=2)
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100, tools=[
+            ("t1", "Bash", {"command": "sed -n '1,900p' f"}),
+            ("t2", "Read", {}),
+            ("t3", "mcp__plugin_serena_serena__find_referencing_symbols", {})]),
+        f.result_row(("t1", "x" * 400), ("t2", "y" * 40), ("t3", "z" * 4_000),
+                     at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=20_000, out=100, mid="m2"),
+    ])
+
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
+    out = capsys.readouterr().out
+
+    assert "(1 more tool," in out, "nothing is silently dropped"
+    assert "mcp__plugin_s…" in out, "the long name is middle-elided"
+    assert "find_referencing_symbols" not in out
+    long_name = "mcp__plugin_serena_serena__find_referencing_symbols"
+    assert long_name in report()["tools"]["by_tool"], "--json carries it in full"
+
+
+def test_the_dashboard_renders_the_same_payload(fleet_fixture):
+    """No second computation: the partial reads `fleet.tools` and nothing else."""
+    import jinja2
+
+    from jarvis.ui.app import TEMPLATES
+
+    f = fleet_fixture
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100,
+                   tools=[("t1", "Bash", {"command": "sed -n '1,900p' f"})]),
+        f.result_row(("t1", "x" * 4_000), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=20_000, out=100, mid="m2"),
+    ])
+
+    fleet = ops.fleet_cost(since=SINCE, until=UNTIL)["fleet"]
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)))
+    html = env.get_template("_fleet_distribution.html").render(
+        fleet=fleet, fmt_tok=lambda n: str(n), tool_table=fleetcost.tool_table)
+
+    assert "What the tools cost" in html
+    assert "Bash · sed_range" in html

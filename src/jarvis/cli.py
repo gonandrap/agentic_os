@@ -2882,6 +2882,69 @@ def _fleet_value(value: float | None, unit: str) -> str:
     return f"{value:,.2f}"
 
 
+def _tool_label(name: str, width: int = 28) -> str:
+    """A tool name at display width, middle-elided. `--json` always has it in full."""
+    if len(name) <= width:
+        return name
+    head = (width - 1) // 2
+    return f"{name[:head]}…{name[head + 1 - width:]}"
+
+
+def _main_sub(cost: dict) -> str:
+    """The carried-dollar split as whole percents, or `—` where nothing was carried."""
+    callers = cost.get("by_caller") or {}
+    main = (callers.get("main") or {}).get("carried_usd", 0.0)
+    sub = (callers.get("subagent") or {}).get("carried_usd", 0.0)
+    if main + sub <= 0:
+        return "—"
+    return f"{round(100 * main / (main + sub))}% / {round(100 * sub / (main + sub))}%"
+
+
+def _print_tool_cost(tools: dict) -> None:
+    """§10.7: one compact table, the fleet's dearest TOOL habits, dearest first.
+
+    Every caveat comes out of `tools['notes']`, which `_print_fleet` prints with the
+    rest — the dashboard prints the same sentences from the same keys.
+    """
+    totals = tools.get("totals") or {}
+    if not totals.get("calls"):
+        return
+    print(f"\ntool cost — {totals['calls']:,} calls · "
+          f"{_tok(totals['result_tokens'])} result tok · "
+          f"{_tok(totals['carried_tokens'])} carried tok · "
+          f"${totals['carried_usd']:,.2f} carried")
+    print(f"{'tool':<30} {'calls':>7} {'result tok':>11} {'carried tok':>12} "
+          f"{'carried $':>10}  main/sub")
+    from jarvis import fleetcost
+
+    rows = fleetcost.tool_table(tools)
+    limit = tools.get("row_limit") or len(rows)
+    for label, cost in rows[:limit]:
+        print(f"{_tool_label(label):<30} {cost['calls']:>7,} "
+              f"{_tok(cost['result_tokens']):>11} "
+              f"{_tok(cost['carried_tokens']):>12} "
+              f"{cost['carried_usd']:>10,.2f}  {_main_sub(cost)}")
+    rest = rows[limit:]
+    if rest:
+        print(f"({len(rest)} more tool{'s' if len(rest) != 1 else ''}, "
+              f"{_tok(sum(c['result_tokens'] for _, c in rest))} result tok, "
+              f"${sum(c['carried_usd'] for _, c in rest):,.2f} carried)")
+    # The three money fields are never summed without their names, and the TTL one is
+    # `undecided` rather than $0.00 when no `cold_prefix_floor` could decide the split.
+    ttl = totals["carried_rewrite_ttl_usd"]
+    print(f"  carried $ by cause: cache read ${totals['carried_read_usd']:,.2f} · "
+          f"ttl-expiry re-write "
+          f"{'undecided' if ttl is None else f'${ttl:,.2f}'} · "
+          f"prefix-miss re-write ${totals['carried_rewrite_prefix_usd']:,.2f}")
+    basis = totals["token_basis"]
+    excluded = tools["excluded"]
+    walked = excluded["sessions_walked"]
+    print(f"  {basis['context_delta']:,} result sizes measured exactly, "
+          f"{basis['chars']:,} estimated from characters · "
+          f"{walked:,} transcript{'s' if walked != 1 else ''} read · "
+          f"{excluded['unmatched_calls']:,} calls with no result, excluded")
+
+
 def _print_fleet(fleet: dict) -> None:
     """The distribution: one line per metric, then the OS's spend, then the payoff.
 
@@ -2926,6 +2989,8 @@ def _print_fleet(fleet: dict) -> None:
                   f"call{'s' if un['calls'] != 1 else ' '}  "
                   f"${un['cost_usd']:>10,.2f}")
 
+    _print_tool_cost(fleet.get("tools") or {})
+
     payoff = fleet["compaction_payoff"]
     if payoff["count"]:
         print(f"\ncompactions {payoff['count']} · "
@@ -2940,7 +3005,11 @@ def _print_fleet(fleet: dict) -> None:
                          f"(median)")
             print(line)
     print()
-    for note in fleet["notes"]:
+    notes = list(fleet["notes"])
+    tools = fleet.get("tools") or {}
+    if (tools.get("totals") or {}).get("calls"):
+        notes += tools["notes"]
+    for note in notes:
         print(f"{note[0].upper()}{note[1:]}.")
     print(f"\nEvery figure above is {fleet['floor_reason']}.")
 
