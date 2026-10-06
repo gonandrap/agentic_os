@@ -175,7 +175,8 @@ def section_names() -> list[str]:
 def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
-                   serena: bool = True) -> str:
+                   serena: bool = True,
+                   tool_search: str = "cli") -> str:
     """One full section, rendered with real ids when the caller has them.
 
     Read-only and total: every listed name renders non-empty text with placeholders
@@ -191,7 +192,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "record":
         return record_section(wo)
     if name == "navigation":
-        return navigation_section(serena)
+        return navigation_section(serena, tool_search=tool_search)
     if name == "concision":
         return concision_section()
     if name == "knowledge":
@@ -571,7 +572,7 @@ NAV_SELECT_LINE = "select:" + ",".join(
     for prefix in ("mcp__serena__", "mcp__plugin_serena_serena__"))
 
 
-def navigation_core(serena: bool = True) -> list[str]:
+def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
     """The navigation posture INLINE in the bare worker prompt — spec §3.
 
     Cause 3 of the defect: an ordinary lead gets one index line pointing at
@@ -587,15 +588,14 @@ def navigation_core(serena: bool = True) -> list[str]:
 
     `serena=False` renders nothing: the index already swaps in NO_SERENA_HOOK and the
     fetched section already carries the grep posture.
+
+    `tool_search="off"` means `dispatch` wrote `ENABLE_TOOL_SEARCH=false`, so the tools
+    are in the tool list with full schemas: the DEFERRED wording and the recovery call
+    would be a falsehood and a wasted call (spec 2026-10-02-serena-the-cheap-path.md §4).
     """
     if not serena:
         return []
-    return [
-        "# Finding code: your symbol tools are DEFERRED, not absent",
-        "They are NOT in your tool list — this CLI resolves them on demand. One "
-        "`ToolSearch` call with this select brings back the four that matter (both "
-        "prefixes; a name this install lacks is ignored):",
-        NAV_SELECT_LINE,
+    tail = [
         "- The bash-first reminder does NOT govern code navigation: `cat`/`sed "
         "-n`/`grep` answer text questions, never symbol ones.",
         "- `find_referencing_symbols` for callers — grep has no equivalent; "
@@ -603,9 +603,26 @@ def navigation_core(serena: bool = True) -> list[str]:
         "`grep -rn \"def foo\"`.",
         "- `activate_project` on the repo root if a call says no project is active.",
     ]
+    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    if tool_search == "off":
+        return [
+            "# Finding code: your symbol tools are IN your tool list",
+            "They are listed with full schemas — `find_symbol`, "
+            "`find_referencing_symbols`, `get_symbols_overview` and `activate_project` "
+            "are callable directly, with no lookup call to make first.",
+            *tail,
+        ]
+    return [
+        "# Finding code: your symbol tools are DEFERRED, not absent",
+        "They are NOT in your tool list — this CLI resolves them on demand. One "
+        "`ToolSearch` call with this select brings back the four that matter (both "
+        "prefixes; a name this install lacks is ignored):",
+        NAV_SELECT_LINE,
+        *tail,
+    ]
 
 
-def navigation_section(serena: bool = True) -> str:
+def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
     """Serena before grep, for every session Jarvis dispatches.
 
     Prose rather than a capability restriction, and it has to be: a worker needs
@@ -640,9 +657,12 @@ def navigation_section(serena: bool = True) -> str:
     lines = [
         "# Navigating the code: Serena first, grep second",
         # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
-        "Serena is wired to this project, and its symbol tools are DEFERRED behind "
-        "`ToolSearch` rather than listed — so use them to find code and do NOT "
-        "grep for symbols. Serena has a language-server symbol index, so "
+        ("Serena is wired to this project, and its symbol tools are listed with full "
+         "schemas — so use them to find code and do NOT grep for symbols."
+         if tool_search == "off" else
+         "Serena is wired to this project, and its symbol tools are DEFERRED behind "
+         "`ToolSearch` rather than listed — so use them to find code and do NOT "
+         "grep for symbols.") + " Serena has a language-server symbol index, so "
         "`find_symbol`, `get_symbols_overview` and especially "
         "`find_referencing_symbols` answer where something is defined and who "
         "calls it as facts, in one call. Grep answers a different question — where "

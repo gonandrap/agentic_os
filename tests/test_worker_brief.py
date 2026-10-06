@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.catalog import ProjectSpec
+from jarvis.catalog import ProjectSpec, WorkerDefaults
 from jarvis.gates import GateConfig
 
 WO = {"id": "wo-brief01", "title": "Add exporter",
@@ -33,6 +33,11 @@ WO = {"id": "wo-brief01", "title": "Add exporter",
 SPEC = ProjectSpec(name="p1", path=Path("/tmp/p1"))
 GATED = ProjectSpec(name="p1", path=Path("/tmp/p1"),
                     gates=GateConfig(enabled=("release", "pr_merge")))
+# §4 of docs/specs/2026-10-02-serena-the-cheap-path.md — the deferral states, named.
+TS_ON = ProjectSpec(name="p1", path=Path("/tmp/p1"),
+                    worker=WorkerDefaults(tool_search="on"))
+TS_OFF = ProjectSpec(name="p1", path=Path("/tmp/p1"),
+                     worker=WorkerDefaults(tool_search="off"))
 
 SECTION_NAMES = ["contract", "gates", "record", "navigation", "concision",
                  "knowledge"]
@@ -305,20 +310,60 @@ def test_the_navigation_block_is_inlined_after_the_section_index():
 
 
 def test_the_navigation_block_says_the_tools_are_deferred_not_absent():
-    p = _prompt()
+    """At the tool-search-ON state, which is the state the wording is TRUE in: with the
+    deferral off the tools carry full schemas and "DEFERRED" would be a falsehood (§4)."""
+    p = _prompt(TS_ON)
     assert "DEFERRED" in p
     assert "appear in your tool list" not in p
+
+
+def test_the_navigation_block_does_not_call_the_tools_deferred_when_tool_search_is_off():
+    """`worker.tool_search=off` puts the symbol tools in the tool list with full schemas,
+    so the deferral wording and the recovery call are a falsehood and a wasted call."""
+    p = _prompt(TS_OFF)
+    assert "DEFERRED" not in p
+    assert SELECT_LINE not in p
+    assert "ToolSearch" not in p
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+    assert "does NOT govern code navigation" in p
+
+
+@pytest.mark.parametrize("spec", [TS_ON, SPEC])
+def test_the_select_line_survives_for_the_tool_search_on_states(spec):
+    """`on` and `cli` both leave the tools deferred, so the recovery call must still be
+    there byte for byte — the off state is the only one that drops it (§4)."""
+    p = _prompt(spec)
+    assert SELECT_LINE in p
+    assert "DEFERRED" in p
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+
+
+def test_the_navigation_section_does_not_claim_deferral_when_tool_search_is_off():
+    """The fetched section is the same claim as the inline block, and `jarvis brief
+    navigation` is a separate process — it reads the state from `JARVIS_TOOL_SEARCH`."""
+    from jarvis import worker_brief
+
+    text = worker_brief.navigation_section(tool_search="off")
+    assert "DEFERRED" not in text
+    assert "ToolSearch" not in text
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in text, f"the navigation section never names {call}"
 
 
 def test_the_navigation_block_overrides_the_bash_first_steer():
     """Belt and braces on §1: it survives a project setting `relaxed` or `cli`, and it
     survives the per-session cohort draw if a future CLI re-introduces the steer under a
     different name."""
-    assert "does NOT govern code navigation" in _prompt()
+    assert "does NOT govern code navigation" in _prompt(TS_ON)
 
 
 def test_the_navigation_block_ranks_the_calls_by_what_grep_cannot_do():
-    p = _prompt()
+    p = _prompt(TS_ON)
     for call in ("find_referencing_symbols", "get_symbols_overview", "find_symbol",
                  "activate_project"):
         assert call in p, f"the navigation block never names {call}"
