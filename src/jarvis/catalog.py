@@ -94,6 +94,15 @@ DEFAULT_WORKER_BASH_FIRST = "off"
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "cli"
 
+# Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
+# `.py` path. §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+#
+# TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
+# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF — a hook nobody
+# has enabled cannot strand a worker; §7 owns the flip.
+VALID_PY_NAV_HOOK = ("off", "on")
+DEFAULT_WORKER_PY_NAV_HOOK = "off"
+
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
 # through to `claude --model`, so it accepts a full model id (pinned, as here) or an
@@ -438,6 +447,8 @@ class WorkerDefaults:
     bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
+    py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -1380,6 +1391,8 @@ class OsConfig:
     default_bash_first: str = DEFAULT_WORKER_BASH_FIRST
     # Spec 2026-10-02-serena-the-cheap-path.md §4 — see VALID_TOOL_SEARCH.
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
+    # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
+    default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -2228,6 +2241,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_permission_mode=defaults.get("permission_mode", DEFAULT_PERMISSION_MODE),
         default_bash_first=defaults.get("bash_first", DEFAULT_WORKER_BASH_FIRST),
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
+        # Spec 2026-10-02-serena-the-cheap-path.md §6.
+        default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2279,6 +2294,10 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_tool_search not in VALID_TOOL_SEARCH:
         raise _err(f"os.defaults.tool_search {os_cfg.default_tool_search!r} not in "
                    f"{sorted(VALID_TOOL_SEARCH)}")
+    # Spec 2026-10-02-serena-the-cheap-path.md §6.
+    if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
+        raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
+                   f"{sorted(VALID_PY_NAV_HOOK)}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2323,6 +2342,12 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if tool_search not in VALID_TOOL_SEARCH:
             raise _err(f"project {name}: worker.tool_search {tool_search!r} not in "
                        f"{sorted(VALID_TOOL_SEARCH)}")
+        # Spec 2026-10-02-serena-the-cheap-path.md §6 — this message IS what
+        # `jarvis config set <project> worker.py_nav_hook` shows.
+        py_nav_hook = w.get("py_nav_hook", os_cfg.default_py_nav_hook)
+        if py_nav_hook not in VALID_PY_NAV_HOOK:
+            raise _err(f"project {name}: worker.py_nav_hook {py_nav_hook!r} not in "
+                       f"{sorted(VALID_PY_NAV_HOOK)}")
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2342,6 +2367,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             permission_mode=pmode,
             bash_first=bash_first,
             tool_search=tool_search,
+            py_nav_hook=py_nav_hook,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
