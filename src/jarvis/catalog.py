@@ -89,17 +89,25 @@ DEFAULT_WORKER_BASH_FIRST = "off"
 # schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
-# behaviour Jarvis does not own, and writes no key. `cli` IS the shipped default — §7
-# owns the flip, so this key arriving changes no worker's tool list.
+# behaviour Jarvis does not own, and writes no key. DEFAULT `on`: Jarvis PINS deferral
+# rather than leaving it to the vendor default, because deferral is what makes a worker's
+# first navigation call a symbol call — 7/7 deferred against 1/10 with the tools present
+# (wo-ab5d81db), which makes `off` a measured regression on that outcome. §4 addendum of
+# docs/specs/2026-10-02-serena-the-cheap-path.md.
 VALID_TOOL_SEARCH = ("off", "on", "cli")
-DEFAULT_WORKER_TOOL_SEARCH = "cli"
+DEFAULT_WORKER_TOOL_SEARCH = "on"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
 # `.py` path. §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
-# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF — a hook nobody
-# has enabled cannot strand a worker; §7 owns the flip.
+# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF, and the flip is
+# SEQUENCED rather than refused: the hook measures ZERO contribution to first-call order
+# (with the Serena tools present the first navigation call was a symbol call 0/3 with the
+# hook off and 0/2 with it on; with them deferred 2/2 both ways), and on fleet-wide a
+# worker cannot search the tree for ANY text — issue 936, `navigation._sweeps_the_tree`
+# ignores its suffixes argument. wo-d2d777dc owns that fix; flip after it lands
+# (wo-ab5d81db).
 VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
 

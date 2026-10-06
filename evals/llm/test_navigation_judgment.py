@@ -43,7 +43,8 @@ import pytest
 
 from jarvis import claude_cli, hooks
 from jarvis.bootstrap import jarvis_hook_command
-from jarvis.catalog import ProjectSpec
+from jarvis.catalog import (DEFAULT_WORKER_BASH_FIRST, DEFAULT_WORKER_PY_NAV_HOOK,
+                            DEFAULT_WORKER_TOOL_SEARCH, ProjectSpec)
 from jarvis.dispatch import (bash_first_env, build_worker_prompt, serena_allow_rules,
                              tool_search_env)
 from jarvis.navigation import (NAV_COMMANDS, SOURCE_SUFFIXES, is_symbol_call,
@@ -216,16 +217,19 @@ def repo(tmp_path_factory) -> Path:
     return root
 
 
-#: The arms, each a `(bash_first, tool_search, py_nav_hook)` triple — ONE dimension and not
-#: a grid. `off`/`cli`/`off` is the fleet's PRE-FLIP default; `strict` PINS the steer rather
-#: than leaving it to the per-session statsig cohort draw, which is the only way that arm is
-#: a measurement.
-#: `tool-search` is the FLIPPED-DEFAULT SPAWN — §4's deferral off plus §6's hook live, with
-#: §5's activation wired in every arm, because §7's ordering assertion measures the
-#: COMBINATION of §4, §5 and §6 and not §4 alone. ASSERTED.
+#: The arms, each a `(bash_first, tool_search, py_nav_hook)` triple. `off`/`on`/`off` is
+#: the SHIPPED DEFAULT — §4's deferral PINNED ON by Jarvis, with §5's activation wired in
+#: every arm, because the ordering assertion measures the COMBINATION of §4 and §5.
+#: §6's hook is OFF in EVERY arm, because that is what the fleet dispatches: it measures
+#: zero contribution to first-call order, and on fleet-wide a worker cannot text-search
+#: the tree at all (issue 936; wo-d2d777dc owns that fix). An arm running it live would
+#: measure a spawn that never happens. ASSERTED.
+#: `steer` pins the bash-first steer rather than leaving it to the per-session statsig
+#: cohort draw, which is the only way that arm is a measurement; recorded, not asserted.
+#: `tools-present` is the FALSIFIED configuration, kept as evidence — see its reason.
 STEER_ARMS = [
-    pytest.param(("off", "cli", "off"), id="no-steer"),
-    pytest.param(("strict", "cli", "off"), id="steer",
+    pytest.param(("off", "on", "off"), id="no-steer"),
+    pytest.param(("strict", "on", "off"), id="steer",
                  marks=pytest.mark.xfail(
                      strict=False,
                      reason="recorded, not asserted: the steer is a vendor system-prompt "
@@ -233,14 +237,29 @@ STEER_ARMS = [
                             "must not go red on a cohort draw inside a vendor binary. "
                             "The arm's job is to show the two arms differ, which is the "
                             "measurement that `off` is the right default (spec §5.2)")),
-    pytest.param(("off", "off", "on"), id="tool-search"),
+    pytest.param(("off", "off", "off"), id="tools-present",
+                 marks=pytest.mark.xfail(
+                     strict=False,
+                     reason="FALSIFIED, not flaky: with the Serena tools PRESENT the "
+                            "first navigation call was a symbol call in 1/10 probe runs "
+                            "against 7/7 with them deferred — always the same first "
+                            "call, `grep -rn \"total_for\"`. Presence deletes the "
+                            "`ToolSearch select:` step the brief makes the worker "
+                            "execute, and the grep prior wins. The arm is kept as the "
+                            "recorded evidence that presence is the regression, which "
+                            "is why the shipped default pins deferral on "
+                            "(wo-ab5d81db)")),
 ]
 
 
 def run_and_record(repo: Path, prompt: str, agents: dict[str, Path] | None = None,
                    system_prompt: str | None = None,
-                   timeout: int = 420, bash_first: str = "off",
-                   tool_search: str = "cli", py_nav_hook: str = "off",
+                   timeout: int = 420,
+                   # The SHIPPED defaults, imported rather than retyped, so the non-arm
+                   # controls run the configuration the fleet dispatches.
+                   bash_first: str = DEFAULT_WORKER_BASH_FIRST,
+                   tool_search: str = DEFAULT_WORKER_TOOL_SEARCH,
+                   py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK,
                    permission_mode: str = "auto",
                    outcome: dict[str, str] | None = None) -> list[dict[str, str]]:
     """Run one headless turn and return every tool call it made, with its agent_type.
@@ -359,9 +378,18 @@ def test_a_seat_does_not_grep_for_code(repo, seat):
 # -- an ordinary worker, held by prose alone ----------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def worker_briefing(repo) -> str:
+def worker_briefing(repo: Path, tool_search: str = DEFAULT_WORKER_TOOL_SEARCH) -> str:
+    """The brief THIS ARM's spawn would carry, not a default one.
+
+    A plain helper and not a module-scoped fixture: the fixture built one prompt from a
+    default `ProjectSpec` and every arm reused it, so the tools-present arm told its
+    worker the symbol tools were DEFERRED while they were in its tool list. The brief's
+    wording is the whole mechanism here (`worker_brief.navigation_core` branches on this
+    value), so an arm that spawns with one setting and briefs with another measures a
+    spawn the fleet never runs.
+    """
     spec = ProjectSpec(name="nav_eval", path=repo, description="pricing")
+    spec.worker.tool_search = tool_search
     return build_worker_prompt(
         {"id": "wo-nav01", "title": "Change how discounts are applied",
          "description": "Adjust the discount maths in the pricing module.",
@@ -371,21 +399,21 @@ def worker_briefing(repo) -> str:
 
 @pytest.mark.parametrize("arm", STEER_ARMS)
 @scenario("navigation", "worker-uses-serena")
-def test_a_worker_finds_code_with_serena(repo, worker_briefing, arm):
+def test_a_worker_finds_code_with_serena(repo, arm):
     """No capability restriction is possible here — a worker needs Grep and Bash. The
     briefing's wording is the entire mechanism, so this is what would catch a rewording
     that quietly drops the ranking.
 
-    Three arms. `no-steer` and `tool-search` are ASSERTED; `steer` is recorded only — see
-    STEER_ARMS for why CI must not go red on it.
+    Three arms. `no-steer` is the shipped default and is ASSERTED; `steer` and
+    `tools-present` are recorded only — see STEER_ARMS for the reason each.
     """
     bash_first, tool_search, py_nav_hook = arm
     calls = run_and_record(
         repo,
         "Where is `total_for` defined in this repository, and which functions call it? "
         "Do not change any files; just answer.",
-        system_prompt=worker_briefing, bash_first=bash_first, tool_search=tool_search,
-        py_nav_hook=py_nav_hook)
+        system_prompt=worker_briefing(repo, tool_search), bash_first=bash_first,
+        tool_search=tool_search, py_nav_hook=py_nav_hook)
 
     used = [c["tool"] for c in calls]
     assert used, f"the worker made no tool calls at all: {calls}"
@@ -396,17 +424,18 @@ def test_a_worker_finds_code_with_serena(repo, worker_briefing, arm):
 
 @pytest.mark.parametrize("arm", STEER_ARMS)
 @scenario("navigation", "worker-does-not-grep")
-def test_a_worker_does_not_grep_for_code(repo, worker_briefing, arm):
+def test_a_worker_does_not_grep_for_code(repo, arm):
     """`Bash(grep -rn …)` counts here, not just `Grep` — see `navigates_source`. The same
-    arms, and the same reason the `steer` one is recorded rather than asserted.
+    arms, and the same reasons `steer` and `tools-present` are recorded rather than
+    asserted.
     """
     bash_first, tool_search, py_nav_hook = arm
     calls = run_and_record(
         repo,
         "Where is `apply_discount` defined in this repository, and which functions call "
         "it? Do not change any files; just answer.",
-        system_prompt=worker_briefing, bash_first=bash_first, tool_search=tool_search,
-        py_nav_hook=py_nav_hook)
+        system_prompt=worker_briefing(repo, tool_search), bash_first=bash_first,
+        tool_search=tool_search, py_nav_hook=py_nav_hook)
 
     grepped = text_search_for_code(calls)
     assert not grepped, f"the worker used {grepped} to find code that Serena had indexed"
@@ -414,7 +443,7 @@ def test_a_worker_does_not_grep_for_code(repo, worker_briefing, arm):
 
 @pytest.mark.parametrize("arm", STEER_ARMS)
 @scenario("navigation", "no-grep-before-the-first-symbol-call")
-def test_no_source_grep_precedes_the_first_symbol_call(repo, worker_briefing, arm):
+def test_no_source_grep_precedes_the_first_symbol_call(repo, arm):
     """The feature's done-when, as an ORDER assertion rather than set membership (§7): a
     worker that greps first and reaches the index afterwards has already paid for the
     grep, and every other assertion here would pass that run.
@@ -424,8 +453,8 @@ def test_no_source_grep_precedes_the_first_symbol_call(repo, worker_briefing, ar
         repo,
         "Where is `total_for` defined in this repository, and which functions call it? "
         "Do not change any files; just answer.",
-        system_prompt=worker_briefing, bash_first=bash_first, tool_search=tool_search,
-        py_nav_hook=py_nav_hook)
+        system_prompt=worker_briefing(repo, tool_search), bash_first=bash_first,
+        tool_search=tool_search, py_nav_hook=py_nav_hook)
 
     first = first_navigation_call(calls)
     assert first is not None, f"the worker never navigated source at all: {calls}"
@@ -435,7 +464,7 @@ def test_no_source_grep_precedes_the_first_symbol_call(repo, worker_briefing, ar
 
 
 @scenario("navigation", "text-search-is-still-allowed")
-def test_a_genuine_text_question_may_still_use_text_search(repo, worker_briefing):
+def test_a_genuine_text_question_may_still_use_text_search(repo):
     """The negative control, and it is the one that keeps this suite honest.
 
     "Never grep" is the wrong lesson and an easy one to teach by accident: text search is
@@ -446,7 +475,7 @@ def test_a_genuine_text_question_may_still_use_text_search(repo, worker_briefing
     calls = run_and_record(
         repo,
         "Which files in this repository contain the literal word 'coupon'? Just answer.",
-        system_prompt=worker_briefing)
+        system_prompt=worker_briefing(repo))
 
     used = [c["tool"] for c in calls]
     assert used, f"the worker made no tool calls at all: {calls}"
@@ -460,8 +489,7 @@ def test_a_genuine_text_question_may_still_use_text_search(repo, worker_briefing
 
 
 @scenario("navigation", "the-hook-allows-a-markdown-text-search")
-def test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file(repo,
-                                                                          worker_briefing):
+def test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file(repo):
     """The negative control's hook twin: §6's hook is suffix-gated, so a literal-word
     search in a named `.md` file must be allowed and must still produce an answer.
 
@@ -473,7 +501,7 @@ def test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file(repo,
         repo,
         "Which lines of notes.md in this repository contain the literal word 'coupon'? "
         "Just answer.",
-        system_prompt=worker_briefing, py_nav_hook="on", outcome=outcome)
+        system_prompt=worker_briefing(repo), py_nav_hook="on", outcome=outcome)
 
     assert outcome.get("text"), f"the turn produced no answer: {outcome}, calls={calls}"
     # A PreToolUse recorder sees the ATTEMPT and not the verdict, so the shipped predicate
