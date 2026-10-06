@@ -38,6 +38,69 @@ def test_a_recursive_sweep_of_the_tree_navigates_source():
     assert navigation.navigates_source("sudo find . -name '*.py'", (".py",)) is True
 
 
+def test_an_unscoped_sweep_does_not_navigate_source_with_scoped_sweeps_on():
+    """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: under the flag a sweep counts
+    only when its own scope names a configured suffix."""
+    assert navigation.navigates_source('grep -rn "def foo" .', (".py",),
+                                       scoped_sweeps=True) is False
+    assert navigation.navigates_source("rg foo src", (".py",),
+                                       scoped_sweeps=True) is False
+    assert navigation.navigates_source("find . -name Makefile", (".py",),
+                                       scoped_sweeps=True) is False
+    assert navigation.navigates_source("grep -rn TODO docs/", (".py",),
+                                       scoped_sweeps=True) is False
+
+
+@pytest.mark.parametrize("command", [
+    "grep --include=*.py -rn foo .",
+    "grep --include='*.py' -rn foo .",
+    'grep --include "*.py" -rn foo .',
+    "rg -g '*.py' foo",
+    "rg -g *.py foo",
+    "rg --glob '*.py' foo",
+    'find . -name "*.py"',
+    "find . -name *.py",
+    "find . -path './src/*.py'",
+])
+def test_a_sweep_scoped_to_a_configured_suffix_navigates_source_with_the_flag_on(command):
+    """Quoted and unquoted both: `_mask_shell_text` blanks the quoted form, so the scope
+    words are read from the RAW command."""
+    assert navigation.navigates_source(command, (".py",), scoped_sweeps=True) is True
+
+
+def test_the_scope_of_a_sweep_is_read_against_the_configured_suffixes():
+    assert navigation.navigates_source("find . -name '*.md'", (".py",),
+                                       scoped_sweeps=True) is False
+    assert navigation.navigates_source("find . -name '*.md'", (".md",),
+                                       scoped_sweeps=True) is True
+
+
+def test_the_flag_is_off_by_default_so_the_counter_reads_the_same():
+    """`nav_volume.BEFORE_NOTE`'s baseline was measured with unscoped sweeps counting."""
+    for command in ('grep -rn "def foo" .', "rg foo src", "find . -name Makefile",
+                    "grep -rn TODO docs/"):
+        assert navigation.navigates_source(command, (".py",)) is True, command
+
+
+def test_an_unbalanced_quote_falls_back_to_the_masked_words():
+    """`shlex.split` raises `ValueError` on an unterminated quote; the classifier must
+    still answer."""
+    assert navigation.navigates_source("find . -name *.py 'x", (".py",),
+                                       scoped_sweeps=True) is True
+    assert navigation.navigates_source("find . -name Makefile 'x", (".py",),
+                                       scoped_sweeps=True) is False
+
+
+def test_a_py_path_still_navigates_source_with_the_flag_on():
+    """The flag scopes the SWEEP arm only (§6): a named `.py` path is untouched."""
+    assert navigation.navigates_source("cat src/x.py", (".py",),
+                                       scoped_sweeps=True) is True
+    assert navigation.navigates_source("grep -rn x a.py", (".py",),
+                                       scoped_sweeps=True) is True
+    assert navigation.navigates_source("grep -rn x notes.md", (".py",),
+                                       scoped_sweeps=True) is False
+
+
 def test_bookkeeping_reads_do_not_navigate_source():
     for command in ("cat tool-log.jsonl",
                     "jq . payload.json",

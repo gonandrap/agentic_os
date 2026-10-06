@@ -1446,7 +1446,8 @@ def py_nav_decision(payload: dict[str, Any],
     root = find_project_root(Path(cwd))
     if root is None or not (root / ".serena" / "project.yml").exists():
         return None
-    if not navigates_source(command, PY_NAV_SUFFIXES):
+    # §6: a sweep counts only when its own scope names `.py` (issue 936).
+    if not navigates_source(command, PY_NAV_SUFFIXES, scoped_sweeps=True):
         return None
     return _deny(_PY_NAV_DENY)
 

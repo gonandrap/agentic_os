@@ -123,6 +123,47 @@ def test_the_refusal_is_reached_before_the_jarvis_auto_allow(repo):
     assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+@pytest.mark.parametrize("command", [
+    "grep -rn TODO docs/",
+    'find . -name "*.md"',
+    "grep -rn coupon .",
+])
+def test_a_tree_sweep_for_non_python_text_is_allowed(repo, command):
+    """Issue 936: the sweep arm ignored the suffix set, so every tree search anywhere in
+    the repo got the symbol-call refusal."""
+    assert hooks.py_nav_decision(_payload(command, repo), ON) is None
+
+
+@pytest.mark.parametrize("command", [
+    "grep --include='*.py' -rn total_for .",
+    "grep --include=*.py -rn total_for .",
+    "rg -g '*.py' total_for",
+    'find . -name "*.py"',
+])
+def test_a_tree_sweep_scoped_to_python_is_refused(repo, command):
+    assert hooks.py_nav_decision(
+        _payload(command, repo), ON)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    "grep -rn TODO docs/",
+    'find . -name "*.md"',
+    "grep -rn coupon .",
+])
+def test_a_tree_sweep_for_non_python_text_reaches_the_preflight_chain(repo, command):
+    """The arm sits before the `is_jarvis_command_chain` auto-allow, so the unit answer
+    and the production answer are the same one."""
+    assert hooks.preflight_decision(_payload(command, repo), ON) is None
+
+
+def test_a_python_scoped_sweep_is_refused_through_the_preflight_chain(repo):
+    decision = hooks.preflight_decision(
+        _payload("grep --include='*.py' -rn total_for .", repo), ON)
+
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "find_symbol" in _reason(decision)
+
+
 def test_py_nav_runs_after_the_investigator_refusal(repo):
     """Position: immediately AFTER `investigator_bash_decision`, so an investigator's
     mutating command gets the investigator's own message."""
