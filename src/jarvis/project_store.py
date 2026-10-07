@@ -2584,6 +2584,30 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def settled_release_orders(self, since: float,
+                               limit: int = 20) -> list[dict[str, Any]]:
+        """Settled orders carrying a release batch, newest settlement first.
+
+        `Daemon.refile_dropped_fixes`' population (issue #945 spec §2.2). `status` is
+        indexed and the batch test runs in SQLite, so no row's metadata is parsed in
+        Python unless it is a release order inside the window.
+
+        `'$.release_for_issues'` is `release.BATCH_KEY`'s JSON path, spelled out because a
+        path interpolated from the constant defeats the statement cache.
+
+        `cancelled` is EXCLUDED: a cancelled release is the user stopping a release, and
+        re-filing its batch would overrule them. The `CASE WHEN json_valid` guard is
+        `stale_autopsy_orders`', for its reason.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE status IN ('completed', 'failed')"
+            " AND updated_at >= ?"
+            " AND CASE WHEN json_valid(metadata)"
+            "     THEN json_extract(metadata, '$.release_for_issues') IS NOT NULL"
+            "     ELSE 0 END"
+            " ORDER BY updated_at DESC LIMIT ?", (since, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def seal_autopsy(self, order_id: str, payload_json: str, *,
                      at: float | None = None) -> None:
         """Freeze one work order's autopsy.
