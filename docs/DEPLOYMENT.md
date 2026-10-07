@@ -14,7 +14,7 @@ running fleet.
 | Purpose | develop/test Jarvis OS itself | run the real fleet (dev work + prod monitoring) |
 | Location | `~/workspace/agentic_os` | `$PRODUCTION_CODE/jarvis_os` (default `~/workspace/production/jarvis_os`) |
 | Git | branch `main` (trunk) | detached at tag `jarvis-X.Y.Z` |
-| Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` / `jarvis-ui` (services) |
+| Run | `uv run jarvis …` (manual; resolves this checkout's own venv, never PATH) | `jarvis …` (wrapper in `~/.local/bin`, from `scripts/install_prod_cli.sh`) + `systemctl --user … jarvis` / `jarvis-ui` (services) |
 | `JARVIS_HOME` | `~/.jarvis` (default) | `$PRODUCTION_CODE/state` |
 | `JARVIS_ENV` | unset | `production` (set by the units) |
 | Catalog | `catalogs/gonzalo.json` (empty / test projects) | `$PRODUCTION_CODE/config/catalog.json` (real fleet) |
@@ -144,7 +144,15 @@ mkdir -p "$PRODUCTION_CODE/secrets"                 # 2. place secrets (KEY=VALU
 printf 'JARVIS_TELEGRAM_TOKEN=…\nJARVIS_TELEGRAM_CHAT_ID=…\n' > "$PRODUCTION_CODE/secrets/jarvis.env"
 chmod 600 "$PRODUCTION_CODE/secrets/jarvis.env"
 scripts/install_prod_service.sh                     # 3. install + enable + start the service
+scripts/install_prod_cli.sh                         # 4. put a production jarvis on PATH
 ```
+
+Step 4 is what makes a typed `jarvis` mean production: the wrapper it writes to
+`~/.local/bin/jarvis` carries the units' `JARVIS_HOME`, `PRODUCTION_CODE` and
+`JARVIS_ENV`, so a command run by hand and a command the daemon runs reach one fleet.
+Without it `jarvis` is command-not-found, and the obvious fallback — the deployed venv's
+binary by full path — drives the DEV instance at `~/.jarvis` silently (issue 757). It
+starts and restarts nothing; `jarvis doctor`'s `INV-PROD-CLI` reports it missing.
 
 Start-on-boot needs user lingering (survives logout/reboot):
 
@@ -202,6 +210,14 @@ with no `gh`.
 | `scripts/shipit.sh` step 5a | re-renders both units from the tag being deployed (`install_prod_service.sh --no-restart`; the restarts stay with shipit, which owns their order) | every release, staged or not |
 | `bugreport.heal_path` | appends the missing `GH_SEARCH_DIRS` to the daemon's own `os.environ["PATH"]` at start-up, which every worker then inherits — appends, never prepends, so nothing shadows the prod venv | every daemon start |
 | `INV-SERVICE-PATH` | reports an installed unit whose PATH cannot reach `gh`, reading the file rather than the healed process | `jarvis doctor` |
+
+The `jarvis` wrapper on PATH is kept applied the same way, for the same reason — it
+names `$PROD_DIR`, so it goes stale exactly as a unit does:
+
+| | What it does | When |
+|---|---|---|
+| `scripts/shipit.sh` step 5a2 | re-renders `~/.local/bin/jarvis` from the tag being deployed (`install_prod_cli.sh`; unconditional, before the staged hand-off, and it starts and restarts nothing) | every release, staged or not |
+| `INV-PROD-CLI` | reports a wrapper that is missing, not ours, or pointing at another checkout or `JARVIS_HOME` — reading the file, since a session that has the variables is not the broken one | `jarvis doctor` |
 
 ### Worker turns run outside the daemon's cgroup
 

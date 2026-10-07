@@ -434,6 +434,24 @@ else
   run "'$INSTALLER' --no-restart"
 fi
 
+# --- 5a2. re-render the `jarvis` wrapper from the tag being shipped --------------
+#
+# Same lesson as 5a, one layer out: the wrapper names $PROD_DIR, so it goes stale in
+# exactly the same way. Unconditional, unlike 5a — a ~/.local/bin/jarvis enables
+# nothing, starts nothing and restarts nothing, and the only machine reaching step 5 is
+# one where production was just deployed, which is precisely the machine on which
+# `jarvis` must mean production. The script's own precondition is the guard that
+# matters. Before 5b so a --stage release gets it too; `jarvis doctor`'s INV-PROD-CLI
+# reports the drift if this stops running (issue 757).
+CLI_INSTALLER="$PROD_DIR/scripts/install_prod_cli.sh"
+if [ ! -f "$CLI_INSTALLER" ]; then
+  say "NOTE: $CLI_INSTALLER is missing in $TAG — the \`jarvis\` wrapper was NOT"
+  say "      re-rendered. Check with: jarvis doctor (INV-PROD-CLI)"
+else
+  say "re-rendering the production \`jarvis\` wrapper from $TAG"
+  run "'$CLI_INSTALLER' || say 'NOTE: wrapper install failed — jarvis doctor (INV-PROD-CLI)'"
+fi
+
 # --- 5b. --stage: stop here and hand the restarts to the daemon ------------------
 #
 # Everything that had to happen has happened: the tag is on origin and production's

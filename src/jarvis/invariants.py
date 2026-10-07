@@ -3983,6 +3983,79 @@ def check_production_clean() -> Iterator[Violation]:
     )
 
 
+def check_prod_cli() -> Iterator[Violation]:
+    """INV-PROD-CLI — the `jarvis` a human types must mean production.
+
+    Issue 757. `JARVIS_HOME`, `PRODUCTION_CODE` and `JARVIS_ENV` live only in the two
+    systemd units, so they reach the daemon and every worker it spawns and reach nothing
+    typed in a shell: `jarvis` is command-not-found, and the obvious fallback — the
+    deployed venv's binary by full path — runs production CODE against `~/.jarvis`, the
+    DEV instance's state, with no error and with the dashboard badge saying `production`.
+    `scripts/install_prod_cli.sh` installs a wrapper carrying those three exports; this
+    is the third member of the family `check_service_path` and `check_production_clean`
+    started, watching an install step a human runs once and nothing ever compares.
+
+    Reads the FILE, not `os.environ`: a session that HAS the variables is not the session
+    that is broken. Keys on the MACHINE's deployment, not `paths.deployment_env()` —
+    the subject is the interactive shell, which is neither instance, so `jarvis doctor`
+    run from the dev checkout on a host that also runs production does report, and must.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: writing an executable onto the user's PATH
+    is an install action, not a derivation a read-only check may perform.
+    """
+    from . import release
+    from .paths import production_code_dir
+
+    prod = production_code_dir()
+    if not (prod / ".git").exists() or not os.access(prod / ".venv/bin/jarvis", os.X_OK):
+        return  # no production deployment on this machine
+    wrapper = release.cli_wrapper()
+    expected_target = str(prod / ".venv/bin/jarvis")
+    expected_home = f"{prod.parent}/state"
+    facts = release.cli_wrapper_facts()
+    if facts is None:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"no production `jarvis` on PATH: {wrapper} does not exist, so "
+                    f"`jarvis` in an interactive shell is either command-not-found or — "
+                    f"worse — the venv binary with no `JARVIS_HOME`, which drives the "
+                    f"DEV instance at ~/.jarvis silently (issue 757). Install it with "
+                    f"scripts/install_prod_cli.sh (it starts and restarts nothing)."),
+            context={"wrapper": str(wrapper), "target": None, "jarvis_home": None,
+                     "expected_target": expected_target, "expected_home": expected_home,
+                     "generated": False},
+        )
+        return
+    target, home = facts["target"], facts["env"].get("JARVIS_HOME")
+    context = {"wrapper": str(wrapper), "target": target, "jarvis_home": home,
+               "expected_target": expected_target, "expected_home": expected_home,
+               "generated": facts["generated"]}
+    if not facts["generated"]:
+        # Most likely a dev install pointing at ~/.jarvis — the defect's second half. The
+        # detail says it was not generated here, so a deliberate install can be kept.
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} is a `jarvis` this OS did not generate (no "
+                    f"`{release.CLI_MARKER}` marker), so typing `jarvis` reaches "
+                    f"something other than the fleet the units run — most likely a dev "
+                    f"install writing to ~/.jarvis (issue 757). Replace it by running "
+                    f"scripts/install_prod_cli.sh, or keep it deliberately."),
+            context=context,
+        )
+        return
+    if target != expected_target or home != expected_home:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} execs {target} and exports JARVIS_HOME={home}, but "
+                    f"production on this machine is {prod} with "
+                    f"JARVIS_HOME={expected_home} — every `jarvis` typed in a shell is "
+                    f"therefore driving a different fleet from the one the units run. "
+                    f"Re-render it with scripts/install_prod_cli.sh."),
+            context=context,
+        )
+
+
 # -- cache health ----------------------------------------------------------------------
 #
 # Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
@@ -4273,6 +4346,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_config_drift,
     check_service_path,
     check_production_clean,
+    check_prod_cli,
     check_cache_ttl_trigger,
     check_prefix_stable,
 )

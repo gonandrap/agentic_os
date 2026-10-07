@@ -136,5 +136,10 @@ If `jarvis.service` isn't installed yet, after the first `shipit` run:
 2. `scripts/install_prod_service.sh` — renders `deploy/jarvis.service.template`,
    installs it under `~/.config/systemd/user/`, and enables + starts it with
    `Restart=always` recovery.
+3. `scripts/install_prod_cli.sh` — renders `deploy/jarvis.cli.template` to
+   `~/.local/bin/jarvis`, so a typed `jarvis` carries the units' `JARVIS_HOME`,
+   `PRODUCTION_CODE` and `JARVIS_ENV` instead of silently driving the dev instance at
+   `~/.jarvis` (issue 757). Starts and restarts nothing. Every later release re-renders
+   it (step 5a2); `jarvis doctor`'s `INV-PROD-CLI` reports it missing or stale.
 
 See `docs/DEPLOYMENT.md` for the full dev/prod split, service management, and rollback.
