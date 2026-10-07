@@ -37,9 +37,17 @@ any round whose packet had no diff.
 
 ## 4. The classifier is the previous round's own citations
 
-`validation.cited_paths` regex-extracts repo-relative paths from the previous round's
-BLOCKERS — title and detail, read through `validation.blockers(validation.findings(...))`,
-the same pair `ops.prior_round_history` reads.
+`validation.cited_paths` reads the previous round's BLOCKERS — through
+`validation.blockers(validation.findings(...))`, the same pair `ops.prior_round_history`
+reads — **anchor first, per blocker**: a finding whose `file` key is non-empty cites that
+path and its prose is NOT regexed. Only a finding with no anchor falls back to extracting
+repo-relative paths from its title and detail. Mixed sets work finding by finding.
+
+The anchor wins because prose is an argument and may quote any path at all. wo-5ef5f42c
+round 2: both blockers carried `file:
+docs/specs/2026-10-06-navigate-specs-like-code.md` and illustrated it with `sed -n
+'40,80p' docs/specs/x.md`, so the regex cited a path that exists nowhere and bounced a
+commit that did change the spec — twice, to the ceiling.
 
 This is what keeps the rule out of judgement. The work order asked for "production code"
 to be distinguished from tests, and for a rejection that was ABOUT the tests to be
@@ -51,14 +59,24 @@ wo-2005a89b's round 3 touches none of the production files round 2 named.
 
 ## 5. The rule, and what it will not do
 
-`validation.unanswered_submission(previous, blockers, before, now)` returns the cited
-paths when NONE of them moved, else None.
+`validation.unanswered_submission(previous, blockers, before, now, *, exists=None)`
+returns the cited paths when NONE of them moved, else None.
 
+- **A CITATION THAT NAMES NO REAL FILE IS DROPPED FIRST**, before the `changed_since`
+  comparison. A path is kept if `exists(path)`, or if it matches a key of `before`, or of
+  `now`. A list that empties returns None, and the tuple returned — the paths the bounce
+  message shows the submitter — is always the FILTERED one.
+- **`exists` is injected, never looked up here.** `before`/`now` are
+  `evidence.file_digests` maps of CHANGED paths, not a repo tree, so this module cannot
+  answer "is that a file" and stays pure: no `Path`, no `os`, no stat. `ops.unanswered_paths`
+  supplies the work order's worktree (`exists=lambda p: (worktree / p).is_file()`, None
+  when no worktree resolves, and a path escaping the tree is never kept). Neo question 1382.
 - **SOME of the list is enough to reach the panel.** Partial progress is the panel's to
   judge. Only a round that addressed none short-circuits.
 - **Every uncertainty returns None.** No previous round, a previous round that was not a
-  rejection, either file map empty, no path cited at all. Failing open costs one panel
-  round, which is what happens today; failing closed bounces work that was really done.
+  rejection, either file map empty, no path cited at all, no citation that survives the
+  filter. Failing open costs one panel round, which is what happens today; failing closed
+  bounces work that was really done.
 - It reads no code and calls no model.
 
 `ops.submit_for_validation` applies it BEFORE opening a round — not in the daemon, where

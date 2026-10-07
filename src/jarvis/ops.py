@@ -5327,8 +5327,38 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     )
 
 
-def unanswered_paths(store: ProjectStore, wo_id: str,
-                     packet: Any) -> tuple[dict[str, Any], tuple[str, ...]] | None:
+def _worktree_file_test(project_path: Path,
+                        wo: Mapping[str, Any]) -> Callable[[str], bool] | None:
+    """`exists` for `validation.unanswered_submission`, or None when no worktree resolves.
+
+    The filesystem that pure module may not have (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5).
+    """
+    from . import evidence as evidence_mod
+    from . import worker_session
+
+    # type: ignore — `ProjectRef` carries the one attribute that helper reads.
+    worktree = worker_session.worktree_path(
+        evidence_mod.ProjectRef(project_path), dict(wo))  # type: ignore[arg-type]
+    if worktree is None:
+        return None
+
+    def present(path: str) -> bool:
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            return False
+        try:
+            return (worktree / candidate).is_file()
+        except (OSError, ValueError):
+            return False
+
+    return present
+
+
+def unanswered_paths(store: ProjectStore, wo_id: str, packet: Any, *,
+                     project_path: Path,
+                     wo: Mapping[str, Any],
+                     ) -> tuple[dict[str, Any], tuple[str, ...]] | None:
     """`(the round that asked, the paths it asked about)` when this submission answers
     none of them, else None.
 
@@ -5337,6 +5367,8 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
     read through `validation.blockers(validation.findings(...))`, the SAME pair
     `prior_round_history` reads, because a second classifier is a second answer to what
     the submitter was told.
+
+    Also the filesystem half: `exists` is the work order's own worktree (spec §5).
     """
     from . import validation
 
@@ -5348,7 +5380,7 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
         raised += validation.blockers(validation.findings(op))
     cited = validation.unanswered_submission(
         previous, raised, ProjectStore.validation_file_shas(previous),
-        dict(packet.file_shas))
+        dict(packet.file_shas), exists=_worktree_file_test(project_path, wo))
     return (previous, cited) if cited is not None else None
 
 
@@ -5447,7 +5479,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     # other (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
     unanswered = (None if forced_reason.strip()
-                  else unanswered_paths(store, str(wo["id"]), packet))
+                  else unanswered_paths(store, str(wo["id"]), packet,
+                                        project_path=project_path, wo=wo))
     if unanswered is not None:
         previous, cited = unanswered
         if consecutive_bounces(store, str(wo["id"]),
