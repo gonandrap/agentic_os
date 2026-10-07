@@ -13,7 +13,7 @@ from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, github, invariants, ops, specs, uilog, wiring
+from .. import bill, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -810,6 +810,10 @@ def create_app() -> FastAPI:
         # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded
         # once, in `bill.SUBAGENT_REWRITE_ZERO`, and read by this page and `jarvis cost`.
         subagent_rewrite_zero=bill.SUBAGENT_REWRITE_ZERO,
+        # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason
+        # the partial already gives about figures: an order computed in a renderer is
+        # one the other renderer disagrees with (§10.7).
+        tool_table=fleetcost.tool_table,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,
@@ -1399,9 +1403,16 @@ def create_app() -> FastAPI:
             report = ops.cost_report(project=project or None)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        # The distribution is a SECTION of this page, so a failure to build it must not
+        # take the listing down with it: the two read different databases and the
+        # listing is the older, load-bearing half.
+        try:
+            fleet = ops.fleet_cost(project=project or None)["fleet"]
+        except Exception:                                   # noqa: BLE001
+            fleet = None
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project,
+                      project=project, fleet=fleet,
                       projects=sorted(ops.registered_project_paths()))
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)
