@@ -195,7 +195,7 @@ def in_flight(store: ProjectStore, wo_id: str) -> float:
 
 def feature_in_flight(store: ProjectStore, fo: dict[str, Any]) -> float:
     """The same for a feature order's whole family — its planner and every child."""
-    return sum(in_flight(store, child["id"]) for child in _family(store, fo))
+    return sum(in_flight(store, child["id"]) for child in family(store, fo))
 
 
 def feature_spent(store: ProjectStore, central: CentralStore | None,
@@ -207,13 +207,21 @@ def feature_spent(store: ProjectStore, central: CentralStore | None,
     `jarvis cost <fo-id>`.
     """
     total = Spend()
-    for child in _family(store, fo):
+    for child in family(store, fo):
         total = total + spent(store, central, child["id"])
     return total
 
 
-def _family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
-    """Every work order whose spend the feature is answerable for."""
+def family(store: ProjectStore, fo: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every work order whose spend the feature is answerable for.
+
+    THE FAMILY THE FAMILY BUDGET IS BOUNDED OVER, and public so that what the OS REPORTS
+    is read off the same set the allocator ENFORCES over (Neo question 1198). It is
+    deliberately NOT `ProjectStore.feature_children`, which is the `kind='worker'`
+    children only: an improvement order's analyst and an investigation's investigator are
+    `kind='analyst'`/`'investigator'` and reach their parent as its `plan_wo_id`, so for
+    those two kinds the two sets do not intersect at all.
+    """
     orders: list[dict[str, Any]] = []
     planner_id = fo.get("plan_wo_id")
     if planner_id:
@@ -303,7 +311,7 @@ def pool(store: ProjectStore, central: CentralStore | None, fo: dict[str, Any],
     total = Spend()
     held = 0.0
     unclaimed = 0
-    for child in _family(store, fo):
+    for child in family(store, fo):
         child_spend = spent(store, central, child["id"])
         total = total + child_spend
         if child["id"] == claimant:
@@ -446,6 +454,10 @@ class Exhaustion:
     #: What the worker was in the middle of when it stopped — its last turn's prompt,
     #: squeezed to one line. Empty when the order never ran a turn.
     doing: str = ""
+    #: What this child's family is CALLED — "feature", "investigation", "improvement
+    #: order". Supplied by `exhaustion`, which is the only place with the parent row;
+    #: "feature" is the default because an order with no parent never shows it.
+    family: str = "feature"
 
     @property
     def reason(self) -> str:
@@ -457,11 +469,11 @@ class Exhaustion:
         its feature still has to top it up with.
         """
         c = self.ceiling
-        where = "its feature's slice" if c.source == "feature" else "its budget"
+        where = f"its {self.family}'s slice" if c.source == "feature" else "its budget"
         line = (f"budget spent — ${c.spent_usd:.2f} of {where} of ${c.cap_usd:.2f}"
                 f"; raise it with `jarvis wo budget <id> <amount>` or close it")
         if self.pool is not None:
-            line += (f" (its feature has ${self.pool.unreserved_usd:.2f} unreserved "
+            line += (f" (its {self.family} has ${self.pool.unreserved_usd:.2f} unreserved "
                      f"of ${self.pool.budget_usd:.2f})")
         return line
 
@@ -485,15 +497,25 @@ def exhaustion(store: ProjectStore, central: CentralStore | None,
     if c is None or not c.exhausted:
         return None
     parent_pool = None
+    family = "feature"
     parent_id = wo.get("parent_id")
     if parent_id:
         try:
-            parent_pool = pool(store, central, store.get_feature_order(parent_id))
+            parent = store.get_feature_order(parent_id)
         except KeyError:
-            parent_pool = None
+            parent = None
+        if parent is not None:
+            parent_pool = pool(store, central, parent)
+            # The ONE place that knows the parent's kind, so the word is resolved here
+            # and carried on the value object: `reason` is read from three call sites
+            # (`escalate`, `invariants.true_blockers`, `BudgetExhausted`) and none of
+            # them holds the row. Function-local so `budget.py` keeps no module-scope
+            # dependency on `ops` — the allocator stays under the surfaces.
+            from .ops import family_prose
+            family = family_prose(parent.get("kind"))[0]
     turn = store.latest_turn(wo["id"])
     doing = " ".join((turn or {}).get("prompt", "").split())[:200]
-    return Exhaustion(ceiling=c, pool=parent_pool, doing=doing)
+    return Exhaustion(ceiling=c, pool=parent_pool, doing=doing, family=family)
 
 
 def feature_exhaustion(store: ProjectStore, central: CentralStore | None,
@@ -626,13 +648,25 @@ def format_usd(value: float | None) -> str:
     return "—" if not value else f"${value:,.2f}"
 
 
+def format_money(value: float) -> str:
+    """A figure that is MONEY, where zero is a number and not an absence.
+
+    The counterpart to `format_usd`, not a replacement: that one renders 0.0 and None
+    identically as an em dash, which is right for "this order has no budget" and wrong
+    for "it has spent nothing" or "its family has nothing left". Both of those read as
+    "unknown" through the dash, and "unknown" sends the user somewhere other than where
+    the fact points.
+    """
+    return f"${value:,.2f}"
+
+
 def status_note(store: ProjectStore, central: CentralStore | None,
                 wo: dict[str, Any]) -> str:
     """`$1.20 of $5.00` for a listing, or "" when the order has no ceiling."""
     c = ceiling(store, central, wo)
     if c is None:
         return ""
-    return f"{format_usd(c.spent_usd)} of {format_usd(c.cap_usd)}"
+    return f"{format_money(c.spent_usd)} of {format_usd(c.cap_usd)}"
 
 
 def default_for(project: ProjectSpec | None) -> float | None:

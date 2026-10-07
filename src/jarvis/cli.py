@@ -1102,6 +1102,14 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("inv_id")
     v.add_argument("--project")
 
+    v = inv.add_parser("budget", help="show, set, raise or clear an investigation's "
+                                      "family budget")
+    v.add_argument("inv_id")
+    v.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars. Omit to just show it")
+    v.add_argument("--clear", action="store_true", help="remove the ceiling")
+    v.add_argument("--project")
+
     v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
                                        "investigator's terminal action, and what settles "
                                        "the order")
@@ -2628,8 +2636,8 @@ def _normalise_issues(argv: list[str]) -> list[str]:
 #: `jarvis investigate <subject>` takes a bare subject while every other spelling takes a
 #: sub-verb, so the second word is a sub-verb when it is one of these and a SUBJECT
 #: otherwise. A subject is always a `wo-`/`fo-`/`io-` id and can therefore never collide
-#: with one of these four words.
-INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict")
+#: with one of these words.
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget")
 
 
 def _normalise_investigate(argv: list[str]) -> list[str]:
@@ -3702,12 +3710,16 @@ def cmd_io(args: argparse.Namespace) -> int:
 
     elif args.io_cmd == "budget":
         # The family here is the order plus its analyst, so the feature-order arithmetic
-        # is already correct with no children — §2.6, which is why nothing is reimplemented.
+        # is already correct with no children — §2.6, which is why nothing is
+        # reimplemented. Through the KIND-GUARDED wrappers, like every other `io` verb:
+        # this was the one that routed straight at the feature-order functions, so `/api`
+        # and every future caller had no guard at all.
         if args.amount is None and not args.clear:
-            _print(ops.feature_order_budget(args.io_id, args.project), args.json)
+            _print(ops.improvement_order_budget(args.io_id, args.project), args.json)
         else:
             amount = None if args.clear else _parse_budget_amount(args.amount)
-            _print(ops.set_feature_budget(args.io_id, amount, args.project), args.json)
+            _print(ops.set_improvement_budget(args.io_id, amount, args.project),
+                   args.json)
 
     return 0
 
@@ -3778,6 +3790,16 @@ def cmd_investigate(args: argparse.Namespace) -> int:
 
     elif args.inv_cmd == "cancel":
         _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
+
+    elif args.inv_cmd == "budget":
+        # THE SECOND STEP OF THE TOP-UP, and the command a parked child's note names.
+        # Same shape as `jarvis io budget`, through the kind-guarded wrappers.
+        if args.amount is None and not args.clear:
+            _print(ops.investigation_order_budget(args.inv_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_investigation_budget(args.inv_id, amount, args.project),
+                   args.json)
 
     elif args.inv_cmd == "verdict":
         path = Path(args.from_file)

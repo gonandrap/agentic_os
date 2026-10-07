@@ -605,7 +605,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         if mode and worker_stalls_on_prompts(mode):
                             item["resume_auto"] = f"jarvis wo resume-auto {wo['id']}"
                     attention.append(item)
-                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                # `kind=None`: KIND-AGNOSTIC PATH, so it names the argument rather than
+                # leaving the default (§5 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # The attention strip below already sees every kind through
+                # `flagged_feature_orders`, so a feature-only read here is what produced
+                # four attention items against an empty listing.
+                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind=None)
                 # Which feature orders get a line: the open ones, plus any that is asking
                 # for the user or holds a flagged child. Both additions are about the same
                 # status — `failed` is SETTLED, and it is also the one a feature order
@@ -661,9 +668,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
                     "summary": summary,
+                    # ONE MERGED LIST WITH A `kind` LABEL, not three keys: three means
+                    # every consumer must learn three and the next kind breaks each one
+                    # again, whereas `kind` is already how the attention strip carries
+                    # this and how the rows are discriminated in the database. The label
+                    # and not the raw status, through the same single mapping: `planning`
+                    # means "analysing" for an io and "investigating" for an inv, and a
+                    # payload saying `planning` for all three is the leak in another
+                    # shape.
                     "feature_orders": [
                         {**{k: fo[k] for k in ("id", "title", "status",
                                                "needs_attention", "attention_reason")},
+                         "kind": fo.get("kind") or "feature",
+                         "status_label": feature_status_label(fo.get("kind"),
+                                                              fo["status"]),
                          "progress": feature_progress(store, fo)}
                         for fo in features
                     ],
@@ -8017,11 +8035,16 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
         p = budget.pool(store, central, fo)
         spend = budget.feature_spent(store, central, fo)
         live = budget.feature_in_flight(store, fo)  # display only; see `budget.spent`
+        # `budget.family` for the same reason as the set path's `exhausted_children`:
+        # the totals beside this list are family totals, so a breakdown off the
+        # `kind='worker'` children alone does not add up to them — and is EMPTY for an
+        # improvement order or an investigation, whose one child is the family's
+        # `plan_wo_id` (Neo question 1198).
         children = [
             {"wo_id": c["id"], "status": c["status"],
              "reserved_usd": c.get("budget_reserved_usd"),
              "spent_usd": budget.spent(store, central, c["id"]).total_usd}
-            for c in store.feature_children(fo_id)
+            for c in budget.family(store, fo)
         ]
     finally:
         central.close()
@@ -8097,7 +8120,23 @@ def list_feature_orders(project_name: str | None = None,
         store = ProjectStore(path)
         try:
             statuses = None if include_settled else FO_OPEN_STATUSES
-            for fo in store.list_feature_orders(statuses=statuses, kind=kind):
+            rows = store.list_feature_orders(statuses=statuses, kind=kind)
+            if not include_settled:
+                # THE DEFAULT LISTING IS THE OPEN ONES PLUS ANY FLAGGED ROW WHATEVER ITS
+                # STATUS (§6 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # `flagged_feature_orders`' own docstring is the argument: `failed` is a
+                # SETTLED status and also the one a feature order raises its flag in, and
+                # a `WAITING_ON_USER` investigation is `completed` AND flagged in one
+                # transaction. A flag nobody can list is a flag nobody can act on.
+                # Here and not in `ProjectStore`: each of its two methods is honest about
+                # one question, and `--all` is still the way to see settled quiet rows.
+                seen = {fo["id"] for fo in rows}
+                rows += [fo for fo in store.flagged_feature_orders()
+                         if fo["id"] not in seen
+                         and (kind is None or (fo.get("kind") or "feature") == kind)]
+                rows.sort(key=lambda fo: fo["created_at"], reverse=True)
+            for fo in rows:
                 out.append({"project": name, **fo,
                             "status_label": feature_status_label(kind, fo["status"]),
                             "progress": feature_progress(store, fo)})
@@ -8162,6 +8201,24 @@ _KIND_PHRASES = {
     "improvement": "an improvement order",
     "investigation": "an investigation order",
 }
+
+#: Per kind: how the FAMILY reads in prose, and the command that raises its budget. A
+#: TABLE for `_require_kind`'s own reason — a third kind read as "a feature order" is a
+#: message that names the wrong surface, and `jarvis fo budget` on an `io-`/`inv-` row
+#: refuses. §2 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. Here beside
+#: `_KIND_PHRASES` and not in the budgets section: a second kind table down there is the
+#: one that goes stale when a fourth kind lands.
+_KIND_FAMILY = {
+    "feature": ("feature", "jarvis fo budget"),
+    "improvement": ("improvement order", "jarvis io budget"),
+    "investigation": ("investigation", "jarvis investigate budget"),
+}
+
+
+def family_prose(kind: str | None) -> tuple[str, str]:
+    """`(what the family is called, the command that raises its budget)` for one kind."""
+    return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
 def create_improvement_order(project_name: str, title: str, description: str = "",
@@ -8300,6 +8357,29 @@ def cancel_improvement_order(io_id: str, project_name: str | None = None
     _, _, fo = find_feature_order(io_id, project_name)
     _require_kind(fo, "improvement", "jarvis fo cancel")
     return cancel_feature_order(io_id, project_name)
+
+
+def improvement_order_budget(io_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis io budget`, read-only. The feature-order arithmetic unchanged: the family
+    here is the order plus its analyst (§2.6 of the improvement-orders spec).
+
+    THE GUARD IS HERE AND NOT IN THE CLI, like every other `io` verb's — `jarvis io
+    budget` was the one that routed straight to the feature-order function, so `/api` and
+    every future caller got no guard at all (§3 of
+    docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+    """
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return feature_order_budget(io_id, project_name)
+
+
+def set_improvement_budget(io_id: str, amount: float | None,
+                           project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io budget <amount>`. Guard, then delegate — see the read above."""
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return set_feature_budget(io_id, amount, project_name)
 
 
 def submit_findings(io_id: str, doc: Any,
@@ -8755,6 +8835,34 @@ def cancel_investigation_order(inv_id: str, project_name: str | None = None
     _, _, fo = find_feature_order(inv_id, project_name)
     _require_kind(fo, "investigation", "jarvis fo cancel")
     return cancel_feature_order(inv_id, project_name)
+
+
+def investigation_order_budget(inv_id: str, project_name: str | None = None
+                               ) -> dict[str, Any]:
+    """`jarvis investigate budget`, read-only — THE SECOND STEP OF THE TOP-UP.
+
+    §3 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: the
+    command a parked child's note names has to exist. The family is the order plus its
+    one investigator, so the feature-order arithmetic is already correct (§2.6 of the
+    improvement-orders spec) and nothing is reimplemented. Guard here, as every other
+    `investigate` verb's is.
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return feature_order_budget(inv_id, project_name)
+
+
+def set_investigation_budget(inv_id: str, amount: float | None,
+                             project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis investigate budget <amount>`. Guard, then delegate — see the read above.
+
+    Raising it takes the investigation out of `budget_exhausted` on the next reconcile
+    tick, back to `planning` — the status its lifecycle actually runs in
+    (`Daemon.settle_features`).
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return set_feature_budget(inv_id, amount, project_name)
 
 
 def submit_verdict(inv_id: str, doc: Any,
@@ -14197,13 +14305,25 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         # reader can (issue #471, Neo question 469). Added for DISPLAY only, and it
         # never reaches `cap`.
         live = budget.in_flight(store, wo_id)
-        parent_pool = None
-        if wo.get("parent_id"):
-            try:
-                parent_pool = budget.pool(store, central,
-                                          store.get_feature_order(wo["parent_id"]))
-            except KeyError:
-                parent_pool = None
+        parent = _parent_of(store, wo)
+        parent_pool = budget.pool(store, central, parent) if parent else None
+        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
+        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
+        # and is NOT a claim that the parent is a feature order, so a card reading it
+        # raw told an investigation's child about "its feature's slice". Same
+        # `family_prose` table as the note, so card and note agree.
+        family = family_prose(parent["kind"])[0] if parent else None
+        # THE SAME SENTENCE THE SET PATH RETURNS (§1 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): four
+        # numbers the reader has to assemble themselves is what made a raise look
+        # accepted and inert. Only when the FAMILY's slice is what binds — an order
+        # stopped by its own number needs no explanation beyond the number. Through
+        # `_feature_unreserved`, the set path's own read, so the two strings are one
+        # string and not two that agree today.
+        note = ""
+        if cap is not None and cap.source == "feature" and cap.exhausted:
+            note = _still_capped_note(cap, spend.total_usd, parent,
+                                      _feature_unreserved(store, central, wo))
     finally:
         central.close()
         store.close()
@@ -14224,6 +14344,8 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "remaining_usd": cap.remaining_usd if cap else None,
         "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+        "family": family,
+        "note": note,
     }
 
 
@@ -14273,12 +14395,9 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
             if cap is not None and cap.exhausted:
-                note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
-                        f"spent against {budget.format_usd(cap.cap_usd)}")
-                if cap.source == "feature":
-                    note += (" (its feature's slice, and the feature has "
-                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
-                             " unreserved — raise the feature with `jarvis fo budget`)")
+                note = _still_capped_note(
+                    cap, spend.total_usd, _parent_of(store, fresh),
+                    _feature_unreserved(store, central, fresh))
             else:
                 resumed, note = _resume_after_budget(store, name, fresh)
     finally:
@@ -14287,6 +14406,45 @@ def set_work_order_budget(wo_id: str, amount: float | None,
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
+                       parent: dict[str, Any] | None,
+                       unreserved_usd: float) -> str:
+    """Why a raised budget changed nothing — ONE WORDING, for the set path and the show
+    path.
+
+    §1 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. The
+    reporter had `budget_usd=10`, `cap_usd=2.0036`, `cap_source='feature'` and
+    `feature_unreserved_usd=0.0` and could not assemble them. Two wordings of this is how
+    a user reading the dashboard and a user reading the CLI come to believe different
+    things, so `work_order_budget` and `set_work_order_budget` both say it from here.
+
+    Here and not in `budget.py`: the sentence names CLI COMMANDS, and the allocator knows
+    nothing about surfaces.
+    """
+    spent, cap_usd = budget.format_usd(spent_usd), budget.format_usd(cap.cap_usd)
+    if cap.source != "feature":
+        return f"still over its ceiling — {spent} spent against {cap_usd}"
+    family, verb = family_prose((parent or {}).get("kind"))
+    # `format_money`, not `format_usd`: the remainder being NOTHING is the entire
+    # condition for this sentence, and the dash would read as "unknown". The parent's
+    # budget keeps `format_usd`: a family cap always has one.
+    return (f"still over its ceiling: {spent} spent against {cap_usd}, which is its "
+            f"{family}'s slice. The {family} has "
+            f"{budget.format_money(unreserved_usd)} unreserved of "
+            f"its {budget.format_usd((parent or {}).get('budget_usd'))} budget, so "
+            f"raise the {family} with `{verb}`.")
+
+
+def _parent_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature-order row this work order belongs to, or None."""
+    if not wo.get("parent_id"):
+        return None
+    try:
+        return store.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return None
 
 
 def _feature_unreserved(store: ProjectStore, central: CentralStore,
@@ -14389,7 +14547,13 @@ def set_feature_budget(fo_id: str, amount: float | None,
     try:
         store.update_feature_order(fo_id, budget_usd=amount)
         p = budget.pool(store, central, store.get_feature_order(fo_id))
-        stuck = [c["id"] for c in store.feature_children(fo_id)
+        # `budget.family`, NOT `store.feature_children`: the budget is enforced over the
+        # family, and the worker children are a strict subset of it that an improvement
+        # order's analyst and an investigation's investigator are never in (§3 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md, Neo
+        # question 1198). Reported off the enforced set, this list can never be empty
+        # where a child is in fact parked.
+        stuck = [c["id"] for c in budget.family(store, store.get_feature_order(fo_id))
                  if c["status"] == budget.EXHAUSTED]
     finally:
         central.close()

@@ -243,12 +243,15 @@
               >~${{ '%.2f'|format(cap.live_spent_usd) }}</span>
       {%- else %} ${{ '%.2f'|format(cap.spent_usd) }}
       {%- endif %} of ${{ '%.2f'|format(cap.cap_usd) }}
-      {%- if cap.cap_source == 'feature' %} (its feature's slice){% endif %}
+      {#- The NOUN comes from the parent's kind (`ops.family_prose`), never from
+          `cap_source`: 'feature' is the allocator's name for the family's cap, and
+          rendering it raw told an investigation's child about "its feature's slice". #}
+      {%- if cap.cap_source == 'feature' %} (its {{ cap.family or 'feature' }}'s slice){% endif %}
       {%- if cap.live_remaining_usd > 0 %} ·
         {%- if cap.in_flight_usd %} ~{% endif %}${{ '%.2f'|format(cap.live_remaining_usd) }} left
       {%- else %} · spent{% endif %}
       {% if cap.feature_unreserved_usd is not none %}
-        · its feature has ${{ '%.2f'|format(cap.feature_unreserved_usd) }} unreserved
+        · its {{ cap.family or 'feature' }} has ${{ '%.2f'|format(cap.feature_unreserved_usd) }} unreserved
       {% endif %}
     {% else %}
       <span class="sub">No budget — this order runs uncapped.</span>
