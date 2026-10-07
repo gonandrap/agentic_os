@@ -52,6 +52,7 @@ from .project_store import (
     ACTIVE_STATUSES,
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
@@ -420,6 +421,24 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
+#: What a work order says when its turn died AFTER it had delivered — wo-604b5b99, whose
+#: session was killed in a stampede cleanup with PR #839 open. The state IDLE_NO_FINISH
+#: used to claim, and its sentence is false twice over there: the order finished, and the
+#: turn did not stop, it died. Nothing is left to re-run, so the way out is a person's.
+#:
+#: Under IDLE_NO_FINISH_BLOCKER's own obligation: `Daemon.settle_work_order` raises it and
+#: `true_blockers` re-derives it from here, or INV-ATTENTION-REASON relabels it on the next
+#: tick. FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule — `ack_attention` stores it
+#: verbatim.
+TURN_DIED_AFTER_DELIVERY_BLOCKER = (
+    "its worker's session died after the work was delivered — the delivery is on record; "
+    "read it, then `jarvis wo review` or `jarvis wo done`")
+
+#: `kind` of the event the settler writes on that path, so the record never reads as a
+#: clean delivery. Here rather than in `daemon` because the writer is the daemon and the
+#: reader is the derivation above: the two must not drift.
+TURN_DIED_AFTER_DELIVERY_EVENT = "turn_died_after_delivery"
+
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
 
@@ -544,6 +563,42 @@ def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]
     """
     return [c for c in children
             if c["status"] in ("failed", "cancelled") and not c.get("superseded")]
+
+
+def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Has this work order produced something a person has to decide about?
+
+    Beside `dead_feature_children` because it is the function whose input this changes:
+    a turn that dies after a delivery settles to `needs_review` instead of `failed`
+    (`Daemon.settle_work_order`), so the dead-child predicate never sees it.
+
+    A pull request and an assumption are artefacts the order cannot take back. NOT
+    `result_summary`: a worker can write one and keep working, so it does not say the
+    order has nothing left to run.
+    """
+    return bool(wo.get("pr_url")) or bool(store.all_assumptions(wo["id"]))
+
+
+#: What a live child says when the feature it belongs to has settled under it —
+#: wo-3db50904 and wo-0cb6dc6b, which kept running under a `failed` fo-ac00376e with no
+#: addressee for the `manager` role and nothing on their faces to say so. A HOLD and never
+#: a reopen (Neo question 1393): reopening the feature at the fork flaps, because
+#: `Daemon.settle_features` re-fails it on the next tick off the same dead child.
+#:
+#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and derived by `true_blockers`
+#: alone — no call site raises it, so nothing can drift from it.
+SETTLED_FEATURE_BLOCKER = ("its feature order {fo_id} is {status} — nothing will "
+                           "coordinate this work order until the feature is live "
+                           "again; {remedy}")
+
+#: One remedy per settled status, because the way out genuinely differs: `jarvis fo
+#: resume` refuses anything but `failed` (`ops.resume_feature_order`), so naming it under
+#: a cancelled feature would send the user at a command that errors.
+SETTLED_FEATURE_REMEDY = {
+    "failed": "`jarvis fo resume {fo_id}`",
+    "cancelled": "`jarvis wo cancel {wo_id}` if this work order is not wanted either",
+    "completed": "`jarvis wo done {wo_id}`, or `jarvis wo cancel {wo_id}`",
+}
 
 #: What a work order says when something it depends on can never complete. A dependency
 #: that is `cancelled` or `failed` will not come back, so the dependent would sit in
@@ -970,6 +1025,24 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # THE FEATURE THIS CHILD BELONGS TO HAS SETTLED UNDER IT. A fact about the work
+    # order's context rather than about its own delivery, so it sits below the assumptions
+    # line it must not displace and above the `needs_review` triage. Gated on the status
+    # and on the column so no other work order pays for the read; a manager is skipped,
+    # because `_close_feature_manager` settling it with its feature is correct. Spec §(b),
+    # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
+    # manager-or-a-hold.md
+    if (wo["status"] in OPEN_STATUSES and wo.get("parent_id")
+            and wo.get("kind") != "manager"):
+        try:
+            parent = store.get_feature_order(wo["parent_id"])
+        except KeyError:
+            parent = None  # deleted out from under the child: nothing left to name
+        if parent is not None and parent["status"] in FO_TERMINAL_STATUSES:
+            remedy = SETTLED_FEATURE_REMEDY.get(parent["status"], "")
+            blockers.append(SETTLED_FEATURE_BLOCKER.format(
+                fo_id=parent["id"], status=parent["status"],
+                remedy=remedy.format(fo_id=parent["id"], wo_id=wo["id"])))
     # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
     # on the status so no other work order pays the query; the ordinary re-park raises
     # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
@@ -1076,8 +1149,17 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
+        #
+        #    SPLIT IN TWO, and nothing else moved: the SESSION DIED after the work was
+        #    delivered is the one state whose sentence this arm got wrong, and splitting
+        #    the last arm cannot reorder the three above it. The read sits behind
+        #    `needs_review` and `not pending`, so no other work order pays for it.
+        #    Spec §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-
+        #    must-have-a-manager-or-a-hold.md
         elif not pending:
-            blockers.append(IDLE_NO_FINISH_BLOCKER)
+            died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
+            blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
+                            else IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs
     # for these — the hold is the absence of an attempt, so there is no call site to
@@ -2984,14 +3066,36 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
             still_open = False
         if not still_open:
             continue
+        lost = (f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
+                f"about {subject} reached nobody: {env['note'] or 'undeliverable'}")
+        # LEADS WITH WHAT IS SETTLED for a lost `manager` envelope: the user read the
+        # SUBJECT as the completed order, because the settled fact arrived last or not at
+        # all. Derived, never stored, and only the manager case had a second order in it
+        # to confuse. Spec §(d), docs/superpowers/specs/2026-10-07-a-settled-features-live-
+        # children-must-have-a-manager-or-a-hold.md
+        manager, fo_id = None, None
+        if env["to_role"] == "manager":
+            from .bus import _feature_of
+
+            fo_id = _feature_of(store, env)
+            manager = store.manager_work_order(fo_id) if fo_id else None
+        if manager is not None:
+            detail = (f"the manager work order {manager['id']} is {manager['status']} "
+                      f"under feature {fo_id}, so {lost}")
+            if env["subject_wo_id"]:
+                detail += (f". {env['subject_wo_id']} is held until the feature is live "
+                           f"again")
+        else:
+            detail = lost
         yield Violation(
             invariant="INV-ENVELOPE-LOST",
             wo_id=env["subject_wo_id"],
-            detail=(f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
-                    f"about {subject} reached nobody: {env['note'] or 'undeliverable'}"),
+            detail=detail,
             context={"envelope_id": env["id"], "kind": env["kind"],
                      "to_role": env["to_role"], "state": env["state"],
-                     "subject_fo_id": env["subject_fo_id"]},
+                     "subject_fo_id": env["subject_fo_id"],
+                     "manager_wo_id": manager["id"] if manager else None,
+                     "manager_status": manager["status"] if manager else None},
         )
 
 
@@ -3099,6 +3203,15 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
             continue
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # A reopened feature with a `completed` manager has no addressee for its next
+        # round's feedback. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+        # features-live-children-must-have-a-manager-or-a-hold.md
+        from .ops import lower_settled_feature_holds, revive_feature_manager
+
+        revived = revive_feature_manager(store, fo_id, why="INV-FEATURE-FALSE-FAILURE")
+        # ...and the children's holds go down with it: SETTLED_FEATURE_BLOCKER is now
+        # false and nothing re-derives a stored flag.
+        lower_settled_feature_holds(store, children)
         yield Violation(
             invariant="INV-FEATURE-FALSE-FAILURE",
             detail=(f"feature order {fo_id} is `failed` — \"{row['attention_reason']}\" "
@@ -3106,9 +3219,11 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
                     f"cancelled any more. The child recovered after the feature settled, "
                     f"and nothing re-derives a settled feature."),
             repaired=True,
-            repair="back to `executing` — the next tick settles it on the real state",
+            repair=("back to `executing` — the next tick settles it on the real state"
+                    + (", manager revived" if revived else "")),
             context={"fo_id": fo_id, "children": len(children),
-                     "stale_reason": row["attention_reason"]},
+                     "stale_reason": row["attention_reason"],
+                     "manager_revived": revived["id"] if revived else None},
         )
 
 

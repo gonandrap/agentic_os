@@ -323,6 +323,16 @@ FEATURE_MANAGER_STALLED = (
     "its manager was told the work orders it filed after round {n} had landed and did "
     "not resubmit the feature — `jarvis fo submit {fo_id}` is what it was asked to run")
 
+#: And the third, which is not a manager that did nothing but a manager that is not there
+#: — every feature released before the manager existed, or one whose row was deleted. A
+#: replacement would be briefed on nothing and would answer a round of feedback blind, so
+#: the OS names the situation instead of building one. Spec §(c), docs/superpowers/specs/
+#: 2026-10-07-a-settled-features-live-children-must-have-a-manager-or-a-hold.md
+FEATURE_MANAGER_MISSING = (
+    "it has no project manager work order at all, so nothing will ever resubmit it — a "
+    "replacement would be briefed on none of this feature's history; decide what has to "
+    "change, or close it (`jarvis fo cancel {fo_id}`)")
+
 #: `kind` of the event that records what the handoff did, and the only memory it has.
 #: Each payload carries the `round` and the `children` the action was about, because THAT
 #: PAIR is the episode — not the round alone. A manager that answers a nudge with one more
@@ -1542,7 +1552,35 @@ class Daemon:
         if not last or last["outcome"] in RUNNABLE_VALIDATION_OUTCOMES:
             return  # a round is in flight or being retried: not the manager's turn yet
         manager = store.manager_work_order(fo_id)
-        if not manager or manager["status"] != "idle":
+        if manager is None:
+            # NEVER A SILENT RETURN, and never a replacement manager either: a fresh one
+            # would answer this round's feedback briefed on none of the feature's history.
+            # The dedupe rides on `carrier_for_feature` — the GENERAL carrier rule, of
+            # which `ops.feature_event`'s manager-only one is the narrow case — because
+            # this is the one branch with no manager to carry the event. Spec §(c).
+            reason = FEATURE_MANAGER_MISSING.format(fo_id=fo_id)
+            carrier = store.carrier_for_feature(fo_id)
+            said = (store.events_of_kind(carrier["id"], FEATURE_HANDOFF_EVENT)
+                    if carrier else [])
+            if any(db.from_json(e["payload"], {}).get("reason") == reason
+                   for e in said):
+                return
+            store.flag_feature_attention(fo_id, reason)
+            if carrier is not None:
+                store.add_event(carrier["id"], FEATURE_HANDOFF_EVENT,
+                                {"round": int(last["round"]), "action": "flagged",
+                                 "reason": reason, "children": [],
+                                 "feature_order": fo_id})
+            # No session at all — a feature nobody has planned — so there is nothing to
+            # dedupe on and this reading flags once per tick it is reached.
+            log.info("[%s] feature %s flagged: %s", project.name, fo_id, reason)
+            return
+        # A manager that is SETTLED is revived and this branch goes on to its nudge or its
+        # flag; one that is genuinely busy — running, or mid-turn — returns as it always
+        # did, because it has not finished reacting. Spec §(c).
+        if (manager["status"] != "idle"
+                and ops.revive_feature_manager(store, fo_id, why="manager handoff")
+                is None):
             return
         if store.queued_messages(manager["id"]):
             return
@@ -4971,9 +5009,31 @@ class Daemon:
             if pause and not pause.exhausted:
                 return
             if wo["status"] != "failed":
-                store.set_status(wo["id"], "failed")
-                store.flag_attention(wo["id"],
-                                     "worker turn failed — review and retry")
+                # THE TURN'S FATE IS NOT THE ORDER'S. A session killed after the work was
+                # delivered leaves a pull request and assumptions nobody can take back,
+                # and `failed` makes the child dead to `dead_feature_children` — which
+                # failed fo-ac00376e off a delivered wo-604b5b99. Spec §(a),
+                # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-
+                # have-a-manager-or-a-hold.md
+                delivered = invariants_mod.has_delivered(store, wo)
+                if delivered:
+                    store.set_status(wo["id"], "needs_review")
+                    store.add_event(
+                        wo["id"], invariants_mod.TURN_DIED_AFTER_DELIVERY_EVENT,
+                        {"error": turn.get("error"),
+                         **({"attempts": pause.attempts, "reason": pause.reason,
+                             "message": pause.message} if pause else {})})
+                    # ONLY IF THERE IS A BLOCKER TO FLAG. An UNGOVERNED order — one the
+                    # user injected — derives nothing from `needs_review` at all, and
+                    # asking it for nothing is correct (`retire_ungoverned`).
+                    fresh_row = store.get_work_order(wo["id"])
+                    blockers = invariants_mod.true_blockers(store, fresh_row)
+                    if blockers:
+                        store.flag_attention(wo["id"], blockers[0])
+                else:
+                    store.set_status(wo["id"], "failed")
+                    store.flag_attention(wo["id"],
+                                         "worker turn failed — review and retry")
                 if pause:
                     # Retried until the OS ran out of patience. Say so plainly: the
                     # message the user needs is "this is not going to fix itself", and

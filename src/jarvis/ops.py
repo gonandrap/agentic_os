@@ -9722,6 +9722,67 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 FIX_TITLE_CHARS = 120
 
 
+def revive_feature_manager(store: ProjectStore, fo_id: str,
+                           why: str) -> dict[str, Any] | None:
+    """Give an `executing` feature back the manager its settlement closed.
+
+    THE ONE SITE manager liveness is derived at, and that is the point: it was written
+    once at a transition (`Daemon._close_feature_manager`) and never derived, so all three
+    paths that reverse that transition — `resume_feature_order`,
+    INV-FEATURE-FALSE-FAILURE's repair and `Daemon._manager_handoff` — had to remember to
+    undo it, and none of them did. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+    features-live-children-must-have-a-manager-or-a-hold.md
+
+    `idle`, the manager's designed steady state since issue #264: `_manager_handoff` tests
+    for it and `invariants.true_blockers` derives nothing from it but MESSAGE_STUCK_BLOCKER,
+    so a revived manager asks the user for nothing.
+
+    Returns the manager row, or None when there is no manager row at all, when the manager
+    is already open, or when the feature is not `executing` — the callers need to tell
+    those apart.
+    """
+    try:
+        feature = store.get_feature_order(fo_id)
+    except KeyError:
+        return None
+    if feature["status"] != "executing":
+        return None
+    manager = store.manager_work_order(fo_id)
+    if manager is None or manager["status"] in OPEN_STATUSES:
+        return None
+    store.set_status(manager["id"], "idle")
+    store.clear_attention(manager["id"])
+    # The exact mirror of `_close_feature_manager`'s `feature_settled`, so the manager's
+    # timeline reads as a pair.
+    store.add_event(manager["id"], "manager_revived",
+                    {"feature_order": fo_id, "was": manager["status"], "why": why})
+    return store.get_work_order(manager["id"])
+
+
+def lower_settled_feature_holds(store: ProjectStore,
+                                children: list[dict[str, Any]]) -> list[str]:
+    """Take down the hold a child carried while its feature was settled.
+
+    TWO CALLERS, in two modules — `resume_feature_order` below and
+    INV-FEATURE-FALSE-FAILURE's repair — and that is why it is public: both paths reopen a
+    feature, so both owe the children the same clear.
+
+    SETTLED_FEATURE_BLOCKER is derived, so the reopening makes it untrue — and nothing
+    re-derives a flag already stored, so the stale sentence would stand until the child
+    settled. The same rule `_carry_round_onto` states for its own flag: lowered only when
+    `true_blockers` is EMPTY, so another blocker is somebody else's reason and is left
+    exactly as it was, and only while the flag is up, which makes it idempotent.
+    """
+    lowered = []
+    for child in children:
+        fresh = store.get_work_order(child["id"])
+        if not fresh["needs_attention"] or true_blockers(store, fresh):
+            continue
+        store.clear_attention(fresh["id"])
+        lowered.append(fresh["id"])
+    return lowered
+
+
 def resume_feature_order(fo_id: str, fix: str = "",
                          project_name: str | None = None) -> dict[str, Any]:
     """`jarvis fo resume` — put a failed feature order back to work.
@@ -9767,6 +9828,10 @@ def resume_feature_order(fo_id: str, fix: str = "",
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # BEFORE the `--fix` child is filed, so a crash between them leaves a live manager
+        # rather than a child with no addressee.
+        revive_feature_manager(store, fo_id, why="jarvis fo resume")
+        lower_settled_feature_holds(store, children)
         child = None
         if fix.strip():
             title = " ".join(fix.split())[:FIX_TITLE_CHARS]
