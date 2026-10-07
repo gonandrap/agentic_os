@@ -19,8 +19,10 @@ from jarvis.central_store import CentralStore
 DOCUMENT = {
     "os": {"defaults": {"model": "opus"}},
     "projects": [
+        # Distinct paths: OS identity is per `origin` per path (issue 956), and two
+        # projects on one path are two candidates and so no OS at all.
         {"name": "proj_a", "path": "/tmp", "description": "one"},
-        {"name": "proj_b", "path": "/tmp", "description": "two"},
+        {"name": "proj_b", "path": "/var/tmp", "description": "two"},
     ],
 }
 
@@ -594,15 +596,22 @@ def test_an_unregistered_catalog_says_how_to_name_one(tmp_path, capsys):
 #
 # docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §4. USER RULE,
 # 2026-09-28 (kn-7312c7de). Refused in `ops`, so the CLI and the dashboard's console
-# inherit it from one place. The owner is derived WITHOUT `schedule.os_owner`'s
-# first-in-catalog fallback, so a test project owns the OS only by holding the install.
+# inherit it from one place. The OS project is derived with no first-in-catalog fallback,
+# so a test project IS the OS only by sharing an `origin` with the running install.
 
 @pytest.fixture()
 def os_project(monkeypatch):
-    """`proj_a` (path `/tmp`) contains the running install."""
+    """`proj_a` (path `/tmp`) and the running install share one `origin`.
+
+    Through `schedule._ORIGIN_CACHE` rather than a real remote on `/tmp`: identity is a
+    `git remote get-url` per path since issue 956, and this file has no checkout to give
+    one to.
+    """
     from jarvis import schedule
 
-    monkeypatch.setattr(schedule, "__file__", "/tmp/src/jarvis/schedule.py")
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, "/tmp", ("gonandrap", "agentic_os"))
 
 SWEEP_OFF = [
     ("projects.proj_a.supervisor.health_enabled", False),
@@ -643,7 +652,7 @@ def test_unsetting_the_switch_back_to_its_false_default_is_refused_too(os_projec
 
 
 def test_a_catalog_holding_no_install_has_no_os_project_to_protect(catalog):
-    """§4: derived WITHOUT `os_owner`'s first-in-catalog fallback."""
+    """§4: no first-in-catalog fallback, and no project here is a checkout of the OS."""
     res = ops.set_config("projects.proj_a.supervisor.health_enabled", False,
                          reason="proj_a is not the OS")
 

@@ -11200,11 +11200,12 @@ def _refuse_os_sweep_off(key: str, document: dict[str, Any],
     against the document the write WOULD commit, before `_commit_document`, so nothing
     is written on a refusal.
 
-    The OS project is DERIVED, never hardcoded: `schedule.os_owner`, so a renamed or
-    relocated checkout produces the right sentence with no edit. WITHOUT that function's
-    first-in-catalog fallback, deliberately unlike `Daemon._os_owner`: a project that
-    merely happens to be listed first is not the OS and may not be refused this write.
-    No owner means there is nothing to protect.
+    The OS project is DERIVED, never hardcoded: `schedule.os_project`, so a renamed or
+    relocated checkout produces the right sentence with no edit. BY GIT ORIGIN, and
+    deliberately not `os_owner`'s path containment (issue 956): a project that merely
+    happens to be listed first is not the OS and may not be refused this write, and in
+    production nothing contains the running install at all. No OS project in the catalog
+    means there is nothing to protect.
 
     JUDGED ON THE KEY THE WRITE TOUCHES, and on that key's RESOLVED value afterwards —
     so every spelling is covered (the project's own key, the `os.` block it inherits
@@ -11221,9 +11222,8 @@ def _refuse_os_sweep_off(key: str, document: dict[str, Any],
     projects = [p for p in document.get("projects", [])
                 if isinstance(p, dict) and isinstance(p.get("name"), str)]
     try:
-        owner = schedule.os_owner(
-            ((p["name"], Path(str(p.get("path") or file.parent))) for p in projects),
-            fallback=False)
+        owner = schedule.os_project(
+            (p["name"], Path(str(p.get("path") or file.parent))) for p in projects)
     except (OSError, ValueError):       # an unreadable path is not an authorisation
         return
     if owner is None:
