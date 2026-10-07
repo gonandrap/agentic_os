@@ -13,8 +13,10 @@ else's, so nothing here re-implements it.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import sections
 
@@ -70,3 +72,93 @@ def toc(markdown: str) -> list[Section]:
 def section(markdown: str, which: str) -> str | None:
     """One section by number or name, or None — `sections.extract_section` verbatim."""
     return sections.extract_section(markdown, which)
+
+
+#: Directories never walked. An unpruned walk makes §4.2's "sub-second scan" false on the
+#: first project with a virtualenv — `.venv` alone carries more markdown than the repo.
+#: `worktrees` is pruned because a worktree is a COPY of the whole tree: unpruned, every
+#: document comes back once per live worktree, the `limit` budget is spent on duplicates,
+#: and a sibling BRANCH's text is ranked above the caller's own under the same filename.
+#: `.jarvis` is KEPT and must stay kept: a feature child's materialised spec section lives
+#: there at the REGISTERED ROOT and in no worktree, and it is exactly the document a child
+#: is looking for (Neo ruling on q1372).
+PRUNED_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".tox",
+    ".mypy_cache", ".pytest_cache", "worktrees",
+})
+
+#: Characters of context per hit. Wide enough for a sentence, narrow enough that the
+#: `limit` of 40 hits still fits a terminal — a paragraph per hit is the dump this verb
+#: exists to replace.
+CONTEXT_CHARS = 120
+
+
+@dataclass(frozen=True)
+class Hit:
+    """One SECTION that matches, and the ref that opens it."""
+
+    path: str
+    section: str
+    line: int
+    context: str
+
+
+def search(root: Path, words: str, *, suffixes: tuple[str, ...] = (".md",),
+           limit: int = 40) -> list[Hit]:
+    """Sections of `root`'s documents containing every term of `words` — §4.1.
+
+    SECTION granularity and deduplicated per section, first match winning: the caller's
+    next call is `jarvis spec section <path> <ref>`, so a second hit in the same section
+    is a repeat of the same next step. A grep line list would make the reader do the
+    mapping the toc already knows.
+
+    `limit` is a second bound on top of the prune (Neo ruling, q1372): a query with a
+    common term cannot return a dump however small the tree.
+    """
+    terms = [w.lower() for w in words.split()]
+    if not terms:
+        return []
+    out: list[Hit] = []
+    for path in _documents(root, suffixes):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:     # unreadable file: not a match, never a failed scan
+            continue
+        if not all(t in text.lower() for t in terms):
+            continue
+        heads = toc(text)
+        seen: set[str] = set()
+        for number, line in enumerate(text.splitlines(), start=1):
+            low = line.lower()
+            if not all(t in low for t in terms):
+                continue
+            ref = _section_ref(heads, number)
+            if ref in seen:
+                continue
+            seen.add(ref)
+            out.append(Hit(path=path.relative_to(root).as_posix(), section=ref,
+                           line=number, context=line.strip()[:CONTEXT_CHARS]))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _section_ref(heads: list[Section], line: int) -> str:
+    """The ref of the last heading at or above `line` — `""` before the first heading."""
+    found = ""
+    for s in heads:
+        if s.line > line:
+            break
+        found = s.number or s.name
+    return found
+
+
+def _documents(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
+    """Every candidate file under `root`, in a stable order, pruned by `PRUNED_DIRS`."""
+    out: list[Path] = []
+    for where, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in PRUNED_DIRS)
+        for name in sorted(filenames):
+            if name.endswith(suffixes):
+                out.append(Path(where) / name)
+    return out
