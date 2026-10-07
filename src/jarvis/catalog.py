@@ -1094,6 +1094,23 @@ class BugsConfig:
     label: str = DEFAULT_BUGS_LABEL
 
 
+#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
+#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
+
+
+@dataclass
+class ReleaseConfig:
+    """How long a settled release order's dropped batch stays worth re-filing.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    the answer is a claim about THIS project's release cadence, and a project that ships
+    weekly has a different one from a project that ships twice a year.
+    """
+
+    refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
+
+
 @dataclass
 class MessagingConfig:
     """When a message queued for a worker stops being in flight and becomes a defect.
@@ -1362,6 +1379,7 @@ class ProjectSpec:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1493,6 +1511,7 @@ class OsConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -2048,6 +2067,26 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
     return BugsConfig(label=label)
 
 
+def _parse_release(raw: Any, base: ReleaseConfig | None = None,
+                   where: str = "os.release") -> ReleaseConfig:
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: a window of 0 days
+    means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or ReleaseConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = ReleaseConfig(
+        refile_window_days=int(raw.get("refile_window_days", base.refile_window_days)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
                      where: str = "os.messaging") -> MessagingConfig:
     """`os.messaging`, or a project's override of it — field-level, like `_parse_inspect`.
@@ -2389,6 +2428,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
@@ -2530,6 +2570,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        release_cfg = _parse_release(
+            p.get("release", {}), base=os_cfg.release,
+            where=f"projects[{i}] ({name}).release")
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
@@ -2558,6 +2601,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                release=release_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,
