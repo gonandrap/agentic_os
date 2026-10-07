@@ -9,6 +9,7 @@ The fleet reader that used to live here is `tests/test_nav_volume.py`.
 """
 
 import ast
+import builtins
 
 import pytest
 
@@ -171,3 +172,121 @@ def test_the_eval_uses_the_shipped_classifier():
     assert ev.NAV_COMMANDS is navigation.NAV_COMMANDS
     assert ev.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
     assert "def bash_navigates_code" not in open(ev.__file__).read()
+
+
+# -- the doc classifiers (§3.1, §3.4) --------------------------------------------------
+
+def _called_names_per_function(source: str) -> list[tuple[str, str]]:
+    """Every called NAME paired with the `FunctionDef` enclosing it.
+
+    Enclosure, not reachability: reachability is not decidable from an AST, which is
+    `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers`' argument.
+    """
+    tree = ast.parse(source)
+    enclosing: dict[ast.AST, str] = {}
+
+    def walk(node: ast.AST, fn: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            here = child.name if isinstance(child, ast.FunctionDef) else fn
+            enclosing[child] = here
+            walk(child, here)
+
+    walk(tree, "")
+    # Builtins dropped: the property pinned is which HELPERS a body reaches, and `any`
+    # is not one.
+    return [(node.func.id, fn) for node, fn in enclosing.items()
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and not hasattr(builtins, node.func.id)]
+
+
+def test_navigates_source_calls_exactly_what_it_calls_today():
+    """§3.4's AST enclosure pin: no branch and no helper was added to the counted body
+    (§2.2 — the fleet baseline was measured with it as it stands)."""
+    found = _called_names_per_function(open(navigation.__file__).read())
+    assert found, "the walk found no calls at all — it would pass on any module"
+    assert {name for name, fn in found if fn == "navigates_source"} == {
+        "_statements", "_mask_shell_text", "_command_word", "_reads_with_sed",
+        "_sweeps_the_tree"}
+
+
+def test_dumps_doc_never_calls_the_sweep_classifier():
+    """§3.1: with `grep`/`rg`/`find` absent from the command set there is no sweep to
+    classify, and reaching for it inherits the issue-936 defect."""
+    found = _called_names_per_function(open(navigation.__file__).read())
+    assert found
+    assert "_sweeps_the_tree" not in {name for name, fn in found if fn == "dumps_doc"}
+    assert navigation.dumps_doc("find docs -name '*.md'") is False
+
+
+def test_the_enclosure_pin_would_catch_the_move_it_forbids():
+    """A guard nobody has ever seen fail is a guard nobody knows works. The same shape,
+    over synthetic source that violates it."""
+    found = _called_names_per_function(
+        "def dumps_doc(c):\n    return _sweeps_the_tree('grep', [c])\n")
+    assert found
+    assert "_sweeps_the_tree" in {name for name, fn in found if fn == "dumps_doc"}
+
+
+def test_dumps_doc_counts_every_dump_and_narrows_only_on_a_keyword():
+    """§3.4, both halves: `nav_volume` passes nothing and counts the ranged dump too; the
+    hook passes its resolved bar and the same dump falls under it."""
+    assert navigation.dumps_doc("sed -n '40,80p' docs/specs/<spec>.md") is True
+    assert navigation.dumps_doc("sed -n '40,80p' docs/specs/<spec>.md",
+                                limit_lines=200) is False
+
+
+@pytest.mark.parametrize("command,span", [
+    ("sed -n '40,80p' docs/specs/<spec>.md", 41),
+    ("sed -n '40p' docs/specs/<spec>.md", 1),
+    ("head -40 docs/specs/<spec>.md", 40),
+    ("head -n 40 docs/specs/<spec>.md", 40),
+    ("cat docs/specs/<spec>.md", None),
+    ("head docs/specs/<spec>.md", None),
+    # Deliberately conservative: one dump named no range, so the chain is UNRANGED.
+    ("cat docs/a.md; sed -n '1,5p' docs/b.md", None),
+    ("echo hi", None),
+])
+def test_dump_span_reads_the_widest_named_range(command, span):
+    assert navigation._dump_span(command) == span
+
+
+def test_the_dump_command_set_is_an_argument_to_the_extractor_too():
+    """A catalog-added command the extractor cannot see names NO range, so every ranged
+    read of it would be refused at any bar — the false positive this feature must not
+    have."""
+    assert navigation._dump_span("tail -n 40 docs/a.md", ("tail",)) == 40
+    assert navigation._dump_span("tail -n 40 docs/a.md") is None
+
+
+def test_an_unranged_dump_never_compares_as_zero():
+    """§3.1: `None` from `_dump_span` means UNRANGED, which is over any bar."""
+    assert navigation.dumps_doc("cat docs/specs/<spec>.md", limit_lines=200) is True
+    assert navigation.dumps_doc("head docs/specs/<spec>.md", limit_lines=200) is True
+
+
+def test_a_md_path_inside_a_quoted_string_does_not_dump():
+    assert navigation.dumps_doc('git commit -m "fix README.md"') is False
+
+
+def test_the_doc_classifiers_are_siblings_and_not_a_widened_source_one():
+    """§2.2: a new sibling, and `navigates_source` is not edited or aliased."""
+    assert navigation.DOC_SUFFIXES == (".md",)
+    assert navigation.DOC_DUMP_COMMANDS == ("cat", "head", "sed")
+    assert navigation.DOC_SUFFIXES is not navigation.SOURCE_SUFFIXES
+    assert navigation.dumps_doc is not navigation.navigates_source
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("docs/specs/<spec>.md", True),
+    (".jarvis/features/fo-1/spec.md", True),
+    # §2.3 class 3: the child's own assigned section, at any size.
+    (".jarvis/features/fo-1/sections/wo-1.md", False),
+    ("notes.md", False),
+    ("docs/specs/<spec>.py", False),
+    # COMPONENTS, never substrings.
+    ("mydocs/specs/<spec>.md", False),
+    ("docsy/<spec>.md", False),
+    ("", False),
+])
+def test_is_spec_path_is_three_valued_and_component_wise(path, expected):
+    assert navigation.is_spec_path(path) is expected
