@@ -43,11 +43,16 @@ docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
 
 The OS never fires "label it now" at GitHub and hopes. `desired_state` turns a work
 order's status into one of three tracker states, `apply` moves the issue there, and the
-`issue_state` column records what was last applied — so the daemon's sweep is a
-comparison, costs nothing while the two agree, and RETRIES for free when `gh` is
-unreachable. That is what makes E (fail closed, never half-apply) and D (idempotency,
+`issue_state` column records what was last applied — so the daemon's sweep asks
+`needs_sync`, costs nothing while there is nothing to do, and RETRIES for free when `gh`
+is unreachable. That is what makes E (fail closed, never half-apply) and D (idempotency,
 reopening, a human who closed it first) fall out of the design rather than out of a
 guard per call site.
+
+It is NOT a bare comparison: `apply` may return a state that is not the desired one, so
+`needs_sync` carries the terminal case a comparison alone could never converge on — a
+column latched at CLOSED (issue #961,
+docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
 
 The OS never fights a human. An issue a person reopened or closed by hand is left where
 they put it — `apply` re-reads the issue before it writes, and records what it found.
@@ -704,6 +709,35 @@ def desired_state(store: Any, wo: dict[str, Any]) -> str:
     if wo["status"] == "completed" and not store.work_unlanded_open(wo_id):
         return CLOSED
     return RELEASED
+
+
+def needs_sync(store: Any, wo: dict[str, Any]) -> bool:
+    """Is there anything left the sweep MAY do to this issue? Issue #961.
+
+    The comparison `desired_state(...) != issue_state` has no fixed point on its own,
+    because `apply` is allowed to return a state that is not the desired one: it returns
+    CLOSED for an issue a person already closed, whatever the want was, so an order whose
+    want is IN_PROGRESS or RELEASED over a closed issue disagrees with its column for
+    ever — one `gh issue view`, one log line and one duplicate `issue_closed` event per
+    tick, per order.
+
+    So a stored CLOSED is TERMINAL. It is where a person (or a converged pass) put the
+    issue and there is nothing left to do there: `apply` would return CLOSED again, the
+    column already says it, and the comment went out on the sweep that discovered the
+    close. The loss is that a human REOPENING is not re-labelled by this sweep, which is
+    `apply`'s existing never-fight-a-human rule reached one step earlier and without the
+    `gh` call. Full reasoning:
+    docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md.
+
+    The latch lives here and not in the daemon because `record_applied` has a second
+    caller (`promote_confirmed`), so both read the same policy. `desired_state` STAYS
+    PURE — derived from the work order alone, never from `issue_state`; putting the latch
+    there would let the filing path RE-CLOSE an issue a human reopened (Neo question
+    1410).
+    """
+    if (wo.get("issue_state") or "") == CLOSED:
+        return False
+    return desired_state(store, wo) != (wo.get("issue_state") or "")
 
 
 def closing_comment(wo: dict[str, Any]) -> str:

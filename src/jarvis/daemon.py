@@ -7696,10 +7696,14 @@ class Daemon:
         order is on it and closed when that work lands — without which the tracker is a
         thing only a human maintains, which is the whole of the issue.
 
-        **A COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives where
-        the issue belongs from the work order, `issue_state` records where the OS last
-        put it, and nothing is sent while the two agree. So the common case — every
-        tracked work order already reconciled — costs ONE indexed query for the whole
+        **A LATCHED COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives
+        where the issue belongs from the work order, `issue_state` records where the OS
+        last put it, and `issues.needs_sync` answers whether anything may still be done —
+        the comparison, plus the terminal case a bare comparison could never converge on,
+        a column latched at CLOSED (issue #961,
+        docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
+        Nothing is sent while it says no. So the common case — every tracked work order
+        already reconciled — costs ONE indexed query for the whole
         project and no subprocess at all, and a project that has never filed a bug does
         not even pay that (the query returns nothing).
 
@@ -7714,9 +7718,9 @@ class Daemon:
         from . import github, issues
 
         for wo in tracked:
-            want = issues.desired_state(store, wo)
-            if want == (wo.get("issue_state") or ""):
+            if not issues.needs_sync(store, wo):
                 continue
+            was = (wo.get("issue_state") or "")
             try:
                 applied = issues.record_applied(store, wo, project.bugs.label)
             except github.GitHubError as e:
@@ -7748,7 +7752,9 @@ class Daemon:
             # order carries an honest low/medium rating or none at all, so the rating
             # column alone could never see that they asked for this in production now
             # (2026-09-27 spec §2).
-            if (applied == issues.CLOSED
+            # `was` is what makes the one-shot contract TRUE instead of assumed: issue
+            # #961's replay re-read the same closed issue and re-filed the release.
+            if (applied == issues.CLOSED and was != issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
                     and (issues.dispatches(wo.get("issue_priority") or "")
                          or issues.was_expedited(wo))):
@@ -7934,8 +7940,9 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         Checked BEFORE the batch loop: an already-live fix must neither file a fresh order
         nor join an open batch, which would keep that order waiting on work already out.
 
-        **EVERY DOUBT FILES.** The call is one-shot — it fires on the issue-state
-        transition and never comes back — so an unreadable repository or production
+        **EVERY DOUBT FILES.** The call is one-shot: `sync_issues` fires it only when the
+        `issue_state` column actually CHANGED to CLOSED, a check and no longer an
+        assumption (issue #961). So an unreadable repository or production
         checkout falling through is mandatory, not merely safe. Tag but not live falls
         through too, and keeps reaching `settle_shipped_releases`' not-live path.
         """
@@ -7980,9 +7987,10 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         """Keep a pending release order out of dispatch while the base branch is red.
 
         **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
-        fires only on the issue-state TRANSITION, so a release skipped because `main`
-        was red would never be filed again and the fix would drop out of every future
-        batch. The order is always created — the one exception is a payload production
+        fires only on a REAL issue-state transition — `sync_issues` compares the column
+        before and after the pass (issue #961) — so a release skipped because `main` was
+        red would never be filed again and the fix would drop out of every future batch.
+        The order is always created — the one exception is a payload production
         already runs (#934), where there is nothing left to ship, and that one-shot call
         is why every other case there falls through and files. This defers dispatch until
         the base is buildable.
