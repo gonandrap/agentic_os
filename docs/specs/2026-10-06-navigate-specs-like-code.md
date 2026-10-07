@@ -535,6 +535,18 @@ A SMALL TARGETED DUMP IS NOT AN EVASION AND REFUSING IT IS THE BRIEF'S MUST NOT.
 table prices `head … .md` at 317 tokens a call; a refusal costs a whole turn. The arm
 exists for the 2,000-line range, not for the 40-line one.
 
+HOW THE NUMBER IS READ, because this runs on every `PreToolUse` and a crash here is worse
+than any dump: `int(env.get("JARVIS_DOC_READ_LIMIT_LINES", ""))` inside a `try`, falling
+back to 200 on `ValueError` or a missing key — the env var is a string the worker's
+settings file wrote, and a hook that raises on a malformed one breaks every tool call in
+that session, not just the refused ones. The CATALOG is where a bad value is rejected
+loudly (§5.3's two validations, naming the key); the HOOK is where it is absorbed quietly.
+Those are different jobs and both are needed: validation cannot see a settings file edited
+by hand, and the hook must not be the place a typo is reported. A resolved `0` or a
+negative number falls back to 200 as well, so no misconfiguration can turn the bar into a
+blanket refusal of every targeted read — which is the §1.1 failure, reached by accident
+instead of by design.
+
 A missing `limit` is whole-file: that is §1(a)'s finding and the reason this hook adds no
 disk access to any `Read`. Verify the `Read` `tool_input` shape (`file_path`, `offset`,
 `limit`) against the installed Claude Code rather than assuming it.
@@ -636,6 +648,10 @@ below goes through `hooks.preflight_decision`, not through the decision function
   `dumps_doc(limit_lines=...)` or the counter and the refusal will disagree.
 - AST enclosure over both `doc_nav_decision` and `py_nav_decision`: `_allow` is called in
   neither. Today that contract is only a docstring claim.
+- The malformed-env table: `JARVIS_DOC_READ_LIMIT_LINES` set to `"abc"`, `""`, `"0"`,
+  `"-5"` and absent entirely. All five resolve to 200 and NONE raises — assert through
+  `preflight_decision`, because a hook that raises takes every tool call in the session
+  with it. A `"0"` that resolved as the bar would refuse every targeted read in the fleet.
 - No import of `spec_index` or `catalog` anywhere in `hooks.py`, and §4.3's three command
   strings are string LITERALS there. `tests/test_concision_mechanisms.py` is the
   existing AST-over-imports model — find it as the test that asserts no module ending in
