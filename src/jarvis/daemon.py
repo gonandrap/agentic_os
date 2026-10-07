@@ -7869,10 +7869,18 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
         Idempotent for the same reason the rest of the lifecycle is — a fix already in
         the batch is not added twice, so a sweep that runs again changes nothing.
+
+        **Except for a payload production is ALREADY RUNNING** (issue #934, Neo question
+        1329 option A): batching against open orders alone meant every fix landing after
+        the previous release settled earned a tag whose only commit was its own version
+        bump. `release.overtaken_by` answers that at filing time, where
+        `settle_shipped_releases` answers it a tick too late to beat dispatch.
         """
         from . import db, issues
         from .project_store import OPEN_STATUSES
 
+        if self._already_live(project, store, wo):
+            return ""
         url = wo.get("issue_url") or ""
         # Expedited first: an order can be both, and the user's scheduling act is the
         # one that is never contingent on a verdict (spec §4).
@@ -7913,6 +7921,44 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         log.info("[%s] %s landed — filed release %s", project.name, url, fresh["id"])
         return str(fresh["id"])
 
+    #: Said on the FIXING order when no release was filed because a live tag already
+    #: carries the fix (issue #934). A SIBLING of `OVERTAKEN_EVENT`, not a reuse: that one
+    #: is a note on a release order that still exists, this one records a release that was
+    #: never filed, and one kind meaning both would make the timelines unreadable.
+    ALREADY_SHIPPED_EVENT = "release_already_shipped"
+
+    def _already_live(self, project: ProjectSpec, store: ProjectStore,
+                      wo: dict) -> bool:
+        """Is this landed fix already in production — so there is nothing left to ship.
+
+        Checked BEFORE the batch loop: an already-live fix must neither file a fresh order
+        nor join an open batch, which would keep that order waiting on work already out.
+
+        **EVERY DOUBT FILES.** The call is one-shot — it fires on the issue-state
+        transition and never comes back — so an unreadable repository or production
+        checkout falling through is mandatory, not merely safe. Tag but not live falls
+        through too, and keeps reaching `settle_shipped_releases`' not-live path.
+        """
+        from . import release
+
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout —
+        # `settle_shipped_releases`' guard, for its reason.
+        if project.name != self._os_owner():
+            return False
+        sha = self._merge_commit_of(project, store, wo)
+        if not sha:
+            return False
+        found = release.overtaken_by(project.path, [sha])
+        if found.error or not (found.tag and found.live):
+            return False
+        store.add_event(str(wo["id"]), self.ALREADY_SHIPPED_EVENT, {
+            "tag": found.tag, "shas": [sha], "deployed": found.deployed,
+            "detail": (f"{found.tag} already carries this fix and production runs "
+                       f"{found.deployed} — no release filed")})
+        log.info("[%s] %s is already live in %s — no release filed", project.name,
+                 wo["id"], found.deployed)
+        return True
+
     #: How long a red base defers a release order's dispatch. Only a RE-CHECK INTERVAL:
     #: a fixed `main` ships within five minutes, so being wrong about the number is
     #: cheap, and it is deliberately not a config key until someone wants a different one.
@@ -7936,7 +7982,10 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
         fires only on the issue-state TRANSITION, so a release skipped because `main`
         was red would never be filed again and the fix would drop out of every future
-        batch. The order is always created; this defers it until the base is buildable.
+        batch. The order is always created — the one exception is a payload production
+        already runs (#934), where there is nothing left to ship, and that one-shot call
+        is why every other case there falls through and files. This defers dispatch until
+        the base is buildable.
 
         Now that an expedited `low` ships on landing, releases go out unattended and
         routinely, and the only thing standing between a red `main` and a release was a
