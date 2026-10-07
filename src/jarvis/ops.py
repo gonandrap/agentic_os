@@ -12607,6 +12607,157 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     return payload
 
 
+def _spec_scope(project: str | None) -> tuple[str, Path]:
+    """Which project's tree `jarvis spec` reads, and never more than one — §4.2.
+
+    ONE project at a time, resolved through the registry, so an unknown name exits
+    naming it and scans nothing; a comma-separated `a,b` is simply such a name (Neo
+    ruling, q1372). A cwd no project owns is an error naming the fix and NEVER a silent
+    fall back to the cwd: a scan rooted wherever the shell happened to be is a different
+    answer from the one the caller asked for.
+    """
+    paths = registered_project_paths()
+    if project:
+        if project not in paths:
+            known = ", ".join(sorted(paths)) or "no project is registered"
+            raise OpsError(
+                f"no registered project named {project!r} — `jarvis spec` scans one "
+                f"project at a time, never a list. Registered: {known}"
+            )
+        return project, paths[project]
+    cwd = os.getcwd()
+    name = _project_for_cwd(cwd, paths)
+    if not name:
+        raise OpsError(
+            f"no registered project owns {cwd} — pass --project <name> to say which "
+            f"tree to read"
+        )
+    return name, paths[name]
+
+
+def _spec_file(root: Path, path: str) -> tuple[Path, str]:
+    """A document inside `root`, or an OpsError naming the root it refused to leave.
+
+    BOTH SIDES RESOLVED before the containment test (§4.2, revised): a string-prefix or
+    `..`-counting test is passed by a symlink inside the tree whose target is outside it,
+    which is the whole shape of the bug.
+
+    A RELATIVE PATH IS RELATIVE TO THE CWD, as the shell says and never to the root:
+    every worker runs in a git worktree under the registered root, so a root-relative
+    base silently hands it MAIN's copy of the file it is editing on its branch — a
+    different document under the same name, the failure this verb exists to prevent.
+    """
+    candidate = Path(path)
+    target = candidate if candidate.is_absolute() else Path(os.getcwd()) / candidate
+    resolved = target.resolve()
+    base = root.resolve()
+    if not resolved.is_relative_to(base):
+        raise OpsError(
+            f"{path!r} resolves to {resolved}, outside {base} — `jarvis spec` refuses to "
+            f"leave the project root"
+        )
+    if not resolved.is_file():
+        raise OpsError(f"no such file in {base}: {path}")
+    return resolved, resolved.relative_to(base).as_posix()
+
+
+def _spec_callable_path(resolved: Path) -> str:
+    """A path string that opens `resolved` FROM THE CALLER'S CWD, for the printed command.
+
+    `_spec_file` reads a relative path from the cwd, so the ROOT-RELATIVE string the
+    payload displays opens a different file — or none at all — from any cwd but the root,
+    and §4.2's "exact command that shows it" is the whole point of the payload. Relative
+    while it stays under the cwd, absolute the moment it would need a `..` component: a
+    worker runs in a git worktree, where a `.jarvis/features/…` hit does not exist and a
+    `docs/…` hit would silently open the worktree's own copy of the document.
+    """
+    rel = os.path.relpath(resolved, os.getcwd())
+    return str(resolved) if ".." in Path(rel).parts else rel
+
+
+def _spec_command(path: str, ref: str, project: str | None = None) -> str:
+    """The exact command that shows one row — the way `jarvis search` prints one per hit.
+
+    §4.2: that is what makes the output navigable rather than a dump with extra steps.
+    A match above the first heading has no section ref, so the next step is the toc.
+    `path` must be callable from the cwd (`_spec_callable_path`); and when the caller
+    NAMED a project the command names it too, because without `--project` it re-resolves
+    the scope from the cwd and refuses wherever no registered project owns it.
+    """
+    import shlex
+
+    scope = f" --project {shlex.quote(project)}" if project is not None else ""
+    return f"jarvis spec section{scope} {shlex.quote(path)} {shlex.quote(ref)}" if ref \
+        else f"jarvis spec toc{scope} {shlex.quote(path)}"
+
+
+def spec_toc(path: str, project: str | None = None) -> dict[str, Any]:
+    """What is in this document and how big each part is — `jarvis spec toc` (§4.2).
+
+    `tokens_estimate` carries the word estimate in the key, because §4.1's number is
+    chars // 4: an unlabelled wrong number is worse than a labelled approximate one.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    callable_path = _spec_callable_path(resolved)
+    rows = []
+    for s in spec_index.toc(text):
+        ref = s.number or s.name
+        rows.append({"number": s.number, "name": s.name, "level": s.level,
+                     "line": s.line, "tokens_estimate": s.tokens, "ref": ref,
+                     "command": _spec_command(callable_path, ref, project)})
+    return {"project": name, "root": str(root), "path": rel, "sections": rows,
+            "tokens_estimate": len(text) // 4}
+
+
+def spec_section(path: str, which: str, project: str | None = None) -> dict[str, Any]:
+    """One section of one document — `jarvis spec section` (§4.2).
+
+    A `which` that resolves to nothing names the headings that DO exist, the courtesy
+    `feature_spec` already gives: naming them is the difference between one more call and
+    reading the whole file to find the ref.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    content = spec_index.section(text, which)
+    if content is None:
+        names = [s.name for s in spec_index.toc(text)]
+        headings = ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
+        raise OpsError(
+            f"{which!r} matches no section of {rel}. It carries: "
+            f"{headings or 'no headings at all'}"
+        )
+    return {"project": name, "root": str(root), "path": rel, "which": which,
+            "content": content, "tokens_estimate": len(content) // 4,
+            "command": _spec_command(_spec_callable_path(resolved), which, project)}
+
+
+def spec_search(words: str, project: str | None = None,
+                limit: int = 40) -> dict[str, Any]:
+    """Which SECTIONS of one project's documents match — `jarvis spec search` (§4.2).
+
+    One project's tree and never a union: a scan whose cost grows with the fleet would be
+    a different feature, and the caller who wants two projects runs the command twice.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    hits = spec_index.search(root, words, limit=limit)
+    # `h.path` is root-relative for DISPLAY; the command needs one callable from the cwd.
+    base = root.resolve()
+    rows = [{"path": h.path, "section": h.section, "line": h.line, "context": h.context,
+             "command": _spec_command(_spec_callable_path((base / h.path).resolve()),
+                                      h.section, project)} for h in hits]
+    return {"project": name, "root": str(root), "words": words, "limit": limit,
+            "count": len(rows), "truncated": len(rows) >= limit, "hits": rows}
+
+
 def cold_prefix_floor(project: str | None = None) -> int | None:
     """`os.cold_prefix_floor` if a catalog can be reached, else None.
 
