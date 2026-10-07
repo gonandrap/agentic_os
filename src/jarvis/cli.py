@@ -617,14 +617,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = spec_p.add_parser("toc", help="every heading of one document, with an ESTIMATE "
                                        "of each section's size")
-    sp.add_argument("path", help="a path inside the project (relative to its root)")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
     sp.add_argument("--project", help="one project, by name (default: the one owning the "
                                       "current directory)")
     sp.add_argument("--json", action="store_true")
 
     sp = spec_p.add_parser("section", help="one section of one document, by number or by "
                                            "heading substring")
-    sp.add_argument("path", help="a path inside the project (relative to its root)")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
     sp.add_argument("which", help="a section number (`4`, `4.2`) or part of its heading")
     sp.add_argument("--project", help="one project, by name (default: the one owning the "
                                       "current directory)")

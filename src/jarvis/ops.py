@@ -12605,16 +12605,34 @@ def _spec_file(root: Path, path: str) -> tuple[Path, str]:
     return resolved, resolved.relative_to(base).as_posix()
 
 
-def _spec_command(path: str, ref: str) -> str:
+def _spec_callable_path(resolved: Path) -> str:
+    """A path string that opens `resolved` FROM THE CALLER'S CWD, for the printed command.
+
+    `_spec_file` reads a relative path from the cwd, so the ROOT-RELATIVE string the
+    payload displays opens a different file — or none at all — from any cwd but the root,
+    and §4.2's "exact command that shows it" is the whole point of the payload. Relative
+    while it stays under the cwd, absolute the moment it would need a `..` component: a
+    worker runs in a git worktree, where a `.jarvis/features/…` hit does not exist and a
+    `docs/…` hit would silently open the worktree's own copy of the document.
+    """
+    rel = os.path.relpath(resolved, os.getcwd())
+    return str(resolved) if ".." in Path(rel).parts else rel
+
+
+def _spec_command(path: str, ref: str, project: str | None = None) -> str:
     """The exact command that shows one row — the way `jarvis search` prints one per hit.
 
     §4.2: that is what makes the output navigable rather than a dump with extra steps.
     A match above the first heading has no section ref, so the next step is the toc.
+    `path` must be callable from the cwd (`_spec_callable_path`); and when the caller
+    NAMED a project the command names it too, because without `--project` it re-resolves
+    the scope from the cwd and refuses wherever no registered project owns it.
     """
     import shlex
 
-    return f"jarvis spec section {shlex.quote(path)} {shlex.quote(ref)}" if ref \
-        else f"jarvis spec toc {shlex.quote(path)}"
+    scope = f" --project {shlex.quote(project)}" if project is not None else ""
+    return f"jarvis spec section{scope} {shlex.quote(path)} {shlex.quote(ref)}" if ref \
+        else f"jarvis spec toc{scope} {shlex.quote(path)}"
 
 
 def spec_toc(path: str, project: str | None = None) -> dict[str, Any]:
@@ -12628,12 +12646,13 @@ def spec_toc(path: str, project: str | None = None) -> dict[str, Any]:
     name, root = _spec_scope(project)
     resolved, rel = _spec_file(root, path)
     text = resolved.read_text(encoding="utf-8", errors="replace")
+    callable_path = _spec_callable_path(resolved)
     rows = []
     for s in spec_index.toc(text):
         ref = s.number or s.name
         rows.append({"number": s.number, "name": s.name, "level": s.level,
                      "line": s.line, "tokens_estimate": s.tokens, "ref": ref,
-                     "command": _spec_command(rel, ref)})
+                     "command": _spec_command(callable_path, ref, project)})
     return {"project": name, "root": str(root), "path": rel, "sections": rows,
             "tokens_estimate": len(text) // 4}
 
@@ -12660,7 +12679,7 @@ def spec_section(path: str, which: str, project: str | None = None) -> dict[str,
         )
     return {"project": name, "root": str(root), "path": rel, "which": which,
             "content": content, "tokens_estimate": len(content) // 4,
-            "command": _spec_command(rel, which)}
+            "command": _spec_command(_spec_callable_path(resolved), which, project)}
 
 
 def spec_search(words: str, project: str | None = None,
@@ -12674,8 +12693,11 @@ def spec_search(words: str, project: str | None = None,
 
     name, root = _spec_scope(project)
     hits = spec_index.search(root, words, limit=limit)
+    # `h.path` is root-relative for DISPLAY; the command needs one callable from the cwd.
+    base = root.resolve()
     rows = [{"path": h.path, "section": h.section, "line": h.line, "context": h.context,
-             "command": _spec_command(h.path, h.section)} for h in hits]
+             "command": _spec_command(_spec_callable_path((base / h.path).resolve()),
+                                      h.section, project)} for h in hits]
     return {"project": name, "root": str(root), "words": words, "limit": limit,
             "count": len(rows), "truncated": len(rows) >= limit, "hits": rows}
 

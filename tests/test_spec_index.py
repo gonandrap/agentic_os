@@ -274,6 +274,25 @@ def test_no_project_and_a_cwd_outside_every_project_names_the_fix(registered, tm
     assert "--project" in str(e.value)
 
 
+def _execute(command: str) -> dict:
+    """Run an emitted `jarvis spec section …` string the way a reader would type it.
+
+    Parsing it and calling `ops` is the whole test: a command that only PARSES can still
+    open a different file, which is what a root-relative path does from any cwd but the
+    root. The parser runs too, since `ops` alone would accept a `--project` placed where
+    argparse rejects it.
+    """
+    tokens = shlex.split(command)
+    assert tokens[:3] == ["jarvis", "spec", "section"], command
+    cli.build_parser().parse_args(tokens[1:])
+    rest = tokens[3:]
+    project = None
+    if rest and rest[0] == "--project":
+        project, rest = rest[1], rest[2:]
+    path, ref = rest
+    return ops.spec_section(path, ref, project=project)
+
+
 def test_a_relative_path_is_read_from_the_cwd_and_reported_root_relative(registered,
                                                                          monkeypatch):
     """A worker's worktree sits under the root, so a root-relative base reads MAIN's copy.
@@ -288,8 +307,58 @@ def test_a_relative_path_is_read_from_the_cwd_and_reported_root_relative(registe
     out = ops.spec_toc("doc.md")
     assert [s["name"] for s in out["sections"]] == ["The copy beside the caller"]
     assert out["path"] == "sub/doc.md"
-    # shlex, not split: the ref is an unnumbered heading, so the command quotes it.
-    cli.build_parser().parse_args(shlex.split(out["sections"][0]["command"])[1:])
+    row = out["sections"][0]
+    assert _execute(row["command"])["content"].startswith("# The copy beside the caller")
+
+
+def test_an_emitted_toc_command_opens_that_row_from_the_callers_cwd(registered,
+                                                                    monkeypatch):
+    """§4.2's "exact command that shows it": it must run from the cwd that printed it."""
+    sub = registered / "sub"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    out = ops.spec_toc("../docs/specs/exporter.md")
+    assert out["path"] == "docs/specs/exporter.md"
+    for row in out["sections"][1:4]:
+        first = _execute(row["command"])["content"].splitlines()[0]
+        assert first.endswith(row["name"]), (row["command"], first)
+
+
+def test_an_emitted_search_command_opens_a_hit_in_another_directory(registered,
+                                                                   monkeypatch):
+    """The hit's DISPLAY path is root-relative; the command's must be callable.
+
+    The hit lives in `docs/specs/`, the caller in `sub/`, so a root-relative string in
+    the command resolves to nothing at all.
+    """
+    sub = registered / "sub"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    found = ops.spec_search("separable piece")
+    assert found["hits"]
+    hit = found["hits"][0]
+    assert hit["path"].startswith("docs/specs/")
+    content = _execute(hit["command"])["content"]
+    assert content.startswith("#") and hit["context"] in content, hit["command"]
+
+
+def test_an_emitted_command_names_the_project_the_caller_named(registered, tmp_path,
+                                                               monkeypatch):
+    """`--project` plus an absolute path: from outside every root, nothing else resolves."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    # Absolute: from outside every root a relative path reads nothing, as `_spec_file` says.
+    toc = ops.spec_toc(str(registered / "docs" / "specs" / "exporter.md"),
+                       project="proj_a")
+    row = toc["sections"][1]
+    assert "--project proj_a" in row["command"]
+    assert _execute(row["command"])["content"].splitlines()[0].endswith(row["name"])
+
+    hit = ops.spec_search("separable piece", project="proj_a")["hits"][0]
+    assert "--project proj_a" in hit["command"]
+    content = _execute(hit["command"])["content"]
+    assert content.startswith("#") and hit["context"] in content, hit["command"]
 
 
 def test_a_symlink_out_of_the_tree_is_refused_naming_the_root(registered, tmp_path):
