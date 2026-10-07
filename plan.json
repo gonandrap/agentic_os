@@ -8,7 +8,7 @@
       "spec_section": "3",
       "description": "Lands first and owns the two classifiers a sibling consumes, so there is exactly one body. Your files: `navigation.py`, `nav_volume.py`, `cli._print_navigation`. Do NOT touch `hooks.py` — you add the classifiers, another child calls them from a refusal. Do not create `spec_index.py`, do not edit `dispatch.py`, `worker_brief.py` or `cli.py`'s subparsers, add no dashboard route, and create no catalog key. Done when `uv run pytest tests/test_navigation.py tests/test_nav_volume.py tests/test_inspection.py tests/test_autopsy.py -q` is green with every existing test in them unmodified.",
       "needs": [],
-      "acceptance": "jarvis navigation --project jarvis_os --days 36500 and its --json print the new figures alongside, not instead of, the existing ones, and the payload carries both BEFORE_NOTE and DOC_BEFORE_NOTE."
+      "acceptance": "jarvis navigation --project jarvis_os --days 36500 and its --json print the new figures alongside, not instead of, the existing ones, and the payload carries both BEFORE_NOTE and DOC_BEFORE_NOTE. AND dumps_doc owns the range: with no limit_lines it is True for a ranged sed of a .md (counters count every dump) and False at limit_lines=200, and _dump_span returns 41 / 40 / None for sed -n '40,80p' / head -40 / cat."
     },
     {
       "key": "speccli",
@@ -24,7 +24,7 @@
       "spec_section": "5",
       "description": "`navigation.is_spec_path` and `navigation.dumps_doc` are already on your branch — CALL them, never re-spell them, and edit neither `navigation.py` nor any counter in `nav_volume.py`. In `dispatch.py` your edit is the env block beside JARVIS_PY_NAV_HOOK at line 215 and nothing else: another child owns the spec prose at lines 456-467 and will conflict if you stray. Do not touch `spec_index.py`, `cli.py`, `worker_brief.py` or `concision.py`. Nothing ships on, so merging this changes no running worker's behaviour and the paired on/off assertion is the whole of your proof.",
       "needs": ["measure"],
-      "acceptance": "New tests/test_doc_nav_hook.py, modelled on tests/test_py_nav_hook.py, with every reachability assertion made through hooks.preflight_decision rather than through the decision function. AND: the read limit resolves from the catalog, not from a module constant — worker.doc_read_limit_lines gets the same seven wiring rows as worker.doc_nav_hook, and a project setting it to a value other than 200 flips a borderline Read's verdict. The .py arm has NO threshold and grows none: a Read with no limit is refused, the same Read with limit=4000 passes."
+      "acceptance": "New tests/test_doc_nav_hook.py, modelled on tests/test_py_nav_hook.py, with every reachability assertion made through hooks.preflight_decision rather than through the decision function. AND: the read limit resolves from the catalog, not from a module constant — worker.doc_read_limit_lines gets the same seven wiring rows as worker.doc_nav_hook, and a project setting it to a value other than 200 flips a borderline Read's verdict. The .py arm has NO threshold and grows none: a Read with no limit is refused, the same Read with limit=4000 passes. AND the SAME resolved bar governs both doc arms: section 5.4's matrix is seven inputs by two switch states, with sed -n '40,80p' and head -40 of a spec PASSING beside the sed -n '1,2000p' deny. A blanket Bash refusal fails this child."
     },
     {
       "key": "brief",

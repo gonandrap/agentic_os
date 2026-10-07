@@ -45,8 +45,10 @@ Five readings decide the whole design:
 with no `limit` key, and every cheap one carries a small `limit`. 1,422 `.py` reads at
 `limit<=200` average 873 tokens; 133 at `limit=none` average 3,662. So "is this a whole
 file read" is answerable from `tool_input` alone — no `stat`, no line count, no disk
-access, no latency added to any `Read`. A threshold on `limit` is the secondary arm, for
-`limit>200`.
+access, no latency added to any `Read`. A threshold on the named range is the SECOND arm,
+and §5.1 says where it applies and where it must not: markdown has one, because a ranged
+dump of a spec is a measured evasion (reading (c)); `.py` has NONE, because this reading
+already separates its two populations.
 
 **(b) `.md` whole-file reads are 1.03M tokens over 199 calls.** 199 calls is a small
 number and 5,187 tokens each is why it matters: these are the 82 specs under `docs/specs`
@@ -212,12 +214,32 @@ DOC_DUMP_COMMANDS: tuple[str, ...] = ("cat", "head", "sed")
 
 def dumps_doc(command: str,
               suffixes: tuple[str, ...] = DOC_SUFFIXES,
-              commands: tuple[str, ...] = DOC_DUMP_COMMANDS) -> bool:
-    """Whether this Bash command DUMPS a markdown file."""
+              commands: tuple[str, ...] = DOC_DUMP_COMMANDS,
+              *,
+              limit_lines: int | None = None) -> bool:
+    """Whether this Bash command DUMPS a markdown file.
+
+    limit_lines=None COUNTS EVERY DUMP, ranged or not — what nav_volume wants.
+    An int narrows to the ones worth refusing: unranged, or naming a range
+    WIDER than it. §2.2's rule — the narrowing is a keyword argument at the
+    hook's call site, never an edit to the counted body.
+    """
+
+def _dump_span(command: str) -> int | None:
+    """Lines a dump NAMES: 41 for sed -n '40,80p', 40 for head -40, None for
+    cat or a bare head. THE ONE EXTRACTOR, and module-private."""
 
 def is_spec_path(path: str) -> bool:
     """§2.3's three-valued test. The ONE spelling."""
 ```
+
+**`dumps_doc` EXTRACTS THE RANGE, `doc_nav_decision` DOES NOT.** The decision function
+passes the resolved bar in and reads a bool out; it never parses a `sed` expression itself.
+A second extractor in `hooks.py` is the copied body §2.2 forbids, and it would make the
+counter and the refusal disagree about what "40 lines" means. `_dump_span` is where the
+`-n '40,80p'`, `-n '40p'`, `head -40`, `head -n 40` and `cat` cases are decided, once.
+`None` from `_dump_span` means UNRANGED, which is a whole-file dump and is always over any
+bar — do not spell it as zero.
 
 `dumps_doc` reuses `_mask_shell_text`, `_statements`, `_command_word` and `_reads_with_sed`
 by calling them — a `.md` inside a quoted string is prose, and `sed` without `-n` is an
@@ -241,9 +263,13 @@ meaning (§2.2).
 read_tool_bytes: int        # the Read tool's own result bytes
 doc_read_bytes: int         # ...of a .md path
 whole_file_read_calls: int  # Read with no `limit` in its input
-doc_dump_bash_calls: int    # Bash that `dumps_doc`
+doc_dump_bash_calls: int    # Bash that `dumps_doc`, with NO limit_lines
 doc_dump_bash_bytes: int
 ```
+
+The counter passes no `limit_lines` and therefore counts EVERY dump, ranged or not. That is
+deliberate: the baseline has to include the 40-line reads the hook will go on allowing, or
+the AFTER figure would show a drop the refusal never caused.
 
 plus a per-tool result-byte breakdown, which nothing in the tree reports today
 (`inspection.tool_profile` is per-tool SECONDS, and wo-38456776's fleet cost view is
@@ -281,6 +307,12 @@ for this payload (`_print_navigation` lives only in `cli.py`), so this is CLI-on
   it calls is unchanged, so no branch and no helper was added to it.
 - AST enclosure over `FunctionDef dumps_doc`: `_sweeps_the_tree` is NOT among the names it
   calls, and behaviourally `dumps_doc("find docs -name '*.md'")` is False.
+- `dumps_doc` with NO `limit_lines` is unchanged by the keyword's existence: the ranged
+  `sed -n '40,80p' docs/x.md` is True there (`nav_volume` counts every dump) and False at
+  `limit_lines=200`. Both halves, or the keyword is untested on the side that matters.
+- `_dump_span` over a table: `sed -n '40,80p'` is 41, `sed -n '40p'` is 1, `head -40` and
+  `head -n 40` are 40, `cat` and bare `head` are `None`. `None` is UNRANGED and must not
+  compare as zero — a `limit_lines=200` call on `cat docs/x.md` is True.
 - `DOC_SUFFIXES is not SOURCE_SUFFIXES`, `dumps_doc is not navigates_source`, and
   `navigates_source("cat README.md", SOURCE_SUFFIXES) is False` — that last assertion
   already lives inside
@@ -371,9 +403,16 @@ SYMLINKS ARE RESOLVED BEFORE THE CONTAINMENT TEST: `Path(p).resolve()` against
 test is passed by a symlink inside the tree pointing out of it, which is the whole shape of
 the bug. The pin in §4.4 is a link, not a `../`.
 
-`search` defaults to the CURRENT project's tree; a wide scope is explicit, because 82
-files and 1.4MB is a sub-second regex scan per project and the fleet-wide cost is
-unmeasured.
+`search` defaults to the CURRENT project's tree; 82 files and 1.4MB is a sub-second regex
+scan, and the fleet-wide cost is unmeasured.
+
+`--project <other>` IS BOUNDED THE SAME WAY, one project at a time and never a union. It
+resolves that project's root through the catalog — the same lookup `ops` already uses, so
+an unknown name exits non-zero naming it rather than scanning anything — and then the
+`root.resolve()` containment of §4.2 applies to THAT root. There is no `--all`, no
+`--project a,b` and no default-to-every-project: a scan whose cost grows with the fleet
+would be a different feature, and the caller who wants two projects runs the command twice.
+`limit` (default 40) caps the hits so one query cannot return a dump either.
 
 ### 4.3 The contract the other sections depend on
 
@@ -405,6 +444,9 @@ They are repeated as literals in `hooks.py` rather than imported: §2.1's rule a
   fixture is where this suite goes vacuous.
 - `hooks.is_jarvis_command_chain('jarvis spec search "a|b"')` is `False`, and the `--help`
   text says so.
+- `search --project <unknown>` exits non-zero naming the project and scans nothing, and
+  there is no flag that scans two projects: assert the argparse surface has no `--all` and
+  rejects a comma-separated `--project`.
 - Path traversal: a path outside the resolved project root exits non-zero naming the root
   it refused to leave — asserted with a SYMLINK inside the tree whose target is outside it,
   not with a `../` string. The `../` case is passed by a prefix test that the symlink
@@ -434,8 +476,14 @@ why: every expensive `.py` `Read` passed no `limit` (487,048 tok over 133 calls)
 cheap one passed a small one (1,242,656 tok over 1,422 calls), so `limit is None` already
 separates the two populations and a number added on top would be an unkeyed threshold
 earning nothing. Markdown is the opposite case and that is why it has a key: a ranged
-`sed -n '1,2000p'` of a spec is the measured evasion (§1(b)), so the doc arm needs a bar
-and the bar is `worker.doc_read_limit_lines`. One threshold in this feature, one key.
+`sed -n '1,2000p'` of a spec is the measured evasion (§1(c) — 1.25M tokens over 2,189 Bash
+calls, more than the whole-file `Read` figure in §1(b)), so the doc arm needs a bar and the
+bar is `worker.doc_read_limit_lines`. One threshold in this feature, one key.
+
+THAT BAR GOVERNS BOTH DOC ARMS, `Read` AND `Bash`. The evasion that justifies it is a
+`Bash` one, so a bar applied only to `Read` would leave the justifying case ungoverned
+while refusing `head -40 docs/specs/x.md` — 317 tokens a call by §1's table, against a
+whole turn for the refusal. §5.2 states both arms in the same terms.
 
 The `.py` `Read` arm goes INSIDE the existing `py_nav_decision` — same
 `_PY_NAV_DENY` text, same `JARVIS_WO_ID` gate, same `.serena/project.yml` precondition —
@@ -467,8 +515,25 @@ It denies when, and only when:
 - `tool_name == "Read"`, `navigation.is_spec_path(file_path)`, and `tool_input` has no
   `limit` key, or a `limit` over the RESOLVED `worker.doc_read_limit_lines` (read from the
   environment, never from a constant in `hooks.py`); or
-- `tool_name == "Bash"` and `navigation.dumps_doc(command)` — but only for a command whose
-  named `.md` paths are all `is_spec_path`.
+- `tool_name == "Bash"` and `navigation.dumps_doc(command, limit_lines=<the SAME resolved
+  number>)` — but only for a command whose named `.md` paths are all `is_spec_path`.
+
+THE TWO ARMS USE ONE BAR AND THE SAME ONE. Both read the resolved
+`worker.doc_read_limit_lines`; neither carries a number of its own. So, with the bar at its
+fallback 200:
+
+| command | verdict | why |
+|---|---|---|
+| `cat docs/specs/x.md` | DENY | unranged, whole file |
+| `head docs/specs/x.md` | DENY | bare `head`, no range named |
+| `sed -n '1,2000p' docs/specs/x.md` | DENY | 2,000 > 200 |
+| `head -40 docs/specs/x.md` | **PASS** | 40 <= 200 |
+| `sed -n '40,80p' docs/specs/x.md` | **PASS** | 41 <= 200 |
+| `grep -rn "words" docs/` | PASS | not a dump command, ever (§1.1) |
+
+A SMALL TARGETED DUMP IS NOT AN EVASION AND REFUSING IT IS THE BRIEF'S MUST NOT. §1's
+table prices `head … .md` at 317 tokens a call; a refusal costs a whole turn. The arm
+exists for the 2,000-line range, not for the 40-line one.
 
 A missing `limit` is whole-file: that is §1(a)'s finding and the reason this hook adds no
 disk access to any `Read`. Verify the `Read` `tool_input` shape (`file_path`, `offset`,
@@ -510,16 +575,26 @@ the test that matters is the one that sets a per-project value and sees the hook
 ### 5.4 What this section must prove
 
 The DONE WHEN's mechanical half, and it belongs in this PR because a refusal whose test
-lands later is a refusal nobody verified: a whole-file `Read` of a spec is refused, a
-40-line targeted read of the same file passes, a `grep -rn` over `docs/` passes, a
-`sed -n '1,2000p'` of a spec is refused, and a `Read` of
-`.jarvis/features/fo-x/sections/wo-y.md` passes at any size.
+lands later is a refusal nobody verified. SEVEN inputs, and the three that PASS on the Bash
+side are the ones that keep this feature inside its MUST NOT:
 
-Those five verdicts are the key-`on` column. The key-`off` column is not "the same five
-again": with `JARVIS_DOC_NAV_HOOK` `off` or absent, `doc_nav_decision` returns `None` for
-ALL FIVE INPUTS, including the two it denies when `on`. Write the matrix as five inputs by
-two switch states and assert ten cells, so the pair that flips is visible. §5.5's
-reachability pins are a different axis and do not substitute for this one.
+| input | key `on` | key `off` |
+|---|---|---|
+| `Read docs/specs/x.md`, no `limit` | DENY | `None` |
+| `Read docs/specs/x.md`, `limit=40` | pass | `None` |
+| `Bash sed -n '1,2000p' docs/specs/x.md` | DENY | `None` |
+| `Bash sed -n '40,80p' docs/specs/x.md` | **pass** | `None` |
+| `Bash head -40 docs/specs/x.md` | **pass** | `None` |
+| `Bash grep -rn "words" docs/` | pass | `None` |
+| `Read .jarvis/features/fo-x/sections/wo-y.md`, any size | pass | `None` |
+
+Fourteen cells, and write them as seven inputs by two switch states rather than as two
+lists. The key-`off` column is not "the same seven again": with `JARVIS_DOC_NAV_HOOK` `off`
+or absent, `doc_nav_decision` returns `None` for ALL SEVEN, including the two it denies
+when `on`, so the pair that flips is only visible as a matrix. A suite that exercises the
+40-line pass through `Read` ALONE is the hole this section exists to close: a blanket Bash
+refusal ships green through it. §5.5's reachability pins are a different axis and do not
+substitute for this one.
 
 SEVENTH, for §5.1's threshold-free `.py` arm: a `Read` of a `.py` with no `limit` is
 refused and a `Read` of the SAME file with `limit=4000` passes. A test that only exercises
@@ -528,8 +603,10 @@ a small `limit` cannot tell "no threshold" from "a threshold someone will add la
 SIXTH, and it is the one that proves §5.3's second key is wired rather than declared: a
 project whose catalog sets `worker.doc_read_limit_lines` to a value OTHER than 200 gets
 that number honoured by `doc_nav_decision` — a `Read` with a `limit` between the project's
-value and 200 flips its verdict when the key changes. A test that only exercises the
-fallback cannot tell a resolved setting from a hardcoded one. Also pin
+value and 200 flips its verdict when the key changes — and the `Bash` arm flips with it, on
+a `sed -n` range in the same window. A test that only exercises the fallback cannot tell a
+resolved setting from a hardcoded one, and one that flips only the `Read` arm cannot tell
+one shared bar from two. Also pin
 `_write_worker_settings` writing the resolved number, and both validations refusing a
 non-integer and a zero while naming the key.
 
@@ -553,7 +630,10 @@ below goes through `hooks.preflight_decision`, not through the decision function
 - `tests/test_py_nav_hook.py::test_py_nav_runs_after_the_investigator_refusal` pins that an
   investigator's refusal wins over a navigation one; the equivalent holds for the new arms.
 - AST enclosure over `doc_nav_decision`: it CALLS `is_spec_path` and `dumps_doc`, and no
-  local `startswith`, `"docs" in` literal or `re.compile` stands in for either.
+  local `startswith`, `"docs" in` literal or `re.compile` stands in for either. The same
+  walk pins that it does NOT parse a range: no `"p"`-stripping, no `split(",")` and no
+  `re` at all in that body. The range comes from `navigation._dump_span` through
+  `dumps_doc(limit_lines=...)` or the counter and the refusal will disagree.
 - AST enclosure over both `doc_nav_decision` and `py_nav_decision`: `_allow` is called in
   neither. Today that contract is only a docstring claim.
 - No import of `spec_index` or `catalog` anywhere in `hooks.py`, and §4.3's three command
