@@ -2532,13 +2532,22 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
                  f"({row['code_nav_bash_calls']} on code)  "
                  f"{row['read_tool_calls']:>4} Read"
                  if payload.get("calls_reported", True) else "")
+        # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
+        # the payload's flag, BYTE counters always.
+        doc_calls = (f"  {row['whole_file_read_calls']:>4} whole-file Read  "
+                     f"{row['doc_dump_bash_calls']:>4} doc dumps"
+                     if payload.get("calls_reported", True) else "")
         print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
-              f"{row['transcripts']:>4} transcripts{calls}")
+              f"{row['transcripts']:>4} transcripts{calls}{doc_calls}")
         print(f"{indent}           code reads via bash: {share_text} of "
               f"{_tok(row['result_bytes'])} bytes of tool results"
               + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
                  if row["unattributed_bytes"] else ""))
+        print(f"{indent}           docs: {_tok(row['doc_read_bytes'])} bytes via Read · "
+              f"{_tok(row['doc_dump_bash_bytes'])} bytes dumped via bash · "
+              f"{_tok(row['read_tool_bytes'])} bytes of Read results")
     print(f"{indent}  {payload['before']}")
+    print(f"{indent}  {payload['doc_before']}")
 
 
 def cmd_navigation(args: argparse.Namespace) -> int:
