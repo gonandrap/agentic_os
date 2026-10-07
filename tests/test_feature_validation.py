@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import claude_cli, ops, validation
+from jarvis import branchproof, claude_cli, evidence, ops, validation
 from jarvis.catalog import load_catalog
 from jarvis.daemon import (FEATURE_HANDOFF_EVENT, FEATURE_MANAGER_SILENT,
                            FEATURE_MANAGER_STALLED,
@@ -1659,3 +1659,267 @@ def test_a_refused_feature_round_escalates_once_and_burns_no_outage_retry(fleet)
     # session rather than at the rounds (`_feature_refused`).
     assert fo_id in rows[0]["title"] and rows[0]["wo_id"] is None
     assert "os.max_os_prompt_chars" in rows[0]["body"]
+
+
+# -- the head a round judges must contain the children's merges -----------------------
+#
+# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+
+
+def _dangling_commit(fleet) -> str:
+    """A real commit that is NOT reachable from the default branch — a child merged
+    somewhere else, or merged after the local ref was last fetched."""
+    before = _git(fleet.project, "rev-parse", "HEAD").strip()
+    sha = fleet.merge("sidecar.py", "sidecar = 1\n")
+    _git(fleet.project, "reset", "--hard", before)
+    return sha
+
+
+def _pr_merged(store: ProjectStore, child_id: str, sha: str,
+               *, minutes_ago: float = 0.0) -> None:
+    """What the merge poller records when a child's pull request lands."""
+    store.add_event(child_id, "pr_merged", {"merge_commit": sha},
+                    ts=time.time() - minutes_ago * 60)
+
+
+def _defers(fleet, store, fo_id: str) -> bool:
+    return fleet.daemon._route_to_validation(fleet.spec, store,
+                                             store.get_feature_order(fo_id))
+
+
+def _landed_feature(fleet, store, *keys: str) -> str:
+    """A feature whose children have all completed over a real merge on the head."""
+    fo_id = fleet.release("CSV export", *(keys or ("one",)))
+    fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+    fleet.land_children(fo_id, store)
+    return fo_id
+
+
+def test_the_default_branch_is_fetched_before_a_feature_is_collected(fleet, monkeypatch):
+    """§1. The judged head was as stale as the last unrelated `git fetch` anyone happened
+    to run in the checkout — nothing on the path fetched. ORDER IS THE ASSERTION: a fetch
+    after collection answers about a commit nobody judged."""
+    calls: list[tuple] = []
+    real_collect = evidence.collect_feature
+    monkeypatch.setattr(branchproof, "fetch",
+                        lambda repo, *refs: calls.append(("fetch", repo, refs)) or True)
+
+    def collect(*a, **kw):
+        calls.append(("collect",))
+        return real_collect(*a, **kw)
+
+    monkeypatch.setattr(evidence, "collect_feature", collect)
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+
+        fleet.daemon.settle_features(fleet.spec, store)
+
+        assert [c[0] for c in calls] == ["fetch", "collect"]
+        assert calls[0][1] == fleet.project
+        assert calls[0][2] == (evidence.base_ref(fleet.project),), (
+            "the fetch guessed a branch the collector did not judge")
+        assert store.get_feature_order(fo_id)["status"] == "validating"
+    finally:
+        store.close()
+
+
+def test_a_failed_fetch_is_logged_and_the_round_still_opens(fleet, monkeypatch):
+    """§1. A project with no network must still be able to validate; §2's check is what
+    catches the stale case regardless of why the fetch failed."""
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+
+        fleet.daemon.settle_features(fleet.spec, store)
+
+        assert store.get_feature_order(fo_id)["status"] == "validating"
+        assert [r["round"] for r in store.validation_rounds(fo_id=fo_id)] == [1]
+    finally:
+        store.close()
+
+
+def test_a_child_whose_merge_is_not_in_the_head_defers_the_round(fleet):
+    """§2. The measured failure of fo-ac00376e round 1: the panel was shown a head that
+    predated a child's merge and reported the child's work as missing."""
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        _pr_merged(store, child["id"], _dangling_commit(fleet))
+
+        assert _defers(fleet, store, fo_id) is True
+
+        assert store.validation_rounds(fo_id=fo_id) == []
+        fo = store.get_feature_order(fo_id)
+        assert fo["status"] == "executing"
+        # Waiting is the system working, and the OS's rule is that waiting never flags.
+        assert fo["needs_attention"] == 0
+    finally:
+        store.close()
+
+
+def test_settle_features_does_not_complete_a_deferred_feature(fleet):
+    """§2. The whole tick, not `_route_to_validation`: `True` means "dealt with, leave it
+    alone", and a `False` return here would COMPLETE the feature unjudged — strictly worse
+    than the false rejection this spec fixes."""
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        _pr_merged(store, child["id"], _dangling_commit(fleet))
+
+        fleet.tick()
+
+        assert store.get_feature_order(fo_id)["status"] == "executing"
+        assert store.validation_rounds(fo_id=fo_id) == []
+        assert fleet.daemon.validator.calls == []
+    finally:
+        store.close()
+
+
+def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet):
+    """§3. A child merged into a sibling branch never becomes an ancestor of that head, so
+    an unbounded deferral parks the feature silently — issue #881's failure mode."""
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        commit = _dangling_commit(fleet)
+        waited = fleet.spec.validation.feature_merge_wait_minutes + 1
+        _pr_merged(store, child["id"], commit, minutes_ago=waited)
+
+        assert _defers(fleet, store, fo_id) is True
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["needs_attention"] == 1
+        reason = fo["attention_reason"]
+        # Three things, because each points at a different remedy.
+        assert child["id"] in reason
+        assert commit in reason
+        assert evidence.default_branch_head(fleet.project) in reason
+        assert store.validation_rounds(fo_id=fo_id) == []
+        assert fo["status"] == "executing"
+    finally:
+        store.close()
+
+
+def test_one_defer_event_per_distinct_state(fleet):
+    """§3. A per-tick event would write a row a minute for fifteen minutes and then for
+    ever; crossing the bound IS news and gets the second row."""
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        commit = _dangling_commit(fleet)
+        _pr_merged(store, child["id"], commit)
+
+        assert _defers(fleet, store, fo_id) is True
+        assert _defers(fleet, store, fo_id) is True
+
+        events = ops.feature_events_of_kind(store, fo_id,
+                                            Daemon.VALIDATION_DEFER_EVENT)
+        assert len(events) == 1
+        said = json.loads(events[0]["payload"])
+        assert said["child"] == child["id"] and said["commit"] == commit
+        assert said["head"] == evidence.default_branch_head(fleet.project)
+        assert said["expired"] is False
+
+        store.conn.execute(
+            "UPDATE wo_events SET ts=? WHERE wo_id=? AND kind='pr_merged'",
+            (time.time() - (fleet.spec.validation.feature_merge_wait_minutes + 1) * 60,
+             child["id"]))
+        store.conn.commit()
+
+        assert _defers(fleet, store, fo_id) is True
+        assert _defers(fleet, store, fo_id) is True
+
+        events = ops.feature_events_of_kind(store, fo_id,
+                                            Daemon.VALIDATION_DEFER_EVENT)
+        assert len(events) == 2
+        assert json.loads(events[1]["payload"])["expired"] is True
+    finally:
+        store.close()
+
+
+def test_every_child_integrated_opens_the_round_as_today(fleet):
+    """§2. The no-regression pair: merge commits reachable from the head defer nothing,
+    and a child that delivered without a pull request contributes nothing to check."""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = fleet.release("CSV export", "one", "two")
+        merged = fleet.merge("exporter.py", "def export():\n    return 'a,b'\n")
+        fleet.land_children(fo_id, store)
+        first, second = store.feature_children(fo_id)
+        _pr_merged(store, first["id"], merged)   # landed on the head
+        # `second` has no pr_url and no merge event: it delivered without a PR.
+
+        assert _defers(fleet, store, fo_id) is True
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["status"] == "validating"
+        assert [(r["round"], r["outcome"])
+                for r in store.validation_rounds(fo_id=fo_id)] == [(1, "pending")]
+        assert len(ops.feature_events_of_kind(store, fo_id,
+                                              "validation_submitted")) == 1
+        assert ops.feature_events_of_kind(store, fo_id,
+                                          Daemon.VALIDATION_DEFER_EVENT) == []
+    finally:
+        store.close()
+
+
+def test_a_feature_round_records_the_commit_it_judged(fleet):
+    """§5. `jarvis validation show <fo-id>` printed "commit not recorded" for every round a
+    feature had ever had, so a rejection could not later say what it rejected."""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+
+        fleet.drain()
+
+        head = evidence.default_branch_head(fleet.project)
+        assert head
+        rnd = store.latest_validation_round(fo_id=fo_id)
+        assert rnd["head_sha"] == head
+        assert validator.calls[0]["packet"].head == head
+    finally:
+        store.close()
+
+
+def test_the_judged_commit_is_recorded_on_the_escalate_paths_too(fleet):
+    """§5(b). Written immediately after collection and BEFORE the escalate/void guards:
+    it is a fact about the packet, so an escalation can still say what it was about."""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        baseless = _landed_feature(fleet, store)
+        store.update_feature_order(baseless, base_sha=None)
+        empty = fleet.release("nothing merged", "one")
+        fleet.land_children(empty, store)
+
+        fleet.drain()
+
+        head = evidence.default_branch_head(fleet.project)
+        # A feature with no base resolves no head either (`collect_feature`), so `""` is
+        # the honest record there and the empty-diff round carries the real commit.
+        for fo_id, why, judged in (
+                (baseless, "no recorded base commit", ""),
+                (empty, "nothing has changed on the default branch", head)):
+            rnd = store.latest_validation_round(fo_id=fo_id)
+            assert rnd["outcome"] == "escalated", fo_id
+            assert why in rnd["reason"]
+            assert rnd["head_sha"] == judged, fo_id
+    finally:
+        store.close()

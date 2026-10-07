@@ -6050,9 +6050,21 @@ def submit_feature_for_validation(store: ProjectStore, project_path: Path,
     the last child lands, and `jarvis fo submit` opens every round after that. Neither
     reads the kill switch here; both read it before calling, which is the rule the whole
     design turns on (see `finish`).
+
+    THE FETCH IS HERE, at the point those two callers share, because neither has any
+    reason to want a stale head: in the daemon alone it would leave `jarvis fo submit`
+    judging a stale one for ever, which is the common case for rounds 2+. §1 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
     """
+    from . import branchproof
     from . import evidence as evidence_mod
 
+    # §1: the same ladder the collector resolves its head with, so the fetch cannot bring
+    # down a different branch than the one judged. A failed fetch is not fatal.
+    ref = evidence_mod.base_ref(project_path)
+    if ref and not branchproof.fetch(project_path, ref):
+        log.warning("could not fetch %s in %s — %s is being judged on the local ref as "
+                    "it stands", ref, project_path, fo["id"])
     packet = collect_feature_evidence(store, project_path, fo, declared=declared,
                                       summary=summary, cfg=cfg)
     fo_id = fo["id"]

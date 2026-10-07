@@ -534,6 +534,14 @@ FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
                            "plan promised")
 
+#: What a FEATURE order says when a merged child's commit never reached the head a round
+#: would judge, past the bound. §3 of
+#: docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+FEATURE_CHILD_NOT_INTEGRATED = (
+    "{id}'s merge commit {commit} is not in {head}, the commit on the default branch a "
+    "review would judge — so a panel would report its work as missing. Nothing has been "
+    "judged.")
+
 
 def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The children that fail their feature: ended badly, and not answered for.

@@ -975,3 +975,30 @@ def test_cost_paths_have_an_explicit_apply_class():
     assert any(glob == "*.cost.*" for glob, _ in ops.APPLY_RULES)
     assert ops.apply_class("os.cost.percentile") == "hot"
     assert ops.apply_class("projects.a.cost.week_reset_hour") == "hot"
+
+
+def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide():
+    """§4 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md:
+    how long the reconciler waits for a merged child's commit to appear on the default
+    branch is a per-project habit, so it is a catalog key with this block's ordinary
+    field-level fallback rather than a module constant."""
+    assert (parse_catalog({"projects": []}).os.validation.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    inherits, own = projects_validation(
+        {"feature_merge_wait_minutes": 30}, {},
+        {"validation": {"feature_merge_wait_minutes": 5}})
+    assert inherits.feature_merge_wait_minutes == 30
+    assert own.feature_merge_wait_minutes == 5
+
+    [silent] = projects_validation(None, {})
+    assert (silent.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    # 0 is legal and means "never defer": check once, flag immediately.
+    assert validation_of(
+        {"feature_merge_wait_minutes": 0}).feature_merge_wait_minutes == 0
+    with pytest.raises(CatalogError,
+                       match="os.validation.feature_merge_wait_minutes must be >= 0"):
+        validation_of({"feature_merge_wait_minutes": -1})
