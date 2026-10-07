@@ -97,7 +97,24 @@ NOTES = (
 # The window
 # ---------------------------------------------------------------------------------------
 
-def usage_week(now: float, cfg: CostConfig) -> tuple[float, float]:
+#: The windows a report can be asked for by NAME. §1 of
+#: docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+WEEK = "week"                       #: the Claude usage week
+SESSION = "5h"                      #: the 5-hour grid, anchored on the weekly reset
+WINDOW_NAMES = (WEEK, SESSION)
+
+#: Said in the payload rather than in a renderer, for `NOTES`' reason: nothing in the
+#: codebase or in the usage data records Claude's real 5h session boundary, so a 5h
+#: window here is a SLICE OF THE WEEK and not a claim about Anthropic's accounting (§2).
+SESSION_ANCHOR_NOTE = (
+    "a 5h window is a 5h slice of the usage week, anchored on the weekly reset: no "
+    "table and no transcript records Claude's own session boundary, so stepping back is "
+    "continuous in absolute time and an older window may not align with that week's "
+    "own reset"
+)
+
+
+def usage_week(now: float, cfg: CostConfig, offset: int = 0) -> tuple[float, float]:
     """The Claude usage week containing `now`, as (since, until).
 
     VERIFIED: the week resets Monday 21:00 America/Los_Angeles, so Mon 2026-09-28 21:00
@@ -108,6 +125,10 @@ def usage_week(now: float, cfg: CostConfig) -> tuple[float, float]:
     The arithmetic is done on the LOCAL wall clock and converted once, so a week that
     spans a DST change is still seven local days and still starts at the configured
     hour — absolute arithmetic on an aware datetime would slide the reset by an hour.
+
+    `offset` steps back whole LOCAL weeks for the same reason, so a window spanning a
+    DST change is 167 or 169 absolute hours and still starts at the configured hour
+    (§4 of the window-selector spec).
     """
     zone = ZoneInfo(cfg.week_reset_zone)
     local = datetime.fromtimestamp(now, zone).replace(tzinfo=None)
@@ -115,21 +136,85 @@ def usage_week(now: float, cfg: CostConfig) -> tuple[float, float]:
     start -= timedelta(days=(start.weekday() - cfg.week_reset_weekday) % 7)
     if start > local:
         start -= timedelta(days=7)
+    start += timedelta(days=7 * offset)
     return (start.replace(tzinfo=zone).timestamp(),
             (start + timedelta(days=7)).replace(tzinfo=zone).timestamp())
 
 
-def window_of(since: float | str | None, until: float | str | None, cfg: CostConfig,
-              *, now: float | None = None) -> dict[str, Any]:
-    """The window to report over: the flags if given, else the current usage week."""
-    if since is not None or until is not None:
+def session_window(now: float, cfg: CostConfig,
+                   offset: int = 0) -> tuple[float, float]:
+    """One 5h slice of the usage week — see `SESSION_ANCHOR_NOTE` for the anchor."""
+    week_start, _ = usage_week(now, cfg)
+    length = cfg.session_window_hours * 3600
+    k = math.floor((now - week_start) / length)
+    since = week_start + (k + offset) * length
+    return (since, since + length)
+
+
+def resolve_window(*, window: str | None = None, offset: int = 0,
+                   since: float | str | None = None,
+                   until: float | str | None = None,
+                   cfg: CostConfig, now: float | None = None) -> dict[str, Any]:
+    """THE window resolver — one answer for the CLI, `--json` and the page.
+
+    Exactly one function interprets a window NAME (Neo q1420), and its seven keys are
+    the contract every surface reads. Resolved ONCE per surface and passed to both
+    payload builders: this is a function of `now`, so two calls a few milliseconds apart
+    can land either side of a boundary and the page would show two windows again.
+
+    A BAD PARAMETER IS A REFUSAL, never a silent fallback to the default week: a page
+    that ignored `?window=5x` would report the week while the reader believes they
+    picked 5h, which is the one failure mode a selector must not have (§3).
+    """
+    from jarvis.ops import OpsError
+
+    named = window is not None or offset
+    custom = since is not None or until is not None
+    if named and custom:
+        raise OpsError("--since/--until and --window/--offset are two ways to name the "
+                       "same thing — pass one or the other, not both")
+    if window is not None and window not in WINDOW_NAMES:
+        raise OpsError(f"window must be one of {', '.join(WINDOW_NAMES)} — {window!r} "
+                       f"is not a window this report knows")
+    if offset > 0:
+        raise OpsError(f"offset must be 0 or negative — {offset} names a window that "
+                       f"has not happened yet")
+    if custom:
         start = _as_ts(since) if since is not None else 0.0
         end = _as_ts(until) if until is not None else _now(now)
-        source = "flags"
+        if start >= end:
+            raise OpsError(f"since must be before until — {_stamp(start)} is at or "
+                           f"after {_stamp(end)}, which is an empty window")
+        return _window(start, end, cfg, source="flags", window=None, offset=None)
+    if window == SESSION:
+        start, end = session_window(_now(now), cfg, offset)
+        source = "session-window"
     else:
-        start, end = usage_week(_now(now), cfg)
-        source = "usage-week"
-    return {"since": start, "until": end, "label": _label(start, end), "source": source}
+        start, end = usage_week(_now(now), cfg, offset)
+        # The literal the existing template branch and CLI line already read, kept for
+        # the default so neither changes meaning (§1).
+        source = "usage-week" if not offset else "week-offset"
+    return _window(start, end, cfg, source=source, window=window or WEEK, offset=offset)
+
+
+def window_of(since: float | str | None, until: float | str | None, cfg: CostConfig,
+              *, now: float | None = None) -> dict[str, Any]:
+    """The window to report over: the flags if given, else the current usage week.
+
+    A shim over `resolve_window`, kept because this signature is public: `report` calls
+    it and tests use it. One implementation, no broken caller.
+    """
+    return resolve_window(
+        since=since, until=until,
+        window=None if (since is not None or until is not None) else WEEK,
+        cfg=cfg, now=now)
+
+
+def _window(since: float, until: float, cfg: CostConfig, *, source: str,
+            window: str | None, offset: int | None) -> dict[str, Any]:
+    return {"since": since, "until": until, "label": _label(since, until),
+            "local_label": _local_label(since, until, cfg), "source": source,
+            "window": window, "offset": offset}
 
 
 def _now(now: float | None) -> float:
@@ -146,6 +231,25 @@ def _label(since: float, until: float) -> str:
     fmt = "%Y-%m-%d %H:%M"
     return (f"{datetime.fromtimestamp(since, timezone.utc).strftime(fmt)} to "
             f"{datetime.fromtimestamp(until, timezone.utc).strftime(fmt)} UTC")
+
+
+def _stamp(when: float) -> str:
+    return datetime.fromtimestamp(when, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _local_label(since: float, until: float, cfg: CostConfig) -> str:
+    """The same span in `week_reset_zone` — the clock the reset is specified in.
+
+    BOTH abbreviations when the ends differ: a single `%Z` across a DST transition is a
+    label that is wrong at one end (§4).
+    """
+    zone = ZoneInfo(cfg.week_reset_zone)
+    start, end = datetime.fromtimestamp(since, zone), datetime.fromtimestamp(until, zone)
+    fmt = "%Y-%m-%d %H:%M"
+    if start.tzname() != end.tzname():
+        return (f"{start.strftime(fmt)} {start.tzname()} to "
+                f"{end.strftime(fmt)} {end.tzname()}")
+    return f"{start.strftime(fmt)} to {end.strftime(fmt)} {end.tzname()}"
 
 
 # ---------------------------------------------------------------------------------------
@@ -977,15 +1081,28 @@ def cost_config(project: str | None = None) -> CostConfig:
 
 
 def report(*, project: str | None = None, since: float | str | None = None,
-           until: float | str | None = None, now: float | None = None,
+           until: float | str | None = None, window: str | None = None,
+           offset: int = 0, resolved: dict[str, Any] | None = None,
+           now: float | None = None,
            home: Path | None = None) -> dict[str, Any]:
-    """The whole `fleet` payload. One computation for the CLI, `--json` and the page."""
+    """The whole `fleet` payload. One computation for the CLI, `--json` and the page.
+
+    `resolved` is a window `resolve_window` already returned — the page resolves ONCE
+    and hands the same dict to both payload builders (§6). It wins, and is refused
+    beside any raw parameter so there is never a question of which one was used.
+    """
     from jarvis.bill import _cold_prefix_floor
-    from jarvis.ops import COST_FLOOR_NOTE
+    from jarvis.ops import COST_FLOOR_NOTE, OpsError
 
     cfg = cost_config(project)
-    window = window_of(since, until, cfg, now=now)
-    start, end = window["since"], window["until"]
+    if resolved is not None:
+        if since is not None or until is not None or window is not None or offset:
+            raise OpsError("a resolved window and --since/--until/--window/--offset are "
+                           "two ways to name the same thing — pass one or the other, "
+                           "not both")
+    picked = resolved if resolved is not None else resolve_window(
+        window=window, offset=offset, since=since, until=until, cfg=cfg, now=now)
+    start, end = picked["since"], picked["until"]
     home = paths.jarvis_home() if home is None else home
     floor = _cold_prefix_floor()
     index = usage.index_sessions()
@@ -1035,7 +1152,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
 
     return {"fleet": {
         "version": PAYLOAD_VERSION,
-        "window": window,
+        "window": picked,
         "scope": project or "fleet",
         "orders": {
             "n": len(orders),
@@ -1057,7 +1174,10 @@ def report(*, project: str | None = None, since: float | str | None = None,
                                      index=index))),
         "floor": True,
         "floor_reason": COST_FLOOR_NOTE,
-        "notes": list(NOTES),
+        # The 5h anchor is said only where it applies: a caveat about a grid nobody
+        # asked for is one the reader learns to ignore (§2).
+        "notes": list(NOTES) + ([SESSION_ANCHOR_NOTE]
+                                if picked.get("window") == SESSION else []),
     }}
 
 

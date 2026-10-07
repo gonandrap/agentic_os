@@ -217,6 +217,34 @@ def fmt_ts(ts: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _offset_param(raw: str) -> int:
+    """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI.
+
+    §3 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: a framework 422 on
+    a cost page is a dead end, and a silent fallback to the current window would report
+    one window while the reader believes they picked another.
+    """
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        raise ops.OpsError(f"offset must be a whole number of windows — {raw!r} is not "
+                           f"a number") from None
+
+
+def _window_inputs(window: dict) -> dict[str, str]:
+    """The active window as `datetime-local` values, so the custom form pre-fills.
+
+    UTC, and LABELLED UTC on the page: `compaction_payoff.parse_when` reads a naive
+    stamp as UTC and `--since` already behaves that way, so reading the form in
+    `week_reset_zone` would make one string mean two things on two surfaces (§6).
+    """
+    fmt = "%Y-%m-%dT%H:%M"
+    return {key: time.strftime(fmt, time.gmtime(window[key]))
+            for key in ("since", "until")}
+
+
 #: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
 #: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
@@ -1391,28 +1419,42 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.get("/cost", response_class=HTMLResponse)
-    def cost_page(request: Request, project: str = ""):
+    def cost_page(request: Request, project: str = "", window: str = "",
+                  offset: str = "", since: str = "", until: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
 
         Its own page rather than a column on the dashboard: this reads and parses every
         session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
         dashboard re-reads itself every 15 seconds. Spend is a question someone asks
         deliberately, not one worth paying for on every pulse.
+
+        THE WINDOW IS RESOLVED ONCE and handed to both payload builders, which is what
+        makes the two halves of the page incapable of disagreeing: resolution is a
+        function of `now`, so resolving twice can straddle a boundary (§6 of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md). Every parameter is
+        a string so that a bad one comes back as the OS's own sentence rather than a
+        framework 422 — and is a REFUSAL, never a silent fallback to the week.
         """
         try:
-            report = ops.cost_report(project=project or None)
+            picked = ops.cost_window(project=project or None, window=window or None,
+                                     offset=_offset_param(offset),
+                                     since=since or None, until=until or None)
+            report = ops.cost_report(project=project or None, window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         # The distribution is a SECTION of this page, so a failure to build it must not
         # take the listing down with it: the two read different databases and the
         # listing is the older, load-bearing half.
         try:
-            fleet = ops.fleet_cost(project=project or None)["fleet"]
+            fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
         except Exception:                                   # noqa: BLE001
             fleet = None
+        # Its own variable and never read out of `fleet`: losing the section must not
+        # lose the window the reader picked.
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project, fleet=fleet,
+                      project=project, fleet=fleet, window=picked,
+                      window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)

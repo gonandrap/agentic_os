@@ -550,6 +550,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="start of the window, a date or ISO datetime "
                          "(default: this Claude usage week; naive = UTC)")
     sp.add_argument("--until", type=_when, help="end of the window, exclusive")
+    # The window SELECTOR, beside the raw range rather than instead of it — §6 of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    sp.add_argument("--window", choices=["week", "5h"],
+                    help="which window to report over: the Claude usage week, or one 5h "
+                         "SLICE of it anchored on the weekly reset (nothing records "
+                         "Claude's own session boundary, so a 5h window is not a claim "
+                         "about its session accounting)")
+    sp.add_argument("--offset", type=int, default=0,
+                    help="step back whole windows: 0 is the current one, -1 the "
+                         "previous (--fleet only; 0 or negative)")
     sp.add_argument("--project", help="one project instead of the whole fleet "
                                       "(--fleet only)")
     sp.add_argument("--json", action="store_true")
@@ -2910,7 +2920,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # a section, it does not reshape a row (spec §5).
     if getattr(args, "fleet", False):
         payload = ops.fleet_cost(project=args.project or target or None,
-                                 since=args.since, until=args.until)
+                                 since=args.since, until=args.until,
+                                 window=args.window, offset=args.offset)
         if args.json:
             _print(payload, True)
             return 0
@@ -3012,6 +3023,11 @@ def cmd_cost(args: argparse.Namespace) -> int:
             print(f"               {cause.strip()}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Silence when zero: nothing was excluded, so there is nothing to disclose (§5c of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    if totals.get("undated_messages"):
+        print(f"  {totals['undated_messages']} transcript messages carried no readable "
+              f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
@@ -3119,6 +3135,10 @@ def _print_fleet(fleet: dict) -> None:
     orders = fleet["orders"]
     print(f"{fleet['scope']} — {fleet['window']['label']} "
           f"({fleet['window']['source']})")
+    # Both clocks: UTC is what `agent_calls.ts` is comparable to, the local one is what
+    # the reset is specified in (§4).
+    if fleet["window"].get("local_label"):
+        print(f"  {fleet['window']['local_label']}")
     print(f"{orders['n']} order{'s' if orders['n'] != 1 else ''} with a turn in the "
           f"window · {orders['live']} live · {orders['truncated']} truncated by it · "
           f"{orders['excluded_no_turns']} with no turn in it\n")
