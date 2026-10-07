@@ -12,6 +12,7 @@ a fake would let the wrong field pass (kn-179cd767, kn-4f5aaa2b).
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from jarvis import db, release
-from jarvis.catalog import load_catalog
+from jarvis.catalog import CatalogError, load_catalog, parse_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import commit
@@ -790,6 +791,64 @@ def test_an_unreadable_tag_list_files_nothing_and_is_retried(project, store, dae
     assert snapshot(store, rel) == before
     assert list(batch_urls(store)) == [rel]
     assert events(store, rel, Daemon.RELEASE_BATCH_CLEARED_EVENT) == []
+
+
+# -- §2.2: the window is a setting, not a constant -------------------------------------
+
+
+def window_daemon(catalog_file: Path, *, days: int) -> Daemon:
+    """A daemon whose `proj_a` sets `release.refile_window_days`."""
+    data = json.loads(catalog_file.read_text())
+    data["projects"][0]["release"] = {"refile_window_days": days}
+    catalog_file.write_text(json.dumps(data))
+    return Daemon(load_catalog(catalog_file))
+
+
+def age(store: ProjectStore, wo_id: str, seconds: float) -> None:
+    """Push a settled order's `updated_at` back — what the sweep's window reads."""
+    row = store.get_work_order(wo_id)
+    store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                       (row["updated_at"] - seconds, wo_id))
+
+
+def test_the_refile_window_is_per_project(project):
+    cat = parse_catalog({
+        "os": {"release": {"refile_window_days": 30}},
+        "projects": [{"name": "proj_a", "path": str(project),
+                      "release": {"refile_window_days": 3}},
+                     {"name": "proj_b", "path": str(project)}],
+    })
+
+    assert cat.os.release.refile_window_days == 30
+    assert cat.project("proj_a").release.refile_window_days == 3
+    assert cat.project("proj_b").release.refile_window_days == 30  # inherited
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_a_window_below_a_day_is_refused_rather_than_clamped(days):
+    """Zero days means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that the parser is the last place able to name."""
+    with pytest.raises(CatalogError, match=r"release\.refile_window_days"):
+        parse_catalog({"os": {"release": {"refile_window_days": days}},
+                       "projects": []})
+
+
+def test_the_sweep_honours_the_projects_window(project, store, catalog_file):
+    """§2.2: how long a dropped fix stays worth re-filing is the project's claim."""
+    outside = land(project, "fix-old.txt")
+    inside = land(project, "fix-new.txt")
+    old = release_order(store, project, shas={OTHER: outside}, status="completed")
+    new = release_order(store, project, shas={ISSUE: inside}, status="completed")
+    age(store, old, 3 * 86400)
+    age(store, new, 1 * 86400)
+    daemon = window_daemon(catalog_file, days=2)
+
+    sweep(daemon, store)
+
+    assert events(store, old, Daemon.RELEASE_REFILED_EVENT) == []
+    assert batch_urls(store)[old] == [OTHER]
+    assert [e["issue_url"]
+            for e in events(store, new, Daemon.RELEASE_REFILED_EVENT)] == [ISSUE]
 
 
 # -- no release is filed for a fix a live tag already carries — issue #934 ------------

@@ -198,11 +198,16 @@ def settled_release_orders(self, since: float,
 * **`cancelled` is excluded.** A cancelled release order is the user stopping a release;
   re-filing one would overrule them. `completed` is wo-29f44978's path and `failed` is a
   release order that died holding fixes — both are drops the user never chose.
-* **Window:** `Daemon.RELEASE_REFILE_WINDOW_SECONDS = 14 * 86400`, read as
-  `db.now() - RELEASE_REFILE_WINDOW_SECONDS`. A release order settles within minutes to
-  hours of its batch landing; two weeks covers a `needs_review` order the user leaves over
-  a holiday and bounds the scan to a handful of rows on this repository's history. It is a
-  constant, not a catalog setting, for `PR_POLL_EVERY_TICKS`' recorded reason.
+* **Window:** `catalog.ReleaseConfig.refile_window_days`, defaulting to
+  `DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14` and read as
+  `db.now() - project.release.refile_window_days * 86400`. A release order settles within
+  minutes to hours of its batch landing; two weeks covers a `needs_review` order the user
+  leaves over a holiday and bounds the scan to a handful of rows on this repository's
+  history. It is **per-project catalog config, not a `Daemon` constant** (the user's
+  ruling of 2026-10-06): how long a dropped fix stays worth re-filing is a claim about
+  that project's release cadence, and the fleet's answer is not every project's. Field-level
+  inheritance from `os.release`, like `_parse_messaging`; `< 1` is refused, not clamped,
+  because a window of 0 days means the sweep can never see anything.
 * **Steady-state cost:** one indexed query plus one `events_of_kind` read per not-yet-cleared
   row. Once every url of a batch is accounted for, the sweep writes
   `RELEASE_BATCH_CLEARED_EVENT = "release_batch_cleared"` on that order and skips it on

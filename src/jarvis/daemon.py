@@ -8136,10 +8136,6 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
     #: and zero `gh` work (§2.2).
     RELEASE_BATCH_CLEARED_EVENT = "release_batch_cleared"
 
-    #: How far back `refile_dropped_fixes` looks. A release order settles within minutes to
-    #: hours of its batch landing; two weeks covers one the user leaves over a holiday (§2.2).
-    RELEASE_REFILE_WINDOW_SECONDS = 14 * 86400
-
     def settle_shipped_releases(self, project: ProjectSpec,
                                 store: ProjectStore) -> None:
         """End a release order whose fixes another release already shipped — issue #784.
@@ -8310,7 +8306,8 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         # this repository and not about a project.
         if project.name != self._os_owner():
             return
-        since = db.now() - self.RELEASE_REFILE_WINDOW_SECONDS
+        # §2.2: the window is this project's claim about its release cadence.
+        since = db.now() - int(project.release.refile_window_days) * 86400
         for wo in store.settled_release_orders(since):
             try:
                 self._refile_dropped_batch(project, store, wo)
