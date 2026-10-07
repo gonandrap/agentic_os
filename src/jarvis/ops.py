@@ -10890,6 +10890,11 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # was launched with, and nothing re-reads the catalog at it — the hook must not,
     # since it runs on every Bash command.
     ("*.concision.*", "next-dispatch"),
+    # `jarvis cost --fleet` reads the catalog on every invocation, so a change is in
+    # force on the next run — stated rather than left to fall through, even though the
+    # fall-through answer is the same one. Spec §6.2:
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md
+    ("*.cost.*", "hot"),
 )
 
 APPLY_NOTES = {
@@ -12030,6 +12035,24 @@ def bill(target: str, project: str | None = None, *,
     from .bill import build
 
     return build(target, project, live=live)
+
+
+def fleet_cost(**kwargs: Any) -> dict[str, Any]:
+    """What a TYPICAL order costs, over a window — see `jarvis.fleetcost`.
+
+    `cost_report` says which orders cost the MOST and has no place to put a population
+    statistic; this says what normal looks like, so "is this order an outlier" and "did
+    last week get dearer" become answerable. One thin wrapper rather than a second
+    import path, exactly like `bill` above, so the CLI and the dashboard reach it the way
+    they reach everything else in the OS.
+
+    Imported lazily because `fleetcost` must never touch `ProjectStore` — it opens every
+    database `mode=ro` — and keeping it out of this module's import graph is what keeps
+    that true.
+    """
+    from . import fleetcost
+
+    return fleetcost.report(**kwargs)
 
 
 def cost_report(project: str | None = None, target: str | None = None,

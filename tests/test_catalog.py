@@ -738,3 +738,122 @@ def test_the_sweep_cadence_defaults_do_not_move(tmp_path):
     cfg = parse_catalog({"os": {}, "projects": []}).os.supervisor
     assert (cfg.health_every_ticks, cfg.health_min_interval_minutes,
             cfg.health_stale_minutes, cfg.health_max_units_per_tick) == (20, 30, 720, 4)
+
+
+# -- `os.cost`: the fleet distribution's tunables ---------------------------------------
+#
+# §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. Neo's rider: no
+# module constant for anything tunable, so the usage-week reset and the percentile are
+# catalog settings, resolvable fleet-wide AND per project.
+
+
+def test_cost_defaults_ship_on_both_config_objects(tmp_path):
+    cat = parse_catalog({"projects": [{"name": "a", "path": str(tmp_path)}]})
+    for cfg in (cat.os.cost, cat.projects[0].cost):
+        assert cfg.week_reset_weekday == 0            # Monday
+        assert cfg.week_reset_hour == 21
+        assert cfg.week_reset_zone == "America/Los_Angeles"
+        assert cfg.percentile == 0.9
+        assert cfg.max_orders == 500
+        # §10.10 of the per-tool addendum: the `chars` estimator's divisor and the row
+        # cap of the tool table, both catalog settings for the same stated reason.
+        assert cfg.chars_per_token == 4.0
+        assert cfg.tool_rows == 20
+
+
+def test_a_non_positive_chars_per_token_is_refused():
+    """Zero or less is not a divisor, and a negative one would report negative tokens."""
+    for bad in (0, -1, -0.5):
+        with pytest.raises(CatalogError, match="chars_per_token"):
+            parse_catalog({"os": {"cost": {"chars_per_token": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"chars_per_token": 3.5}},
+                          "projects": []}).os.cost.chars_per_token == 3.5
+
+
+def test_a_cost_tool_rows_below_one_is_refused():
+    """Zero rows is a table with a truncation line and nothing above it."""
+    for bad in (0, -5):
+        with pytest.raises(CatalogError, match="tool_rows"):
+            parse_catalog({"os": {"cost": {"tool_rows": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"tool_rows": 1}},
+                          "projects": []}).os.cost.tool_rows == 1
+
+
+def test_a_project_overrides_one_cost_key_and_inherits_the_rest(tmp_path):
+    """Field-level inheritance, `_parse_inspect`'s shape (kn-6ca2bcd9): the project
+    object is the ANSWER, so no caller consults two objects."""
+    from jarvis import config_version
+
+    cat = parse_catalog({
+        "os": {"cost": {"percentile": 0.95, "max_orders": 50}},
+        "projects": [
+            {"name": "a", "path": str(tmp_path)},
+            {"name": "b", "path": str(tmp_path), "cost": {"percentile": 0.5}},
+        ],
+    })
+    assert cat.os.cost.percentile == 0.95
+    assert cat.projects[0].cost.percentile == 0.95          # inherited from os
+    assert cat.projects[1].cost.percentile == 0.5           # its own
+    assert cat.projects[1].cost.max_orders == 50            # inherited from os
+    assert cat.projects[1].cost.week_reset_hour == 21       # inherited from the default
+    resolved = config_version.resolve(cat)
+    assert resolved["os.cost.percentile"] == 0.95
+    assert resolved["projects.b.cost.percentile"] == 0.5
+    assert resolved["os.cost.week_reset_zone"] == "America/Los_Angeles"
+
+
+def test_midnight_is_a_legal_cost_week_reset_hour():
+    """Zero is legal here: `_parse_inspect`'s ">= 1" rule would reject midnight, and
+    an hour is not a count."""
+    cat = parse_catalog({"os": {"cost": {"week_reset_hour": 0,
+                                         "week_reset_weekday": 0}}, "projects": []})
+    assert cat.os.cost.week_reset_hour == 0
+    assert cat.os.cost.week_reset_weekday == 0
+
+
+def test_an_out_of_range_cost_reset_day_or_hour_is_refused_naming_the_key():
+    for bad in (-1, 7, 99):
+        with pytest.raises(CatalogError, match="week_reset_weekday"):
+            parse_catalog({"os": {"cost": {"week_reset_weekday": bad}}, "projects": []})
+    for bad in (-1, 24, 100):
+        with pytest.raises(CatalogError, match="week_reset_hour"):
+            parse_catalog({"os": {"cost": {"week_reset_hour": bad}}, "projects": []})
+
+
+def test_a_cost_percentile_outside_the_open_interval_is_refused():
+    """Both ends exclusive: 0 names no value and 1 is the max, which `max` already is."""
+    for bad in (0, 1, -0.5, 1.5):
+        with pytest.raises(CatalogError, match="percentile"):
+            parse_catalog({"os": {"cost": {"percentile": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"percentile": 0.99}},
+                          "projects": []}).os.cost.percentile == 0.99
+
+
+def test_a_cost_max_orders_below_one_is_refused():
+    for bad in (0, -5):
+        with pytest.raises(CatalogError, match="max_orders"):
+            parse_catalog({"os": {"cost": {"max_orders": bad}}, "projects": []})
+
+
+def test_an_unknown_cost_time_zone_is_refused_naming_the_bad_value(tmp_path):
+    """A zone that no `ZoneInfo` can construct makes every window wrong, so it fails
+    where it was typed."""
+    with pytest.raises(CatalogError) as caught:
+        parse_catalog({"os": {"cost": {"week_reset_zone": "Mars/Olympus"}},
+                       "projects": []})
+    assert "Mars/Olympus" in str(caught.value)
+    assert "week_reset_zone" in str(caught.value)
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).cost"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "cost": {"week_reset_zone": "Nowhere/At_All"}}]})
+    with pytest.raises(CatalogError, match="must be an object"):
+        parse_catalog({"os": {"cost": "weekly"}, "projects": []})
+
+
+def test_cost_paths_have_an_explicit_apply_class():
+    """ops.APPLY_RULES decides it rather than falling through (spec §6.2)."""
+    from jarvis import ops
+
+    assert any(glob == "*.cost.*" for glob, _ in ops.APPLY_RULES)
+    assert ops.apply_class("os.cost.percentile") == "hot"
+    assert ops.apply_class("projects.a.cost.week_reset_hour") == "hot"

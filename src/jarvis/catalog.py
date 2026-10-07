@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -895,6 +896,44 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+#: Shipped defaults of `CostConfig`. The usage week resets Monday 21:00
+#: America/Los_Angeles — VERIFIED: Mon 2026-09-28 21:00 PDT = 2026-09-29 04:00 UTC.
+DEFAULT_COST_WEEK_RESET_WEEKDAY = 0        # Monday, `datetime.weekday()` numbering
+DEFAULT_COST_WEEK_RESET_HOUR = 21
+DEFAULT_COST_WEEK_RESET_ZONE = "America/Los_Angeles"
+DEFAULT_COST_PERCENTILE = 0.9
+DEFAULT_COST_MAX_ORDERS = 500
+#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply.
+#: A model-family property the OS does not control, and UNCALIBRATED against the fleet —
+#: which is why every figure derived from it reports its `token_basis` counts beside it.
+DEFAULT_COST_CHARS_PER_TOKEN = 4.0
+DEFAULT_COST_TOOL_ROWS = 20
+
+
+@dataclass
+class CostConfig:
+    """What `jarvis cost --fleet` reports over, and where its default window starts.
+
+    Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
+    project naming one key keeps the OS answer for the rest. Neo's rider on
+    wo-38456776 — no module constant for anything tunable — and the reason is that all
+    seven of these move: a DST shift and an Anthropic policy change both move the reset,
+    what counts as the tail of the distribution differs by project, and the tokens-per-
+    character of a model family is Anthropic's to change.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md, and §10.10
+    of its per-tool addendum for the last two.
+    """
+
+    week_reset_weekday: int = DEFAULT_COST_WEEK_RESET_WEEKDAY
+    week_reset_hour: int = DEFAULT_COST_WEEK_RESET_HOUR
+    week_reset_zone: str = DEFAULT_COST_WEEK_RESET_ZONE
+    percentile: float = DEFAULT_COST_PERCENTILE
+    max_orders: int = DEFAULT_COST_MAX_ORDERS
+    chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
+    tool_rows: int = DEFAULT_COST_TOOL_ROWS
+
+
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
@@ -1239,6 +1278,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
@@ -1366,6 +1406,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
@@ -1750,6 +1791,65 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
                 raise _err(f"{where}.{name} must be >= 0")
         elif name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_cost(raw: Any, base: CostConfig | None = None,
+                where: str = "os.cost") -> CostConfig:
+    """`os.cost`, or a project's override of it, with absurd values refused.
+
+    `base` is the same field-level inheritance `_parse_inspect` uses (kn-6ca2bcd9):
+    `os.cost` parses against the shipped defaults and each project parses against the OS
+    answer, so no caller consults two objects.
+
+    THE FOUR VOCABULARIES ARE KEPT APART because `_parse_inspect`'s ">= 1" rule serves
+    none of them. A WEEKDAY is 0..6 and a reset HOUR is 0..23 — zero is LEGAL in both,
+    and ">= 1" would reject Monday and midnight. A PERCENTILE is refused outside
+    `(0, 1)`, both ends exclusive: 0 names no observation and 1 is the maximum, which the
+    report already carries beside it. A COUNT of orders to walk is refused below 1, where
+    zero would report an empty distribution rather than fail. A ZONE must construct a
+    `ZoneInfo` or the window is silently wrong every week, so it is refused naming the
+    value typed. A DIVISOR (`chars_per_token`) is refused at or below zero, where the
+    rule is not ">= 1" because 3.5 characters per token is a legal belief about a model
+    family; a ROW COUNT (`tool_rows`) takes the count rule.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+    base = base or CostConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = CostConfig(
+        week_reset_weekday=int(raw.get("week_reset_weekday", base.week_reset_weekday)),
+        week_reset_hour=int(raw.get("week_reset_hour", base.week_reset_hour)),
+        week_reset_zone=str(raw.get("week_reset_zone", base.week_reset_zone)),
+        percentile=float(raw.get("percentile", base.percentile)),
+        max_orders=int(raw.get("max_orders", base.max_orders)),
+        chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
+        tool_rows=int(raw.get("tool_rows", base.tool_rows)),
+    )
+    if not 0 <= cfg.week_reset_weekday <= 6:
+        raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
+                   f"{cfg.week_reset_weekday} is not a day of the week")
+    if not 0 <= cfg.week_reset_hour <= 23:
+        raise _err(f"{where}.week_reset_hour must be 0..23 — {cfg.week_reset_hour} is "
+                   f"not an hour of the day")
+    if not 0 < cfg.percentile < 1:
+        raise _err(f"{where}.percentile must be strictly inside (0, 1) — "
+                   f"{cfg.percentile} names either no observation or the maximum, which "
+                   f"the report already reports beside it")
+    if cfg.max_orders < 1:
+        raise _err(f"{where}.max_orders must be >= 1")
+    if cfg.chars_per_token <= 0:
+        raise _err(f"{where}.chars_per_token must be > 0 — {cfg.chars_per_token} is not "
+                   f"a divisor, and a negative one would report negative tokens")
+    if cfg.tool_rows < 1:
+        raise _err(f"{where}.tool_rows must be >= 1")
+    try:
+        zoneinfo.ZoneInfo(cfg.week_reset_zone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+        raise _err(f"{where}.week_reset_zone {cfg.week_reset_zone!r} is not a time zone "
+                   f"this system knows ({e}) — the usage week would start at the wrong "
+                   f"instant every week") from e
     return cfg
 
 
@@ -2155,6 +2255,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        cost=_parse_cost(os_raw.get("cost", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
@@ -2269,6 +2370,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        cost_cfg = _parse_cost(
+            p.get("cost", {}), base=os_cfg.cost,
+            where=f"projects[{i}] ({name}).cost")
         observability_cfg = _parse_observability(
             p.get("observability", {}), base=os_cfg.observability,
             where=f"projects[{i}] ({name}).observability")
@@ -2305,6 +2409,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                cost=cost_cfg,
                 observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
