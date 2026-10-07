@@ -91,6 +91,13 @@ think one half is wrong:
   it** (`dispatch.py:215`, the env block beside `JARVIS_PY_NAV_HOOK`). They were read at
   `9df40d3`, and they exist to make a landmark findable in a 10,000-line module. Confirm by
   the name, which is stable; if the number misses, the name is the citation.
+- **Every example path is a metavariable in angle brackets** — `docs/specs/<spec>.md`,
+  `.jarvis/features/<fo-id>/sections/<wo-id>.md` — and never a short name that could be
+  mistaken for a file in the tree. This feature is ABOUT paths in commands, so its examples
+  get read by tools and by people looking for a file to open. An earlier draft used a
+  bare one-letter stem under the real specs directory; an automated reader took it for a
+  file in the tree and it cost this work order two review rounds. A placeholder has to be
+  unmistakable at a glance.
 
 ### 2.1 Where each piece lives
 
@@ -308,11 +315,11 @@ for this payload (`_print_navigation` lives only in `cli.py`), so this is CLI-on
 - AST enclosure over `FunctionDef dumps_doc`: `_sweeps_the_tree` is NOT among the names it
   calls, and behaviourally `dumps_doc("find docs -name '*.md'")` is False.
 - `dumps_doc` with NO `limit_lines` is unchanged by the keyword's existence: the ranged
-  `sed -n '40,80p' docs/x.md` is True there (`nav_volume` counts every dump) and False at
+  `sed -n '40,80p' docs/<doc>.md` is True there (`nav_volume` counts every dump) and False at
   `limit_lines=200`. Both halves, or the keyword is untested on the side that matters.
 - `_dump_span` over a table: `sed -n '40,80p'` is 41, `sed -n '40p'` is 1, `head -40` and
   `head -n 40` are 40, `cat` and bare `head` are `None`. `None` is UNRANGED and must not
-  compare as zero — a `limit_lines=200` call on `cat docs/x.md` is True.
+  compare as zero — a `limit_lines=200` call on `cat docs/<doc>.md` is True.
 - `DOC_SUFFIXES is not SOURCE_SUFFIXES`, `dumps_doc is not navigates_source`, and
   `navigates_source("cat README.md", SOURCE_SUFFIXES) is False` — that last assertion
   already lives inside
@@ -482,7 +489,7 @@ bar is `worker.doc_read_limit_lines`. One threshold in this feature, one key.
 
 THAT BAR GOVERNS BOTH DOC ARMS, `Read` AND `Bash`. The evasion that justifies it is a
 `Bash` one, so a bar applied only to `Read` would leave the justifying case ungoverned
-while refusing `head -40 docs/specs/x.md` — 317 tokens a call by §1's table, against a
+while refusing `head -40 docs/specs/<spec>.md` — 317 tokens a call by §1's table, against a
 whole turn for the refusal. §5.2 states both arms in the same terms.
 
 The `.py` `Read` arm goes INSIDE the existing `py_nav_decision` — same
@@ -524,11 +531,11 @@ fallback 200:
 
 | command | verdict | why |
 |---|---|---|
-| `cat docs/specs/x.md` | DENY | unranged, whole file |
-| `head docs/specs/x.md` | DENY | bare `head`, no range named |
-| `sed -n '1,2000p' docs/specs/x.md` | DENY | 2,000 > 200 |
-| `head -40 docs/specs/x.md` | **PASS** | 40 <= 200 |
-| `sed -n '40,80p' docs/specs/x.md` | **PASS** | 41 <= 200 |
+| `cat docs/specs/<spec>.md` | DENY | unranged, whole file |
+| `head docs/specs/<spec>.md` | DENY | bare `head`, no range named |
+| `sed -n '1,2000p' docs/specs/<spec>.md` | DENY | 2,000 > 200 |
+| `head -40 docs/specs/<spec>.md` | **PASS** | 40 <= 200 |
+| `sed -n '40,80p' docs/specs/<spec>.md` | **PASS** | 41 <= 200 |
 | `grep -rn "words" docs/` | PASS | not a dump command, ever (§1.1) |
 
 A SMALL TARGETED DUMP IS NOT AN EVASION AND REFUSING IT IS THE BRIEF'S MUST NOT. §1's
@@ -592,11 +599,11 @@ side are the ones that keep this feature inside its MUST NOT:
 
 | input | key `on` | key `off` |
 |---|---|---|
-| `Read docs/specs/x.md`, no `limit` | DENY | `None` |
-| `Read docs/specs/x.md`, `limit=40` | pass | `None` |
-| `Bash sed -n '1,2000p' docs/specs/x.md` | DENY | `None` |
-| `Bash sed -n '40,80p' docs/specs/x.md` | **pass** | `None` |
-| `Bash head -40 docs/specs/x.md` | **pass** | `None` |
+| `Read docs/specs/<spec>.md`, no `limit` | DENY | `None` |
+| `Read docs/specs/<spec>.md`, `limit=40` | pass | `None` |
+| `Bash sed -n '1,2000p' docs/specs/<spec>.md` | DENY | `None` |
+| `Bash sed -n '40,80p' docs/specs/<spec>.md` | **pass** | `None` |
+| `Bash head -40 docs/specs/<spec>.md` | **pass** | `None` |
 | `Bash grep -rn "words" docs/` | pass | `None` |
 | `Read .jarvis/features/fo-x/sections/wo-y.md`, any size | pass | `None` |
 
@@ -631,7 +638,7 @@ its repo root — `hooks.find_project_root` resolves the project by it (kn-6c033
 REACHABILITY IS THE ONE THAT DECIDES WHETHER THIS SECTION DID ANYTHING. Every assertion
 below goes through `hooks.preflight_decision`, not through the decision function:
 
-- the Bash doc arm denies a `cd <repo> && sed -n '1,2000p' docs/specs/x.md`, which proves
+- the Bash doc arm denies a `cd <repo> && sed -n '1,2000p' docs/specs/<spec>.md`, which proves
   it sits before the `is_jarvis_command_chain` auto-allow.
   `tests/test_py_nav_hook.py::test_the_refusal_is_reached_before_the_jarvis_auto_allow` is
   the existing test of exactly this shape, and it exists because the arm after that allow
@@ -728,7 +735,7 @@ to the seats that never did.
 - The prompt no longer contains `The whole spec is at` or `if the section is not enough`,
   and still contains the materialised section path with `read it first`.
 - The three command strings in the prompt are byte-identical to §4.3's, and
-  `hooks.is_jarvis_command_chain("jarvis spec toc docs/specs/x.md")` is `True`. Prose
+  `hooks.is_jarvis_command_chain("jarvis spec toc docs/specs/<spec>.md")` is `True`. Prose
   naming `jarvis spec show` passes any substring test the worker writes for itself and is
   dead in the field.
 - `_planner_prompt` and `_common_briefing` are asserted too, not only the child path.
