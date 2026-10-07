@@ -74,6 +74,11 @@
   {% endif %}
 </div>
 
+{# The DISTRIBUTION, above the listing: the listing says which order cost the most and
+   cannot say what normal looks like. Absent rather than faked when it could not be
+   built — see `cost_page`. #}
+{% if fleet %}{% include "_fleet_distribution.html" %}{% endif %}
+
 <div class="panel" style="margin-top: 14px;">
   {% for u in units %}
   <div class="row">
