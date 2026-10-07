@@ -312,10 +312,12 @@ def test_a_missing_root_is_an_honest_absence(tmp_path, monkeypatch):
 # -- the payload: the renderer derives nothing ----------------------------------------
 
 CALL_KEYS = ("symbol_calls", "text_search_calls", "nav_bash_calls",
-             "code_nav_bash_calls", "other_bash_calls", "read_tool_calls")
+             "code_nav_bash_calls", "other_bash_calls", "read_tool_calls",
+             "whole_file_read_calls", "doc_dump_bash_calls")
 
 BYTE_KEYS = ("result_bytes", "nav_bash_bytes", "code_nav_bash_bytes", "symbol_bytes",
-             "unattributed_bytes")
+             "unattributed_bytes", "read_tool_bytes", "doc_read_bytes",
+             "doc_dump_bash_bytes", "bytes_by_tool")
 
 
 def test_as_dict_carries_every_number_the_renderer_prints(tree):
@@ -639,3 +641,170 @@ def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, ca
             f"{lead['symbol_calls']:>4} symbol") in out
     assert (f"{sub['symbol_calls']:>4} symbol  "
             f"{sub['text_search_calls']:>4} text-search") in out
+
+
+# -- the doc counters: §3.2 of docs/specs/2026-10-06-navigate-specs-like-code.md -------
+
+def test_bytes_by_tool_folds_across_a_lead_and_two_subagent_transcripts(tree):
+    """THE FOLD, and it is why the field is a `Counter`: `_merge` folds every field with
+    `+` over `vars()`, and a plain `dict[str, int]` raises `TypeError` there. A
+    single-transcript test passes vacuously."""
+    tree("d1", [
+        tool_use_row("t1", "Read", file_path="/tmp/a.py"),
+        tool_result_row("t1", "x" * 100),
+        tool_use_row("t2", "Bash", command="cat src/a.py"),
+        tool_result_row("t2", "x" * 10),
+    ], subagents={
+        "agent-aaa": [tool_use_row("u1", "Read", file_path="/tmp/b.py"),
+                      tool_result_row("u1", "y" * 5),
+                      tool_use_row("u2", "Bash", command="cat src/b.py"),
+                      tool_result_row("u2", "y" * 7)],
+        "agent-bbb": [tool_use_row("v1", "Read", file_path="/tmp/c.py"),
+                      tool_result_row("v1", "z" * 3),
+                      tool_use_row("v2", "Bash", command="cat src/c.py"),
+                      tool_result_row("v2", "z" * 11)],
+    })
+
+    vol = nav_volume.read_session("d1", CFG)
+
+    assert vol.sides["lead"].bytes_by_tool == {"Read": 100, "Bash": 10}
+    assert vol.sides["subagent"].bytes_by_tool == {"Read": 8, "Bash": 18}
+    payload = vol.as_dict()
+    assert payload["sides"]["subagent"]["bytes_by_tool"] == {"Bash": 18, "Read": 8}
+    assert list(payload["sides"]["subagent"]["bytes_by_tool"]) == ["Bash", "Read"]
+
+
+def test_whole_file_read_calls_count_a_read_with_no_limit_only(tree):
+    """§1(a): `limit is None` IS the predicate, answerable from `tool_input` alone."""
+    path = tree("d2", [
+        tool_use_row("t1", "Read", file_path="/tmp/a.py", limit=200),
+        tool_result_row("t1", "x" * 10),
+        tool_use_row("t2", "Read", file_path="/tmp/b.py"),
+        tool_result_row("t2", "x" * 20),
+    ])
+
+    vol = nav_volume.read_transcript(path, nav_volume.SIDE_LEAD, CFG)
+
+    assert vol.whole_file_read_calls == 1
+    assert vol.read_tool_calls == 2
+    assert vol.read_tool_bytes == 30
+
+
+def test_doc_read_bytes_are_the_markdown_half_of_read_tool_bytes(tree):
+    path = tree("d3", [
+        tool_use_row("t1", "Read", file_path="/tmp/docs/spec.md"),
+        tool_result_row("t1", "m" * 40),
+        tool_use_row("t2", "Read", file_path="/tmp/src/x.py"),
+        tool_result_row("t2", "p" * 15),
+    ])
+
+    vol = nav_volume.read_transcript(path, nav_volume.SIDE_LEAD, CFG)
+
+    assert vol.doc_read_bytes == 40
+    assert vol.read_tool_bytes == 55
+    assert vol.whole_file_read_calls == 2
+
+
+def test_doc_dump_bash_calls_go_through_the_shipped_classifier(tree):
+    """`grep` over a `.md` is text search and stays legal — this feature's MUST NOT
+    (§1.1). A `pytest` run is no dump either."""
+    path = tree("d4", [
+        tool_use_row("t1", "Bash", command="cat docs/a.md"),
+        tool_result_row("t1", "x" * 70),
+        tool_use_row("t2", "Bash", command="grep -rn foo docs/a.md"),
+        tool_result_row("t2", "x" * 9),
+        tool_use_row("t3", "Bash", command="uv run pytest"),
+        tool_result_row("t3", "ok"),
+    ])
+
+    vol = nav_volume.read_transcript(path, nav_volume.SIDE_LEAD, CFG)
+
+    assert vol.doc_dump_bash_calls == 1
+    assert vol.doc_dump_bash_bytes == 70
+
+
+def test_the_doc_before_note_is_a_second_note_and_both_reach_the_payload(tree):
+    """§2.2: `BEFORE_NOTE` is not edited — §1's figures travel as a second note."""
+    tree("d5", [tool_use_row("t1", "Bash", command="cat src/a.py"),
+                tool_result_row("t1", "x" * 10)])
+
+    payload = nav_volume.read_tree(cfg=CFG, days=7).as_dict()
+
+    assert nav_volume.DOC_BEFORE_NOTE is not nav_volume.BEFORE_NOTE
+    assert payload["before"] == nav_volume.BEFORE_NOTE
+    assert payload["doc_before"] == nav_volume.DOC_BEFORE_NOTE
+
+
+def test_the_doc_before_note_names_its_corpus_its_date_and_its_figures():
+    """A RECORDED BASELINE, not an assertion: the acceptance criterion is that the
+    command reproduces a number (§3.2)."""
+    note = nav_volume.DOC_BEFORE_NOTE
+
+    assert "877 transcripts" in note
+    assert "~/.claude/projects/*agentic*/" in note
+    assert "2026-10-06" in note
+    assert "chars // 4" in note
+    assert "1,032,302" in note and "199 calls" in note
+    assert "1,252,687" in note and "2,189 calls" in note
+    assert "487,048" in note and "133 calls" in note
+    assert "jarvis navigation" in note
+    assert "recorded baseline" in note.lower()
+
+
+def test_the_catalog_doc_defaults_are_the_leafs_sets_and_not_a_second_definition():
+    """Identity, not equality: a copied body passes equality and then drifts (§2.5)."""
+    from jarvis import catalog, navigation
+
+    assert catalog.DEFAULT_NAVIGATION_DOC_SUFFIXES is navigation.DOC_SUFFIXES
+    assert catalog.DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS is navigation.DOC_DUMP_COMMANDS
+    assert NavigationConfig().doc_suffixes is navigation.DOC_SUFFIXES
+    assert NavigationConfig().doc_dump_commands is navigation.DOC_DUMP_COMMANDS
+    assert "doc_suffixes" in catalog.NAVIGATION_PATTERN_KEYS
+    assert "doc_dump_commands" in catalog.NAVIGATION_PATTERN_KEYS
+
+
+def test_an_empty_doc_pattern_list_and_a_dotless_doc_suffix_are_refused():
+    from jarvis.catalog import CatalogError, parse_catalog
+
+    with pytest.raises(CatalogError, match="navigation.doc_suffixes"):
+        parse_catalog({"os": {"navigation": {"doc_suffixes": []}}, "projects": []})
+    with pytest.raises(CatalogError, match="navigation.doc_dump_commands"):
+        parse_catalog({"os": {"navigation": {"doc_dump_commands": []}},
+                       "projects": []})
+    with pytest.raises(CatalogError, match="doc_suffixes"):
+        parse_catalog({"os": {"navigation": {"doc_suffixes": ["md"]}}, "projects": []})
+
+
+def test_the_cli_prints_the_doc_figures_and_the_doc_before_line(tree, capsys):
+    from jarvis import cli
+
+    tree("d6", [tool_use_row("t1", "Read", file_path="/tmp/docs/spec.md"),
+                tool_result_row("t1", "m" * 40),
+                tool_use_row("t2", "Bash", command="cat docs/a.md"),
+                tool_result_row("t2", "d" * 70)])
+    payload = nav_volume.read_tree(cfg=CFG, days=7).as_dict()
+
+    cli._print_navigation(payload)
+
+    out = capsys.readouterr().out
+    assert "whole-file Read" in out
+    assert "doc dumps" in out
+    assert "docs:" in out
+    assert "877 transcripts" in out
+
+
+def test_the_cli_prints_no_doc_call_columns_on_a_per_order_payload(tree, capsys):
+    """§3.2's second trap: new CALL counters are gated on `calls_reported`, new BYTE
+    counters are not."""
+    from jarvis import cli
+
+    tree("d7", [tool_use_row("t1", "Read", file_path="/tmp/docs/spec.md"),
+                tool_result_row("t1", "m" * 40)])
+    payload = nav_volume.read_session("d7", CFG).as_dict()
+
+    cli._print_navigation(payload)
+
+    out = capsys.readouterr().out
+    assert "whole-file Read" not in out
+    assert "doc dumps" not in out
+    assert "docs:" in out
