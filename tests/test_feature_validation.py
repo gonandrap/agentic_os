@@ -1682,7 +1682,8 @@ def _pr_merged(store: ProjectStore, child_id: str, sha: str,
                     ts=time.time() - minutes_ago * 60)
 
 
-def _defers(fleet, store, fo_id: str) -> bool:
+def _route(fleet, store, fo_id: str) -> bool:
+    """`_route_to_validation`'s bool: "dealt with" — a round opened OR a deferral."""
     return fleet.daemon._route_to_validation(fleet.spec, store,
                                              store.get_feature_order(fo_id))
 
@@ -1716,7 +1717,9 @@ def test_the_default_branch_is_fetched_before_a_feature_is_collected(fleet, monk
 
         fleet.daemon.settle_features(fleet.spec, store)
 
-        assert [c[0] for c in calls] == ["fetch", "collect"]
+        # Two fetches: §2's ancestry check fetches first, then §1's. ORDER, not count —
+        # nothing is collected before a fetch.
+        assert [c[0] for c in calls] == ["fetch", "fetch", "collect"]
         assert calls[0][1] == fleet.project
         assert calls[0][2] == (evidence.base_ref(fleet.project),), (
             "the fetch guessed a branch the collector did not judge")
@@ -1752,7 +1755,7 @@ def test_a_child_whose_merge_is_not_in_the_head_defers_the_round(fleet):
         child = store.feature_children(fo_id)[0]
         _pr_merged(store, child["id"], _dangling_commit(fleet))
 
-        assert _defers(fleet, store, fo_id) is True
+        assert _route(fleet, store, fo_id) is True, "deferred, so: leave it alone"
 
         assert store.validation_rounds(fo_id=fo_id) == []
         fo = store.get_feature_order(fo_id)
@@ -1783,6 +1786,66 @@ def test_settle_features_does_not_complete_a_deferred_feature(fleet):
         store.close()
 
 
+def test_a_deferred_feature_clears_itself_once_the_fetch_finds_the_merge(fleet,
+                                                                        monkeypatch):
+    """§2. A deferral must be able to END. Every other defer test leaves the commit
+    dangling for ever, so the arm where the re-check finds the child integrated decides
+    whether a feature that defers once parks for ever."""
+    fleet.daemon.validator = Validator(passed())
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        sha = _dangling_commit(fleet)
+        _pr_merged(store, child["id"], sha)
+
+        assert _route(fleet, store, fo_id) is True, "deferred, so: leave it alone"
+        assert store.validation_rounds(fo_id=fo_id) == []
+
+        # What the production fetch does once the child's merge is upstream: the local
+        # default-branch ref moves forward over that commit.
+        monkeypatch.setattr(branchproof, "fetch",
+                            lambda repo, *refs: bool(_git(repo, "reset", "--hard", sha))
+                            or True)
+
+        assert _route(fleet, store, fo_id) is True, "unparked: the round opened"
+
+        fo = store.get_feature_order(fo_id)
+        assert fo["status"] == "validating"
+        assert [r["round"] for r in store.validation_rounds(fo_id=fo_id)] == [1]
+        assert fo["needs_attention"] == 0
+    finally:
+        store.close()
+
+
+def test_the_check_failing_defers_rather_than_completing_the_feature(fleet, monkeypatch):
+    """§2. `_defer_unintegrated_children` catches everything and answers True precisely so
+    its OWN failures cannot fall into `_route_to_validation`'s `except: return False` arm,
+    which `settle_features` reads as "complete this feature unjudged"."""
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        _pr_merged(store, child["id"], evidence.default_branch_head(fleet.project))
+
+        def boom(*a, **kw):
+            raise RuntimeError("git is not answering about ancestry")
+
+        monkeypatch.setattr(branchproof, "is_ancestor", boom)
+
+        fleet.daemon.settle_features(fleet.spec, store)
+
+        status = store.get_feature_order(fo_id)["status"]
+        assert status not in ("completed", "validating"), status
+        assert status == "executing"
+        assert store.validation_rounds(fo_id=fo_id) == []
+        assert validator.calls == []
+    finally:
+        store.close()
+
+
 def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet):
     """§3. A child merged into a sibling branch never becomes an ancestor of that head, so
     an unbounded deferral parks the feature silently — issue #881's failure mode."""
@@ -1795,7 +1858,7 @@ def test_past_the_bound_the_feature_asks_the_user_and_still_opens_no_round(fleet
         waited = fleet.spec.validation.feature_merge_wait_minutes + 1
         _pr_merged(store, child["id"], commit, minutes_ago=waited)
 
-        assert _defers(fleet, store, fo_id) is True
+        assert _route(fleet, store, fo_id) is True, "deferred, past the bound"
 
         fo = store.get_feature_order(fo_id)
         assert fo["needs_attention"] == 1
@@ -1821,8 +1884,8 @@ def test_one_defer_event_per_distinct_state(fleet):
         commit = _dangling_commit(fleet)
         _pr_merged(store, child["id"], commit)
 
-        assert _defers(fleet, store, fo_id) is True
-        assert _defers(fleet, store, fo_id) is True
+        assert _route(fleet, store, fo_id) is True  # deferred
+        assert _route(fleet, store, fo_id) is True  # deferred again, same state
 
         events = ops.feature_events_of_kind(store, fo_id,
                                             Daemon.VALIDATION_DEFER_EVENT)
@@ -1838,8 +1901,8 @@ def test_one_defer_event_per_distinct_state(fleet):
              child["id"]))
         store.conn.commit()
 
-        assert _defers(fleet, store, fo_id) is True
-        assert _defers(fleet, store, fo_id) is True
+        assert _route(fleet, store, fo_id) is True  # deferred, now past the bound
+        assert _route(fleet, store, fo_id) is True  # deferred, still past it
 
         events = ops.feature_events_of_kind(store, fo_id,
                                             Daemon.VALIDATION_DEFER_EVENT)
@@ -1863,7 +1926,7 @@ def test_every_child_integrated_opens_the_round_as_today(fleet):
         _pr_merged(store, first["id"], merged)   # landed on the head
         # `second` has no pr_url and no merge event: it delivered without a PR.
 
-        assert _defers(fleet, store, fo_id) is True
+        assert _route(fleet, store, fo_id) is True, "nothing deferred: the round opened"
 
         fo = store.get_feature_order(fo_id)
         assert fo["status"] == "validating"

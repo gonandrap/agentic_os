@@ -1519,7 +1519,9 @@ class Daemon:
         docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
 
         ITS OWN FAILURES DEFER TOO. Anything this cannot answer reads as "not proven",
-        never as "fine": the alternative arm completes the feature unjudged.
+        never as "fine". The catch-all is also load-bearing: this runs BEFORE
+        `_route_to_validation`'s `try:`, so an escaping raise would abort `settle_features`
+        for every feature in the project, not just this one.
         """
         try:
             return self._unintegrated_child(project, store, fo, cfg)
@@ -1535,6 +1537,10 @@ class Daemon:
         from . import evidence as evidence_mod
         from .invariants import FEATURE_CHILD_NOT_INTEGRATED
 
+        # §2: the head is read AFTER a fetch, so the check and the collection agree.
+        ref = evidence_mod.base_ref(project.path)
+        if ref:
+            branchproof.fetch(project.path, ref)
         head = evidence_mod.default_branch_head(project.path)
         if not head:
             return False  # no default branch: the collector resolves no head either
@@ -1549,16 +1555,6 @@ class Daemon:
                 merged.append((child, sha))
         missing = [(c, s) for c, s in merged
                    if not branchproof.is_ancestor(project.path, s, head)]
-        if missing:
-            # §1's fetch lives in `submit_feature_for_validation`, which a deferral never
-            # reaches — so without this the head would stay as stale as it was on the
-            # tick that first deferred. Paid for only in the suspicious case.
-            ref = evidence_mod.base_ref(project.path)
-            if ref:
-                branchproof.fetch(project.path, ref)
-            head = evidence_mod.default_branch_head(project.path) or head
-            missing = [(c, s) for c, s in missing
-                       if not branchproof.is_ancestor(project.path, s, head)]
         if not missing:
             return False
         child, sha = missing[0]
