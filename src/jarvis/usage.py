@@ -86,6 +86,7 @@ surfaces reading the same rows then disagree about the same tokens — see
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1052,3 +1053,289 @@ def read_session(session_id: str, cold_prefix_floor: int,
     # see (it never compares across files).
     result.main.resume_boundaries += len(paths) - 1
     return result
+
+
+# --- Tool results -----------------------------------------------------------------
+#
+# WHAT A TOOL COST, which the rest of this module cannot see. The ledger above is keyed
+# by API CALL, and a tool result is not a call: it is a payload that rides along inside
+# every SUBSEQUENT call's prefix. `_usage_of` walks `_assistant_messages`, which
+# pre-filters the file on the needle `'"usage"'`, and a `tool_result` block lives on a
+# `user` row with no `usage` object — so the module that owns token accounting has never
+# read a tool result at all. The walk below is that reading, and nothing more: pairing
+# and sizing, no prices, no rollup, no catalog. The aggregation (classification by
+# command shape, the carried-cost arithmetic, the fleet denominators) is `fleetcost`'s,
+# which may import this; this must never import that.
+#
+# Spec: docs/superpowers/specs/2026-10-06-fleet-cost-per-tool.md §10.2-§10.3.
+
+#: How a result's size was arrived at. The transcript carries NO per-result token count
+#: — token counts exist only in `message.usage` on `assistant` rows — so every size here
+#: is derived, and which way is reported per result rather than averaged away.
+BASIS_CONTEXT_DELTA = "context-delta"
+BASIS_CHARS = "chars"
+
+#: The caller of a tool call is THE FILE ITS ROW CAME FROM, which is `read_session`'s
+#: own split and not a second mechanism: Claude Code writes each subagent's transcript
+#: under `<segment>/subagents/*.jsonl`, and that is what makes `SessionUsage.subagents`
+#: separable from `main` one level up.
+CALLER_MAIN = "main"
+CALLER_SUBAGENT = "subagent"
+
+#: `background.ERROR_PREFIX`, duplicated rather than imported: this module is a leaf and
+#: `background` is not one. The text check is the LAST of the three error signals, after
+#: `is_error` on the block and `is_error`/`isError` on the sibling `toolUseResult`.
+_RESULT_ERROR_PREFIX = "Error: "
+
+
+@dataclass
+class ToolResult:
+    """ONE tool call and what came back, as the transcript records it.
+
+    Sizes are tokens, like everything else in this module, and `token_basis` says which
+    estimator produced them. An UNMATCHED call — the turn was killed between the
+    `tool_use` and its result, the case `inspection.ToolSpan.ended == 0.0` models — is
+    returned with `matched=False`, no tokens and no basis. It is never zero-filled: a
+    call that produced nothing must not pull a tool's average down as though it had.
+    """
+
+    tool_use_id: str
+    name: str
+    input: dict[str, Any] = field(default_factory=dict)
+    caller: str = CALLER_MAIN
+    #: When the model ASKED (the `tool_use` row) and when the result LANDED. The second
+    #: is what bounds "every later call this result rode along in".
+    call_ts: float = 0.0
+    ts: float = 0.0
+    chars: int = 0
+    tokens: int = 0
+    token_basis: str = ""
+    is_error: bool = False
+    matched: bool = False
+
+
+def tool_results(path: Path | str, *, chars_per_token: float = 4.0,
+                 ) -> list[ToolResult]:
+    """Every tool call in one transcript, paired with its result and sized.
+
+    ONE unfiltered pass, `rows(path)` with no needle. The needle `'"tool_'` would catch
+    both block types, but the sizing below also needs the `assistant` usage rows, the
+    prompt rows and the `compact_boundary` rows from the SAME ordered walk — the things
+    collected here are defined by their position relative to each other, exactly as
+    `inspection.read_transcript` is, and one unfiltered pass beats four filtered ones.
+
+    Returned in `tool_use` order, which makes the walk reproducible run to run.
+
+    `chars_per_token` is the divisor of the `chars` fallback and is `cost.chars_per_token`
+    FROM THE CATALOG (default 4.0): a model-family property the OS does not control and
+    therefore configuration, not a constant. It is a parameter because this module is a
+    leaf and must not import the catalog — the caller supplies it. Refused at or below
+    zero, the same rule the catalog applies, rather than inventing a size.
+    """
+    if chars_per_token <= 0:
+        raise ValueError("chars_per_token must be > 0")
+    path = Path(path)
+    caller = CALLER_SUBAGENT if path.parent.name == "subagents" else CALLER_MAIN
+    found: list[ToolResult] = []
+    pending: dict[str, ToolResult] = {}
+    # The results that landed since the last API call: the ones the NEXT call's context
+    # growth paid for.
+    group: list[ToolResult] = []
+    calls: dict[str, Call] = {}
+    previous: Call | None = None
+    # A prompt row or a compaction between two calls means the context grew (or shrank)
+    # for a reason that is not the tool, so the exact basis is off for this group.
+    interrupted = False
+
+    for row in rows(path):
+        kind = row.get("type")
+        if kind == "system" and row.get("subtype") == "compact_boundary":
+            interrupted = True
+            continue
+        if _is_prompt_row(row):
+            interrupted = True
+            continue
+        if kind == "assistant":
+            call, mid = _call_of_row(row)
+            if call is not None:
+                seen = calls.get(mid)
+                if seen is not None:
+                    # THE STREAMING DUPLICATE: one assistant message is written several
+                    # times as its text grows, every copy repeating the input counts and
+                    # climbing toward the final `output_tokens`. Merge by max into the
+                    # call already placed, the same rule `_assistant_messages` applies —
+                    # summing the copies would triple the context.
+                    _merge_call(seen, call)
+                else:
+                    _size_group(group, previous, call, interrupted, chars_per_token)
+                    group = []
+                    interrupted = False
+                    calls[mid] = call
+                    previous = call
+            for block in blocks_of(row, "tool_use"):
+                tool_id = str(block.get("id") or "")
+                if not tool_id or tool_id in pending:
+                    continue
+                arguments = block.get("input")
+                item = ToolResult(
+                    tool_use_id=tool_id, name=str(block.get("name") or ""),
+                    input=arguments if isinstance(arguments, dict) else {},
+                    caller=caller, call_ts=parse_stamp(row.get("timestamp")))
+                pending[tool_id] = item
+                found.append(item)
+            continue
+        for block in blocks_of(row, "tool_result"):
+            item = pending.pop(str(block.get("tool_use_id") or ""), None)
+            if item is None:
+                # A result for a call this file never recorded. Ignored rather than
+                # invented: there is no name to charge it to.
+                continue
+            item.matched = True
+            item.ts = parse_stamp(row.get("timestamp"))
+            item.chars = len(_result_text(block.get("content")))
+            item.is_error = _result_failed(block, row.get("toolUseResult"))
+            group.append(item)
+    # A result after the LAST call of the session has no delta to be measured against.
+    _size_group(group, previous, None, True, chars_per_token)
+    return found
+
+
+def _is_prompt_row(row: dict[str, Any]) -> bool:
+    """Whether this row is the USER talking, rather than the agent's own loop.
+
+    `inspection._prompt_of`'s rule, reduced to the boolean this walk needs: of the three
+    kinds of `user` row only one is a prompt — a tool result is the loop, and an
+    `isMeta` row is Claude Code talking to itself (a skill's base directory, a hook's
+    output). Charging either to a tool is how the user's typing lands on a `Read`.
+    """
+    if row.get("type") != "user":
+        return False
+    if row.get("promptSource") != "sdk" and (
+            row.get("isMeta") or blocks_of(row, "tool_result")):
+        return False
+    content = (row.get("message") or {}).get("content")
+    text = content if isinstance(content, str) else " ".join(
+        b.get("text", "") for b in blocks_of(row, "text"))
+    return bool(text.strip())
+
+
+def _call_of_row(row: dict[str, Any]) -> tuple[Call | None, str]:
+    """The API call one assistant row stands for, with its message id, or (None, "").
+
+    The same two rejections `_assistant_messages` makes — no `usage` object, and
+    `_is_api_call` — so the calls this walk measures a delta between are exactly the
+    calls the rest of the module bills.
+    """
+    message = row.get("message") or {}
+    counts, mid = message.get("usage"), message.get("id")
+    if not isinstance(counts, dict) or not mid:
+        return (None, "")
+    entry: dict[str, Any] = {"model": message.get("model") or ""}
+    for key, value in counts.items():
+        if isinstance(value, int):
+            entry[key] = value
+    creation = counts.get("cache_creation")
+    if isinstance(creation, dict):
+        for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
+            value = creation.get(key)
+            if isinstance(value, int):
+                entry[key] = value
+    if not _is_api_call(entry):
+        return (None, "")
+    return (Call(ts=parse_stamp(row.get("timestamp")), model=entry["model"],
+                 input=entry.get("input_tokens", 0),
+                 cache_write=entry.get("cache_creation_input_tokens", 0),
+                 cache_read=entry.get("cache_read_input_tokens", 0),
+                 output=entry.get("output_tokens", 0),
+                 cache_1h=entry.get("ephemeral_1h_input_tokens", 0),
+                 cache_5m=entry.get("ephemeral_5m_input_tokens", 0)), str(mid))
+
+
+def _merge_call(into: Call, other: Call) -> None:
+    """Fold a repeated copy of one assistant message into the call already placed."""
+    into.input = max(into.input, other.input)
+    into.cache_write = max(into.cache_write, other.cache_write)
+    into.cache_read = max(into.cache_read, other.cache_read)
+    into.output = max(into.output, other.output)
+    into.cache_1h = max(into.cache_1h, other.cache_1h)
+    into.cache_5m = max(into.cache_5m, other.cache_5m)
+
+
+def _size_group(group: list[ToolResult], previous: Call | None, nxt: Call | None,
+                interrupted: bool, chars_per_token: float) -> None:
+    """Charge one batch of results with the tokens the next call carried them as.
+
+    `context-delta`, token-exact where it applies:
+
+        appended = context(N+1) - context(N) - output(N)
+
+    `Call.context` is the full prompt size of one API call, so the growth between two
+    consecutive calls of the same chain is what was appended between them — the results
+    of this group, plus the assistant message N itself, which `output(N)` removes. Split
+    across the group in proportion to characters, because parallel tool calls put
+    several results between one pair of calls and the transcript says nothing about
+    which of them was the big one.
+
+    Falls back to `chars` whenever the delta is not evidence: a prompt row or a
+    compaction between the two calls (`interrupted`), no next call, or a delta that did
+    not grow. The estimate is visible in `token_basis`, never silently mixed in.
+    """
+    if not group:
+        return
+    delta = 0
+    if previous is not None and nxt is not None and not interrupted:
+        delta = nxt.context - previous.context - previous.output
+    if delta > 0:
+        for item, share in zip(group, _split_by_chars(delta,
+                                                      [i.chars for i in group])):
+            item.tokens = share
+            item.token_basis = BASIS_CONTEXT_DELTA
+        return
+    for item in group:
+        item.tokens = math.ceil(item.chars / chars_per_token)
+        item.token_basis = BASIS_CHARS
+
+
+def _split_by_chars(total: int, weights: list[int]) -> list[int]:
+    """Split an exact total in proportion to character counts, losing nothing.
+
+    Largest remainder, ties to the earlier result: the parts MUST sum to `total`, since
+    the total is the one token-exact figure in this walk and a per-result rounding that
+    dropped its remainder would under-report every parallel call in the fleet. Equal
+    shares when nothing has any characters — an empty result still rode along.
+    """
+    count = len(weights)
+    if total <= 0 or count == 0:
+        return [0] * count
+    denominator = sum(weights) or count
+    scale = weights if sum(weights) else [1] * count
+    parts = [total * weight // denominator for weight in scale]
+    remainders = sorted(range(count),
+                        key=lambda i: (-(total * scale[i] % denominator), i))
+    for index in remainders[:total - sum(parts)]:
+        parts[index] += 1
+    return parts
+
+
+def _result_text(content: Any) -> str:
+    """A `tool_result` block's text: a bare string, or a list of text blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text") or "") for b in content
+                        if isinstance(b, dict))
+    return ""
+
+
+def _result_failed(block: dict[str, Any], result: Any) -> bool:
+    """Whether this result reports an ERROR — `background._failed`'s precedence.
+
+    Kept apart rather than dropped: a refused call returns a two-line refusal, and
+    averaging it in with a 20k-token file dump moves the number a reader acts on.
+    """
+    if block.get("is_error"):
+        return True
+    if isinstance(result, dict):
+        return bool(result.get("is_error") or result.get("isError"))
+    text = result if isinstance(result, str) else _result_text(block.get("content"))
+    return text.startswith(_RESULT_ERROR_PREFIX)
