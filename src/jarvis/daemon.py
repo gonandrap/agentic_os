@@ -913,6 +913,8 @@ class Daemon:
                     # the only other thing that changes the answer — the reconcile beat
                     # would be too slow to save the worker turn this exists to save.
                     self.settle_shipped_releases(project, store)
+                    # Immediately after it, never before: issue #945 spec §2.1.
+                    self.refile_dropped_fixes(project, store)
                 # After the pull-request poll, so the merge that completes a feature's
                 # last child settles the feature in the same tick rather than the next
                 # one — but outside the `if`, because a child can also finish without
@@ -7870,6 +7872,13 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         Idempotent for the same reason the rest of the lifecycle is — a fix already in
         the batch is not added twice, so a sweep that runs again changes nothing.
 
+        **A candidate whose worker has DELIVERED ships nothing more** (issue #945, Neo
+        question 1335): `OPEN_STATUSES` answers "is this order settled", and four of its
+        names are reached only after a delivery, so wo-29f44978 grew a batch three minutes
+        after its turn ended and no tag ever carried the fix. The `finished` event is the
+        discriminator, and the already-present url is read BEFORE any write so the §2
+        sweep is never raced by a second order filed here.
+
         **Except for a payload production is ALREADY RUNNING** (issue #934, Neo question
         1329 option A): batching against open orders alone meant every fix landing after
         the previous release settled earned a tag whose only commit was its own version
@@ -7889,22 +7898,32 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         line = (f"- {url} — fixed by `{wo['id']}`"
                 + (f" ({wo['pr_url']})" if wo.get("pr_url") else "")
                 + f" — {reason}")
+        candidates: list[tuple[dict[str, Any], dict[str, Any], list]] = []
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
                                                 include_hidden=True):
             meta = db.from_json(candidate.get("metadata"), {}) or {}
             batch = meta.get(self.RELEASE_BATCH_KEY)
-            if not isinstance(batch, list):
+            if isinstance(batch, list):
+                candidates.append((candidate, meta, batch))
+        # §1.3, pass one over the one read: an url already batched anywhere is never added
+        # twice and never earns a second order, finished holder or not.
+        for candidate, _meta, batch in candidates:
+            if url in batch:
+                return str(candidate["id"])
+        # §1.1-1.2: `finished` is written by `jarvis wo finish`, which every delivery goes
+        # through. Skip and keep looking; no candidate falls through to a fresh order.
+        for candidate, meta, batch in candidates:
+            if store.events_of_kind(candidate["id"], "finished"):
                 continue
-            if url not in batch:
-                store.update_work_order(
-                    candidate["id"],
-                    metadata=db.to_json({**meta,
-                                         self.RELEASE_BATCH_KEY: [*batch, url]}),
-                    description=f"{candidate.get('description') or ''}\n{line}")
-                store.add_event(candidate["id"], "release_batched",
-                                {"issue_url": url, "wo_id": wo["id"]})
-                log.info("[%s] %s joins the pending release %s", project.name, url,
-                         candidate["id"])
+            store.update_work_order(
+                candidate["id"],
+                metadata=db.to_json({**meta,
+                                     self.RELEASE_BATCH_KEY: [*batch, url]}),
+                description=f"{candidate.get('description') or ''}\n{line}")
+            store.add_event(candidate["id"], "release_batched",
+                            {"issue_url": url, "wo_id": wo["id"]})
+            log.info("[%s] %s joins the pending release %s", project.name, url,
+                     candidate["id"])
             return str(candidate["id"])
 
         # The brief names the work order's OWN id (`shipit.sh --wo`), which does not
@@ -8106,6 +8125,17 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
     #: read from GitHub once for a pull request that merged before the poller recorded it.
     MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
 
+    #: On the DROPPER: one url of its batch that no `jarvis-*` tag carried, re-filed by
+    #: `refile_dropped_fixes` (issue #945 spec §2.4). Also its per-url dedupe marker.
+    RELEASE_REFILED_EVENT = "release_refiled"
+
+    #: The other end, on the TARGET: where this entry of its batch came from.
+    RELEASE_REFILED_FROM_EVENT = "release_refiled_from"
+
+    #: Every url of a settled order's batch is accounted for, so later passes do zero git
+    #: and zero `gh` work (§2.2).
+    RELEASE_BATCH_CLEARED_EVENT = "release_batch_cleared"
+
     def settle_shipped_releases(self, project: ProjectSpec,
                                 store: ProjectStore) -> None:
         """End a release order whose fixes another release already shipped — issue #784.
@@ -8255,6 +8285,97 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         store.add_event(fix["id"], self.MERGE_COMMIT_EVENT,
                         {"pr_url": pr_url, "merge_commit": pr.merge_commit_oid})
         return pr.merge_commit_oid
+
+    def refile_dropped_fixes(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Re-file a fix a SETTLED release order dropped — issue #945 §2.
+
+        A batch entry has no post-condition. `_release_payload` and
+        `_settle_shipped_release` ask whether a tag carries a batch in order to CLOSE an
+        order; nothing ever asked whether a settled order's batch was carried, so every
+        route to a drop — a batch grown after the worker finished, a release that failed
+        holding fixes — was permanent and silent. Issue 903's merge commit `667bd494` is in
+        no tag because of it.
+
+        `ensure_release` fires only on the issue-state TRANSITION, so the landing signal is
+        spent once and nothing re-files: the tags are the only remaining witness. Pure
+        catch-up on the `poll_prs` beat, scoped like both its neighbours.
+
+        docs/superpowers/specs/2026-10-06-a-landed-fix-batched-into-a-release-order-that-already-finished.md
+        """
+        # §2.1: it reads `jarvis-*` tags and `paths.production_code_dir()`, facts about
+        # this repository and not about a project.
+        if project.name != self._os_owner():
+            return
+        # §2.2: the window is this project's claim about its release cadence.
+        since = db.now() - int(project.release.refile_window_days) * 86400
+        for wo in store.settled_release_orders(since):
+            try:
+                self._refile_dropped_batch(project, store, wo)
+            except Exception:  # noqa: BLE001 — one order must not stall the tick
+                log.exception("[%s] re-filing %s's dropped fixes failed", project.name,
+                              wo["id"])
+                continue
+
+    def _refile_dropped_batch(self, project: ProjectSpec, store: ProjectStore,
+                              wo: dict[str, Any]) -> None:
+        """One settled order, one decision per url — §2.3.
+
+        `_release_payload` is NOT reused: it returns None when ONE entry is unresolvable,
+        which is right for completing an order and wrong here, where an unreadable entry
+        must not hide a genuine drop in the entries beside it.
+        """
+        from . import release
+
+        wo_id = str(wo["id"])
+        if store.events_of_kind(wo_id, self.RELEASE_BATCH_CLEARED_EVENT):
+            return
+        meta = db.from_json(wo.get("metadata"), {}) or {}
+        batch = [str(u) for u in (meta.get(self.RELEASE_BATCH_KEY) or [])]
+        fixers = {}
+        for event in store.events_of_kind(wo_id, "release_batched"):
+            said = db.from_json(event["payload"], {})
+            fixers[said.get("issue_url")] = said.get("wo_id")
+        done = {db.from_json(e["payload"], {}).get("issue_url")
+                for e in store.events_of_kind(wo_id, self.RELEASE_REFILED_EVENT)}
+        accounted = True
+        for url in batch:
+            if url in done:
+                continue
+            fix = None
+            fix_id = fixers.get(url)
+            if fix_id:
+                try:
+                    fix = store.get_work_order(str(fix_id))
+                except KeyError:
+                    fix = None
+            sha = self._merge_commit_of(project, store, fix) if fix else ""
+            if not fix or not sha:
+                accounted = False  # §2.3.4: unresolved blocks the clear, so it is re-read
+                continue
+            found = release.overtaken_by(project.path, [sha])
+            # The TAG first: a tag read fine is not an unreadable tag list, whatever
+            # production is running — that is the deploy question (§2.3.3).
+            if found.tag:
+                continue
+            if found.error:
+                log.debug("[%s] %s: cannot tell whether %s shipped: %s", project.name,
+                          wo_id, url, found.error)
+                accounted = False
+                continue
+            target = self.ensure_release(project, store, fix)
+            if not target:
+                # `ensure_release` filing nothing is not a re-file (§2.3.4).
+                accounted = False
+                continue
+            store.add_event(wo_id, self.RELEASE_REFILED_EVENT, {
+                "issue_url": url, "release_wo_id": target, "fix_wo_id": str(fix["id"])})
+            store.add_event(target, self.RELEASE_REFILED_FROM_EVENT, {
+                "issue_url": url, "dropped_by": wo_id})
+            log.info("[%s] %s was dropped by %s and no tag carries it — re-filed as %s",
+                     project.name, url, wo_id, target)
+        if accounted:
+            store.add_event(wo_id, self.RELEASE_BATCH_CLEARED_EVENT,
+                            {"batch": batch})
 
     def _warn_issue_sync_broken(self, project: ProjectSpec, store: ProjectStore,
                                 error: Exception) -> None:
