@@ -427,8 +427,9 @@ def test_the_tick_runs_the_step_after_the_issue_sweep(project, daemon, monkeypat
 # -- the red-`main` hold ---------------------------------------------------------------
 #
 # docs/superpowers/specs/2026-09-27-an-expedited-order-that-lands-ships-a-release.md §5.
-# `ensure_release` always files, so the hold is on DISPATCH: a call skipped because the
-# base was red never comes back, and the fix would be dropped from every future batch.
+# `ensure_release` files unless production already runs the payload (#934), so the hold is
+# on DISPATCH: a call skipped because the base was red never comes back, and the fix would
+# be dropped from every future batch.
 
 
 def run(sha_: str, conclusion: str = "failure", workflow: str = "tests",
@@ -579,3 +580,129 @@ def test_overtaken_settles_a_release_deferred_in_pending(project, store, daemon,
 
     assert store.get_work_order(rel)["status"] == "completed"
     assert len(events(store, rel, "release_completed")) == 1
+
+
+# -- no release is filed for a fix a live tag already carries — issue #934 ------------
+#
+# `ensure_release` batched only against OPEN release orders, so once the previous release
+# settled the next landed fix always earned a new one — five times a worker turn, a gate
+# and a tag whose only commit was its own version bump (issue 837 was eight tags behind).
+
+
+def landed_fix(store: ProjectStore, url: str, merge_commit: str) -> dict:
+    """The FIXING order as `sync_issues` hands it to `ensure_release`."""
+    fix = store.create_work_order("fix the bug", status="completed", issue_url=url)
+    store.update_work_order(fix["id"], pr_url=PR)
+    payload = {"pr_url": PR, "head_oid": "branchtip"}
+    if merge_commit:
+        payload["merge_commit"] = merge_commit
+    store.add_event(fix["id"], "pr_merged", payload)
+    return store.get_work_order(fix["id"])
+
+
+def filing(daemon: Daemon, store: ProjectStore, fix: dict) -> str:
+    """The filing step alone, without the rest of the issue sweep around it."""
+    return daemon.ensure_release(daemon.catalog.project("proj_a"), store, fix)
+
+
+def batches(store: ProjectStore) -> list[dict]:
+    """Every order carrying a release batch — what `ensure_release` files or joins."""
+    return [w for w in store.list_work_orders(include_hidden=True)
+            if isinstance(db.from_json(w.get("metadata"), {}).get(
+                Daemon.RELEASE_BATCH_KEY), list)]
+
+
+def test_a_fix_a_live_tag_already_carries_files_no_release_at_all(
+        project, store, daemon, deploy):
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    fix = landed_fix(store, ISSUE, landed)
+
+    assert filing(daemon, store, fix) == ""
+
+    assert batches(store) == []
+    said = events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT)
+    assert len(said) == 1
+    assert said[0]["tag"] == TAG
+    assert said[0]["deployed"] == TAG
+    assert said[0]["shas"] == [landed]
+    assert TAG in said[0]["detail"]
+
+
+def test_a_fix_a_live_tag_already_carries_does_not_join_an_open_batch_either(
+        project, store, daemon, deploy):
+    """The guard runs BEFORE the batch loop: joining would put a shipped fix in the next
+    release's notes and keep that order open on work already live."""
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    rel = release_order(store, project, shas={ISSUE + "-other": landed})
+    before = snapshot(store, rel)
+    fix = landed_fix(store, ISSUE, landed)
+
+    assert filing(daemon, store, fix) == ""
+
+    assert snapshot(store, rel) == before
+    assert len(events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT)) == 1
+
+
+def unreadable_repository(project, store, daemon, deploy, landed):
+    tag(project, TAG)
+    deploy(project, TAG)
+    return landed_fix(store, ISSUE, "not-a-sha-at-all")
+
+
+def no_resolvable_merge_commit(project, store, daemon, deploy, landed):
+    tag(project, TAG)
+    deploy(project, TAG)
+    return landed_fix(store, ISSUE, "")
+
+
+def a_tag_production_is_behind(project, store, daemon, deploy, landed):
+    tag(project, OLD_TAG, rev="HEAD~1")
+    tag(project, TAG)
+    deploy(project, OLD_TAG)
+    return landed_fix(store, ISSUE, landed)
+
+
+def nothing_carries_it_yet(project, store, daemon, deploy, landed):
+    tag(project, OLD_TAG, rev="HEAD~1")  # cut BEFORE the fix landed
+    deploy(project, OLD_TAG)
+    return landed_fix(store, ISSUE, landed)
+
+
+@pytest.mark.parametrize("setup", [
+    unreadable_repository,
+    no_resolvable_merge_commit,
+    a_tag_production_is_behind,
+    nothing_carries_it_yet,
+], ids=lambda f: f.__name__)
+def test_everything_short_of_already_live_still_files_a_release(
+        project, store, daemon, deploy, fake_gh, setup):
+    """An unreadable repository or production checkout must NEVER strand a release —
+    `an unreadable CI does not hold` points the same way."""
+    fake_gh.fail("gh: could not connect")
+    landed = land(project, "fix-one.txt")
+    fix = setup(project, store, daemon, deploy, landed)
+
+    rel = filing(daemon, store, fix)
+
+    assert [w["id"] for w in batches(store)] == [rel]
+    assert events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT) == []
+
+
+def test_a_project_that_does_not_own_the_os_files_exactly_as_before(
+        project, store, daemon, deploy, monkeypatch):
+    """`overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, so a
+    second project keeps today's behaviour — `settle_shipped_releases`' guard."""
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    monkeypatch.setattr(daemon, "_os_owner", lambda: "someone-else")
+    fix = landed_fix(store, ISSUE, landed)
+
+    rel = filing(daemon, store, fix)
+
+    assert [w["id"] for w in batches(store)] == [rel]
+    assert events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT) == []
