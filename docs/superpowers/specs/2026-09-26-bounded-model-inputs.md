@@ -291,6 +291,51 @@ Optional, and speculative: measure whether rendering the evidence block FIRST in
 knows where the CLI places a cache breakpoint inside a user message. Measure it; do not
 build on it, and do not reorder that prompt on the strength of a guess.
 
+### 6.1 — The result, measured 2026-10-07 (wo-a2cc8692)
+
+**The trim is not unsafe, and it is not free.** Over 136 scored rows it never confirmed
+where the full diff refused — the one row that did, wo-3b93b1ea#1, did not reproduce — but
+it escalates 82 of 136, 60.3% of the confirmations the full diff approved. Its agreement with what the fleet actually recorded falls from 0.750 to
+0.213. At 12,000 chars the confirmation pass stops being mostly an auto-confirmer and
+becomes mostly an escalator. That is a cost the user has to price, not a defect, and
+section 2's number is the thing it prices.
+
+`JARVIS_EVALS_LLM=1 pytest evals/llm/test_confirm_evidence_ab.py -q -s`, model sonnet, full
+arm at `daemon.CONFIRM_COLLECT_CHARS` (1,000,000 — nothing cut), trimmed arm at
+`catalog.DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS` (12,000).
+
+The corpus comes from `evals/tools/build_confirm_corpus.py`, built against the live
+production fleet through the `jarvis` CLI only: 211 work orders read, 146 usable
+confirmation cases (141 recorded accepted, 5 rejected), 235 assumptions skipped as never
+confirmed and 5 with no diff left to collect. Not committed, for the reason in this
+section's design and the builder's own docstring.
+
+Exclusions, each a count. 8 of the 146 rows rendered byte-identical arms — the diff was
+already under 12,000 — and were filtered out before the paid calls, not after. 136 of the
+remaining 138 scored; 2 excluded as unreadable replies, wo-564ebedb#1 and wo-35216d58#3.
+Zero transport failures in the final numbers: the first pass lost 64 rows to transient
+failures of its own making, 7 shards in parallel against the shared usage limit, and
+re-running exactly those rows at concurrency 2 scored 64 of 66 with no transport failure at
+all. Parallelism against one account is the hazard, not the payload size.
+
+- verdict agreement, full vs trimmed: 53/136 = 0.390
+- unsafe flips (full refuses, trimmed approves): 1 — wo-3b93b1ea#1, which re-judged
+  full=approve / trimmed=escalate 3 times out of 3, so the recorded flip was the full arm's
+  own sampling variance on one call. Both arms are a single sample per row and the assertion
+  demands exactly 0 over 136 rows, so filed as issue 958 against the EVAL, not against the
+  trim.
+- safe-direction disagreement (full approves, trimmed escalates): 82/136 = 0.603
+- agreement with the recorded outcome: full 0.750 (102/136), trimmed 0.213 (29/136)
+
+Input sizes, from the `prompt_chars` / `system_prompt_chars` columns section 3 added, over
+the 136 scored rows. Full: median 79,777, mean 100,859, max 302,149, total 13,716,932.
+Trimmed: median 10,042, mean 11,054, max 20,580, total 1,503,431. A saving of 12,213,501
+chars over the run — 89.0% of the full arm's input, 87.4% at the median.
+`system_prompt_chars` is 4,984 in both arms, so the whole difference is the evidence block.
+
+This section's optional cache-prefix experiment was not built, for the reason stated above
+it. Unchanged.
+
 ## 7 — Refused and deferred, with reasons, so nobody re-litigates them
 
 **Which of the user's eight items these are.** Item 2 (one diff per work order per
