@@ -421,9 +421,16 @@ policies whose blockers differ.
 ### 5.2 `doc_nav_decision`
 
 ```python
-DEFAULT_DOC_READ_LIMIT = 200   # catalog-settable
 def doc_nav_decision(payload, env) -> dict[str, Any] | None: ...
 ```
+
+THE LINE LIMIT IS A CATALOG SETTING AND NEVER A MODULE CONSTANT. `worker.doc_read_limit_lines`,
+resolvable fleet-wide and per project, enumerated in §5.3 exactly as the switch is. The
+standing rulings on `fleet_health.*` and on the backstop ceiling are unambiguous on this,
+and the user's own scope text says "over a configurable line/token threshold" — a
+conservative default does not earn an exception. `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES`
+is the FALLBACK VALUE of that key (200) and is not the resolved one: the hook reads the
+resolved number out of the environment, and a project that sets its own gets its own.
 
 Gated on `JARVIS_DOC_NAV_HOOK == "on"` and on `JARVIS_WO_ID` being set, so an interactive
 session in a managed project is untouched. NOT gated on `.serena/project.yml`: the
@@ -446,13 +453,33 @@ has to be actionable from the refusal alone.
 
 ### 5.3 Wiring
 
-`catalog.py`: `DEFAULT_WORKER_DOC_NAV_HOOK = "off"`, `VALID_DOC_NAV_HOOK`,
-`WorkerDefaults.doc_nav_hook` beside `py_nav_hook` at line 459,
-`OsConfig.default_doc_nav_hook` beside line 1403, and both validations (the `os.defaults`
-one near 2306 and the per-project one near 2355) so an invalid value names the key and the
-valid values. `dispatch.py` writes `JARVIS_DOC_NAV_HOOK` and the threshold beside
-`JARVIS_PY_NAV_HOOK` at line 215. `ops.py` gains `("*.doc_nav_hook", "next-dispatch")`
-beside line 10991.
+TWO KEYS, each enumerated in full. Neither is a module constant, and this list is the
+checklist: a key that is missing one row of it is half-wired and the setting silently does
+nothing.
+
+**`worker.doc_nav_hook`** — the switch, `"off"` | `"on"`, default `"off"`:
+
+| where | what |
+|---|---|
+| `catalog.py` | `DEFAULT_WORKER_DOC_NAV_HOOK = "off"` and `VALID_DOC_NAV_HOOK` |
+| `catalog.py` | `WorkerDefaults.doc_nav_hook`, beside `py_nav_hook` at line 459 |
+| `catalog.py` | `OsConfig.default_doc_nav_hook`, beside line 1403 |
+| `catalog.py` | the `os.defaults` validation near line 2306 |
+| `catalog.py` | the per-project validation near line 2355 |
+| `dispatch.py` | writes `JARVIS_DOC_NAV_HOOK`, beside `JARVIS_PY_NAV_HOOK` at line 215 |
+| `ops.py` | `("*.doc_nav_hook", "next-dispatch")`, beside line 10991 |
+
+**`worker.doc_read_limit_lines`** — the threshold, an `int`, fallback 200. THE SAME SEVEN
+ROWS, and not one fewer: `DEFAULT_WORKER_DOC_READ_LIMIT_LINES = 200`,
+`WorkerDefaults.doc_read_limit_lines`, `OsConfig.default_doc_read_limit_lines`, both
+validations (an `int` above zero; an invalid value names the key and says so), the
+`dispatch.py` env write beside the switch, and `("*.doc_read_limit_lines",
+"next-dispatch")` in `ops.py`. `WorkerDefaults.mcp_tool_timeout_ms` is the existing model
+for a numeric worker key — follow its shape rather than inventing one.
+
+Both validations must name the KEY in their message. A number resolved from a project's
+catalog and a number hardcoded in `hooks.py` are indistinguishable in a passing test, so
+the test that matters is the one that sets a per-project value and sees the hook honour it.
 
 ### 5.4 What this section must prove
 
@@ -462,6 +489,14 @@ lands later is a refusal nobody verified: a whole-file `Read` of a spec is refus
 `sed -n '1,2000p'` of a spec is refused, and a `Read` of
 `.jarvis/features/fo-x/sections/wo-y.md` passes at any size. All five with the key `on`;
 all five pass with it `off`.
+
+SIXTH, and it is the one that proves §5.3's second key is wired rather than declared: a
+project whose catalog sets `worker.doc_read_limit_lines` to a value OTHER than 200 gets
+that number honoured by `doc_nav_decision` — a `Read` with a `limit` between the project's
+value and 200 flips its verdict when the key changes. A test that only exercises the
+fallback cannot tell a resolved setting from a hardcoded one. Also pin
+`_write_worker_settings` writing the resolved number, and both validations refusing a
+non-integer and a zero while naming the key.
 
 A fixture exercising any jarvis `PreToolUse` hook must create a `.jarvis/` directory at
 its repo root — `hooks.find_project_root` resolves the project by it (kn-6c033672).
