@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -972,6 +973,44 @@ class NavigationConfig:
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
 
+#: Shipped defaults of `CostConfig`. The usage week resets Monday 21:00
+#: America/Los_Angeles — VERIFIED: Mon 2026-09-28 21:00 PDT = 2026-09-29 04:00 UTC.
+DEFAULT_COST_WEEK_RESET_WEEKDAY = 0        # Monday, `datetime.weekday()` numbering
+DEFAULT_COST_WEEK_RESET_HOUR = 21
+DEFAULT_COST_WEEK_RESET_ZONE = "America/Los_Angeles"
+DEFAULT_COST_PERCENTILE = 0.9
+DEFAULT_COST_MAX_ORDERS = 500
+#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply.
+#: A model-family property the OS does not control, and UNCALIBRATED against the fleet —
+#: which is why every figure derived from it reports its `token_basis` counts beside it.
+DEFAULT_COST_CHARS_PER_TOKEN = 4.0
+DEFAULT_COST_TOOL_ROWS = 20
+
+
+@dataclass
+class CostConfig:
+    """What `jarvis cost --fleet` reports over, and where its default window starts.
+
+    Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
+    project naming one key keeps the OS answer for the rest. Neo's rider on
+    wo-38456776 — no module constant for anything tunable — and the reason is that all
+    seven of these move: a DST shift and an Anthropic policy change both move the reset,
+    what counts as the tail of the distribution differs by project, and the tokens-per-
+    character of a model family is Anthropic's to change.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md, and §10.10
+    of its per-tool addendum for the last two.
+    """
+
+    week_reset_weekday: int = DEFAULT_COST_WEEK_RESET_WEEKDAY
+    week_reset_hour: int = DEFAULT_COST_WEEK_RESET_HOUR
+    week_reset_zone: str = DEFAULT_COST_WEEK_RESET_ZONE
+    percentile: float = DEFAULT_COST_PERCENTILE
+    max_orders: int = DEFAULT_COST_MAX_ORDERS
+    chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
+    tool_rows: int = DEFAULT_COST_TOOL_ROWS
+
+
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
@@ -1053,6 +1092,23 @@ class BugsConfig:
     """
 
     label: str = DEFAULT_BUGS_LABEL
+
+
+#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
+#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
+
+
+@dataclass
+class ReleaseConfig:
+    """How long a settled release order's dropped batch stays worth re-filing.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    the answer is a claim about THIS project's release cadence, and a project that ships
+    weekly has a different one from a project that ships twice a year.
+    """
+
+    refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
 @dataclass
@@ -1317,11 +1373,13 @@ class ProjectSpec:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1447,11 +1505,13 @@ class OsConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1878,6 +1938,65 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
     return cfg
 
 
+def _parse_cost(raw: Any, base: CostConfig | None = None,
+                where: str = "os.cost") -> CostConfig:
+    """`os.cost`, or a project's override of it, with absurd values refused.
+
+    `base` is the same field-level inheritance `_parse_inspect` uses (kn-6ca2bcd9):
+    `os.cost` parses against the shipped defaults and each project parses against the OS
+    answer, so no caller consults two objects.
+
+    THE FOUR VOCABULARIES ARE KEPT APART because `_parse_inspect`'s ">= 1" rule serves
+    none of them. A WEEKDAY is 0..6 and a reset HOUR is 0..23 — zero is LEGAL in both,
+    and ">= 1" would reject Monday and midnight. A PERCENTILE is refused outside
+    `(0, 1)`, both ends exclusive: 0 names no observation and 1 is the maximum, which the
+    report already carries beside it. A COUNT of orders to walk is refused below 1, where
+    zero would report an empty distribution rather than fail. A ZONE must construct a
+    `ZoneInfo` or the window is silently wrong every week, so it is refused naming the
+    value typed. A DIVISOR (`chars_per_token`) is refused at or below zero, where the
+    rule is not ">= 1" because 3.5 characters per token is a legal belief about a model
+    family; a ROW COUNT (`tool_rows`) takes the count rule.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+    base = base or CostConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = CostConfig(
+        week_reset_weekday=int(raw.get("week_reset_weekday", base.week_reset_weekday)),
+        week_reset_hour=int(raw.get("week_reset_hour", base.week_reset_hour)),
+        week_reset_zone=str(raw.get("week_reset_zone", base.week_reset_zone)),
+        percentile=float(raw.get("percentile", base.percentile)),
+        max_orders=int(raw.get("max_orders", base.max_orders)),
+        chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
+        tool_rows=int(raw.get("tool_rows", base.tool_rows)),
+    )
+    if not 0 <= cfg.week_reset_weekday <= 6:
+        raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
+                   f"{cfg.week_reset_weekday} is not a day of the week")
+    if not 0 <= cfg.week_reset_hour <= 23:
+        raise _err(f"{where}.week_reset_hour must be 0..23 — {cfg.week_reset_hour} is "
+                   f"not an hour of the day")
+    if not 0 < cfg.percentile < 1:
+        raise _err(f"{where}.percentile must be strictly inside (0, 1) — "
+                   f"{cfg.percentile} names either no observation or the maximum, which "
+                   f"the report already reports beside it")
+    if cfg.max_orders < 1:
+        raise _err(f"{where}.max_orders must be >= 1")
+    if cfg.chars_per_token <= 0:
+        raise _err(f"{where}.chars_per_token must be > 0 — {cfg.chars_per_token} is not "
+                   f"a divisor, and a negative one would report negative tokens")
+    if cfg.tool_rows < 1:
+        raise _err(f"{where}.tool_rows must be >= 1")
+    try:
+        zoneinfo.ZoneInfo(cfg.week_reset_zone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+        raise _err(f"{where}.week_reset_zone {cfg.week_reset_zone!r} is not a time zone "
+                   f"this system knows ({e}) — the usage week would start at the wrong "
+                   f"instant every week") from e
+    return cfg
+
+
 def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
                         where: str = "os.observability") -> ObservabilityConfig:
     """`os.observability`, or a project's override of it — field-level, like
@@ -1946,6 +2065,26 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
         raise _err(f"{where}.label must start with a letter or digit and use only "
                    f"letters, digits, spaces and ._:/- (got {label!r})")
     return BugsConfig(label=label)
+
+
+def _parse_release(raw: Any, base: ReleaseConfig | None = None,
+                   where: str = "os.release") -> ReleaseConfig:
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: a window of 0 days
+    means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or ReleaseConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = ReleaseConfig(
+        refile_window_days=int(raw.get("refile_window_days", base.refile_window_days)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
@@ -2283,11 +2422,13 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
         navigation=_parse_navigation(os_raw.get("navigation", {})),
+        cost=_parse_cost(os_raw.get("cost", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
@@ -2411,6 +2552,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         navigation_cfg = _parse_navigation(
             p.get("navigation", {}), base=os_cfg.navigation,
             where=f"projects[{i}] ({name}).navigation")
+        cost_cfg = _parse_cost(
+            p.get("cost", {}), base=os_cfg.cost,
+            where=f"projects[{i}] ({name}).cost")
         observability_cfg = _parse_observability(
             p.get("observability", {}), base=os_cfg.observability,
             where=f"projects[{i}] ({name}).observability")
@@ -2426,6 +2570,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        release_cfg = _parse_release(
+            p.get("release", {}), base=os_cfg.release,
+            where=f"projects[{i}] ({name}).release")
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
@@ -2448,11 +2595,13 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 validation=validation_cfg,
                 inspect=inspect_cfg,
                 navigation=navigation_cfg,
+                cost=cost_cfg,
                 observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                release=release_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,

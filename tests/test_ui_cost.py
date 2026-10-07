@@ -462,6 +462,35 @@ def test_the_drilldown_groups_subprocess_spend_by_what_ran_it(client, project):
     assert "pytest" in page.text and "40 calls" in page.text
 
 
+def test_the_cost_page_shows_the_fleet_distribution(client, project):
+    """The page could say which order cost the most and not what normal looks like.
+
+    Same keys as `jarvis cost --fleet --json`, computed once by `ops.fleet_cost` — a
+    second computation on the page is how two surfaces start disagreeing about a number.
+    """
+    wo = ops.create_work_order("proj_a", "the typical one")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+
+    page = client.get("/cost")
+
+    assert page.status_code == 200
+    assert "cost_per_turn_usd" in page.text
+    assert "p90" in page.text
+    assert "usage week" in page.text, "the window says where it came from"
+
+
+def test_the_cost_page_survives_a_fleet_section_that_cannot_be_built(client, project,
+                                                                     monkeypatch):
+    """The distribution is a SECTION. Losing it must not take the listing down with it."""
+    monkeypatch.setattr(ops, "fleet_cost",
+                        lambda **_k: (_ for _ in ()).throw(ops.OpsError("no catalog")))
+
+    page = client.get("/cost")
+
+    assert page.status_code == 200
+    assert "What the work cost" in page.text
+
+
 def test_every_cost_surface_says_the_figure_is_a_floor(client, project):
     """Unconditional, and identical on both pages — `ops.COST_FLOOR_NOTE` is the single
     source. A caveat that appears in one surface and not another is one the reader learns

@@ -539,6 +539,19 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
+    # The DISTRIBUTION, beside the listing rather than instead of it: what a typical
+    # order costs, over one usage week. Spec §5 of
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    sp.add_argument("--fleet", action="store_true",
+                    help="what a TYPICAL order costs: n, avg, p90 and max per metric "
+                         "over a window, plus what Jarvis itself spent by kind and "
+                         "whether the compactions paid off")
+    sp.add_argument("--since", type=_when,
+                    help="start of the window, a date or ISO datetime "
+                         "(default: this Claude usage week; naive = UTC)")
+    sp.add_argument("--until", type=_when, help="end of the window, exclusive")
+    sp.add_argument("--project", help="one project instead of the whole fleet "
+                                      "(--fleet only)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
@@ -2966,9 +2979,33 @@ def _one_line(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
+def _when(text: str) -> float:
+    """A `--since`/`--until` value, parsed the one way the OS parses a window bound.
+
+    Lazy import so the parser does not drag `usage` and the price tables into every
+    `jarvis` invocation.
+    """
+    from .compaction_payoff import parse_when
+
+    try:
+        return parse_when(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date or ISO datetime: {e}")
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
     target = args.target
+    # The distribution BRANCHES FIRST and the listing below is untouched: `--fleet` adds
+    # a section, it does not reshape a row (spec §5).
+    if getattr(args, "fleet", False):
+        payload = ops.fleet_cost(project=args.project or target or None,
+                                 since=args.since, until=args.until)
+        if args.json:
+            _print(payload, True)
+            return 0
+        _print_fleet(payload["fleet"])
+        return 0
     # One argument, three kinds of thing. Ids are prefixed and projects are not, so
     # this never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project
     # name. The feature-order half goes through the shared predicate rather than a third
@@ -3004,16 +3041,26 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # order, and what the worker spent below itself. `jarvis` and `sub` are how much of
     # it was each. A work order whose transcript is gone can still show those two: both
     # were recorded as they happened rather than read back from a file.
-    print(f"{'$':>7} {'jarvis':>7} {'sub':>7} {'turns':>5} {'output':>7} "
-          f"{'re-write':>9}  work order")
+    # `subproc` was called `sub`, next to a quantity five times larger that was never
+    # printed per order at all. It is `agent_calls.kind='worker_subprocess'` — bare
+    # `claude` processes a worker's own tool calls spawned — and ~$0.57 fleet-wide for a
+    # week, so the dashes were honest about what they measured. `subagent` is the other
+    # quantity: Task-tool subagents, already computed as `subagent_cost_usd` and until
+    # now shown only in the footer total. On wo-6dcd484a that was $3.12 of a $7.03 bill
+    # (spec §5, defect 3).
+    print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
+          f"{'output':>7} {'re-write':>9}  work order")
     for u in units:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
+        agent_cost = (f"{u['subagent_cost_usd']:.2f}"
+                      if u.get("subagent_count") else "—")
         if not u["found"]:
-            print(f"{'—':>7} {os_cost:>7} {sub_cost:>7} {'—':>5} {'—':>7} {'—':>9}  "
-                  f"{u['id']}  {u['title'][:44]}")
+            print(f"{'—':>7} {os_cost:>7} {sub_cost:>8} {agent_cost:>9} {'—':>5} "
+                  f"{'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
             continue
-        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {sub_cost:>7} {u['turns']:>5} "
+        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {sub_cost:>8} "
+              f"{agent_cost:>9} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
 
@@ -3072,6 +3119,153 @@ def cmd_cost(args: argparse.Namespace) -> int:
     print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
           "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
+
+
+def _fleet_value(value: float | None, unit: str) -> str:
+    """One figure, formatted by its UNIT — the renderer never guesses the metric."""
+    if value is None:
+        return "—"
+    if unit == "usd":
+        return f"${value:,.2f}"
+    if unit == "tokens":
+        return _tok(int(value))
+    if unit == "seconds":
+        return f"{value:,.0f}s"
+    if unit == "share":
+        return f"{100 * value:.1f}%"
+    return f"{value:,.2f}"
+
+
+def _tool_label(name: str, width: int = 28) -> str:
+    """A tool name at display width, middle-elided. `--json` always has it in full."""
+    if len(name) <= width:
+        return name
+    head = (width - 1) // 2
+    return f"{name[:head]}…{name[head + 1 - width:]}"
+
+
+def _main_sub(cost: dict) -> str:
+    """The carried-dollar split as whole percents, or `—` where nothing was carried."""
+    callers = cost.get("by_caller") or {}
+    main = (callers.get("main") or {}).get("carried_usd", 0.0)
+    sub = (callers.get("subagent") or {}).get("carried_usd", 0.0)
+    if main + sub <= 0:
+        return "—"
+    return f"{round(100 * main / (main + sub))}% / {round(100 * sub / (main + sub))}%"
+
+
+def _print_tool_cost(tools: dict) -> None:
+    """§10.7: one compact table, the fleet's dearest TOOL habits, dearest first.
+
+    Every caveat comes out of `tools['notes']`, which `_print_fleet` prints with the
+    rest — the dashboard prints the same sentences from the same keys.
+    """
+    totals = tools.get("totals") or {}
+    if not totals.get("calls"):
+        return
+    print(f"\ntool cost — {totals['calls']:,} calls · "
+          f"{_tok(totals['result_tokens'])} result tok · "
+          f"{_tok(totals['carried_tokens'])} carried tok · "
+          f"${totals['carried_usd']:,.2f} carried")
+    print(f"{'tool':<30} {'calls':>7} {'result tok':>11} {'carried tok':>12} "
+          f"{'carried $':>10}  main/sub")
+    from jarvis import fleetcost
+
+    rows = fleetcost.tool_table(tools)
+    limit = tools.get("row_limit") or len(rows)
+    for label, cost in rows[:limit]:
+        print(f"{_tool_label(label):<30} {cost['calls']:>7,} "
+              f"{_tok(cost['result_tokens']):>11} "
+              f"{_tok(cost['carried_tokens']):>12} "
+              f"{cost['carried_usd']:>10,.2f}  {_main_sub(cost)}")
+    rest = rows[limit:]
+    if rest:
+        print(f"({len(rest)} more tool{'s' if len(rest) != 1 else ''}, "
+              f"{_tok(sum(c['result_tokens'] for _, c in rest))} result tok, "
+              f"${sum(c['carried_usd'] for _, c in rest):,.2f} carried)")
+    # The three money fields are never summed without their names, and the TTL one is
+    # `undecided` rather than $0.00 when no `cold_prefix_floor` could decide the split.
+    ttl = totals["carried_rewrite_ttl_usd"]
+    print(f"  carried $ by cause: cache read ${totals['carried_read_usd']:,.2f} · "
+          f"ttl-expiry re-write "
+          f"{'undecided' if ttl is None else f'${ttl:,.2f}'} · "
+          f"prefix-miss re-write ${totals['carried_rewrite_prefix_usd']:,.2f}")
+    basis = totals["token_basis"]
+    excluded = tools["excluded"]
+    walked = excluded["sessions_walked"]
+    print(f"  {basis['context_delta']:,} result sizes measured exactly, "
+          f"{basis['chars']:,} estimated from characters · "
+          f"{walked:,} transcript{'s' if walked != 1 else ''} read · "
+          f"{excluded['unmatched_calls']:,} calls with no result, excluded")
+
+
+def _print_fleet(fleet: dict) -> None:
+    """The distribution: one line per metric, then the OS's spend, then the payoff.
+
+    Every caveat comes out of the PAYLOAD (`notes`, `floor_reason`) rather than being
+    written here, for `ops.COST_FLOOR_NOTE`'s reason — the dashboard prints the same
+    sentences from the same keys.
+    """
+    orders = fleet["orders"]
+    print(f"{fleet['scope']} — {fleet['window']['label']} "
+          f"({fleet['window']['source']})")
+    print(f"{orders['n']} order{'s' if orders['n'] != 1 else ''} with a turn in the "
+          f"window · {orders['live']} live · {orders['truncated']} truncated by it · "
+          f"{orders['excluded_no_turns']} with no turn in it\n")
+    if not orders["n"]:
+        print("nothing ran in that window — try --since/--until")
+        return
+    print(f"{'metric':<38} {'n':>4} {'avg':>10} {'p90':>10} {'max':>10}  basis")
+    for name, m in fleet["metrics"].items():
+        unit = m["unit"]
+        top = m["max"] or {}
+        basis = m["provenance"]
+        if m["cost_basis"] and m["cost_basis"]["transcript"] and basis == "envelope":
+            # Both sub-populations exist, so the reader is told so beside the figure —
+            # the counts travel in `cost_basis` and the two are never averaged together.
+            basis = (f"envelope ({m['cost_basis']['envelope']} turns; "
+                     f"{m['cost_basis']['transcript']} floored, reported separately)")
+        print(f"{name:<38} {m['n']:>4} {_fleet_value(m['avg'], unit):>10} "
+              f"{_fleet_value(m['p90'], unit):>10} "
+              f"{_fleet_value(top.get('value'), unit):>10}  {basis}"
+              f"{'  ' + top['wo_id'] if top.get('wo_id') else ''}")
+
+    kinds = fleet["os_cost_by_kind"]
+    if kinds:
+        print("\nwhat jarvis itself spent, by kind (dearest first, $0 kinds included)")
+        for row in kinds:
+            print(f"  {row['kind']:<22} {row['calls']:>6} "
+                  f"call{'s' if row['calls'] != 1 else ' '}  "
+                  f"${row['cost_usd']:>10,.2f}")
+        un = fleet["os_unattributed"]
+        if un["calls"]:
+            print(f"  {'(no work order)':<22} {un['calls']:>6} "
+                  f"call{'s' if un['calls'] != 1 else ' '}  "
+                  f"${un['cost_usd']:>10,.2f}")
+
+    _print_tool_cost(fleet.get("tools") or {})
+
+    payoff = fleet["compaction_payoff"]
+    if payoff["count"]:
+        print(f"\ncompactions {payoff['count']} · "
+              f"cost ${payoff['total_cost_usd']:,.2f} · "
+              f"saved ${payoff['total_savings_usd']:,.2f} · "
+              f"net ${payoff['net_usd']:,.2f}")
+        if payoff["pct_paid_off"] is not None:
+            line = (f"  {payoff['pct_paid_off']}% of {payoff['closed']} closed one"
+                    f"{'s' if payoff['closed'] != 1 else ''} paid off")
+            if payoff["break_even_turn_median"] is not None:
+                line += (f"; break-even at {payoff['break_even_turn_median']} turns "
+                         f"(median)")
+            print(line)
+    print()
+    notes = list(fleet["notes"])
+    tools = fleet.get("tools") or {}
+    if (tools.get("totals") or {}).get("calls"):
+        notes += tools["notes"]
+    for note in notes:
+        print(f"{note[0].upper()}{note[1:]}.")
+    print(f"\nEvery figure above is {fleet['floor_reason']}.")
 
 
 def _print_orphans(orphans: list[dict]) -> None:

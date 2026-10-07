@@ -75,6 +75,8 @@ DAEMON_UNIT = "jarvis.service"
 #: fixes, and these are the ones it is shipping". HERE rather than on `Daemon`, whose
 #: `RELEASE_BATCH_KEY` is now an alias: `ops` needs the predicate and importing `daemon`
 #: at module level would be a cycle (2026-09-29 spec §1).
+#: SECOND READER: `ProjectStore.settled_release_orders` spells this value out as the SQL
+#: path `'$.release_for_issues'`, so changing it here means changing that query too.
 BATCH_KEY = "release_for_issues"
 
 #: Said once per BROKEN COMMIT when a release that delivered no release is re-parked to
