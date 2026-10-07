@@ -78,6 +78,18 @@ helps. Filed to the backlog.
 
 ## 2. Architecture and the three rules every child is bound by
 
+HOW THIS SPEC CITES, because it is inconsistent on purpose and a reader will otherwise
+think one half is wrong:
+
+- **Every `tests/` citation is by TEST NAME, never by line.** Find it with
+  `grep -n '<name>' tests/` . Test files are the ones this feature's children ADD to, so
+  their line numbers drift inside the feature itself; the line numbers an advisory pass
+  produced for them were already off by ~9 when checked.
+- **Every `src/jarvis/` citation carries a line number, and it is a HINT with a NAME beside
+  it** (`dispatch.py:215`, the env block beside `JARVIS_PY_NAV_HOOK`). They were read at
+  `9df40d3`, and they exist to make a landmark findable in a 10,000-line module. Confirm by
+  the name, which is stable; if the number misses, the name is the citation.
+
 ### 2.1 Where each piece lives
 
 ```
@@ -105,29 +117,6 @@ that file. §6 edits the spec prose at dispatch.py:456-467 plus `_planner_prompt
 `jarvis fo spec <fo-id>` already exists (cli.py:969, `ops.feature_spec`): it prints the
 spec a FEATURE ORDER holds. `jarvis spec` is a second, PATH-addressed surface. Nothing
 in this feature changes `jarvis fo spec` or routes through it.
-
-### 2.5 Every section carries an anti-vacuity pin
-
-Three pin idioms already exist in this tree and each section below names which it owes:
-
-Every citation below is by TEST NAME, because line numbers drift. Find them with
-`grep -n '<name>' tests/` — do not trust a line number anyone hands you.
-
-- **identity, not equality** —
-  `tests/test_navigation.py::test_hooks_re_exports_the_moved_helpers_rather_than_copying_them`
-  asserts `hooks._mask_shell_text is navigation._mask_shell_text`, and
-  `::test_the_catalog_defaults_are_the_leafs_sets_and_not_a_second_definition` asserts the
-  catalog defaults ARE the leaf's sets. A copied body passes equality and then drifts.
-- **AST enclosure** —
-  `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers` walks
-  `ast.parse` over a module, collects called names per enclosing `FunctionDef`, and asserts
-  `found` is non-empty FIRST so the walk cannot pass on any module; the test beside it
-  re-runs the shape over synthetic source that violates it, to prove the pin would catch
-  the move it forbids. Copy both halves or the pin is decoration.
-- **re-apply the shipped predicate** —
-  `evals/llm/test_navigation_judgment.py::test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file`
-  grades recorded commands by calling the shipped classifier in Python, because a
-  `PreToolUse` recorder sees the ATTEMPT and not the verdict.
 
 ### 2.2 A predicate read by a counter and by a hook is never narrowed in place
 
@@ -180,6 +169,26 @@ own `if tool == "Read":` block, before the `Edit`/`Write`/`NotebookEdit` block a
 folded into the `mcp__` branch. There is no auto-allow in front of it, so the first
 argument above does not apply to it — and the reason it does not apply must be written
 into the docstring, because the next reader will assume it does.
+
+### 2.5 Every section carries an anti-vacuity pin
+
+Three pin idioms already exist in this tree and each section below names which it owes:
+
+- **identity, not equality** —
+  `tests/test_navigation.py::test_hooks_re_exports_the_moved_helpers_rather_than_copying_them`
+  asserts `hooks._mask_shell_text is navigation._mask_shell_text`, and
+  `::test_the_catalog_defaults_are_the_leafs_sets_and_not_a_second_definition` asserts the
+  catalog defaults ARE the leaf's sets. A copied body passes equality and then drifts.
+- **AST enclosure** —
+  `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers` walks
+  `ast.parse` over a module, collects called names per enclosing `FunctionDef`, and asserts
+  `found` is non-empty FIRST so the walk cannot pass on any module; the test beside it
+  re-runs the shape over synthetic source that violates it, to prove the pin would catch
+  the move it forbids. Copy both halves or the pin is decoration.
+- **re-apply the shipped predicate** —
+  `evals/llm/test_navigation_judgment.py::test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file`
+  grades recorded commands by calling the shipped classifier in Python, because a
+  `PreToolUse` recorder sees the ATTEMPT and not the verdict.
 
 ---
 
@@ -261,6 +270,11 @@ window passes. The acceptance criterion is that the command reproduces a number.
 three tests read them. New call counters go in `CALL_KEYS`, new byte counters in
 `BYTE_KEYS`, or every new key is untested on both projections.
 
+### 3.3 The surface
+
+`jarvis navigation` and its `--json` gain the new figures. There is no dashboard route
+for this payload (`_print_navigation` lives only in `cli.py`), so this is CLI-only.
+
 ### 3.4 The pins this section owes
 
 - AST enclosure over `FunctionDef navigates_source` in `navigation.py`: the set of names
@@ -282,11 +296,6 @@ three tests read them. New call counters go in `CALL_KEYS`, new byte counters in
   do `tests/test_inspection.py`, `tests/test_autopsy.py` and `tests/test_autopsy_read.py`:
   `inspection` and `autopsy` both read `nav_volume`, so a renamed field breaks
   `jarvis inspect` and `jarvis autopsy` silently in the per-order projection.
-
-### 3.3 The surface
-
-`jarvis navigation` and its `--json` gain the new figures. There is no dashboard route
-for this payload (`_print_navigation` lives only in `cli.py`), so this is CLI-only.
 
 ---
 
@@ -356,8 +365,13 @@ Every hit in every payload carries the exact `jarvis spec section <path> <ref>` 
 that shows it, the way `jarvis search` already prints the command per hit. That is what
 makes the output navigable rather than a dump with extra steps.
 
-Path resolution refuses a path outside the resolved project root rather than traversing
-it. `search` defaults to the CURRENT project's tree; a wide scope is explicit, because 82
+Path resolution refuses a path outside the project root rather than traversing it, and
+SYMLINKS ARE RESOLVED BEFORE THE CONTAINMENT TEST: `Path(p).resolve()` against
+`root.resolve()`, both sides, then the containment check. A string-prefix or `..`-counting
+test is passed by a symlink inside the tree pointing out of it, which is the whole shape of
+the bug. The pin in §4.4 is a link, not a `../`.
+
+`search` defaults to the CURRENT project's tree; a wide scope is explicit, because 82
 files and 1.4MB is a sub-second regex scan per project and the fleet-wide cost is
 unmeasured.
 
@@ -392,7 +406,9 @@ They are repeated as literals in `hooks.py` rather than imported: §2.1's rule a
 - `hooks.is_jarvis_command_chain('jarvis spec search "a|b"')` is `False`, and the `--help`
   text says so.
 - Path traversal: a path outside the resolved project root exits non-zero naming the root
-  it refused to leave.
+  it refused to leave — asserted with a SYMLINK inside the tree whose target is outside it,
+  not with a `../` string. The `../` case is passed by a prefix test that the symlink
+  defeats.
 - `jarvis fo spec --help` and `jarvis spec --help` both exit 0, and
   `tests/test_feature_orders.py`, `tests/test_spec_page.py` and `tests/test_search.py`
   stay green — a new top-level verb can reorder argparse subcommands.
@@ -410,7 +426,16 @@ behaviour of no running worker.
 | policy | key | default | why separate |
 |---|---|---|---|
 | markdown: whole-file `Read`, and `cat`/`head`/`sed -n` | `worker.doc_nav_hook` | `off` | no flip blocker of its own |
-| `.py`: whole-file or large `Read` | `worker.py_nav_hook` (existing) | `off` | flip sequenced behind issue 936, kn-76f7d3f6 |
+| `.py`: whole-file `Read` | `worker.py_nav_hook` (existing) | `off` | flip sequenced behind issue 936, kn-76f7d3f6 |
+
+THE `.py` ARM HAS NO SIZE THRESHOLD, AND MUST NOT GROW ONE. It denies a `Read` with no
+`limit` key and nothing else; a `Read` carrying ANY `limit` passes, however large. §1(a) is
+why: every expensive `.py` `Read` passed no `limit` (487,048 tok over 133 calls) and every
+cheap one passed a small one (1,242,656 tok over 1,422 calls), so `limit is None` already
+separates the two populations and a number added on top would be an unkeyed threshold
+earning nothing. Markdown is the opposite case and that is why it has a key: a ranged
+`sed -n '1,2000p'` of a spec is the measured evasion (§1(b)), so the doc arm needs a bar
+and the bar is `worker.doc_read_limit_lines`. One threshold in this feature, one key.
 
 The `.py` `Read` arm goes INSIDE the existing `py_nav_decision` — same
 `_PY_NAV_DENY` text, same `JARVIS_WO_ID` gate, same `.serena/project.yml` precondition —
@@ -440,7 +465,8 @@ symbol index.
 It denies when, and only when:
 
 - `tool_name == "Read"`, `navigation.is_spec_path(file_path)`, and `tool_input` has no
-  `limit` key, or a `limit` over `DEFAULT_DOC_READ_LIMIT`; or
+  `limit` key, or a `limit` over the RESOLVED `worker.doc_read_limit_lines` (read from the
+  environment, never from a constant in `hooks.py`); or
 - `tool_name == "Bash"` and `navigation.dumps_doc(command)` — but only for a command whose
   named `.md` paths are all `is_spec_path`.
 
@@ -487,8 +513,17 @@ The DONE WHEN's mechanical half, and it belongs in this PR because a refusal who
 lands later is a refusal nobody verified: a whole-file `Read` of a spec is refused, a
 40-line targeted read of the same file passes, a `grep -rn` over `docs/` passes, a
 `sed -n '1,2000p'` of a spec is refused, and a `Read` of
-`.jarvis/features/fo-x/sections/wo-y.md` passes at any size. All five with the key `on`;
-all five pass with it `off`.
+`.jarvis/features/fo-x/sections/wo-y.md` passes at any size.
+
+Those five verdicts are the key-`on` column. The key-`off` column is not "the same five
+again": with `JARVIS_DOC_NAV_HOOK` `off` or absent, `doc_nav_decision` returns `None` for
+ALL FIVE INPUTS, including the two it denies when `on`. Write the matrix as five inputs by
+two switch states and assert ten cells, so the pair that flips is visible. §5.5's
+reachability pins are a different axis and do not substitute for this one.
+
+SEVENTH, for §5.1's threshold-free `.py` arm: a `Read` of a `.py` with no `limit` is
+refused and a `Read` of the SAME file with `limit=4000` passes. A test that only exercises
+a small `limit` cannot tell "no threshold" from "a threshold someone will add later".
 
 SIXTH, and it is the one that proves §5.3's second key is wired rather than declared: a
 project whose catalog sets `worker.doc_read_limit_lines` to a value OTHER than 200 gets
