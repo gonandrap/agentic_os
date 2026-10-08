@@ -512,3 +512,57 @@ sentence and a non-zero exit, and `--json` carries `local_label`.
   population they are computed over becomes selectable.
 * **No "compare two windows" view.** One window at a time. A diff is a second feature and
   it needs a decision about which figures are comparable across a mixed cost basis.
+
+### 11. The DISPLAY zone (amendment)
+
+Added after the selector shipped (commit 2fc541d, PR #972). The page could only ever be
+read in one clock — `cfg.week_reset_zone` — so a reader in Madrid had to convert every
+label by hand. `/cost` gains `?tz=<IANA name>`.
+
+Decided before this amendment and not re-opened (Neo q1460):
+
+* **DISPLAY ONLY.** Weekly and 5h BOUNDARIES stay anchored in `cfg.week_reset_zone`.
+  Changing `tz` must move NO number: `since` and `until` in the resolved window are
+  byte-identical whatever `tz` is. That is the load-bearing test
+  (`test_a_picked_zone_moves_the_label_and_no_number`).
+* **The page speaks ONE clock.** The custom range's two `datetime-local` inputs are
+  rendered AND parsed in the picked zone, and the hint names the zone instead of saying
+  UTC. The §6 justification for labelling that form UTC no longer holds, because the form
+  is now parsed in the same zone it is rendered in.
+* **An unknown or malformed zone is a REFUSAL**, matching the four window refusals of §3:
+  `tz must be an IANA time zone name — {tz!r} is not a zone this report knows`. Never a
+  silent fallback to the default.
+* **URL-only**: no persisted setting, no cookie, for §9's reason.
+* **The default comes from `cfg.week_reset_zone`.** No module-level default string.
+
+The pieces:
+
+* `fleetcost.resolve_zone(tz, cfg) -> str` — its OWN function, because the UI needs the
+  zone BEFORE it can parse the form's naive datetimes and so cannot wait for
+  `resolve_window` to return. Validates with `zoneinfo.ZoneInfo` and raises `OpsError` on
+  `ZoneInfoNotFoundError`/`ValueError`. Empty is ABSENT, not bad: a blank form field is not
+  a refusal.
+* `resolve_window(..., tz=None)` calls it and adds an EIGHTH payload key, `zone` — the
+  IANA name actually used — and renders `local_label` in it. `_local_label` takes the zone
+  NAME rather than the config; the both-`%Z`-abbreviations rule of §4 is unchanged and now
+  fires for a transition in the PICKED zone too. `report(tz=…)` and `window_of(tz=…)` pass
+  it through; `ops.cost_zone(tz, project)` is the route's wrapper, beside
+  `ops.cost_window`.
+* `cost_page(..., tz="")` resolves the zone FIRST, converts the submitted naive
+  `since`/`until` to epoch floats IN THAT ZONE (`_in_zone`), then resolves the window
+  once as before. A string carrying an explicit offset is honoured as written. Every
+  refusal stays inside the existing `try/except ops.OpsError`, so a bad `?tz=` renders
+  `error.html`.
+* `cost.html` gains a text `<input name="tz" list="tz-options">` with a datalist of common
+  zones — a text input and NOT a `<select>`, so any IANA name is reachable. `tz` rides on
+  every week/5h link and in both forms' hidden fields; the zone form carries a custom
+  range with its OFFSET, so re-rendering it in a new zone moves no boundary.
+* `jarvis cost --fleet --tz <IANA>`, so the CLI label and the page label agree.
+
+**`fleetcost._as_ts` and `compaction_payoff.parse_when` are NOT touched: a naive `--since`
+on the CLI stays UTC.** Redefining an existing flag's clock is not in scope, and the page
+is the surface that now has a zone control. The asymmetry is deliberate and is stated in
+`--tz`'s help.
+
+`PAYLOAD_VERSION` stays 1 for §7's reason: `window.zone` is additive, and `local_label` is
+a label whose meaning (the span in the zone being displayed) is unchanged at its default.

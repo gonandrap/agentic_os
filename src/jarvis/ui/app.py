@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -236,13 +238,35 @@ def _offset_param(raw: str) -> int:
 def _window_inputs(window: dict) -> dict[str, str]:
     """The active window as `datetime-local` values, so the custom form pre-fills.
 
-    UTC, and LABELLED UTC on the page: `compaction_payoff.parse_when` reads a naive
-    stamp as UTC and `--since` already behaves that way, so reading the form in
-    `week_reset_zone` would make one string mean two things on two surfaces (§6).
+    Rendered in the window's DISPLAY zone, because the route parses the submitted
+    strings in that same zone: the page speaks ONE clock (§11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). The CLI's naive
+    `--since` is still UTC — that flag's clock is not redefined here.
     """
     fmt = "%Y-%m-%dT%H:%M"
-    return {key: time.strftime(fmt, time.gmtime(window[key]))
-            for key in ("since", "until")}
+    tzinfo = ZoneInfo(window["zone"])
+    out = {key: datetime.fromtimestamp(window[key], tzinfo).strftime(fmt)
+           for key in ("since", "until")}
+    # The zone form carries a custom range with its OFFSET, so re-rendering it in a new
+    # zone moves no boundary: changing zone is display only (§11).
+    out.update({f"{key}_fixed": datetime.fromtimestamp(window[key], tzinfo).isoformat()
+                for key in ("since", "until")})
+    return out
+
+
+def _in_zone(raw: str, zone: str) -> float | str:
+    """A naive datetime-local string as the epoch it means IN `zone` (§11).
+
+    A string carrying an explicit offset is honoured as written, and anything this
+    cannot parse is handed on untouched so `fleetcost` refuses it in its own words.
+    """
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=ZoneInfo(zone))
+    return when.timestamp()
 
 
 #: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
@@ -1420,7 +1444,8 @@ def create_app() -> FastAPI:
 
     @app.get("/cost", response_class=HTMLResponse)
     def cost_page(request: Request, project: str = "", window: str = "",
-                  offset: str = "", since: str = "", until: str = ""):
+                  offset: str = "", since: str = "", until: str = "",
+                  tz: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
 
         Its own page rather than a column on the dashboard: this reads and parses every
@@ -1434,11 +1459,18 @@ def create_app() -> FastAPI:
         docs/superpowers/specs/2026-10-07-cost-window-selector.md). Every parameter is
         a string so that a bad one comes back as the OS's own sentence rather than a
         framework 422 — and is a REFUSAL, never a silent fallback to the week.
+
+        `?tz=` picks the DISPLAY zone and moves no boundary; it is resolved FIRST because
+        the custom range is parsed in it (§11).
         """
         try:
+            # The zone FIRST: the custom form's naive datetimes are parsed in the same
+            # zone they are rendered in, so the page speaks one clock (§11).
+            zone = ops.cost_zone(tz or None, project or None)
             picked = ops.cost_window(project=project or None, window=window or None,
-                                     offset=_offset_param(offset),
-                                     since=since or None, until=until or None)
+                                     offset=_offset_param(offset), tz=tz or None,
+                                     since=_in_zone(since, zone) if since else None,
+                                     until=_in_zone(until, zone) if until else None)
             report = ops.cost_report(project=project or None, window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))

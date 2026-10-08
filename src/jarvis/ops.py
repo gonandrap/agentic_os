@@ -12215,6 +12215,18 @@ def cost_window(**kwargs: Any) -> dict[str, Any]:
     return fleetcost.resolve_window(**kwargs)
 
 
+def cost_zone(tz: str | None = None, project: str | None = None) -> str:
+    """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
+
+    Its own wrapper because the page needs the zone before it can parse the custom
+    form's naive datetimes: §11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    return fleetcost.resolve_zone(tz, fleetcost.cost_config(project))
+
+
 def cost_report(project: str | None = None, target: str | None = None,
                 limit: int = 50, include_hidden: bool = True,
                 window: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -560,6 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--offset", type=int, default=0,
                     help="step back whole windows: 0 is the current one, -1 the "
                          "previous (--fleet only; 0 or negative)")
+    # §11 of the same spec: DISPLAY only, so the CLI label and the page label agree.
+    sp.add_argument("--tz", help="IANA time zone to DISPLAY the window in (default: the "
+                                 "catalog's cost.week_reset_zone). No boundary moves, "
+                                 "and --since/--until are still read as UTC when naive")
     sp.add_argument("--project", help="one project instead of the whole fleet "
                                       "(--fleet only)")
     sp.add_argument("--json", action="store_true")
@@ -2921,7 +2925,8 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if getattr(args, "fleet", False):
         payload = ops.fleet_cost(project=args.project or target or None,
                                  since=args.since, until=args.until,
-                                 window=args.window, offset=args.offset)
+                                 window=args.window, offset=args.offset,
+                                 tz=args.tz)
         if args.json:
             _print(payload, True)
             return 0

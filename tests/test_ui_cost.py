@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -570,8 +572,12 @@ def test_a_custom_range(client, project):
     wo = ops.create_work_order("proj_a", "inside the typed range")
     at = ops.cost_window(window="week")["since"] + 3_600
     add_recorded_turn(project, wo["id"], 0.05, 48_000, at=at)
-    since = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(at - 600))
-    until = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(at + 600))
+    # Rendered AND parsed in the page's display zone, which with no `?tz=` is the
+    # catalog's `week_reset_zone` (§11) — not UTC.
+    zone = ZoneInfo(ops.cost_zone())
+    fmt = "%Y-%m-%dT%H:%M"
+    since = datetime.fromtimestamp(at - 600, zone).strftime(fmt)
+    until = datetime.fromtimestamp(at + 600, zone).strftime(fmt)
 
     page = client.get(f"/cost?since={since}&until={until}")
 
@@ -675,6 +681,55 @@ def test_the_window_is_in_the_url(client, project):
     assert "/cost?window=week&offset=-3&project=proj_a" in past.text
     assert "/cost?window=week&offset=-1&project=proj_a" in past.text  # next
     assert "next ›" in past.text
+
+
+def test_the_reader_can_pick_the_display_zone(client, project):
+    """§11: the zone is DISPLAY ONLY, and a bad one is a refusal with a sentence."""
+    berlin = ops.cost_window(window="week", tz="Europe/Berlin")
+    default = ops.cost_window(window="week")
+
+    page = client.get("/cost?tz=Europe/Berlin")
+
+    assert page.status_code == 200
+    assert berlin["local_label"] in page.text
+    assert default["local_label"] not in page.text
+    # No number moved: the label is the only difference.
+    assert (berlin["since"], berlin["until"]) == (default["since"], default["until"])
+    assert default["label"] in page.text
+    assert 'name="tz"' in page.text and 'value="Europe/Berlin"' in page.text
+
+    bad = client.get("/cost?tz=Mars/Olympus")
+    assert bad.status_code == 200
+    # The template escapes the quotes the sentence puts round the zone name.
+    assert "tz must be an IANA time zone name" in bad.text
+    assert "Mars/Olympus" in bad.text
+    assert "is not a zone this report knows" in bad.text
+    assert default["local_label"] not in bad.text, "a refusal, never a fallback"
+
+
+def test_the_picked_zone_rides_on_every_window_link(client, project):
+    page = client.get("/cost?tz=Europe/Berlin")
+
+    assert "/cost?window=week&offset=-1&project=&tz=Europe/Berlin" in page.text
+    assert "/cost?window=5h&offset=-1&project=&tz=Europe/Berlin" in page.text
+    assert '<input type="hidden" name="tz" value="Europe/Berlin">' in page.text
+
+
+def test_a_custom_range_is_parsed_in_the_picked_zone(client, project):
+    """One clock: the form is rendered AND parsed in the zone the reader picked."""
+    page = client.get("/cost?since=2026-10-20T10:00&until=2026-10-20T12:00"
+                      "&tz=Europe/Berlin")
+
+    assert page.status_code == 200
+    # Berlin was CEST (UTC+2) on that date, so 10:00 local is 08:00 UTC.
+    assert "2026-10-20 08:00 to 2026-10-20 10:00 UTC" in page.text
+    assert 'name="since" value="2026-10-20T10:00"' in page.text
+    assert 'name="until" value="2026-10-20T12:00"' in page.text
+    assert "Europe/Berlin" in page.text and "UTC — the clock" not in page.text
+    # An explicit offset submitted by hand is still honoured.
+    explicit = client.get("/cost?since=2026-10-20T10:00:00%2B00:00"
+                          "&until=2026-10-20T12:00:00%2B00:00&tz=Europe/Berlin")
+    assert "2026-10-20 10:00 to 2026-10-20 12:00 UTC" in explicit.text
 
 
 def test_every_cost_surface_says_the_figure_is_a_floor(client, project):

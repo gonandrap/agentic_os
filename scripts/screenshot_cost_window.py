@@ -8,16 +8,20 @@ is placed on a CHOSEN clock — four orders, one per window:
     the current usage week · the previous week · a 5h slice · and one six weeks back
     that must appear in NO shot
 
-so the five shots differ in the only way that makes them evidence. Five shots, because
-the claim has five parts: the default is still the usage week, a past week moves every
-number, a 5h slice is reportable at all, a custom range round-trips through the form, and
+so the shots differ in the only way that makes them evidence. Seven shots, because the
+claim has seven parts: the default is still the usage week, a past week moves every
+number, a 5h slice is reportable at all, a custom range round-trips through the form,
 A BAD PARAMETER IS REFUSED rather than silently reported as the week (§3 of
-docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+docs/superpowers/specs/2026-10-07-cost-window-selector.md), the DISPLAY ZONE can be
+picked and labels the page in it, and a bad zone is refused the same way (§11).
 
 Each shot is CLIPPED from the page heading to the bottom of the headline panel, so the
 selector row, both window labels and the totals are legible in one image rather than a
 full-page strip. The default/previous-week pair is compared before the script exits: an
-identical pair is worthless as evidence, so it fails rather than reporting success.
+identical pair is worthless as evidence, so it fails rather than reporting success. The
+Europe/Berlin shot is compared against the default week the other way round — §11's
+display-only rule says changing the zone must move NO number, so an unequal headline
+total fails.
 
     uv run python scripts/screenshot_cost_window.py
 """
@@ -30,8 +34,9 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
@@ -83,9 +88,14 @@ def os_call(wo_id: str, at: float, *, read: int, out: int) -> None:
         central.close()
 
 
-def stamp(ts: float) -> str:
-    """The seconds-less shape `<input type="datetime-local">` submits, read as UTC."""
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
+def stamp(ts: float, zone: str) -> str:
+    """The seconds-less shape `<input type="datetime-local">` submits.
+
+    Rendered in the page's DISPLAY zone, because that is the clock the form is now
+    parsed in (§11). Stamping UTC here put the custom shot's range hours off its seeded
+    orders and the shot read $0.00.
+    """
+    return datetime.fromtimestamp(ts, tz=ZoneInfo(zone)).strftime("%Y-%m-%dT%H:%M")
 
 
 def seed() -> dict[str, str]:
@@ -148,13 +158,17 @@ def seed() -> dict[str, str]:
         ])
         os_call(wo_id, at + 120, read=read // 4, out=out // 4)
 
+    # The zone read the way the page reads it, never a constant imported from catalog.
+    zone = ops.cost_zone()
     return {
         "wo-cost-window-week": "",
         "wo-cost-window-prev-week": "?window=week&offset=-1",
         "wo-cost-window-5h": "?window=5h&offset=-1",
-        "wo-cost-window-custom": (f"?since={stamp(custom_since)}"
-                                  f"&until={stamp(custom_until)}"),
+        "wo-cost-window-custom": (f"?since={stamp(custom_since, zone)}"
+                                  f"&until={stamp(custom_until, zone)}"),
         "wo-cost-window-refusal": "?window=5x",
+        "wo-cost-window-tz": "?tz=Europe/Berlin",
+        "wo-cost-window-tz-refusal": "?tz=Mars/Olympus",
     }
 
 
@@ -201,8 +215,23 @@ def main() -> int:
         print(f"FAIL: the default and previous-week shots both read {default} — "
               f"an identical pair proves nothing", file=sys.stderr)
         return 1
-    if seen["wo-cost-window-refusal"] is not None:
-        print("FAIL: ?window=5x rendered a cost headline instead of refusing",
+    for name, query in (("wo-cost-window-refusal", "?window=5x"),
+                        ("wo-cost-window-tz-refusal", "?tz=Mars/Olympus")):
+        if seen[name] is not None:
+            print(f"FAIL: {query} rendered a cost headline instead of refusing",
+                  file=sys.stderr)
+            return 1
+    custom = seen["wo-cost-window-custom"]
+    if custom in (None, "~$0.00") or custom == default:
+        print(f"FAIL: the custom-range shot reads {custom} — a range that reports "
+              f"nothing, or reports the default week, is not evidence of a range",
+              file=sys.stderr)
+        return 1
+    # §11: the display zone is display only, so the total under it may not move.
+    berlin = seen["wo-cost-window-tz"]
+    if berlin != default:
+        print(f"FAIL: ?tz=Europe/Berlin reads {berlin} and the default week reads "
+              f"{default} — changing the display zone must move no number",
               file=sys.stderr)
         return 1
     return 0

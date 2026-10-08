@@ -212,6 +212,76 @@ def test_window_of_still_resolves_the_week():
     assert flagged["source"] == "flags" and flagged["window"] is None
 
 
+# -- 1c. the DISPLAY zone --------------------------------------------------------------
+#
+# §11 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. Display only: the
+# boundaries stay anchored in `cfg.week_reset_zone`, so picking a zone must move NO
+# number.
+
+
+def test_the_default_zone_comes_from_the_catalog():
+    cfg = catalog.CostConfig()
+
+    assert fleetcost.resolve_zone(None, cfg) == cfg.week_reset_zone
+    # Empty is ABSENT, not a bad zone: a blank form field is not a refusal.
+    assert fleetcost.resolve_zone("", cfg) == cfg.week_reset_zone
+    assert fleetcost.resolve_zone("Europe/Berlin", cfg) == "Europe/Berlin"
+    # And it is read from the catalog, never a module constant.
+    moved = catalog.CostConfig(week_reset_zone="Asia/Tokyo")
+    assert fleetcost.resolve_zone(None, moved) == "Asia/Tokyo"
+
+    week = resolved(window="week")
+    assert week["zone"] == catalog.CostConfig().week_reset_zone
+    assert week["local_label"] == "2026-09-28 21:00 to 2026-10-05 21:00 PDT"
+
+
+def test_a_picked_zone_moves_the_label_and_no_number():
+    """The load-bearing test: the zone is DISPLAY ONLY (Neo q1460)."""
+    default = resolved(window="week")
+    berlin = resolved(window="week", tz="Europe/Berlin")
+
+    assert berlin["zone"] == "Europe/Berlin"
+    assert berlin["local_label"] != default["local_label"]
+    assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
+    # Byte-identical boundaries: the week stays anchored in `week_reset_zone`.
+    assert berlin["since"] == default["since"]
+    assert berlin["until"] == default["until"]
+    assert berlin["label"] == default["label"]
+
+
+def test_a_bad_zone_is_a_refusal_never_a_fallback():
+    for bad in ("Mars/Olympus", "not a zone", "../etc/passwd"):
+        with pytest.raises(ops.OpsError) as caught:
+            resolved(window="week", tz=bad)
+        assert str(caught.value) == (
+            f"tz must be an IANA time zone name — {bad!r} is not a zone this report "
+            f"knows")
+        with pytest.raises(ops.OpsError):
+            fleetcost.resolve_zone(bad, catalog.CostConfig())
+
+
+def test_a_dst_change_in_a_picked_zone_prints_both_abbreviations():
+    """Berlin's autumn transition is 2026-10-25, inside this usage week."""
+    week = resolved(window="week", tz="Europe/Berlin",
+                    now=stamp("2026-10-21T12:00:00+00:00"))
+
+    assert "CEST" in week["local_label"] and "CET" in week["local_label"]
+    assert week["local_label"] == "2026-10-20 06:00 CEST to 2026-10-27 05:00 CET"
+
+
+def test_the_zone_rides_on_every_source():
+    windows = (resolved(window="week", tz="Asia/Tokyo"),
+               resolved(window="5h", offset=-2, tz="Asia/Tokyo"),
+               resolved(since=SINCE, until=UNTIL, tz="Asia/Tokyo"),
+               fleetcost.window_of(None, None, catalog.CostConfig(), now=T0,
+                                   tz="Asia/Tokyo"))
+
+    assert {w["source"] for w in windows} == {"usage-week", "session-window", "flags"}
+    for w in windows:
+        assert w["zone"] == "Asia/Tokyo"
+        assert "JST" in w["local_label"]
+
+
 # -- 2. the one place a population statistic is computed -------------------------------
 
 
@@ -484,7 +554,7 @@ def test_payload_keys_stable(fleet_fixture):
     assert set(fleet) == FLEET_KEYS
     assert set(fleet["metrics"]) == METRIC_KEYS
     assert set(fleet["window"]) == {"since", "until", "label", "local_label", "source",
-                                    "window", "offset"}
+                                    "window", "offset", "zone"}
     assert set(fleet["orders"]) == {"n", "live", "truncated", "excluded_no_turns"}
     one = fleet["metrics"]["cost_per_turn_usd"]
     assert set(one) == {"n", "avg", "p90", "max", "unit", "provenance", "cost_basis",
@@ -615,6 +685,27 @@ def test_the_cli_prints_the_local_window_beside_the_utc_one(fleet_fixture, capsy
     out = capsys.readouterr().out
     assert "2026-09-29 04:00 to 2026-10-06 04:00 UTC" in out
     assert "2026-09-28 21:00 to 2026-10-05 21:00 PDT" in out
+
+
+def test_the_cli_takes_a_display_zone(fleet_fixture, capsys):
+    """§11: `--tz` so the CLI label and the page label agree, and nothing else moves."""
+    from jarvis import cli
+
+    args = ["cost", "--fleet", "--json", "--since", "2026-09-29T04:00:00+00:00",
+            "--until", "2026-10-06T04:00:00+00:00"]
+    assert cli.main(args) == 0
+    plain = json.loads(capsys.readouterr().out)["fleet"]["window"]
+    assert cli.main(args + ["--tz", "Europe/Berlin"]) == 0
+    berlin = json.loads(capsys.readouterr().out)["fleet"]["window"]
+
+    assert plain["zone"] == "America/Los_Angeles"
+    assert berlin["zone"] == "Europe/Berlin"
+    assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
+    assert (berlin["since"], berlin["until"]) == (plain["since"], plain["until"])
+    assert berlin["label"] == plain["label"]
+    # A bad zone is the same refusal here as on the page, with a non-zero exit.
+    assert cli.main(args + ["--tz", "Mars/Olympus"]) == 1
+    assert "is not a zone this report knows" in capsys.readouterr().err
 
 
 def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, capsys):

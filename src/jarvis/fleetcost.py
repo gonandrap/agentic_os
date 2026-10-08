@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis import compaction_payoff, paths, usage
 from jarvis.catalog import CostConfig
@@ -151,13 +151,34 @@ def session_window(now: float, cfg: CostConfig,
     return (since, since + length)
 
 
+def resolve_zone(tz: str | None, cfg: CostConfig) -> str:
+    """The IANA zone to DISPLAY a window in: `tz` when given and valid, else the catalog.
+
+    Its own function because the UI needs the zone BEFORE it can parse the custom form's
+    naive datetimes, so it cannot wait for `resolve_window` to return (§11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). DISPLAY ONLY: the
+    boundaries stay anchored in `cfg.week_reset_zone` whatever this returns.
+    """
+    from jarvis.ops import OpsError
+
+    if not tz:
+        return cfg.week_reset_zone
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        # A refusal with a sentence, never a silent fallback to the default (§11).
+        raise OpsError(f"tz must be an IANA time zone name — {tz!r} is not a zone this "
+                       f"report knows") from None
+    return tz
+
+
 def resolve_window(*, window: str | None = None, offset: int = 0,
                    since: float | str | None = None,
-                   until: float | str | None = None,
+                   until: float | str | None = None, tz: str | None = None,
                    cfg: CostConfig, now: float | None = None) -> dict[str, Any]:
     """THE window resolver — one answer for the CLI, `--json` and the page.
 
-    Exactly one function interprets a window NAME (Neo q1420), and its seven keys are
+    Exactly one function interprets a window NAME (Neo q1420), and its eight keys are
     the contract every surface reads. Resolved ONCE per surface and passed to both
     payload builders: this is a function of `now`, so two calls a few milliseconds apart
     can land either side of a boundary and the page would show two windows again.
@@ -168,6 +189,7 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
     """
     from jarvis.ops import OpsError
 
+    zone = resolve_zone(tz, cfg)
     named = window is not None or offset
     custom = since is not None or until is not None
     if named and custom:
@@ -185,7 +207,7 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
         if start >= end:
             raise OpsError(f"since must be before until — {_stamp(start)} is at or "
                            f"after {_stamp(end)}, which is an empty window")
-        return _window(start, end, cfg, source="flags", window=None, offset=None)
+        return _window(start, end, zone, source="flags", window=None, offset=None)
     if window == SESSION:
         start, end = session_window(_now(now), cfg, offset)
         source = "session-window"
@@ -194,27 +216,27 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
         # The literal the existing template branch and CLI line already read, kept for
         # the default so neither changes meaning (§1).
         source = "usage-week" if not offset else "week-offset"
-    return _window(start, end, cfg, source=source, window=window or WEEK, offset=offset)
+    return _window(start, end, zone, source=source, window=window or WEEK, offset=offset)
 
 
 def window_of(since: float | str | None, until: float | str | None, cfg: CostConfig,
-              *, now: float | None = None) -> dict[str, Any]:
+              *, now: float | None = None, tz: str | None = None) -> dict[str, Any]:
     """The window to report over: the flags if given, else the current usage week.
 
     A shim over `resolve_window`, kept because this signature is public: `report` calls
     it and tests use it. One implementation, no broken caller.
     """
     return resolve_window(
-        since=since, until=until,
+        since=since, until=until, tz=tz,
         window=None if (since is not None or until is not None) else WEEK,
         cfg=cfg, now=now)
 
 
-def _window(since: float, until: float, cfg: CostConfig, *, source: str,
+def _window(since: float, until: float, zone: str, *, source: str,
             window: str | None, offset: int | None) -> dict[str, Any]:
     return {"since": since, "until": until, "label": _label(since, until),
-            "local_label": _local_label(since, until, cfg), "source": source,
-            "window": window, "offset": offset}
+            "local_label": _local_label(since, until, zone), "source": source,
+            "window": window, "offset": offset, "zone": zone}
 
 
 def _now(now: float | None) -> float:
@@ -237,14 +259,16 @@ def _stamp(when: float) -> str:
     return datetime.fromtimestamp(when, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def _local_label(since: float, until: float, cfg: CostConfig) -> str:
-    """The same span in `week_reset_zone` — the clock the reset is specified in.
+def _local_label(since: float, until: float, zone: str) -> str:
+    """The same span in the DISPLAY zone — by default the clock the reset is specified in.
 
     BOTH abbreviations when the ends differ: a single `%Z` across a DST transition is a
-    label that is wrong at one end (§4).
+    label that is wrong at one end (§4). Takes the zone NAME rather than the config
+    because the reader can pick a zone to read in (§11).
     """
-    zone = ZoneInfo(cfg.week_reset_zone)
-    start, end = datetime.fromtimestamp(since, zone), datetime.fromtimestamp(until, zone)
+    tzinfo = ZoneInfo(zone)
+    start = datetime.fromtimestamp(since, tzinfo)
+    end = datetime.fromtimestamp(until, tzinfo)
     fmt = "%Y-%m-%d %H:%M"
     if start.tzname() != end.tzname():
         return (f"{start.strftime(fmt)} {start.tzname()} to "
@@ -1082,7 +1106,8 @@ def cost_config(project: str | None = None) -> CostConfig:
 
 def report(*, project: str | None = None, since: float | str | None = None,
            until: float | str | None = None, window: str | None = None,
-           offset: int = 0, resolved: dict[str, Any] | None = None,
+           offset: int = 0, tz: str | None = None,
+           resolved: dict[str, Any] | None = None,
            now: float | None = None,
            home: Path | None = None) -> dict[str, Any]:
     """The whole `fleet` payload. One computation for the CLI, `--json` and the page.
@@ -1101,7 +1126,7 @@ def report(*, project: str | None = None, since: float | str | None = None,
                            "two ways to name the same thing — pass one or the other, "
                            "not both")
     picked = resolved if resolved is not None else resolve_window(
-        window=window, offset=offset, since=since, until=until, cfg=cfg, now=now)
+        window=window, offset=offset, since=since, until=until, tz=tz, cfg=cfg, now=now)
     start, end = picked["since"], picked["until"]
     home = paths.jarvis_home() if home is None else home
     floor = _cold_prefix_floor()
