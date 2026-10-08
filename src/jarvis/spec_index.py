@@ -6,7 +6,7 @@ the habit scales with every spec the OS writes. So the document gets the same tw
 code already has: list what is in it, then open the one part — and the size of each part
 is on the list, so the choice is made before anything is read.
 
-§4.1 of docs/specs/2026-10-06-navigate-specs-like-code.md. Stdlib only, and `sections` is
+§4.1 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Stdlib only, and `sections` is
 the only `jarvis` import: matching headings is `sections.find_heading`'s job and nowhere
 else's, so nothing here re-implements it.
 """

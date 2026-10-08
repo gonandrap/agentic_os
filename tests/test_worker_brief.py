@@ -33,7 +33,7 @@ WO = {"id": "wo-brief01", "title": "Add exporter",
 SPEC = ProjectSpec(name="p1", path=Path("/tmp/p1"))
 GATED = ProjectSpec(name="p1", path=Path("/tmp/p1"),
                     gates=GateConfig(enabled=("release", "pr_merge")))
-# §4 of docs/specs/2026-10-02-serena-the-cheap-path.md — the deferral states, named.
+# §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md — the deferral states, named.
 TS_ON = ProjectSpec(name="p1", path=Path("/tmp/p1"),
                     worker=WorkerDefaults(tool_search="on"))
 TS_OFF = ProjectSpec(name="p1", path=Path("/tmp/p1"),
@@ -216,7 +216,7 @@ def test_contract_section_contains_everything_the_old_contract_had():
         "it is not an escalation",
         "does not interrupt the user",
         "one paragraph: the decision, the concrete options, your recommendation",
-        'section 3 of design doc "docs/specs/feature.md"',
+        'section 3 of design doc "docs/superpowers/specs/feature.md"',
         "characters are refused",
         "The trigger is DOUBT, not importance",
         "either would work",
@@ -599,7 +599,7 @@ def _child_prompt(spec: ProjectSpec = SPEC) -> str:
     from jarvis.dispatch import build_worker_prompt
     return build_worker_prompt(
         WO, spec,
-        design_doc={"section": "3. Schema", "repo_path": "docs/specs/exporter.md",
+        design_doc={"section": "3. Schema", "repo_path": "docs/superpowers/specs/exporter.md",
                     "section_path": "/tmp/p1/.jarvis/features/fo-1/sections/wo-1.md",
                     "path": "/tmp/p1/.jarvis/features/fo-1/exporter.md"})
 
@@ -656,7 +656,7 @@ def test_the_spec_commands_are_a_chain_a_worker_can_run_unprompted():
     prompt, which is the same as not shipping it."""
     from jarvis import hooks
 
-    assert hooks.is_jarvis_command_chain("jarvis spec toc docs/specs/x.md") is True
+    assert hooks.is_jarvis_command_chain("jarvis spec toc docs/superpowers/specs/x.md") is True
 
 
 def test_the_child_spec_block_points_at_commands_not_at_a_whole_file():

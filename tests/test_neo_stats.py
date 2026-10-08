@@ -1,6 +1,6 @@
 """`jarvis neo stats` — the report itself, against seeded stores.
 
-Spec: docs/specs/2026-10-01-neo-observability.md §4. Neo was the only agent in the OS with
+Spec: docs/superpowers/specs/2026-10-01-neo-observability.md §4. Neo was the only agent in the OS with
 no aggregate of any kind: `NeoStore.counts()` is a GROUP BY status over all time, built for
 a nav badge, so "is Neo escalating more than it used to, and what for" had no answer in the
 data.

@@ -1107,7 +1107,7 @@ def test_every_bucket_of_the_partition_has_a_label_on_the_page():
 
 def test_the_dashboards_partition_is_keyed_off_parts():
     """THE THIRD SURFACE THE BRIEF NAMES — and it now exists: `/wo/{p}/{id}/debug` renders
-    an `Anatomy` (spec §7 of docs/specs/2026-09-24-order-observability.md), which is the
+    an `Anatomy` (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md), which is the
     case this test's previous form said to convert it to when it arrived.
 
     So the pin moves from "the dashboard reads no anatomy" to the property that actually

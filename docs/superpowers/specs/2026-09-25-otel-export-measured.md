@@ -1,6 +1,6 @@
 # Claude Code's OTEL export, measured
 
-Findings for §9 of `docs/specs/2026-09-24-order-observability.md`. Not a design, not a
+Findings for §9 of `docs/superpowers/specs/2026-09-24-order-observability.md`. Not a design, not a
 plan. Measured 2026-09-25 against CLI **2.1.282** with `scripts/spike_otel.py`.
 
 ## Verdict — DECLINE

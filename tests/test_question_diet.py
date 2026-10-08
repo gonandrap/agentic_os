@@ -88,7 +88,7 @@ def test_plan_question_is_a_skeleton_and_fo_show_keeps_the_full_briefs():
     fo = {"id": "fo-x", "title": "CSV export", "description": ASK}
     plan = plans.parse_plan({
         "summary": "an exporter",
-        "design_doc": "docs/specs/exporter.md",
+        "design_doc": "docs/superpowers/specs/exporter.md",
         "children": [fat_child("schema"), fat_child("api", needs=["schema"])],
     })
     question = plans.build_plan_question(fo, plan)
@@ -112,7 +112,7 @@ def test_plan_question_is_a_skeleton_and_fo_show_keeps_the_full_briefs():
     # MAX_DESCRIPTION_CHARS and silently weakens every time that number moves.
     thin = plans.parse_plan({
         "summary": "an exporter",
-        "design_doc": "docs/specs/exporter.md",
+        "design_doc": "docs/superpowers/specs/exporter.md",
         "children": [{**fat_child("schema"), "description": "a" * 200},
                      {**fat_child("api", needs=["schema"]), "description": "b" * 200}],
     })
@@ -124,11 +124,11 @@ def test_plan_question_names_the_design_doc_when_the_plan_has_one():
     fo = {"id": "fo-x", "title": "CSV export", "description": ASK}
     plan = plans.parse_plan({
         "summary": "an exporter",
-        "design_doc": "docs/specs/exporter.md",
+        "design_doc": "docs/superpowers/specs/exporter.md",
         "children": [fat_child("schema")],
     })
     question = plans.build_plan_question(fo, plan)
-    assert 'docs/specs/exporter.md' in question
+    assert 'docs/superpowers/specs/exporter.md' in question
 
 
 def test_plan_reviewer_persona_no_longer_judges_text_it_does_not_receive():
@@ -145,10 +145,10 @@ def test_plan_reviewer_persona_no_longer_judges_text_it_does_not_receive():
 def test_parse_plan_normalises_design_doc_and_refuses_an_absolute_path():
     plan = plans.parse_plan({
         "summary": "s",
-        "design_doc": "  docs/specs/exporter.md  ",
+        "design_doc": "  docs/superpowers/specs/exporter.md  ",
         "children": [fat_child("a")],
     })
-    assert plan["design_doc"] == "docs/specs/exporter.md"
+    assert plan["design_doc"] == "docs/superpowers/specs/exporter.md"
     with pytest.raises(plans.PlanError, match="design_doc"):
         plans.parse_plan({"design_doc": "/etc/passwd",
                           "children": [fat_child("a")]})
@@ -164,34 +164,34 @@ def planning(started, store):
 
 def test_fo_plan_snapshots_the_design_doc_or_refuses(planning, store, project):
     daemon, fo = planning
-    doc = project / "docs" / "specs" / "exporter.md"
+    doc = project / "docs" / "superpowers" / "specs" / "exporter.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
     doc.write_text(DESIGN_DOC)
 
     with pytest.raises(ops.OpsError, match="missing.md"):
         ops.submit_plan(fo["id"], {
-            "summary": "s", "design_doc": "docs/specs/missing.md",
+            "summary": "s", "design_doc": "docs/superpowers/specs/missing.md",
             "children": [fat_child("a")],
         })
 
     ops.submit_plan(fo["id"], {
-        "summary": "s", "design_doc": "docs/specs/exporter.md",
+        "summary": "s", "design_doc": "docs/superpowers/specs/exporter.md",
         "children": [fat_child("a")],
     })
     stored = db.from_json(store.get_feature_order(fo["id"])["plan"], {})
-    assert stored["design_doc"] == "docs/specs/exporter.md"
+    assert stored["design_doc"] == "docs/superpowers/specs/exporter.md"
     assert stored["design_doc_content"] == DESIGN_DOC
 
 
 def test_children_of_a_design_doc_plan_get_the_doc_materialised(planning, store,
                                                                 project, fake_claude):
     daemon, fo = planning
-    doc = project / "docs" / "specs" / "exporter.md"
+    doc = project / "docs" / "superpowers" / "specs" / "exporter.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
     doc.write_text(DESIGN_DOC)
     ops.submit_plan(fo["id"], {
         "summary": "an exporter FORCE_APPROVE",
-        "design_doc": "docs/specs/exporter.md",
+        "design_doc": "docs/superpowers/specs/exporter.md",
         "children": [fat_child("schema")],
     })
     daemon._neo_drain()
@@ -235,10 +235,10 @@ def test_a_work_order_with_no_feature_carries_no_spec_section(started, store, pr
 
 def test_find_refs_reads_the_documented_shapes():
     text = ('Should rounding live in the writer? My question is from section 3 of '
-            'design doc "docs/specs/exporter.md": the doc says errors raise.')
-    assert sections.find_refs(text) == [("docs/specs/exporter.md", "3")]
-    text2 = 'Per section "Data model" of the design doc "docs/specs/exporter.md", ...'
-    assert sections.find_refs(text2) == [("docs/specs/exporter.md", "Data model")]
+            'design doc "docs/superpowers/specs/exporter.md": the doc says errors raise.')
+    assert sections.find_refs(text) == [("docs/superpowers/specs/exporter.md", "3")]
+    text2 = 'Per section "Data model" of the design doc "docs/superpowers/specs/exporter.md", ...'
+    assert sections.find_refs(text2) == [("docs/superpowers/specs/exporter.md", "Data model")]
     assert sections.find_refs("no references here") == []
 
 
@@ -279,12 +279,12 @@ def dispatched(started, project):
 def test_a_referenced_section_reaches_neo_and_the_rest_of_the_doc_does_not(
         dispatched, project):
     daemon, wo = dispatched
-    doc = project / "docs" / "specs" / "exporter.md"
+    doc = project / "docs" / "superpowers" / "specs" / "exporter.md"
     doc.parent.mkdir(parents=True, exist_ok=True)
     doc.write_text(DESIGN_DOC)
     ops.ask_question(
         wo["id"],
-        'From section 3 of design doc "docs/specs/exporter.md": should an empty '
+        'From section 3 of design doc "docs/superpowers/specs/exporter.md": should an empty '
         'result set also log a warning? I recommend no — errors raise, quiet '
         'otherwise.')
     neo = NeoStore()
@@ -300,7 +300,7 @@ def test_an_unresolvable_reference_still_asks_and_says_so(dispatched, project):
     daemon, wo = dispatched
     out = ops.ask_question(
         wo["id"],
-        'From section 9 of design doc "docs/specs/ghost.md": which default?')
+        'From section 9 of design doc "docs/superpowers/specs/ghost.md": which default?')
     neo = NeoStore()
     try:
         q = neo.get(1)
@@ -347,7 +347,7 @@ def test_the_contracts_teach_the_reference_shape_not_paste_everything():
     from jarvis import worker_brief
     worker_contract = worker_brief.render_section("contract", wo_id="wo-1", project="p")
     for text in (planner, worker_contract):
-        assert 'section 3 of design doc "docs/specs/feature.md"' in text
+        assert 'section 3 of design doc "docs/superpowers/specs/feature.md"' in text
     # The planner is told the design doc carries the shared context now.
     assert "design_doc" in planner
     assert "Repetition is cheap" not in planner

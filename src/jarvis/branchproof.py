@@ -60,7 +60,7 @@ def attempt(repo: Path, *args: str, stdin: str | None = None) -> tuple[str | Non
     Exists because `run` logs the reason a command failed and returns None, so a caller
     that has to RECORD the refusal had nothing to record: `harvest._checkpoint` writes
     git's words into `checkpoint_skipped` (spec
-    docs/specs/2026-09-30-harvesting-a-dead-turn.md §7). Same `_env()`, same
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §7). Same `_env()`, same
     `GIT_TIMEOUT`, never raises; `run` delegates here so there is one subprocess block.
     `""` when the process could not run at all, or when it succeeded.
     """
@@ -83,7 +83,7 @@ def run(repo: Path, *args: str, stdin: str | None = None) -> str | None:
 
     PUBLIC because `harvest` runs on the daemon's tick and needs exactly this one's two
     properties — the timeout and the non-interactive `_env()` — rather than a fourth copy
-    of the `subprocess.run` block (spec docs/specs/2026-09-30-harvesting-a-dead-turn.md
+    of the `subprocess.run` block (spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md
     §2). `_git` stays as the in-module alias so no existing call site changes.
     """
     return attempt(repo, *args, stdin=stdin)[0]

@@ -372,7 +372,7 @@ def test_a_question_that_does_not_exist_says_so(client):
 
 
 def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
-    """§6 of docs/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
+    """§6 of docs/superpowers/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
     and an absent ratio reads "not recorded" rather than 0%."""
     page = client.get("/neo/stats")
     assert page.status_code == 200
@@ -3266,7 +3266,7 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
 
 
 # -- the retry control -----------------------------------------------------------------
-# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
 
 #: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
 #: the timeline or the conversation, which also talk about retries (kn-d51713af).

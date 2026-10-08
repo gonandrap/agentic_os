@@ -13,7 +13,7 @@ There is exactly ONE masker in the tree: a copied body passes equality and then 
 (kn-7f5f2d0d).
 
 The DOC classifiers — `DOC_SUFFIXES`, `DOC_DUMP_COMMANDS`, `dumps_doc`, `_dump_span`,
-`is_spec_path` — are §3.1 of docs/specs/2026-10-06-navigate-specs-like-code.md. They are
+`is_spec_path` — are §3.1 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. They are
 SIBLINGS of `navigates_source`, whose body is not edited: it is read by `nav_volume` to
 COUNT and by `hooks.py_nav_decision` to REFUSE, and the fleet's published baseline was
 measured with its current meaning (§2.2, kn-358ffb53).

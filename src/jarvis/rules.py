@@ -1,6 +1,6 @@
 """The registry the OS uses to recognise its own recurring gaps — grammar and evaluator.
 
-docs/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
+docs/superpowers/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
 feature: the condition grammar, the pure evaluator, the `Facts` shape, the lookup
 contract `resolve`, and the five seed rows. It holds no store, fires nothing and acts on
 nothing.

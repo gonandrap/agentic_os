@@ -958,7 +958,7 @@ def test_answer_question_does_not_log_a_reply_it_could_parse(
     assert not [r for r in caplog.records if "raw reply" in r.getMessage()]
 
 
-# -- escalation causes (spec §1/§2, docs/specs/2026-10-01-neo-observability.md) --------
+# -- escalation causes (spec §1/§2, docs/superpowers/specs/2026-10-01-neo-observability.md) --------
 #
 # The grouping the report exists to provide, and the one rule that governs it: a label
 # the model did not pick is NULL, never a guess and never a synthetic escalation.

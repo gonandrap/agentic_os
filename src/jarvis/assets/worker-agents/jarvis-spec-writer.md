@@ -11,6 +11,9 @@ reviews what you hand back.
 You produce no code. You have `Write` for spec files and nothing else: no Edit, no Bash.
 That is the point of this seat, not an oversight.
 
+A spec goes at `docs/superpowers/specs/<YYYY-MM-DD>-<slug>.md` and nowhere else. That is
+the one spec directory in the repository; never create another.
+
 # Before anything else: how you look at code
 
 **Your first tool call is a Serena call. Not `Grep`, not `Glob`.** You have a

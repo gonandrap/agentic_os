@@ -25,7 +25,7 @@ expires, and sealing would freeze an episode that was OPEN at seal time. `from_s
 The module legends (`hold_causes`, `PARTS`, `subagent_depth_read`, `param_caps`) are
 re-derived at render, so a raised cap is reflected on an old seal. And span `params` are
 sealed AT `full` AND AT NO OTHER LEVEL: tool parameters are what that level buys, which is
-§6 of docs/specs/2026-09-27-order-autopsy-durability.md — redacted file contents and Bash
+§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md — redacted file contents and Bash
 command lines in a store that does not expire, so at `normal` the payload holds no `params`
 key at all rather than an empty one.
 
