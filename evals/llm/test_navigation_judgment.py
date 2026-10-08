@@ -310,9 +310,9 @@ def run_and_record(repo: Path, prompt: str, agents: dict[str, Path] | None = Non
         matchers.append({"matcher": "Bash", "hooks": [
             {"type": "command", "command": jarvis_hook_command(), "timeout": 15}]})
     if doc_nav_hook == "on":
-        # §5 of docs/specs/2026-10-06-navigate-specs-like-code.md: the doc hook has a
-        # `Read` arm as well as a `Bash` one, and the bar is the key `dispatch` resolves
-        # into the worker's environment rather than a number retyped here.
+        # §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: the doc
+        # hook has a `Read` arm as well as a `Bash` one, and the bar is the key `dispatch`
+        # resolves into the worker's environment rather than a number retyped here.
         hook_env["JARVIS_DOC_NAV_HOOK"] = "on"
         hook_env["JARVIS_DOC_READ_LIMIT_LINES"] = str(DEFAULT_WORKER_DOC_READ_LIMIT_LINES)
         matchers.append({"matcher": "Bash|Read", "hooks": [
@@ -550,9 +550,10 @@ def test_the_hook_does_not_refuse_a_literal_word_search_in_a_markdown_file(repo)
 # -- the DOC side: does a feature child NAVIGATE a spec? ---------------------------------
 #
 # §7 of .jarvis/features/fo-2cc90946/sections/wo-6026ee80.md, over the feature spec
-# docs/specs/2026-10-06-navigate-specs-like-code.md. The DONE WHEN's other half: a fresh
-# feature child that needs spec context beyond its given section uses `jarvis spec
-# toc`/`section`/`search` and makes no whole-file `Read`, `cat` or `sed` of a spec.
+# docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. The DONE WHEN's other
+# half: a fresh feature child that needs spec context beyond its given section uses
+# `jarvis spec toc`/`section`/`search` and makes no whole-file `Read`, `cat` or `sed` of a
+# spec.
 #
 # "Makes no whole-file read" is satisfied by reading NOTHING, which is why every clause
 # below is a POSITIVE and a NEGATIVE over the SAME run, and why every assertion is over
@@ -640,7 +641,7 @@ def doc_paths(doc_repo: Path) -> dict[str, Path]:
     from this and every assertion reads them from it, so §7.2's "the path the fixture
     built is the path `is_spec_path` sees" cannot drift into two paths."""
     return {
-        "spec": doc_repo / "docs" / "specs" / DOC_SPEC_FILENAME,
+        "spec": doc_repo / "docs" / "superpowers" / "specs" / DOC_SPEC_FILENAME,
         "section": (doc_repo / ".jarvis" / "features" / "fo-docnav" / "sections"
                     / DOC_SECTION_FILENAME),
     }
@@ -835,7 +836,7 @@ def doc_worker_briefing(doc_repo: Path) -> str:
          "kind": "worker"},
         spec, None,
         {"section": f"{_CHILD_SECTION}. {_DOC_SECTION_TITLES[_CHILD_SECTION - 1]}",
-         "repo_path": f"docs/specs/{DOC_SPEC_FILENAME}",
+         "repo_path": str(paths["spec"].relative_to(doc_repo)),
          "section_path": str(paths["section"]),
          "path": str(paths["spec"])})
 
