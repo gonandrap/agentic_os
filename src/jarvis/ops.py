@@ -11110,6 +11110,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # Read once per spawn into the worker's settings file, which is where the hook reads
     # it. Spec §6: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.py_nav_hook", "next-dispatch"),
+    # Both read once per spawn into the worker's settings file, which is where the hook
+    # reads them. Spec §5: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md
+    ("*.doc_nav_hook", "next-dispatch"),
+    ("*.doc_read_limit_lines", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -12178,7 +12182,9 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
 
 def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
               turn_rows: Sequence[dict[str, Any]] = (),
-              os_groups: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+              os_groups: Sequence[dict[str, Any]] = (),
+              *, since: float | None = None,
+              until: float | None = None) -> dict[str, Any]:
     """One work order's spend, flattened for a table.
 
     The transcript figures stay the body of the row (they are the only source with a
@@ -12199,7 +12205,7 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     from .bill import _cold_prefix_floor
 
     session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
-                                     index=index)
+                                     index=index, since=since, until=until)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -12287,8 +12293,35 @@ def fleet_cost(**kwargs: Any) -> dict[str, Any]:
     return fleetcost.report(**kwargs)
 
 
+def cost_window(**kwargs: Any) -> dict[str, Any]:
+    """Which window a cost surface is reporting over — see `fleetcost.resolve_window`.
+
+    Resolved ONCE per surface and handed to both payload builders, so the two halves of
+    a page cannot disagree. Lazy import for `fleet_cost`'s reason: §6 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    project = kwargs.pop("project", None)
+    kwargs.setdefault("cfg", fleetcost.cost_config(project))
+    return fleetcost.resolve_window(**kwargs)
+
+
+def cost_zone(tz: str | None = None, project: str | None = None) -> str:
+    """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
+
+    Its own wrapper because the page needs the zone before it can parse the custom
+    form's naive datetimes: §11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    return fleetcost.resolve_zone(tz, fleetcost.cost_config(project))
+
+
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+                limit: int = 50, include_hidden: bool = True,
+                window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
 
     `target` is a work-order or feature-order id for a single unit — a feature order
@@ -12319,6 +12352,12 @@ def cost_report(project: str | None = None, target: str | None = None,
     work order. The marker is unconditional on purpose: a heuristic that tried to guess
     whether any escaped would be blind in exactly the cases it was meant to catch, and a
     flat statement is always true and costs one line (ruled on wo-76e021aa, issue #103).
+
+    `window` is a dict `fleetcost.resolve_window` returned, and this ONLY FILTERS with
+    it — the boundary arithmetic is `fleetcost`'s (§5 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). `None` keeps the
+    whole-history behaviour, and a window is NEVER applied to `target=`: one order's
+    bill is the whole order, and truncating it would make the bill stop reconciling.
     """
     from . import usage as usage_mod
 
@@ -12329,7 +12368,9 @@ def cost_report(project: str | None = None, target: str | None = None,
     if target:
         return _cost_for_target(target, project, index)
 
-    os_groups = _os_groups(project)
+    since = window["since"] if window else None
+    until = window["until"] if window else None
+    os_groups = _os_groups(project, since=since, until=until)
     scope = {project: paths[project]} if project else paths
     units: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
@@ -12337,20 +12378,38 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+            rows = store.list_work_orders(
+                limit=limit, include_hidden=include_hidden,
+                active_between=(since, until) if window else None)
+            # An order whose only in-window activity is an `agent_call` — Neo answered
+            # it between turns — has no in-window turn and is added by id (§5a).
+            seen = {wo["id"] for wo in rows}
+            for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
+                try:
+                    extra = store.get_work_order(wo_id)
+                except KeyError:
+                    continue            # a legacy row naming no project: not this one's
+                if include_hidden or not extra["hidden"]:
+                    rows.append(extra)
+            for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ())))
+                                       os_groups.get(wo["id"], ()),
+                                       since=since, until=until))
         finally:
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost —
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
-    return {"scope": project or "fleet", "units": units,
+    # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/
+    # `totals` keys describe a different POPULATION when a window is given, and this is
+    # how a consumer tells (§7).
+    return {"scope": project or "fleet", "units": units, "window": window,
             **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
-def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
+def _os_groups(project: str | None = None, *, since: float | None = None,
+               until: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """Every work order's OS-side call groups, in one query. See `_os_spend`.
 
     One read of `os.db` for the whole fleet rather than one per work order: this report
@@ -12359,11 +12418,27 @@ def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
     central = CentralStore()
     try:
         groups: dict[str, list[dict[str, Any]]] = {}
-        for row in central.agent_call_totals(project):
+        for row in central.agent_call_totals(project, since=since, until=until):
             groups.setdefault(row["wo_id"] or "", []).append(row)
         return groups
     finally:
         central.close()
+
+
+def _os_only_ids(groups: dict[str, list[dict[str, Any]]], project: str,
+                 seen: set[str]) -> list[str]:
+    """Ids whose only in-window activity was an OS call, NARROWED TO ONE PROJECT.
+
+    `_os_groups` is read fleet-wide and `ProjectStore.get_work_order` raises on an id
+    its database does not hold, so the `agent_calls.project` column is what keeps a
+    fleet-wide report from asking proj_a for proj_b's order (§5a of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). A row that names NO
+    project is a candidate everywhere and is placed by the guarded lookup instead.
+    """
+    return sorted(
+        wo_id for wo_id, rows in groups.items()
+        if wo_id and wo_id not in seen
+        and any((r.get("project") or "") in ("", project) for r in rows))
 
 
 def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -12425,6 +12500,9 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            # Over ALL units: what a window could not place is disclosed whether or not
+            # the order it belongs to was measurable (§5c).
+            "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, units),
         },
     }

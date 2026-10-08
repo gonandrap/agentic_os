@@ -157,9 +157,12 @@ HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 #: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
 REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
                              "worker has not delivered again since")
+#: Issue #975: the held reason a user reads must end in something they can type.
 REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
                              "worker has pushed commits since without running `jarvis "
-                             "wo finish` — the OS has asked it to declare them")
+                             "wo finish` — the OS has asked it to declare them; you can "
+                             "also send it a message asking it to finish, or run `jarvis "
+                             "validation force` to judge the pull request as it stands")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 #: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass

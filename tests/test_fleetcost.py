@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -71,6 +72,214 @@ def test_window_of_prefers_the_flags():
     assert (flagged["since"], flagged["until"]) == (SINCE, UNTIL)
     assert flagged["source"] == "flags"
     assert fleetcost.window_of(None, None, cfg, now=T0)["source"] == "usage-week"
+
+
+# -- 1b. the window SELECTOR -----------------------------------------------------------
+#
+# §1-§4 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. One resolver, read
+# by the CLI, `--json` and the page, so a bad parameter is a refusal on all three.
+
+WEEK_SECONDS = 7 * 86400
+
+
+def resolved(**kwargs):
+    kwargs.setdefault("cfg", catalog.CostConfig())
+    kwargs.setdefault("now", T0)
+    return fleetcost.resolve_window(**kwargs)
+
+
+def test_week_offsets_step_back_whole_local_weeks():
+    windows = {n: resolved(window="week", offset=n) for n in (0, -1, -4)}
+
+    assert (windows[0]["since"], windows[0]["until"]) == (SINCE, UNTIL)
+    assert windows[0]["source"] == "usage-week"
+    for n in (-1, -4):
+        w = windows[n]
+        assert w["source"] == "week-offset"
+        assert w["window"] == "week" and w["offset"] == n
+        # Seven LOCAL days, and the configured hour at each end.
+        local = datetime.fromtimestamp(w["since"], ZoneInfo("America/Los_Angeles"))
+        assert (local.hour, local.weekday()) == (21, 0)
+        assert w["until"] - w["since"] == WEEK_SECONDS
+    # The windows abut exactly: no gap and no overlap at a boundary.
+    assert windows[-1]["until"] == windows[0]["since"]
+    assert windows[-4]["since"] == SINCE - 4 * WEEK_SECONDS
+
+
+def test_week_across_dst_in_both_directions():
+    """A week spanning a transition is seven LOCAL days: 169 or 167 absolute hours."""
+    autumn = resolved(window="week", now=stamp("2026-10-28T12:00:00+00:00"))
+    spring = resolved(window="week", now=stamp("2027-03-10T12:00:00+00:00"))
+
+    assert autumn["until"] - autumn["since"] == 169 * 3600
+    assert spring["until"] - spring["since"] == 167 * 3600
+    for w in (autumn, spring):
+        local = datetime.fromtimestamp(w["since"], ZoneInfo("America/Los_Angeles"))
+        assert (local.hour, local.weekday()) == (21, 0)
+        # Both ends printed: one abbreviation across a transition is wrong at one end.
+        assert "PDT" in w["local_label"] and "PST" in w["local_label"]
+    assert autumn["local_label"] == "2026-10-26 21:00 PDT to 2026-11-02 21:00 PST"
+    # The OFFSET path crosses it too, not just the week containing `now`.
+    back = resolved(window="week", offset=-1, now=stamp("2026-11-04T12:00:00+00:00"))
+    assert back["until"] - back["since"] == 169 * 3600
+    assert back["local_label"] == autumn["local_label"]
+
+
+def test_week_boundary_second_either_side():
+    one_before = resolved(window="week", now=SINCE - 1)
+    assert (one_before["since"], one_before["until"]) == (SINCE - WEEK_SECONDS, SINCE)
+    earlier = resolved(window="week", offset=-1, now=SINCE - 1)
+    assert earlier["until"] == SINCE - WEEK_SECONDS
+    assert resolved(window="week", now=SINCE)["since"] == SINCE
+
+
+def test_session_window_grid():
+    cfg = catalog.CostConfig()
+    now = SINCE + 12 * 3600
+    current = resolved(window="5h", now=now, cfg=cfg)
+
+    assert (current["since"], current["until"]) == (SINCE + 10 * 3600,
+                                                    SINCE + 15 * 3600)
+    assert current["source"] == "session-window"
+    assert current["window"] == "5h" and current["offset"] == 0
+    assert resolved(window="5h", offset=-1, now=now, cfg=cfg)["since"] == \
+        SINCE + 5 * 3600
+    assert resolved(window="5h", offset=-3, now=now, cfg=cfg)["since"] == \
+        current["since"] - 15 * 3600
+    # A non-default length moves every edge, and a fractional one is legal.
+    hourly = resolved(window="5h", now=now,
+                      cfg=catalog.CostConfig(session_window_hours=1.0))
+    assert (hourly["since"], hourly["until"]) == (now, now + 3600)
+    half = resolved(window="5h", now=now,
+                    cfg=catalog.CostConfig(session_window_hours=2.5))
+    assert (half["since"], half["until"]) == (SINCE + 10 * 3600, SINCE + 12.5 * 3600)
+
+
+def test_session_window_steps_across_a_week_start():
+    """Continuous in ABSOLUTE time: the step stays the length, across the reset (§2)."""
+    now = SINCE + 2 * 3600
+    steps = [resolved(window="5h", offset=-n, now=now) for n in range(4)]
+
+    for earlier, later in zip(steps[1:], steps):
+        assert later["since"] - earlier["since"] == 5 * 3600
+        assert earlier["until"] == later["since"]
+    # It crosses the reset rather than re-anchoring on the previous week's own grid,
+    # which is the accepted non-alignment: 168 is not a multiple of 5.
+    assert steps[1]["since"] < SINCE < steps[0]["until"]
+
+
+def test_custom_range():
+    for until in ("2026-10-06", "2026-10-06T04:00:00+00:00", "2026-10-06T04:00"):
+        window = resolved(since="2026-09-29T04:00", until=until)
+        assert window["since"] == SINCE
+        assert window["source"] == "flags"
+        assert window["window"] is None and window["offset"] is None
+    # Naive input is UTC, the way `--since` already reads it.
+    assert resolved(since="2026-09-29T04:00:00")["since"] == SINCE
+
+
+def test_refusals():
+    with pytest.raises(ops.OpsError, match=r"window must be one of week, 5h — 'month' "
+                                           r"is not a window this report knows"):
+        resolved(window="month")
+    with pytest.raises(ops.OpsError,
+                       match="offset must be 0 or negative — 1 names a window that has "
+                             "not happened yet"):
+        resolved(window="week", offset=1)
+    for since, until in ((UNTIL, SINCE), (SINCE, SINCE)):
+        with pytest.raises(ops.OpsError, match="since must be before until"):
+            resolved(since=since, until=until)
+    with pytest.raises(ops.OpsError, match="which is an empty window"):
+        resolved(since=SINCE, until=SINCE)
+    with pytest.raises(
+            ops.OpsError,
+            match=r"--since/--until and --window/--offset are two ways to name the same "
+                  r"thing — pass one or the other, not both"):
+        resolved(window="week", since=SINCE)
+    # The same refusal covers an offset beside a custom range.
+    with pytest.raises(ops.OpsError, match="pass one or the other, not both"):
+        resolved(offset=-1, until=UNTIL)
+
+
+def test_window_of_still_resolves_the_week():
+    cfg = catalog.CostConfig()
+    week = fleetcost.window_of(None, None, cfg, now=T0)
+
+    assert (week["since"], week["until"]) == (SINCE, UNTIL)
+    assert week["source"] == "usage-week"
+    assert week["window"] == "week" and week["offset"] == 0
+    flagged = fleetcost.window_of(SINCE, UNTIL, cfg, now=T0)
+    assert flagged["source"] == "flags" and flagged["window"] is None
+
+
+# -- 1c. the DISPLAY zone --------------------------------------------------------------
+#
+# §11 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. Display only: the
+# boundaries stay anchored in `cfg.week_reset_zone`, so picking a zone must move NO
+# number.
+
+
+def test_the_default_zone_comes_from_the_catalog():
+    cfg = catalog.CostConfig()
+
+    assert fleetcost.resolve_zone(None, cfg) == cfg.week_reset_zone
+    # Empty is ABSENT, not a bad zone: a blank form field is not a refusal.
+    assert fleetcost.resolve_zone("", cfg) == cfg.week_reset_zone
+    assert fleetcost.resolve_zone("Europe/Berlin", cfg) == "Europe/Berlin"
+    # And it is read from the catalog, never a module constant.
+    moved = catalog.CostConfig(week_reset_zone="Asia/Tokyo")
+    assert fleetcost.resolve_zone(None, moved) == "Asia/Tokyo"
+
+    week = resolved(window="week")
+    assert week["zone"] == catalog.CostConfig().week_reset_zone
+    assert week["local_label"] == "2026-09-28 21:00 to 2026-10-05 21:00 PDT"
+
+
+def test_a_picked_zone_moves_the_label_and_no_number():
+    """The load-bearing test: the zone is DISPLAY ONLY (Neo q1460)."""
+    default = resolved(window="week")
+    berlin = resolved(window="week", tz="Europe/Berlin")
+
+    assert berlin["zone"] == "Europe/Berlin"
+    assert berlin["local_label"] != default["local_label"]
+    assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
+    # Byte-identical boundaries: the week stays anchored in `week_reset_zone`.
+    assert berlin["since"] == default["since"]
+    assert berlin["until"] == default["until"]
+    assert berlin["label"] == default["label"]
+
+
+def test_a_bad_zone_is_a_refusal_never_a_fallback():
+    for bad in ("Mars/Olympus", "not a zone", "../etc/passwd"):
+        with pytest.raises(ops.OpsError) as caught:
+            resolved(window="week", tz=bad)
+        assert str(caught.value) == (
+            f"tz must be an IANA time zone name — {bad!r} is not a zone this report "
+            f"knows")
+        with pytest.raises(ops.OpsError):
+            fleetcost.resolve_zone(bad, catalog.CostConfig())
+
+
+def test_a_dst_change_in_a_picked_zone_prints_both_abbreviations():
+    """Berlin's autumn transition is 2026-10-25, inside this usage week."""
+    week = resolved(window="week", tz="Europe/Berlin",
+                    now=stamp("2026-10-21T12:00:00+00:00"))
+
+    assert "CEST" in week["local_label"] and "CET" in week["local_label"]
+    assert week["local_label"] == "2026-10-20 06:00 CEST to 2026-10-27 05:00 CET"
+
+
+def test_the_zone_rides_on_every_source():
+    windows = (resolved(window="week", tz="Asia/Tokyo"),
+               resolved(window="5h", offset=-2, tz="Asia/Tokyo"),
+               resolved(since=SINCE, until=UNTIL, tz="Asia/Tokyo"),
+               fleetcost.window_of(None, None, catalog.CostConfig(), now=T0,
+                                   tz="Asia/Tokyo"))
+
+    assert {w["source"] for w in windows} == {"usage-week", "session-window", "flags"}
+    for w in windows:
+        assert w["zone"] == "Asia/Tokyo"
+        assert "JST" in w["local_label"]
 
 
 # -- 2. the one place a population statistic is computed -------------------------------
@@ -344,7 +553,8 @@ def test_payload_keys_stable(fleet_fixture):
 
     assert set(fleet) == FLEET_KEYS
     assert set(fleet["metrics"]) == METRIC_KEYS
-    assert set(fleet["window"]) == {"since", "until", "label", "source"}
+    assert set(fleet["window"]) == {"since", "until", "label", "local_label", "source",
+                                    "window", "offset", "zone"}
     assert set(fleet["orders"]) == {"n", "live", "truncated", "excluded_no_turns"}
     one = fleet["metrics"]["cost_per_turn_usd"]
     assert set(one) == {"n", "avg", "p90", "max", "unit", "provenance", "cost_basis",
@@ -357,6 +567,25 @@ def test_payload_keys_stable(fleet_fixture):
     assert fleet["metrics"]["tokens_per_turn.cache_write"]["unit"] == "tokens"
     # The payoff block is the existing arithmetic, verbatim.
     assert "pct_paid_off" in fleet["compaction_payoff"]
+
+
+def test_the_report_takes_a_named_window_or_a_resolved_one(fleet_fixture):
+    """`resolved` wins and is refused beside any raw parameter: no "which one was it" (§6)."""
+    wo = fleet_fixture.order(session_id="sess-a")
+    fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+
+    week = ops.fleet_cost(window="week", offset=-1, now=T0)["fleet"]
+    assert week["window"]["source"] == "week-offset"
+    assert week["orders"]["n"] == 0, "last week, and the turn ran this week"
+
+    picked = ops.cost_window(window="5h", now=T0)
+    session = ops.fleet_cost(resolved=picked)["fleet"]
+    assert session["window"] == picked
+    # The anchor travels in the payload, not in one renderer (§2).
+    assert fleetcost.SESSION_ANCHOR_NOTE in session["notes"]
+    assert fleetcost.SESSION_ANCHOR_NOTE not in week["notes"]
+    with pytest.raises(ops.OpsError, match="pass one or the other, not both"):
+        ops.fleet_cost(resolved=picked, window="week")
 
 
 def test_an_unknown_project_is_refused_not_reported_as_empty(fleet_fixture):
@@ -413,6 +642,70 @@ def test_the_cli_fleet_json_is_the_payload(fleet_fixture, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert set(payload["fleet"]) == FLEET_KEYS
+
+
+def test_the_cli_takes_a_named_window_and_an_offset(fleet_fixture, capsys):
+    """§6: `--fleet` is the windowed surface on the CLI; the bare listing is not."""
+    from jarvis import cli
+
+    wo = fleet_fixture.order(session_id="sess-a")
+    fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.25)
+
+    assert cli.main(["cost", "--fleet", "--json", "--window", "5h",
+                     "--offset", "-2"]) == 0
+    window = json.loads(capsys.readouterr().out)["fleet"]["window"]
+
+    assert window["window"] == "5h" and window["offset"] == -2
+    assert window["source"] == "session-window"
+    # The local clock the reset is specified in, beside the UTC label (§4).
+    assert window["local_label"] and "UTC" in window["label"]
+    assert cli.main(["cost", "--fleet", "--window", "week", "--offset", "-1"]) == 0
+    assert "usage week" not in capsys.readouterr().out
+
+
+def test_the_cli_refuses_a_window_beside_a_custom_range(fleet_fixture, capsys):
+    from jarvis import cli
+
+    assert cli.main(["cost", "--fleet", "--window", "week",
+                     "--since", "2026-09-29T04:00:00+00:00"]) == 1
+
+    assert ("--since/--until and --window/--offset are two ways to name the same thing "
+            "— pass one or the other, not both") in capsys.readouterr().err
+
+
+def test_the_cli_prints_the_local_window_beside_the_utc_one(fleet_fixture, capsys):
+    from jarvis import cli
+
+    wo = fleet_fixture.order(session_id="sess-a")
+    fleet_fixture.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.25)
+
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
+
+    out = capsys.readouterr().out
+    assert "2026-09-29 04:00 to 2026-10-06 04:00 UTC" in out
+    assert "2026-09-28 21:00 to 2026-10-05 21:00 PDT" in out
+
+
+def test_the_cli_takes_a_display_zone(fleet_fixture, capsys):
+    """§11: `--tz` so the CLI label and the page label agree, and nothing else moves."""
+    from jarvis import cli
+
+    args = ["cost", "--fleet", "--json", "--since", "2026-09-29T04:00:00+00:00",
+            "--until", "2026-10-06T04:00:00+00:00"]
+    assert cli.main(args) == 0
+    plain = json.loads(capsys.readouterr().out)["fleet"]["window"]
+    assert cli.main(args + ["--tz", "Europe/Berlin"]) == 0
+    berlin = json.loads(capsys.readouterr().out)["fleet"]["window"]
+
+    assert plain["zone"] == "America/Los_Angeles"
+    assert berlin["zone"] == "Europe/Berlin"
+    assert berlin["local_label"] == "2026-09-29 06:00 to 2026-10-06 06:00 CEST"
+    assert (berlin["since"], berlin["until"]) == (plain["since"], plain["until"])
+    assert berlin["label"] == plain["label"]
+    # A bad zone is the same refusal here as on the page, with a non-zero exit.
+    assert cli.main(args + ["--tz", "Mars/Olympus"]) == 1
+    assert "is not a zone this report knows" in capsys.readouterr().err
 
 
 def test_the_default_render_names_subproc_and_shows_subagents(fleet_fixture, capsys):

@@ -2153,13 +2153,27 @@ class ProjectStore:
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
+        active_between: tuple[float, float] | None = None,
     ) -> list[dict[str, Any]]:
+        """Work orders, newest first.
+
+        `active_between` is a half-open window of TURN time, for a cost report over one
+        usage week — and it is applied HERE rather than in Python because the clause has
+        to run BEFORE `LIMIT`: filtering the page would report an empty last week as
+        soon as a project has `limit` newer orders (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+        """
         conds, params = [], []
         if statuses:
             conds.append(f"status IN ({','.join('?' for _ in statuses)})")
             params.extend(statuses)
         if not include_hidden:
             conds.append("hidden=0")
+        if active_between is not None:
+            conds.append("""EXISTS (SELECT 1 FROM wo_turns t WHERE t.wo_id =
+                                    work_orders.id AND t.started_at >= ?
+                                    AND t.started_at < ?)""")
+            params.extend(active_between)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",

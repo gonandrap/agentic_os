@@ -1836,7 +1836,11 @@ class CentralStore:
         model re-aggregate in Python, so the finer key costs them nothing.
 
         One query for the whole fleet: the alternative is a query per work order, and
-        the cost report walks every work order there is.
+        the cost report walks every work order there is. `project` is in the key for
+        that reason — a fleet-wide consumer opens one project's store at a time and
+        `ProjectStore.get_work_order` RAISES on a foreign id, so the column is how a
+        row is placed without a lookup (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
 
         THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
         is what stops the report under-pricing its own overhead at the 1.25x floor (spec:
@@ -1868,7 +1872,7 @@ class CentralStore:
             params.append(until)
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
-            f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
+            f"""SELECT wo_id, project, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
@@ -1878,7 +1882,8 @@ class CentralStore:
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
                            AS cache_5m
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, label, model""", tuple(params)).fetchall())
+                GROUP BY wo_id, project, kind, label, model""",
+            tuple(params)).fetchall())
 
     def agent_call_totals_by_day(self, project: str | None = None,
                                  since: float | None = None,
