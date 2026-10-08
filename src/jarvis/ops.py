@@ -11110,6 +11110,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # Read once per spawn into the worker's settings file, which is where the hook reads
     # it. Spec §6: docs/specs/2026-10-02-serena-the-cheap-path.md
     ("*.py_nav_hook", "next-dispatch"),
+    # Both read once per spawn into the worker's settings file, which is where the hook
+    # reads them. Spec §5: docs/specs/2026-10-06-navigate-specs-like-code.md
+    ("*.doc_nav_hook", "next-dispatch"),
+    ("*.doc_read_limit_lines", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`

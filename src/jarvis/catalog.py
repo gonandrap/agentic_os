@@ -112,6 +112,30 @@ DEFAULT_WORKER_TOOL_SEARCH = "on"
 VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
 
+# Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC —
+# §5 of docs/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
+# VALID_PY_NAV_HOOK above and for its reason: the hook is entirely Jarvis's own.
+# DEFAULT OFF — nothing in that spec ships on, so merging it changes the behaviour of no
+# running worker.
+VALID_DOC_NAV_HOOK = ("off", "on")
+DEFAULT_WORKER_DOC_NAV_HOOK = "off"
+
+# THE BAR BOTH DOC ARMS SHARE, in lines: a `Read` with a larger `limit` (or none at all)
+# and a `cat`/`head`/`sed -n` naming a wider range are refused. 200 because §1's table
+# prices `head … .md` at 317 tokens a call while the measured evasion is
+# `sed -n '1,2000p'` (§1(c): 1.25M tokens over 2,189 Bash calls) — the arm exists for the
+# 2,000-line range, not for the 40-line one.
+#
+# THIS IS THE KEY'S FALLBACK AND NOT THE RESOLVED NUMBER: a catalog setting rather than a
+# module constant in `hooks.py`, so a project can raise or lower it, and the hook reads
+# the value `dispatch` resolved into the worker's environment.
+DEFAULT_WORKER_DOC_READ_LIMIT_LINES = 200
+# Zero or a negative would make the bar a blanket refusal of every targeted read, which
+# is the feature's own MUST NOT reached by a typo. It arrives through `jarvis config
+# set`, so it is refused where the message can name the key — the HOOK absorbs a bad
+# value quietly instead, because it runs on every tool call.
+WORKER_DOC_READ_LIMIT_LINES_MIN = 1
+
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
 # through to `claude --model`, so it accepts a full model id (pinned, as here) or an
@@ -458,6 +482,10 @@ class WorkerDefaults:
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # The bar both doc arms share — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -1480,6 +1508,10 @@ class OsConfig:
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    default_doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # Its bar, fleet-wide — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    default_doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -1688,6 +1720,25 @@ def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
         return _parse_autocompact(raw, key, where, default)
     except ValueError as e:
         raise _err(str(e)) from e
+
+
+def _doc_read_limit_or_err(raw: dict[str, Any], where: str, default: int) -> int:
+    """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key.
+
+    §5.3 of docs/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
+    is rejected LOUDLY; `hooks.doc_nav_decision` absorbs one quietly, because it runs on
+    every tool call and a hook that raises breaks the whole session. Both are needed:
+    validation cannot see a settings file edited by hand.
+    """
+    value = raw.get("doc_read_limit_lines", default)
+    try:
+        lines = int(value)
+    except (TypeError, ValueError) as e:
+        raise _err(f"{where} must be a whole number of lines, got {value!r}") from e
+    if lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"{where} must be >= {WORKER_DOC_READ_LIMIT_LINES_MIN} (lines — zero "
+                   f"or less would refuse every targeted read), got {lines}")
+    return lines
 
 
 def load_catalog(path: str | Path) -> Catalog:
@@ -2421,6 +2472,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         # Spec 2026-10-02-serena-the-cheap-path.md §6.
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
+        # Spec 2026-10-06-navigate-specs-like-code.md §5.
+        default_doc_nav_hook=defaults.get("doc_nav_hook", DEFAULT_WORKER_DOC_NAV_HOOK),
+        default_doc_read_limit_lines=_doc_read_limit_or_err(
+            defaults, "os.defaults.doc_read_limit_lines",
+            DEFAULT_WORKER_DOC_READ_LIMIT_LINES),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2478,6 +2534,14 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
                    f"{sorted(VALID_PY_NAV_HOOK)}")
+    # Spec 2026-10-06-navigate-specs-like-code.md §5.
+    if os_cfg.default_doc_nav_hook not in VALID_DOC_NAV_HOOK:
+        raise _err(f"os.defaults.doc_nav_hook {os_cfg.default_doc_nav_hook!r} not in "
+                   f"{sorted(VALID_DOC_NAV_HOOK)}")
+    if os_cfg.default_doc_read_limit_lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"os.defaults.doc_read_limit_lines must be >= "
+                   f"{WORKER_DOC_READ_LIMIT_LINES_MIN}, got "
+                   f"{os_cfg.default_doc_read_limit_lines}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2528,6 +2592,15 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if py_nav_hook not in VALID_PY_NAV_HOOK:
             raise _err(f"project {name}: worker.py_nav_hook {py_nav_hook!r} not in "
                        f"{sorted(VALID_PY_NAV_HOOK)}")
+        # Spec 2026-10-06-navigate-specs-like-code.md §5 — this message IS what
+        # `jarvis config set <project> worker.doc_nav_hook` shows.
+        doc_nav_hook = w.get("doc_nav_hook", os_cfg.default_doc_nav_hook)
+        if doc_nav_hook not in VALID_DOC_NAV_HOOK:
+            raise _err(f"project {name}: worker.doc_nav_hook {doc_nav_hook!r} not in "
+                       f"{sorted(VALID_DOC_NAV_HOOK)}")
+        doc_read_limit_lines = _doc_read_limit_or_err(
+            w, f"project {name}: worker.doc_read_limit_lines",
+            os_cfg.default_doc_read_limit_lines)
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2548,6 +2621,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             bash_first=bash_first,
             tool_search=tool_search,
             py_nav_hook=py_nav_hook,
+            doc_nav_hook=doc_nav_hook,
+            doc_read_limit_lines=doc_read_limit_lines,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
