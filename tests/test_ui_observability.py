@@ -480,7 +480,7 @@ def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
                 assert body["limiter"]["available"] == 0
                 assert body["last_ok_age_seconds"] is not None   # it WAS healthy
                 assert body["uptime_seconds"] >= 0
-                assert body["version"]
+                assert body["probe_failure_reason"] == "pool_timeout"
 
                 control = pool.submit(client.get, "/_sync_control")
                 with pytest.raises(cf.TimeoutError):
@@ -524,6 +524,109 @@ def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypa
     # wedge is not an unhandled exception.
     ui_log = uilog.ui_log_path()
     assert "[ERROR]" not in (ui_log.read_text() if ui_log.exists() else "")
+
+
+# -- the detector is cause-independent (review round 1) -----------------------------
+#
+# The shipped probe only saw a SATURATED limiter. Production was not saturated — 11
+# threads against 40 tokens, a process-global lock held for ever (kn-5b1be5c3) — so
+# `_pool_ping` took a free token, returned at once, and `/healthz` said healthy while
+# every page hung. In-flight routed requests are tracked on the event loop instead.
+
+
+def test_a_wedge_that_never_saturates_the_pool_still_trips(started, monkeypatch):
+    """Issue #986's own shape: far fewer blocked handlers than tokens."""
+    _fast_probe(monkeypatch, trip_threshold=1)
+    lock = threading.Lock()
+    app = create_app()
+
+    @app.get("/_lockwait")
+    def lock_waiter():
+        """The holder. Its name is what the stack dump has to name."""
+        with lock:
+            return {"ok": True}
+
+    lock.acquire()
+    pool = cf.ThreadPoolExecutor(max_workers=16)
+    try:
+        with TestClient(app) as client:
+            try:
+                total = _limiter(client)["total"]
+                for _ in range(11):
+                    pool.submit(client.get, "/_lockwait")
+                assert _wait_until(
+                    lambda: client.get("/healthz").json()["wedged"] is True,
+                    timeout=15), "/healthz never reported wedged on an unsaturated pool"
+
+                body = client.get("/healthz").json()
+                assert body["pool_healthy"] is False
+                assert body["probe_failure_reason"] == "inflight_stall"
+                assert body["inflight"] >= 1
+                assert body["oldest_inflight_seconds"] >= 1
+                # The discriminator: tokens were still free the whole time.
+                assert 11 < total
+                assert _limiter(client)["available"] > 0
+                assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=15)
+            finally:
+                lock.release()
+    finally:
+        pool.shutdown(wait=True)
+
+    assert "lock_waiter" in uilog.stack_dump_path().read_text()
+
+
+def _next_key(probe) -> int:
+    key = probe.begin("GET", "/_counter")
+    probe.end(key)
+    return key
+
+
+def test_only_routed_requests_count_as_in_flight(started):
+    """A stream of 404s on unrouted paths must not read as a wedge: in the measured
+    fault they answered in 1ms while every routed page hung."""
+    app = create_app()
+    probe = app.state.pool_probe
+    seen: dict = {}
+
+    @app.get("/_peek")
+    def peek():
+        seen["oldest"] = probe.oldest_inflight()
+        return {"ok": True}
+
+    @app.get("/_raises")
+    def raiser():
+        raise RuntimeError("kaboom")
+
+    client = TestClient(app, raise_server_exceptions=False)
+
+    k0 = _next_key(probe)
+    assert client.get("/_definitely_not_a_route").status_code == 404
+    assert _next_key(probe) == k0 + 1          # the 404 registered nothing
+
+    k1 = _next_key(probe)
+    assert client.get("/_peek").status_code == 200
+    assert _next_key(probe) == k1 + 2          # the routed request registered one
+    assert seen["oldest"] is not None
+    assert seen["oldest"][1] == "GET /_peek"
+    assert probe.oldest_inflight() is None     # cleared when it returned
+
+    assert client.get("/_raises").status_code == 500
+    assert probe.oldest_inflight() is None     # cleared when it raised
+
+    # `/healthz` itself never counts, or the daemon's 5s poll would be the oldest entry.
+    client.get("/healthz")
+    assert probe.oldest_inflight() is None
+
+
+def test_healthz_publishes_no_version_and_no_filesystem_path(started):
+    """`/healthz` is unauthenticated: it may not hand out a build version or a path."""
+    body = TestClient(create_app()).get("/healthz").json()
+
+    assert "version" not in body
+    assert "stack_dump" not in body
+    blob = json.dumps(body)
+    assert "/" not in blob
+    assert str(uilog.stack_dump_path()) not in blob
 
 
 # -- the daemon detects it and heals it ---------------------------------------------

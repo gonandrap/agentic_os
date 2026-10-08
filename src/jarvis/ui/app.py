@@ -296,6 +296,22 @@ def _quiet(path: str) -> bool:
 # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)
 
 
+def _routed(request) -> bool:
+    """Does this request match a route? The measured fault's own discriminator: unrouted
+    paths answered 404 in 1ms while every routed page hung, so counting them would make a
+    stream of 404s read as a wedge (spec §1). Starlette 1.3.1: `route.matches(scope)`
+    returns `(Match, scope)` and only `Match.FULL` is a hit."""
+    from starlette.routing import Match
+
+    try:
+        for route in request.app.routes:
+            if route.matches(request.scope)[0] == Match.FULL:
+                return True
+    except Exception:  # noqa: BLE001 — never raise on the request path
+        return False
+    return False
+
+
 def _pool_ping() -> bool:
     """The probe's whole job in the thread: return. No I/O, no lock, nothing that can
     fail for a reason other than the pool itself."""
@@ -337,6 +353,13 @@ class PoolProbe:
         self.consecutive_failures = 0
         self.wedged_since: float | None = None
         self.stack_dump: str | None = None
+        # Routed requests in flight, keyed by a counter: a monotonic start time and a
+        # label. Registered on the EVENT LOOP by `access_log`, where a wedged pool cannot
+        # hide them — the shipped probe saw a saturated limiter only, and production was
+        # never saturated (spec §1, kn-5b1be5c3).
+        self._inflight: dict[int, tuple[float, str]] = {}
+        self._inflight_seq = 0
+        self.probe_failure_reason = ""
         # Resolved once, here: `jarvis_version` shells out to git on its first call, and
         # `/healthz` must never be the request that pays for that. Swallowed, for the
         # reason `instance_badge` swallows it: a version string must not be why the app
@@ -363,10 +386,30 @@ class PoolProbe:
         except Exception:  # noqa: BLE001 — no loop, or an anyio that moved
             return {"borrowed": 0, "available": 0, "total": 0, "waiting": 0}
 
+    def begin(self, method: str, path: str) -> int:
+        """Register one routed request. Dict writes only: this is on the request path and
+        may never raise (spec §1)."""
+        self._inflight_seq += 1
+        key = self._inflight_seq
+        self._inflight[key] = (time.monotonic(), f"{method} {path}")
+        return key
+
+    def end(self, key: int) -> None:
+        self._inflight.pop(key, None)
+
+    def oldest_inflight(self) -> tuple[float, str] | None:
+        """Age in seconds and label of the longest-running routed request, or None."""
+        entries = list(self._inflight.values())
+        if not entries:
+            return None
+        started, label = min(entries, key=lambda e: e[0])
+        return (time.monotonic() - started, label)
+
     @property
     def pool_healthy(self) -> bool:
-        """The last round-trip succeeded. A probe that has never run reads as healthy:
-        silence from a probe that was never started is not evidence of a wedge."""
+        """The last probe ROUND passed — the pool round-trip AND the in-flight check,
+        whichever of the two would have failed. A probe that has never run reads as
+        healthy: silence from a probe that was never started is not evidence of a wedge."""
         return self.consecutive_failures == 0
 
     def wedged(self, trip_threshold: int) -> bool:
@@ -376,6 +419,8 @@ class PoolProbe:
 
     def payload(self, cfg) -> dict:
         now = time.time()
+        oldest = self.oldest_inflight()
+        # No `version` and no `stack_dump`: `/healthz` is unauthenticated (review round 1).
         return {
             "pool_healthy": self.pool_healthy,
             "wedged": self.wedged(cfg.trip_threshold),
@@ -385,26 +430,36 @@ class PoolProbe:
                                     else round(now - self.last_ok, 3)),
             "consecutive_failures": self.consecutive_failures,
             "uptime_seconds": round(now - self.started_at, 1),
-            "version": self.version,
             "wedged_since": self.wedged_since,
-            "stack_dump": self.stack_dump,
+            "inflight": len(self._inflight),
+            "oldest_inflight_seconds": (None if oldest is None else round(oldest[0], 3)),
+            "probe_failure_reason": self.probe_failure_reason,
         }
 
     async def step(self, cfg) -> bool:
-        """One round trip through the pool. Returns whether it came back."""
+        """One round, two checks: the pool round-trip, and whether any routed request has
+        been in flight longer than the timeout (spec §1)."""
         import anyio
 
         try:
             with anyio.fail_after(cfg.probe_timeout_seconds):
                 await anyio.to_thread.run_sync(_pool_ping)
         except TimeoutError:
-            self.consecutive_failures += 1
-            if self.wedged(cfg.trip_threshold):
-                self._trip()
-            return False
+            return self._fail("pool_timeout", cfg)
+        oldest = self.oldest_inflight()
+        if oldest is not None and oldest[0] > cfg.probe_timeout_seconds:
+            return self._fail("inflight_stall", cfg)
         self.last_ok = time.time()
         self.consecutive_failures = 0
+        self.probe_failure_reason = ""
         return True
+
+    def _fail(self, reason: str, cfg) -> bool:
+        self.probe_failure_reason = reason
+        self.consecutive_failures += 1
+        if self.wedged(cfg.trip_threshold):
+            self._trip()
+        return False
 
     def _trip(self) -> None:
         """Dump this process's stacks — the only way to get the frames at all, since
@@ -1143,20 +1198,29 @@ def create_app() -> FastAPI:
         server error" impossible to place in time.
         """
         t0 = time.perf_counter()
+        # Runs on the event loop, before `call_next` queues a sync handler onto the pool:
+        # the one place a wedged request is still visible (spec §1).
+        key = (probe.begin(request.method, request.url.path)
+               if request.url.path != "/healthz" and _routed(request) else None)
         try:
-            response = await call_next(request)
-        except Exception:
-            # The handler above renders the page, but it runs *outside* this middleware
-            # (ServerErrorMiddleware is outermost), so this is the only place that sees
-            # both the failure and the elapsed time.
-            uilog.record_access(request.method, _rel_url(request), 500,
-                                (time.perf_counter() - t0) * 1000)
-            raise
-        if response.status_code >= 400 or not _quiet(request.url.path):
-            uilog.record_access(request.method, _rel_url(request),
-                                response.status_code,
-                                (time.perf_counter() - t0) * 1000)
-        return response
+            try:
+                response = await call_next(request)
+            except Exception:
+                # The handler above renders the page, but it runs *outside* this middleware
+                # (ServerErrorMiddleware is outermost), so this is the only place that sees
+                # both the failure and the elapsed time.
+                uilog.record_access(request.method, _rel_url(request), 500,
+                                    (time.perf_counter() - t0) * 1000)
+                raise
+            if response.status_code >= 400 or not _quiet(request.url.path):
+                uilog.record_access(request.method, _rel_url(request),
+                                    response.status_code,
+                                    (time.perf_counter() - t0) * 1000)
+            return response
+        finally:
+            # A 500 and a cancellation both clean up (spec §1).
+            if key is not None:
+                probe.end(key)
 
     # -- pages ------------------------------------------------------------------
 
