@@ -782,6 +782,10 @@ def sentence(*, five_hour: dict[str, Any], spend: dict[str, Any],
     outside += f": {_named(sessions)})" if sessions else ")"
     said += f", {outside}, unexplained {_money(spend['residual_usd'])} " \
             f"({_share(spend['residual_share'])}) — {RESIDUAL_LABEL}"
+    if spend.get("scope_project"):
+        # The scoped figure, named and never subtracted from the meter (§7).
+        said += (f"; {spend['scope_project']}'s own share of that is "
+                 f"{_money(spend['scope_jarvis_usd'])}")
     if dollars["source"] == "seed":
         said += (f"; from the shipped {dollars['value']:g}/point estimate, not measured "
                  f"here")
@@ -851,9 +855,13 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
 
     sessions = outside_sessions(since=since, until=until, home=root)
     outside_usd = sum(s.usd for s in sessions)
+    # The residual arithmetic is ALWAYS fleet-wide, whatever the query's scope (§7).
     workers_usd, calls_usd = jarvis_spend(since=since, until=until, home=root,
-                                          project=project)
+                                          project=None)
     jarvis_usd = workers_usd + calls_usd
+    scope_workers, scope_calls = (
+        jarvis_spend(since=since, until=until, home=root, project=project)
+        if project else (None, None))
     implied = five.delta_points * float(dollars["value"]) if covered else None
     residual = (implied - jarvis_usd - outside_usd) if covered else None
 
@@ -871,7 +879,14 @@ def reconciliation(*, resolved: dict[str, Any], project: str | None = None,
              # clamping it to zero would hide the drift (§7).
              "residual_usd": round(residual, 2) if covered else None,
              "residual_share": share(residual), "outside_share": share(outside_usd),
-             "jarvis_share": share(jarvis_usd)}
+             "jarvis_share": share(jarvis_usd),
+             # Reported BESIDE the meter and never subtracted from it (§7).
+             "scope_project": project,
+             "scope_workers_usd": None if project is None else round(scope_workers, 2),
+             "scope_jarvis_calls_usd": (None if project is None
+                                        else round(scope_calls, 2)),
+             "scope_jarvis_usd": (None if project is None
+                                  else round(scope_workers + scope_calls, 2))}
     coverage = _coverage_dict(five.coverage, in_span)
     five_hour = _window_dict(five)
     return {"meter": {

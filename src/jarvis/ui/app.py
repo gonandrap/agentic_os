@@ -1486,7 +1486,8 @@ def create_app() -> FastAPI:
         # losing it must not take the listing down.
         try:
             meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
-        except Exception:                                   # noqa: BLE001
+        except Exception as e:                              # noqa: BLE001
+            uilog.record_error(request.method, "cost/meter", e)
             meter = None
         # Its own variable and never read out of `fleet`: losing the section must not
         # lose the window the reader picked.

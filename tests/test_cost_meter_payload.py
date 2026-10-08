@@ -131,7 +131,9 @@ def test_the_subtree_keys_and_version_are_pinned(fleet_fixture):
                                                "basis_usd"}
     assert set(meter["spend"]) == {"implied_usd", "workers_usd", "jarvis_calls_usd",
                                    "jarvis_usd", "outside_usd", "residual_usd",
-                                   "residual_share", "outside_share", "jarvis_share"}
+                                   "residual_share", "outside_share", "jarvis_share",
+                                   "scope_project", "scope_workers_usd",
+                                   "scope_jarvis_calls_usd", "scope_jarvis_usd"}
     assert set(meter["outside"]) == {"total_usd", "n", "sessions"}
     assert set(meter["alerts"]) == {"outside", "residual", "thresholds", "min_usd"}
     assert set(meter["timeline"][0]) == {"ts", "five_hour_pct", "seven_day_pct", "ok"}
@@ -211,6 +213,58 @@ def test_a_negative_residual_is_reported_negative_and_never_clamped(fleet_fixtur
     assert meter["spend"]["residual_share"] < 0
     assert "unexplained -$" in meter["sentence"]
     assert "usage this machine cannot see" in meter["sentence"]
+
+
+def test_a_scoped_query_keeps_the_residual_fleet_wide(fleet_fixture):
+    """Another project's spend is EXPLAINED, never unexplained (§7).
+
+    `jarvis cost <project>` scopes the listing, but the meter is account-wide, so the
+    residual arithmetic stays fleet-wide and the project's own share is reported beside
+    it.
+    """
+    from jarvis.testing import FleetCostFixture, make_git_project
+
+    second = make_git_project(fleet_fixture.catalog_path.parent, "proj_b")
+    data = json.loads(fleet_fixture.catalog_path.read_text())
+    data["projects"].append({"name": "proj_b", "path": str(second)})
+    fleet_fixture.catalog_path.write_text(json.dumps(data))
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_b", str(second), "the other project")
+        central.conn.commit()
+    finally:
+        central.close()
+    other = FleetCostFixture(fleet_fixture.home, second, fleet_fixture.transcript_root,
+                             fleet_fixture.catalog_path, name="proj_b")
+    resolved = scene(fleet_fixture, outside=False)
+    wo_b = other.order("the order proj_b spent on")
+    other.turn(wo_b, started_at=resolved["since"] + 2 * MINUTE,
+               ended_at=resolved["since"] + 3 * MINUTE, cost_usd=3.0)
+
+    meter = meter_of(fleet_fixture, resolved, project="proj_a")
+    spend = meter["spend"]
+    implied = float(spend["implied_usd"])
+
+    # proj_b's $3.00 is counted, and the residual is the fleet-wide one.
+    assert spend["jarvis_usd"] == pytest.approx(9.5)
+    assert spend["workers_usd"] == pytest.approx(9.0)
+    assert spend["residual_usd"] == pytest.approx(round(implied - 9.5, 2))
+    assert spend["residual_usd"] != pytest.approx(round(implied - 6.5, 2))
+    # The scoped figures sit beside it, never subtracted from the meter.
+    assert spend["scope_project"] == "proj_a"
+    assert spend["scope_jarvis_usd"] == pytest.approx(6.5)
+    assert spend["scope_workers_usd"] == pytest.approx(6.0)
+    assert spend["scope_jarvis_calls_usd"] == pytest.approx(0.5)
+    assert "proj_a's own share of that is $6.50" in meter["sentence"]
+
+
+def test_an_unscoped_query_carries_the_scope_keys_as_none(fleet_fixture):
+    meter = meter_of(fleet_fixture, scene(fleet_fixture))
+
+    for key in ("scope_project", "scope_workers_usd", "scope_jarvis_calls_usd",
+                "scope_jarvis_usd"):
+        assert meter["spend"][key] is None, key
+    assert "own share of that" not in meter["sentence"]
 
 
 # -- 33-35. the CLI ----------------------------------------------------------------------

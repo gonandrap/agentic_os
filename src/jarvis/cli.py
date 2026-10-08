@@ -3019,11 +3019,14 @@ def _when(text: str) -> float:
 def _cost_meter(picked: dict, project: str | None) -> dict | None:
     """The meter subtree, or None. Its own `try`, as `/cost` has: the meter reads a
     different table from the listing and losing it must not take the listing down."""
+    import logging
+
     from . import ops
 
     try:
         return ops.cost_meter(resolved=picked, project=project)["meter"]
-    except Exception:                                   # noqa: BLE001
+    except Exception as e:                              # noqa: BLE001
+        logging.getLogger(__name__).warning("cost meter unavailable: %s", e)
         return None
 
 

@@ -339,8 +339,20 @@ Jarvis spend for the span, from the records it already has, with no new reader:
 
 * **workers** — `fleetcost.turn_rows` over every registered project, summed as
   `fleetcost.report` already does;
-* **jarvis calls** — `fleetcost.os_by_kind(since, until, project)` plus
-  `fleetcost.os_unattributed`, which is how the OS's own calls are already attributed.
+* **jarvis calls** — the by-kind rows of `fleetcost.os_by_kind(since, until, project)`,
+  which is how the OS's own calls are already attributed. The payload does NOT add
+  `os_unattributed`: that line is a SUBSET of the by-kind rows, so adding it would count
+  Neo's between-turn answers twice.
+
+**The residual is computed FLEET-WIDE whatever the query's scope.** `jarvis cost
+<project>` and `/cost?project=X` scope the LISTING; the meter is an account-wide reading,
+and subtracting one project's spend from it would dump every other project's spend into
+the residual and call it unexplained. So `workers_usd`, `jarvis_calls_usd`, `jarvis_usd`,
+`implied_usd`, every share and `residual_usd` are always `project=None`. A scoped query
+ALSO reports the project's own figures beside them — `spend.scope_project`,
+`scope_workers_usd`, `scope_jarvis_calls_usd`, `scope_jarvis_usd`, null when unscoped —
+never subtracted from the meter, and the sentence names them in one clause
+("…; jarvis_os's own share of that is $3.10").
 
 Then:
 
@@ -449,7 +461,9 @@ meter.dollars_per_point           {value, low, high, source, basis_spans,
                                    basis_points, basis_usd}
 meter.spend                       {implied_usd, workers_usd, jarvis_calls_usd,
                                    jarvis_usd, outside_usd, residual_usd,
-                                   residual_share, outside_share, jarvis_share}
+                                   residual_share, outside_share, jarvis_share,
+                                   scope_project, scope_workers_usd,
+                                   scope_jarvis_calls_usd, scope_jarvis_usd}
 meter.outside                     {total_usd, n, sessions: [{session_id, project,
                                    project_dir, title, models, calls, tokens, usd,
                                    first_ts, last_ts}]}
@@ -531,8 +545,9 @@ listing — §5 of the ask: the sentence is the first thing read, not a row in a
 carries the sentence as one paragraph, the two deltas, the coverage share, the outside
 session table (session id linking nowhere — these are not Jarvis records), and the
 utilisation timeline as an inline SVG sparkline of `meter.timeline`, 5h and 7d as two
-lines, with the span's work-order dispatches marked, so a jump in the meter lines up
-against what spent in that span. Built in its own `try` in `cost_page`, exactly as the
+lines. The sparkline carries those two lines and NO work-order dispatch marks: lining a
+jump in the meter up against what spent in that span is DEFERRED, not promised here.
+Built in its own `try` in `cost_page`, exactly as the
 distribution section is (ui/app.py:1476-1482): the meter reads a different table from the
 listing, and losing it must not take the older, load-bearing half down.
 
@@ -585,7 +600,11 @@ listing, and losing it must not take the older, load-bearing half down.
 New: `tests/test_usage_meter.py` (sampler + schema + segments + estimator),
 `tests/test_usage_meter_outside.py` (ownership + the walk),
 `tests/test_cost_meter_payload.py` (the subtree, the sentence, the surfaces).
-Extended: `tests/test_ui_cost.py`, `tests/test_daemon.py`, `tests/test_doctor.py`.
+Extended: `tests/test_ui_cost.py`. There is no `tests/test_daemon.py` and no
+`tests/test_doctor.py` in this tree: cases 38-42 — the sampler cadence, the
+once-per-streak gap notice and the `INV-USAGE-METER-STALE` invariant — live in
+`tests/test_usage_meter.py`, and case 43 — the `os_owner` outside-spend alarm — lives in
+`tests/test_cost_meter_payload.py`.
 Fixtures reused, not invented: `testing.FleetCostFixture.transcript(session_id, rows,
 subagents=…)` (testing.py:2960) and `.os_call(kind, ts=…, …)` (testing.py:2868) and
 `.turn(...)`, under the `fleet_fixture` fixture (testing.py:2973). No test performs a
