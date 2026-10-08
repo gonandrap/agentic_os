@@ -634,6 +634,49 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
     sp.add_argument("--json", action="store_true")
 
+    # §4.3 of docs/specs/2026-10-06-navigate-specs-like-code.md: these three spellings are
+    # a contract two sibling sections quote verbatim.
+    spec_p = sub.add_parser(
+        "spec",
+        help="read a markdown document the way code is read — list its sections, open "
+             "one, or find which section says a thing",
+    ).add_subparsers(dest="spec_cmd", required=True)
+
+    sp = spec_p.add_parser("toc", help="every heading of one document, with an ESTIMATE "
+                                       "of each section's size")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser("section", help="one section of one document, by number or by "
+                                           "heading substring")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("which", help="a section number (`4`, `4.2`) or part of its heading")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser(
+        "search",
+        help="which SECTIONS of this project's documents contain every word — the next "
+             "step is `jarvis spec section`, and each hit prints it",
+        description="Every whitespace-separated word must appear in a line, "
+                    "case-insensitively, and the SECTION containing it is reported once. "
+                    "One project at a time: there is no --all and no comma-separated "
+                    "list. KEEP SHELL METACHARACTERS OUT OF THE QUERY: a command "
+                    "containing | ; ` $ < or > is refused by "
+                    "hooks.is_jarvis_command_chain, so it stops being auto-allowed and "
+                    "prompts instead — which stalls a background worker.",
+    )
+    sp.add_argument("words", help="the words to look for, quoted")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--limit", type=int, default=40, help="hits to show (default: 40)")
+    sp.add_argument("--json", action="store_true")
+
     # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
     # implicit `list`, on `alarms`' precedent below and for the same argparse reason.
     issues_p = sub.add_parser(
@@ -2503,13 +2546,22 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
                  f"({row['code_nav_bash_calls']} on code)  "
                  f"{row['read_tool_calls']:>4} Read"
                  if payload.get("calls_reported", True) else "")
+        # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
+        # the payload's flag, BYTE counters always.
+        doc_calls = (f"  {row['whole_file_read_calls']:>4} whole-file Read  "
+                     f"{row['doc_dump_bash_calls']:>4} doc dumps"
+                     if payload.get("calls_reported", True) else "")
         print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
-              f"{row['transcripts']:>4} transcripts{calls}")
+              f"{row['transcripts']:>4} transcripts{calls}{doc_calls}")
         print(f"{indent}           code reads via bash: {share_text} of "
               f"{_tok(row['result_bytes'])} bytes of tool results"
               + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
                  if row["unattributed_bytes"] else ""))
+        print(f"{indent}           docs: {_tok(row['doc_read_bytes'])} bytes via Read · "
+              f"{_tok(row['doc_dump_bash_bytes'])} bytes dumped via bash · "
+              f"{_tok(row['read_tool_bytes'])} bytes of Read results")
     print(f"{indent}  {payload['before']}")
+    print(f"{indent}  {payload['doc_before']}")
 
 
 def cmd_navigation(args: argparse.Namespace) -> int:
@@ -2728,6 +2780,53 @@ def cmd_search(args: argparse.Namespace) -> int:
         if hit["snippet"]:
             print(f"  {hit['snippet']}")
         print(f"  {hit['ref']}")
+    return 0
+
+
+def cmd_spec(args: argparse.Namespace) -> int:
+    """`jarvis spec toc | section | search` — §4.2 of the navigate-specs-like-code spec.
+
+    THIS RENDERER DERIVES NOTHING: every ref, every command and every size is a value out
+    of the `ops.spec_*` payload, so the terminal and `--json` cannot disagree about what
+    the next call is.
+    """
+    from . import ops
+
+    if args.spec_cmd == "toc":
+        out = ops.spec_toc(args.path, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['tokens_estimate']} tokens (estimate)")
+        for row in out["sections"]:
+            print(f"  {'  ' * (row['level'] - 1)}{row['name']}  "
+                  f"line {row['line']}  ~{row['tokens_estimate']} tokens (estimate)")
+            print(f"  {'  ' * (row['level'] - 1)}  {row['command']}")
+        return 0
+
+    if args.spec_cmd == "section":
+        out = ops.spec_section(args.path, args.which, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['which']} — {out['tokens_estimate']} tokens "
+              f"(estimate)")
+        print(out["content"])
+        return 0
+
+    out = ops.spec_search(args.words, args.project, limit=args.limit)
+    if args.json:
+        _print(out, True)
+        return 0
+    if not out["hits"]:
+        print(f"nothing in {out['project']} matches {out['words']!r}")
+        return 0
+    print(f"{out['count']} section(s) in {out['project']}"
+          + (f" — capped at --limit {out['limit']}" if out["truncated"] else ""))
+    for hit in out["hits"]:
+        print(f"\n{hit['path']}  line {hit['line']}")
+        print(f"  {hit['context']}")
+        print(f"  {hit['command']}")
     return 0
 
 
@@ -5318,6 +5417,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_alarms(args)
         if args.cmd == "search":
             return cmd_search(args)
+        if args.cmd == "spec":
+            return cmd_spec(args)
         if args.cmd == "issues":
             return (cmd_issues_start(args) if args.issues_cmd == "start"
                     else cmd_issues(args))

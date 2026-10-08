@@ -461,8 +461,12 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                f"is the source of truth for WHAT to build. It is materialised at "
                f"{design_doc['section_path']}: read it first.",
                ] if design_doc.get("section_path") else []),
-            *([f"The whole spec is at {design_doc['path']} if the section is not enough. "
-               f"Both are read-only snapshots; the authoritative copy is on the "
+            # Spec 2026-10-06-navigate-specs-like-code.md §6: the path is an ARGUMENT.
+            *([f"The whole spec is snapshotted at {design_doc['path']} — navigate it, "
+               f"never open it whole: `jarvis spec toc <path>` for its headings, "
+               f"`jarvis spec section <path> <n|name>` for another section, "
+               f"`jarvis spec search \"<words>\"` to find which spec covers a thing. "
+               f"Both files are read-only snapshots; the authoritative copy is on the "
                f"planner's branch.",
                ] if design_doc.get("path") else []),
         ] if design_doc else []),
@@ -744,6 +748,11 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
            f"`jarvis learn show <id>` returns the body. A plan built "
            f"without it will hand children the lessons the fleet already paid for, "
            f"again."] if knowledge else []),
+        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        "- NAVIGATE the specs you read, never open one whole — you are the fleet's "
+        "heaviest spec reader: `jarvis spec toc <path>` for the headings, "
+        "`jarvis spec section <path> <n|name>` for the one section you need, "
+        "`jarvis spec search \"<words>\"` to find which spec says a thing.",
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "

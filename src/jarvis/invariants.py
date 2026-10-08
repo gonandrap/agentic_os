@@ -534,6 +534,14 @@ FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
                            "plan promised")
 
+#: What a FEATURE order says when a merged child's commit never reached the head a round
+#: would judge, past the bound. §3 of
+#: docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+FEATURE_CHILD_NOT_INTEGRATED = (
+    "{id}'s merge commit {commit} is not in {head}, the commit on the default branch a "
+    "review would judge — so a panel would report its work as missing. Nothing has been "
+    "judged.")
+
 
 def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The children that fail their feature: ended badly, and not answered for.
@@ -3221,9 +3229,13 @@ def _live_catalog() -> Any:
 def _os_owning_project(store: ProjectStore) -> Any:
     """This store's `ProjectSpec` if it is the project that runs the OS, else None.
 
-    Derived, NEVER hardcoded: `schedule.os_owner` over the live catalog, compared on the
+    Derived, NEVER hardcoded: `schedule.os_project` over the live catalog, compared on the
     RESOLVED PATH rather than on a name, because a store knows its directory and not
     what the catalog calls it.
+
+    Identity is BY GIT ORIGIN (issue 956). Asked by path containment this check was dead
+    in production, where the running package is in the deployed checkout and no catalog
+    path contains it.
     """
     from . import schedule
 
@@ -3231,9 +3243,7 @@ def _os_owning_project(store: ProjectStore) -> Any:
     if catalog is None:
         return None
     try:
-        # §5: no fallback — an arbitrary first-in-catalog project is not the OS.
-        owner = schedule.os_owner(((p.name, p.path) for p in catalog.projects),
-                                  fallback=False)
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
         if owner is None:
             return None
         spec = catalog.project(owner)
@@ -3983,6 +3993,79 @@ def check_production_clean() -> Iterator[Violation]:
     )
 
 
+def check_prod_cli() -> Iterator[Violation]:
+    """INV-PROD-CLI — the `jarvis` a human types must mean production.
+
+    Issue 757. `JARVIS_HOME`, `PRODUCTION_CODE` and `JARVIS_ENV` live only in the two
+    systemd units, so they reach the daemon and every worker it spawns and reach nothing
+    typed in a shell: `jarvis` is command-not-found, and the obvious fallback — the
+    deployed venv's binary by full path — runs production CODE against `~/.jarvis`, the
+    DEV instance's state, with no error and with the dashboard badge saying `production`.
+    `scripts/install_prod_cli.sh` installs a wrapper carrying those three exports; this
+    is the third member of the family `check_service_path` and `check_production_clean`
+    started, watching an install step a human runs once and nothing ever compares.
+
+    Reads the FILE, not `os.environ`: a session that HAS the variables is not the session
+    that is broken. Keys on the MACHINE's deployment, not `paths.deployment_env()` —
+    the subject is the interactive shell, which is neither instance, so `jarvis doctor`
+    run from the dev checkout on a host that also runs production does report, and must.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: writing an executable onto the user's PATH
+    is an install action, not a derivation a read-only check may perform.
+    """
+    from . import release
+    from .paths import production_code_dir
+
+    prod = production_code_dir()
+    if not (prod / ".git").exists() or not os.access(prod / ".venv/bin/jarvis", os.X_OK):
+        return  # no production deployment on this machine
+    wrapper = release.cli_wrapper()
+    expected_target = str(prod / ".venv/bin/jarvis")
+    expected_home = f"{prod.parent}/state"
+    facts = release.cli_wrapper_facts()
+    if facts is None:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"no production `jarvis` on PATH: {wrapper} does not exist, so "
+                    f"`jarvis` in an interactive shell is either command-not-found or — "
+                    f"worse — the venv binary with no `JARVIS_HOME`, which drives the "
+                    f"DEV instance at ~/.jarvis silently (issue 757). Install it with "
+                    f"scripts/install_prod_cli.sh (it starts and restarts nothing)."),
+            context={"wrapper": str(wrapper), "target": None, "jarvis_home": None,
+                     "expected_target": expected_target, "expected_home": expected_home,
+                     "generated": False},
+        )
+        return
+    target, home = facts["target"], facts["env"].get("JARVIS_HOME")
+    context = {"wrapper": str(wrapper), "target": target, "jarvis_home": home,
+               "expected_target": expected_target, "expected_home": expected_home,
+               "generated": facts["generated"]}
+    if not facts["generated"]:
+        # Most likely a dev install pointing at ~/.jarvis — the defect's second half. The
+        # detail says it was not generated here, so a deliberate install can be kept.
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} is a `jarvis` this OS did not generate (no "
+                    f"`{release.CLI_MARKER}` marker), so typing `jarvis` reaches "
+                    f"something other than the fleet the units run — most likely a dev "
+                    f"install writing to ~/.jarvis (issue 757). Replace it by running "
+                    f"scripts/install_prod_cli.sh, or keep it deliberately."),
+            context=context,
+        )
+        return
+    if target != expected_target or home != expected_home:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} execs {target} and exports JARVIS_HOME={home}, but "
+                    f"production on this machine is {prod} with "
+                    f"JARVIS_HOME={expected_home} — every `jarvis` typed in a shell is "
+                    f"therefore driving a different fleet from the one the units run. "
+                    f"Re-render it with scripts/install_prod_cli.sh."),
+            context=context,
+        )
+
+
 # -- cache health ----------------------------------------------------------------------
 #
 # Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
@@ -4267,14 +4350,58 @@ def check_prefix_stable() -> Iterator[Violation]:
     )
 
 
+def check_os_identity() -> Iterator[Violation]:
+    """INV-OS-IDENTITY — the OS's own project must be identifiable.
+
+    Issue 956: `schedule.os_project` returning None makes the three release guards, the
+    health-sweep invariant and the config refusal all INERT, and inert is invisible —
+    production filed six release orders for fixes it was already running before anyone
+    looked. Every one of those callers is right to do nothing on None, so None is the
+    thing that has to be reported rather than acted on.
+
+    KEYED ON A CANDIDATE EXISTING, never on None alone: a pip-installed OS driving
+    projects that are not it has no candidate and no identity, and that deployment is
+    correct. What fires is a catalog that HOLDS a checkout of this repository while
+    identity still resolves to nothing, and AMBIGUITY is the only way that happens: two
+    or more projects on this code's origin. That is the complete set — a single candidate
+    always resolves, and a path whose origin cannot be read is never a candidate, since
+    `os_candidates` keeps only paths whose origin EQUALS this code's.
+
+    NOT repairable: which of two checkouts of this repository is the OS is the user's to
+    say, by removing one from the catalog.
+    """
+    from . import schedule
+
+    catalog = _live_catalog()
+    if catalog is None:
+        return
+    projects = [(p.name, p.path) for p in getattr(catalog, "projects", ())]
+    candidates = schedule.os_candidates(projects)
+    if not candidates or schedule.os_project(projects) is not None:
+        return
+    yield Violation(
+        invariant="INV-OS-IDENTITY",
+        detail=(f"the catalog holds {len(candidates)} projects that are checkouts of the "
+                f"OS's own repository ({', '.join(candidates)}), so which one IS the OS "
+                f"has no answer — and every caller of that question does nothing on no "
+                f"answer. The release guards file duplicate release orders for fixes "
+                f"already live, the OS's health sweep is never checked for liveness, and "
+                f"`jarvis config set` stops refusing a write that switches that sweep "
+                f"off. Leave one of them in the catalog."),
+        level="critical", context={"candidates": candidates},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
     check_production_clean,
+    check_prod_cli,
     check_cache_ttl_trigger,
     check_prefix_stable,
+    check_os_identity,
 )
 
 

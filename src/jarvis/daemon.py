@@ -1470,6 +1470,13 @@ class Daemon:
         no sender and the feature parked for ever. `_manager_handoff` is that half, and it
         belongs here because this is the branch that knows the whole precondition.
 
+        THE THIRD CASE IS A DEFERRAL: a child has merged but its commit is not yet in the
+        head a round would be collected over, so no round is opened and the feature stays
+        `executing` for the next tick to ask again. `True` is the only safe answer there —
+        `False` would complete the feature unjudged — and only the daemon can defer at
+        all, because only the daemon has a next tick (§2 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+
         Both switches are read here rather than in the round machine, for the reason the
         whole design turns on: `enabled` gates OPENING a round and never settling one, so
         a user who turns the panel off at three in the morning drains what is open and
@@ -1487,9 +1494,16 @@ class Daemon:
             # only tick that knows it can make one (issue #480).
             self._manager_handoff(project, store, fo)
             return True
+        if self._defer_unintegrated_children(project, store, fo, cfg):
+            return True
         try:
             round_row = ops.submit_feature_for_validation(
                 store, project.path, fo, declared="", summary="", cfg=cfg)
+        except ops.UnintegratedChild as e:
+            # §2: never the arm below, which completes the feature unjudged.
+            log.info("[%s] feature %s: %s", project.name, fo["id"], e)
+            self._defer_for(project, store, fo["id"], e.child_id, e.commit, e.head, cfg)
+            return True
         except Exception:  # noqa: BLE001 — one feature must not cost the tick the rest
             log.exception("[%s] could not open a validation round for %s",
                           project.name, fo["id"])
@@ -1497,6 +1511,101 @@ class Daemon:
         log.info("[%s] feature %s -> validating (round %d)", project.name, fo["id"],
                  round_row["round"])
         return True
+
+    #: §3: one row per distinct deferral state, on the feature's own timeline.
+    VALIDATION_DEFER_EVENT = "validation_defer"
+
+    def _defer_unintegrated_children(self, project: ProjectSpec, store: ProjectStore,
+                                     fo: dict, cfg: Any) -> bool:
+        """Is a merged child's commit still missing from the head a round would judge?
+
+        True means defer: open no round, leave the feature `executing`, and ask again next
+        tick. The collector silently assumes this precondition, and when it does not hold
+        the panel reports the child's work as missing and rejects — a false blocker that
+        spends a round (§2 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+
+        ITS OWN FAILURES DEFER TOO. Anything this cannot answer reads as "not proven",
+        never as "fine". The catch-all is also load-bearing: this runs BEFORE
+        `_route_to_validation`'s `try:`, so an escaping raise would abort `settle_features`
+        for every feature in the project, not just this one.
+        """
+        try:
+            return self._unintegrated_child(project, store, fo, cfg)
+        except Exception:  # noqa: BLE001 — §2: cannot prove it is integrated, so wait
+            log.exception("[%s] could not check %s's children against the default "
+                          "branch head", project.name, fo["id"])
+            return True
+
+    def _unintegrated_child(self, project: ProjectSpec, store: ProjectStore,
+                            fo: dict, cfg: Any) -> bool:
+        """`_defer_unintegrated_children` without the catch-all. See its docstring."""
+        from . import branchproof, ops
+        from . import evidence as evidence_mod
+
+        # §2: the head is read AFTER a fetch, so the check and the collection agree.
+        ref = evidence_mod.base_ref(project.path)
+        if ref:
+            branchproof.fetch(project.path, ref)
+        head = evidence_mod.default_branch_head(project.path)
+        if not head:
+            return False  # no default branch: the collector resolves no head either
+        missing = ops.unintegrated_children(
+            project.path, store, fo["id"], head,
+            lambda child: self._merge_commit_of(project, store, child))
+        if not missing:
+            return False
+        child, sha = missing[0]
+        self._defer_for(project, store, fo["id"], child["id"], sha, head, cfg)
+        return True
+
+    def _defer_for(self, project: ProjectSpec, store: ProjectStore, fo_id: str,
+                   child_id: str, sha: str, head: str, cfg: Any) -> None:
+        """Record one deferral: the timeline event, and the user on expiry.
+
+        Shared by the daemon's own precondition and the `ops.UnintegratedChild` arm, which
+        reach the same state down two paths (§2/§3 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+        """
+        from .invariants import FEATURE_CHILD_NOT_INTEGRATED
+
+        waited = self._minutes_since_merge(store, {"id": child_id})
+        expired = waited >= int(cfg.feature_merge_wait_minutes)
+        self._record_defer(store, fo_id, {
+            "child": child_id, "commit": sha, "head": head,
+            "waited_minutes": round(waited, 1), "expired": expired})
+        if expired:
+            # §3: a child merged into a sibling branch never becomes an ancestor, and an
+            # unbounded deferral parks the feature silently.
+            store.flag_feature_attention(fo_id, FEATURE_CHILD_NOT_INTEGRATED.format(
+                id=child_id, commit=sha, head=head))
+        log.info("[%s] feature %s: %s's merge %s is not in %s after %.0f min — no round "
+                 "opened%s", project.name, fo_id, child_id, sha[:12], head[:12],
+                 waited, " (asking the user)" if expired else "")
+
+    def _minutes_since_merge(self, store: ProjectStore, child: dict) -> float:
+        """How long ago this child's merge was recorded. §3: minutes, never ticks — a
+        bound in ticks silently changes meaning when the reconcile interval does."""
+        for kind in ("pr_merged", self.MERGE_COMMIT_EVENT):
+            rows = store.events_of_kind(child["id"], kind)
+            if rows:
+                return max(0.0, (time.time() - float(rows[-1]["ts"])) / 60)
+        return 0.0
+
+    def _record_defer(self, store: ProjectStore, fo_id: str,
+                      payload: dict[str, Any]) -> None:
+        """One event per distinct `(child, commit, expired)`. §3: a per-tick event would
+        write a row a minute for fifteen minutes and then for ever."""
+        from . import ops
+
+        state = (payload["child"], payload["commit"], payload["expired"])
+        prior = ops.feature_events_of_kind(store, fo_id, self.VALIDATION_DEFER_EVENT)
+        if prior:
+            last = db.from_json(prior[-1]["payload"], {})
+            if (last.get("child"), last.get("commit"),
+                    bool(last.get("expired"))) == state:
+                return
+        ops.feature_event(store, fo_id, self.VALIDATION_DEFER_EVENT, payload)
 
     def _manager_handoff(self, project: ProjectSpec, store: ProjectStore,
                          fo: dict) -> None:
@@ -2913,6 +3022,13 @@ class Daemon:
                 store, project.path, fo, declared=str(round_row["evidence"] or ""),
                 summary=str(round_row["summary"] or ""), cfg=cfg,
                 history=ops.prior_round_history(store, fo_id=fo_id, before=n))
+            # WHICH COMMIT THIS ROUND IS JUDGING, in the same position and for the same
+            # reason as the work-order path: a fact about the packet, written before any
+            # verdict exists, so an escalation can still say what it was about. NO FETCH
+            # HERE, deliberately — not fetching is what keeps this head equal to the one
+            # the round was fingerprinted against (§5b of
+            # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+            store.set_validation_head(round_id, evidence_mod.judged_head(packet))
 
             validator = (self.validator if self.validator is not None
                          else self._validator(cfg))
@@ -4451,6 +4567,18 @@ class Daemon:
         from . import schedule
 
         return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
+
+    def _os_project(self) -> str | None:
+        """Which project IS the OS — `schedule.os_project`, per tick.
+
+        NOT `_os_owner`, and the difference is issue 956: that one resolves by path
+        containment and answers with an arbitrary project when nothing contains the
+        install, which is every production deployment. Callers granting the OS's own
+        authority — the release path — ask this and do nothing on None.
+        """
+        from . import schedule
+
+        return schedule.os_project((p.name, p.path) for p in self.catalog.projects)
 
     @staticmethod
     def _schedule_blocker(store: ProjectStore, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -7698,10 +7826,14 @@ class Daemon:
         order is on it and closed when that work lands — without which the tracker is a
         thing only a human maintains, which is the whole of the issue.
 
-        **A COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives where
-        the issue belongs from the work order, `issue_state` records where the OS last
-        put it, and nothing is sent while the two agree. So the common case — every
-        tracked work order already reconciled — costs ONE indexed query for the whole
+        **A LATCHED COMPARISON, NOT A SCHEDULE OF POKES.** `issues.desired_state` derives
+        where the issue belongs from the work order, `issue_state` records where the OS
+        last put it, and `issues.needs_sync` answers whether anything may still be done —
+        the comparison, plus the terminal case a bare comparison could never converge on,
+        a column latched at CLOSED (issue #961,
+        docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
+        Nothing is sent while it says no. So the common case — every tracked work order
+        already reconciled — costs ONE indexed query for the whole
         project and no subprocess at all, and a project that has never filed a bug does
         not even pay that (the query returns nothing).
 
@@ -7716,9 +7848,9 @@ class Daemon:
         from . import github, issues
 
         for wo in tracked:
-            want = issues.desired_state(store, wo)
-            if want == (wo.get("issue_state") or ""):
+            if not issues.needs_sync(store, wo):
                 continue
+            was = (wo.get("issue_state") or "")
             try:
                 applied = issues.record_applied(store, wo, project.bugs.label)
             except github.GitHubError as e:
@@ -7750,7 +7882,9 @@ class Daemon:
             # order carries an honest low/medium rating or none at all, so the rating
             # column alone could never see that they asked for this in production now
             # (2026-09-27 spec §2).
-            if (applied == issues.CLOSED
+            # `was` is what makes the one-shot contract TRUE instead of assumed: issue
+            # #961's replay re-read the same closed issue and re-filed the release.
+            if (applied == issues.CLOSED and was != issues.CLOSED
                     and ops_mod.routes_on_pull_request(store, wo)
                     and (issues.dispatches(wo.get("issue_priority") or "")
                          or issues.was_expedited(wo))):
@@ -7953,16 +8087,20 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         Checked BEFORE the batch loop: an already-live fix must neither file a fresh order
         nor join an open batch, which would keep that order waiting on work already out.
 
-        **EVERY DOUBT FILES.** The call is one-shot — it fires on the issue-state
-        transition and never comes back — so an unreadable repository or production
+        **EVERY DOUBT FILES.** The call is one-shot: `sync_issues` fires it only when the
+        `issue_state` column actually CHANGED to CLOSED, a check and no longer an
+        assumption (issue #961). So an unreadable repository or production
         checkout falling through is mandatory, not merely safe. Tag but not live falls
         through too, and keeps reaching `settle_shipped_releases`' not-live path.
         """
         from . import release
 
-        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout —
-        # `settle_shipped_releases`' guard, for its reason.
-        if project.name != self._os_owner():
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, so
+        # the scope is the project that IS the OS, by origin. Issue 956: asked by path
+        # containment this never matched in production — the install is in the deployed
+        # checkout, which no catalog path contains — and six fixes already live were
+        # filed for release again.
+        if project.name != self._os_project():
             return False
         sha = self._merge_commit_of(project, store, wo)
         if not sha:
@@ -7999,9 +8137,10 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         """Keep a pending release order out of dispatch while the base branch is red.
 
         **THE HOLD IS ON DISPATCH, NEVER ON FILING** (Neo question 794). `ensure_release`
-        fires only on the issue-state TRANSITION, so a release skipped because `main`
-        was red would never be filed again and the fix would drop out of every future
-        batch. The order is always created — the one exception is a payload production
+        fires only on a REAL issue-state transition — `sync_issues` compares the column
+        before and after the pass (issue #961) — so a release skipped because `main` was
+        red would never be filed again and the fix would drop out of every future batch.
+        The order is always created — the one exception is a payload production
         already runs (#934), where there is nothing left to ship, and that one-shot call
         is why every other case there falls through and files. This defers dispatch until
         the base is buildable.
@@ -8027,8 +8166,9 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
-        # release script and the production checkout, both facts about this repository.
-        if project.name != self._os_owner():
+        # release script and the production checkout, both facts about this repository —
+        # so the project that IS the OS, by origin and not by path containment (956).
+        if project.name != self._os_project():
             return
         due: list[dict[str, Any]] = []
         for candidate in store.list_work_orders(statuses=("pending",),
@@ -8163,7 +8303,9 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
         # §8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both
         # facts about the OS's own release path. Another project keeps today's behaviour.
-        if project.name != self._os_owner():
+        # The project that IS the OS, by origin: path containment answers this wrong in
+        # production, where the install is in the deployed checkout (956).
+        if project.name != self._os_project():
             return
         orders: list[tuple[dict[str, Any], list[str]]] = []
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,
