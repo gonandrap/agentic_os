@@ -1308,3 +1308,56 @@ def test_the_dashboard_renders_the_same_payload(fleet_fixture):
 
     assert "What the tools cost" in html
     assert "Bash · sed_range" in html
+
+
+def _window_hid_one(f):
+    """A transcript with exactly one matched result PAST `until`, and one inside it."""
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100,
+                   tools=[("t1", "Bash", {"command": "sed -n '1,900p' f"})]),
+        f.result_row(("t1", "x" * 4_000), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=20_000, out=100, mid="m2"),
+        f.call_row(at=UNTIL + 5, write=1_000, out=50, mid="m3",
+                   tools=[("t2", "Read", {})]),
+        f.result_row(("t2", "y" * 40), at=UNTIL + 6),
+        f.call_row(at=UNTIL + 7, read=1_200, mid="m4"),
+    ])
+
+
+def test_the_render_names_what_the_window_hid(fleet_fixture, capsys):
+    """§10.7: the clip is DISCLOSED with its count, and silent when nothing was hidden."""
+    from jarvis import cli
+
+    _window_hid_one(fleet_fixture)
+
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
+    out = capsys.readouterr().out
+    assert "1 tool results outside the window, excluded" in out
+
+    # The same state with a window wide enough to contain everything: nothing hidden,
+    # so the sentence must not appear at all.
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2027-10-06T04:00:00+00:00"]) == 0
+    assert "tool results outside the window, excluded" not in capsys.readouterr().out
+
+
+def test_the_dashboard_names_what_the_window_hid(fleet_fixture):
+    """The HTML footer discloses the same count from the same payload key."""
+    import jinja2
+
+    from jarvis.ui.app import TEMPLATES
+
+    _window_hid_one(fleet_fixture)
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)))
+
+    def render(until: float) -> str:
+        fleet = ops.fleet_cost(since=SINCE, until=until)["fleet"]
+        return env.get_template("_fleet_distribution.html").render(
+            fleet=fleet, fmt_tok=lambda n: str(n), tool_table=fleetcost.tool_table)
+
+    assert "1 tool results outside the window, excluded" in render(UNTIL)
+    assert ("tool results outside the window, excluded"
+            not in render(stamp("2027-10-06T04:00:00+00:00")))
