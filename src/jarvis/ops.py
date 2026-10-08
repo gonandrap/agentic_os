@@ -6035,6 +6035,70 @@ def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,
     return out
 
 
+#: The daemon's own back-fill row (`Daemon.MERGE_COMMIT_EVENT`), named here because the
+#: ancestry check reads it from both sides.
+MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
+
+
+class UnintegratedChild(Exception):
+    """A completed child's merge commit is not in the head a round would be judged over.
+
+    RAISED, never deferred: `ops` has no next tick, so the only honest answers it has are
+    "open the round" and "refuse" (Neo question 1394). The daemon catches this explicitly
+    and defers; `jarvis fo submit` lets it reach the manager.
+    """
+
+    def __init__(self, child_id: str, commit: str, head: str) -> None:
+        super().__init__(invariants.FEATURE_CHILD_NOT_INTEGRATED.format(
+            id=child_id, commit=commit, head=head))
+        self.child_id = child_id
+        self.commit = commit
+        self.head = head
+
+
+def recorded_merge_commit(store: ProjectStore, child: dict[str, Any]) -> str:
+    """The commit this child put on the default branch, from the RECORD alone.
+
+    No `gh` call: the one-off back-fill belongs to the daemon, which has somewhere to
+    write the answer back to.
+    """
+    for kind in ("pr_merged", MERGE_COMMIT_EVENT):
+        rows = store.events_of_kind(child["id"], kind)
+        if rows:
+            sha = db.from_json(rows[-1]["payload"], {}).get("merge_commit") or ""
+            if sha:
+                return str(sha)
+    return ""
+
+
+def unintegrated_children(project_path: Path, store: ProjectStore, fo_id: str, head: str,
+                          merge_commit: Callable[[dict[str, Any]], str],
+                          ) -> list[tuple[dict[str, Any], str]]:
+    """Which of this feature's completed children are missing from `head`.
+
+    ONE copy of the check, called by both the daemon's deferral and
+    `submit_feature_for_validation`'s refusal — two that drifted apart is the defect being
+    fixed, one level up (§2 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+    `merge_commit` is how the caller resolves a child's commit, which is where the two
+    differ: the daemon may spend a `gh` call, `ops` may not.
+
+    `is_ancestor` is `False` when git cannot answer, which reads as "not proven".
+    """
+    from . import branchproof
+
+    missing: list[tuple[dict[str, Any], str]] = []
+    for child in store.feature_children(fo_id):
+        # The children `settle_features` counted. One with no pull request and no merge
+        # event contributes nothing to check.
+        if child["superseded"] or child["status"] != "completed":
+            continue
+        sha = merge_commit(child)
+        if sha and not branchproof.is_ancestor(project_path, sha, head):
+            missing.append((child, sha))
+    return missing
+
+
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
                              fo: dict[str, Any], *, declared: str, summary: str,
                              cfg: Any,
@@ -6083,9 +6147,33 @@ def submit_feature_for_validation(store: ProjectStore, project_path: Path,
     the last child lands, and `jarvis fo submit` opens every round after that. Neither
     reads the kill switch here; both read it before calling, which is the rule the whole
     design turns on (see `finish`).
+
+    THE FETCH IS HERE, at the point those two callers share, because neither has any
+    reason to want a stale head: in the daemon alone it would leave `jarvis fo submit`
+    judging a stale one for ever, which is the common case for rounds 2+. §1 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
+
+    A FAILED fetch raises `UnintegratedChild` when a completed child's merge is missing
+    from the local head, and opens no round. It never defers (Neo question 1394).
     """
+    from . import branchproof
     from . import evidence as evidence_mod
 
+    # §1: the same ladder the collector resolves its head with, so the fetch cannot bring
+    # down a different branch than the one judged. A failed fetch is not fatal.
+    ref = evidence_mod.base_ref(project_path)
+    if ref and not branchproof.fetch(project_path, ref):
+        log.warning("could not fetch %s in %s — %s is being judged on the local ref as "
+                    "it stands", ref, project_path, fo["id"])
+        # §2 + Neo 1394: a stale local ref is exactly how a round gets opened over a head
+        # that predates a child's merge, so refuse rather than judge it.
+        head = evidence_mod.default_branch_head(project_path)
+        missing = unintegrated_children(
+            project_path, store, fo["id"], head,
+            lambda child: recorded_merge_commit(store, child)) if head else []
+        if missing:
+            child, sha = missing[0]
+            raise UnintegratedChild(child["id"], sha, head)
     packet = collect_feature_evidence(store, project_path, fo, declared=declared,
                                       summary=summary, cfg=cfg)
     fo_id = fo["id"]

@@ -535,6 +535,11 @@ DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
+# How long the reconciler may wait for a merged child's commit to appear on the default
+# branch before it stops deferring the feature's round and asks the user. §3 of
+# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
+
 #: Which net answers "is this assumption high-stakes?" before any model call
 #: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
 #:
@@ -592,6 +597,9 @@ class ValidationConfig:
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
     feature_units: bool = True
+    # §3 of
+    # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+    feature_merge_wait_minutes: int = DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES
     # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF, once the panel has
     # accepted the exact commit at the head and CI is green
     # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md).
@@ -1802,6 +1810,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # falling back would read as the feature being off.
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
+    feature_merge_wait_minutes = int(
+        raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
+    if feature_merge_wait_minutes < 0:
+        # 0 is legal and means "never defer": check once, flag immediately.
+        raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
@@ -1818,6 +1831,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        feature_merge_wait_minutes=feature_merge_wait_minutes,
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
         max_follow_ups=max_follow_ups,
