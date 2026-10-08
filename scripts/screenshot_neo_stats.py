@@ -1,5 +1,5 @@
 """Screenshot `/neo/stats` — Neo's own report (§6 of
-docs/specs/2026-10-01-neo-observability.md), for a PR's UI evidence.
+docs/superpowers/specs/2026-10-01-neo-observability.md), for a PR's UI evidence.
 
 Every block the page claims has to render with real numbers, because an empty page proves
 nothing: questions over a week with a RISING escalation rate, escalations carrying causes

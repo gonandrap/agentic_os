@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS gate_rules (
 );
 -- The self-evolution registry: the gaps the OS has learned to RECOGNISE in itself, and
 -- what it proposes doing about each one. See rules.py and
--- docs/specs/2026-09-27-self-evolution.md §3.1.
+-- docs/superpowers/specs/2026-09-27-self-evolution.md §3.1.
 --
 -- CENTRAL AND FLEET-WIDE, for the reason `gate_rules` above is: most gaps are OS
 -- behaviour rather than one project's, so a rule learned on `jarvis_os` protects every
@@ -501,7 +501,7 @@ ADDED_COLUMNS = {
         "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         # How long the call took, in milliseconds — §3 of
-        # docs/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
+        # docs/superpowers/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
         # beside it: 0 chars of prompt is impossible so 0 can safely mean "not measured"
         # there, whereas a sub-millisecond call rounds to 0 and the report must not print
         # "0 ms" for a call nobody timed.
@@ -1319,7 +1319,7 @@ class CentralStore:
 
     # -- the self-evolution registry (detectors, remedy rules, fires; see rules.py) ----
     #
-    # docs/specs/2026-09-27-self-evolution.md §3. These mirror the
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3. These mirror the
     # `gate_rules` methods above deliberately, retraction semantics included: a retraction
     # NEVER deletes, a reason is required, and a second one raises. Rows are never
     # rewritten in place except the counters, the timestamps and the retract fields —
@@ -1772,7 +1772,7 @@ class CentralStore:
         which. Token columns stay zero there, so it cannot inflate a total.
 
         `latency_ms=None` is "nobody timed this call" and stays NULL — §3 of
-        docs/specs/2026-10-01-neo-observability.md.
+        docs/superpowers/specs/2026-10-01-neo-observability.md.
         """
         u = usage or {}
         cur = self.conn.execute(
@@ -1887,7 +1887,7 @@ class CentralStore:
         """`agent_call_totals`' windowed sibling, keyed on (kind, project, day, model).
 
         A separate query rather than a widened one — §4 of
-        docs/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
+        docs/superpowers/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
         asked on every cost report, and the key it groups on (`wo_id`) is the one this
         report never wants. The DAY BUCKET IS SQL's, as the sums beside it already are.
 

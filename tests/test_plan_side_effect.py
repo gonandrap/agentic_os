@@ -239,7 +239,7 @@ def test_a_submitted_plan_is_one_attested_effect_on_its_planner(fleet):
     assert effect["attested"] is True
     assert "verified" not in effect
     assert "1" in effect["summary"]  # one child
-    assert "docs/specs/exporter.md" in effect["detail"]
+    assert "docs/superpowers/specs/exporter.md" in effect["detail"]
 
 
 @pytest.mark.parametrize("wo_id", ["wo-nobody", ""])

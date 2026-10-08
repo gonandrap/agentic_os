@@ -45,8 +45,8 @@ repo-relative paths from its title and detail. Mixed sets work finding by findin
 
 The anchor wins because prose is an argument and may quote any path at all. wo-5ef5f42c
 round 2: both blockers carried `file:
-docs/specs/2026-10-06-navigate-specs-like-code.md` and illustrated it with `sed -n
-'40,80p' docs/specs/x.md`, so the regex cited a path that exists nowhere and bounced a
+docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md` and illustrated it with `sed -n
+'40,80p' docs/superpowers/specs/x.md`, so the regex cited a path that exists nowhere and bounced a
 commit that did change the spec — twice, to the ceiling.
 
 This is what keeps the rule out of judgement. The work order asked for "production code"

@@ -1258,7 +1258,7 @@ def test_a_fetch_of_a_ref_nobody_publishes_fails_rather_than_guessing(tmp_path):
 
 
 def test_attempt_hands_back_gits_own_stderr(tmp_path):
-    """spec docs/specs/2026-09-30-harvesting-a-dead-turn.md §7: `run` drops the reason a
+    """spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §7: `run` drops the reason a
     command failed, so `checkpoint_skipped` could only hold a fixed string. `attempt` is
     the same execution block, handing back git's stderr beside the stdout `run` returns."""
     from jarvis import branchproof

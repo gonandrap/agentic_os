@@ -333,7 +333,7 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     this differs from `send`/`retry` in: `dispatch.dispatch_work_order` records the
     context ledger for the seq-1 turn, and `briefing_for` REWRITES the worker settings
     file — so dispatch must be handed the briefing rather than rebuilding it to measure
-    it (spec docs/specs/2026-09-24-order-observability.md §5).
+    it (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
     """
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
@@ -727,7 +727,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
         "session_id": wo["session_id"], "resumed": resume,
         # Where the branch stood when this turn began, so a harvest can scope its
         # reading to the TURN rather than the whole order — §2 of
-        # docs/specs/2026-09-30-harvesting-a-dead-turn.md. "" when git cannot say.
+        # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. "" when git cannot say.
         "head": _head_sha(cwd),
     })
     log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
@@ -743,7 +743,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     # only caller holding the `KnowledgeBrief` the knowledge block is measured from. The
     # partition is by (kind, seq) and not by kind: a RETRIED dispatch turn takes a fresh
     # seq, so it lands here, and every turn is therefore recorded exactly once by exactly
-    # one writer (spec docs/specs/2026-09-24-order-observability.md §5).
+    # one writer (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
     if kind != "dispatch" or turn["seq"] > 1:
         context.record(store, project, wo, fresh, briefing)
     return fresh  # type: ignore[return-value]
@@ -752,7 +752,7 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
 def _head_sha(cwd: Path | None) -> str:
     """`git rev-parse HEAD` in the directory the turn runs in, or "". One subprocess per
     turn, on `branchproof.run`'s timeout — spec §2 of
-    docs/specs/2026-09-30-harvesting-a-dead-turn.md."""
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md."""
     from . import branchproof
 
     if cwd is None:
@@ -854,7 +854,7 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
             # surprises it mid-task. After `finish_turn` and wrapped here rather than
             # inside the module, so a daemon killed mid-harvest leaves a SETTLED turn
             # with no harvest and an ImportError is caught too (spec §7):
-            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
             try:
                 from . import harvest
 

@@ -88,7 +88,7 @@ SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 
 #: What the user spent LOOKING at an order — the five observability paths, each metered at
 #: its own definition by `observability.metered` (§10 of
-#: docs/specs/2026-09-24-order-observability.md). A THIRD CLASS beside the worker's turns
+#: docs/superpowers/specs/2026-09-24-order-observability.md). A THIRD CLASS beside the worker's turns
 #: and Jarvis's overhead, for `WORKER_SUBPROCESS`'s reason exactly: money spent looking at
 #: an order is not money spent doing it, and a bill that mixes them answers neither
 #: question.
@@ -108,7 +108,7 @@ OBSERVE_CONTEXT_WRITE = "observe_context_write"
 OBSERVABILITY_KINDS = frozenset({OBSERVE_LIVE, OBSERVE_INSPECT, OBSERVE_CONTEXT,
                                  OBSERVE_WHY, OBSERVE_CONTEXT_WRITE})
 
-#: What Neo COSTS — §4 of docs/specs/2026-10-01-neo-observability.md. A FOURTH CLASS,
+#: What Neo COSTS — §4 of docs/superpowers/specs/2026-10-01-neo-observability.md. A FOURTH CLASS,
 #: named here in the module that owns the vocabulary rather than as a literal list in the
 #: report, for `SUBPROCESS_KINDS`' reason: every call Jarvis makes to decide something on
 #: the user's behalf. Excluded: `COMPACTION`, `WORKER_SUBPROCESS` and every
@@ -204,7 +204,7 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     """
     prompt_chars = system_prompt_chars = 0
     #: None, never 0: a sub-millisecond call rounds to 0 and the report must not print
-    #: "0 ms" for a call nobody timed (§3 of docs/specs/2026-10-01-neo-observability.md).
+    #: "0 ms" for a call nobody timed (§3 of docs/superpowers/specs/2026-10-01-neo-observability.md).
     latency_ms: int | None = None
     if isinstance(usage, claude_cli.HeadlessResult):
         model = model or usage.model

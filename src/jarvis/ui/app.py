@@ -225,7 +225,7 @@ QUIET_PATHS = ("/api/status",)
 
 #: The same rule for polls whose path carries an id, so an exact match cannot express it:
 #: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
-#: open (spec §7 of docs/specs/2026-09-24-order-observability.md) and would bury the
+#: open (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md) and would bury the
 #: user's navigation exactly as `/api/status` did. Suffix, not prefix: the id sits in the
 #: middle.
 QUIET_SUFFIXES = ("/live",)
@@ -1279,7 +1279,7 @@ def create_app() -> FastAPI:
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
             # The retry control, and the note a press just left — §7b of
-            # docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
+            # docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
             # order that is not `failed`, so no control renders there at all. The notice
             # is REBUILT from an id this order's own record knows: a number the query
             # string invented states no fact.
@@ -1287,7 +1287,7 @@ def create_app() -> FastAPI:
             # WHAT THE OS SAVED when the last turn died, rendered directly above that
             # control: it is what the user reads before pressing the button. None keeps
             # it off every page whose turn was never harvested — §5 of
-            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
             harvest = ops.harvest_state(store, wo)
             retried_line = (ops.retry_queued_notice(int(retried))
                             if retried.isdigit()
@@ -1349,7 +1349,7 @@ def create_app() -> FastAPI:
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
     def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
         """"Show me all of the above on one page" — spec §7 of
-        docs/specs/2026-09-24-order-observability.md.
+        docs/superpowers/specs/2026-09-24-order-observability.md.
 
         DELIBERATELY NOT `?debug=1` on the page above, which means something else
         entirely (show debug-level timeline events) and is left alone.
@@ -1533,7 +1533,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo/stats", response_class=HTMLResponse)
     def neo_stats_page(request: Request, project: str = "", days: int | None = None):
-        """Neo's own report — §6 of docs/specs/2026-10-01-neo-observability.md.
+        """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md.
 
         A PAGE AND NOT A SECTION OF `/neo`, per kn-a7e321bc / kn-c609211f: that page is an
         action surface, and a block counting `approval` questions among review forms
@@ -1898,7 +1898,7 @@ def create_app() -> FastAPI:
 
         `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
         rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
-        docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
         """
         back = f"/wo/{name}/{wo_id}"
         try:

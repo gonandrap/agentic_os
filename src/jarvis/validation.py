@@ -837,7 +837,7 @@ def cited_paths(found: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
     ANCHOR FIRST, PER FINDING: a blocker's `file` key is the file the seat says it
     rejects, and its prose is an argument that may quote any path at all — wo-5ef5f42c
     round 2 anchored the real spec and illustrated it with `sed -n '40,80p'
-    docs/specs/x.md`. Only a finding with no anchor falls back to the regex, where title
+    docs/superpowers/specs/x.md`. Only a finding with no anchor falls back to the regex, where title
     AND detail are read: a seat states the file in whichever it please, and reading only
     one would silently halve the citations.
     """

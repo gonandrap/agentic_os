@@ -460,7 +460,7 @@ re-proposes them mid-feature.
 
 **OTEL is DECLINED, on a measurement and not on the prior.** A real headless turn on CLI
 2.1.282 exported to a recording listener (`scripts/spike_otel.py`, findings in
-`docs/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
+`docs/superpowers/specs/2026-09-25-otel-export-measured.md`) and carried none of the three things this
 tree needs: `tool_result` gives `tool_input_size_bytes` and never the input, so §4 is
 unserved; cache tokens arrive as flat `cache_read_tokens` / `cache_creation_tokens` with no
 `ephemeral_5m` / `ephemeral_1h` and no `modelUsage`, so `classify_writes`'s cause is
@@ -573,7 +573,7 @@ this repository — read it before you start.
 6. What does it cost to run: process count, port, failure modes with many concurrent
    headless workers.
 
-**The deliverable** is a findings document under `docs/specs/`, one knowledge-base entry
+**The deliverable** is a findings document under `docs/superpowers/specs/`, one knowledge-base entry
 via `jarvis learn add --project jarvis_os --topic observability`, and a pull request
 containing both. **Write no production code.** If the finding is that OTEL adds something
 the transcript does not, the deliverable is still the finding — file the integration as a
@@ -619,7 +619,7 @@ The first comment is the METER; the second is the GATE. **They are two separate 
 this section keeps them apart, because conflating them is what makes the rest of the text
 read as a contradiction.** The gate governs two writes: §5's per-turn ingredient row, and
 the sealed autopsy (`autopsy.records_autopsy`, §5 of
-`docs/specs/2026-09-27-order-autopsy-durability.md`). The meter observes all five paths,
+`docs/superpowers/specs/2026-09-27-order-autopsy-durability.md`). The meter observes all five paths,
 four of which are reads, and it is never switched off: a meter the user can disable cannot
 answer the question the meter exists to answer.
 

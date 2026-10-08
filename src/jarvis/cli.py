@@ -620,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
     sp.add_argument("--json", action="store_true")
 
-    # §4.3 of docs/specs/2026-10-06-navigate-specs-like-code.md: these three spellings are
+    # §4.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: these three spellings are
     # a contract two sibling sections quote verbatim.
     spec_p = sub.add_parser(
         "spec",
@@ -802,7 +802,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
                                    "on a failed order this also revives the session; "
                                    "`wo retry` is the named form")
@@ -912,7 +912,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
 
-    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §9.1 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
                                      "the named form of `wo send`'s revive. Nothing "
                                      "automatic: a turn that died with no result is "
@@ -1265,7 +1265,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--project")
 
     # rules (the self-healing detector/remedy registry) ----------------------------------
-    # docs/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
     # a verb under `jarvis gate`: that family answers "what counts as privileged", this
     # one answers "what does the OS recognise as its own recurring gap", and one verb
     # meaning two registries is how `jarvis gate rules` stops being readable. The
@@ -2532,7 +2532,7 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
                  f"({row['code_nav_bash_calls']} on code)  "
                  f"{row['read_tool_calls']:>4} Read"
                  if payload.get("calls_reported", True) else "")
-        # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
         # the payload's flag, BYTE counters always.
         doc_calls = (f"  {row['whole_file_read_calls']:>4} whole-file Read  "
                      f"{row['doc_dump_bash_calls']:>4} doc dumps"
@@ -3124,7 +3124,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"\nEvery figure above is {res['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
     # Money is all this command has ever shown, and the complaint behind spec §7 of
-    # docs/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
+    # docs/superpowers/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
     print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
           "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
@@ -3334,7 +3334,7 @@ def _budget_arg(args: argparse.Namespace) -> float | None:
 def _print_context(res: dict[str, Any]) -> None:
     """`jarvis wo context` for a human. DERIVES NOTHING: every number and every sentence
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
-    (spec docs/specs/2026-09-24-order-observability.md §5)."""
+    (spec docs/superpowers/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
     # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
     # the one who most needs to know which reading was consulted.
@@ -3519,7 +3519,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # WHAT THE OS READ OFF DISK when this order's latest turn died without
                 # writing a result. Same never-always rule: no line at all for a turn
                 # that was never harvested — spec §5 of
-                # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+                # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
                 **({"harvest": h} if (h := ops.harvest_state(store, wo)) else {}),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
@@ -4740,7 +4740,7 @@ def _pct(rate: float | None) -> str:
     """A rate as a percentage, or "not recorded" — NEVER `0%` for an absent one.
 
     Zero settled questions and zero escalations are different answers (spec §4's zero
-    rule, docs/specs/2026-10-01-neo-observability.md).
+    rule, docs/superpowers/specs/2026-10-01-neo-observability.md).
     """
     return NOT_RECORDED if rate is None else f"{rate * 100:.0f}%"
 
@@ -4790,7 +4790,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
           "answers")
     # Three labelled groups, each with the sentence that says what the class means. A flat
     # list of fifteen labels would not answer the question the report exists for (§3 of
-    # docs/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
+    # docs/superpowers/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
     groups = (("chosen", "Neo chose to hand it back", "Neo chose this label"),
               ("overridden", "Neo answered and the OS overrode it",
                "the OS derived it from Neo's answer"),

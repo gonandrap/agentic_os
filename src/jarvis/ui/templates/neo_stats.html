@@ -3,7 +3,7 @@
 {% block title %}Neo stats — Jarvis{% endblock %}
 {% block content %}
 
-{# §6 of docs/specs/2026-10-01-neo-observability.md. No arithmetic here and none in the
+{# §6 of docs/superpowers/specs/2026-10-01-neo-observability.md. No arithmetic here and none in the
    route: every figure comes off `ops.neo_stats_report`, so the terminal and this page can
    never disagree. An absent figure is `not recorded`, bill.html:128's idiom — never 0. #}
 {% set q = report.questions %}

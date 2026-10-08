@@ -129,7 +129,7 @@ def test_the_input_size_is_taken_off_a_plain_envelope_too(jarvis_home):
 
 def test_the_latency_is_taken_off_a_headless_result(jarvis_home):
     """How long the model took, recorded with the call. Spec §3,
-    docs/specs/2026-10-01-neo-observability.md."""
+    docs/superpowers/specs/2026-10-01-neo-observability.md."""
     result = claude_cli.HeadlessResult(text="{}", usage={"output": 9},
                                        model="claude-haiku-4-5", latency_ms=2_400)
     agent_usage.record("neo_answer", usage=result, wo_id="wo-lat-1")
@@ -363,7 +363,7 @@ def test_deleting_a_work_order_takes_its_os_spend_with_it(asked):
 
 # -- the meter over the observability paths --------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. A THIRD CLASS beside the worker's
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. A THIRD CLASS beside the worker's
 # turns and Jarvis's overhead: what the user spent LOOKING at an order. Its dollars are a
 # measured zero, and the measured zero is the point — "debugging is mechanical" becomes a
 # number instead of an assertion, and a path that ever gains a model call stops reading

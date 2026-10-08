@@ -2299,7 +2299,7 @@ def settle_turns():
 #: `design_doc`. Every plan must stand on one, so without a real file here each test that
 #: submits a plan would have to write one first. See §7 of
 #: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+FIXTURE_DESIGN_DOC = "docs/superpowers/specs/exporter.md"
 
 #: How many numbered sections the fixture document carries. A plan is refused unless every
 #: child names a section that resolves AND no two children name the same one, so a fixture

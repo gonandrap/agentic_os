@@ -1401,7 +1401,7 @@ def investigator_bash_decision(payload: dict[str, Any],
 
 
 #: This hook's OWN suffix set, narrower than `navigation.SOURCE_SUFFIXES` (the
-#: counter's): §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+#: counter's): §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 PY_NAV_SUFFIXES = (".py",)
 
 #: The refusal IS the mitigation, so it names the call to make instead and the
@@ -1419,7 +1419,7 @@ def py_nav_decision(payload: dict[str, Any],
                     env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call.
 
-    §6 of docs/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
+    §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
     DEFAULT OFF: a hook nobody has enabled cannot strand a worker.
 
     POSITION: in the Bash chain of `preflight_decision`, immediately after
@@ -2129,7 +2129,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if mutating is not None:
             return mutating
         # Before the auto-allow for the ordering reason above (§6 of
-        # docs/specs/2026-10-02-serena-the-cheap-path.md).
+        # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md).
         text_read = py_nav_decision(payload, env)
         if text_read is not None:
             return text_read
@@ -2923,7 +2923,7 @@ def serena_activation_context(cwd: Path) -> str:
     The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
     `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
     dispatched worker's first `find_symbol` fails with `No active project` and it falls
-    back to a text search. Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+    back to a text search. Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
 
     BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
     entries: a plugin install produces the long prefix, `claude mcp add serena` the short
@@ -3039,7 +3039,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             # key `dispatch._write_worker_settings` already writes from
             # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
             # `activate_project` writes itself (Neo q1259).
-            # Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+            # Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
             context = concision.house_style()
             if env.get("JARVIS_SERENA") != "0":
                 context += serena_activation_context(cwd)

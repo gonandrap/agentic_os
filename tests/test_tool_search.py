@@ -1,7 +1,7 @@
 """`worker.tool_search`: the env Jarvis writes to decide whether the symbol tools are
 in a worker's tool list at all.
 
-Spec: docs/specs/2026-10-02-serena-the-cheap-path.md §4.
+Spec: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §4.
 
 Claude Code defers most MCP tools behind a `ToolSearch` call rather than listing them
 with full schemas — measured at 45 tools plus `ToolSearch` by default against 92 tools

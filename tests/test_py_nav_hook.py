@@ -1,6 +1,6 @@
 """A source-navigation Bash call at a `.py` path is refused, with the symbol call named.
 
-§6 of docs/specs/2026-10-02-serena-the-cheap-path.md. The deny message IS the
+§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. The deny message IS the
 mitigation: a refusal that does not name `find_symbol` and the `activate_project`
 fallback buys a reworded retry, not a symbol call.
 """

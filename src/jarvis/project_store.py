@@ -1017,7 +1017,7 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     -- WHAT JARVIS PUT IN THIS TURN'S CONTEXT WINDOW, per ingredient: the appended system
     -- prompt, the prompt, the knowledge index, the settings file, the memory files, the
     -- persona, the --add-dir trees and the MCP server set, each with bytes and an
-    -- ESTIMATED token count (`context.payload`; spec docs/specs/
+    -- ESTIMATED token count (`context.payload`; spec docs/superpowers/specs/
     -- 2026-09-24-order-observability.md §5). One blob per turn, same lifetime and same
     -- owner as the row, which is why it is a column and not a table.
     -- NULL means "not recorded" — a turn that ran before this landed, or one whose
@@ -1160,7 +1160,7 @@ ADDED_COLUMNS = {
         # for "this order has no answer", which is `budget_usd`'s precedent and what every
         # row written before this existed says. NULL is NOT `off`: it falls through to the
         # project config (`observability.level_for`). See
-        # docs/specs/2026-09-24-order-observability.md §10 for the one write it gates.
+        # docs/superpowers/specs/2026-09-24-order-observability.md §10 for the one write it gates.
         "observability": "TEXT",
         "job_id": "TEXT",
         "reply_job_id": "TEXT",
@@ -1241,7 +1241,7 @@ ADDED_COLUMNS = {
         # schedule, so an order inspected later reports a clock that got SHORTER as its
         # evidence aged. NULL means not sealed yet: an open order, one that settled before
         # this column existed, or one the observability level did not record (§3 of
-        # docs/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
+        # docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
         # no `feature_orders` twin: a feature's autopsy is read by reading its children's.
         "autopsy_json": "TEXT",
         "autopsy_sealed_at": "REAL",
@@ -2624,7 +2624,7 @@ class ProjectStore:
 
         ITS OWN QUERY and not `unsealed_terminal_orders`, whose predicate is `bill_json IS
         NULL`: sharing one would let a bill that cannot be computed stop autopsies too (§3
-        of docs/specs/2026-09-27-order-autopsy-durability.md).
+        of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md).
         """
         marks = ", ".join("?" for _ in TERMINAL_STATUSES)
         rows = self.conn.execute(
@@ -2636,7 +2636,7 @@ class ProjectStore:
                              limit: int = 5) -> list[dict[str, Any]]:
         """Settled orders whose sealed autopsy predates `version` — oldest first, bounded.
 
-        The other half of §3 of docs/specs/2026-09-27-order-autopsy-durability.md: the
+        The other half of §3 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: the
         WRITER re-seals, so a stale payload repairs itself on a tick instead of waiting
         for a reader to happen by.
 
@@ -2784,7 +2784,7 @@ class ProjectStore:
 
     def set_observability(self, wo_id: str, level: str | None) -> None:
         """Set this order's debug-collection level, or None to clear it back to "no
-        answer" (§10 of docs/specs/2026-09-24-order-observability.md).
+        answer" (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 
         The vocabulary is validated HERE and not at the surface: a level outside it would
         fall through the resolver silently and leave the user believing they had changed
