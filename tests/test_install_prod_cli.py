@@ -139,6 +139,26 @@ def test_it_is_idempotent(prod, tmp_path):
     assert (tmp_path / "bin" / "jarvis").read_bytes() == before
 
 
+def test_it_replaces_a_hand_made_symlink_without_writing_through_it(prod, tmp_path):
+    """The workaround the spec rejects: `ln -s $PROD_DIR/.venv/bin/jarvis ~/.local/bin/jarvis`.
+    A `>` redirect follows that symlink and overwrites the deployed venv's own console
+    script with a wrapper that execs itself — `jarvis` loops for ever, and the units'
+    ExecStart is that same binary, so the next restart takes production down."""
+    stub = prod / "jarvis_os" / ".venv" / "bin" / "jarvis"
+    before = stub.read_bytes()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "jarvis").symlink_to(stub)
+
+    result = _run(prod, tmp_path, bin_dir=bin_dir)
+    wrapper = bin_dir / "jarvis"
+
+    assert result.returncode == 0, result.stderr
+    assert stub.read_bytes() == before, "wrote through the symlink into the prod venv"
+    assert not wrapper.is_symlink(), "the symlink was written through, not replaced"
+    assert MARKER in wrapper.read_text()
+
+
 def test_it_says_so_when_the_bin_dir_is_not_on_the_callers_path(prod, tmp_path):
     """Same reasoning as the `gh`-reachability note in install_prod_service.sh: the
     install succeeds either way and the only symptom is a feature that never happens."""

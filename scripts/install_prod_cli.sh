@@ -52,8 +52,14 @@ if [ "$DRY_RUN" = 1 ]; then
   printf '%s\n' "$BODY"
 else
   mkdir -p "$BIN_DIR"
-  printf '%s\n' "$BODY" > "$BIN_DIR/jarvis"
-  chmod 755 "$BIN_DIR/jarvis"
+  # Temp-then-mv, not `>`: a redirect writes THROUGH a pre-existing symlink into the
+  # venv's own console script — docs/superpowers/specs/2026-10-07-a-production-jarvis-on-path.md
+  TMP="$(mktemp "$BIN_DIR/.jarvis.XXXXXX")"
+  cleanup() { [ -n "${TMP:-}" ] && rm -f "$TMP" 2>/dev/null || true; }
+  trap cleanup EXIT
+  printf '%s\n' "$BODY" > "$TMP"
+  chmod 755 "$TMP"
+  mv -f "$TMP" "$BIN_DIR/jarvis"
   echo "installed $BIN_DIR/jarvis"
 fi
 

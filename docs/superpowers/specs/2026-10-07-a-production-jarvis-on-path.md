@@ -104,9 +104,19 @@ wrapper from some other `jarvis` on PATH.
   `--bin-dir <dir>` for the target directory, defaulting to
   `${JARVIS_CLI_BIN_DIR:-$HOME/.local/bin}` — the same seam `--unit-dir` gives the unit
   installer, and the same env var the invariant reads (§4).
-* `mkdir -p "$BIN_DIR"`, render to `$BIN_DIR/jarvis`, `chmod 755`, print
-  `installed $BIN_DIR/jarvis`. Idempotent by construction: the output is a pure function
-  of `PROD_ROOT`, so a second run rewrites the same bytes.
+* `mkdir -p "$BIN_DIR"`, render to a `mktemp "$BIN_DIR/.jarvis.XXXXXX"`, `chmod 755`,
+  `mv -f` it onto `$BIN_DIR/jarvis`, print `installed $BIN_DIR/jarvis`. Idempotent by
+  construction: the output is a pure function of `PROD_ROOT`, so a second run rewrites the
+  same bytes.
+* **Temp-file-then-`mv -f`, in the same directory, NOT a `>` redirect.** A `>` redirect
+  follows a pre-existing symlink and writes through it. A user who worked around issue 757
+  by hand — `ln -s $PROD_DIR/.venv/bin/jarvis ~/.local/bin/jarvis`, the alternative
+  rejected below — therefore has the deployed venv's own console script **overwritten by a
+  wrapper that `exec`s itself**: `jarvis` loops for ever, and because the unit's PATH
+  resolves to that same overwritten file (`install_prod_service.sh:50`), the next service
+  restart takes the production daemon down — with the release still reporting success.
+  `mv -f` replaces the symlink instead of writing through it. Same directory so the rename
+  is atomic and cannot cross a filesystem.
 * **Say it out loud when `$BIN_DIR` is not on the caller's PATH** — in the character of
   the `gh`-reachability note at `install_prod_service.sh:85-91`, and for the same reason:
   the install succeeds either way and the only symptom is a feature that silently never
@@ -294,35 +304,40 @@ plus `--bin-dir tmp_path/bin`):
 7. `bash -n` on the rendered wrapper, and a smoke run of it with a stub `jarvis` in the
    fake venv asserting the stub saw `JARVIS_HOME` and the forwarded argv (including an
    argument containing a space — the `"$@"` guarantee).
+8. **replaces a hand-made symlink instead of writing through it**
+   (`test_it_replaces_a_hand_made_symlink_without_writing_through_it`): plant
+   `bin/jarvis` as a symlink to the venv stub, run the script for real, assert the stub's
+   bytes are unchanged and `bin/jarvis` is now a regular file carrying the marker. The
+   `mv -f` in §1 made mechanical — a `>` redirect passes every other case here.
 
 **The shipit call** (extend `tests/test_shipit.py`, `--dry-run` against the throwaway
 repo):
 
-8. the dry-run plan contains `install_prod_cli.sh`, and its line precedes the staging
+9. the dry-run plan contains `install_prod_cli.sh`, and its line precedes the staging
    marker line, proving it is before 5b.
-9. a `$PROD_DIR` whose `scripts/` lacks the installer prints the `NOTE:` naming
-   `INV-PROD-CLI` and the release still exits 0.
+10. a `$PROD_DIR` whose `scripts/` lacks the installer prints the `NOTE:` naming
+    `INV-PROD-CLI` and the release still exits 0.
 
 **The invariant** (fixture sets `JARVIS_CLI_BIN_DIR` and `PRODUCTION_CODE` to a fake
 deployed prod under `tmp_path`, mirroring `test_install_prod_service.py:195-274`):
 
-10. wrapper missing → exactly one `INV-PROD-CLI`, detail contains
+11. wrapper missing → exactly one `INV-PROD-CLI`, detail contains
     `scripts/install_prod_cli.sh` ("no way out is named" is the existing assertion).
-11. a wrapper the real script just rendered → silent. Rendered, not hand-written: it
+12. a wrapper the real script just rendered → silent. Rendered, not hand-written: it
     closes the loop between the two halves.
-12. wrapper exec'ing a different checkout → violation, `context["target"]` is the wrong
+13. wrapper exec'ing a different checkout → violation, `context["target"]` is the wrong
     path.
-13. wrapper exporting a different `JARVIS_HOME` → violation (target correct, so this
+14. wrapper exporting a different `JARVIS_HOME` → violation (target correct, so this
     proves the home is checked independently).
-14. a hand-written `jarvis` without the marker → violation, `context["generated"]` false.
-15. no production deployment (`PRODUCTION_CODE` at an empty dir) → silent, even with no
+15. a hand-written `jarvis` without the marker → violation, `context["generated"]` false.
+16. no production deployment (`PRODUCTION_CODE` at an empty dir) → silent, even with no
     wrapper anywhere. This is every dev-only machine.
-16. doctor-only: `check_prod_cli in OS_INVARIANTS` and `not in INVARIANTS`.
+17. doctor-only: `check_prod_cli in OS_INVARIANTS` and `not in INVARIANTS`.
 
 **The sandboxing** (extend `tests/test_isolation_gate.py`):
 
-17. `gate_environment(root)[release.CLI_BIN_DIR_ENV]` is inside `root`.
-18. under the gate, `release.cli_bin_dir()` resolves inside `testing.GATE_ROOT` and
+18. `gate_environment(root)[release.CLI_BIN_DIR_ENV]` is inside `root`.
+19. under the gate, `release.cli_bin_dir()` resolves inside `testing.GATE_ROOT` and
     `check_prod_cli()` is silent — so a suite running under the gate can never read the
     real `~/.local/bin`.
 
@@ -361,7 +376,9 @@ deployed prod under `tmp_path`, mirroring `test_install_prod_service.py:195-274`
   fixes only failure 1. The exec'd binary would still run with no `JARVIS_HOME` and so
   still drive `~/.jarvis` — it converts a loud `command not found` into the silent wrong
   fleet, which is the worse half of the defect. A wrapper exists for the three exports,
-  not for the PATH entry.
+  not for the PATH entry. Rejected as a *design*, but the installer must still survive
+  finding one in place — a user may have made it by hand — which is why the write is
+  temp-file-then-`mv -f` (§1).
 * **`uv tool install` / `pipx install` of the deployed tree.** Installs a *second* copy of
   the code, so the thing on PATH is no longer the thing the units run and `jarvis
   --version` can disagree with production. It also carries no environment, so failure 2
