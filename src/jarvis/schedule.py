@@ -3,8 +3,9 @@
 Design, and the ruling behind each guard rail:
 docs/superpowers/specs/2026-09-14-the-scheduler.md.
 
-Layering: this module imports NOTHING else of Jarvis's, which is what lets `catalog`
-import it for the job roster without a cycle. The cadence is a PURE FUNCTION of a stored
+Layering: this module imports NOTHING else of Jarvis's AT MODULE SCOPE, which is what lets
+`catalog` import it for the job roster without a cycle — `os_project`'s `github` read is
+function-local for that reason. The cadence is a PURE FUNCTION of a stored
 row, a config and a clock (`decide`), so the one thing that must never be got wrong — "may the OS spend money right now" — is
 testable without a store, a daemon or a catalog. `Daemon.schedule_tick` is the only
 caller that turns a `Decision` into a work order.
@@ -166,6 +167,76 @@ def os_owner(projects: Iterable[tuple[str, Path]], *, fallback: bool = True) -> 
         except (OSError, ValueError):   # unresolvable path: not the owner
             continue
     return first if fallback else None
+
+
+#: `os_project`'s origin reads, memoised by the path asked about. `git remote get-url` is
+#: a subprocess and the release guards ask once per project per tick, while the `origin` of
+#: a checkout does not move under a running daemon. Tests that rewrite a remote clear it
+#: (the `origins` fixture).
+_ORIGIN_CACHE: dict[str, tuple[str, str] | None] = {}
+
+
+def _origin_of(path: Path | None) -> tuple[str, str] | None:
+    """`github.origin_repo(path)`, cached, and never the thing that raises."""
+    # Function-local, and must stay so: this module imports nothing of Jarvis's at module
+    # scope, which is what lets `catalog` import it without a cycle.
+    from . import github
+
+    if path is None:
+        return None
+    key = str(path)
+    if key not in _ORIGIN_CACHE:
+        try:
+            _ORIGIN_CACHE[key] = github.origin_repo(path)
+        except (OSError, ValueError):   # an unreadable path is not an identity
+            _ORIGIN_CACHE[key] = None
+    return _ORIGIN_CACHE[key]
+
+
+def os_candidates(projects: Iterable[tuple[str, Path]], *,
+                  install: Path | None = None) -> list[str]:
+    """Every catalog project whose git `origin` is this code's — `os_project`'s matches.
+
+    Separate so a caller can tell the two None cases apart: no candidate is an OS-less
+    deployment, two candidates is an ambiguity nobody declared
+    (`invariants.check_os_identity`).
+    """
+    mine = _origin_of(install if install is not None else Path(__file__).resolve().parent)
+    if mine is None:
+        return []
+    return [name for name, path in projects if _origin_of(path) == mine]
+
+
+def os_project(projects: Iterable[tuple[str, Path]], *,
+               install: Path | None = None) -> str | None:
+    """Which catalog project IS the OS — the one whose git `origin` is this code's, or None.
+
+    The question `os_owner` must NOT be asked: that one answers "who runs the fleet
+    checks" and is allowed an arbitrary answer, this one grants the OS's own authority
+    over its release path and its config, and a wrong answer there is worse than none.
+
+    BY ORIGIN, NOT BY PATH. Path containment cannot answer it in production: the running
+    package lives in the deployed checkout (`…/production/jarvis_os/src/jarvis`) while the
+    catalog's `jarvis_os` path is the dev checkout, so no project contains the install and
+    `os_owner` answers with its fallback — the wrong project — or with None. Both
+    checkouts have the SAME `origin`, because a release tag is a checkout of this
+    repository, so origin is the one property that holds in dev and in production alike.
+
+    Derived rather than declared, the rule `os_owner` and `issues.tracker_project` already
+    state, and this is `tracker_project`'s exact mechanism: `github.origin_repo` per
+    project path. No catalog key, no environment variable, nothing a deployment can set
+    wrong.
+
+    None on every doubt, and that is the safe answer everywhere it is asked: an
+    unreadable origin, a pip-installed OS whose code is in no checkout at all, and
+    AMBIGUITY — two catalog projects sharing one origin (a worktree listed beside its
+    checkout) name no unique OS, so nothing is granted the OS's authority.
+
+    `install` is the seam the tests need: it defaults to the directory of the RUNNING
+    `jarvis` package, and a test passes the package directory of a simulated deployment.
+    """
+    matches = os_candidates(projects, install=install)
+    return matches[0] if len(matches) == 1 else None
 
 
 # -- the cadence -------------------------------------------------------------------------

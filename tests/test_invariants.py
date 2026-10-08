@@ -977,12 +977,19 @@ def _dark(store) -> list:
 
 
 def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
-    """A project owns the OS only by CONTAINING the running install — there is no
-    first-in-catalog fallback here (spec §3), so the install is pointed inside it."""
+    """A project IS the OS only by sharing an `origin` with the running install — by
+    origin since issue 956, and still with no first-in-catalog fallback (spec §3).
+
+    Through the cache rather than a real remote: a remote on a fixture project arms every
+    other origin-gated path in the daemon. Real `git remote get-url` is
+    `test_scheduler`'s job.
+    """
     from jarvis import schedule
 
-    monkeypatch.setattr(schedule, "__file__",
-                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
     _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
                                   "description": "the OS's own"}], **kw)
     return ProjectStore(project)
@@ -1073,8 +1080,10 @@ def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_p
 
     other = tmp_path / "other"
     (other / ".jarvis").mkdir(parents=True)
-    monkeypatch.setattr(schedule, "__file__",
-                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
     _register_catalog(tmp_path, [
         {"name": "proj_a", "path": str(project), "description": "the OS's own"},
         {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
@@ -1089,8 +1098,9 @@ def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_p
     store.close()
 
 
-def test_a_catalog_with_no_project_holding_the_install_owns_nothing(tmp_path, project):
-    """§5: derived WITHOUT `os_owner`'s first-in-catalog fallback."""
+def test_a_catalog_with_no_checkout_of_this_repository_owns_nothing(tmp_path, project):
+    """§5: no first-in-catalog fallback. A project sharing no `origin` with the install
+    is not the OS, however it is listed."""
     _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
                                   "description": "an ordinary one"}], health=False)
     store = ProjectStore(project)
@@ -1111,6 +1121,79 @@ def test_the_dark_check_runs_every_tick(tmp_path, project):
     spot."""
     assert invariants.check_os_health_sweep_alive in invariants.INVARIANTS
     assert invariants.check_os_health_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+# -- INV-OS-IDENTITY: the OS's own project must be identifiable -------------------------
+#
+# Issue 956. `schedule.os_project` returning None makes three release guards, the
+# health-sweep invariant and the config refusal all silently inert — the failure that went
+# unnoticed for six duplicate release orders.
+
+OS_ORIGIN = "gonandrap/agentic_os"
+
+
+def _os_checkout(root, name, origin=OS_ORIGIN):
+    from jarvis.testing import make_git_project, with_origin
+
+    return with_origin(make_git_project(root, name), origin)
+
+
+def _install_in(checkout: Path, monkeypatch) -> None:
+    """Run as if the `jarvis` package being executed lived in this checkout."""
+    from jarvis import schedule
+
+    pkg = checkout / "src" / "jarvis"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(schedule, "__file__", str(pkg / "schedule.py"))
+
+
+def test_an_ambiguous_os_identity_is_reported(tmp_path, monkeypatch, origins):
+    """Two catalog projects on one origin — a worktree listed beside its checkout. The
+    OS is in the catalog, so None here is a defect and not a deployment without one."""
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    twin = _os_checkout(tmp_path, "jarvis_os_worktree")
+    _register_catalog(tmp_path, [
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+        {"name": "jarvis_os_wt", "path": str(twin), "description": "its worktree"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    (violation,) = list(invariants.check_os_identity())
+
+    assert violation.invariant == "INV-OS-IDENTITY"
+    assert violation.level == "critical"
+    assert not violation.repaired, "which project is the OS is not the OS's to decide"
+    assert violation.context["candidates"] == ["jarvis_os", "jarvis_os_wt"]
+    assert "release" in violation.detail
+
+
+def test_a_deployment_that_drives_no_checkout_of_this_repository_is_silent(
+        tmp_path, monkeypatch, origins):
+    """A pip-installed OS whose catalog holds only other people's projects. None is the
+    right answer there, so firing would be an alarm about a correct deployment."""
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    elsewhere = _os_checkout(tmp_path, "install")
+    _register_catalog(tmp_path, [{"name": "shared_schedule", "path": str(other),
+                                  "description": "not the OS"}])
+    _install_in(elsewhere, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_identity_resolved_to_one_project_is_silent(tmp_path, monkeypatch, origins):
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    _register_catalog(tmp_path, [
+        {"name": "shared_schedule", "path": str(other), "description": "not the OS"},
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_the_identity_check_is_an_os_level_one():
+    assert invariants.check_os_identity in invariants.OS_INVARIANTS
 
 
 def test_the_notification_carries_the_violations_own_level(tmp_path, project,
