@@ -7,7 +7,9 @@ ruling is quoted in (a), and the issue's "Expected" still stands.
 
 ## The problem
 
-Three defects on one incident, in order of causation.
+Three defects on one incident, in order of causation. Line references marked `@008c12f`
+are against that commit, the one this branch starts from, because the code they name is
+what this change removes and it is not at HEAD.
 
 ### 1. A delivered child fails its feature, and the notice says only that a turn died
 
@@ -15,7 +17,7 @@ fo-ac00376e went `failed` because its child wo-604b5b99's turn died in a stamped
 cleanup. The child **had delivered**: `pr_url` pointing at PR #839, open, and three
 assumptions on record.
 
-`src/jarvis/daemon.py:4994-5054`, `Daemon.settle_work_order`, the
+`src/jarvis/daemon.py:4956-4994 @008c12f`, `Daemon.settle_work_order`, the
 `turn["state"] == "failed"` branch. Once the pause is exhausted it writes, with no test
 of what the order produced:
 
@@ -28,9 +30,10 @@ if wo["status"] != "failed":
 `failed` is the right label for the ORDER: the turn never finished. Two things are wrong
 with what the OS does around it.
 
-First, what it concludes. `invariants.dead_feature_children` (`invariants.py:557`) counts
-the child as dead and `Daemon.settle_features` (`daemon.py:1372-1381`) fails the feature
-on it, neither one testing what the child produced. Root cause: the FEATURE's verdict is
+First, what it concludes. `invariants.dead_feature_children`
+(`invariants.py:538 @008c12f`) counts the child as dead and `Daemon.settle_features`
+(`daemon.py:1362-1371 @008c12f`) fails the feature on it, neither one testing what the
+child produced. Root cause: the FEATURE's verdict is
 derived from one child's TURN fate and never from that child's delivery. It is one
 predicate wide.
 
@@ -41,28 +44,28 @@ instead of at a dead session. That is the follow-up comment's complaint.
 
 ### 2. Failing the feature killed its manager, and the siblings kept running headless
 
-`settle_features` calls `_close_feature_manager` (`daemon.py:1603`, called at
-`daemon.py:1370`), which completes manager wo-b57da97e. Siblings wo-3db50904 and
+`settle_features` calls `_close_feature_manager` (`daemon.py:1641`, called at
+`daemon.py:1380`), which completes manager wo-b57da97e. Siblings wo-3db50904 and
 wo-0cb6dc6b stayed live with no addressee for the `manager` role.
 
 wo-3db50904's `deferral_request`, envelope 155, went `undeliverable`
 (`bus._unfilled`, `src/jarvis/bus.py:428-441`). INV-ENVELOPE-LOST
-(`invariants.check_no_lost_feedback`, `invariants.py:2948`) is report-only by
+(`invariants.check_no_lost_feedback`, `invariants.py:3063`) is report-only by
 construction — "Reported, never repaired. There is nothing to derive here" — so the
 lost message was described and nothing was done about it. The live children themselves
-raised nothing: `true_blockers` (`invariants.py:856`) has no line about a parent
+raised nothing: `true_blockers` (`invariants.py:857 @008c12f`) has no line about a parent
 feature, so `invariants.check_blocked_work_is_surfaced` had nothing to flag.
 
 ### 3. A reopened feature has no manager, and the handoff is silent about it
 
 The feature was later reopened to `executing`; the manager stayed `completed`.
 
-- `ops.resume_feature_order` (`src/jarvis/ops.py:9724-9784`) supersedes dead children,
-  sets `executing`, clears the flag, files `--fix`. It never looks at the manager.
+- `ops.resume_feature_order` (`src/jarvis/ops.py:9725-9785 @008c12f`) supersedes dead
+  children, sets `executing`, clears the flag, files `--fix`. It never looks at the manager.
 - INV-FEATURE-FALSE-FAILURE's repair (`invariants.check_feature_failures_are_real`,
-  `invariants.py:3070-3111`) does `set_feature_status(fo_id, "executing")` plus
+  `invariants.py:3100-3101 @008c12f`) does `set_feature_status(fo_id, "executing")` plus
   `clear_feature_attention`. Same omission.
-- `Daemon._manager_handoff` (`daemon.py:1544-1546`) then returns in silence:
+- `Daemon._manager_handoff` (`daemon.py:1544-1546 @008c12f`) then returns in silence:
 
 ```python
 manager = store.manager_work_order(fo_id)
@@ -72,7 +75,7 @@ if not manager or manager["status"] != "idle":
 
 So with a judged round and every live child `completed`, neither the nudge
 (`bus.ChildrenLanded`) nor FEATURE_MANAGER_STALLED/FEATURE_MANAGER_SILENT
-(`daemon.py:318-323`) happens. The feature sat in `executing` for 5.4 days with no
+(`daemon.py:319-324`) happens. The feature sat in `executing` for 5.4 days with no
 signal of any kind.
 
 Second root cause, one level up: manager liveness is WRITTEN ONCE at a transition
@@ -81,7 +84,7 @@ transition has to remember to undo it, and none of the three does.
 
 ### 4. The lost-envelope sentence leads with the wrong order
 
-Today, `invariants.py:2990-2992`:
+Today, `invariants.py:2990-2992 @008c12f`:
 
 > envelope 155 (deferral_request to role manager) about wo-3db50904 reached nobody: …
 
@@ -118,20 +121,20 @@ and `superseded` are untouched.
 
 **Why there and not in `Daemon.settle_features`.** The function is deliberately ONE
 function so the settler and INV-FEATURE-FALSE-FAILURE cannot disagree
-(`invariants.py:558-562`). An exemption in the settler alone is exactly the flap that
+(`invariants.py:569-572`). An exemption in the settler alone is exactly the flap that
 docstring warns about: `settle_features` would stop failing the feature while
 `check_feature_failures_are_real` kept un-failing it off the same child, every tick. All
 three call sites pass the store:
 
 1. `Daemon.settle_features`, `daemon.py:1372`;
-2. `invariants.check_feature_failures_are_real`, `invariants.py:3201`;
-3. `ops.resume_feature_order`, `ops.py:9825` (already a function-local import).
+2. `invariants.check_feature_failures_are_real`, `invariants.py:3234`;
+3. `ops.resume_feature_order`, `ops.py:9826` (already a function-local import).
 
 **Why the predicate keys on the EVENT and not on a live `has_delivered` read.** The event
 names the CAUSE — this order's turn died after it delivered. A `pr_url` is a coincidence of
 state: keying on it would exempt every `failed` order that happens to hold one, including
 the ones that failed for every other reason after opening a pull request. `has_delivered`
-(`invariants.py:567`) survives, but only as the daemon's branch test for whether to WRITE
+(`invariants.py:598`) survives, but only as the daemon's branch test for whether to WRITE
 the event.
 
 **The daemon's half.** `Daemon.settle_work_order`, the `turn["state"] == "failed"` branch,
@@ -143,8 +146,10 @@ branches is three writes:
   `turn.get("error")` and, when there was a pause, `pause.attempts`/`pause.reason`/
   `pause.message`. The event is the predicate's input, so it must be written before the
   flag;
-- `store.flag_attention(wo["id"], invariants_mod.true_blockers(store, fresh_row)[0])`, not
-  a literal, so the settler and the derivation say one sentence;
+- `blockers = invariants_mod.true_blockers(store, fresh_row)` and, guarded on
+  `if blockers:`, `store.flag_attention(wo["id"], blockers[0])` — not a literal, so the
+  settler and the derivation say one sentence, and guarded because an UNGOVERNED order
+  derives nothing from `failed` at all and `[0]` on an empty list is an `IndexError`;
 - the notification, below.
 
 The existing `turn_retries_exhausted` event stays on both paths: the retries WERE spent.
@@ -152,10 +157,18 @@ The existing `turn_retries_exhausted` event stays on both paths: the retries WER
 **The notification half of the ruling.** The delivered path gets its own title and body:
 
 ```python
-title=f"{wo['id']} delivered, then its worker session died"
-body=(f"{wo['pr_url']}\n" if wo.get("pr_url") else "")
-     + (f"{n} assumptions on record\n" if n else "")
-     + (turn.get("error") or "no error recorded")[:500]
+title = f"{wo['id']} delivered, then its session died"
+said = ["The work was delivered and is on record; the order is "
+        "`failed` because the turn never finished."]
+if wo.get("pr_url"):
+    said.append(f"Pull request: {wo['pr_url']}.")
+n = len(store.all_assumptions(wo["id"]))
+if n:
+    said.append(f"{n} assumption{'s' if n != 1 else ''} on record.")
+said.append(f"`jarvis wo retry {wo['id']}` resumes the session where "
+            f"it died; `jarvis wo done {wo['id']}` closes it.")
+said.append(turn.get("error") or "no error recorded")
+body = " ".join(said)
 ```
 
 It names what is ON RECORD because the bare "worker turn failed" is what the issue
@@ -166,7 +179,7 @@ a dead session. The undelivered path keeps today's title and body exactly, inclu
 **`invariants.true_blockers`, two edits and no new constant.**
 
 - The `turn_died_after_delivery` read MOVES from the last arm of the `needs_review` ladder
-  (`invariants.py:1158-1161`) to the `failed` arm (`invariants.py:964-965`): with the event
+  (`invariants.py:1190-1194`) to the `failed` arm (`invariants.py:1005-1007`): with the event
   present it appends `TURN_DIED_AFTER_DELIVERY_BLOCKER`, else today's
   `"worker failed — review and retry"`. Gated on the status already, so no other work order
   pays for the query.
@@ -203,9 +216,9 @@ where `fo resume` refuses outright (`ops.py:9818-9822`). Both remedies are child
 which is why the blocker's sentence names only child-level commands.
 
 **Blast radius, accepted and not fixed here.** `failed` is a `DEPENDENCY_DEAD_STATUS`
-(`DEPENDENCY_DEAD_STATUSES`, `project_store.py:1633`), so a sibling with `--depends-on` on
+(`DEPENDENCY_DEAD_STATUSES`, `project_store.py:1634`), so a sibling with `--depends-on` on
 a delivered-death child now derives `DEAD_DEPENDENCY_BLOCKER` (`invariants.py:1530`,
-appended at `invariants.py:1061`) and raises attention, where under `needs_review` it would
+appended at `invariants.py:1068`) and raises attention, where under `needs_review` it would
 have waited quietly. That follows from the ruling and is accepted: the issue's "Expected"
 guaranteed that the feature would not fail and said nothing about dependents, and the
 dependent genuinely is waiting on a child nobody has decided about. If the user wants it
@@ -223,7 +236,7 @@ nothing a hold plus a revived manager doesn't."
 A reopen at the fork would flap. `Daemon.settle_features` re-fails the feature on the
 next tick off the same dead child, and `dead_feature_children` is deliberately ONE
 function shared by the settler and INV-FEATURE-FALSE-FAILURE precisely so the two cannot
-disagree (`invariants.py:539-543`). Putting a third writer on the other side of that
+disagree (`invariants.py:569-572`). Putting a third writer on the other side of that
 predicate is the infinite loop its docstring names.
 
 **Where.** `invariants.true_blockers`. New constants at module level, with the other
@@ -242,7 +255,7 @@ SETTLED_FEATURE_REMEDY = {
 ```
 
 One template, a remedy per settled status, because the way out genuinely differs: `fo
-resume` refuses anything but `failed` (`ops.py:9759-9763`), so naming it under a
+resume` refuses anything but `failed` (`ops.py:9818-9822`), so naming it under a
 cancelled feature would send the user at a command that errors.
 
 **Derivation, following the neighbouring conventions exactly.** Gated on status so no
@@ -257,7 +270,7 @@ if wo["status"] in OPEN_STATUSES and wo.get("parent_id"):
 ```
 
 `FO_TERMINAL_STATUSES` is `("completed", "failed", "cancelled")`
-(`project_store.py:453`). Placed after the `pending`/DEAD_DEPENDENCY arm and before the
+(`project_store.py:454`). Placed after the `pending`/DEAD_DEPENDENCY arm and before the
 `needs_review` ladder: it is a fact about the work order's context, not about its own
 delivery, and it must not displace an assumption the user owes — the assumptions line is
 appended above it anyway. No elapsed time in the string; `kind='manager'` orders are
@@ -265,7 +278,7 @@ skipped (a manager has `parent_id` set to its feature and `_close_feature_manage
 settling it is correct, not a hold — gate on `wo.get("kind") != "manager"`).
 
 **It reaches the user with no new writer.** `check_blocked_work_is_surfaced`
-(INV-ATTENTION-MISSING, `invariants.py:2296`) runs over `BLOCKED_STATUSES`, which covers
+(INV-ATTENTION-MISSING, `invariants.py:2410`) runs over `BLOCKED_STATUSES`, which covers
 every open status except `validating`, and raises `blockers[0]`. So the hold appears
 within one reconcile tick and — this is the point — **clears itself** the moment the
 feature is reopened, because it is derived and INV-ATTENTION-PHANTOM/INV-ATTENTION-REASON
@@ -304,37 +317,37 @@ Given a feature order that is `executing` and a manager work order that is not i
    all need to tell those apart.
 
 **`idle`, not `waiting_input`.** That is the manager's designed steady state since issue
-#264 (`project_store.py:22-25`; `_close_feature_manager`'s docstring describes the
+#264 (`project_store.py:23-30`; `_close_feature_manager`'s docstring describes the
 `waiting_input` version as the old shape), it is what `_manager_handoff` tests for
-(`daemon.py:1545`), and `invariants.true_blockers` deliberately derives nothing from
-`idle` except MESSAGE_STUCK_BLOCKER (`invariants.py:86-92`) — so a revived manager asks
+(`daemon.py:1581`), and `invariants.true_blockers` deliberately derives nothing from
+`idle` except MESSAGE_STUCK_BLOCKER (`invariants.py:87-92`) — so a revived manager asks
 the user for nothing.
 
 **Placement, and why there.** `ops.py`, not `daemon.py` and not `invariants.py`. `ops`
 is the write-API layer and already owns `resume_feature_order`; `daemon` imports `ops`
-inside the methods that need it (`daemon.py:1538`, `daemon.py:5000`), and `invariants`
+inside the methods that need it (`daemon.py:1548`, `daemon.py:5081`), and `invariants`
 already reaches into `ops` with a function-local import for exactly this reason
-(`from .ops import auto_review_at`, `invariants.py:880`). Putting it in `daemon` would
+(`from .ops import auto_review_at`, `invariants.py:865`). Putting it in `daemon` would
 make `ops` import the daemon; putting it in `invariants` would put a status write in the
 module whose contract is derivation.
 
 **Three callers.**
 
 1. `ops.resume_feature_order`, immediately after `set_feature_status(fo_id,
-   "executing")` / `clear_feature_attention` (`ops.py:9767-9768`) and before the `--fix`
+   "executing")` / `clear_feature_attention` (`ops.py:9829-9830`) and before the `--fix`
    child is filed, so a crash between them leaves a live manager rather than a child with
    no addressee.
 2. INV-FEATURE-FALSE-FAILURE's repair, `invariants.check_feature_failures_are_real`,
    after its own `set_feature_status`/`clear_feature_attention` pair
-   (`invariants.py:3099-3100`). The `repair=` string gains "manager revived" when the
+   (`invariants.py:3236-3237`). The `repair=` string gains "manager revived" when the
    helper returned a row, so `jarvis doctor` says what it did.
-3. `Daemon._manager_handoff`, replacing the silent return at `daemon.py:1545-1546`:
+3. `Daemon._manager_handoff`, replacing the silent return at `daemon.py:1581-1583`:
 
    ```python
    manager = store.manager_work_order(fo_id)
    if manager is None:
        # flag the feature naming the missing manager; return
-   if manager["status"] not in ("idle",) and ops.revive_feature_manager(...) is None:
+   if manager["status"] != "idle" and ops.revive_feature_manager(...) is None:
        return   # genuinely busy: running, or mid-turn — not this branch's business
    ```
 
@@ -342,17 +355,17 @@ module whose contract is derivation.
    manager envelope, still returns early exactly as today — it has not finished reacting.
    A manager that is SETTLED is revived and the branch proceeds to its existing nudge or
    flag. A feature with no manager row at all (features created before the manager
-   existed; `ProjectStore.create_feature_order`, `project_store.py:3119-3172`, is the
+   existed; `ProjectStore.create_feature_order`, `project_store.py:2884-2910`, is the
    only creator) gets `store.flag_feature_attention(fo_id, ...)` naming the missing
    manager, under a new constant beside FEATURE_MANAGER_STALLED/SILENT
-   (`daemon.py:318-323`) — `FEATURE_MANAGER_MISSING`, keyed into the same
+   (`daemon.py:319-324`) — `FEATURE_MANAGER_MISSING`, keyed into the same
    `FEATURE_HANDOFF_EVENT` dedupe (`action: "flagged"`) so it is raised once and never
    re-raised over an unchanged situation. **Never a silent return.**
 
-**INV-MANAGER-SLOTS cannot break.** `check_manager_slots` (`invariants.py:3564`) compares
+**INV-MANAGER-SLOTS cannot break.** `check_manager_slots` (`invariants.py:3711`) compares
 `store.count_active()` against the count of `SLOT_STATUSES` rows with
 `kind != 'manager'`. `SLOT_STATUSES` is `("dispatching", "running")`
-(`project_store.py:366`); `idle` is in neither side, and `count_active` excludes managers
+(`project_store.py:367`); `idle` is in neither side, and `count_active` excludes managers
 regardless. Reviving a manager to `idle` moves both sides by zero.
 
 **Bus side effect, intended.** `bus.resolve`'s `manager` role resolves to the
@@ -362,7 +375,7 @@ again and the next round's feedback has somewhere to land.
 
 ### (d) The envelope-lost sentence leads with what is settled
 
-`invariants.check_no_lost_feedback`, the `detail=` at `invariants.py:2990-2992`. New
+`invariants.check_no_lost_feedback`, the `detail=` at `invariants.py:3115-3119`. New
 shape, settled order first:
 
 > `the manager work order wo-b57da97e is completed under feature fo-ac00376e, so
@@ -474,6 +487,9 @@ In `tests/`, beside `tests/test_feature_order_resume.py` and
   per tick, bounded by the dead children of a single feature. Left as it is. The cheaper
   shape, if that ever matters, is a `wo_events` join inside `feature_children`.
 - Retroactive repair of features already settled this way. INV-FEATURE-FALSE-FAILURE
-  plus (c) reopens them with a live manager once a child recovers; a feature whose child
-  is still `failed` needs `jarvis fo resume`, which is the existing route and now revives
-  the manager.
+  plus (c) reopens them with a live manager once a child recovers; a feature that is
+  itself `failed` on a child still `failed` with NO `turn_died_after_delivery` event
+  needs `jarvis fo resume`, which is the existing route and now revives the manager. A
+  feature left `executing` by an EXEMPT child is the other case and not this one: `fo
+  resume` refuses anything but `failed` (`ops.py:9818-9822`), so the route there is
+  child-level — `jarvis wo retry` or `jarvis wo done`, as §(a) says.

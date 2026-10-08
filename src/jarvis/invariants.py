@@ -598,7 +598,6 @@ def dead_feature_children(store: ProjectStore,
 def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this work order produced something a person has to decide about?
 
-    Beside `dead_feature_children` because it is the function whose ANSWER this changes.
     The STATUS is unchanged: a turn that dies after a delivery still settles `failed`
     (`Daemon.settle_work_order`) — `needs_review` is the queue the user works through to
     decide on delivered work, and a turn that died mid-flight does not belong in it. What
