@@ -333,7 +333,7 @@ def test_the_input_size_lands_on_the_result_and_in_the_envelope(fake_claude,
 def test_the_call_is_timed_and_the_latency_rides_on_both(fake_claude, tmp_path) -> None:
     """The only latency the OS records on a default fleet (the panel ships disabled), so
     it is measured here, one layer below every caller. Spec §3,
-    docs/specs/2026-10-01-neo-observability.md.
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
 
     BOTH places for `prompt_chars`' reason: `agent_usage.record` reads the dataclass when
     a caller hands it one and the envelope when the caller passes `usage=result.usage`.

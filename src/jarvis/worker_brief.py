@@ -359,7 +359,7 @@ def _question_shape(wo_id: str) -> list[str]:
         f"recommendation. Do NOT paste context — whoever answers already holds this "
         f"work order's title and description, and when your paragraph references "
         f"the design artifact it argues from in-text (e.g. `from section 3 of "
-        f"design doc \"docs/specs/feature.md\": …`) that section is delivered "
+        f"design doc \"docs/superpowers/specs/feature.md\": …`) that section is delivered "
         f"alongside it automatically. Questions over {QUESTION_MAX_CHARS} "
         f"characters are refused.",
         "  - The trigger is DOUBT, not importance. If you catch yourself weighing "
@@ -572,6 +572,24 @@ NAV_SELECT_LINE = "select:" + ",".join(
     for prefix in ("mcp__serena__", "mcp__plugin_serena_serena__"))
 
 
+#: The markdown half of the posture, and it is INDEPENDENT of Serena: the specs are
+#: navigated with a `jarvis` verb over headings, not with a symbol index, so a project
+#: that deselected Serena still gets it. The three command strings are §4.3 of
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md, quoted verbatim —
+#: `jarvis spec show` does not exist. Measured cause (§1(b) of that spec): 199 whole-file
+#: `.md` reads at 5,187 tokens each, and the prompt is what decides the FIRST call.
+_MARKDOWN_NAV = [
+    "# Finding things in specs and docs: navigate them like code",
+    "A spec is a tree of headings, so read the heading you need and not the file: "
+    "`jarvis spec toc <path>` lists the sections, "
+    "`jarvis spec section <path> <n|name>` returns one of them, and "
+    "`jarvis spec search \"<words>\"` finds which spec says a thing at all.",
+    "- `grep`, `rg` and `find` over markdown stay fine for TEXT questions — a phrase, "
+    "a filename, who mentions a key. Reading a whole spec to reach one section is the "
+    "waste, not text search.",
+]
+
+
 def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
     """The navigation posture INLINE in the bare worker prompt — spec §3.
 
@@ -586,15 +604,20 @@ def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
     (evals/llm/test_worker_contract_ab.py), so 500 ungraded chars in there would dilute a
     claim, not just a number.
 
-    `serena=False` renders nothing: the index already swaps in NO_SERENA_HOOK and the
-    fetched section already carries the grep posture.
+    `serena=False` renders the MARKDOWN half alone (`_MARKDOWN_NAV`) and no symbol half:
+    ruled by spec 2026-10-06-navigate-specs-like-code.md §6.1, because navigating a spec
+    needs no symbol index, so swallowing it inside the Serena branch would withhold the
+    posture from the projects that never had it. The symbol half still goes: the index
+    already swaps in NO_SERENA_HOOK and the fetched section already carries the grep
+    posture.
 
     `tool_search="off"` means `dispatch` wrote `ENABLE_TOOL_SEARCH=false`, so the tools
     are in the tool list with full schemas: the DEFERRED wording and the recovery call
     would be a falsehood and a wasted call (spec 2026-10-02-serena-the-cheap-path.md §4).
     """
+    # Spec 2026-10-06-navigate-specs-like-code.md §6.1.
     if not serena:
-        return []
+        return list(_MARKDOWN_NAV)
     tail = [
         "- The bash-first reminder does NOT govern code navigation: `cat`/`sed "
         "-n`/`grep` answer text questions, never symbol ones.",
@@ -611,6 +634,8 @@ def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
             "`find_referencing_symbols`, `get_symbols_overview` and `activate_project` "
             "are callable directly, with no lookup call to make first.",
             *tail,
+            "",
+            *_MARKDOWN_NAV,
         ]
     return [
         "# Finding code: your symbol tools are DEFERRED, not absent",
@@ -619,6 +644,8 @@ def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
         "prefixes; a name this install lacks is ignored):",
         NAV_SELECT_LINE,
         *tail,
+        "",
+        *_MARKDOWN_NAV,
     ]
 
 
@@ -653,6 +680,9 @@ def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
             "sweep would have missed rather than claiming it was exhaustive.",
             "- Read a file's imports and its module docstring before its body: on a "
             "project with a written map, the map is cheaper than the code.",
+            "",
+            # Spec 2026-10-06-navigate-specs-like-code.md §6.
+            *_MARKDOWN_NAV,
         ])
     lines = [
         "# Navigating the code: Serena first, grep second",
@@ -681,6 +711,9 @@ def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
         "wrong, it is just the wrong tool for finding code.",
         "- If the symbol tools say no project is active, `activate_project` on the "
         "repo root first.",
+        "",
+        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        *_MARKDOWN_NAV,
     ]
     return "\n".join(lines)
 

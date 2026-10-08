@@ -141,6 +141,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # entire subject of that check (issue #202). Pointed at a directory inside the
         # sandbox holding no checkout: "no production deployment on this machine".
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
+        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads. Same trap as the
+        # two entries above: left ambient, `jarvis doctor` in a test passes or fails on
+        # whether the human has run install_prod_cli.sh — and it fails, which is the
+        # subject of that check. Pointed at an empty directory inside the sandbox: no
+        # wrapper installed, and PRODUCTION_ROOT_ENV above already means "no production
+        # deployment", so the check is silent either way.
+        release.CLI_BIN_DIR_ENV: str(root / "cli-bin"),
         # The production units export `JARVIS_ENV=production` and it OVERRIDES the
         # location check above, so a suite run BY A JARVIS WORKER inherits it from the
         # daemon and every test of the dev badge fails on a machine where the OS is
@@ -2292,7 +2299,7 @@ def settle_turns():
 #: `design_doc`. Every plan must stand on one, so without a real file here each test that
 #: submits a plan would have to write one first. See §7 of
 #: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+FIXTURE_DESIGN_DOC = "docs/superpowers/specs/exporter.md"
 
 #: How many numbered sections the fixture document carries. A plan is refused unless every
 #: child names a section that resolves AND no two children name the same one, so a fixture
@@ -2484,6 +2491,20 @@ def local_base(monkeypatch):
     monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
     monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
     return state
+
+
+@pytest.fixture()
+def origins():
+    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote.
+
+    The cache exists because `origin` does not move under a running daemon, which is the
+    one assumption a test adding a remote to a fresh repository breaks.
+    """
+    from . import schedule
+
+    schedule._ORIGIN_CACHE.clear()
+    yield
+    schedule._ORIGIN_CACHE.clear()
 
 
 @pytest.fixture()

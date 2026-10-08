@@ -137,6 +137,9 @@ def test_the_hold_says_so_when_the_worker_pushed_without_declaring_it():
     assert d.reason == autoreview.REFUSAL_UNDECLARED_REASON
     assert "pushed commits since without running `jarvis wo finish`" in d.reason
     assert "the OS has asked it to declare them" in d.reason
+    # Issue #975: a hold the user reads must end in something they can type.
+    assert "jarvis validation force" in d.reason
+    assert "send it a message asking it to finish" in d.reason
 
 
 def test_the_early_hold_carries_the_same_second_sentence():
@@ -531,7 +534,7 @@ def test_everything_that_is_not_an_explicit_approval_stays_with_the_user(verdict
 
 # -- why the OS escalated, as one groupable label --------------------------------------
 #
-# docs/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
+# docs/superpowers/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
 # override is a THIRD answer to "who decided", so these five members are their own class
 # and every one is derived from facts the code already holds — never read off a reply.
 
@@ -879,6 +882,44 @@ def test_a_second_escalated_round_refreshes_the_hold_rather_than_voiding_it(star
     assert "gave up" in rulings(store, wo["id"])[0]
 
 
+def _refusal_hold(store, wo, reason: str) -> autoreview.Decision:
+    (row,) = store.all_assumptions(wo["id"])
+    return autoreview._held(autoreview.HELD_REFUSAL_UNANSWERED, reason,
+                            assumption_id=row["id"], n=1)
+
+
+def test_the_undeclared_refusal_sentence_is_not_deduped_away_by_the_first(started):
+    """ISSUE #975, measured on wo-2933fc24: both refusal sentences share the code
+    `HELD_REFUSAL_UNANSWERED`, and `undeclared_delivery` can only become true AFTER a hold
+    was written with the other one. Keyed on the code alone, the second write was dropped
+    and `assumptions_with_rulings` — newest hold wins — kept rendering 'has not delivered
+    again since' about a worker that had pushed commits."""
+    store, wo = park(started, auto_review=True, outcome="")
+
+    started._note_autoreview_held(
+        store, wo["id"], _refusal_hold(store, wo, autoreview.REFUSAL_UNANSWERED_REASON))
+    started._note_autoreview_held(
+        store, wo["id"], _refusal_hold(store, wo, autoreview.REFUSAL_UNDECLARED_REASON))
+
+    holds = events(store, wo["id"], "autoreview_held")
+    assert [h["reason"] for h in holds] == [autoreview.REFUSAL_UNANSWERED_REASON,
+                                            autoreview.REFUSAL_UNDECLARED_REASON]
+    assert "pushed commits since" in rulings(store, wo["id"])[0]
+
+
+def test_the_same_refusal_reason_twice_is_still_recorded_once(started):
+    """The dedupe the reason key must not weaken: the pass runs every reconcile tick."""
+    store, wo = park(started, auto_review=True, outcome="")
+
+    for _ in range(3):
+        started._note_autoreview_held(
+            store, wo["id"],
+            _refusal_hold(store, wo, autoreview.REFUSAL_UNANSWERED_REASON))
+
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["reason"] == autoreview.REFUSAL_UNANSWERED_REASON
+
+
 def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
     """A payload from before this shipped carries no round: KEPT while the newest round is
     still escalated (the panel did give up), dropped once a later one passed."""
@@ -1207,7 +1248,7 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
 
 # -- WHO decided, on the row the report groups by --------------------------------------
 #
-# docs/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
+# docs/superpowers/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
 # re-marks happen AFTER Neo answered, so without a cause every one of them renders "not
 # recorded" for ever — on `kind='assumption'`, the population the user complained about.
 

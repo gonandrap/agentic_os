@@ -20,8 +20,8 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
-from .navigation import (NAV_COMMANDS, SOURCE_SUFFIXES, SYMBOL_TOOLS,
-                         TEXT_SEARCH_TOOLS)
+from .navigation import (DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
+                         SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
@@ -87,19 +87,19 @@ VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
 
 # Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
-# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
 # behaviour Jarvis does not own, and writes no key. DEFAULT `on`: Jarvis PINS deferral
 # rather than leaving it to the vendor default, because deferral is what makes a worker's
 # first navigation call a symbol call — 7/7 deferred against 1/10 with the tools present
 # (wo-ab5d81db), which makes `off` a measured regression on that outcome. §4 addendum of
-# docs/specs/2026-10-02-serena-the-cheap-path.md.
+# docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "on"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
-# `.py` path. §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
 # it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF, and the flip is
@@ -111,6 +111,30 @@ DEFAULT_WORKER_TOOL_SEARCH = "on"
 # (wo-ab5d81db).
 VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
+
+# Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC —
+# §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
+# VALID_PY_NAV_HOOK above and for its reason: the hook is entirely Jarvis's own.
+# DEFAULT OFF — nothing in that spec ships on, so merging it changes the behaviour of no
+# running worker.
+VALID_DOC_NAV_HOOK = ("off", "on")
+DEFAULT_WORKER_DOC_NAV_HOOK = "off"
+
+# THE BAR BOTH DOC ARMS SHARE, in lines: a `Read` with a larger `limit` (or none at all)
+# and a `cat`/`head`/`sed -n` naming a wider range are refused. 200 because §1's table
+# prices `head … .md` at 317 tokens a call while the measured evasion is
+# `sed -n '1,2000p'` (§1(c): 1.25M tokens over 2,189 Bash calls) — the arm exists for the
+# 2,000-line range, not for the 40-line one.
+#
+# THIS IS THE KEY'S FALLBACK AND NOT THE RESOLVED NUMBER: a catalog setting rather than a
+# module constant in `hooks.py`, so a project can raise or lower it, and the hook reads
+# the value `dispatch` resolved into the worker's environment.
+DEFAULT_WORKER_DOC_READ_LIMIT_LINES = 200
+# Zero or a negative would make the bar a blanket refusal of every targeted read, which
+# is the feature's own MUST NOT reached by a typo. It arrives through `jarvis config
+# set`, so it is refused where the message can name the key — the HOOK absorbs a bad
+# value quietly instead, because it runs on every tool call.
+WORKER_DOC_READ_LIMIT_LINES_MIN = 1
 
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
@@ -458,6 +482,10 @@ class WorkerDefaults:
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # The bar both doc arms share — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -535,6 +563,11 @@ DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
+# How long the reconciler may wait for a merged child's commit to appear on the default
+# branch before it stops deferring the feature's round and asks the user. §3 of
+# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
+
 #: Which net answers "is this assumption high-stakes?" before any model call
 #: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
 #:
@@ -592,6 +625,9 @@ class ValidationConfig:
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
     feature_units: bool = True
+    # §3 of
+    # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+    feature_merge_wait_minutes: int = DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES
     # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF, once the panel has
     # accepted the exact commit at the head and CI is green
     # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md).
@@ -942,15 +978,26 @@ DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = TEXT_SEARCH_TOOLS
 #: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
 DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 
+#: Which files make a read a DOC read. A sibling of `code_suffixes`, never a widening of
+#: it: `navigates_source`'s meaning is the fleet's published baseline (§2.2). Data rather
+#: than code so re-measuring needs no release.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
+
+#: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
+#: search in markdown stays legal and counting it would price a legitimate call as waste.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
+
 #: The default window for a wide scope, in days. Seven, for
 #: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
 #: reports the trend away, and the trend is the whole question after `worker.bash_first`.
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
 #: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all four the same way. An empty one reports 0% everywhere and looks like a win.
+#: refuse all six the same way. An empty one reports 0% everywhere and looks like a win.
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
-                           "code_suffixes")
+                           "code_suffixes", "doc_suffixes", "doc_dump_commands")
 
 
 @dataclass
@@ -970,6 +1017,8 @@ class NavigationConfig:
     symbol_tools: tuple[str, ...] = DEFAULT_NAVIGATION_SYMBOL_TOOLS
     text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
     code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
+    doc_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_SUFFIXES
+    doc_dump_commands: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
 
@@ -985,6 +1034,9 @@ DEFAULT_COST_MAX_ORDERS = 500
 #: which is why every figure derived from it reports its `token_basis` counts beside it.
 DEFAULT_COST_CHARS_PER_TOKEN = 4.0
 DEFAULT_COST_TOOL_ROWS = 20
+#: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting —
+#: §2 of docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+DEFAULT_COST_SESSION_WINDOW_HOURS = 5.0
 
 
 @dataclass
@@ -994,7 +1046,7 @@ class CostConfig:
     Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
     project naming one key keeps the OS answer for the rest. Neo's rider on
     wo-38456776 — no module constant for anything tunable — and the reason is that all
-    seven of these move: a DST shift and an Anthropic policy change both move the reset,
+    eight of these move: a DST shift and an Anthropic policy change both move the reset,
     what counts as the tail of the distribution differs by project, and the tokens-per-
     character of a model family is Anthropic's to change.
 
@@ -1009,13 +1061,14 @@ class CostConfig:
     max_orders: int = DEFAULT_COST_MAX_ORDERS
     chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
     tool_rows: int = DEFAULT_COST_TOOL_ROWS
+    session_window_hours: float = DEFAULT_COST_SESSION_WINDOW_HOURS
 
 
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
 #: reads a config object and catalog importing it back would be the cycle.
-#: docs/specs/2026-09-24-order-observability.md §10.
+#: docs/superpowers/specs/2026-09-24-order-observability.md §10.
 OBSERVABILITY_LEVELS = ("off", "normal", "full")
 DEFAULT_OBSERVABILITY_LEVEL = "normal"
 
@@ -1023,14 +1076,14 @@ DEFAULT_OBSERVABILITY_LEVEL = "normal"
 @dataclass
 class ObservabilityConfig:
     """What debug data Jarvis COLLECTS. §10 of
-    docs/specs/2026-09-24-order-observability.md.
+    docs/superpowers/specs/2026-09-24-order-observability.md.
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
     (`_parse_observability`), and a per-order override on `work_orders.observability`
     beats both — precedence resolved in one place, `observability.level_for`.
 
     `off` GATES TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json` and
-    the sealed autopsy (§5 of docs/specs/2026-09-27-order-autopsy-durability.md). So `off`
+    the sealed autopsy (§5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). So `off`
     stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
@@ -1038,7 +1091,7 @@ class ObservabilityConfig:
     context` says it was not recorded.
 
     `full` DIFFERS FROM `normal` BY EXACTLY ONE THING: the tool parameters a `full` seal
-    retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
+    retains (§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
     itself — every turn, its tools, its token classes, its context total, delta, peak and
     composition — is derived at read time from the transcript (§§3, 4, 6, 7) and so is
     shown for every order at every level, `off` included.
@@ -1092,6 +1145,23 @@ class BugsConfig:
     """
 
     label: str = DEFAULT_BUGS_LABEL
+
+
+#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
+#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
+
+
+@dataclass
+class ReleaseConfig:
+    """How long a settled release order's dropped batch stays worth re-filing.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    the answer is a claim about THIS project's release cadence, and a project that ships
+    weekly has a different one from a project that ships twice a year.
+    """
+
+    refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
 @dataclass
@@ -1362,6 +1432,7 @@ class ProjectSpec:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1441,6 +1512,10 @@ class OsConfig:
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    default_doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # Its bar, fleet-wide — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    default_doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -1493,6 +1568,7 @@ class OsConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1650,6 +1726,25 @@ def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
         raise _err(str(e)) from e
 
 
+def _doc_read_limit_or_err(raw: dict[str, Any], where: str, default: int) -> int:
+    """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key.
+
+    §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
+    is rejected LOUDLY; `hooks.doc_nav_decision` absorbs one quietly, because it runs on
+    every tool call and a hook that raises breaks the whole session. Both are needed:
+    validation cannot see a settings file edited by hand.
+    """
+    value = raw.get("doc_read_limit_lines", default)
+    try:
+        lines = int(value)
+    except (TypeError, ValueError) as e:
+        raise _err(f"{where} must be a whole number of lines, got {value!r}") from e
+    if lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"{where} must be >= {WORKER_DOC_READ_LIMIT_LINES_MIN} (lines — zero "
+                   f"or less would refuse every targeted read), got {lines}")
+    return lines
+
+
 def load_catalog(path: str | Path) -> Catalog:
     path = Path(path).expanduser()
     if not path.exists():
@@ -1770,6 +1865,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # falling back would read as the feature being off.
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
+    feature_merge_wait_minutes = int(
+        raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
+    if feature_merge_wait_minutes < 0:
+        # 0 is legal and means "never defer": check once, flag immediately.
+        raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
@@ -1786,6 +1886,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        feature_merge_wait_minutes=feature_merge_wait_minutes,
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
         max_follow_ups=max_follow_ups,
@@ -1908,14 +2009,18 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         symbol_tools=patterns("symbol_tools", base.symbol_tools),
         text_search_tools=patterns("text_search_tools", base.text_search_tools),
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+        doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
+        doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
     )
     if cfg.window_days < 1:
         raise _err(f"{where}.window_days must be >= 1")
-    for suffix in cfg.code_suffixes:
-        if not suffix.startswith("."):
-            raise _err(f'"{where}.code_suffixes" entries must start with a dot — '
-                       f"{suffix!r} matches no path")
+    for name in ("code_suffixes", "doc_suffixes"):
+        for suffix in getattr(cfg, name):
+            if not suffix.startswith("."):
+                raise _err(f'"{where}.{name}" entries must start with a dot — '
+                           f"{suffix!r} matches no path")
     return cfg
 
 
@@ -1951,6 +2056,8 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
         max_orders=int(raw.get("max_orders", base.max_orders)),
         chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
         tool_rows=int(raw.get("tool_rows", base.tool_rows)),
+        session_window_hours=float(raw.get("session_window_hours",
+                                           base.session_window_hours)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -1969,6 +2076,11 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                    f"a divisor, and a negative one would report negative tokens")
     if cfg.tool_rows < 1:
         raise _err(f"{where}.tool_rows must be >= 1")
+    # A LENGTH, not a count: 2.5 hours is a legal belief about the grid, so the test is
+    # strictly positive (§7 of the window-selector spec).
+    if cfg.session_window_hours <= 0:
+        raise _err(f"{where}.session_window_hours must be > 0 — "
+                   f"{cfg.session_window_hours} is not a length of time")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
@@ -2046,6 +2158,26 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
         raise _err(f"{where}.label must start with a letter or digit and use only "
                    f"letters, digits, spaces and ._:/- (got {label!r})")
     return BugsConfig(label=label)
+
+
+def _parse_release(raw: Any, base: ReleaseConfig | None = None,
+                   where: str = "os.release") -> ReleaseConfig:
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: a window of 0 days
+    means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or ReleaseConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = ReleaseConfig(
+        refile_window_days=int(raw.get("refile_window_days", base.refile_window_days)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
@@ -2351,6 +2483,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         # Spec 2026-10-02-serena-the-cheap-path.md §6.
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
+        # Spec 2026-10-06-navigate-specs-like-code.md §5.
+        default_doc_nav_hook=defaults.get("doc_nav_hook", DEFAULT_WORKER_DOC_NAV_HOOK),
+        default_doc_read_limit_lines=_doc_read_limit_or_err(
+            defaults, "os.defaults.doc_read_limit_lines",
+            DEFAULT_WORKER_DOC_READ_LIMIT_LINES),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2389,6 +2526,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
@@ -2407,6 +2545,14 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
                    f"{sorted(VALID_PY_NAV_HOOK)}")
+    # Spec 2026-10-06-navigate-specs-like-code.md §5.
+    if os_cfg.default_doc_nav_hook not in VALID_DOC_NAV_HOOK:
+        raise _err(f"os.defaults.doc_nav_hook {os_cfg.default_doc_nav_hook!r} not in "
+                   f"{sorted(VALID_DOC_NAV_HOOK)}")
+    if os_cfg.default_doc_read_limit_lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"os.defaults.doc_read_limit_lines must be >= "
+                   f"{WORKER_DOC_READ_LIMIT_LINES_MIN}, got "
+                   f"{os_cfg.default_doc_read_limit_lines}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2457,6 +2603,15 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if py_nav_hook not in VALID_PY_NAV_HOOK:
             raise _err(f"project {name}: worker.py_nav_hook {py_nav_hook!r} not in "
                        f"{sorted(VALID_PY_NAV_HOOK)}")
+        # Spec 2026-10-06-navigate-specs-like-code.md §5 — this message IS what
+        # `jarvis config set <project> worker.doc_nav_hook` shows.
+        doc_nav_hook = w.get("doc_nav_hook", os_cfg.default_doc_nav_hook)
+        if doc_nav_hook not in VALID_DOC_NAV_HOOK:
+            raise _err(f"project {name}: worker.doc_nav_hook {doc_nav_hook!r} not in "
+                       f"{sorted(VALID_DOC_NAV_HOOK)}")
+        doc_read_limit_lines = _doc_read_limit_or_err(
+            w, f"project {name}: worker.doc_read_limit_lines",
+            os_cfg.default_doc_read_limit_lines)
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2477,6 +2632,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             bash_first=bash_first,
             tool_search=tool_search,
             py_nav_hook=py_nav_hook,
+            doc_nav_hook=doc_nav_hook,
+            doc_read_limit_lines=doc_read_limit_lines,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
@@ -2530,6 +2687,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        release_cfg = _parse_release(
+            p.get("release", {}), base=os_cfg.release,
+            where=f"projects[{i}] ({name}).release")
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
@@ -2558,6 +2718,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                release=release_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,

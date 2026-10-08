@@ -1,6 +1,6 @@
 """The context ledger: what Jarvis put in the window, and the delta between turns.
 
-§5 of docs/specs/2026-09-24-order-observability.md. Three properties carry the section and
+§5 of docs/superpowers/specs/2026-09-24-order-observability.md. Three properties carry the section and
 each has its own tests below, because each is a defect the knowledge base already named:
 
 * one payload per turn, written EXACTLY ONCE — the two call sites partition the turns
@@ -475,8 +475,8 @@ def test_the_column_is_a_plain_text_blob_the_store_can_read_back(dispatched):
 
 # -- 8. the gate: who turns the write off ----------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md, and §5 of
-# docs/specs/2026-09-27-order-autopsy-durability.md: the gate governs THIS write and the
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md, and §5 of
+# docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: the gate governs THIS write and the
 # sealed autopsy, and no read — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the
 # debug page are arithmetic over files that already exist and are never gated.
 
@@ -625,7 +625,7 @@ def test_jarvis_wo_create_stamps_the_level_on_the_order(jarvis_home, fake_claude
 
 
 def test_both_surfaces_say_the_autopsy_reading_is_shown_at_every_level():
-    """Neo 814 and §5 of docs/specs/2026-09-27-order-autopsy-durability.md: no level gates
+    """Neo 814 and §5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: no level gates
     a READ, and both surfaces must say so in one phrase.
 
     §§3, 4, 6 and 7 derive the autopsy at read time, so the reading is shown at every level
@@ -710,14 +710,14 @@ def test_every_observability_setting_reaches_the_config_console_and_full_reads_a
 
 
 def test_section_10_of_the_spec_tells_full_and_normal_apart():
-    """§5 of docs/specs/2026-09-27-order-autopsy-durability.md gave `full` a meaning, so the
+    """§5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md gave `full` a meaning, so the
     section that described the two levels as collapsing may no longer say so: it names both
     and names the content a `full` seal retains. Whitespace is collapsed before matching so
     a reflow cannot fail it."""
     from pathlib import Path
 
     spec = (Path(__file__).resolve().parents[1] /
-            "docs/specs/2026-09-24-order-observability.md").read_text()
+            "docs/superpowers/specs/2026-09-24-order-observability.md").read_text()
     section = " ".join(spec.split("## 10.", 1)[1].split("## 11.", 1)[0].split())
 
     assert "`full`" in section and "`normal`" in section

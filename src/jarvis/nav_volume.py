@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -47,6 +48,24 @@ BEFORE_NOTE = (
     "all history, measured 2026-10-05: lead 1 symbol call, 38.2% of 72.2 MB of "
     "tool-result bytes over 351 transcripts; subagent 1,148 symbol calls, 34.7% of "
     "58.6 MB over 439 transcripts"
+)
+
+#: The SECOND baseline, separately attributable: `BEFORE_NOTE` was measured under the
+#: strict source classifier over a different corpus and is left byte-identical (§2.2), so
+#: the doc figures travel beside it rather than inside it. A RECORDED BASELINE and not an
+#: assertion — whether doc reads fell is unprovable until a later order flips
+#: `worker.doc_nav_hook` and a window passes.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §1 and §3.2.
+DOC_BEFORE_NOTE = (
+    "doc baseline recorded 2026-10-06 over 877 transcripts under "
+    "`~/.claude/projects/*agentic*/`, tokens as `chars // 4`: `.md` Read with no "
+    "`limit` 1,032,302 tok over 199 calls; `.md` Bash dumps (sed+cat+head) 1,252,687 "
+    "tok over 2,189 calls; `.py` Read with no `limit` 487,048 tok over 133 calls. A "
+    "RECORDED BASELINE, not an assertion: reproduce a number today with `jarvis "
+    "navigation --project jarvis_os --days 36500`, whose per-side `doc_read_bytes`, "
+    "`doc_dump_bash_bytes` and no-`limit` Read counts are the same reading; whether doc "
+    "reads FELL is unprovable until a later order flips `worker.doc_nav_hook` and a "
+    "window passes"
 )
 
 #: `mcp__<server>__` — stripped before a tool name is matched, because both
@@ -84,6 +103,16 @@ class SideVolume:
     #: `tool_result` bytes whose `tool_use_id` matched no `tool_use` in the same file.
     #: REPORTED, never silently dropped and never in a share's numerator.
     unattributed_bytes: int = 0
+    # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+    read_tool_bytes: int = 0       # the `Read` tool's own result bytes
+    doc_read_bytes: int = 0        # ...of a path with a configured doc suffix
+    whole_file_read_calls: int = 0  # `Read` with no `limit` in its input
+    doc_dump_bash_calls: int = 0   # Bash that `dumps_doc`, with NO limit_lines
+    doc_dump_bash_bytes: int = 0
+    #: Per-tool result bytes, nothing in the tree reports this. A `Counter` AND NOT A
+    #: `dict[str, int]`: `_merge` folds every field with `+` over `vars()`, where a plain
+    #: dict raises `TypeError` and `Counter + Counter` folds. Do not simplify it.
+    bytes_by_tool: Counter[str] = field(default_factory=Counter)
 
     def code_nav_share(self) -> float | None:
         """`code_nav_bash_bytes / result_bytes`, or None on an empty corpus.
@@ -103,7 +132,11 @@ class SideVolume:
                  "nav_bash_calls": self.nav_bash_calls,
                  "code_nav_bash_calls": self.code_nav_bash_calls,
                  "other_bash_calls": self.other_bash_calls,
-                 "read_tool_calls": self.read_tool_calls} if calls_reported else {}
+                 "read_tool_calls": self.read_tool_calls,
+                 # §3.2: new CALL counters inside the gate, new BYTE counters outside it.
+                 "whole_file_read_calls": self.whole_file_read_calls,
+                 "doc_dump_bash_calls": self.doc_dump_bash_calls}  \
+            if calls_reported else {}
         return {"side": self.side,
                 "transcripts": self.transcripts,
                 **calls,
@@ -112,6 +145,11 @@ class SideVolume:
                 "code_nav_bash_bytes": self.code_nav_bash_bytes,
                 "symbol_bytes": self.symbol_bytes,
                 "unattributed_bytes": self.unattributed_bytes,
+                "read_tool_bytes": self.read_tool_bytes,
+                "doc_read_bytes": self.doc_read_bytes,
+                "doc_dump_bash_bytes": self.doc_dump_bash_bytes,
+                # Sorted and plain, so the JSON payload is stable.
+                "bytes_by_tool": dict(sorted(self.bytes_by_tool.items())),
                 "code_nav_share": self.code_nav_share()}
 
 
@@ -152,7 +190,10 @@ class NavigationVolume:
                 "calls_reported": self.calls_reported,
                 "sides": {side: self.sides[side].as_dict(
                     calls_reported=self.calls_reported) for side in SIDES},
-                "before": BEFORE_NOTE}
+                "before": BEFORE_NOTE,
+                # §3.2: a second, separately attributable baseline — not an edit to the
+                # first.
+                "doc_before": DOC_BEFORE_NOTE}
 
 
 def _merge(dst: SideVolume, src: SideVolume) -> None:
@@ -185,22 +226,30 @@ def read_transcript(path: Path, side: str, cfg: NavigationConfig) -> SideVolume:
     file twice.
     """
     vol = SideVolume(side=side, transcripts=1)
-    produced: dict[str, tuple[str, bool]] = {}
+    produced: dict[str, tuple[str, bool, bool, bool]] = {}
     for row in usage.rows(path):
         kind = row.get("type")
         if kind == "assistant":
             for block in usage.blocks_of(row, "tool_use"):
                 tool_id = str(block.get("id") or "")
                 name = str(block.get("name") or "")
+                tool_input = block.get("input") or {}
                 is_nav = False
+                is_doc_read = False
+                is_doc_dump = False
                 if navigation.is_symbol_call(name, tuple(cfg.symbol_tools)):
                     vol.symbol_calls += 1
                 elif name in tuple(cfg.text_search_tools):
                     vol.text_search_calls += 1
                 elif name == READ_TOOL:
                     vol.read_tool_calls += 1
+                    # §1(a): `limit is None` IS the predicate, from `tool_input` alone.
+                    if "limit" not in tool_input:
+                        vol.whole_file_read_calls += 1
+                    is_doc_read = str(tool_input.get("file_path") or "").endswith(
+                        tuple(cfg.doc_suffixes))
                 elif name == "Bash":
-                    command = str((block.get("input") or {}).get("command") or "")
+                    command = str(tool_input.get("command") or "")
                     is_nav = navigation.navigates_source(
                         command, tuple(cfg.code_suffixes), tuple(cfg.bash_commands))
                     if is_nav:
@@ -210,8 +259,17 @@ def read_transcript(path: Path, side: str, cfg: NavigationConfig) -> SideVolume:
                         vol.code_nav_bash_calls += 1
                     else:
                         vol.other_bash_calls += 1
+                    # NO `limit_lines` on purpose: the baseline must keep the small reads
+                    # the hook will go on allowing, or the AFTER figure shows a drop the
+                    # refusal never caused (§3.2). An INDEPENDENT classification — a
+                    # command can be both a source nav and a doc dump, or neither.
+                    is_doc_dump = navigation.dumps_doc(
+                        command, tuple(cfg.doc_suffixes),
+                        tuple(cfg.doc_dump_commands))
+                    if is_doc_dump:
+                        vol.doc_dump_bash_calls += 1
                 if tool_id:
-                    produced[tool_id] = (name, is_nav)
+                    produced[tool_id] = (name, is_nav, is_doc_read, is_doc_dump)
             continue
         for block in usage.blocks_of(row, "tool_result"):
             size = _content_bytes(block)
@@ -222,11 +280,20 @@ def read_transcript(path: Path, side: str, cfg: NavigationConfig) -> SideVolume:
                 # Never dropped and never in a share's numerator.
                 vol.unattributed_bytes += size
                 continue
-            name, is_nav = origin
+            name, is_nav, is_doc_read, is_doc_dump = origin
             vol.result_bytes += size
+            # §3.2: every ATTRIBUTED result, so unattributed bytes stay out as they stay
+            # out of every share's numerator.
+            vol.bytes_by_tool[name] += size
             if is_nav:
                 vol.nav_bash_bytes += size
                 vol.code_nav_bash_bytes += size
+            if name == READ_TOOL:
+                vol.read_tool_bytes += size
+                if is_doc_read:
+                    vol.doc_read_bytes += size
+            if is_doc_dump:
+                vol.doc_dump_bash_bytes += size
             if navigation.is_symbol_call(name, tuple(cfg.symbol_tools)):
                 vol.symbol_bytes += size
     return vol

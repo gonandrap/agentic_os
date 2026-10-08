@@ -12,7 +12,7 @@ The two properties these tests exist to pin:
 
 The CLI derives no number: it prints what `ops` returned.
 
-Spec: docs/specs/2026-09-27-self-evolution.md §3.4.
+Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §3.4.
 """
 
 from __future__ import annotations

@@ -241,6 +241,10 @@ class Usage:
     #: Boundaries whose TTL-vs-prefix split was left OPEN — the caller had no
     #: `os.cold_prefix_floor`. Counted in `resume_boundaries` and in no write bucket.
     boundaries_undecided: int = 0
+    #: Messages a WINDOW could not place: `timestamp` missing or malformed. Excluded
+    #: from every figure above and counted here, never dropped silently and never
+    #: counted as in-window. Always 0 with no window — nothing was excluded.
+    undated_messages: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -287,6 +291,7 @@ class Usage:
             boundaries_compact=self.boundaries_compact + other.boundaries_compact,
             boundaries_undecided=(self.boundaries_undecided
                                   + other.boundaries_undecided),
+            undated_messages=self.undated_messages + other.undated_messages,
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -373,6 +378,7 @@ class Usage:
             "boundaries_ttl": self.boundaries_ttl,
             "boundaries_compact": self.boundaries_compact,
             "boundaries_undecided": self.boundaries_undecided,
+            "undated_messages": self.undated_messages,
             "rewrite_compact_write": self.rewrite_compact_write,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
@@ -894,16 +900,48 @@ def last_compaction(session_id: str, *, since: float = 0.0,
     return max(found, key=lambda c: c["ts"]) if found else None
 
 
-def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
+def _call_of(message: dict[str, Any]) -> Call:
+    return Call(ts=message.get("ts") or 0.0, model=message.get("model") or "",
+                input=message.get("input_tokens", 0),
+                cache_write=message.get("cache_creation_input_tokens", 0),
+                cache_read=message.get("cache_read_input_tokens", 0),
+                output=message.get("output_tokens", 0),
+                cache_1h=message.get("ephemeral_1h_input_tokens", 0),
+                cache_5m=message.get("ephemeral_5m_input_tokens", 0))
+
+
+def _inside(ts: float, since: float | None, until: float | None) -> bool:
+    """Half-open, like every other window in the OS."""
+    return not ((since is not None and ts < since) or (until is not None and ts >= until))
+
+
+def _in_window(messages: list[dict[str, Any]], since: float | None,
+               until: float | None) -> tuple[list[dict[str, Any]], int]:
+    """The messages inside the window, and how many could not be PLACED.
+
+    A message whose `timestamp` was missing or malformed has `ts == 0.0` (`parse_stamp`)
+    and is EXCLUDED AND COUNTED when a window is given — never silently dropped and
+    never counted as in-window, which would attribute spend to a window on no evidence.
+    With no window nothing is excluded, so there is nothing to disclose and the list is
+    returned unchanged (§5c of the window-selector spec).
+    """
+    if since is None and until is None:
+        return messages, 0
+    inside = [m for m in messages if m.get("ts") and _inside(m["ts"], since, until)]
+    return inside, sum(1 for m in messages if not m.get("ts"))
+
+
+def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
+              until: float | None = None) -> Usage:
     messages = _assistant_messages(path)
     if not messages:
         return Usage()
     compactions = compaction_stamps(path)
-    usage = Usage(messages=len(messages))
+    windowed, undated = _in_window(messages, since, until)
+    usage = Usage(messages=len(windowed), undated_messages=undated)
     calls: list[Call] = []
-    for message in messages:
+    for message in windowed:
         model = message.get("model") or ""
-        ts = message.get("ts") or None
         plain = message.get("input_tokens", 0)
         write = message.get("cache_creation_input_tokens", 0)
         read = message.get("cache_read_input_tokens", 0)
@@ -922,8 +960,7 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
                             ("cache_1h", hour), ("cache_5m", five)):
             counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
-        calls.append(Call(ts=ts or 0.0, model=model, input=plain, cache_write=write,
-                          cache_read=read, output=out, cache_1h=hour, cache_5m=five))
+        calls.append(_call_of(message))
         # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
         # most accurate this estimate can be made without the CLI's own figure.
         classes = class_costs(model, input=plain, cache_write=write, cache_read=read,
@@ -937,8 +974,17 @@ def _usage_of(path: Path, cold_prefix_floor: int) -> Usage:
     # ONE FILE at a time, which is what keeps this an exact refactor: a session-wide run
     # would see a boundary between two segments where this walk sees none
     # (`classify_boundaries`' own note). `read_session` calls this per path.
-    fold_boundaries(usage, classify_boundaries(
-        calls, compactions=compactions, cold_prefix_floor=cold_prefix_floor))
+    #
+    # CLASSIFIED OVER EVERY CALL IN THE FILE AND FILTERED AFTERWARDS: the classifier
+    # compares a call with its PREDECESSOR, so filtering the calls first would lose the
+    # boundary at the window's left edge — usually a cold start, the dearest event in it
+    # (§5c of docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    boundaries = classify_boundaries(
+        calls if windowed is messages else [_call_of(m) for m in messages],
+        compactions=compactions, cold_prefix_floor=cold_prefix_floor)
+    if windowed is not messages:
+        boundaries = [b for b in boundaries if _inside(b.ts, since, until)]
+    fold_boundaries(usage, boundaries)
     usage.rewrite_excess = max(0, usage.cache_write - usage.context_peak)
     return usage
 
@@ -1022,11 +1068,16 @@ def index_sessions(root: Path | None = None) -> dict[str, list[Path]]:
 
 def read_session(session_id: str, cold_prefix_floor: int,
                  root: Path | None = None,
-                 index: dict[str, list[Path]] | None = None) -> SessionUsage:
+                 index: dict[str, list[Path]] | None = None,
+                 *, since: float | None = None,
+                 until: float | None = None) -> SessionUsage:
     """Spend for one session id, subagents included but reported separately.
 
     `cold_prefix_floor` is `os.cold_prefix_floor` and is REQUIRED: a caller that cannot
     reach a catalog must fail rather than classify against a guessed threshold.
+
+    `since`/`until` are the half-open window a cost report was asked for, additive and
+    defaulted: a bill asks for the WHOLE order and must never pass them (§5c).
     """
     result = SessionUsage(session_id=session_id)
     if index is None:
@@ -1036,14 +1087,15 @@ def read_session(session_id: str, cold_prefix_floor: int,
         return result
     result.found = True
     for path in sorted(paths):
-        result.main = result.main + _usage_of(path, cold_prefix_floor)
+        result.main = result.main + _usage_of(path, cold_prefix_floor, since=since,
+                                              until=until)
         # Claude Code writes each subagent's own transcript beside the parent's, under
         # a directory named for the parent session — beside whichever segment the
         # subagent was spawned from.
         subagent_dir = path.with_suffix("") / "subagents"
         if subagent_dir.is_dir():
             for sub in sorted(subagent_dir.glob("*.jsonl")):
-                sub_usage = _usage_of(sub, cold_prefix_floor)
+                sub_usage = _usage_of(sub, cold_prefix_floor, since=since, until=until)
                 if sub_usage.messages:
                     result.subagents = result.subagents + sub_usage
                     result.subagent_count += 1

@@ -283,8 +283,12 @@ def judged_head(packet: EvidencePacket) -> str:
 
     NOT `packet.head`: on the pull-request path that field holds `headRefName`, a BRANCH
     NAME, which is precisely the thing that keeps meaning something different as commits
-    land on it.
+    land on it. ON THE FEATURE PATH IT IS EXACTLY `packet.head`, and for the same reason:
+    there that field is `default_branch_head`'s output, a resolved commit sha (§5a of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
     """
+    if packet.unit == "feature":
+        return str(packet.head or "")
     if packet.source != "pull_request" or not packet.pr:
         return ""
     return str(packet.pr.get("head_sha") or "")

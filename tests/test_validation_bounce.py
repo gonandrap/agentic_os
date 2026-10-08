@@ -97,6 +97,80 @@ def test_a_bare_filename_is_not_a_citation():
     assert validation.cited_paths([{"title": "budget.py is wrong", "detail": ""}]) == ()
 
 
+#: wo-5ef5f42c round 2's real anchor, and the illustrative command its prose carried.
+INCIDENT_SPEC = "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md"
+INCIDENT_PROSE = "run sed -n '40,80p' docs/superpowers/specs/x.md to see how it reads"
+
+
+def anchored(path: str, prose: str = INCIDENT_PROSE) -> dict:
+    """A blocker as `validation.findings` normalises one: all three anchor keys."""
+    return {"severity": validation.BLOCKER, "file": path, "symbol": "", "failure": "",
+            "title": "the spec is not navigable", "detail": prose}
+
+
+def test_an_anchored_blocker_cites_its_anchor_and_never_its_prose():
+    """wo-5ef5f42c round 2: both blockers named the real spec in `file` and quoted
+    `docs/superpowers/specs/x.md` as an example, so the prose regex cited a path that exists nowhere
+    and bounced a commit that DID change the spec — twice, to BOUNCE_EXHAUSTED."""
+    assert validation.cited_paths([anchored(INCIDENT_SPEC)]) == (INCIDENT_SPEC,)
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, [anchored(INCIDENT_SPEC)],
+        {INCIDENT_SPEC: "1"}, {INCIDENT_SPEC: "2"}) is None
+
+
+def test_an_anchor_and_a_prose_only_blocker_are_both_read():
+    """Mixed sets: the anchor replaces that finding's prose and nobody else's."""
+    found = [anchored(INCIDENT_SPEC),
+             {"file": "", "symbol": "", "failure": "",
+              "title": "src/jarvis/budget.py is wrong", "detail": ""}]
+    assert validation.cited_paths(found) == (INCIDENT_SPEC, "src/jarvis/budget.py")
+
+
+def test_a_blank_anchor_falls_back_to_the_prose():
+    assert validation.cited_paths(
+        [{"file": "   ", "title": "src/jarvis/budget.py is wrong", "detail": ""}]
+    ) == ("src/jarvis/budget.py",)
+
+
+def test_a_citation_no_filesystem_can_find_lets_the_panel_judge():
+    """A prose-only blocker citing a path that is nowhere — not in either map, not on
+    disk — is no list at all, which is the fail-open §5 already promises."""
+    found = [{"file": "", "title": "look at docs/superpowers/specs/x.md", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"src/app.py": "1"}, {"src/app.py": "2"},
+        exists=lambda p: False) is None
+
+
+def test_the_filter_does_not_fail_open_onto_a_real_file():
+    """An anchored real file the submission never touched still bounces, and the tuple
+    the submitter is shown is that file."""
+    found = [anchored("src/app.py")]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"notes/notes.py": "1"},
+        {"notes/notes.py": "9"}, exists=lambda p: p == "src/app.py") == ("src/app.py",)
+
+
+def test_with_no_predicate_the_two_maps_are_the_only_test():
+    """`exists=None` means there is no filesystem source: a path in `before` or `now` is
+    kept exactly as before, one in neither is not."""
+    found = [{"file": "", "title": "a/b.py is wrong", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found,
+        {"a/b.py": "1"}, {"a/b.py": "1", "a/z.py": "9"}) == ("a/b.py",)
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"a/z.py": "1"}, {"a/z.py": "9"}) is None
+
+
+def test_the_returned_tuple_is_the_filtered_list():
+    """Only the surviving citations reach the bounce message — a path nothing can find
+    would read to the submitter as a file they must change."""
+    found = [anchored("src/app.py"),
+             {"file": "", "title": "and docs/superpowers/specs/x.md", "detail": ""}]
+    assert validation.unanswered_submission(
+        {"outcome": "rejected"}, found, {"notes/notes.py": "1"},
+        {"notes/notes.py": "9"}, exists=lambda p: p == "src/app.py") == ("src/app.py",)
+
+
 def test_changed_since_counts_a_deleted_path():
     before, now = {"a.py": "1", "b.py": "2"}, {"a.py": "9"}
     assert evidence.changed_since(before, now) == frozenset({"a.py", "b.py"})
@@ -142,9 +216,11 @@ def test_the_short_citation_reaches_the_rule_and_not_just_the_helper():
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"a.py": "1"},
         {"src/jarvis/budget.py": "2"}) is None
+    # `exists` keeps it: a short citation for a file that IS there is a citation, and
+    # only a path no source can find is dropped (spec §5).
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"a.py": "1"},
-        {"src/jarvis/budgets.py": "2"}) == ("jarvis/budget.py",)
+        {"src/jarvis/budgets.py": "2"}, exists=lambda p: True) == ("jarvis/budget.py",)
 
 
 def test_one_cited_path_touched_is_enough():
@@ -301,6 +377,22 @@ def test_the_bounce_goes_back_to_the_worker_as_feedback(fleet):
     assert env["to_role"] == "implementor"
     assert "src/app.py" in payload["reason"]
     assert "no round was spent" in payload["reason"]
+
+
+def test_a_citation_absent_from_the_worktree_reaches_the_panel(fleet):
+    """The fleet half of the real-file filter: `ops.unanswered_paths` resolves the work
+    order's worktree and passes `exists`, so a round whose only citation is a path that
+    is not in the tree bounces nothing (spec §5)."""
+    wo = fleet.dispatch()
+    v = rejected_once(fleet, wo["id"], "docs/superpowers/specs/x.md")
+    v.outcomes = [passed()]
+
+    edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")
+    finish(fleet, wo["id"])
+    fleet.drain()
+
+    assert not events(fleet, wo["id"], "validation_bounced")
+    assert len(v.calls) == 2
 
 
 def test_touching_a_cited_path_reaches_the_panel(fleet):

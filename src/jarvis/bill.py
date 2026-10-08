@@ -97,7 +97,7 @@ PAYLOAD_VERSION = 5
 #: one thing: the worker's own conversation, what Jarvis spent thinking about the order
 #: while the worker slept, what the worker's own tool calls spawned beneath it, and what
 #: the user spent LOOKING at the order rather than doing it (§10 of
-#: docs/specs/2026-09-24-order-observability.md).
+#: docs/superpowers/specs/2026-09-24-order-observability.md).
 WORKER, JARVIS, SUBPROC = "worker", "jarvis", "subprocesses"
 OBSERVE = "observability"
 
@@ -1030,7 +1030,7 @@ def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
     — no reading was taken, so there is none to be old.
 
     AN OBSERVABILITY ROW IS SKIPPED FOR THAT SAME REASON, envelope or not (§10 of
-    docs/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
+    docs/superpowers/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
     its `wall_ms`-and-zeros envelope carries no reading that could be old, and counting it
     as version 1 would make every bill holding one disclose an under-reading that is not
     there.

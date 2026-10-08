@@ -6,8 +6,10 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -217,6 +219,56 @@ def fmt_ts(ts: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _offset_param(raw: str) -> int:
+    """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI.
+
+    §3 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: a framework 422 on
+    a cost page is a dead end, and a silent fallback to the current window would report
+    one window while the reader believes they picked another.
+    """
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        raise ops.OpsError(f"offset must be a whole number of windows — {raw!r} is not "
+                           f"a number") from None
+
+
+def _window_inputs(window: dict) -> dict[str, str]:
+    """The active window as `datetime-local` values, so the custom form pre-fills.
+
+    Rendered in the window's DISPLAY zone, because the route parses the submitted
+    strings in that same zone: the page speaks ONE clock (§11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). The CLI's naive
+    `--since` is still UTC — that flag's clock is not redefined here.
+    """
+    fmt = "%Y-%m-%dT%H:%M"
+    tzinfo = ZoneInfo(window["zone"])
+    out = {key: datetime.fromtimestamp(window[key], tzinfo).strftime(fmt)
+           for key in ("since", "until")}
+    # The zone form carries a custom range with its OFFSET, so re-rendering it in a new
+    # zone moves no boundary: changing zone is display only (§11).
+    out.update({f"{key}_fixed": datetime.fromtimestamp(window[key], tzinfo).isoformat()
+                for key in ("since", "until")})
+    return out
+
+
+def _in_zone(raw: str, zone: str) -> float | str:
+    """A naive datetime-local string as the epoch it means IN `zone` (§11).
+
+    A string carrying an explicit offset is honoured as written, and anything this
+    cannot parse is handed on untouched so `fleetcost` refuses it in its own words.
+    """
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=ZoneInfo(zone))
+    return when.timestamp()
+
+
 #: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
 #: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
@@ -225,7 +277,7 @@ QUIET_PATHS = ("/api/status",)
 
 #: The same rule for polls whose path carries an id, so an exact match cannot express it:
 #: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
-#: open (spec §7 of docs/specs/2026-09-24-order-observability.md) and would bury the
+#: open (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md) and would bury the
 #: user's navigation exactly as `/api/status` did. Suffix, not prefix: the id sits in the
 #: middle.
 QUIET_SUFFIXES = ("/live",)
@@ -1279,7 +1331,7 @@ def create_app() -> FastAPI:
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
             # The retry control, and the note a press just left — §7b of
-            # docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
+            # docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
             # order that is not `failed`, so no control renders there at all. The notice
             # is REBUILT from an id this order's own record knows: a number the query
             # string invented states no fact.
@@ -1287,7 +1339,7 @@ def create_app() -> FastAPI:
             # WHAT THE OS SAVED when the last turn died, rendered directly above that
             # control: it is what the user reads before pressing the button. None keeps
             # it off every page whose turn was never harvested — §5 of
-            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
             harvest = ops.harvest_state(store, wo)
             retried_line = (ops.retry_queued_notice(int(retried))
                             if retried.isdigit()
@@ -1349,7 +1401,7 @@ def create_app() -> FastAPI:
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
     def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
         """"Show me all of the above on one page" — spec §7 of
-        docs/specs/2026-09-24-order-observability.md.
+        docs/superpowers/specs/2026-09-24-order-observability.md.
 
         DELIBERATELY NOT `?debug=1` on the page above, which means something else
         entirely (show debug-level timeline events) and is left alone.
@@ -1391,28 +1443,50 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.get("/cost", response_class=HTMLResponse)
-    def cost_page(request: Request, project: str = ""):
+    def cost_page(request: Request, project: str = "", window: str = "",
+                  offset: str = "", since: str = "", until: str = "",
+                  tz: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
 
         Its own page rather than a column on the dashboard: this reads and parses every
         session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
         dashboard re-reads itself every 15 seconds. Spend is a question someone asks
         deliberately, not one worth paying for on every pulse.
+
+        THE WINDOW IS RESOLVED ONCE and handed to both payload builders, which is what
+        makes the two halves of the page incapable of disagreeing: resolution is a
+        function of `now`, so resolving twice can straddle a boundary (§6 of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md). Every parameter is
+        a string so that a bad one comes back as the OS's own sentence rather than a
+        framework 422 — and is a REFUSAL, never a silent fallback to the week.
+
+        `?tz=` picks the DISPLAY zone and moves no boundary; it is resolved FIRST because
+        the custom range is parsed in it (§11).
         """
         try:
-            report = ops.cost_report(project=project or None)
+            # The zone FIRST: the custom form's naive datetimes are parsed in the same
+            # zone they are rendered in, so the page speaks one clock (§11).
+            zone = ops.cost_zone(tz or None, project or None)
+            picked = ops.cost_window(project=project or None, window=window or None,
+                                     offset=_offset_param(offset), tz=tz or None,
+                                     since=_in_zone(since, zone) if since else None,
+                                     until=_in_zone(until, zone) if until else None)
+            report = ops.cost_report(project=project or None, window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
         # The distribution is a SECTION of this page, so a failure to build it must not
         # take the listing down with it: the two read different databases and the
         # listing is the older, load-bearing half.
         try:
-            fleet = ops.fleet_cost(project=project or None)["fleet"]
+            fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
         except Exception:                                   # noqa: BLE001
             fleet = None
+        # Its own variable and never read out of `fleet`: losing the section must not
+        # lose the window the reader picked.
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project, fleet=fleet,
+                      project=project, fleet=fleet, window=picked,
+                      window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)
@@ -1533,7 +1607,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo/stats", response_class=HTMLResponse)
     def neo_stats_page(request: Request, project: str = "", days: int | None = None):
-        """Neo's own report — §6 of docs/specs/2026-10-01-neo-observability.md.
+        """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md.
 
         A PAGE AND NOT A SECTION OF `/neo`, per kn-a7e321bc / kn-c609211f: that page is an
         action surface, and a block counting `approval` questions among review forms
@@ -1898,7 +1972,7 @@ def create_app() -> FastAPI:
 
         `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
         rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
-        docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
         """
         back = f"/wo/{name}/{wo_id}"
         try:

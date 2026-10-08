@@ -977,12 +977,19 @@ def _dark(store) -> list:
 
 
 def _owning(monkeypatch, tmp_path, project, **kw) -> ProjectStore:
-    """A project owns the OS only by CONTAINING the running install — there is no
-    first-in-catalog fallback here (spec §3), so the install is pointed inside it."""
+    """A project IS the OS only by sharing an `origin` with the running install — by
+    origin since issue 956, and still with no first-in-catalog fallback (spec §3).
+
+    Through the cache rather than a real remote: a remote on a fixture project arms every
+    other origin-gated path in the daemon. Real `git remote get-url` is
+    `test_scheduler`'s job.
+    """
     from jarvis import schedule
 
-    monkeypatch.setattr(schedule, "__file__",
-                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
     _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
                                   "description": "the OS's own"}], **kw)
     return ProjectStore(project)
@@ -1073,8 +1080,10 @@ def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_p
 
     other = tmp_path / "other"
     (other / ".jarvis").mkdir(parents=True)
-    monkeypatch.setattr(schedule, "__file__",
-                        str(Path(project) / "src" / "jarvis" / "schedule.py"))
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, ("gonandrap", "agentic_os"))
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project),
+                        ("gonandrap", "agentic_os"))
     _register_catalog(tmp_path, [
         {"name": "proj_a", "path": str(project), "description": "the OS's own"},
         {"name": "proj_b", "path": str(other), "description": "an ordinary one"},
@@ -1089,8 +1098,9 @@ def test_a_project_that_does_not_run_the_os_is_never_reported(monkeypatch, tmp_p
     store.close()
 
 
-def test_a_catalog_with_no_project_holding_the_install_owns_nothing(tmp_path, project):
-    """§5: derived WITHOUT `os_owner`'s first-in-catalog fallback."""
+def test_a_catalog_with_no_checkout_of_this_repository_owns_nothing(tmp_path, project):
+    """§5: no first-in-catalog fallback. A project sharing no `origin` with the install
+    is not the OS, however it is listed."""
     _register_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
                                   "description": "an ordinary one"}], health=False)
     store = ProjectStore(project)
@@ -1111,6 +1121,79 @@ def test_the_dark_check_runs_every_tick(tmp_path, project):
     spot."""
     assert invariants.check_os_health_sweep_alive in invariants.INVARIANTS
     assert invariants.check_os_health_sweep_alive not in invariants.SLOW_INVARIANTS
+
+
+# -- INV-OS-IDENTITY: the OS's own project must be identifiable -------------------------
+#
+# Issue 956. `schedule.os_project` returning None makes three release guards, the
+# health-sweep invariant and the config refusal all silently inert — the failure that went
+# unnoticed for six duplicate release orders.
+
+OS_ORIGIN = "gonandrap/agentic_os"
+
+
+def _os_checkout(root, name, origin=OS_ORIGIN):
+    from jarvis.testing import make_git_project, with_origin
+
+    return with_origin(make_git_project(root, name), origin)
+
+
+def _install_in(checkout: Path, monkeypatch) -> None:
+    """Run as if the `jarvis` package being executed lived in this checkout."""
+    from jarvis import schedule
+
+    pkg = checkout / "src" / "jarvis"
+    pkg.mkdir(parents=True)
+    monkeypatch.setattr(schedule, "__file__", str(pkg / "schedule.py"))
+
+
+def test_an_ambiguous_os_identity_is_reported(tmp_path, monkeypatch, origins):
+    """Two catalog projects on one origin — a worktree listed beside its checkout. The
+    OS is in the catalog, so None here is a defect and not a deployment without one."""
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    twin = _os_checkout(tmp_path, "jarvis_os_worktree")
+    _register_catalog(tmp_path, [
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+        {"name": "jarvis_os_wt", "path": str(twin), "description": "its worktree"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    (violation,) = list(invariants.check_os_identity())
+
+    assert violation.invariant == "INV-OS-IDENTITY"
+    assert violation.level == "critical"
+    assert not violation.repaired, "which project is the OS is not the OS's to decide"
+    assert violation.context["candidates"] == ["jarvis_os", "jarvis_os_wt"]
+    assert "release" in violation.detail
+
+
+def test_a_deployment_that_drives_no_checkout_of_this_repository_is_silent(
+        tmp_path, monkeypatch, origins):
+    """A pip-installed OS whose catalog holds only other people's projects. None is the
+    right answer there, so firing would be an alarm about a correct deployment."""
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    elsewhere = _os_checkout(tmp_path, "install")
+    _register_catalog(tmp_path, [{"name": "shared_schedule", "path": str(other),
+                                  "description": "not the OS"}])
+    _install_in(elsewhere, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_identity_resolved_to_one_project_is_silent(tmp_path, monkeypatch, origins):
+    dev = _os_checkout(tmp_path, "jarvis_os")
+    other = _os_checkout(tmp_path, "shared_schedule", "gonandrap/shared_schedule")
+    _register_catalog(tmp_path, [
+        {"name": "shared_schedule", "path": str(other), "description": "not the OS"},
+        {"name": "jarvis_os", "path": str(dev), "description": "the OS's own"},
+    ])
+    _install_in(dev, monkeypatch)
+
+    assert list(invariants.check_os_identity()) == []
+
+
+def test_the_identity_check_is_an_os_level_one():
+    assert invariants.check_os_identity in invariants.OS_INVARIANTS
 
 
 def test_the_notification_carries_the_violations_own_level(tmp_path, project,
@@ -1477,8 +1560,8 @@ def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
 
 
 def test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery(project):
-    """Spec §2c. `ops.refusal_answered` stays False — the finish IS the declaration —
-    and the OS gets a detector instead of a widened predicate."""
+    """Spec §2c. `ops.refusal_answered` stays False here — this round predates the
+    refusal and is not a user-rework round — and the OS gets a detector."""
     store = ProjectStore(project)
     wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
 
@@ -1545,3 +1628,107 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
     assert not reported[0].repaired
     assert reported[0].repair.startswith("would raise")
     assert store.alarms_of(wo["id"]) == []
+
+
+# -- a passed forced round answers a refusal --------------------------------------------
+# docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md
+
+FORCED = "2222222222222222222222222222222222222222"
+
+
+def _forced_round(store: ProjectStore, wo_id: str, *, outcome: str = "passed",
+                  cause: str | None = None, head: str = FORCED,
+                  carried: str = "") -> dict:
+    """The one round `ops.user_rework_pending` grants, opened after the refusal."""
+    row = store.open_validation_round(
+        wo_id=wo_id, fingerprint="fp2", uncounted=True,
+        uncounted_cause=ops.USER_REWORK_CAUSE if cause is None else cause)
+    if head:
+        store.set_validation_head(row["id"], head)
+    store.close_validation_round(row["id"], outcome, "green")
+    if carried:
+        store.carry_round_head(row["id"], carried, "base merge")
+    return store.latest_validation_round(wo_id=wo_id)
+
+
+def test_a_passed_user_rework_round_answers_the_refusal_and_lands(project):
+    """Spec §The predicate (b): the user forcing that round IS the declaration."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"])
+
+    assert ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "waiting_pr_merge"
+
+
+def test_a_rejected_user_rework_round_leaves_the_refusal_unanswered(project):
+    """Spec §What does NOT change: (b) requires `passed`."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], outcome="rejected")
+
+    assert not ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "needs_review"
+
+
+def test_a_rebind_round_never_answers_a_refusal(project):
+    """Spec §What does NOT change: the OS demanded that merge, not the user."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], cause=ops.REBIND_CAUSE)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unmoved_judged_head_does_not_answer_the_refusal(project):
+    """Spec §The head guard: a pass on the refused commit is the back door."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unrecorded_head_on_either_round_still_answers(project):
+    """Spec §The head guard: "" is never a match — the pre-0.10.0 population."""
+    store = ProjectStore(project)
+    forced_blank = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, forced_blank["id"], head="")
+    prior_blank = _refused_then_pushed(store, head=PUSHED, judged="")
+    _forced_round(store, prior_blank["id"], head=DELIVERED)
+
+    assert ops.refusal_answered(store, forced_blank["id"])
+    assert ops.refusal_answered(store, prior_blank["id"])
+
+
+def test_a_round_settled_before_the_refusal_does_not_answer_it(project):
+    """Spec §The predicate: the newest counted round must be newer than the cut."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_a_carried_head_equal_to_the_refused_one_does_not_answer(project):
+    """Spec §The head guard: `validated_head` is the read, so the carry is the head."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=FORCED, carried=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_the_undeclared_delivery_detector_follows_the_widened_predicate(project):
+    """Spec §`invariants.undeclared_delivery`: it keeps CALLING the predicate, so an
+    answered refusal stops the nudge. A rejected forced round leaves the refusal
+    unanswered (asserted above) but records no `validated_head`, so `judged_heads` is
+    empty and the detector's own empty-set guard answers first — the True half is
+    `test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery`."""
+    store = ProjectStore(project)
+    answered = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, answered["id"])
+
+    assert not invariants.undeclared_delivery(store, store.get_work_order(
+        answered["id"]))

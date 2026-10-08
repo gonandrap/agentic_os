@@ -72,7 +72,7 @@ def bash_first_env(bash_first: str) -> dict[str, str]:
 
 
 # Whether Claude Code DEFERS MCP tools behind `ToolSearch` or lists them with full
-# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md records the probes.
+# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md records the probes.
 TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 
@@ -213,6 +213,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Whether `hooks.py_nav_decision` refuses a source-navigating Bash call at a
         # `.py` path (spec 2026-10-02-serena-the-cheap-path.md §6).
         "JARVIS_PY_NAV_HOOK": project.worker.py_nav_hook,
+        # Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a
+        # SPEC, and the line bar both of its arms share (spec §5 of
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). The bar is the RESOLVED
+        # number — `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES` is only its fallback —
+        # and travels as a STRING because Claude Code's settings `env` is a
+        # `Record<string,string>`, like `MCP_TOOL_TIMEOUT` below.
+        "JARVIS_DOC_NAV_HOOK": project.worker.doc_nav_hook,
+        "JARVIS_DOC_READ_LIMIT_LINES": str(project.worker.doc_read_limit_lines),
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
         # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog
@@ -461,8 +469,12 @@ def build_worker_prompt(wo: dict[str, Any], project: ProjectSpec,
                f"is the source of truth for WHAT to build. It is materialised at "
                f"{design_doc['section_path']}: read it first.",
                ] if design_doc.get("section_path") else []),
-            *([f"The whole spec is at {design_doc['path']} if the section is not enough. "
-               f"Both are read-only snapshots; the authoritative copy is on the "
+            # Spec 2026-10-06-navigate-specs-like-code.md §6: the path is an ARGUMENT.
+            *([f"The whole spec is snapshotted at {design_doc['path']} — navigate it, "
+               f"never open it whole: `jarvis spec toc <path>` for its headings, "
+               f"`jarvis spec section <path> <n|name>` for another section, "
+               f"`jarvis spec search \"<words>\"` to find which spec covers a thing. "
+               f"Both files are read-only snapshots; the authoritative copy is on the "
                f"planner's branch.",
                ] if design_doc.get("path") else []),
         ] if design_doc else []),
@@ -623,9 +635,11 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         "```json",
         "{",
         '  "summary": "one line: what this feature is, once it is all done",',
-        '  "design_doc": "docs/specs/<feature>.md — the spec you wrote, relative to the '
-        'repo root. REQUIRED, and it must already be COMMITTED on your branch — the '
-        'reviewer is sent the committed text, never your working tree",',
+        '  "design_doc": "docs/superpowers/specs/<feature>.md — the spec you wrote. '
+        'Specs live ONLY in docs/superpowers/specs/; never create another spec '
+        'directory. Relative to the repo root, REQUIRED, and it must already be '
+        'COMMITTED on your branch — the reviewer is sent the committed text, never '
+        'your working tree",',
         '  "justification": "only if you exceed the child cap — why it cannot be fewer",',
         '  "children": [',
         "    {",
@@ -648,8 +662,9 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"merged.",
         "",
         "## THE SPEC IS THE DELIVERABLE. The plan is an index into it.",
-        "Write the feature's spec FIRST — a markdown file in your worktree (convention: "
-        "`docs/`), with numbered sections — and name it in `design_doc`. Commit it "
+        "Write the feature's spec FIRST — a markdown file in your worktree at "
+        "`docs/superpowers/specs/<YYYY-MM-DD>-<slug>.md`, the ONE directory specs live "
+        "in — with numbered sections, and name it in `design_doc`. Commit it "
         "before you submit; a plan that names no spec, or names one that is not "
         "committed on your branch, is refused — writing the file is not enough, the "
         "reviewer only ever sees the committed text. Everything you know because you "
@@ -728,7 +743,7 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
         f"recover from by revising the decomposition. A question is one paragraph: the "
         f"decision, the options, your recommendation — arguing from your design "
         f"document by section in-text (e.g. `from section 3 of design doc "
-        f"\"docs/specs/feature.md\": …`), never by pasting it; the referenced section "
+        f"\"docs/superpowers/specs/feature.md\": …`), never by pasting it; the referenced section "
         f"is delivered to whoever answers automatically.",
         f"- `jarvis wo assume {wo['id']} \"...\"` for a call you made with NO doubt. "
         f"Record every one, including the small ones.",
@@ -744,6 +759,11 @@ def _planner_prompt(wo: dict[str, Any], project: ProjectSpec,
            f"`jarvis learn show <id>` returns the body. A plan built "
            f"without it will hand children the lessons the fleet already paid for, "
            f"again."] if knowledge else []),
+        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        "- NAVIGATE the specs you read, never open one whole — you are the fleet's "
+        "heaviest spec reader: `jarvis spec toc <path>` for the headings, "
+        "`jarvis spec section <path> <n|name>` for the one section you need, "
+        "`jarvis spec search \"<words>\"` to find which spec says a thing.",
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project.name} --topic \"<topic>\"`.",
         f"- Alert the human when needed: `jarvis notify --project {project.name} "
@@ -1470,7 +1490,7 @@ def dispatch_work_order(
     # site holding the `KnowledgeBrief` the knowledge block is measured from
     # (`worker_session._launch` records every other turn). The briefing comes back from
     # `start` rather than being rebuilt — `briefing_for` REWRITES the worker settings
-    # file, and a measurement must not have side effects. Spec docs/specs/
+    # file, and a measurement must not have side effects. Spec docs/superpowers/specs/
     # 2026-09-24-order-observability.md §5.
     if turn["seq"] == 1:
         # `worktree` is written by `start` above, AFTER the row this `wo` was read from —

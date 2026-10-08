@@ -937,7 +937,7 @@ def test_the_invariant_closes_an_abandoned_proposal_and_leaves_a_live_one_alone(
 
 # -- 6. §4 of the self-evolution spec: the parameter schema and the precondition --------
 #
-# docs/specs/2026-09-27-self-evolution.md §4. The six new primitives each WRAP an
+# docs/superpowers/specs/2026-09-27-self-evolution.md §4. The six new primitives each WRAP an
 # existing call rather than reimplementing one, so what is graded here is the seam the
 # rest of the feature stands on — `params` (Neo 904), `can_apply`, and the closed tables
 # that keep both honest. THE FIVE ACTING HANDLERS ARE TESTED BELOW TOO
@@ -1172,7 +1172,7 @@ def test_drop_hold_refuses_every_cause_but_the_gate_by_name(project):
 
 def test_raise_attention_takes_a_template_key_and_refuses_an_unknown_one_three_ways(
         project):
-    """§4 of docs/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
+    """§4 of docs/superpowers/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
     `raise_attention` RENDERS its reason and never relays one. The parameter is a key from
     a closed tuple, so an unknown key must be refused at every one of the three doors —
     and the first of them, `check_params`, is the insert-time refusal the correction asks

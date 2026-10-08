@@ -1,6 +1,6 @@
 """The debugging page — `GET /wo/{name}/{wo_id}/debug` — and the JSON the poll reads.
 
-§7 of docs/specs/2026-09-24-order-observability.md. The four payloads (`ops.diagnose`,
+§7 of docs/superpowers/specs/2026-09-24-order-observability.md. The four payloads (`ops.diagnose`,
 `ops.live_report`, `ops.inspect_report`, `ops.context_report`) are each covered by their
 own file; what is left here is the two ways ONE page over four readings can lie:
 

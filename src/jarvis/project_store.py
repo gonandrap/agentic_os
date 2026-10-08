@@ -1017,7 +1017,7 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     -- WHAT JARVIS PUT IN THIS TURN'S CONTEXT WINDOW, per ingredient: the appended system
     -- prompt, the prompt, the knowledge index, the settings file, the memory files, the
     -- persona, the --add-dir trees and the MCP server set, each with bytes and an
-    -- ESTIMATED token count (`context.payload`; spec docs/specs/
+    -- ESTIMATED token count (`context.payload`; spec docs/superpowers/specs/
     -- 2026-09-24-order-observability.md §5). One blob per turn, same lifetime and same
     -- owner as the row, which is why it is a column and not a table.
     -- NULL means "not recorded" — a turn that ran before this landed, or one whose
@@ -1160,7 +1160,7 @@ ADDED_COLUMNS = {
         # for "this order has no answer", which is `budget_usd`'s precedent and what every
         # row written before this existed says. NULL is NOT `off`: it falls through to the
         # project config (`observability.level_for`). See
-        # docs/specs/2026-09-24-order-observability.md §10 for the one write it gates.
+        # docs/superpowers/specs/2026-09-24-order-observability.md §10 for the one write it gates.
         "observability": "TEXT",
         "job_id": "TEXT",
         "reply_job_id": "TEXT",
@@ -1241,7 +1241,7 @@ ADDED_COLUMNS = {
         # schedule, so an order inspected later reports a clock that got SHORTER as its
         # evidence aged. NULL means not sealed yet: an open order, one that settled before
         # this column existed, or one the observability level did not record (§3 of
-        # docs/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
+        # docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
         # no `feature_orders` twin: a feature's autopsy is read by reading its children's.
         "autopsy_json": "TEXT",
         "autopsy_sealed_at": "REAL",
@@ -2153,13 +2153,27 @@ class ProjectStore:
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
+        active_between: tuple[float, float] | None = None,
     ) -> list[dict[str, Any]]:
+        """Work orders, newest first.
+
+        `active_between` is a half-open window of TURN time, for a cost report over one
+        usage week — and it is applied HERE rather than in Python because the clause has
+        to run BEFORE `LIMIT`: filtering the page would report an empty last week as
+        soon as a project has `limit` newer orders (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+        """
         conds, params = [], []
         if statuses:
             conds.append(f"status IN ({','.join('?' for _ in statuses)})")
             params.extend(statuses)
         if not include_hidden:
             conds.append("hidden=0")
+        if active_between is not None:
+            conds.append("""EXISTS (SELECT 1 FROM wo_turns t WHERE t.wo_id =
+                                    work_orders.id AND t.started_at >= ?
+                                    AND t.started_at < ?)""")
+            params.extend(active_between)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
@@ -2584,6 +2598,30 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def settled_release_orders(self, since: float,
+                               limit: int = 20) -> list[dict[str, Any]]:
+        """Settled orders carrying a release batch, newest settlement first.
+
+        `Daemon.refile_dropped_fixes`' population (issue #945 spec §2.2). `status` is
+        indexed and the batch test runs in SQLite, so no row's metadata is parsed in
+        Python unless it is a release order inside the window.
+
+        `'$.release_for_issues'` is `release.BATCH_KEY`'s JSON path, spelled out because a
+        path interpolated from the constant defeats the statement cache.
+
+        `cancelled` is EXCLUDED: a cancelled release is the user stopping a release, and
+        re-filing its batch would overrule them. The `CASE WHEN json_valid` guard is
+        `stale_autopsy_orders`', for its reason.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE status IN ('completed', 'failed')"
+            " AND updated_at >= ?"
+            " AND CASE WHEN json_valid(metadata)"
+            "     THEN json_extract(metadata, '$.release_for_issues') IS NOT NULL"
+            "     ELSE 0 END"
+            " ORDER BY updated_at DESC LIMIT ?", (since, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def seal_autopsy(self, order_id: str, payload_json: str, *,
                      at: float | None = None) -> None:
         """Freeze one work order's autopsy.
@@ -2600,7 +2638,7 @@ class ProjectStore:
 
         ITS OWN QUERY and not `unsealed_terminal_orders`, whose predicate is `bill_json IS
         NULL`: sharing one would let a bill that cannot be computed stop autopsies too (§3
-        of docs/specs/2026-09-27-order-autopsy-durability.md).
+        of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md).
         """
         marks = ", ".join("?" for _ in TERMINAL_STATUSES)
         rows = self.conn.execute(
@@ -2612,7 +2650,7 @@ class ProjectStore:
                              limit: int = 5) -> list[dict[str, Any]]:
         """Settled orders whose sealed autopsy predates `version` — oldest first, bounded.
 
-        The other half of §3 of docs/specs/2026-09-27-order-autopsy-durability.md: the
+        The other half of §3 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: the
         WRITER re-seals, so a stale payload repairs itself on a tick instead of waiting
         for a reader to happen by.
 
@@ -2760,7 +2798,7 @@ class ProjectStore:
 
     def set_observability(self, wo_id: str, level: str | None) -> None:
         """Set this order's debug-collection level, or None to clear it back to "no
-        answer" (§10 of docs/specs/2026-09-24-order-observability.md).
+        answer" (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 
         The vocabulary is validated HERE and not at the surface: a level outside it would
         fall through the resolver silently and leave the user believing they had changed

@@ -1,6 +1,6 @@
 """A dispatched worker's first Serena call must not fail with `No active project`.
 
-Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5. The Claude Code plugin starts the
+Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5. The Claude Code plugin starts the
 Serena MCP server with fixed args carrying neither `--project` nor `--project-from-cwd`,
 and no Serena env var selects a project — so the first `find_symbol` of a dispatched turn
 fails and the worker falls back to grep. Jarvis therefore injects the activation call at

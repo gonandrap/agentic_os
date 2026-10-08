@@ -550,6 +550,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="start of the window, a date or ISO datetime "
                          "(default: this Claude usage week; naive = UTC)")
     sp.add_argument("--until", type=_when, help="end of the window, exclusive")
+    # The window SELECTOR, beside the raw range rather than instead of it — §6 of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    sp.add_argument("--window", choices=["week", "5h"],
+                    help="which window to report over: the Claude usage week, or one 5h "
+                         "SLICE of it anchored on the weekly reset (nothing records "
+                         "Claude's own session boundary, so a 5h window is not a claim "
+                         "about its session accounting)")
+    sp.add_argument("--offset", type=int, default=0,
+                    help="step back whole windows: 0 is the current one, -1 the "
+                         "previous (--fleet only; 0 or negative)")
+    # §11 of the same spec: DISPLAY only, so the CLI label and the page label agree.
+    sp.add_argument("--tz", help="IANA time zone to DISPLAY the window in (default: the "
+                                 "catalog's cost.week_reset_zone). No boundary moves, "
+                                 "and --since/--until are still read as UTC when naive")
     sp.add_argument("--project", help="one project instead of the whole fleet "
                                       "(--fleet only)")
     sp.add_argument("--json", action="store_true")
@@ -618,6 +632,49 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--kind", action="append", choices=list(SEARCH_KINDS),
                     help="restrict to one kind; repeatable")
     sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
+    sp.add_argument("--json", action="store_true")
+
+    # §4.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: these three spellings are
+    # a contract two sibling sections quote verbatim.
+    spec_p = sub.add_parser(
+        "spec",
+        help="read a markdown document the way code is read — list its sections, open "
+             "one, or find which section says a thing",
+    ).add_subparsers(dest="spec_cmd", required=True)
+
+    sp = spec_p.add_parser("toc", help="every heading of one document, with an ESTIMATE "
+                                       "of each section's size")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser("section", help="one section of one document, by number or by "
+                                           "heading substring")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("which", help="a section number (`4`, `4.2`) or part of its heading")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser(
+        "search",
+        help="which SECTIONS of this project's documents contain every word — the next "
+             "step is `jarvis spec section`, and each hit prints it",
+        description="Every whitespace-separated word must appear in a line, "
+                    "case-insensitively, and the SECTION containing it is reported once. "
+                    "One project at a time: there is no --all and no comma-separated "
+                    "list. KEEP SHELL METACHARACTERS OUT OF THE QUERY: a command "
+                    "containing | ; ` $ < or > is refused by "
+                    "hooks.is_jarvis_command_chain, so it stops being auto-allowed and "
+                    "prompts instead — which stalls a background worker.",
+    )
+    sp.add_argument("words", help="the words to look for, quoted")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--limit", type=int, default=40, help="hits to show (default: 40)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
@@ -759,7 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    # §9.2 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
                                    "on a failed order this also revives the session; "
                                    "`wo retry` is the named form")
@@ -869,7 +926,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
 
-    # §9.1 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §9.1 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
                                      "the named form of `wo send`'s revive. Nothing "
                                      "automatic: a turn that died with no result is "
@@ -1222,7 +1279,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--project")
 
     # rules (the self-healing detector/remedy registry) ----------------------------------
-    # docs/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
     # a verb under `jarvis gate`: that family answers "what counts as privileged", this
     # one answers "what does the OS recognise as its own recurring gap", and one verb
     # meaning two registries is how `jarvis gate rules` stops being readable. The
@@ -2489,13 +2546,22 @@ def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
                  f"({row['code_nav_bash_calls']} on code)  "
                  f"{row['read_tool_calls']:>4} Read"
                  if payload.get("calls_reported", True) else "")
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
+        # the payload's flag, BYTE counters always.
+        doc_calls = (f"  {row['whole_file_read_calls']:>4} whole-file Read  "
+                     f"{row['doc_dump_bash_calls']:>4} doc dumps"
+                     if payload.get("calls_reported", True) else "")
         print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
-              f"{row['transcripts']:>4} transcripts{calls}")
+              f"{row['transcripts']:>4} transcripts{calls}{doc_calls}")
         print(f"{indent}           code reads via bash: {share_text} of "
               f"{_tok(row['result_bytes'])} bytes of tool results"
               + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
                  if row["unattributed_bytes"] else ""))
+        print(f"{indent}           docs: {_tok(row['doc_read_bytes'])} bytes via Read · "
+              f"{_tok(row['doc_dump_bash_bytes'])} bytes dumped via bash · "
+              f"{_tok(row['read_tool_bytes'])} bytes of Read results")
     print(f"{indent}  {payload['before']}")
+    print(f"{indent}  {payload['doc_before']}")
 
 
 def cmd_navigation(args: argparse.Namespace) -> int:
@@ -2717,6 +2783,53 @@ def cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_spec(args: argparse.Namespace) -> int:
+    """`jarvis spec toc | section | search` — §4.2 of the navigate-specs-like-code spec.
+
+    THIS RENDERER DERIVES NOTHING: every ref, every command and every size is a value out
+    of the `ops.spec_*` payload, so the terminal and `--json` cannot disagree about what
+    the next call is.
+    """
+    from . import ops
+
+    if args.spec_cmd == "toc":
+        out = ops.spec_toc(args.path, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['tokens_estimate']} tokens (estimate)")
+        for row in out["sections"]:
+            print(f"  {'  ' * (row['level'] - 1)}{row['name']}  "
+                  f"line {row['line']}  ~{row['tokens_estimate']} tokens (estimate)")
+            print(f"  {'  ' * (row['level'] - 1)}  {row['command']}")
+        return 0
+
+    if args.spec_cmd == "section":
+        out = ops.spec_section(args.path, args.which, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['which']} — {out['tokens_estimate']} tokens "
+              f"(estimate)")
+        print(out["content"])
+        return 0
+
+    out = ops.spec_search(args.words, args.project, limit=args.limit)
+    if args.json:
+        _print(out, True)
+        return 0
+    if not out["hits"]:
+        print(f"nothing in {out['project']} matches {out['words']!r}")
+        return 0
+    print(f"{out['count']} section(s) in {out['project']}"
+          + (f" — capped at --limit {out['limit']}" if out["truncated"] else ""))
+    for hit in out["hits"]:
+        print(f"\n{hit['path']}  line {hit['line']}")
+        print(f"  {hit['context']}")
+        print(f"  {hit['command']}")
+    return 0
+
+
 def cmd_issues(args: argparse.Namespace) -> int:
     """Which tracker issues the fleet keeps running into — the priority signal.
 
@@ -2910,7 +3023,9 @@ def cmd_cost(args: argparse.Namespace) -> int:
     # a section, it does not reshape a row (spec §5).
     if getattr(args, "fleet", False):
         payload = ops.fleet_cost(project=args.project or target or None,
-                                 since=args.since, until=args.until)
+                                 since=args.since, until=args.until,
+                                 window=args.window, offset=args.offset,
+                                 tz=args.tz)
         if args.json:
             _print(payload, True)
             return 0
@@ -3012,6 +3127,11 @@ def cmd_cost(args: argparse.Namespace) -> int:
             print(f"               {cause.strip()}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Silence when zero: nothing was excluded, so there is nothing to disclose (§5c of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    if totals.get("undated_messages"):
+        print(f"  {totals['undated_messages']} transcript messages carried no readable "
+              f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
@@ -3025,7 +3145,7 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"\nEvery figure above is {res['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
     # Money is all this command has ever shown, and the complaint behind spec §7 of
-    # docs/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
+    # docs/superpowers/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
     print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
           "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
@@ -3119,6 +3239,10 @@ def _print_fleet(fleet: dict) -> None:
     orders = fleet["orders"]
     print(f"{fleet['scope']} — {fleet['window']['label']} "
           f"({fleet['window']['source']})")
+    # Both clocks: UTC is what `agent_calls.ts` is comparable to, the local one is what
+    # the reset is specified in (§4).
+    if fleet["window"].get("local_label"):
+        print(f"  {fleet['window']['local_label']}")
     print(f"{orders['n']} order{'s' if orders['n'] != 1 else ''} with a turn in the "
           f"window · {orders['live']} live · {orders['truncated']} truncated by it · "
           f"{orders['excluded_no_turns']} with no turn in it\n")
@@ -3235,7 +3359,7 @@ def _budget_arg(args: argparse.Namespace) -> float | None:
 def _print_context(res: dict[str, Any]) -> None:
     """`jarvis wo context` for a human. DERIVES NOTHING: every number and every sentence
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
-    (spec docs/specs/2026-09-24-order-observability.md §5)."""
+    (spec docs/superpowers/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
     # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
     # the one who most needs to know which reading was consulted.
@@ -3420,7 +3544,7 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # WHAT THE OS READ OFF DISK when this order's latest turn died without
                 # writing a result. Same never-always rule: no line at all for a turn
                 # that was never harvested — spec §5 of
-                # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+                # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
                 **({"harvest": h} if (h := ops.harvest_state(store, wo)) else {}),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
@@ -4641,7 +4765,7 @@ def _pct(rate: float | None) -> str:
     """A rate as a percentage, or "not recorded" — NEVER `0%` for an absent one.
 
     Zero settled questions and zero escalations are different answers (spec §4's zero
-    rule, docs/specs/2026-10-01-neo-observability.md).
+    rule, docs/superpowers/specs/2026-10-01-neo-observability.md).
     """
     return NOT_RECORDED if rate is None else f"{rate * 100:.0f}%"
 
@@ -4691,7 +4815,7 @@ def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
           "answers")
     # Three labelled groups, each with the sentence that says what the class means. A flat
     # list of fifteen labels would not answer the question the report exists for (§3 of
-    # docs/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
+    # docs/superpowers/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
     groups = (("chosen", "Neo chose to hand it back", "Neo chose this label"),
               ("overridden", "Neo answered and the OS overrode it",
                "the OS derived it from Neo's answer"),
@@ -5293,6 +5417,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_alarms(args)
         if args.cmd == "search":
             return cmd_search(args)
+        if args.cmd == "spec":
+            return cmd_spec(args)
         if args.cmd == "issues":
             return (cmd_issues_start(args) if args.issues_cmd == "start"
                     else cmd_issues(args))

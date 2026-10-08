@@ -115,7 +115,7 @@ def test_absent_and_null_are_different():
 
 
 def test_tool_search_defaults_and_overrides_per_project():
-    """§4 of docs/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
+    """§4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
     fleet-wide with a per-project override. The default PINS DEFERRAL ON — deferral is
     what makes a worker's first navigation call a symbol call (7/7 deferred against 1/10
     with the tools present, wo-ab5d81db), so `cli` would leave that outcome to a vendor
@@ -153,7 +153,7 @@ def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
 
 
 def test_py_nav_hook_defaults_off_and_overrides_per_project():
-    """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
+    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
     `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
     entirely Jarvis's own. Default OFF: the hook measures ZERO contribution to first-call
     order, and on fleet-wide a worker cannot search the tree for ANY text (issue 936);
@@ -641,7 +641,7 @@ def test_worker_require_crew_parsed():
 
 # -- observability: what debug data is COLLECTED ----------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
 # §5's per-turn ingredient row, and no read.
 
 
@@ -877,6 +877,19 @@ def test_cost_defaults_ship_on_both_config_objects(tmp_path):
         # cap of the tool table, both catalog settings for the same stated reason.
         assert cfg.chars_per_token == 4.0
         assert cfg.tool_rows == 20
+        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's
+        # length is a belief about the usage grid, so it is a setting and not a constant.
+        assert cfg.session_window_hours == 5.0
+
+
+def test_a_non_positive_session_window_hours_is_refused():
+    """A fractional length is a legal belief about the grid; zero is not a length."""
+    for bad in (0, -1, -2.5):
+        with pytest.raises(CatalogError, match="session_window_hours must be > 0"):
+            parse_catalog({"os": {"cost": {"session_window_hours": bad}},
+                           "projects": []})
+    assert parse_catalog({"os": {"cost": {"session_window_hours": 2.5}},
+                          "projects": []}).os.cost.session_window_hours == 2.5
 
 
 def test_a_non_positive_chars_per_token_is_refused():
@@ -975,3 +988,30 @@ def test_cost_paths_have_an_explicit_apply_class():
     assert any(glob == "*.cost.*" for glob, _ in ops.APPLY_RULES)
     assert ops.apply_class("os.cost.percentile") == "hot"
     assert ops.apply_class("projects.a.cost.week_reset_hour") == "hot"
+
+
+def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide():
+    """§4 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md:
+    how long the reconciler waits for a merged child's commit to appear on the default
+    branch is a per-project habit, so it is a catalog key with this block's ordinary
+    field-level fallback rather than a module constant."""
+    assert (parse_catalog({"projects": []}).os.validation.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    inherits, own = projects_validation(
+        {"feature_merge_wait_minutes": 30}, {},
+        {"validation": {"feature_merge_wait_minutes": 5}})
+    assert inherits.feature_merge_wait_minutes == 30
+    assert own.feature_merge_wait_minutes == 5
+
+    [silent] = projects_validation(None, {})
+    assert (silent.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    # 0 is legal and means "never defer": check once, flag immediately.
+    assert validation_of(
+        {"feature_merge_wait_minutes": 0}).feature_merge_wait_minutes == 0
+    with pytest.raises(CatalogError,
+                       match="os.validation.feature_merge_wait_minutes must be >= 0"):
+        validation_of({"feature_merge_wait_minutes": -1})
