@@ -1560,8 +1560,8 @@ def _refused_then_pushed(store: ProjectStore, *, head: str, judged: str,
 
 
 def test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery(project):
-    """Spec §2c. `ops.refusal_answered` stays False — the finish IS the declaration —
-    and the OS gets a detector instead of a widened predicate."""
+    """Spec §2c. `ops.refusal_answered` stays False here — this round predates the
+    refusal and is not a user-rework round — and the OS gets a detector."""
     store = ProjectStore(project)
     wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
 
@@ -1628,3 +1628,107 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
     assert not reported[0].repaired
     assert reported[0].repair.startswith("would raise")
     assert store.alarms_of(wo["id"]) == []
+
+
+# -- a passed forced round answers a refusal --------------------------------------------
+# docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md
+
+FORCED = "2222222222222222222222222222222222222222"
+
+
+def _forced_round(store: ProjectStore, wo_id: str, *, outcome: str = "passed",
+                  cause: str | None = None, head: str = FORCED,
+                  carried: str = "") -> dict:
+    """The one round `ops.user_rework_pending` grants, opened after the refusal."""
+    row = store.open_validation_round(
+        wo_id=wo_id, fingerprint="fp2", uncounted=True,
+        uncounted_cause=ops.USER_REWORK_CAUSE if cause is None else cause)
+    if head:
+        store.set_validation_head(row["id"], head)
+    store.close_validation_round(row["id"], outcome, "green")
+    if carried:
+        store.carry_round_head(row["id"], carried, "base merge")
+    return store.latest_validation_round(wo_id=wo_id)
+
+
+def test_a_passed_user_rework_round_answers_the_refusal_and_lands(project):
+    """Spec §The predicate (b): the user forcing that round IS the declaration."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"])
+
+    assert ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "waiting_pr_merge"
+
+
+def test_a_rejected_user_rework_round_leaves_the_refusal_unanswered(project):
+    """Spec §What does NOT change: (b) requires `passed`."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], outcome="rejected")
+
+    assert not ops.refusal_answered(store, wo["id"])
+    assert ops.land_when_cleared(store, store.get_work_order(wo["id"]),
+                                 "https://example/pull/2") == "needs_review"
+
+
+def test_a_rebind_round_never_answers_a_refusal(project):
+    """Spec §What does NOT change: the OS demanded that merge, not the user."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], cause=ops.REBIND_CAUSE)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unmoved_judged_head_does_not_answer_the_refusal(project):
+    """Spec §The head guard: a pass on the refused commit is the back door."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_an_unrecorded_head_on_either_round_still_answers(project):
+    """Spec §The head guard: "" is never a match — the pre-0.10.0 population."""
+    store = ProjectStore(project)
+    forced_blank = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, forced_blank["id"], head="")
+    prior_blank = _refused_then_pushed(store, head=PUSHED, judged="")
+    _forced_round(store, prior_blank["id"], head=DELIVERED)
+
+    assert ops.refusal_answered(store, forced_blank["id"])
+    assert ops.refusal_answered(store, prior_blank["id"])
+
+
+def test_a_round_settled_before_the_refusal_does_not_answer_it(project):
+    """Spec §The predicate: the newest counted round must be newer than the cut."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_a_carried_head_equal_to_the_refused_one_does_not_answer(project):
+    """Spec §The head guard: `validated_head` is the read, so the carry is the head."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, wo["id"], head=FORCED, carried=DELIVERED)
+
+    assert not ops.refusal_answered(store, wo["id"])
+
+
+def test_the_undeclared_delivery_detector_follows_the_widened_predicate(project):
+    """Spec §`invariants.undeclared_delivery`: it keeps CALLING the predicate, so an
+    answered refusal stops the nudge. A rejected forced round leaves the refusal
+    unanswered (asserted above) but records no `validated_head`, so `judged_heads` is
+    empty and the detector's own empty-set guard answers first — the True half is
+    `test_commits_past_the_judged_head_with_no_finish_are_an_undeclared_delivery`."""
+    store = ProjectStore(project)
+    answered = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    _forced_round(store, answered["id"])
+
+    assert not invariants.undeclared_delivery(store, store.get_work_order(
+        answered["id"]))

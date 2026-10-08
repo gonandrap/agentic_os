@@ -54,6 +54,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -5240,16 +5241,44 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     the round in the meantime would land the very decision the user turned down. Only
     reachable because the two gates now run in parallel (spec §5).
 
-    The boundary is the `finished` event, which is the same one
+    One boundary is the `finished` event, which is the same one
     `ProjectStore.review_assumption`'s round rule is read against (kn-82d853ca) — and
     why `finish` records it BEFORE it settles anything.
+
+    The other is a PASSED user-rework round: the one round `user_rework_pending` grants
+    per refusal, which the user themselves forced, guarded on the judged head having
+    moved off the commit the refused decision sat on (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
     """
     refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
                 if not db.from_json(e["payload"], {}).get("accepted", True)]
     if not refusals:
         return True
+    cut = float(refusals[-1]["ts"])
     delivered = store.events_of_kind(wo_id, "finished")
-    return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
+    if delivered and float(delivered[-1]["ts"]) > cut:
+        return True
+    # One read of the rows, like `validated_head`'s one-read rule: the guard needs the
+    # prior counted row from the same list (spec §The predicate).
+    counted = [r for r in store.validation_rounds(wo_id=wo_id)
+               if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
+    if not counted:
+        return False
+    newest = counted[-1]
+    # `validation_rounds.ts` is the round's OPEN time and nothing writes a settle one;
+    # `user_rework_pending` compares against the same column (spec §The predicate).
+    if (str(newest["outcome"] or "") != "passed"
+            or str(newest.get("uncounted_cause") or "") != USER_REWORK_CAUSE
+            or float(newest["ts"] or 0) <= cut):
+        return False
+    forced_head = ProjectStore.validated_head(newest) or ""
+    before = [r for r in counted[:-1] if float(r["ts"] or 0) <= cut]
+    prior = before[-1] if before else None
+    prior_head = ((ProjectStore.validated_head(prior) or str(prior["head_sha"] or ""))
+                  if prior is not None else "")
+    # Spec §The head guard on (b): an unmoved head is the refused decision landing by
+    # the back door; an unrecorded one is never a match.
+    return not (forced_head and forced_head == prior_head)
 
 
 def user_rework_pending(store: ProjectStore, wo_id: str) -> bool:
