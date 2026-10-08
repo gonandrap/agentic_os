@@ -20,8 +20,8 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
-from .navigation import (NAV_COMMANDS, SOURCE_SUFFIXES, SYMBOL_TOOLS,
-                         TEXT_SEARCH_TOOLS)
+from .navigation import (DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
+                         SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
@@ -942,15 +942,26 @@ DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = TEXT_SEARCH_TOOLS
 #: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
 DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 
+#: Which files make a read a DOC read. A sibling of `code_suffixes`, never a widening of
+#: it: `navigates_source`'s meaning is the fleet's published baseline (§2.2). Data rather
+#: than code so re-measuring needs no release.
+#: docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
+
+#: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
+#: search in markdown stays legal and counting it would price a legitimate call as waste.
+#: docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
+
 #: The default window for a wide scope, in days. Seven, for
 #: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
 #: reports the trend away, and the trend is the whole question after `worker.bash_first`.
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
 #: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all four the same way. An empty one reports 0% everywhere and looks like a win.
+#: refuse all six the same way. An empty one reports 0% everywhere and looks like a win.
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
-                           "code_suffixes")
+                           "code_suffixes", "doc_suffixes", "doc_dump_commands")
 
 
 @dataclass
@@ -970,6 +981,8 @@ class NavigationConfig:
     symbol_tools: tuple[str, ...] = DEFAULT_NAVIGATION_SYMBOL_TOOLS
     text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
     code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
+    doc_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_SUFFIXES
+    doc_dump_commands: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
 
 
@@ -1092,6 +1105,23 @@ class BugsConfig:
     """
 
     label: str = DEFAULT_BUGS_LABEL
+
+
+#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
+#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
+
+
+@dataclass
+class ReleaseConfig:
+    """How long a settled release order's dropped batch stays worth re-filing.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    the answer is a claim about THIS project's release cadence, and a project that ships
+    weekly has a different one from a project that ships twice a year.
+    """
+
+    refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
 @dataclass
@@ -1362,6 +1392,7 @@ class ProjectSpec:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1493,6 +1524,7 @@ class OsConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1908,14 +1940,18 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         symbol_tools=patterns("symbol_tools", base.symbol_tools),
         text_search_tools=patterns("text_search_tools", base.text_search_tools),
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
+        # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+        doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
+        doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
     )
     if cfg.window_days < 1:
         raise _err(f"{where}.window_days must be >= 1")
-    for suffix in cfg.code_suffixes:
-        if not suffix.startswith("."):
-            raise _err(f'"{where}.code_suffixes" entries must start with a dot — '
-                       f"{suffix!r} matches no path")
+    for name in ("code_suffixes", "doc_suffixes"):
+        for suffix in getattr(cfg, name):
+            if not suffix.startswith("."):
+                raise _err(f'"{where}.{name}" entries must start with a dot — '
+                           f"{suffix!r} matches no path")
     return cfg
 
 
@@ -2046,6 +2082,26 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
         raise _err(f"{where}.label must start with a letter or digit and use only "
                    f"letters, digits, spaces and ._:/- (got {label!r})")
     return BugsConfig(label=label)
+
+
+def _parse_release(raw: Any, base: ReleaseConfig | None = None,
+                   where: str = "os.release") -> ReleaseConfig:
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: a window of 0 days
+    means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or ReleaseConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = ReleaseConfig(
+        refile_window_days=int(raw.get("refile_window_days", base.refile_window_days)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
@@ -2389,6 +2445,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
@@ -2530,6 +2587,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        release_cfg = _parse_release(
+            p.get("release", {}), base=os_cfg.release,
+            where=f"projects[{i}] ({name}).release")
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
@@ -2558,6 +2618,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 supervisor=supervisor_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                release=release_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,

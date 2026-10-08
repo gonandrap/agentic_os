@@ -40,6 +40,24 @@ def store(project):
     s.close()
 
 
+@pytest.fixture(autouse=True)
+def os_identity(project, monkeypatch, origins):
+    """`proj_a` IS the OS, so `hold_red_release` runs at all: the hold is scoped to the
+    project that is the OS, by `origin` since issue 956.
+
+    Through `schedule._ORIGIN_CACHE`, not a real remote: a remote on a fixture project
+    arms every other origin-gated path in the daemon. `test_scheduler` owns the real one.
+    """
+    from pathlib import Path
+
+    from jarvis import schedule
+
+    repo = ("gonandrap", "agentic_os")
+    monkeypatch.setitem(schedule._ORIGIN_CACHE,
+                        str(Path(schedule.__file__).resolve().parent), repo)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project), repo)
+
+
 def release_order(store: ProjectStore, *, status: str = "running") -> str:
     """A release order mid-run: the batch in its metadata, no release delivered."""
     wo = store.create_work_order("Ship the fix", status=status,

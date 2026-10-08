@@ -2494,6 +2494,20 @@ def local_base(monkeypatch):
 
 
 @pytest.fixture()
+def origins():
+    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote.
+
+    The cache exists because `origin` does not move under a running daemon, which is the
+    one assumption a test adding a remote to a fresh repository breaks.
+    """
+    from . import schedule
+
+    schedule._ORIGIN_CACHE.clear()
+    yield
+    schedule._ORIGIN_CACHE.clear()
+
+
+@pytest.fixture()
 def project(tmp_path, claude_json):
     p = make_git_project(tmp_path, "proj_a")
     claude_json(p)  # trusted, like a real project the user works in
