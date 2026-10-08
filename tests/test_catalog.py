@@ -877,6 +877,19 @@ def test_cost_defaults_ship_on_both_config_objects(tmp_path):
         # cap of the tool table, both catalog settings for the same stated reason.
         assert cfg.chars_per_token == 4.0
         assert cfg.tool_rows == 20
+        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's
+        # length is a belief about the usage grid, so it is a setting and not a constant.
+        assert cfg.session_window_hours == 5.0
+
+
+def test_a_non_positive_session_window_hours_is_refused():
+    """A fractional length is a legal belief about the grid; zero is not a length."""
+    for bad in (0, -1, -2.5):
+        with pytest.raises(CatalogError, match="session_window_hours must be > 0"):
+            parse_catalog({"os": {"cost": {"session_window_hours": bad}},
+                           "projects": []})
+    assert parse_catalog({"os": {"cost": {"session_window_hours": 2.5}},
+                          "projects": []}).os.cost.session_window_hours == 2.5
 
 
 def test_a_non_positive_chars_per_token_is_refused():
