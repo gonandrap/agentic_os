@@ -3221,9 +3221,13 @@ def _live_catalog() -> Any:
 def _os_owning_project(store: ProjectStore) -> Any:
     """This store's `ProjectSpec` if it is the project that runs the OS, else None.
 
-    Derived, NEVER hardcoded: `schedule.os_owner` over the live catalog, compared on the
+    Derived, NEVER hardcoded: `schedule.os_project` over the live catalog, compared on the
     RESOLVED PATH rather than on a name, because a store knows its directory and not
     what the catalog calls it.
+
+    Identity is BY GIT ORIGIN (issue 956). Asked by path containment this check was dead
+    in production, where the running package is in the deployed checkout and no catalog
+    path contains it.
     """
     from . import schedule
 
@@ -3231,9 +3235,7 @@ def _os_owning_project(store: ProjectStore) -> Any:
     if catalog is None:
         return None
     try:
-        # §5: no fallback — an arbitrary first-in-catalog project is not the OS.
-        owner = schedule.os_owner(((p.name, p.path) for p in catalog.projects),
-                                  fallback=False)
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
         if owner is None:
             return None
         spec = catalog.project(owner)
@@ -4267,6 +4269,48 @@ def check_prefix_stable() -> Iterator[Violation]:
     )
 
 
+def check_os_identity() -> Iterator[Violation]:
+    """INV-OS-IDENTITY — the OS's own project must be identifiable.
+
+    Issue 956: `schedule.os_project` returning None makes the three release guards, the
+    health-sweep invariant and the config refusal all INERT, and inert is invisible —
+    production filed six release orders for fixes it was already running before anyone
+    looked. Every one of those callers is right to do nothing on None, so None is the
+    thing that has to be reported rather than acted on.
+
+    KEYED ON A CANDIDATE EXISTING, never on None alone: a pip-installed OS driving
+    projects that are not it has no candidate and no identity, and that deployment is
+    correct. What fires is a catalog that HOLDS a checkout of this repository while
+    identity still resolves to nothing, and AMBIGUITY is the only way that happens: two
+    or more projects on this code's origin. That is the complete set — a single candidate
+    always resolves, and a path whose origin cannot be read is never a candidate, since
+    `os_candidates` keeps only paths whose origin EQUALS this code's.
+
+    NOT repairable: which of two checkouts of this repository is the OS is the user's to
+    say, by removing one from the catalog.
+    """
+    from . import schedule
+
+    catalog = _live_catalog()
+    if catalog is None:
+        return
+    projects = [(p.name, p.path) for p in getattr(catalog, "projects", ())]
+    candidates = schedule.os_candidates(projects)
+    if not candidates or schedule.os_project(projects) is not None:
+        return
+    yield Violation(
+        invariant="INV-OS-IDENTITY",
+        detail=(f"the catalog holds {len(candidates)} projects that are checkouts of the "
+                f"OS's own repository ({', '.join(candidates)}), so which one IS the OS "
+                f"has no answer — and every caller of that question does nothing on no "
+                f"answer. The release guards file duplicate release orders for fixes "
+                f"already live, the OS's health sweep is never checked for liveness, and "
+                f"`jarvis config set` stops refusing a write that switches that sweep "
+                f"off. Leave one of them in the catalog."),
+        level="critical", context={"candidates": candidates},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
@@ -4275,6 +4319,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_production_clean,
     check_cache_ttl_trigger,
     check_prefix_stable,
+    check_os_identity,
 )
 
 
