@@ -481,7 +481,7 @@ class ToolSpan:
     detail: str = ""
     #: The tool's whole `input`, redacted and capped (`_params_of`). ADDITIVE: `detail`
     #: above is unchanged and stays the one-line answer every renderer already prints —
-    #: spec §4a, `docs/specs/2026-09-24-order-observability.md`.
+    #: spec §4a, `docs/superpowers/specs/2026-09-24-order-observability.md`.
     params: dict[str, str] = field(default_factory=dict)
     #: Keys shortened to `ParamCaps.per_value`, and keys left out because the span or
     #: turn budget ran out. Separate lists: "cut short" and "not printed" are different

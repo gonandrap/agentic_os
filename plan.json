@@ -1,6 +1,6 @@
 {
   "summary": "Markdown gets the progressive disclosure Serena gives code: jarvis spec toc/section/search, a default-off PreToolUse refusal of whole-file spec dumps, prose that points agents at the commands instead of the file, and counters that measure the result.",
-  "design_doc": "docs/specs/2026-10-06-navigate-specs-like-code.md",
+  "design_doc": "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md",
   "children": [
     {
       "key": "measure",

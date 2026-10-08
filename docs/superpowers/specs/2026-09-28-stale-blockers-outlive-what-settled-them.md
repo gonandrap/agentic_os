@@ -281,10 +281,14 @@ keeping every acting call inside a handler still holds.
 Give the hold a second reason, selected when `undeclared_delivery` is true:
 
 > you refused an assumption on this work order, and the worker has pushed commits since
-> without running `jarvis wo finish` — the OS has asked it to declare them
+> without running `jarvis wo finish` — the OS has asked it to declare them; you can also
+> send it a message asking it to finish, or run `jarvis validation force` to judge the
+> pull request as it stands
 
-No count, no sha, no elapsed time: the number of commits and the head both move, and this
-string is stored verbatim by `ack_attention`.
+The remedy clause is issue #975's Expected: a hold the user reads must end in something
+they can type, so the sentence names both routes out rather than only stating the stall.
+Still no count, no sha, no elapsed time: the number of commits and the head both move, and
+this string is stored verbatim by `ack_attention`.
 
 ### 2d1. Every terminal event of a held round closes the synthesised hold
 

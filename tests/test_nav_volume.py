@@ -643,7 +643,7 @@ def test_cmd_navigation_renders_both_sides_with_the_payloads_own_counts(tree, ca
             f"{sub['text_search_calls']:>4} text-search") in out
 
 
-# -- the doc counters: §3.2 of docs/specs/2026-10-06-navigate-specs-like-code.md -------
+# -- the doc counters: §3.2 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md -------
 
 def test_bytes_by_tool_folds_across_a_lead_and_two_subagent_transcripts(tree):
     """THE FOLD, and it is why the field is a `Counter`: `_merge` folds every field with

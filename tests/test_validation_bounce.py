@@ -98,8 +98,8 @@ def test_a_bare_filename_is_not_a_citation():
 
 
 #: wo-5ef5f42c round 2's real anchor, and the illustrative command its prose carried.
-INCIDENT_SPEC = "docs/specs/2026-10-06-navigate-specs-like-code.md"
-INCIDENT_PROSE = "run sed -n '40,80p' docs/specs/x.md to see how it reads"
+INCIDENT_SPEC = "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md"
+INCIDENT_PROSE = "run sed -n '40,80p' docs/superpowers/specs/x.md to see how it reads"
 
 
 def anchored(path: str, prose: str = INCIDENT_PROSE) -> dict:
@@ -110,7 +110,7 @@ def anchored(path: str, prose: str = INCIDENT_PROSE) -> dict:
 
 def test_an_anchored_blocker_cites_its_anchor_and_never_its_prose():
     """wo-5ef5f42c round 2: both blockers named the real spec in `file` and quoted
-    `docs/specs/x.md` as an example, so the prose regex cited a path that exists nowhere
+    `docs/superpowers/specs/x.md` as an example, so the prose regex cited a path that exists nowhere
     and bounced a commit that DID change the spec — twice, to BOUNCE_EXHAUSTED."""
     assert validation.cited_paths([anchored(INCIDENT_SPEC)]) == (INCIDENT_SPEC,)
     assert validation.unanswered_submission(
@@ -135,7 +135,7 @@ def test_a_blank_anchor_falls_back_to_the_prose():
 def test_a_citation_no_filesystem_can_find_lets_the_panel_judge():
     """A prose-only blocker citing a path that is nowhere — not in either map, not on
     disk — is no list at all, which is the fail-open §5 already promises."""
-    found = [{"file": "", "title": "look at docs/specs/x.md", "detail": ""}]
+    found = [{"file": "", "title": "look at docs/superpowers/specs/x.md", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"src/app.py": "1"}, {"src/app.py": "2"},
         exists=lambda p: False) is None
@@ -165,7 +165,7 @@ def test_the_returned_tuple_is_the_filtered_list():
     """Only the surviving citations reach the bounce message — a path nothing can find
     would read to the submitter as a file they must change."""
     found = [anchored("src/app.py"),
-             {"file": "", "title": "and docs/specs/x.md", "detail": ""}]
+             {"file": "", "title": "and docs/superpowers/specs/x.md", "detail": ""}]
     assert validation.unanswered_submission(
         {"outcome": "rejected"}, found, {"notes/notes.py": "1"},
         {"notes/notes.py": "9"}, exists=lambda p: p == "src/app.py") == ("src/app.py",)
@@ -384,7 +384,7 @@ def test_a_citation_absent_from_the_worktree_reaches_the_panel(fleet):
     order's worktree and passes `exists`, so a round whose only citation is a path that
     is not in the tree bounces nothing (spec §5)."""
     wo = fleet.dispatch()
-    v = rejected_once(fleet, wo["id"], "docs/specs/x.md")
+    v = rejected_once(fleet, wo["id"], "docs/superpowers/specs/x.md")
     v.outcomes = [passed()]
 
     edit(fleet, wo["id"], "# unrelated\n", "notes/notes.py")

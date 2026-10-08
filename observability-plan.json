@@ -1,6 +1,6 @@
 {
   "summary": "Four new payloads for any order \u2014 the turn in flight, the full anatomy of every finished turn including tool parameters and subagents, the context window's composition and delta, and a diagnosis saying why an order is not moving \u2014 each with a rendered CLI command and all four on one dashboard debugging view; then a tool that clears the blocker the diagnosis named through the remedies that already ship, and a gate and meter retrofitted over the lot so debugging is configurable and its own cost is visible in the bill. OTEL is decided by measurement.",
-  "design_doc": "docs/specs/2026-09-24-order-observability.md",
+  "design_doc": "docs/superpowers/specs/2026-09-24-order-observability.md",
   "children": [
     {
       "key": "live",
@@ -71,7 +71,7 @@
       "key": "otel-spike",
       "title": "Spike: measure what Claude Code's OTEL export actually emits",
       "spec_section": "9",
-      "description": "A measurement and a finding, not a feature. Write NO production code: the deliverable is a findings document under docs/specs/, one `jarvis learn add` entry, and a PR carrying both. Touch no module under src/jarvis/ \u2014 env vars around a scratch `claude` invocation in your shell suffice. You own the DECISION \u2014 adopt, decline or adopt in part \u2014 and write it into section 8, the only outside prose any child may edit, in the same PR. If OTEL turns out to add something, file a separate feature order rather than build it here.",
+      "description": "A measurement and a finding, not a feature. Write NO production code: the deliverable is a findings document under docs/superpowers/specs/, one `jarvis learn add` entry, and a PR carrying both. Touch no module under src/jarvis/ \u2014 env vars around a scratch `claude` invocation in your shell suffice. You own the DECISION \u2014 adopt, decline or adopt in part \u2014 and write it into section 8, the only outside prose any child may edit, in the same PR. If OTEL turns out to add something, file a separate feature order rather than build it here.",
       "acceptance": "All six questions in the section answered with what arrived or with the word 'nothing', each backed by a recorded payload you can quote \u2014 metric and log-event names enumerated; whether tool parameters, cache-write cause / TTL split, and context composition arrive; the flush interval and whether anything arrives from a turn killed mid-flight; the process, port and failure-mode cost under concurrent headless workers. A DECLINE IS AS FULL A SUCCESS AS AN ADOPTION \u2014 no recommendation is owed in either direction and none should be manufactured. Read scripts/spike_peer_message.py first; it is this repository's precedent for how a spike is written up. The decision is written into section 8 in the same PR: on a decline, an entry citing this measurement and striking whichever of the four reasons it contradicts; on adopt or adopt in part, one line saying OTEL left this feature for a named follow-on feature order, with its id. One session; if the measurement is incomplete, report what was measured and what was not rather than extending. `uv run pytest tests/ evals/` stays green \u2014 which it will, since nothing under src/jarvis/ changed."
     }
   ]

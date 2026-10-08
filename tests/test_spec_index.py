@@ -1,6 +1,6 @@
 """§4.4 pins for `spec_index`: delegation, one matcher, two documents, and the verb.
 
-docs/specs/2026-10-06-navigate-specs-like-code.md §4.4. The traversal pin is a SYMLINK
+docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §4.4. The traversal pin is a SYMLINK
 and never a `../` string: a prefix test passes the `../` case and is defeated by the link,
 so the `../` version of this test pins nothing.
 """
@@ -18,7 +18,8 @@ from jarvis import cli, hooks, ops, sections, spec_index
 from jarvis.central_store import CentralStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REAL_SPEC = REPO_ROOT / "docs" / "specs" / "2026-09-24-order-observability.md"
+REAL_SPEC = (REPO_ROOT / "docs" / "superpowers" / "specs"
+             / "2026-09-24-order-observability.md")
 
 FIXTURE = """# Exporter
 
@@ -223,7 +224,7 @@ def registered(project, monkeypatch):
 
 
 def test_spec_toc_and_search_payloads_carry_the_command_and_the_estimate(registered):
-    toc = ops.spec_toc("docs/specs/exporter.md")
+    toc = ops.spec_toc("docs/superpowers/specs/exporter.md")
     assert toc["project"] == "proj_a"
     row = toc["sections"][1]
     assert row["command"] == f"jarvis spec section {toc['path']} {row['ref']}"
@@ -240,7 +241,7 @@ def test_spec_toc_and_search_payloads_carry_the_command_and_the_estimate(registe
 
 def test_spec_section_names_the_headings_that_exist(registered):
     with pytest.raises(ops.OpsError) as e:
-        ops.spec_section("docs/specs/exporter.md", "no such heading")
+        ops.spec_section("docs/superpowers/specs/exporter.md", "no such heading")
     assert "Data model" in str(e.value)
 
 
@@ -317,8 +318,8 @@ def test_an_emitted_toc_command_opens_that_row_from_the_callers_cwd(registered,
     sub = registered / "sub"
     sub.mkdir()
     monkeypatch.chdir(sub)
-    out = ops.spec_toc("../docs/specs/exporter.md")
-    assert out["path"] == "docs/specs/exporter.md"
+    out = ops.spec_toc("../docs/superpowers/specs/exporter.md")
+    assert out["path"] == "docs/superpowers/specs/exporter.md"
     for row in out["sections"][1:4]:
         first = _execute(row["command"])["content"].splitlines()[0]
         assert first.endswith(row["name"]), (row["command"], first)
@@ -328,7 +329,7 @@ def test_an_emitted_search_command_opens_a_hit_in_another_directory(registered,
                                                                    monkeypatch):
     """The hit's DISPLAY path is root-relative; the command's must be callable.
 
-    The hit lives in `docs/specs/`, the caller in `sub/`, so a root-relative string in
+    The hit lives in `docs/superpowers/specs/`, the caller in `sub/`, so a root-relative string in
     the command resolves to nothing at all.
     """
     sub = registered / "sub"
@@ -337,7 +338,7 @@ def test_an_emitted_search_command_opens_a_hit_in_another_directory(registered,
     found = ops.spec_search("separable piece")
     assert found["hits"]
     hit = found["hits"][0]
-    assert hit["path"].startswith("docs/specs/")
+    assert hit["path"].startswith("docs/superpowers/specs/")
     content = _execute(hit["command"])["content"]
     assert content.startswith("#") and hit["context"] in content, hit["command"]
 
@@ -349,8 +350,9 @@ def test_an_emitted_command_names_the_project_the_caller_named(registered, tmp_p
     outside.mkdir()
     monkeypatch.chdir(outside)
     # Absolute: from outside every root a relative path reads nothing, as `_spec_file` says.
-    toc = ops.spec_toc(str(registered / "docs" / "specs" / "exporter.md"),
-                       project="proj_a")
+    toc = ops.spec_toc(
+        str(registered / "docs" / "superpowers" / "specs" / "exporter.md"),
+        project="proj_a")
     row = toc["sections"][1]
     assert "--project proj_a" in row["command"]
     assert _execute(row["command"])["content"].splitlines()[0].endswith(row["name"])

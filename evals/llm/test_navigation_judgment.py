@@ -92,7 +92,7 @@ def text_search_for_code(calls: list[dict[str, str]]) -> list[str]:
 def symbol_tools(tools: list[str]) -> list[str]:
     """Calls that answer a SYMBOL question rather than a text one.
 
-    §7 of docs/specs/2026-10-02-serena-the-cheap-path.md: the predicate is the leaf's, so
+    §7 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: the predicate is the leaf's, so
     `read_memory`/`list_memories` are bookkeeping and do NOT count.
 
     `search_for_pattern` is excluded on purpose — it is Serena's *text* search, so

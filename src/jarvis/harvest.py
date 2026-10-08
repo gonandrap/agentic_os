@@ -23,7 +23,7 @@ settler); nothing is pushed, no branch is made and no pull request is opened (Ne
 and it runs on the `turn_failed` outcome alone, never on a pause, because a pause resumes
 the same session and a checkpoint commit under a live worker surprises it mid-task.
 
-Spec: docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+Spec: docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
 """
 
 from __future__ import annotations

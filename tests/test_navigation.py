@@ -237,18 +237,18 @@ def test_the_enclosure_pin_would_catch_the_move_it_forbids():
 def test_dumps_doc_counts_every_dump_and_narrows_only_on_a_keyword():
     """§3.4, both halves: `nav_volume` passes nothing and counts the ranged dump too; the
     hook passes its resolved bar and the same dump falls under it."""
-    assert navigation.dumps_doc("sed -n '40,80p' docs/specs/<spec>.md") is True
-    assert navigation.dumps_doc("sed -n '40,80p' docs/specs/<spec>.md",
+    assert navigation.dumps_doc("sed -n '40,80p' docs/superpowers/specs/<spec>.md") is True
+    assert navigation.dumps_doc("sed -n '40,80p' docs/superpowers/specs/<spec>.md",
                                 limit_lines=200) is False
 
 
 @pytest.mark.parametrize("command,span", [
-    ("sed -n '40,80p' docs/specs/<spec>.md", 41),
-    ("sed -n '40p' docs/specs/<spec>.md", 1),
-    ("head -40 docs/specs/<spec>.md", 40),
-    ("head -n 40 docs/specs/<spec>.md", 40),
-    ("cat docs/specs/<spec>.md", None),
-    ("head docs/specs/<spec>.md", None),
+    ("sed -n '40,80p' docs/superpowers/specs/<spec>.md", 41),
+    ("sed -n '40p' docs/superpowers/specs/<spec>.md", 1),
+    ("head -40 docs/superpowers/specs/<spec>.md", 40),
+    ("head -n 40 docs/superpowers/specs/<spec>.md", 40),
+    ("cat docs/superpowers/specs/<spec>.md", None),
+    ("head docs/superpowers/specs/<spec>.md", None),
     # Deliberately conservative: one dump named no range, so the chain is UNRANGED.
     ("cat docs/a.md; sed -n '1,5p' docs/b.md", None),
     ("echo hi", None),
@@ -267,8 +267,8 @@ def test_the_dump_command_set_is_an_argument_to_the_extractor_too():
 
 def test_an_unranged_dump_never_compares_as_zero():
     """§3.1: `None` from `_dump_span` means UNRANGED, which is over any bar."""
-    assert navigation.dumps_doc("cat docs/specs/<spec>.md", limit_lines=200) is True
-    assert navigation.dumps_doc("head docs/specs/<spec>.md", limit_lines=200) is True
+    assert navigation.dumps_doc("cat docs/superpowers/specs/<spec>.md", limit_lines=200) is True
+    assert navigation.dumps_doc("head docs/superpowers/specs/<spec>.md", limit_lines=200) is True
 
 
 def test_a_md_path_inside_a_quoted_string_does_not_dump():
@@ -284,14 +284,14 @@ def test_the_doc_classifiers_are_siblings_and_not_a_widened_source_one():
 
 
 @pytest.mark.parametrize("path,expected", [
-    ("docs/specs/<spec>.md", True),
+    ("docs/superpowers/specs/<spec>.md", True),
     (".jarvis/features/fo-1/spec.md", True),
     # §2.3 class 3: the child's own assigned section, at any size.
     (".jarvis/features/fo-1/sections/wo-1.md", False),
     ("notes.md", False),
-    ("docs/specs/<spec>.py", False),
+    ("docs/superpowers/specs/<spec>.py", False),
     # COMPONENTS, never substrings.
-    ("mydocs/specs/<spec>.md", False),
+    ("mydocs/superpowers/specs/<spec>.md", False),
     ("docsy/<spec>.md", False),
     ("", False),
 ])

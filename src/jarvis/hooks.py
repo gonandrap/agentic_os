@@ -12,7 +12,7 @@ This module also answers `PreToolUse`. A NAVIGATION decision function here
 it can hand out nothing a gate would have caught — and its POSITION in
 `preflight_decision` is the enforcement, because a Bash arm after the
 `is_jarvis_command_chain` auto-allow is unreachable in production however green its unit
-test (§2.4 of docs/specs/2026-10-06-navigate-specs-like-code.md). Nothing in this module
+test (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). Nothing in this module
 may import `catalog` or `spec_index`: it runs on EVERY tool call of every managed worker,
 where a catalog parse is ~60ms against a ~155ms process, so every setting it reads
 arrives as an environment variable `dispatch` resolved at spawn.
@@ -33,7 +33,7 @@ from . import concision
 # §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
 # `navigates_source` joins it for §6 of 2026-10-02-serena-the-cheap-path.md.
 # `dumps_doc` and `is_spec_path` join them for §5 of
-# docs/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of each predicate in
+# docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of each predicate in
 # the tree, read by the counter and by the refusal, by identity and never re-spelled.
 from .navigation import (
     DOC_SUFFIXES,
@@ -1436,7 +1436,7 @@ def py_nav_decision(payload: dict[str, Any],
                     env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call.
 
-    §6 of docs/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
+    §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
     DEFAULT OFF: a hook nobody has enabled cannot strand a worker.
 
     POSITION: in the Bash chain of `preflight_decision`, immediately after
@@ -1451,7 +1451,7 @@ def py_nav_decision(payload: dict[str, Any],
     symbol index must keep grep or the worker cannot read code at all.
 
     IT ALSO REFUSES A WHOLE-FILE `Read` of a `.py` — §5.1 of
-    docs/specs/2026-10-06-navigate-specs-like-code.md. Behind the SAME key, because one
+    docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind the SAME key, because one
     flip must not change two policies whose blockers differ.
 
     THE `.py` ARM HAS NO SIZE THRESHOLD AND MUST NOT GROW ONE. It denies a `Read` with
@@ -1469,7 +1469,7 @@ def py_nav_decision(payload: dict[str, Any],
     if not env.get("JARVIS_WO_ID"):
         return None
     # ONE gate for BOTH arms, resolved once before the split: §5.1 of
-    # docs/specs/2026-10-06-navigate-specs-like-code.md gives the `Read` arm the same
+    # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md gives the `Read` arm the same
     # `.serena/project.yml` precondition as the Bash arm, and a copied check is the drift
     # this tree has paid for twice. Shared by construction, so a later reader cannot
     # widen one arm and leave the other.
@@ -1485,9 +1485,9 @@ def py_nav_decision(payload: dict[str, Any],
         # NO threshold, by the ruling above: a missing `limit` is whole-file and is the
         # only thing refused here.
         # BOTH arms share the COUNTER's suffix set by identity — §5.5 of
-        # docs/specs/2026-10-06-navigate-specs-like-code.md. Two spellings of one
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Two spellings of one
         # predicate is the drift this tree has paid for twice, so the "this hook's OWN
-        # narrower set" ruling (§6 of docs/specs/2026-10-02-serena-the-cheap-path.md) is
+        # narrower set" ruling (§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md) is
         # SUPERSEDED. A narrower enforcement set arrives as a `worker.*` catalog key,
         # never as a second module constant.
         if file_path.endswith(SOURCE_SUFFIXES) and "limit" not in tool_input:
@@ -1540,7 +1540,7 @@ def doc_nav_decision(payload: dict[str, Any],
                      env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse a WHOLE-FILE or oversized read of a spec, naming `jarvis spec`.
 
-    §5 of docs/specs/2026-10-06-navigate-specs-like-code.md. Behind
+    §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind
     `worker.doc_nav_hook`, DEFAULT OFF: nothing here changes the behaviour of a running
     worker until someone flips it.
 
@@ -2281,12 +2281,12 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if mutating is not None:
             return mutating
         # Before the auto-allow for the ordering reason above (§6 of
-        # docs/specs/2026-10-02-serena-the-cheap-path.md).
+        # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md).
         text_read = py_nav_decision(payload, env)
         if text_read is not None:
             return text_read
         # Immediately after it and BEFORE the auto-allow below, for that same ordering
-        # reason (§2.4 and §5.3 of docs/specs/2026-10-06-navigate-specs-like-code.md).
+        # reason (§2.4 and §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md).
         dumped = doc_nav_decision(payload, env)
         if dumped is not None:
             return dumped
@@ -2296,7 +2296,7 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
 
     # Its own branch, and NOT folded into the `mcp__` one or the `Edit`/`Write` one
     # below: a `Read` enters neither, so a refusal placed anywhere else is unreachable
-    # (§2.4 of docs/specs/2026-10-06-navigate-specs-like-code.md). THERE IS NO
+    # (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). THERE IS NO
     # AUTO-ALLOW IN FRONT OF THIS BRANCH, so the ordering argument this docstring makes
     # about arms after `is_jarvis_command_chain` does not apply here — the next reader
     # will assume it does. No investigator arm either: a `Read` is read-only.
@@ -3092,7 +3092,7 @@ def serena_activation_context(cwd: Path) -> str:
     The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
     `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
     dispatched worker's first `find_symbol` fails with `No active project` and it falls
-    back to a text search. Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+    back to a text search. Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
 
     BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
     entries: a plugin install produces the long prefix, `claude mcp add serena` the short
@@ -3208,7 +3208,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             # key `dispatch._write_worker_settings` already writes from
             # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
             # `activate_project` writes itself (Neo q1259).
-            # Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+            # Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
             context = concision.house_style()
             if env.get("JARVIS_SERENA") != "0":
                 context += serena_activation_context(cwd)

@@ -359,7 +359,7 @@ def _question_shape(wo_id: str) -> list[str]:
         f"recommendation. Do NOT paste context — whoever answers already holds this "
         f"work order's title and description, and when your paragraph references "
         f"the design artifact it argues from in-text (e.g. `from section 3 of "
-        f"design doc \"docs/specs/feature.md\": …`) that section is delivered "
+        f"design doc \"docs/superpowers/specs/feature.md\": …`) that section is delivered "
         f"alongside it automatically. Questions over {QUESTION_MAX_CHARS} "
         f"characters are refused.",
         "  - The trigger is DOUBT, not importance. If you catch yourself weighing "

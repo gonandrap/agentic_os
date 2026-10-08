@@ -157,9 +157,12 @@ HELD_REFUSAL_UNANSWERED = "refusal_unanswered"
 #: stores this verbatim and INV-ATTENTION-REASON compares it (kn-681db233 point 3).
 REFUSAL_UNANSWERED_REASON = ("you refused an assumption on this work order and the "
                              "worker has not delivered again since")
+#: Issue #975: the held reason a user reads must end in something they can type.
 REFUSAL_UNDECLARED_REASON = ("you refused an assumption on this work order, and the "
                              "worker has pushed commits since without running `jarvis "
-                             "wo finish` — the OS has asked it to declare them")
+                             "wo finish` — the OS has asked it to declare them; you can "
+                             "also send it a message asking it to finish, or run `jarvis "
+                             "validation force` to judge the pull request as it stands")
 HELD_ASKED = "asked"
 HELD_HIGH_STAKES = "high_stakes"
 #: What the RUNNING pass needs and the parked one cannot reach: an assumption this pass
@@ -1209,7 +1212,7 @@ def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
 
     PURE and in this module because `Ruling` and the stakes vocabulary are, and because
     ONE derivation is what keeps the four daemon call sites from drifting apart (§1 of
-    docs/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
+    docs/superpowers/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
     are spelled as literals rather than imported: this module depends on no store, and
     `tests/test_autoreview.py` pins what it returns against the enum instead.
 
