@@ -834,17 +834,25 @@ class _Chain:
     cumulative: list[tuple[float, float, float, float]] = field(
         default_factory=lambda: [(0.0, 0.0, 0.0, 0.0)])
     compactions: list[float] = field(default_factory=list)
+    #: Exclusive right edge of the report's window. Calls at or after it are not in the
+    #: window, so a result never rides on them. `_chain` always passes the real value;
+    #: `inf` is the identity for this bound (2026-10-08-cost-tool-section-window-clip §3).
+    until: float = math.inf
 
     def carried(self, ts: float) -> tuple[int, tuple[float, float, float, float]]:
         """(later calls, dollars per carried token) for a result that landed at `ts`.
 
-        The window ENDS at the first compaction after `ts`: a compaction replaces the
-        conversation, so the result stops being carried there.
+        The ride ENDS at whichever comes first: the first compaction after `ts` — a
+        compaction replaces the conversation, so the result stops being carried there —
+        or the window's `until`, since a call outside the window is not in the population
+        the report is about (2026-10-08-cost-tool-section-window-clip §2).
         """
         start = bisect.bisect_right(self.stamps, ts)
         stop = next((c for c in self.compactions if c > ts), None)
         end = (len(self.stamps) if stop is None
                else bisect.bisect_left(self.stamps, stop))
+        # Half-open: a call exactly at `until` is out.
+        end = min(end, bisect.bisect_left(self.stamps, self.until))
         if end <= start:
             return (0, (0.0, 0.0, 0.0, 0.0))
         before, after = self.cumulative[start], self.cumulative[end]
@@ -854,7 +862,7 @@ class _Chain:
 
 
 def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
-           floor: int | None) -> _Chain:
+           floor: int | None, *, until: float) -> _Chain:
     """Price carrying one token in every call of a chain, split by what it was billed as.
 
     `compaction_payoff.prefix_rate` is REUSED, not reimplemented: it returns the multiple
@@ -862,12 +870,17 @@ def _chain(calls: Sequence[usage.Call], compactions: Sequence[float],
     rate a result inside that prefix was billed at. The CAUSE of a write comes from
     `usage.classify_boundaries`, joined to the call by `Boundary.ts` — TTL expiry and a
     prefix miss cost the same and have completely different fixes.
+
+    The chain is BUILT over every call in the file, in or out of the window: `prefix_rate`
+    and `classify_boundaries` read each call against its PREDECESSOR, so dropping
+    out-of-window calls here would mis-price the first in-window call and lose the
+    left-edge boundary. `until` clips at READ time, inside `_Chain.carried`.
     """
     ordered = sorted(calls, key=lambda c: c.ts)
     stamps = sorted(compactions)
     causes = {b.ts: b.cause for b in usage.classify_boundaries(
         ordered, compactions=stamps, cold_prefix_floor=floor)}
-    chain = _Chain(compactions=stamps)
+    chain = _Chain(compactions=stamps, until=until)
     previous: usage.Call | None = None
     for i, call in enumerate(ordered):
         kind, rate = compaction_payoff.prefix_rate(call, previous, i == 0)
@@ -973,9 +986,17 @@ def _share(part: float, whole: float) -> float:
 
 
 def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | None,
+               since: float, until: float,
                index: dict[str, list[Path]] | None = None,
                orders_capped: int = 0) -> dict[str, Any]:
     """`fleet.tools`: what every tool cost in the window, and what it CARRIED.
+
+    The window is `[since, until)` and it bounds BOTH ends of the question: a tool result
+    counts only if its own `ts` falls inside it, and the carried ride is clipped at
+    `until` as well as at the next compaction — so every figure here describes the same
+    population as the rest of the page (2026-10-08-cost-tool-section-window-clip.md).
+    Both are REQUIRED: an optional window defaulting to the whole chain is the silent
+    default that produced issue #990.
 
     Bounded by `cost.max_orders` one level up — the orders `fleetcost` already selected
     for the window are the sessions walked, and `excluded` publishes what the cap did.
@@ -986,7 +1007,7 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
     index = usage.index_sessions() if index is None else index
     totals = ToolCost()
     by_tool: dict[str, ToolCost] = {}
-    unmatched = no_transcript = walked = 0
+    unmatched = no_transcript = walked = outside_window = 0
     for order in orders:
         files = sorted(index.get(order.session_id) or []) if order.session_id else []
         if not files:
@@ -995,18 +1016,25 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
             continue
         main = _chain(usage.session_calls(order.session_id, index=index),
                       [c for path in files for c in usage.compaction_stamps(path)],
-                      floor)
+                      floor, until=until)
         for path in files:
-            unmatched += _walk_tools(path, main, cfg, totals, by_tool)
+            seen, late = _walk_tools(path, main, cfg, totals, by_tool,
+                                     since=since, until=until)
+            unmatched += seen
+            outside_window += late
             walked += 1
             sub_dir = path.with_suffix("") / "subagents"
             if not sub_dir.is_dir():
                 continue
             for sub in sorted(sub_dir.glob("*.jsonl")):
-                unmatched += _walk_tools(
+                # A subagent transcript is where the big dumps live: clipping only the
+                # main chain would leave most of the over-count in place (§5).
+                seen, late = _walk_tools(
                     sub, _chain(usage.calls_of(sub), usage.compaction_stamps(sub),
-                                floor),
-                    cfg, totals, by_tool)
+                                floor, until=until),
+                    cfg, totals, by_tool, since=since, until=until)
+                unmatched += seen
+                outside_window += late
                 walked += 1
     ttl_known = floor is not None
     detail = {"percentile": cfg.percentile, "totals": totals, "ttl_known": ttl_known}
@@ -1016,7 +1044,8 @@ def tool_costs(orders: Iterable[OrderStats], *, cfg: CostConfig, floor: int | No
         "by_tool": {name: cost.as_dict(**detail)
                     for name, cost in sorted(by_tool.items())},
         "excluded": {"unmatched_calls": unmatched, "no_transcript": no_transcript,
-                     "orders_capped": orders_capped, "sessions_walked": walked},
+                     "orders_capped": orders_capped, "sessions_walked": walked,
+                     "outside_window": outside_window},
         "row_limit": cfg.tool_rows,
         "notes": list(TOOL_NOTES),
     }
@@ -1047,17 +1076,28 @@ def tool_table(tools: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 
 def _walk_tools(path: Path, chain: _Chain, cfg: CostConfig, totals: ToolCost,
-                by_tool: dict[str, ToolCost]) -> int:
-    """Fold one transcript's tool calls into the accumulators. Returns the unmatched.
+                by_tool: dict[str, ToolCost], *, since: float,
+                until: float) -> tuple[int, int]:
+    """Fold one transcript's tool calls in. Returns (unmatched, outside the window).
 
     An UNMATCHED call — the turn was killed between the `tool_use` and its result —
     contributes no tokens and no carried cost and is never zero-filled: a call that
-    produced nothing must not pull a tool's average down as though it had.
+    produced nothing must not pull a tool's average down as though it had. That check
+    runs FIRST: an unmatched call has no `ts` to place, and its own counter is already
+    its disclosure (2026-10-08-cost-tool-section-window-clip.md §1).
+
+    A matched result counts only if `result.ts` is in `[since, until)` — the stamp of when
+    the result LANDED, since that is when it started riding in later prefixes. A result
+    whose stamp could not be parsed (`0.0`) is outside every real window by the same
+    arithmetic and needs no second rule.
     """
-    unmatched = 0
+    unmatched = outside_window = 0
     for result in usage.tool_results(path, chars_per_token=cfg.chars_per_token):
         if not result.matched:
             unmatched += 1
+            continue
+        if not since <= result.ts < until:
+            outside_window += 1
             continue
         later, money = chain.carried(result.ts)
         tool = by_tool.setdefault(result.name, ToolCost())
@@ -1069,7 +1109,7 @@ def _walk_tools(path: Path, chain: _Chain, cfg: CostConfig, totals: ToolCost,
             bucket.add(result, later, money)
             bucket.by_caller.setdefault(result.caller, ToolCost()).add(
                 result, later, money)
-    return unmatched
+    return (unmatched, outside_window)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1192,7 +1232,8 @@ def report(*, project: str | None = None, since: float | str | None = None,
         # ADDITIVE, and `version` above stays 1: §10.6's rule, the one `cost_report`
         # already applies. The subtree carries its own version so a later re-shaping of
         # it is detectable without bumping the parent.
-        "tools": tool_costs(orders.values(), cfg=cfg, floor=floor, index=index,
+        "tools": tool_costs(orders.values(), cfg=cfg, floor=floor,
+                            since=start, until=end, index=index,
                             orders_capped=capped),
         "compaction_payoff": compaction_payoff.summarise(compaction_payoff.analyse(
             compaction_payoff.gather(home, since=start, until=end, project=project,

@@ -3223,10 +3223,13 @@ def _print_tool_cost(tools: dict) -> None:
     basis = totals["token_basis"]
     excluded = tools["excluded"]
     walked = excluded["sessions_walked"]
+    # Silent when zero: nothing was hidden, so there is nothing to disclose.
+    late = excluded["outside_window"]
     print(f"  {basis['context_delta']:,} result sizes measured exactly, "
           f"{basis['chars']:,} estimated from characters · "
           f"{walked:,} transcript{'s' if walked != 1 else ''} read · "
-          f"{excluded['unmatched_calls']:,} calls with no result, excluded")
+          f"{excluded['unmatched_calls']:,} calls with no result, excluded"
+          + (f" · {late:,} tool results outside the window, excluded" if late else ""))
 
 
 def _print_fleet(fleet: dict) -> None:
