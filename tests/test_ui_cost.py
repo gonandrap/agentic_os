@@ -772,3 +772,81 @@ def test_the_feature_bill_grows_no_own_row_when_there_is_no_own_spend(
     assert page.status_code == 200
     assert "The orders under it" in page.text
     assert OWN_LABEL not in page.text
+
+
+# -- the usage meter, above the listing (tests 36 and 44) ------------------------------
+
+
+def meter_samples_in_the_current_5h_window() -> None:
+    """Twelve readings ending a moment ago, with the real boundary an hour out — so the
+    window `resolve_window` re-anchors on contains every one of them."""
+    from jarvis import db, usage_meter
+    from jarvis.central_store import CentralStore
+
+    now = db.now()
+    central = CentralStore()
+    try:
+        for i in range(12):
+            usage_meter.record(central, usage_meter.Sample(
+                ts=now - (12 - i) * 60, ok=True, five_hour_pct=10.0 + i,
+                five_hour_resets_at=now + 3600, seven_day_pct=5.0 + i / 10,
+                seven_day_resets_at=now + 86_400))
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def test_the_meter_sentence_and_the_sparkline_are_above_the_listing(client, project):
+    """One sentence, built once in `usage_meter.sentence` and rendered VERBATIM: two
+    wordings of the same arithmetic is a difference the reader has to explain (§9)."""
+    wo = ops.create_work_order("proj_a", "an order in this window")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+    meter_samples_in_the_current_5h_window()
+    said = ops.cost_meter(resolved=ops.cost_window(window="5h"))["meter"]["sentence"]
+
+    page = client.get("/cost?window=5h")
+
+    assert page.status_code == 200
+    assert said in page.text, "re-worded in the template"
+    assert "the 5h meter rose" in said
+    assert page.text.index(said) < page.text.index("an order in this window")
+    assert "<svg" in page.text and "<polyline" in page.text
+
+
+def test_a_broken_meter_leaves_the_listing_rendered(client, project, monkeypatch):
+    """Its own `try`, exactly as the distribution section has: the meter reads a
+    different table and losing it must not take the older, load-bearing half down."""
+    wo = ops.create_work_order("proj_a", "still listed")
+    add_recorded_turn(project, wo["id"], 0.05, 48_000)
+
+    def boom(**_kwargs):
+        raise RuntimeError("os.db went away mid-read")
+
+    monkeypatch.setattr(ops, "cost_meter", boom)
+    page = client.get("/cost?window=5h")
+
+    assert page.status_code == 200
+    assert "still listed" in page.text
+    assert "the 5h meter rose" not in page.text
+
+
+def test_the_cost_page_writes_nothing(client, project):
+    """A read must never write — the rule the whole alarm path is arranged around (§8)."""
+    from jarvis.central_store import CentralStore
+
+    add_recorded_turn(project, ops.create_work_order("proj_a", "read only")["id"],
+                      0.05, 48_000)
+    meter_samples_in_the_current_5h_window()
+
+    def counts() -> dict:
+        central = CentralStore()
+        try:
+            return {t: central.conn.execute(
+                f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+                for t in ("inbox", "usage_samples", "agent_calls")}
+        finally:
+            central.close()
+
+    before = counts()
+    assert client.get("/cost?window=5h").status_code == 200
+    assert counts() == before

@@ -12336,6 +12336,27 @@ def cost_window(**kwargs: Any) -> dict[str, Any]:
     return fleetcost.resolve_window(**kwargs)
 
 
+def cost_meter(**kwargs: Any) -> dict[str, Any]:
+    """The account's usage meter reconciled against measured spend — see
+    `usage_meter.reconciliation`.
+
+    A THIRD payload beside `cost_report` and `fleet_cost`, built from the same resolved
+    window: `fleetcost.report` is per-ORDER distribution and must not grow an
+    account-level, network-sourced time series (§10). Lazy import for `fleet_cost`'s
+    reason.
+    """
+    from . import usage_meter
+
+    return usage_meter.reconciliation(**kwargs)
+
+
+def meter_samples(**kwargs: Any) -> list[dict[str, Any]]:
+    """The raw usage-meter series for one span — see `usage_meter.sample_rows`."""
+    from . import usage_meter
+
+    return usage_meter.sample_rows(**kwargs)
+
+
 def cost_zone(tz: str | None = None, project: str | None = None) -> str:
     """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
 

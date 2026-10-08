@@ -1271,6 +1271,29 @@ def _is_prompt_row(row: dict[str, Any]) -> bool:
     return bool(text.strip())
 
 
+#: A session's title is one line of a listing, not the prompt (usage-meter spec §6).
+PROMPT_TITLE_CHARS = 120
+
+
+def first_prompt(path: Path | str, *, limit: int = PROMPT_TITLE_CHARS) -> str:
+    """The first thing the USER typed in one transcript, collapsed and truncated.
+
+    Beside `_is_prompt_row` rather than built on `said_in_session`, which returns
+    ASSISTANT prose: what names a session the user never told Jarvis about is their own
+    opening line (usage-meter spec §6).
+    """
+    for row in rows(path):
+        if not _is_prompt_row(row):
+            continue
+        content = (row.get("message") or {}).get("content")
+        text = content if isinstance(content, str) else " ".join(
+            b.get("text", "") for b in blocks_of(row, "text"))
+        collapsed = " ".join(text.split())
+        if collapsed:
+            return collapsed[:limit]
+    return ""
+
+
 def _call_of_row(row: dict[str, Any]) -> tuple[Call | None, str]:
     """The API call one assistant row stands for, with its message id, or (None, "").
 

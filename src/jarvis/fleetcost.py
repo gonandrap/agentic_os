@@ -151,6 +151,30 @@ def session_window(now: float, cfg: CostConfig,
     return (since, since + length)
 
 
+def meter_window(now: float, cfg: CostConfig,
+                 offset: int = 0) -> tuple[float, float] | tuple[None, None]:
+    """The REAL 5h window, anchored on the account's own `five_hour_resets_at`.
+
+    `(None, None)` when no sample is fresh enough to anchor on — a fresh install has
+    none, and `session_window`'s week-anchored guess is the fallback (Neo q1501, answered
+    (a), §10). Measured 2026-10-08: the guess was 80 minutes out, and every per-window
+    figure was summed over the wrong span.
+
+    `offset < 0` steps back in whole 5h multiples FROM the real boundary.
+    """
+    from . import usage_meter
+
+    try:
+        sample = usage_meter.latest_sample(now=now, within=cfg.meter_nearest_seconds)
+    except Exception:                               # noqa: BLE001 — a guess still works
+        sample = None
+    if sample is None or sample.five_hour_resets_at is None:
+        return (None, None)
+    length = cfg.session_window_hours * 3600
+    end = float(sample.five_hour_resets_at) + offset * length
+    return (end - length, end)
+
+
 def resolve_zone(tz: str | None, cfg: CostConfig) -> str:
     """The IANA zone to DISPLAY a window in: `tz` when given and valid, else the catalog.
 
@@ -209,8 +233,10 @@ def resolve_window(*, window: str | None = None, offset: int = 0,
                            f"after {_stamp(end)}, which is an empty window")
         return _window(start, end, zone, source="flags", window=None, offset=None)
     if window == SESSION:
-        start, end = session_window(_now(now), cfg, offset)
-        source = "session-window"
+        start, end = meter_window(_now(now), cfg, offset)
+        source = "session-meter" if start is not None else "session-window"
+        if start is None:
+            start, end = session_window(_now(now), cfg, offset)
     else:
         start, end = usage_week(_now(now), cfg, offset)
         # The literal the existing template branch and CLI line already read, kept for
@@ -1199,10 +1225,10 @@ def report(*, project: str | None = None, since: float | str | None = None,
                                      index=index))),
         "floor": True,
         "floor_reason": COST_FLOOR_NOTE,
-        # The 5h anchor is said only where it applies: a caveat about a grid nobody
-        # asked for is one the reader learns to ignore (§2).
+        # Said only where it applies (§2), and it describes a GUESS — so the fallback
+        # only: a meter-anchored window is not one (§10).
         "notes": list(NOTES) + ([SESSION_ANCHOR_NOTE]
-                                if picked.get("window") == SESSION else []),
+                                if picked.get("source") == "session-window" else []),
     }}
 
 

@@ -3016,41 +3016,63 @@ def _when(text: str) -> float:
         raise argparse.ArgumentTypeError(f"{text!r} is not a date or ISO datetime: {e}")
 
 
+def _cost_meter(picked: dict, project: str | None) -> dict | None:
+    """The meter subtree, or None. Its own `try`, as `/cost` has: the meter reads a
+    different table from the listing and losing it must not take the listing down."""
+    from . import ops
+
+    try:
+        return ops.cost_meter(resolved=picked, project=project)["meter"]
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
-    target = args.target
-    # The distribution BRANCHES FIRST and the listing below is untouched: `--fleet` adds
-    # a section, it does not reshape a row (spec §5).
-    if getattr(args, "fleet", False):
-        payload = ops.fleet_cost(project=args.project or target or None,
-                                 since=args.since, until=args.until,
-                                 window=args.window, offset=args.offset,
-                                 tz=args.tz)
-        if args.json:
-            _print(payload, True)
-            return 0
-        _print_fleet(payload["fleet"])
-        return 0
-    # One argument, three kinds of thing. Ids are prefixed and projects are not, so
-    # this never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project
-    # name. The feature-order half goes through the shared predicate rather than a third
+    # One argument, three kinds of thing. Ids are prefixed and projects are not, so this
+    # never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project name.
+    # The feature-order half goes through the shared predicate rather than a third
     # literal — §2.5 of docs/superpowers/specs/2026-09-23-improvement-orders.md.
     from .project_store import is_feature_order_id
 
+    target = args.target
     is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target))
+    scope = args.project or (None if is_id else target) or None
+    # THE ZONE, THEN THE WINDOW, ONCE at the top and handed to every payload builder
+    # below (kn-9ccc429b: the display zone is resolved first and moves no boundary;
+    # kn-0c297bdd: a bad parameter is a refusal, never a silent fallback). Resolving
+    # twice is a function of `now` and can straddle a boundary, which is how
+    # `--window 5h` used to window the distribution and nothing else (§10).
+    zone = ops.cost_zone(args.tz, scope)
+    picked = ops.cost_window(project=scope, window=args.window, offset=args.offset,
+                             tz=zone, since=args.since, until=args.until)
+    # The distribution BRANCHES FIRST and the listing below is untouched: `--fleet` adds
+    # a section, it does not reshape a row (spec §5).
+    if getattr(args, "fleet", False):
+        payload = ops.fleet_cost(project=scope, resolved=picked)
+        meter = _cost_meter(picked, scope)
+        if args.json:
+            _print({**payload, **({"meter": meter} if meter else {})}, True)
+            return 0
+        _print_fleet(payload["fleet"])
+        if meter:
+            print(f"\n{meter['sentence']}")
+        return 0
     if is_id:
         # One order asks "where did MY tokens go", which is the bill's question. The
         # fleet view below asks "which orders cost the most", which is the report's.
+        # NO METER BLOCK: a bill's span is the ORDER's own life, not a window, and an
+        # account-level residual printed under one bill reads as that order's (§10).
         bill = ops.bill(target)
         if args.json:
             _print(bill, True)
             return 0
         _print_bill(bill)
         return 0
-    res = ops.cost_report(project=None if is_id else target,
-                          target=target if is_id else None, limit=args.limit)
+    res = ops.cost_report(project=scope, limit=args.limit, window=picked)
+    meter = _cost_meter(picked, scope)
     if args.json:
-        _print(res, True)
+        _print({**res, **({"meter": meter} if meter else {})}, True)
         return 0
 
     units = res["units"]
@@ -3062,6 +3084,10 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res["unmeasured"]:
         header += f", {res['unmeasured']} with no transcript left"
     print(f"{header}\n")
+    # VERBATIM from the payload: the page prints the same string, and two wordings of
+    # the same arithmetic is a difference the reader has to explain (§9).
+    if meter:
+        print(f"{meter['sentence']}\n")
     # `$` is the whole bill — the worker's conversation, what Jarvis itself spent on the
     # order, and what the worker spent below itself. `jarvis` and `sub` are how much of
     # it was each. A work order whose transcript is gone can still show those two: both
