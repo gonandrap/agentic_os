@@ -4452,6 +4452,18 @@ class Daemon:
 
         return schedule.os_owner((p.name, p.path) for p in self.catalog.projects)
 
+    def _os_project(self) -> str | None:
+        """Which project IS the OS — `schedule.os_project`, per tick.
+
+        NOT `_os_owner`, and the difference is issue 956: that one resolves by path
+        containment and answers with an arbitrary project when nothing contains the
+        install, which is every production deployment. Callers granting the OS's own
+        authority — the release path — ask this and do nothing on None.
+        """
+        from . import schedule
+
+        return schedule.os_project((p.name, p.path) for p in self.catalog.projects)
+
     @staticmethod
     def _schedule_blocker(store: ProjectStore, state: dict[str, Any]) -> dict[str, Any] | None:
         """The job's own previous order, if it has not settled yet.
@@ -7967,9 +7979,12 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         """
         from . import release
 
-        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout —
-        # `settle_shipped_releases`' guard, for its reason.
-        if project.name != self._os_owner():
+        # `overtaken_by` reads `jarvis-*` tags and the OS's own production checkout, so
+        # the scope is the project that IS the OS, by origin. Issue 956: asked by path
+        # containment this never matched in production — the install is in the deployed
+        # checkout, which no catalog path contains — and six fixes already live were
+        # filed for release again.
+        if project.name != self._os_project():
             return False
         sha = self._merge_commit_of(project, store, wo)
         if not sha:
@@ -8035,8 +8050,9 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
         from . import ci, evidence, github, ops
 
         # Same scope as `settle_shipped_releases`: the release path is the OS's own
-        # release script and the production checkout, both facts about this repository.
-        if project.name != self._os_owner():
+        # release script and the production checkout, both facts about this repository —
+        # so the project that IS the OS, by origin and not by path containment (956).
+        if project.name != self._os_project():
             return
         due: list[dict[str, Any]] = []
         for candidate in store.list_work_orders(statuses=("pending",),
@@ -8171,7 +8187,9 @@ CI's verdict on it, say so and stop — a release is not the place to fix a red 
 
         # §8: the test reads `paths.production_code_dir()` and globs `jarvis-*`, both
         # facts about the OS's own release path. Another project keeps today's behaviour.
-        if project.name != self._os_owner():
+        # The project that IS the OS, by origin: path containment answers this wrong in
+        # production, where the install is in the deployed checkout (956).
+        if project.name != self._os_project():
             return
         orders: list[tuple[dict[str, Any], list[str]]] = []
         for candidate in store.list_work_orders(statuses=OPEN_STATUSES,

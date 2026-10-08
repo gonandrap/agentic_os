@@ -23,7 +23,7 @@ from jarvis import db, release
 from jarvis.catalog import CatalogError, load_catalog, parse_catalog
 from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
-from jarvis.testing import commit
+from jarvis.testing import commit, make_git_project
 
 ISSUE = "https://github.com/acme/proj/issues/784"
 PR = "https://github.com/acme/proj/pull/7"
@@ -72,6 +72,26 @@ def store(project):
     s = ProjectStore(project)
     yield s
     s.close()
+
+
+#: This repository, as `github.origin_repo` returns it for every checkout of it.
+OS_REPO = ("gonandrap", "agentic_os")
+
+
+@pytest.fixture(autouse=True)
+def os_identity(project, monkeypatch, origins):
+    """`proj_a` IS the OS — the guards below run on no other project (issue 956).
+
+    The install and `proj_a` are given ONE ORIGIN through the cache rather than a real
+    remote: `with_origin` arms every other origin-gated path in the daemon, and this file
+    then spent three minutes reaching for a remote that does not exist. Real remotes and
+    real `git remote get-url` are `test_scheduler`'s job.
+    """
+    from jarvis import schedule
+
+    install = str(Path(schedule.__file__).resolve().parent)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, install, OS_REPO)
+    monkeypatch.setitem(schedule._ORIGIN_CACHE, str(project), OS_REPO)
 
 
 @pytest.fixture()
@@ -387,7 +407,7 @@ def test_a_project_that_does_not_own_the_os_pays_nothing(
     about the OS's own release path. A second project gets exactly today's behaviour."""
     land(project, "fix-one.txt")
     release_order(store, project, shas={ISSUE: sha(project)})
-    monkeypatch.setattr(daemon, "_os_owner", lambda: "someone-else")
+    monkeypatch.setattr(daemon, "_os_project", lambda: "someone-else")
     spawned: list[list[str]] = []
     real = subprocess.run
     monkeypatch.setattr(subprocess, "run",
@@ -899,6 +919,35 @@ def test_a_fix_a_live_tag_already_carries_files_no_release_at_all(
     assert TAG in said[0]["detail"]
 
 
+def test_the_production_layout_still_knows_which_project_is_the_os(
+        project, store, deploy, tmp_path, fake_gh):
+    """ISSUE 956, six duplicate release orders. The guard asked `os_owner`, which resolves
+    by PATH CONTAINMENT: with the install in the deployed checkout no catalog path contains
+    it, so the answer was whatever is first in catalog order and the guard never passed.
+    """
+    import json
+
+    other = make_git_project(tmp_path / "others", "shared_schedule")
+    path = tmp_path / "two-projects.json"
+    path.write_text(json.dumps({
+        "os": {"notifications": {"sinks": ["log"]}},
+        "projects": [
+            {"name": "shared_schedule", "path": str(other), "description": "listed first"},
+            {"name": "proj_a", "path": str(project), "description": "the OS's own"},
+        ]}))
+    fleet = Daemon(load_catalog(path))
+    landed = land(project, "fix-one.txt")
+    tag(project, TAG)
+    deploy(project, TAG)
+    fix = landed_fix(store, ISSUE, landed)
+
+    assert fleet._os_owner() == "shared_schedule", "the old answer, for contrast"
+    assert fleet._os_project() == "proj_a"
+
+    assert fleet.ensure_release(fleet.catalog.project("proj_a"), store, fix) == ""
+    assert len(events(store, fix["id"], Daemon.ALREADY_SHIPPED_EVENT)) == 1
+
+
 def test_a_fix_a_live_tag_already_carries_does_not_join_an_open_batch_either(
         project, store, daemon, deploy):
     """The guard runs BEFORE the batch loop: joining would put a shipped fix in the next
@@ -968,7 +1017,7 @@ def test_a_project_that_does_not_own_the_os_files_exactly_as_before(
     landed = land(project, "fix-one.txt")
     tag(project, TAG)
     deploy(project, TAG)
-    monkeypatch.setattr(daemon, "_os_owner", lambda: "someone-else")
+    monkeypatch.setattr(daemon, "_os_project", lambda: "someone-else")
     fix = landed_fix(store, ISSUE, landed)
 
     rel = filing(daemon, store, fix)
