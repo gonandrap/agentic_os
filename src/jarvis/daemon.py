@@ -66,6 +66,9 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
+# The `os_state` keys the dashboard's self-heal keeps, spelled in `uilog` so this daemon
+# and `invariants.check_ui_wedged` cannot drift onto two sets of names.
+from .uilog import UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
@@ -96,6 +99,39 @@ log = logging.getLogger("jarvisd")
 #: §6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
 #: runs.md.
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
+
+def fetch_healthz(url: str, timeout: float) -> dict[str, Any] | None:
+    """`GET /healthz` as a dict, or None when the dashboard did not answer.
+
+    A module function, so a test replaces it the way the suite replaces
+    `uilog.read_errors` — and so "it timed out", "it refused the connection" and "it
+    answered something that is not the payload" all arrive at the caller as one None.
+
+    A 503 IS AN ANSWER. `urlopen` raises on it, but the body is the payload the caller
+    has to read: the endpoint answers 503 for a human with `curl` the moment one probe
+    fails, and the debounce that decides a wedge is `trip_threshold` inside that payload.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+        body = db.from_json(raw.decode("utf-8", errors="replace"), None)
+    except Exception:  # noqa: BLE001 — every other failure is one verdict (spec §4.2)
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _limiter_line(figures: dict[str, Any]) -> str:
+    """The anyio capacity limiter, as the inbox item states it."""
+    return (f"borrowed {figures.get('borrowed', '?')} / available "
+            f"{figures.get('available', '?')} of {figures.get('total', '?')}, "
+            f"{figures.get('waiting', '?')} waiting")
+
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
@@ -1003,6 +1039,13 @@ class Daemon:
             self.check_ui_log()
         except Exception:  # noqa: BLE001 — never let the UI watch stall the tick
             log.exception("ui log check failed")
+        # Beside it, under the same discipline: a wedge found this tick is notified on
+        # this tick. The dashboard raises no error when it wedges, so this is the only
+        # positive liveness signal the OS has (spec §4).
+        try:
+            self.check_ui_health()
+        except Exception:  # noqa: BLE001 — same rule
+            log.exception("ui health check failed")
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -1802,6 +1845,147 @@ class Daemon:
         )
         log.warning("dashboard errors: %d new (latest: %s)", len(errors), latest.summary)
         return len(errors)
+
+    def check_ui_health(self, now: float | None = None) -> str:
+        """Is the dashboard still serving, and restart it if it is not.
+
+        §4 of
+        docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+        Runs beside `check_ui_log` for that method's reason: a wedge found this tick is
+        notified on this tick rather than the next one.
+
+        TIMEOUT, CONNECTION FAILURE AND "REPORTS WEDGED" ARE THE SAME VERDICT. A wedged
+        process answers nothing at all if the event loop went with the pool, so a check
+        that only believed a 503 would miss the worse case. The payload, never the status
+        code, is what says "wedged": `trip_threshold` is the UI's own debounce, and
+        believing a single slow probe would restart a dashboard that was merely building
+        `/cost`.
+
+        A dashboard that has NEVER answered healthily is not a wedge — nobody started it.
+        Without that, a daemon on a machine with no `jarvis ui` would restart
+        `jarvis-ui.service` on every tick it could.
+
+        A unit that is not ACTIVE is `down`, not wedged: `systemctl --user stop
+        jarvis-ui` leaves the port refusing connections, which is indistinguishable from
+        a dead loop over HTTP alone. The measured fault had the unit `active (running)`,
+        so that is the discriminator — and without it the OS would restart the dashboard
+        the user had just stopped, three times, and tell them about it each time.
+
+        Returns what happened, for the log and the tests: `off`, `down`, `unseen`,
+        `healthy`, `cooldown`, `capped`, `restarted` or `restart_failed`.
+        """
+        from . import release, systemd_units, uilog
+        from .notify import ui_base_url
+
+        cfg = self.catalog.os.ui_health
+        if not cfg.enabled:
+            return "off"
+        now = time.time() if now is None else now
+        try:
+            body = fetch_healthz(f"{ui_base_url(self.catalog)}/healthz",
+                                 cfg.healthz_timeout_seconds)
+        except Exception:  # noqa: BLE001 — an unreachable dashboard is the finding
+            body = None
+        wedged = body is None or bool(body.get("wedged"))
+        if not wedged:
+            self.central.set_state(UI_HEALTHZ_OK_AT, f"{now:.3f}")
+            self.central.set_state(UI_WEDGE_CAPPED_AT, "")
+            return "healthy"
+        # Deliberately stopped, not wedged. The sighting is LEFT ALONE: the dashboard did
+        # serve, and starting it again must not have to earn that back.
+        if not systemd_units.unit_active(release.UI_UNIT):
+            return "down"
+        if not (self.central.get_state(UI_HEALTHZ_OK_AT) or "").strip():
+            return "unseen"
+
+        figures = (body or {}).get("limiter") or {}
+        dump = (body or {}).get("stack_dump") or str(uilog.stack_dump_path())
+        restarts = [t for t in self._ui_restarts() if now - t < 24 * 3600]
+        if restarts and now - max(restarts) < cfg.restart_cooldown_seconds:
+            # Stops a restart loop against a dashboard that wedges on boot.
+            return "cooldown"
+        if len(restarts) >= cfg.max_restarts_per_day:
+            # At the cap the check keeps probing and the UI keeps dumping; what it must
+            # not do is fall silent, which would reproduce the original defect one level
+            # up. One item per entry into the capped state, not one per tick.
+            if not (self.central.get_state(UI_WEDGE_CAPPED_AT) or "").strip():
+                self.central.set_state(UI_WEDGE_CAPPED_AT, f"{now:.3f}")
+                self.central.add_inbox(
+                    project="os", level="critical",
+                    title="the dashboard is wedged and its restart cap is spent",
+                    body=(f"`{release.UI_UNIT}` has been restarted "
+                          f"{len(restarts)} times in the last 24h, which is the cap "
+                          f"(`ui_health.max_restarts_per_day` = "
+                          f"{cfg.max_restarts_per_day}). It will NOT be restarted again "
+                          f"until that window rolls — a fourth wedge in a day is a "
+                          f"different, worse fault than the one a restart fixes.\n"
+                          f"Limiter: {_limiter_line(figures)}\n"
+                          f"Stacks: {dump}\n"
+                          f"Stamp: {uilog.wedge_stamp_path()}"),
+                )
+            return "capped"
+
+        runner = self.release_runner or release.SystemdRunner()
+        # ATTEMPTED BEFORE IT IS ANNOUNCED, and the attempt is recorded whether or not it
+        # raised. The other order claims a restart that may not have happened, and — with
+        # no timestamp written — leaves no cooldown, so the next tick five seconds later
+        # repeats the whole thing: an inbox item per tick, the flood `check_ui_log`'s
+        # one-item-per-batch rule exists to prevent.
+        #
+        # `jarvis-ui.service` can never host this process (`DAEMON_UNIT` is a different
+        # unit), so the inline restart is the correct one — `restart_unit_detached`
+        # exists for the opposite case. APPROVED FOR THIS UNIT AND NOTHING ELSE: no unit
+        # name comes from a catalog key and no project may nominate one (spec §4.5).
+        error = ""
+        try:
+            runner.restart_unit(release.UI_UNIT)
+        except Exception as e:  # noqa: BLE001 — report what happened, do not re-raise
+            error = f"{type(e).__name__}: {e}"
+        restarts.append(now)
+        self.central.set_state(UI_WEDGE_RESTARTS,
+                               db.to_json([round(t, 3) for t in restarts]))
+        self.central.set_state(UI_WEDGE_CAPPED_AT, "")
+        evidence = (f"Limiter: {_limiter_line(figures)}\n"
+                    f"Stacks: {dump}\n"
+                    f"Stamp: {uilog.wedge_stamp_path()}")
+        if error:
+            self.central.add_inbox(
+                project="os", level="critical",
+                title=f"the dashboard is wedged and {release.UI_UNIT} could not be "
+                      f"restarted",
+                body=(f"The restart was attempted and FAILED: {error}. The dashboard is "
+                      f"still wedged and the OS cannot heal it — restart it by hand "
+                      f"(`systemctl --user restart {release.UI_UNIT}`).\n"
+                      f"The attempt counts against `ui_health.max_restarts_per_day`, so "
+                      f"this is said once rather than on every tick.\n"
+                      f"{evidence}"),
+            )
+            log.warning("dashboard wedged: restarting %s failed (%s)",
+                        release.UI_UNIT, error)
+            return "restart_failed"
+        self.central.add_inbox(
+            project="os", level="warning",
+            title=f"the dashboard was wedged — restarted {release.UI_UNIT}",
+            body=(f"Every routed page had stopped answering while the process stayed "
+                  f"`active (running)`. The dashboard dumped every thread's Python "
+                  f"stack before the restart; that dump is the only evidence of what "
+                  f"held the threadpool.\n"
+                  f"{evidence}"),
+        )
+        log.warning("dashboard wedged: restarted %s (%d in 24h)",
+                    release.UI_UNIT, len(restarts))
+        return "restarted"
+
+    def _ui_restarts(self) -> list[float]:
+        """When this daemon has self-restarted the dashboard, as epochs."""
+        rows = db.from_json(self.central.get_state(UI_WEDGE_RESTARTS), []) or []
+        out: list[float] = []
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                out.append(float(row))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     # -- 1. notifications ----------------------------------------------------------
 

@@ -11160,6 +11160,10 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # fall-through answer is the same one. Spec §6.2:
     # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md
     ("*.cost.*", "hot"),
+    # Re-read per probe round in the UI process and per tick in the daemon, so a change
+    # is in force without a restart. §6 of
+    # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md
+    ("*.ui_health.*", "hot"),
 )
 
 APPLY_NOTES = {
@@ -12632,6 +12636,25 @@ def inspect_config(project: str | None = None) -> Any:
                 else catalog.project(project).inspect)
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def ui_health_config(project: str | None = None) -> Any:
+    """The dashboard's liveness settings in force for `project` — or the OS's — or
+    defaults.
+
+    `ops.inspect_config`'s shape and its reasoning, falling back to `UiHealthConfig()`
+    rather than to None: every default here is a measured threshold, and having none
+    would mean having no probe. §6 of
+    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+    """
+    from .catalog import UiHealthConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.ui_health if project is None
+                else catalog.project(project).ui_health)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return UiHealthConfig()
 
 
 def navigation_config(project: str | None = None) -> Any:

@@ -953,6 +953,72 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+# -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
+#
+# §6 of docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+# EVERY NUMBER HERE CAME OUT OF ONE MEASURED OUTAGE (production, 2026-10-08, ~4h of
+# uptime then every routed page silent for 4 minutes), which is exactly why none of them
+# is a module constant in the code that uses it: the next measurement moves them, and a
+# threshold that needs a release to change is one that stays wrong.
+
+#: Seconds between liveness probes. Matches `REFRESH_SECONDS = 15` (`ui/app.py`), the rate
+#: the dashboard already reloads itself at: a probe rarer than the traffic it watches
+#: learns about the wedge later than the user does, and a much denser one adds threadpool
+#: traffic for nothing.
+DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS = 15
+
+#: How long one probe may wait for the threadpool. ABOVE the slowest legitimate page
+#: measured on the wedge day (`GET /cost 15424ms`), or a healthy-but-busy `/cost` build
+#: reads as a wedge. The real pool was saturated for minutes, not seconds, so waiting
+#: past the worst honest page costs the detector nothing.
+DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS = 20
+
+#: Consecutive failed probes before the process dumps its own stacks. Three at 15s is ~45s
+#: of total page unavailability — past any `/cost` burst, far inside the ~4 minutes the
+#: measured wedge went unanswered (05:38:27 to 05:42:58).
+DEFAULT_UI_HEALTH_TRIP_THRESHOLD = 3
+
+#: The DAEMON's own deadline on `GET /healthz`. Small, because the endpoint touches
+#: nothing: anything slower than a few seconds is itself the finding, and the daemon must
+#: not spend a reconcile tick waiting.
+DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS = 5
+
+#: No self-restart within this long of the last one. Longer than the whole measured
+#: outage, so the real case needs exactly one restart; short enough that a second genuine
+#: wedge the same hour is still healed. Stops a restart loop against a dashboard that
+#: wedges on boot.
+DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS = 300
+
+#: Self-restarts allowed in a rolling 24h. A wedge took ~4 hours of uptime to appear, so
+#: three a day is well above the observed rate and the fourth is evidence of a different,
+#: worse fault that wants the user rather than another restart.
+DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
+
+
+@dataclass
+class UiHealthConfig:
+    """How the dashboard reports its own wedge, and when the OS restarts it.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_ui_health`): a project naming one key keeps the OS answer for the rest. The
+    dashboard is the OS's own process, so the fleet answer is the one the probe and the
+    daemon read — the per-project block exists because this is a settings namespace like
+    every other and splitting the shape would be the surprise.
+
+    `enabled` is ONE switch for "probe and heal nothing": the probe, the stack dump, the
+    daemon's check and its restart. A second way to turn one thing off is a second way to
+    be surprised by it (`InspectConfig.enabled`'s reason).
+    """
+
+    enabled: bool = True
+    probe_interval_seconds: int = DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS
+    probe_timeout_seconds: int = DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS
+    trip_threshold: int = DEFAULT_UI_HEALTH_TRIP_THRESHOLD
+    healthz_timeout_seconds: int = DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS
+    restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
+    max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
+
+
 # -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216,
 # §2.3 of
 # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
@@ -1425,6 +1491,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    ui_health: UiHealthConfig = field(default_factory=UiHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
@@ -1561,6 +1628,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    ui_health: UiHealthConfig = field(default_factory=UiHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
@@ -1972,6 +2040,44 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
             if value < 0:
                 raise _err(f"{where}.{name} must be >= 0")
         elif name != "enabled" and value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
+                     where: str = "os.ui_health") -> UiHealthConfig:
+    """`os.ui_health`, or a project's override of it — `_parse_inspect`'s shape exactly.
+
+    Field-level inheritance (kn-6ca2bcd9): `os.ui_health` parses against the shipped
+    defaults and each project against the OS answer, so a project naming one key inherits
+    the rest and no caller consults two objects.
+
+    ONE vocabulary here, unlike `_parse_inspect`: every field is a count or a duration,
+    so every one is refused below 1 rather than clamped. Zero means something different
+    and wrong in each of them — a probe that never sleeps, a timeout that always expires,
+    a trip on the first hiccup, a cooldown that allows a restart loop, a cap that can
+    never heal — and all of them arrive by a typo in a `jarvis config set`, so it is
+    caught where the message can name the key.
+    """
+    base = base or UiHealthConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = UiHealthConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        probe_interval_seconds=int(raw.get("probe_interval_seconds",
+                                           base.probe_interval_seconds)),
+        probe_timeout_seconds=int(raw.get("probe_timeout_seconds",
+                                          base.probe_timeout_seconds)),
+        trip_threshold=int(raw.get("trip_threshold", base.trip_threshold)),
+        healthz_timeout_seconds=int(raw.get("healthz_timeout_seconds",
+                                            base.healthz_timeout_seconds)),
+        restart_cooldown_seconds=int(raw.get("restart_cooldown_seconds",
+                                             base.restart_cooldown_seconds)),
+        max_restarts_per_day=int(raw.get("max_restarts_per_day",
+                                         base.max_restarts_per_day)),
+    )
+    for name, value in vars(cfg).items():
+        if name != "enabled" and value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
 
@@ -2519,6 +2625,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        ui_health=_parse_ui_health(os_raw.get("ui_health", {})),
         navigation=_parse_navigation(os_raw.get("navigation", {})),
         cost=_parse_cost(os_raw.get("cost", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
@@ -2666,6 +2773,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        ui_health_cfg = _parse_ui_health(
+            p.get("ui_health", {}), base=os_cfg.ui_health,
+            where=f"projects[{i}] ({name}).ui_health")
         navigation_cfg = _parse_navigation(
             p.get("navigation", {}), base=os_cfg.navigation,
             where=f"projects[{i}] ({name}).navigation")
@@ -2711,6 +2821,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                ui_health=ui_health_cfg,
                 navigation=navigation_cfg,
                 cost=cost_cfg,
                 observability=observability_cfg,

@@ -8,6 +8,9 @@ seeing "Internal Server Error". Each test below covers one surface that was blin
 
 from __future__ import annotations
 
+import concurrent.futures as cf
+import json
+import threading
 import time
 
 import pytest
@@ -15,7 +18,9 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import ops, uilog  # noqa: E402
+from jarvis import daemon as daemon_mod  # noqa: E402
+from jarvis import invariants, ops, release, systemd_units, uilog  # noqa: E402
+from jarvis.catalog import UiHealthConfig  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.daemon import Daemon  # noqa: E402
@@ -380,3 +385,367 @@ def test_the_tab_badge_shows_active_not_wall(browser, project):
 
     assert '<span class="n">24m</span>' in page
     assert '<span class="n">5.4h</span>' not in page
+
+
+# -- the wedge: the dashboard reports and heals it ----------------------------------
+#
+# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+# The measured shape: every page handler in `app.py` is a sync `def`, so one that never
+# returns saturates the single anyio threadpool for ever — anyio holds the token inside
+# `CancelScope(shield=True)`, so no timeout reclaims it and only a restart helps. These
+# tests reproduce that shape with a handler of their own; the CAUSE of the real one is
+# deliberately not reproduced, because it is not identified.
+
+
+def _wedge_app(gate: threading.Event):
+    app = create_app()
+
+    @app.get("/_wedge")
+    def wedge_handler():
+        """The holder. Its name is what the stack dump has to name."""
+        gate.wait()
+        return {"ok": True}
+
+    @app.get("/_sync_control")
+    def sync_control():
+        """A SYNC route that does nothing — the control for `/healthz` being async."""
+        return {"ok": True}
+
+    return app
+
+
+def _fast_probe(monkeypatch, **kw) -> None:
+    """The probe's knobs are catalog keys, so the test sets them through the resolver."""
+    cfg = UiHealthConfig(**{"probe_interval_seconds": 1, "probe_timeout_seconds": 1,
+                            "trip_threshold": 2, **kw})
+    monkeypatch.setattr(ops, "ui_health_config", lambda project=None: cfg)
+
+
+def _limiter(client) -> dict:
+    return client.get("/healthz").json()["limiter"]
+
+
+def _wait_until(predicate, timeout: float = 20.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_the_pool_can_be_saturated_deterministically(started, monkeypatch):
+    """The rig the next two tests stand on: every token borrowed by sync handlers that
+    never return. Capacity is READ from the limiter, never hardcoded at 40."""
+    _fast_probe(monkeypatch)
+    gate = threading.Event()
+    pool = cf.ThreadPoolExecutor(max_workers=64)
+    try:
+        with TestClient(_wedge_app(gate)) as client:
+            try:
+                total = _limiter(client)["total"]
+                for _ in range(total):
+                    pool.submit(client.get, "/_wedge")
+                assert _wait_until(lambda: _limiter(client)["borrowed"] == total)
+                assert _limiter(client)["available"] == 0
+            finally:
+                gate.set()
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_healthz_answers_while_the_pool_is_wedged_and_a_sync_route_cannot(
+        started, monkeypatch):
+    """The whole point of piece 1. The second half earns its keep: a SYNC route times
+    out in the same state, so this fails if anyone ever de-asyncs the endpoint."""
+    _fast_probe(monkeypatch)
+    gate = threading.Event()
+    pool = cf.ThreadPoolExecutor(max_workers=64)
+    try:
+        with TestClient(_wedge_app(gate)) as client:
+            try:
+                total = _limiter(client)["total"]
+                for _ in range(total):
+                    pool.submit(client.get, "/_wedge")
+                assert _wait_until(lambda: _limiter(client)["borrowed"] == total)
+                assert _wait_until(
+                    lambda: client.get("/healthz").json()["pool_healthy"] is False)
+
+                t0 = time.time()
+                r = client.get("/healthz")
+                assert time.time() - t0 < 5          # answers, while wedged
+                body = r.json()
+                assert r.status_code == 503
+                assert body["pool_healthy"] is False
+                assert body["limiter"]["available"] == 0
+                assert body["last_ok_age_seconds"] is not None   # it WAS healthy
+                assert body["uptime_seconds"] >= 0
+                assert body["version"]
+
+                control = pool.submit(client.get, "/_sync_control")
+                with pytest.raises(cf.TimeoutError):
+                    control.result(timeout=3)
+            finally:
+                gate.set()
+    finally:
+        pool.shutdown(wait=False)
+
+
+def test_a_trip_dumps_every_threads_stack_and_stamps_the_wedge(started, monkeypatch):
+    """The assertion the whole work order exists for: a dump that does not name the
+    holder would leave the next occurrence as unexplained as this one."""
+    _fast_probe(monkeypatch)
+    gate = threading.Event()
+    pool = cf.ThreadPoolExecutor(max_workers=64)
+    try:
+        with TestClient(_wedge_app(gate)) as client:
+            try:
+                total = _limiter(client)["total"]
+                for _ in range(total):
+                    pool.submit(client.get, "/_wedge")
+                assert _wait_until(lambda: uilog.read_wedge() is not None, timeout=30)
+            finally:
+                gate.set()
+    finally:
+        pool.shutdown(wait=False)
+
+    stamp = uilog.read_wedge()
+    assert stamp["limiter"]["borrowed"] == total
+    assert stamp["limiter"]["available"] == 0
+    assert stamp["dump"] == str(uilog.stack_dump_path())
+    assert stamp["since"] > 0
+    assert stamp["version"]
+
+    dump = uilog.stack_dump_path().read_text()
+    assert "wedge_handler" in dump          # the holder, by name
+    assert " in wait" in dump               # parked in threading.Event.wait
+
+    # kn-57fb4919: `[ERROR]` in ui.log is a parsed contract with three readers, and a
+    # wedge is not an unhandled exception.
+    ui_log = uilog.ui_log_path()
+    assert "[ERROR]" not in (ui_log.read_text() if ui_log.exists() else "")
+
+
+# -- the daemon detects it and heals it ---------------------------------------------
+
+
+class _FakeRunner:
+    """The `release_runner` seam, recording. No test touches real systemd."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def restart_unit(self, unit: str) -> None:
+        self.calls.append(("restart_unit", unit))
+
+    def restart_unit_detached(self, unit: str, tag: str) -> None:
+        self.calls.append(("restart_unit_detached", unit, tag))
+
+
+WEDGED = {
+    "pool_healthy": False, "wedged": True, "wedged_since": 1000.0,
+    "consecutive_failures": 3, "stack_dump": "/tmp/state/logs/ui-stacks.log",
+    "limiter": {"borrowed": 40, "available": 0, "total": 40, "waiting": 7},
+}
+HEALTHY = {
+    "pool_healthy": True, "wedged": False, "wedged_since": None,
+    "consecutive_failures": 0, "stack_dump": None,
+    "limiter": {"borrowed": 0, "available": 40, "total": 40, "waiting": 0},
+}
+
+
+@pytest.fixture()
+def ui_unit(monkeypatch):
+    """`jarvis-ui.service` as systemd sees it — `active` unless a test says otherwise.
+
+    Patched in every test that can reach the check: the suite must never ask the real
+    user manager, where the machine's OWN dashboard may be running.
+    """
+    state = {"active": True}
+    monkeypatch.setattr(systemd_units, "unit_active", lambda unit: state["active"])
+    return state
+
+
+@pytest.fixture()
+def wedged(started, catalog_file, monkeypatch, ui_unit):
+    """A daemon whose dashboard answers `/healthz` saying it is wedged."""
+    answers = [HEALTHY]
+    monkeypatch.setattr(daemon_mod, "fetch_healthz",
+                        lambda url, timeout: answers[0])
+    d = Daemon(load_catalog(catalog_file))
+    d.release_runner = _FakeRunner()
+    d.check_ui_health(now=0.0)          # one healthy sighting first
+    answers[0] = WEDGED
+    return d, d.release_runner, answers
+
+
+def _inbox() -> list[dict]:
+    central = CentralStore()
+    try:
+        return central.unacked_inbox()
+    finally:
+        central.close()
+
+
+def test_a_dashboard_that_was_never_up_is_not_restarted(started, catalog_file,
+                                                        monkeypatch, ui_unit):
+    """A connection failure with no healthy sighting ever is "nobody started the
+    dashboard", not a wedge — and a daemon that restarted jarvis-ui.service every tick
+    on a machine with no dashboard would be a worse defect than the one being fixed."""
+    monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: None)
+    d = Daemon(load_catalog(catalog_file))
+    d.release_runner = _FakeRunner()
+
+    assert d.check_ui_health(now=0.0) == "unseen"
+    assert d.release_runner.calls == []
+    assert _inbox() == []
+
+
+def test_the_daemon_restarts_the_wedged_dashboard_once_inside_the_cooldown(wedged):
+    d, runner, _ = wedged
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert d.check_ui_health(now=1010.0) == "cooldown"
+    assert d.check_ui_health(now=1299.0) == "cooldown"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+    assert d.check_ui_health(now=1301.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT),
+                            ("restart_unit", release.UI_UNIT)]
+
+    # Every restart raises an inbox item naming the dump — no silent restarts, ever.
+    items = _inbox()
+    assert len(items) == 2
+    assert "wedged" in items[0]["title"]
+    assert WEDGED["stack_dump"] in items[0]["body"]
+    assert "40" in items[0]["body"]          # the limiter figures
+
+
+def test_a_timeout_and_a_wedged_answer_are_the_same_verdict(wedged, monkeypatch):
+    """A wedged process answers nothing at all if the event loop went too, so a check
+    that only believed a 503 would miss the worse case."""
+    d, runner, _ = wedged
+    monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: None)
+
+    assert d.check_ui_health(now=1000.0) == "restarted"
+    assert runner.calls == [("restart_unit", release.UI_UNIT)]
+
+
+def test_the_daily_cap_stops_restarting_and_still_reaches_the_user(wedged):
+    d, runner, _ = wedged
+    t = 1000.0
+    for i in range(3):                       # `max_restarts_per_day`
+        assert d.check_ui_health(now=t + i * 400) == "restarted"
+    assert len(runner.calls) == 3
+
+    assert d.check_ui_health(now=t + 2000) == "capped"
+    assert len(runner.calls) == 3            # no further restart
+    critical = [i for i in _inbox() if i["level"] == "critical"]
+    assert len(critical) == 1
+    assert "3" in critical[0]["body"]        # the cap that is spent
+    assert WEDGED["stack_dump"] in critical[0]["body"]
+
+    # It must not stop watching and must not fall silent — but one item per entry into
+    # the capped state, not one per tick.
+    assert d.check_ui_health(now=t + 2400) == "capped"
+    assert len([i for i in _inbox() if i["level"] == "critical"]) == 1
+
+    # …and restarting resumes once the 24h window rolls.
+    assert d.check_ui_health(now=t + 90000) == "restarted"
+    assert len(runner.calls) == 4
+
+
+def test_a_deliberately_stopped_dashboard_is_not_a_wedge(wedged, ui_unit):
+    """`systemctl --user stop jarvis-ui` leaves the port refusing connections, which over
+    HTTP alone is indistinguishable from a dead event loop. The measured fault had the
+    unit `active (running)`; without that discriminator the OS would restart the
+    dashboard the user had just stopped, three times, and say so each time."""
+    d, runner, answers = wedged
+    answers[0] = None                     # nothing is listening
+    ui_unit["active"] = False
+
+    assert d.check_ui_health(now=1000.0) == "down"
+    assert runner.calls == []
+    assert _inbox() == []
+
+    # The healthy sighting is left alone: the dashboard DID serve, and starting it again
+    # must not have to earn that back.
+    ui_unit["active"] = True
+    answers[0] = WEDGED
+    assert d.check_ui_health(now=1001.0) == "restarted"
+
+
+def test_a_failed_restart_says_so_once_and_still_spends_the_cooldown(wedged,
+                                                                    monkeypatch):
+    """The other order — announce, then restart — claims a restart that never happened
+    and, with no timestamp written, leaves no cooldown: the next tick five seconds later
+    repeats the whole thing, one inbox item per tick."""
+    d, runner, _ = wedged
+
+    def boom(unit: str) -> None:
+        runner.calls.append(("restart_unit", unit))
+        raise OSError("dbus: connection refused")
+
+    monkeypatch.setattr(runner, "restart_unit", boom)
+
+    assert d.check_ui_health(now=1000.0) == "restart_failed"
+    items = _inbox()
+    assert len(items) == 1
+    assert items[0]["level"] == "critical"
+    assert "could not be restarted" in items[0]["title"]
+    assert "dbus: connection refused" in items[0]["body"]
+    assert WEDGED["stack_dump"] in items[0]["body"]
+
+    # The attempt IS recorded, so the cooldown holds and nothing is said again.
+    assert d.check_ui_health(now=1010.0) == "cooldown"
+    assert len(_inbox()) == 1
+    assert len(runner.calls) == 1
+
+
+def test_the_ui_health_check_is_off_when_the_catalog_says_so(started, catalog_file,
+                                                             monkeypatch):
+    monkeypatch.setattr(daemon_mod, "fetch_healthz", lambda url, timeout: WEDGED)
+    cat = load_catalog(catalog_file)
+    cat.os.ui_health.enabled = False
+    d = Daemon(cat)
+    d.release_runner = _FakeRunner()
+
+    assert d.check_ui_health(now=1000.0) == "off"
+    assert d.release_runner.calls == []
+
+
+def test_the_ui_health_check_never_stalls_the_tick(started, catalog_file, monkeypatch,
+                                                   ui_unit):
+    """Same discipline as `check_ui_log`: the UI watch is the least important thing in
+    the tick."""
+    monkeypatch.setattr(daemon_mod, "fetch_healthz",
+                        lambda url, timeout: (_ for _ in ()).throw(OSError("no net")))
+    Daemon(load_catalog(catalog_file)).tick()      # must not raise
+
+
+def test_doctor_reports_the_wedge_and_the_self_restarts(wedged):
+    """`jarvis doctor` reports, the daemon heals — the OS_INVARIANTS rule."""
+    d, _, _ = wedged
+    uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=14400.0,
+                       version="0.10.0")
+    assert d.check_ui_health(now=time.time()) == "restarted"
+
+    found = [v for v in invariants.check_os() if v.invariant == "INV-UI-WEDGED"]
+    assert len(found) == 1
+    assert str(uilog.stack_dump_path()) in found[0].detail
+    assert found[0].context["restarts"] == 1
+    assert found[0].context["cap_spent"] is False
+    assert [v["invariant"] for v in ops.run_doctor()["os"]] == ["INV-UI-WEDGED"]
+    assert not ops.run_doctor()["os"][0]["repaired"]
+
+
+def test_doctor_stops_reporting_a_wedge_a_day_old(started):
+    """The restarted dashboard is a NEW process and never comes back to delete the
+    stamp, so a report that did not expire would say `wedged` for ever after one."""
+    uilog.record_wedge(limiter=WEDGED["limiter"], uptime_seconds=1.0, version="0.10.0")
+    stamp = uilog.read_wedge()
+    old = time.time() - uilog.ERROR_WINDOW_SECONDS - 60
+    uilog.wedge_stamp_path().write_text(
+        json.dumps({**stamp, "since": old, "at": old}))
+
+    assert [v for v in invariants.check_os() if v.invariant == "INV-UI-WEDGED"] == []

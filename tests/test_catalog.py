@@ -1015,3 +1015,74 @@ def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide()
     with pytest.raises(CatalogError,
                        match="os.validation.feature_merge_wait_minutes must be >= 0"):
         validation_of({"feature_merge_wait_minutes": -1})
+
+
+# -- `ui_health.*`: the dashboard's liveness probe and self-heal ----------------------
+#
+# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md §6.
+
+
+def test_ui_health_ships_the_measured_defaults_fleet_wide_and_per_project():
+    from jarvis.catalog import (
+        DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS,
+        DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY,
+        DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS,
+        DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS,
+        DEFAULT_UI_HEALTH_TRIP_THRESHOLD,
+    )
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+
+    assert DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS == 15
+    assert DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS == 20
+    assert DEFAULT_UI_HEALTH_TRIP_THRESHOLD == 3
+    assert DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS == 5
+    assert DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS == 300
+    assert DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY == 3
+    assert cat.os.ui_health.enabled is True
+    assert cat.os.ui_health.probe_interval_seconds == 15
+    assert cat.projects[0].ui_health.probe_timeout_seconds == 20
+    assert cat.projects[0].ui_health.max_restarts_per_day == 3
+
+
+def test_a_project_naming_one_ui_health_key_inherits_the_rest():
+    """`_parse_inspect`'s field-level inheritance (kn-6ca2bcd9): the project object is
+    the ANSWER, so no caller consults two objects."""
+    from jarvis import config_version
+
+    cat = parse_catalog({
+        "os": {"ui_health": {"trip_threshold": 5}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "ui_health": {"probe_interval_seconds": 30}},
+        ],
+    })
+
+    assert cat.os.ui_health.trip_threshold == 5
+    assert cat.projects[0].ui_health.trip_threshold == 5         # inherited from os
+    assert cat.projects[1].ui_health.probe_interval_seconds == 30    # its own
+    assert cat.projects[1].ui_health.trip_threshold == 5         # inherited from os
+    assert cat.projects[1].ui_health.max_restarts_per_day == 3   # from the default
+    resolved = config_version.resolve(cat)
+    assert resolved["os.ui_health.trip_threshold"] == 5
+    assert resolved["projects.b.ui_health.probe_interval_seconds"] == 30
+    assert resolved["projects.a.ui_health.enabled"] is True
+
+
+def test_an_absurd_ui_health_value_is_refused_naming_the_key():
+    """Every one is a count or a duration, so `>= 1`: a zero interval is a probe that
+    never sleeps, a zero cap a self-heal that can never heal."""
+    for key in ("probe_interval_seconds", "probe_timeout_seconds", "trip_threshold",
+                "healthz_timeout_seconds", "restart_cooldown_seconds",
+                "max_restarts_per_day"):
+        for bad in (0, -1):
+            with pytest.raises(CatalogError, match=f"os.ui_health.{key} must be >= 1"):
+                parse_catalog({"os": {"ui_health": {key: bad}}, "projects": []})
+
+
+def test_ui_health_can_be_switched_off_whole():
+    cat = parse_catalog({"os": {"ui_health": {"enabled": False}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.ui_health.enabled is False
+    assert cat.projects[0].ui_health.enabled is False
