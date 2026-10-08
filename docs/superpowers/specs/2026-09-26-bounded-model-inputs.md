@@ -295,7 +295,8 @@ build on it, and do not reorder that prompt on the strength of a guess.
 
 **The trim is not unsafe, and it is not free.** Over 136 scored rows it never confirmed
 where the full diff refused — the one row that did, wo-3b93b1ea#1, did not reproduce — but
-it escalates 82 of 136, 60.3% of the confirmations the full diff approved. Its agreement with what the fleet actually recorded falls from 0.750 to
+it escalates 82 of 136, 60.3% of the confirmations the full diff approved. Its agreement
+with what the fleet actually recorded (itself judged by opus — see below) falls from 0.750 to
 0.213. At 12,000 chars the confirmation pass stops being mostly an auto-confirmer and
 becomes mostly an escalator. That is a cost the user has to price, not a defect, and
 section 2's number is the thing it prices.
@@ -303,6 +304,14 @@ section 2's number is the thing it prices.
 `JARVIS_EVALS_LLM=1 pytest evals/llm/test_confirm_evidence_ab.py -q -s`, model sonnet, full
 arm at `daemon.CONFIRM_COLLECT_CHARS` (1,000,000 — nothing cut), trimmed arm at
 `catalog.DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS` (12,000).
+
+BOTH ARMS RAN SONNET. The two arms differ only in the evidence block, so the full-vs-trimmed
+numbers above are a clean within-model measurement. The recorded-outcome row is NOT: the
+verdicts the fleet actually recorded came from production Neo, which runs
+`catalog.NeoConfig.model` = `opus` (no override in the live catalog). So full 0.750 is sonnet
+agreeing with opus, and it conflates the model change with the trim. Read it as a floor on
+how well a sonnet confirmation pass tracks the shipped one, not as the full arm's accuracy.
+The trimmed 0.213 is below it for both reasons at once.
 
 The corpus comes from `evals/tools/build_confirm_corpus.py`, built against the live
 production fleet through the `jarvis` CLI only: 211 work orders read, 146 usable
