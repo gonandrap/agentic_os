@@ -1050,7 +1050,14 @@ def test_a_live_hold_buys_no_second_refusal_and_expires_by_the_clock(
     """A recorded hold nobody reads is a quieter retry storm."""
     _enable(catalog_file)
     _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
-    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+    # THE RELATIVE FORM, and that is what makes this test deterministic. `reset_at` is
+    # resolved against the REAL clock (`claude_cli.usage_limit`), while the hold is read
+    # against this file's hand-advanced `db.now` — so a wall-clock reset time put the
+    # second sweep 4 fake minutes past a real deadline, and the assertion below failed
+    # for every run that started between 23:46 and 23:50 America/Los_Angeles. "in 5h" is
+    # longer than the 4 minutes before the second sweep and shorter than the 25 hours
+    # before the third, which is exactly what the three phases need.
+    fake_claude.health_rate_limited(reset="in 5h")
     daemon = started()
 
     _sweep(daemon, clock)

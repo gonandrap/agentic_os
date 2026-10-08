@@ -27,8 +27,8 @@ import pytest
 
 from jarvis import db, ops
 from jarvis.hooks import handle_hook
-from jarvis.invariants import (IDLE_NO_FINISH_BLOCKER, check_project,
-                               true_blockers)
+from jarvis.invariants import (IDLE_NO_FINISH_BLOCKER, WORKER_FAILED_BLOCKER,
+                               check_project, true_blockers)
 from jarvis.project_store import ProjectStore
 
 from test_pipeline import _add_session, _inject, started  # noqa: F401
@@ -128,7 +128,11 @@ def test_a_dispatched_worker_whose_turn_dies_is_still_a_failure(
 
     fresh = store.get_work_order(wo["id"])
     assert fresh["status"] == "failed"
-    assert "turn failed" in fresh["attention_reason"]
+    # The CONSTANT and not a substring of it: the write site and `true_blockers` carried
+    # two spellings of this one state, and INV-ATTENTION-REASON rewrote the daemon's on
+    # the next tick — so a substring match passed while the record drifted. Equality is
+    # what makes the next drift fail loudly.
+    assert fresh["attention_reason"] == WORKER_FAILED_BLOCKER
 
 
 def test_a_dispatched_worker_idle_without_finish_is_still_flagged(
