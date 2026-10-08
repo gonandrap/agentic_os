@@ -1227,7 +1227,7 @@ def test_a_catalog_that_cannot_be_parsed_fails_the_bill_too(store, wo, transcrip
 
 # -- the observability class -------------------------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
 # reported as its own class for `WORKER_SUBPROCESS`'s reason: mixing it with what was spent
 # DOING the order answers neither question. Zero dollars beside a non-zero count and wall
 # clock is the honest rendering of a mechanical path, not a bug.

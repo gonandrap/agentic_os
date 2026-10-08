@@ -926,7 +926,7 @@ def test_each_transport_blocker_reads_its_sentence_from_the_hold_cause():
 
 def test_the_packet_says_when_it_was_read_from_a_seal_and_says_nothing_when_it_was_not(
         started, monkeypatch, tmp_path):
-    """§4 of docs/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which
+    """§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: every surface PRINTS which
     reading answered — but ONLY the sealed case, because the derived one is the packet
     above, byte for byte, and the judge reading it must not be told about a seal that was
     never consulted (Neo q1080)."""

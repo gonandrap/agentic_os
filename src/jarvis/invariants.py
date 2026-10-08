@@ -1222,9 +1222,12 @@ def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this worker pushed past a refusal without declaring it? Spec §2c of
     docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
 
-    `ops.refusal_answered` is CALLED rather than re-derived, and it stays finish-only:
-    the finish is the declaration, and widening it would let the panel judge a submission
-    nobody declared. This is the detector the OS lacked, so that an unanswered refusal
+    `ops.refusal_answered` is CALLED rather than re-derived, and a finish OR a passed
+    user-rework round answers the refusal: the user forcing that round IS the
+    declaration, and once a panel has passed the pushed head, nudging the worker for a
+    `wo finish` is noise (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
+    This is the detector the OS lacked, so that an unanswered refusal
     with commits behind it self-heals into a nudge instead of parking on the user for
     ever.
 

@@ -363,7 +363,7 @@ def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, 
     assert "approve" in fo["attention_reason"]  # Neo's reading, attached
     assert store.feature_children(fo["id"]) == []
     # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo —
-    # docs/specs/2026-10-01-neo-observability.md §1.
+    # docs/superpowers/specs/2026-10-01-neo-observability.md §1.
     assert question(fo["plan_question_id"])["escalation_cause"] == "scope-over-cap"
 
 
@@ -970,14 +970,14 @@ def test_a_spec_with_no_committed_copy_is_refused_and_names_the_commit(planning,
     """5. §11: the refusal is the ruling applied at its source, with the fix named."""
     _, fo = planning
     doc = a_plan(child("reader"))
-    doc["design_doc"] = "docs/specs/uncommitted.md"
+    doc["design_doc"] = "docs/superpowers/specs/uncommitted.md"
     (project / doc["design_doc"]).write_text(FIXTURE_DESIGN_DOC_BODY)
 
     with pytest.raises(ops.OpsError) as e:
         ops.submit_plan(fo["id"], doc)
 
     assert "no COMMITTED copy" in str(e.value)
-    assert "git add docs/specs/uncommitted.md && git commit" in str(e.value)
+    assert "git add docs/superpowers/specs/uncommitted.md && git commit" in str(e.value)
     assert store.get_feature_order(fo["id"])["status"] == "planning"
 
 

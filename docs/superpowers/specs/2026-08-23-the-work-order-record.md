@@ -217,7 +217,7 @@ every level assertion.
 
 `parse_plan` now refuses a plan with no design document, and `ops.submit_plan` refuses one
 naming a file not on disk, so every existing plan fixture broke at once.
-`jarvis.testing.make_git_project` writes `docs/specs/exporter.md` into every fixture project
+`jarvis.testing.make_git_project` writes `docs/superpowers/specs/exporter.md` into every fixture project
 and exports `FIXTURE_DESIGN_DOC`, so a plan helper just names it.
 
 `evals/test_question_diet_budget` reconstructs its 11 KB-brief production shape **past** the

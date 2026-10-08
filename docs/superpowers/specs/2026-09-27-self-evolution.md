@@ -931,7 +931,7 @@ the dashboard's existing idiom, and the numbers come from the report.
 
 You are a Jarvis OS engineer building one slice of the self-evolution feature. Other workers are
 building the other slices in parallel and you will never see their sessions. Your section of
-`docs/specs/2026-09-27-self-evolution.md` is your job; the rest of the spec is context you may
+`docs/superpowers/specs/2026-09-27-self-evolution.md` is your job; the rest of the spec is context you may
 read and must not implement.
 
 **What you must know about this codebase.**
