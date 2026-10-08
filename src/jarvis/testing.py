@@ -141,6 +141,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # entire subject of that check (issue #202). Pointed at a directory inside the
         # sandbox holding no checkout: "no production deployment on this machine".
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
+        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads. Same trap as the
+        # two entries above: left ambient, `jarvis doctor` in a test passes or fails on
+        # whether the human has run install_prod_cli.sh — and it fails, which is the
+        # subject of that check. Pointed at an empty directory inside the sandbox: no
+        # wrapper installed, and PRODUCTION_ROOT_ENV above already means "no production
+        # deployment", so the check is silent either way.
+        release.CLI_BIN_DIR_ENV: str(root / "cli-bin"),
         # The production units export `JARVIS_ENV=production` and it OVERRIDES the
         # location check above, so a suite run BY A JARVIS WORKER inherits it from the
         # daemon and every test of the dev badge fails on a machine where the OS is
