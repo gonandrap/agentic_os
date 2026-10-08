@@ -217,6 +217,14 @@ per_token(m)     = usage.price_for(m)[0] / 1e6
   reverse. The window ends at the first compaction with `ts > ts(result)`
   (`usage.compaction_stamps`, usage.py:875-877): a compaction replaces the conversation,
   so the result stops being carried.
+* **AMENDED by `2026-10-08-cost-tool-section-window-clip.md` (issue #990): the report's
+  window bounds this model at both ends.** A result counts only if its own `result.ts`
+  falls in the report's `[since, until)`, and the carried ride ends at
+  `min(first compaction with ts > result.ts, until)`. `since` is a selector only — a call
+  later than the result is later than `since` by construction — and `until` is both a
+  selector and a bound. As first written this subsection had no notion of a window at all,
+  which is where the defect came from: carried dollars in this subsection exceeded the
+  whole window's spend. The arithmetic above is otherwise unchanged.
 * **Cache read vs TTL-expiry rewrite, split and reported separately.** `prefix_rate`'s
   `kind` gives read-vs-write; the *cause* of a write comes from
   `usage.classify_boundaries(calls, compactions=…, cold_prefix_floor=…)`
@@ -335,7 +343,8 @@ fleet: {
     version: 1,
     totals:  <ToolCost>,                       // every tool, both callers
     by_tool: { "<tool_use.name>": <ToolCost> },
-    excluded: {unmatched_calls, no_transcript, orders_capped, sessions_walked},
+    excluded: {unmatched_calls, no_transcript, orders_capped, sessions_walked,
+               outside_window},             // AMENDED: #990, see below
     notes: [ "<the six known-inaccuracy sentences>" ]
   }
 }
@@ -378,6 +387,12 @@ fleet: {
 * `excluded.sessions_walked` is how many transcripts were read; `orders_capped` is how
   many orders the `max_orders` cap dropped (10.9). Both are in the payload so a share can
   be checked against a denominator.
+* `excluded.outside_window` — added by `2026-10-08-cost-tool-section-window-clip.md` — is
+  how many MATCHED results the window clip removed. It counts RESULTS, not dollars:
+  pricing them is the computation being removed, and a dollar figure there would invite a
+  reader to add it back to the total. `fleet.tools.version` and `fleet.version` both stay
+  **1**: a key added to `excluded` is additive under this subsection's own rule, and the
+  FIGURES changing is the fix, not a re-shaping.
 
 ### 10.7 The text render
 
@@ -412,6 +427,12 @@ mcp__…serena__find_symbol          412        0.2M          1.1M        2.51  
 Dashboard: `fleet.tools` renders into the §5 partial
 `ui/templates/_fleet_distribution.html` as a second table. No second computation, same
 payload.
+
+AMENDED by `2026-10-08-cost-tool-section-window-clip.md`: both surfaces append one
+sentence to the footer that already prints `excluded`, from `excluded.outside_window` —
+`· M tool results outside the window, excluded` — and are SILENT when it is zero, since
+nothing was hidden and there is nothing to disclose. Same key, same sentence, no second
+computation.
 
 ### 10.8 Unit tests
 
@@ -457,6 +478,24 @@ never `conftest.py`, per `mem:testing`; extend §7's `fleet_fixture` with a
     `excluded.orders_capped == 2`, `sessions_walked == 1`.
 12. `test_tools_read_only` — §7.10's assertion extended: the transcript files' mtimes are
     unchanged and `ProjectStore` is never constructed.
+
+Cases 13-18, added by `2026-10-08-cost-tool-section-window-clip.md` §9 for the window
+clip, all in `tests/test_fleetcost.py`'s section-10 block:
+
+13. `test_a_result_before_since_is_excluded`
+14. `test_a_result_after_until_is_excluded` — includes a result at EXACTLY `until`,
+    asserted EXCLUDED: the window is half-open and an off-by-one there is invisible
+    elsewhere.
+15. `test_carried_range_is_truncated_at_until` — and a second arrangement with a compaction
+    BEFORE `until`, so the `min(...)` is proved rather than "whichever bound was added
+    last".
+16. `test_excluded_outside_window_counts_results` — each exclusion in its own key, and the
+    matched check runs before the window check.
+17. `test_subagent_results_are_clipped_too` — the guard against clipping only the main
+    chain.
+18. `test_tool_carried_usd_never_exceeds_window_spend` — the INEQUALITY of §10.12, plus a
+    strict comparison against the same fixture walked unclipped, so a revert fails instead
+    of passing vacuously.
 
 ### 10.9 Cost control
 
