@@ -87,19 +87,19 @@ VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
 
 # Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
-# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
 # behaviour Jarvis does not own, and writes no key. DEFAULT `on`: Jarvis PINS deferral
 # rather than leaving it to the vendor default, because deferral is what makes a worker's
 # first navigation call a symbol call — 7/7 deferred against 1/10 with the tools present
 # (wo-ab5d81db), which makes `off` a measured regression on that outcome. §4 addendum of
-# docs/specs/2026-10-02-serena-the-cheap-path.md.
+# docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 VALID_TOOL_SEARCH = ("off", "on", "cli")
 DEFAULT_WORKER_TOOL_SEARCH = "on"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
-# `.py` path. §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
 # it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF, and the flip is
@@ -113,7 +113,7 @@ VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
 
 # Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC —
-# §5 of docs/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
+# §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
 # VALID_PY_NAV_HOOK above and for its reason: the hook is entirely Jarvis's own.
 # DEFAULT OFF — nothing in that spec ships on, so merging it changes the behaviour of no
 # running worker.
@@ -981,12 +981,12 @@ DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 #: Which files make a read a DOC read. A sibling of `code_suffixes`, never a widening of
 #: it: `navigates_source`'s meaning is the fleet's published baseline (§2.2). Data rather
 #: than code so re-measuring needs no release.
-#: docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
 
 #: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
 #: search in markdown stays legal and counting it would price a legitimate call as waste.
-#: docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
 DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
 
 #: The default window for a wide scope, in days. Seven, for
@@ -1068,7 +1068,7 @@ class CostConfig:
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
 #: reads a config object and catalog importing it back would be the cycle.
-#: docs/specs/2026-09-24-order-observability.md §10.
+#: docs/superpowers/specs/2026-09-24-order-observability.md §10.
 OBSERVABILITY_LEVELS = ("off", "normal", "full")
 DEFAULT_OBSERVABILITY_LEVEL = "normal"
 
@@ -1076,14 +1076,14 @@ DEFAULT_OBSERVABILITY_LEVEL = "normal"
 @dataclass
 class ObservabilityConfig:
     """What debug data Jarvis COLLECTS. §10 of
-    docs/specs/2026-09-24-order-observability.md.
+    docs/superpowers/specs/2026-09-24-order-observability.md.
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
     (`_parse_observability`), and a per-order override on `work_orders.observability`
     beats both — precedence resolved in one place, `observability.level_for`.
 
     `off` GATES TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json` and
-    the sealed autopsy (§5 of docs/specs/2026-09-27-order-autopsy-durability.md). So `off`
+    the sealed autopsy (§5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). So `off`
     stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
@@ -1091,7 +1091,7 @@ class ObservabilityConfig:
     context` says it was not recorded.
 
     `full` DIFFERS FROM `normal` BY EXACTLY ONE THING: the tool parameters a `full` seal
-    retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
+    retains (§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
     itself — every turn, its tools, its token classes, its context total, delta, peak and
     composition — is derived at read time from the transcript (§§3, 4, 6, 7) and so is
     shown for every order at every level, `off` included.
@@ -1729,7 +1729,7 @@ def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
 def _doc_read_limit_or_err(raw: dict[str, Any], where: str, default: int) -> int:
     """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key.
 
-    §5.3 of docs/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
+    §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
     is rejected LOUDLY; `hooks.doc_nav_decision` absorbs one quietly, because it runs on
     every tool call and a hook that raises breaks the whole session. Both are needed:
     validation cannot see a settings file edited by hand.
@@ -2009,7 +2009,7 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         symbol_tools=patterns("symbol_tools", base.symbol_tools),
         text_search_tools=patterns("text_search_tools", base.text_search_tools),
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
-        # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
         doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
         doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),

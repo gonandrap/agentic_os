@@ -534,7 +534,7 @@ def test_everything_that_is_not_an_explicit_approval_stays_with_the_user(verdict
 
 # -- why the OS escalated, as one groupable label --------------------------------------
 #
-# docs/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
+# docs/superpowers/specs/2026-10-01-neo-observability.md §1 plus Neo's ruling on question 1170: an
 # override is a THIRD answer to "who decided", so these five members are their own class
 # and every one is derived from facts the code already holds — never read off a reply.
 
@@ -1248,7 +1248,7 @@ def test_a_panel_that_gives_up_while_neo_is_thinking_stops_the_settle(started):
 
 # -- WHO decided, on the row the report groups by --------------------------------------
 #
-# docs/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
+# docs/superpowers/specs/2026-10-01-neo-observability.md §1 and Neo's ruling on question 1170. These
 # re-marks happen AFTER Neo answered, so without a cause every one of them renders "not
 # recorded" for ever — on `kind='assumption'`, the population the user complained about.
 

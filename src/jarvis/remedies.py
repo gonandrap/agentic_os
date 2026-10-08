@@ -51,7 +51,7 @@ GRANT_USES = 1
 INTENT = "heal {alarm_id}: {remedy} {subject_id} — {argument}"
 
 #: `INTENT`'s sibling for a USER-INITIATED fix — §11 of
-#: docs/specs/2026-09-24-order-observability.md. IT IS NOT A COMMAND EITHER and nothing
+#: docs/superpowers/specs/2026-09-24-order-observability.md. IT IS NOT A COMMAND EITHER and nothing
 #: will execute it. It names NO alarm because there is none: the user reached the remedy
 #: off §6's diagnosis, and `apply` recovers the remedy and the subject from this string
 #: rather than from an alarm row (Neo q795). The prefix differs from `INTENT`'s so the two
@@ -189,7 +189,7 @@ USER_REFUSED_INBOX_TITLE = ("The {remedy} fix on {subject_id} was refused — no
 
 #: The types a remedy parameter may have, as STRINGS keying Python types.
 #:
-#: docs/specs/2026-09-27-self-evolution.md §4 addition 1. A string rather than a bare
+#: docs/superpowers/specs/2026-09-27-self-evolution.md §4 addition 1. A string rather than a bare
 #: `type` object because the sibling section validates a remedy row's parameters as JSON
 #: read back out of a database column: the schema has to survive a round trip through
 #: `json.dumps`, and `int` does not. Closed for the reason the registry itself is closed
@@ -200,7 +200,7 @@ PARAM_TYPES: dict[str, type] = {"str": str, "int": int, "bool": bool}
 #: The closed TEMPLATE table `raise_attention` renders from: our own short key -> the
 #: `invariants` constant that spells the sentence, and the id slots that sentence takes.
 #:
-#: §4 of docs/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
+#: §4 of docs/superpowers/specs/2026-09-27-self-evolution.md as corrected by spec commit 2920441:
 #: **`raise_attention` renders its reason; it never relays one.** The parameter a rule
 #: writes is a KEY, and the sentence the user reads is built in code from that key — no
 #: free-text parameter, and no parameter interpolated into the command the reason tells
@@ -557,7 +557,7 @@ class Intent:
 # `tests/test_remedies.py::test_the_acting_calls_stay_inside_the_handlers` walks this
 # file's AST for `send_message`, `queue_message`, `unblock_work_order`,
 # `create_work_order`, `cancel`, `cancel_work_order` and `set_status` — and, since §4 of
-# docs/specs/2026-09-27-self-evolution.md widened the registry, `update_branch`,
+# docs/superpowers/specs/2026-09-27-self-evolution.md widened the registry, `update_branch`,
 # `abandon_approval`, `flag_attention`, `clear_attention`, `force_validation`,
 # `carry_merge_chain`, `record_base_update` and `record_base_update_failed` — as an
 # attribute or a bare name, and requires the nearest enclosing function to be one of
@@ -698,7 +698,7 @@ def _apply_file_work_order(pstore: Any, central: Any, project: str,
 
 # -- §4's six: the acts a rule may name, each WRAPPING an existing call ----------------
 #
-# docs/specs/2026-09-27-self-evolution.md §4. Every one of these is a thin wrapper around
+# docs/superpowers/specs/2026-09-27-self-evolution.md §4. Every one of these is a thin wrapper around
 # a call the daemon already makes, in the daemon's own order, and NOT a second
 # implementation of it. The catch-up proof is the case that matters (kn-907c9a61):
 # parentage read from GitHub plus content hashed locally with `--full-index --no-ext-diff
@@ -1621,7 +1621,7 @@ def propose_fix(pstore: Any, neo: Any, project: str, subject: dict[str, Any],
                 remedy_id: str, argument: str, cfg: Any,
                 *, reason: str = "") -> dict[str, Any]:
     """`propose` for a subject with NO ALARM — §11 of
-    docs/specs/2026-09-24-order-observability.md, on Neo's q795 ruling.
+    docs/superpowers/specs/2026-09-24-order-observability.md, on Neo's q795 ruling.
 
     Same return shape, same registry, same allow-list, same `self_heal` grant, same
     reviewer, same `GRANT_USES`. THE ONLY NEW THING IS WHO ASKED: the user reached one of

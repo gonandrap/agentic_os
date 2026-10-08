@@ -1,6 +1,6 @@
 """A whole-file or oversized read of a SPEC is refused, naming `jarvis spec`.
 
-§5 of docs/specs/2026-10-06-navigate-specs-like-code.md. The bar is a catalog setting
+§5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. The bar is a catalog setting
 (`worker.doc_read_limit_lines`, fallback 200) and the switch is `worker.doc_nav_hook`,
 DEFAULT OFF — nothing here changes the behaviour of a running worker.
 
@@ -24,7 +24,7 @@ from jarvis import catalog, hooks
 from jarvis.catalog import CatalogError, ProjectSpec, WorkerDefaults
 from jarvis.dispatch import _write_worker_settings
 
-SPEC = "docs/specs/2026-10-06-navigate-specs-like-code.md"
+SPEC = "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md"
 SECTION = ".jarvis/features/fo-x/sections/wo-y.md"
 
 ON = {"JARVIS_DOC_NAV_HOOK": "on", "JARVIS_WO_ID": "wo-1"}

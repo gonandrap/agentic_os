@@ -1,6 +1,6 @@
 """Screenshot the harvest block on a work-order page, for a PR's UI evidence.
 
-Issue #888, spec docs/specs/2026-09-30-harvesting-a-dead-turn.md §5: what the OS read
+Issue #888, spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5: what the OS read
 off disk when a turn died renders directly ABOVE the retry control, because it is what
 the user reads before pressing the button. This shot is that adjacency.
 

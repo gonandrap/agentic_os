@@ -1212,7 +1212,7 @@ def escalation_cause(ruling: Ruling | None = None, *, escalate: bool = False,
 
     PURE and in this module because `Ruling` and the stakes vocabulary are, and because
     ONE derivation is what keeps the four daemon call sites from drifting apart (§1 of
-    docs/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
+    docs/superpowers/specs/2026-10-01-neo-observability.md, Neo's ruling on question 1170). The members
     are spelled as literals rather than imported: this module depends on no store, and
     `tests/test_autoreview.py` pins what it returns against the enum instead.
 

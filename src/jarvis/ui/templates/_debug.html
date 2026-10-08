@@ -1,5 +1,5 @@
 {# Shared furniture for the four blocks of the debugging page (spec §7 of
-   docs/specs/2026-09-24-order-observability.md).
+   docs/superpowers/specs/2026-09-24-order-observability.md).
 
    `failed` is the whole of "degradation is a feature, not an error page": each block is
    read independently and one that could not be read says so, in the sentence the route
@@ -22,7 +22,7 @@
 {% if text %}<div class="sub" style="padding: 10px 16px; color: var(--ink-2);">{{ text }}</div>{% endif %}
 {% endmacro %}
 
-{# WHICH READING ANSWERED — spec §4 of docs/specs/2026-09-27-order-autopsy-durability.md.
+{# WHICH READING ANSWERED — spec §4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md.
    A sealed reading and a fresh one must never disagree on the same order, and a
    disagreement nobody can attribute is one nobody can fix. Every sentence is a key of
    `autopsy.anatomy_for`'s provenance; this macro words none of them, and a sealed-floor

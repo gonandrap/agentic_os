@@ -12,7 +12,7 @@ same string every single time:
 Mechanism: the brief's `ToolSearch select:` line is an ACTION the worker executes, not an
 exhortation it weighs, and having paid a call to load `find_symbol` it then uses it.
 Presence deletes that step, and the grep prior wins. wo-ab5d81db; addendum under section 4
-of docs/specs/2026-10-02-serena-the-cheap-path.md.
+of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 
 Runs the eval's own harness (imported from `evals/llm/test_navigation_judgment.py`, never
 retyped) with the BRIEF and the ENV varied independently — the thing the eval itself

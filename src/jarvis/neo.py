@@ -266,7 +266,7 @@ def parse_dispatch(data: Any) -> dict[str, str] | None:
 
 
 def _escalation_cause(raw: Any) -> str:
-    """The model's `cause` label, or `""` — §2 of docs/specs/2026-10-01-neo-observability.md.
+    """The model's `cause` label, or `""` — §2 of docs/superpowers/specs/2026-10-01-neo-observability.md.
 
     NEVER RAISES, AND NEVER REJECTS THE VERDICT. A missing or unrecognised cause is a
     label absent from an otherwise valid decision; rejecting it would route a perfectly
@@ -309,7 +309,7 @@ def _validate_verdict(data: dict[str, Any]) -> dict[str, Any]:
         # kind, which reads as `routine` there and is never consulted.
         "stakes": str(data.get("stakes") or "")[:20].strip().lower(),
         # Read exactly as `stakes` is — normalised, never trusted, never fatal. §2 of
-        # docs/specs/2026-10-01-neo-observability.md.
+        # docs/superpowers/specs/2026-10-01-neo-observability.md.
         "cause": _escalation_cause(data.get("cause")),
     }
 
@@ -497,7 +497,7 @@ def drain_queue(store: NeoStore, model: str, learnings_limit: int = 50,
             results.append({"question": q, "verdict": None, "outcome": outcome})
             continue
         if verdict["escalate"]:
-            # Spec §2 of docs/specs/2026-10-01-neo-observability.md.
+            # Spec §2 of docs/superpowers/specs/2026-10-01-neo-observability.md.
             store.mark(q["id"], "escalated", reason=verdict["reason"],
                        cause=verdict.get("cause") or "")
             log.info("neo escalated question %s: %s", q["id"], verdict["reason"])

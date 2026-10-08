@@ -50,7 +50,7 @@ def plan(*children: dict, **extra) -> dict:
     """A plan that passes every check. `design_doc` is defaulted rather than written
     into each call so a test can knock out exactly the rule it is about — pass
     `design_doc=""` to make it a plan that names no design document."""
-    return {"design_doc": "docs/specs/budgets.md", "children": list(children), **extra}
+    return {"design_doc": "docs/superpowers/specs/budgets.md", "children": list(children), **extra}
 
 
 # -- the shape ------------------------------------------------------------------------
@@ -354,13 +354,13 @@ def test_the_rendered_plan_carries_what_a_reviewer_has_to_judge():
 
 def test_the_context_carries_the_spec_and_forbids_reading_disk():
     """§5: the reviewer gets the text, its provenance, and the refusal to go hunting."""
-    plan = {"design_doc": "docs/specs/x.md",
+    plan = {"design_doc": "docs/superpowers/specs/x.md",
             "design_doc_content": "# X\n\n## 1. Shape\n\nOne module.\n"}
 
     context = build_plan_context(plan, "main @ fb7739d")
 
     assert context.startswith(
-        "SPEC UNDER REVIEW — docs/specs/x.md, as committed on main @ fb7739d.")
+        "SPEC UNDER REVIEW — docs/superpowers/specs/x.md, as committed on main @ fb7739d.")
     assert "Do NOT open this path on disk" in context
     assert "One module." in context
     assert "TRUNCATED" not in context
@@ -370,7 +370,7 @@ def test_a_clipped_spec_says_so_and_names_every_section_it_dropped():
     """§10: a silently clipped spec the reviewer believes is whole recreates 658."""
     body = "\n".join(f"## {n}. Piece {n}\n\nbody{n} " + "x" * 400
                      for n in range(1, 40))
-    plan = {"design_doc": "docs/specs/x.md", "design_doc_content": body}
+    plan = {"design_doc": "docs/superpowers/specs/x.md", "design_doc_content": body}
 
     context = build_plan_context(plan, "main @ abc1234", max_chars=2000)
 

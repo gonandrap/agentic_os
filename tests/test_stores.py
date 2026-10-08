@@ -470,7 +470,7 @@ def test_approvals_of_kind_is_not_bounded_by_the_generic_listings_window(project
 
 # -- the per-order observability override ----------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md, on `budget_usd`'s precedent:
 # nullable, and NULL is "this order has no answer" and not `off`.
 
 
