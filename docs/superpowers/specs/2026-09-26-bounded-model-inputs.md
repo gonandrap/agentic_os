@@ -345,6 +345,40 @@ chars over the run — 89.0% of the full arm's input, 87.4% at the median.
 This section's optional cache-prefix experiment was not built, for the reason stated above
 it. Unchanged.
 
+### 6.2 — The same question at opus, probed (wo-a2cc8692)
+
+6.1 ran both arms at sonnet. Production Neo runs opus, so the obvious objection to the
+60.3% escalation cost is that it is a sonnet weakness the shipped model would not have.
+It is not. Measured on an ENRICHED sample — the rows where the trim actually changed
+sonnet's answer — most of that cost survives the model change.
+
+Two steps, 35 opus calls, both at concurrency 2, zero transport failures and zero
+unreadable replies.
+
+1. The trimmed arm at opus on 25 of 6.1's 82 safe-flip rows, chosen evenly across the
+   diff-size range (21,446 to 291,763 chars): **21 escalated, 4 approved**. So 0.84 of
+   sonnet's escalations reproduce at opus.
+2. That leaves "opus is simply a stricter reviewer" as the other explanation, which the
+   trimmed arm alone cannot separate. So the FULL arm at opus on 10 of those 21, again
+   spanning the size range: **7 approved, 3 escalated anyway** — median `prompt_chars`
+   84,986, total 1,124,357. 0.70 of the escalations are caused by the trim; the other
+   0.30 opus would have escalated with the whole diff in front of it.
+
+The two factors multiply to 0.59, which puts opus's safe-direction disagreement at
+roughly 0.35 of confirmations — about 48 of 136 rows — against sonnet's 0.603.
+
+READ THAT AS A LOWER BOUND, NOT AS AN ESTIMATE. The sample is enriched by construction:
+it only contains rows where SONNET flipped, so it says nothing about the 54 rows sonnet
+agreed on, and opus may flip some of those too. 21/25 and 7/10 are also small samples
+with wide intervals. The claim this supports is the qualitative one — the trim's
+attention cost is real at the model production actually runs, not a sonnet artefact —
+and not a second decimal place.
+
+Reproduce with `evals/tools/build_confirm_corpus.py` for the corpus and the trimmed/full
+arms of `evals/llm/test_confirm_evidence_ab.py` at `JARVIS_EVALS_MODEL=opus`; the eval
+has no arm-selection or sampling flag, so the probe drove `build_arms` and `judge`
+directly. That gap is the cheap thing to add if this measurement is ever wanted again.
+
 ## 7 — Refused and deferred, with reasons, so nobody re-litigates them
 
 **Which of the user's eight items these are.** Item 2 (one diff per work order per
