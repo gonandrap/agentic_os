@@ -115,7 +115,7 @@ def test_absent_and_null_are_different():
 
 
 def test_tool_search_defaults_and_overrides_per_project():
-    """§4 of docs/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
+    """§4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
     fleet-wide with a per-project override. The default PINS DEFERRAL ON — deferral is
     what makes a worker's first navigation call a symbol call (7/7 deferred against 1/10
     with the tools present, wo-ab5d81db), so `cli` would leave that outcome to a vendor
@@ -153,7 +153,7 @@ def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
 
 
 def test_py_nav_hook_defaults_off_and_overrides_per_project():
-    """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
+    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
     `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
     entirely Jarvis's own. Default OFF: the hook measures ZERO contribution to first-call
     order, and on fleet-wide a worker cannot search the tree for ANY text (issue 936);
@@ -641,7 +641,7 @@ def test_worker_require_crew_parsed():
 
 # -- observability: what debug data is COLLECTED ----------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
 # §5's per-turn ingredient row, and no read.
 
 
@@ -877,6 +877,19 @@ def test_cost_defaults_ship_on_both_config_objects(tmp_path):
         # cap of the tool table, both catalog settings for the same stated reason.
         assert cfg.chars_per_token == 4.0
         assert cfg.tool_rows == 20
+        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's
+        # length is a belief about the usage grid, so it is a setting and not a constant.
+        assert cfg.session_window_hours == 5.0
+
+
+def test_a_non_positive_session_window_hours_is_refused():
+    """A fractional length is a legal belief about the grid; zero is not a length."""
+    for bad in (0, -1, -2.5):
+        with pytest.raises(CatalogError, match="session_window_hours must be > 0"):
+            parse_catalog({"os": {"cost": {"session_window_hours": bad}},
+                           "projects": []})
+    assert parse_catalog({"os": {"cost": {"session_window_hours": 2.5}},
+                          "projects": []}).os.cost.session_window_hours == 2.5
 
 
 def test_a_non_positive_chars_per_token_is_refused():

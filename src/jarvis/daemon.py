@@ -1052,7 +1052,7 @@ class Daemon:
 
     def seal_autopsies(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Freeze the ANATOMY of every settled order that has none yet — §3 of
-        docs/specs/2026-09-27-order-autopsy-durability.md.
+        docs/superpowers/specs/2026-09-27-order-autopsy-durability.md.
 
         Beside `seal_bills`, on the same cadence, for the same reason and with the same
         three properties: a bounded batch, ONE hoisted `usage.index_sessions()` for it, and
@@ -4009,7 +4009,7 @@ class Daemon:
             # Neo answered, but the answer is not what happens. Re-marking the question
             # keeps `jarvis neo list` and `jarvis status` telling the same story: this
             # is now the user's to decide — with WHICH fact overrode it, so the report
-            # can group it (§1 of docs/specs/2026-10-01-neo-observability.md).
+            # can group it (§1 of docs/superpowers/specs/2026-10-01-neo-observability.md).
             neo_store.mark(q["id"], "escalated", reason=reason,
                            cause=autoreview.escalation_cause(
                                over_cap=True, escalate=bool(verdict["escalate"])))
@@ -4273,7 +4273,7 @@ class Daemon:
                 approval = store.get_approval(int(approval_id)) if approval_id else None
                 if approval is not None and approval["status"] == "approved":
                     ready.append((project, alarm["id"], int(approval["id"])))
-            # §11 of docs/specs/2026-09-24-order-observability.md: a USER-INITIATED fix has
+            # §11 of docs/superpowers/specs/2026-09-24-order-observability.md: a USER-INITIATED fix has
             # no alarm row, so the scan above would never see it and an approved grant
             # would sit unspent for ever. Same pool, same `remedies.enabled` gate.
             for grant in remedies_mod.user_grants(store):
@@ -6792,12 +6792,16 @@ class Daemon:
         # would write nothing, the stored payload would still say round 2, and
         # `ops._panel_hold_is_stale` would then drop a hold that is TRUE. Every other code
         # carries 0 on both sides, so their dedupe is what it was.
+        # THE REASON TEXT IS PART OF THE KEY TOO (issue #975): `HELD_REFUSAL_UNANSWERED`
+        # renders two different sentences, so a code-only key suppressed the second and
+        # left the first rendered as a claim about now that had stopped being true.
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
-               int(decision.round or 0))
+               int(decision.round or 0), str(decision.reason or ""))
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
                                         str(p.get("code") or ""),
-                                        int(p.get("round") or 0))):
+                                        int(p.get("round") or 0),
+                                        str(p.get("reason") or ""))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,

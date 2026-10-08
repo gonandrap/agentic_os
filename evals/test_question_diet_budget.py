@@ -58,7 +58,7 @@ def production_shaped_plan() -> dict[str, Any]:
         })
     plan = plans.parse_plan({
         "summary": "no work order reaches the merge queue until the panel says so",
-        "design_doc": "docs/specs/validation-panel.md",
+        "design_doc": "docs/superpowers/specs/validation-panel.md",
         "children": children,
     })
     for child in plan["children"]:

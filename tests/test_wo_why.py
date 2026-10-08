@@ -1,5 +1,5 @@
 """`jarvis wo why` — the diagnosis report, §6 of the order-observability spec
-(docs/specs/2026-09-24-order-observability.md).
+(docs/superpowers/specs/2026-09-24-order-observability.md).
 
 The question it answers is the one §1 measured as the most-asked: "this order has not
 moved in three hours. What is it waiting for, and what do I type?" Everything it prints
@@ -584,7 +584,7 @@ def test_an_order_with_no_notes_reports_all_three_as_none(started):
 
 
 # -- 13. a failed order is offered the retry, and only a failed one ----------------------
-# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §6 and §7.
+# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §6 and §7.
 
 
 def _failed(started, project, session: bool = True) -> dict:

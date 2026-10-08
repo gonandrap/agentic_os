@@ -11,7 +11,7 @@ validation round quotes it — and the dashboard renders its PATH as text. The d
 OS is holding, in `plan["design_doc_content"]`, reaches no page and no terminal.
 
 Live case: planner **wo-1170d758** of **fo-69ba1cc4**. `design_doc` is
-`docs/specs/2026-09-27-self-evolution.md`. `pr_url` is None, so that path exists in exactly
+`docs/superpowers/specs/2026-09-27-self-evolution.md`. `pr_url` is None, so that path exists in exactly
 two places — the planner's worktree, and the plan snapshot in the project database. A user
 reading the feature order page is shown a repo path that does not resolve in their
 checkout.
@@ -192,7 +192,7 @@ content so the two cannot disagree:
 - `src/jarvis/ops.py:7219` — `plan["design_doc_content"], plan["design_doc_source"] = found`
 - `src/jarvis/ops.py:7335` — `plan["design_doc_content"], plan["design_doc_source"] = text, source`
 
-The page prints it verbatim under the title: **`docs/specs/x.md — branch wo-1170d758 @
+The page prints it verbatim under the title: **`docs/superpowers/specs/x.md — branch wo-1170d758 @
 4f2a1c9`**. `landing.committed_text`'s strings are already human-readable and already say
 which rung answered; re-wording them here would make the page and the Neo question describe
 one snapshot two ways.
@@ -263,7 +263,7 @@ section=None)`.
 
 Returns `{"project", "fo_id", "repo_path", "source", "content"}`; with `--section`,
 `content` is `sections.extract_section`'s output and the key `section` is added. Human
-output is one header line — `docs/specs/x.md — branch wo-1170d758 @ 4f2a1c9` — then the
+output is one header line — `docs/superpowers/specs/x.md — branch wo-1170d758 @ 4f2a1c9` — then the
 markdown raw to stdout. **The terminal gets markdown, not the HTML renderer**: `markdown.py`
 serves the page.
 

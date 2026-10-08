@@ -3,7 +3,7 @@
 The failure: the Claude Code plugin starts the Serena MCP server with fixed args carrying
 neither `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so
 the first `find_symbol` of a dispatched turn comes back `No active project`. Spec
-docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
 
 TWO MODES, one real `claude -p` turn each, so each run bills tokens. Not a test.
 

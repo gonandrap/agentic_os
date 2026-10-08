@@ -1,6 +1,6 @@
 """The read side of the seal: one chokepoint, and every surface saying which it read.
 
-§4 of docs/specs/2026-09-27-order-autopsy-durability.md. `autopsy.anatomy_for` is the one
+§4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md. `autopsy.anatomy_for` is the one
 place that chooses between a sealed reading and a fresh one, and standing rule (a) — a
 persisted figure and a freshly derived one must never disagree on the same order — is a
 claim about a SURFACE, so it is proven here and nowhere else: one order, `ops.inspect_report`

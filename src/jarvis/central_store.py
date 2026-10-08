@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS gate_rules (
 );
 -- The self-evolution registry: the gaps the OS has learned to RECOGNISE in itself, and
 -- what it proposes doing about each one. See rules.py and
--- docs/specs/2026-09-27-self-evolution.md §3.1.
+-- docs/superpowers/specs/2026-09-27-self-evolution.md §3.1.
 --
 -- CENTRAL AND FLEET-WIDE, for the reason `gate_rules` above is: most gaps are OS
 -- behaviour rather than one project's, so a rule learned on `jarvis_os` protects every
@@ -501,7 +501,7 @@ ADDED_COLUMNS = {
         "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         # How long the call took, in milliseconds — §3 of
-        # docs/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
+        # docs/superpowers/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
         # beside it: 0 chars of prompt is impossible so 0 can safely mean "not measured"
         # there, whereas a sub-millisecond call rounds to 0 and the report must not print
         # "0 ms" for a call nobody timed.
@@ -1319,7 +1319,7 @@ class CentralStore:
 
     # -- the self-evolution registry (detectors, remedy rules, fires; see rules.py) ----
     #
-    # docs/specs/2026-09-27-self-evolution.md §3. These mirror the
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3. These mirror the
     # `gate_rules` methods above deliberately, retraction semantics included: a retraction
     # NEVER deletes, a reason is required, and a second one raises. Rows are never
     # rewritten in place except the counters, the timestamps and the retract fields —
@@ -1772,7 +1772,7 @@ class CentralStore:
         which. Token columns stay zero there, so it cannot inflate a total.
 
         `latency_ms=None` is "nobody timed this call" and stays NULL — §3 of
-        docs/specs/2026-10-01-neo-observability.md.
+        docs/superpowers/specs/2026-10-01-neo-observability.md.
         """
         u = usage or {}
         cur = self.conn.execute(
@@ -1836,7 +1836,11 @@ class CentralStore:
         model re-aggregate in Python, so the finer key costs them nothing.
 
         One query for the whole fleet: the alternative is a query per work order, and
-        the cost report walks every work order there is.
+        the cost report walks every work order there is. `project` is in the key for
+        that reason — a fleet-wide consumer opens one project's store at a time and
+        `ProjectStore.get_work_order` RAISES on a foreign id, so the column is how a
+        row is placed without a lookup (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
 
         THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
         is what stops the report under-pricing its own overhead at the 1.25x floor (spec:
@@ -1868,7 +1872,7 @@ class CentralStore:
             params.append(until)
         clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
-            f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
+            f"""SELECT wo_id, project, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
@@ -1878,7 +1882,8 @@ class CentralStore:
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
                            AS cache_5m
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, label, model""", tuple(params)).fetchall())
+                GROUP BY wo_id, project, kind, label, model""",
+            tuple(params)).fetchall())
 
     def agent_call_totals_by_day(self, project: str | None = None,
                                  since: float | None = None,
@@ -1887,7 +1892,7 @@ class CentralStore:
         """`agent_call_totals`' windowed sibling, keyed on (kind, project, day, model).
 
         A separate query rather than a widened one — §4 of
-        docs/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
+        docs/superpowers/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
         asked on every cost report, and the key it groups on (`wo_id`) is the one this
         report never wants. The DAY BUCKET IS SQL's, as the sums beside it already are.
 

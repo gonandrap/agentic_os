@@ -55,7 +55,7 @@ BEFORE_NOTE = (
 #: the doc figures travel beside it rather than inside it. A RECORDED BASELINE and not an
 #: assertion — whether doc reads fell is unprovable until a later order flips
 #: `worker.doc_nav_hook` and a window passes.
-#: docs/specs/2026-10-06-navigate-specs-like-code.md §1 and §3.2.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §1 and §3.2.
 DOC_BEFORE_NOTE = (
     "doc baseline recorded 2026-10-06 over 877 transcripts under "
     "`~/.claude/projects/*agentic*/`, tokens as `chars // 4`: `.md` Read with no "
@@ -103,7 +103,7 @@ class SideVolume:
     #: `tool_result` bytes whose `tool_use_id` matched no `tool_use` in the same file.
     #: REPORTED, never silently dropped and never in a share's numerator.
     unattributed_bytes: int = 0
-    # docs/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+    # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
     read_tool_bytes: int = 0       # the `Read` tool's own result bytes
     doc_read_bytes: int = 0        # ...of a path with a configured doc suffix
     whole_file_read_calls: int = 0  # `Read` with no `limit` in its input

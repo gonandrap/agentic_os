@@ -850,7 +850,7 @@ def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
 
 
 def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
-    """§8 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
+    """§8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
     an unlabelled kind renders as a bare kind plus a JSON blob while `event_level` calls
     it signal. THE VERB SAYS WHO — this event is only ever written by a user-facing
     surface and must never read afterwards as something the OS decided."""
@@ -867,7 +867,7 @@ def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
 
 def test_turn_harvested_is_signal():
     """What the OS read off disk when a turn died is the story, not the plumbing —
-    docs/specs/2026-09-30-harvesting-a-dead-turn.md §5."""
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5."""
     from jarvis.timeline import TURN_HARVESTED
 
     assert event_level(TURN_HARVESTED) == "signal"

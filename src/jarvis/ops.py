@@ -54,6 +54,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -914,7 +915,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                         else budget.default_for(_spec_or_none(project_name))),
             # Stamped, never resolved against the catalog here: NULL means "this order
             # has no answer" and the project config is read at write time
-            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            # (`observability.level_for`) — docs/superpowers/specs/2026-09-24-order-observability.md §10.
             observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
@@ -1182,7 +1183,7 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
         note = f"note: work order is {wo['status']}; the session will be revived"
-        # §9.3 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        # §9.3 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
         if wo["status"] == "failed":
             note += f" (`jarvis wo retry {wo_id}` is the named form of this)"
     else:
@@ -1207,7 +1208,7 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
 
 
 #: What a message-less `jarvis wo retry` puts on the queue. §3 of
-#: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+#: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
 RETRY_NOTE = (
     "The OS is relaunching this work order because the user asked for it. Its last turn "
     "ended without a result, so the OS recorded it as failed — nothing about the work was "
@@ -1231,7 +1232,7 @@ def retry_refusal(wo: dict[str, Any]) -> str | None:
     anyway (kn-4ea33fe6)." Same structure as `force_validation_refusal` and `ack_refusal`.
 
     Pure over the row: §4 of
-    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     """
     wo_id = str(wo["id"])
     status = str(wo["status"] or "")
@@ -1263,7 +1264,7 @@ def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
 
     None — no control at all — on any order that is not `failed`: a permanently disabled
     box on every page is noise for a mechanism that does not apply there. §7b of
-    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     """
     if str(wo["status"] or "") != "failed":
         return None
@@ -1279,7 +1280,7 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
     `jarvis wo show` and the work-order page both read this, so the two cannot disagree
     about what was saved. None — no line anywhere — when that turn was never harvested,
     which is every turn that did not die without a result. §5 of
-    docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
     """
     payload = harvest.of_turn(store, wo)
     if not payload:
@@ -1338,7 +1339,7 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
 
     MANUAL ONLY — the automatic half is declined (Neo q1108: a turn that ends with no
     result is exactly the replay risk kn-3d8fa23a excludes), and the shape is Neo q1107's.
-    Design: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    Design: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
 
     `failed` only, and it writes no status: until the daemon launches the turn the order
     really is `failed`. Pending assumptions do NOT refuse it — a retry buries nothing, so
@@ -1348,7 +1349,7 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     refusal = retry_refusal(wo)
     if refusal is not None:
         raise OpsError(refusal)
-    # §6 of docs/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
+    # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
     # beats asking the worker to re-derive it. Its own connection, closed before the
     # delegated send opens one.
     brief_store = ProjectStore(path)
@@ -1505,7 +1506,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "
                           f"`jarvis wo review {hold['planner_id']}`"}
-    # §6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     if wo["status"] == "failed":
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
@@ -2266,7 +2267,7 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     out: list[dict[str, str]] = []
     refusals: list[str] = []
 
-    # FIRST — §7 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     retry_no = retry_refusal(wo)
     if retry_no is None:
         out.append({"command": f"jarvis wo retry {wo_id}",
@@ -2326,13 +2327,13 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
 
 
 # Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
-# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+# this same function (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 @observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
     PURE COMPOSITION, AND THAT IS THE POINT (spec §6 of
-    docs/specs/2026-09-24-order-observability.md). Every part of the answer already
+    docs/superpowers/specs/2026-09-24-order-observability.md). Every part of the answer already
     existed and was scattered over three surfaces that each showed a slice; this puts
     them in one payload and rewrites none of them. A diagnosis that disagrees with the
     status label is worse than no diagnosis, so where `waiting_on` and `true_blockers`
@@ -2784,7 +2785,7 @@ def _fix_unreachable(store: ProjectStore, wo: dict[str, Any], command: str,
 def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = None,
         argument: str | None = None, confirm: bool = False) -> dict[str, Any]:
     """Clear the blocker §6 just named — `jarvis wo fix`, §11 of
-    docs/specs/2026-09-24-order-observability.md.
+    docs/superpowers/specs/2026-09-24-order-observability.md.
 
     IT ADDS NO AUTHORITY AND THAT IS THE WHOLE DESIGN. Every remedy is resolved through
     `remedies.resolve` — CODE today, and DATA rows fo-69ba1cc4 builds tomorrow, keyed by
@@ -5240,16 +5241,44 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     the round in the meantime would land the very decision the user turned down. Only
     reachable because the two gates now run in parallel (spec §5).
 
-    The boundary is the `finished` event, which is the same one
+    One boundary is the `finished` event, which is the same one
     `ProjectStore.review_assumption`'s round rule is read against (kn-82d853ca) — and
     why `finish` records it BEFORE it settles anything.
+
+    The other is a PASSED user-rework round: the one round `user_rework_pending` grants
+    per refusal, which the user themselves forced, guarded on the judged head having
+    moved off the commit the refused decision sat on (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
     """
     refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
                 if not db.from_json(e["payload"], {}).get("accepted", True)]
     if not refusals:
         return True
+    cut = float(refusals[-1]["ts"])
     delivered = store.events_of_kind(wo_id, "finished")
-    return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
+    if delivered and float(delivered[-1]["ts"]) > cut:
+        return True
+    # One read of the rows, like `validated_head`'s one-read rule: the guard needs the
+    # prior counted row from the same list (spec §The predicate).
+    counted = [r for r in store.validation_rounds(wo_id=wo_id)
+               if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
+    if not counted:
+        return False
+    newest = counted[-1]
+    # `validation_rounds.ts` is the round's OPEN time and nothing writes a settle one;
+    # `user_rework_pending` compares against the same column (spec §The predicate).
+    if (str(newest["outcome"] or "") != "passed"
+            or str(newest.get("uncounted_cause") or "") != USER_REWORK_CAUSE
+            or float(newest["ts"] or 0) <= cut):
+        return False
+    forced_head = ProjectStore.validated_head(newest) or ""
+    before = [r for r in counted[:-1] if float(r["ts"] or 0) <= cut]
+    prior = before[-1] if before else None
+    prior_head = ((ProjectStore.validated_head(prior) or str(prior["head_sha"] or ""))
+                  if prior is not None else "")
+    # Spec §The head guard on (b): an unmoved head is the refused decision landing by
+    # the back door; an unrecorded one is never a match.
+    return not (forced_head and forced_head == prior_head)
 
 
 def user_rework_pending(store: ProjectStore, wo_id: str) -> bool:
@@ -9982,7 +10011,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     worker's next user turn via the normal message-delivery path.
 
     A question is one paragraph that may reference a design artifact section in-text
-    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    (`from section 3 of design doc "docs/superpowers/specs/x.md"`). The reference is resolved HERE,
     at ask time: the section — and only the section — is snapshotted into the question's
     context, so Neo reads exactly the design context the paragraph argues from while the
     recorded question stays a paragraph.
@@ -9996,7 +10025,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
             f"the options, your recommendation — arguing from a design artifact it "
             f"references in-text, e.g. `from section 3 of design doc "
-            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
             f"whoever answers, alongside your paragraph; you do not need to paste it."
         )
 
@@ -10785,7 +10814,7 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 
 # -- the self-evolution registry (detectors and remedy rules; see rules.py) --------------
 #
-# docs/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
+# docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
 # PLAIN DICT the CLI and the dashboard both consume verbatim; neither of them derives a
 # number, so the two surfaces cannot disagree about what the registry says.
 #
@@ -11134,11 +11163,15 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.bash_first", "next-dispatch"),
     # Read once per spawn into the worker's settings file, and a running worker's
     # tool list cannot change mid-conversation. Spec §4:
-    # docs/specs/2026-10-02-serena-the-cheap-path.md
+    # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.tool_search", "next-dispatch"),
     # Read once per spawn into the worker's settings file, which is where the hook reads
-    # it. Spec §6: docs/specs/2026-10-02-serena-the-cheap-path.md
+    # it. Spec §6: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.py_nav_hook", "next-dispatch"),
+    # Both read once per spawn into the worker's settings file, which is where the hook
+    # reads them. Spec §5: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md
+    ("*.doc_nav_hook", "next-dispatch"),
+    ("*.doc_read_limit_lines", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -12098,7 +12131,7 @@ def _partition_calls(
         # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
         # one as an OS call would report two calls where Jarvis made one. Money spent
         # LOOKING at an order is reported by `bill.py`, in its own class
-        # (docs/specs/2026-09-24-order-observability.md §10).
+        # (docs/superpowers/specs/2026-09-24-order-observability.md §10).
         if agent_usage.is_observability(kind):
             continue
         target = worker_side if agent_usage.is_subprocess(kind) else os_side
@@ -12207,7 +12240,9 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
 
 def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
               turn_rows: Sequence[dict[str, Any]] = (),
-              os_groups: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+              os_groups: Sequence[dict[str, Any]] = (),
+              *, since: float | None = None,
+              until: float | None = None) -> dict[str, Any]:
     """One work order's spend, flattened for a table.
 
     The transcript figures stay the body of the row (they are the only source with a
@@ -12228,7 +12263,7 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     from .bill import _cold_prefix_floor
 
     session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
-                                     index=index)
+                                     index=index, since=since, until=until)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -12316,8 +12351,35 @@ def fleet_cost(**kwargs: Any) -> dict[str, Any]:
     return fleetcost.report(**kwargs)
 
 
+def cost_window(**kwargs: Any) -> dict[str, Any]:
+    """Which window a cost surface is reporting over — see `fleetcost.resolve_window`.
+
+    Resolved ONCE per surface and handed to both payload builders, so the two halves of
+    a page cannot disagree. Lazy import for `fleet_cost`'s reason: §6 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    project = kwargs.pop("project", None)
+    kwargs.setdefault("cfg", fleetcost.cost_config(project))
+    return fleetcost.resolve_window(**kwargs)
+
+
+def cost_zone(tz: str | None = None, project: str | None = None) -> str:
+    """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
+
+    Its own wrapper because the page needs the zone before it can parse the custom
+    form's naive datetimes: §11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    return fleetcost.resolve_zone(tz, fleetcost.cost_config(project))
+
+
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+                limit: int = 50, include_hidden: bool = True,
+                window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
 
     `target` is a work-order or feature-order id for a single unit — a feature order
@@ -12348,6 +12410,12 @@ def cost_report(project: str | None = None, target: str | None = None,
     work order. The marker is unconditional on purpose: a heuristic that tried to guess
     whether any escaped would be blind in exactly the cases it was meant to catch, and a
     flat statement is always true and costs one line (ruled on wo-76e021aa, issue #103).
+
+    `window` is a dict `fleetcost.resolve_window` returned, and this ONLY FILTERS with
+    it — the boundary arithmetic is `fleetcost`'s (§5 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). `None` keeps the
+    whole-history behaviour, and a window is NEVER applied to `target=`: one order's
+    bill is the whole order, and truncating it would make the bill stop reconciling.
     """
     from . import usage as usage_mod
 
@@ -12358,7 +12426,9 @@ def cost_report(project: str | None = None, target: str | None = None,
     if target:
         return _cost_for_target(target, project, index)
 
-    os_groups = _os_groups(project)
+    since = window["since"] if window else None
+    until = window["until"] if window else None
+    os_groups = _os_groups(project, since=since, until=until)
     scope = {project: paths[project]} if project else paths
     units: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
@@ -12366,20 +12436,38 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+            rows = store.list_work_orders(
+                limit=limit, include_hidden=include_hidden,
+                active_between=(since, until) if window else None)
+            # An order whose only in-window activity is an `agent_call` — Neo answered
+            # it between turns — has no in-window turn and is added by id (§5a).
+            seen = {wo["id"] for wo in rows}
+            for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
+                try:
+                    extra = store.get_work_order(wo_id)
+                except KeyError:
+                    continue            # a legacy row naming no project: not this one's
+                if include_hidden or not extra["hidden"]:
+                    rows.append(extra)
+            for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ())))
+                                       os_groups.get(wo["id"], ()),
+                                       since=since, until=until))
         finally:
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost —
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
-    return {"scope": project or "fleet", "units": units,
+    # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/
+    # `totals` keys describe a different POPULATION when a window is given, and this is
+    # how a consumer tells (§7).
+    return {"scope": project or "fleet", "units": units, "window": window,
             **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
-def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
+def _os_groups(project: str | None = None, *, since: float | None = None,
+               until: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """Every work order's OS-side call groups, in one query. See `_os_spend`.
 
     One read of `os.db` for the whole fleet rather than one per work order: this report
@@ -12388,11 +12476,27 @@ def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
     central = CentralStore()
     try:
         groups: dict[str, list[dict[str, Any]]] = {}
-        for row in central.agent_call_totals(project):
+        for row in central.agent_call_totals(project, since=since, until=until):
             groups.setdefault(row["wo_id"] or "", []).append(row)
         return groups
     finally:
         central.close()
+
+
+def _os_only_ids(groups: dict[str, list[dict[str, Any]]], project: str,
+                 seen: set[str]) -> list[str]:
+    """Ids whose only in-window activity was an OS call, NARROWED TO ONE PROJECT.
+
+    `_os_groups` is read fleet-wide and `ProjectStore.get_work_order` raises on an id
+    its database does not hold, so the `agent_calls.project` column is what keeps a
+    fleet-wide report from asking proj_a for proj_b's order (§5a of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). A row that names NO
+    project is a candidate everywhere and is placed by the guarded lookup instead.
+    """
+    return sorted(
+        wo_id for wo_id, rows in groups.items()
+        if wo_id and wo_id not in seen
+        and any((r.get("project") or "") in ("", project) for r in rows))
 
 
 def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -12454,6 +12558,9 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            # Over ALL units: what a window could not place is disclosed whether or not
+            # the order it belongs to was measurable (§5c).
+            "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, units),
         },
     }
@@ -13191,7 +13298,7 @@ def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
 
-    §5 of docs/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
+    §5 of docs/superpowers/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
     the renderers compute nothing: the residual subtraction, the per-turn delta and the
     sentence naming a prefix break are keys of this payload.
 
@@ -14330,7 +14437,7 @@ def _local_day(ts: float) -> str:
 
 
 #: What `by_kind` cannot say, carried beside it rather than left for a reader to assume —
-#: §"What this does NOT do" of docs/specs/2026-10-01-neo-observability.md.
+#: §"What this does NOT do" of docs/superpowers/specs/2026-10-01-neo-observability.md.
 NEO_ASSUMPTION_KIND_NOTE = (
     "`assumption` covers BOTH auto-review passes: which pass filed one is only on the "
     "project store's `autoreview_asked` event, and splitting on it means opening every "
@@ -14399,7 +14506,7 @@ def _percentile(sorted_values: list[int], fraction: float) -> int | None:
 def neo_stats_report(project: str | None = None, days: int | None = None,
                      limit: int = 20) -> dict[str, Any]:
     """Neo's volume, outcomes, escalation causes, spend and latency — spec §4,
-    docs/specs/2026-10-01-neo-observability.md.
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
 
     `knowledge_usage_report`'s shape above: `project` + `days` in, one plain dict out, no
     rendering — the CLI and the dashboard render the same dict, so neither can show a

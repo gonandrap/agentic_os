@@ -1,7 +1,7 @@
 # Order autopsy durability: write down how an order ran, before the transcript expires
 
 Feature order `fo-5242ee99`. Spec written by the planner, 2026-09-27. The parent spec is
-`docs/specs/2026-09-24-order-observability.md` and every section reference of the form
+`docs/superpowers/specs/2026-09-24-order-observability.md` and every section reference of the form
 "the parent spec's section N" points there.
 
 Every debug payload the order-observability feature renders — turn anatomy, tool profile,

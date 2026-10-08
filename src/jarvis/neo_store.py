@@ -95,7 +95,7 @@ SUPERVISOR_SEAT = "supervisor"
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 
 # WHY an escalation happened, as one groupable label — §1 of
-# docs/specs/2026-10-01-neo-observability.md. Here, beside the vocabularies above, for
+# docs/superpowers/specs/2026-10-01-neo-observability.md. Here, beside the vocabularies above, for
 # `SEATS`' reason exactly: the personas, the CLI and the report all need it and none
 # should have to depend on another.
 #
@@ -278,7 +278,7 @@ ADDED_COLUMNS = {
         # predates this feature is, and what the daemon looks for. It is a DISPLAY
         # artefact: nothing that reaches Neo, a worker or a learning is built from it.
         "digest": "TEXT",
-        # Why this escalation happened — §1 of docs/specs/2026-10-01-neo-observability.md.
+        # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md.
         # NULLABLE, and NOT `NOT NULL DEFAULT ''` like its siblings above: this column is
         # read by a GROUP BY, where an empty-string bucket beside the real causes reads as
         # one more cause. NULL on every pre-existing row and never backfilled from prose.
@@ -489,7 +489,7 @@ class NeoStore:
         if attempts >= max_attempts:
             # `max_attempts=0` is the REFUSAL contract: the only callers that pass it are
             # the prompt/input ceiling clauses, where no call was ever made. §1 of
-            # docs/specs/2026-10-01-neo-observability.md.
+            # docs/superpowers/specs/2026-10-01-neo-observability.md.
             cause = "prompt-refused" if max_attempts == 0 else "transport-unreachable"
             self.conn.execute(
                 "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=?, "
@@ -540,7 +540,7 @@ class NeoStore:
     def mark(self, question_id: int, status: str, reason: str = "",
              cause: str = "") -> None:
         # `cause` is ESCALATION_CAUSES or "" for "not recorded" — §2 of
-        # docs/specs/2026-10-01-neo-observability.md.
+        # docs/superpowers/specs/2026-10-01-neo-observability.md.
         assert status in Q_STATUSES, status
         assert cause == "" or cause in ESCALATION_CAUSES, cause
         self.conn.execute(
@@ -671,7 +671,7 @@ class NeoStore:
         """Every question in the window, grouped on (kind, project, day, outcome).
 
         One query behind every count in `ops.neo_stats_report` — §4 of
-        docs/specs/2026-10-01-neo-observability.md. `answered_by` rides in the key because
+        docs/superpowers/specs/2026-10-01-neo-observability.md. `answered_by` rides in the key because
         `answered_by='os'` is a SUPERSEDED question, which is neither Neo answering nor
         Neo handing back and must not reach the escalation rate's denominator.
 
