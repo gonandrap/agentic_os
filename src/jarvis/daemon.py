@@ -6746,12 +6746,16 @@ class Daemon:
         # would write nothing, the stored payload would still say round 2, and
         # `ops._panel_hold_is_stale` would then drop a hold that is TRUE. Every other code
         # carries 0 on both sides, so their dedupe is what it was.
+        # THE REASON TEXT IS PART OF THE KEY TOO (issue #975): `HELD_REFUSAL_UNANSWERED`
+        # renders two different sentences, so a code-only key suppressed the second and
+        # left the first rendered as a claim about now that had stopped being true.
         key = (int(decision.assumption_id or 0), str(decision.code or ""),
-               int(decision.round or 0))
+               int(decision.round or 0), str(decision.reason or ""))
         if not _hold_is_news(store, wo_id, "autoreview_held", key,
                              lambda p: (int(p.get("assumption_id") or 0),
                                         str(p.get("code") or ""),
-                                        int(p.get("round") or 0))):
+                                        int(p.get("round") or 0),
+                                        str(p.get("reason") or ""))):
             return
         store.add_event(wo_id, "autoreview_held", {
             "code": decision.code, "reason": decision.reason,

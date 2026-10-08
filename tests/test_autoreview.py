@@ -879,6 +879,44 @@ def test_a_second_escalated_round_refreshes_the_hold_rather_than_voiding_it(star
     assert "gave up" in rulings(store, wo["id"])[0]
 
 
+def _refusal_hold(store, wo, reason: str) -> autoreview.Decision:
+    (row,) = store.all_assumptions(wo["id"])
+    return autoreview._held(autoreview.HELD_REFUSAL_UNANSWERED, reason,
+                            assumption_id=row["id"], n=1)
+
+
+def test_the_undeclared_refusal_sentence_is_not_deduped_away_by_the_first(started):
+    """ISSUE #975, measured on wo-2933fc24: both refusal sentences share the code
+    `HELD_REFUSAL_UNANSWERED`, and `undeclared_delivery` can only become true AFTER a hold
+    was written with the other one. Keyed on the code alone, the second write was dropped
+    and `assumptions_with_rulings` — newest hold wins — kept rendering 'has not delivered
+    again since' about a worker that had pushed commits."""
+    store, wo = park(started, auto_review=True, outcome="")
+
+    started._note_autoreview_held(
+        store, wo["id"], _refusal_hold(store, wo, autoreview.REFUSAL_UNANSWERED_REASON))
+    started._note_autoreview_held(
+        store, wo["id"], _refusal_hold(store, wo, autoreview.REFUSAL_UNDECLARED_REASON))
+
+    holds = events(store, wo["id"], "autoreview_held")
+    assert [h["reason"] for h in holds] == [autoreview.REFUSAL_UNANSWERED_REASON,
+                                            autoreview.REFUSAL_UNDECLARED_REASON]
+    assert "pushed commits since" in rulings(store, wo["id"])[0]
+
+
+def test_the_same_refusal_reason_twice_is_still_recorded_once(started):
+    """The dedupe the reason key must not weaken: the pass runs every reconcile tick."""
+    store, wo = park(started, auto_review=True, outcome="")
+
+    for _ in range(3):
+        started._note_autoreview_held(
+            store, wo["id"],
+            _refusal_hold(store, wo, autoreview.REFUSAL_UNANSWERED_REASON))
+
+    (held,) = events(store, wo["id"], "autoreview_held")
+    assert held["reason"] == autoreview.REFUSAL_UNANSWERED_REASON
+
+
 def test_a_hold_written_before_the_round_was_recorded_is_read_honestly(started):
     """A payload from before this shipped carries no round: KEPT while the newest round is
     still escalated (the panel did give up), dropped once a later one passed."""
