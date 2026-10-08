@@ -171,7 +171,14 @@ def test_the_eval_uses_the_shipped_classifier():
 
     assert ev.NAV_COMMANDS is navigation.NAV_COMMANDS
     assert ev.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
-    assert "def bash_navigates_code" not in open(ev.__file__).read()
+    src = open(ev.__file__).read()
+    assert "def bash_navigates_code" not in src
+    # §7.3: the DOC half of the eval (the spec-navigation arms) is held to the same rule.
+    assert ev.DOC_SUFFIXES is navigation.DOC_SUFFIXES
+    assert ev.dumps_doc is navigation.dumps_doc
+    assert ev.is_spec_path is navigation.is_spec_path
+    assert "def dumps_doc" not in src
+    assert "def is_spec_path" not in src
 
 
 # -- the doc classifiers (§3.1, §3.4) --------------------------------------------------
