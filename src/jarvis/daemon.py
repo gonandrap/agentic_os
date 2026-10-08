@@ -1497,6 +1497,11 @@ class Daemon:
         try:
             round_row = ops.submit_feature_for_validation(
                 store, project.path, fo, declared="", summary="", cfg=cfg)
+        except ops.UnintegratedChild as e:
+            # §2: never the arm below, which completes the feature unjudged.
+            log.info("[%s] feature %s: %s", project.name, fo["id"], e)
+            self._defer_for(project, store, fo["id"], e.child_id, e.commit, e.head, cfg)
+            return True
         except Exception:  # noqa: BLE001 — one feature must not cost the tick the rest
             log.exception("[%s] could not open a validation round for %s",
                           project.name, fo["id"])
@@ -1533,9 +1538,8 @@ class Daemon:
     def _unintegrated_child(self, project: ProjectSpec, store: ProjectStore,
                             fo: dict, cfg: Any) -> bool:
         """`_defer_unintegrated_children` without the catch-all. See its docstring."""
-        from . import branchproof
+        from . import branchproof, ops
         from . import evidence as evidence_mod
-        from .invariants import FEATURE_CHILD_NOT_INTEGRATED
 
         # §2: the head is read AFTER a fetch, so the check and the collection agree.
         ref = evidence_mod.base_ref(project.path)
@@ -1544,34 +1548,38 @@ class Daemon:
         head = evidence_mod.default_branch_head(project.path)
         if not head:
             return False  # no default branch: the collector resolves no head either
-        merged: list[tuple[dict, str]] = []
-        for child in store.feature_children(fo["id"]):
-            # The children `settle_features` counted. One with no pull request and no
-            # merge event contributes nothing to check and does not defer.
-            if child["superseded"] or child["status"] != "completed":
-                continue
-            sha = self._merge_commit_of(project, store, child)
-            if sha:
-                merged.append((child, sha))
-        missing = [(c, s) for c, s in merged
-                   if not branchproof.is_ancestor(project.path, s, head)]
+        missing = ops.unintegrated_children(
+            project.path, store, fo["id"], head,
+            lambda child: self._merge_commit_of(project, store, child))
         if not missing:
             return False
         child, sha = missing[0]
-        waited = self._minutes_since_merge(store, child)
+        self._defer_for(project, store, fo["id"], child["id"], sha, head, cfg)
+        return True
+
+    def _defer_for(self, project: ProjectSpec, store: ProjectStore, fo_id: str,
+                   child_id: str, sha: str, head: str, cfg: Any) -> None:
+        """Record one deferral: the timeline event, and the user on expiry.
+
+        Shared by the daemon's own precondition and the `ops.UnintegratedChild` arm, which
+        reach the same state down two paths (§2/§3 of
+        docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+        """
+        from .invariants import FEATURE_CHILD_NOT_INTEGRATED
+
+        waited = self._minutes_since_merge(store, {"id": child_id})
         expired = waited >= int(cfg.feature_merge_wait_minutes)
-        self._record_defer(store, fo["id"], {
-            "child": child["id"], "commit": sha, "head": head,
+        self._record_defer(store, fo_id, {
+            "child": child_id, "commit": sha, "head": head,
             "waited_minutes": round(waited, 1), "expired": expired})
         if expired:
             # §3: a child merged into a sibling branch never becomes an ancestor, and an
             # unbounded deferral parks the feature silently.
-            store.flag_feature_attention(fo["id"], FEATURE_CHILD_NOT_INTEGRATED.format(
-                id=child["id"], commit=sha, head=head))
+            store.flag_feature_attention(fo_id, FEATURE_CHILD_NOT_INTEGRATED.format(
+                id=child_id, commit=sha, head=head))
         log.info("[%s] feature %s: %s's merge %s is not in %s after %.0f min — no round "
-                 "opened%s", project.name, fo["id"], child["id"], sha[:12], head[:12],
+                 "opened%s", project.name, fo_id, child_id, sha[:12], head[:12],
                  waited, " (asking the user)" if expired else "")
-        return True
 
     def _minutes_since_merge(self, store: ProjectStore, child: dict) -> float:
         """How long ago this child's merge was recorded. §3: minutes, never ticks — a

@@ -1940,6 +1940,69 @@ def test_every_child_integrated_opens_the_round_as_today(fleet):
         store.close()
 
 
+def test_a_failing_fetch_defers_rather_than_judging_a_stale_head(fleet, monkeypatch):
+    """§2 + Neo 1394. The arm the daemon's own precondition is supposed to make
+    unreachable: `_defer_unintegrated_children` says fine, the fetch fails, and `ops` is
+    what sees the unintegrated child. `_route_to_validation` must catch that EXPLICITLY —
+    reaching `except Exception: return False` completes the feature unjudged."""
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
+    monkeypatch.setattr(Daemon, "_defer_unintegrated_children",
+                        lambda *a, **kw: False)
+    validator = Validator(passed())
+    fleet.daemon.validator = validator
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        _pr_merged(store, child["id"], _dangling_commit(fleet))
+
+        fleet.daemon.settle_features(fleet.spec, store)
+
+        status = store.get_feature_order(fo_id)["status"]
+        assert status not in ("completed", "validating"), status
+        assert status == "executing"
+        assert store.validation_rounds(fo_id=fo_id) == []
+        assert validator.calls == []
+    finally:
+        store.close()
+
+
+def test_fo_submit_errors_to_the_caller_instead_of_deferring(fleet, monkeypatch):
+    """Neo 1394 holds: `ops` cannot defer — it has no next tick — so a manager's explicit
+    resubmission over a stale head fails loudly instead of opening a round nobody can
+    judge."""
+    monkeypatch.setattr(branchproof, "fetch", lambda repo, *refs: False)
+    store = fleet.store()
+    try:
+        fo_id = _landed_feature(fleet, store)
+        child = store.feature_children(fo_id)[0]
+        commit = _dangling_commit(fleet)
+        _pr_merged(store, child["id"], commit)
+        head = evidence.default_branch_head(fleet.project)
+
+        with pytest.raises(ops.UnintegratedChild) as caught:
+            ops.submit_feature_for_validation(
+                store, fleet.project, store.get_feature_order(fo_id),
+                declared="", summary="", cfg=fleet.spec.validation)
+
+        err = caught.value
+        assert (err.child_id, err.commit, err.head) == (child["id"], commit, head)
+        # Three things, because each points at a different remedy.
+        for fact in (child["id"], commit, head):
+            assert fact in str(err)
+        assert store.validation_rounds(fo_id=fo_id) == []
+        assert store.get_feature_order(fo_id)["status"] == "executing"
+    finally:
+        store.close()
+
+
+def test_the_two_merge_commit_event_literals_stay_equal():
+    """Drift and `ops.recorded_merge_commit` stops seeing the daemon's back-filled merge
+    commit, so a stale head is judged instead of refused. One source is impossible here:
+    `ops` imports `daemon` at module level, so `from . import ops` in daemon.py cycles."""
+    assert Daemon.MERGE_COMMIT_EVENT == ops.MERGE_COMMIT_EVENT
+
+
 def test_a_feature_round_records_the_commit_it_judged(fleet):
     """§5. `jarvis validation show <fo-id>` printed "commit not recorded" for every round a
     feature had ever had, so a rejection could not later say what it rejected."""
