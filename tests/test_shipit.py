@@ -408,6 +408,7 @@ def test_a_tag_without_the_installer_says_so_instead_of_aborting(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "units NOT re-rendered" in r.stdout
     assert "jarvis doctor" in r.stdout
+    assert "--no-restart" not in r.stdout, "claimed a re-render it could not do"
 
 
 # -- re-rendering the `jarvis` wrapper (issue 757) -------------------------------
@@ -447,7 +448,6 @@ def test_a_tag_without_the_cli_installer_says_so_instead_of_aborting(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "wrapper was NOT" in r.stdout
     assert "INV-PROD-CLI" in r.stdout
-    assert "--no-restart" not in r.stdout, "claimed a re-render it could not do"
 
 
 # -- the tag's uv.lock -----------------------------------------------------------

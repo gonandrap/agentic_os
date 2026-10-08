@@ -322,9 +322,9 @@ deployed prod under `tmp_path`, mirroring `test_install_prod_service.py:195-274`
 **The sandboxing** (extend `tests/test_isolation_gate.py`):
 
 17. `gate_environment(root)[release.CLI_BIN_DIR_ENV]` is inside `root`.
-18. under the gate, with a real `~/.local/bin/jarvis` simulated by pointing nothing at it,
-    `check_prod_cli()` is silent — i.e. `release.cli_bin_dir()` resolves inside the
-    sandbox and not to `Path.home() / ".local/bin"`.
+18. under the gate, `release.cli_bin_dir()` resolves inside `testing.GATE_ROOT` and
+    `check_prod_cli()` is silent — so a suite running under the gate can never read the
+    real `~/.local/bin`.
 
 ### Documentation
 
