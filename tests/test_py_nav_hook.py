@@ -7,11 +7,13 @@ fallback buys a reworded retry, not a symbol call.
 
 from __future__ import annotations
 
+import ast
 import json
 
 import pytest
+from test_doc_nav_hook import _body
 
-from jarvis import hooks
+from jarvis import hooks, navigation
 from jarvis.catalog import ProjectSpec, WorkerDefaults
 from jarvis.dispatch import _write_worker_settings
 
@@ -157,7 +159,7 @@ def test_a_py_read_with_no_cwd_is_untouched():
 
 
 def test_a_read_of_a_non_py_path_is_untouched(repo):
-    """The suffix set stays `PY_NAV_SUFFIXES`, so a `.md` `Read` is the doc arm's
+    """The suffix set stays `SOURCE_SUFFIXES`, so a `.md` `Read` is the doc arm's
     business (tests/test_doc_nav_hook.py), not this one's."""
     md = {"tool_name": "Read", "tool_input": {"file_path": "docs/specs/x.md"},
           "cwd": str(repo)}
@@ -173,6 +175,33 @@ def test_the_refusal_is_reached_before_the_jarvis_auto_allow(repo):
         _payload(f'cd {repo} && grep -rn "def total_for" src/a.py', repo), ON)
 
     assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_both_arms_use_the_counters_suffix_set_by_identity():
+    """§5.5 of docs/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of the
+    predicate. A second module constant here is the drift this tree has paid for twice —
+    the counter would stop agreeing with the refusal about what source is. A narrower
+    enforcement set arrives as a `worker.*` catalog key, never as a constant."""
+    assert not hasattr(hooks, "PY_NAV_SUFFIXES")
+    assert hooks.SOURCE_SUFFIXES is navigation.SOURCE_SUFFIXES
+
+    node = _body("py_nav_decision")
+    # The docstring QUOTES `.py`, so the literals are read off the CODE.
+    code = [s for s in node.body if not (isinstance(s, ast.Expr)
+                                         and isinstance(s.value, ast.Constant))]
+    suffix_args = [n.args[-1] for s in code for n in ast.walk(s)
+                   if isinstance(n, ast.Call)
+                   and (n.func.id if isinstance(n.func, ast.Name)
+                        else getattr(n.func, "attr", "")) in ("endswith",
+                                                              "navigates_source")]
+
+    assert len(suffix_args) == 2, ast.unparse(node)
+    for arg in suffix_args:
+        assert isinstance(arg, ast.Name), ast.unparse(arg)
+        assert arg.id == "SOURCE_SUFFIXES", ast.unparse(arg)
+    literals = {n.value for s in code for n in ast.walk(s)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert ".py" not in literals, literals
 
 
 def test_py_nav_runs_after_the_investigator_refusal(repo):

@@ -37,6 +37,7 @@ from . import concision
 # the tree, read by the counter and by the refusal, by identity and never re-spelled.
 from .navigation import (
     DOC_SUFFIXES,
+    SOURCE_SUFFIXES,
     _mask_shell_text,
     _statements,
     dumps_doc,
@@ -1420,10 +1421,6 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
-#: This hook's OWN suffix set, narrower than `navigation.SOURCE_SUFFIXES` (the
-#: counter's): §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
-PY_NAV_SUFFIXES = (".py",)
-
 #: The refusal IS the mitigation, so it names the call to make instead and the
 #: activation fallback — both Serena spellings, as `serena_activation_context` does.
 _PY_NAV_DENY = (
@@ -1487,13 +1484,19 @@ def py_nav_decision(payload: dict[str, Any],
         file_path = tool_input.get("file_path") or ""
         # NO threshold, by the ruling above: a missing `limit` is whole-file and is the
         # only thing refused here.
-        if file_path.endswith(PY_NAV_SUFFIXES) and "limit" not in tool_input:
+        # BOTH arms share the COUNTER's suffix set by identity — §5.5 of
+        # docs/specs/2026-10-06-navigate-specs-like-code.md. Two spellings of one
+        # predicate is the drift this tree has paid for twice, so the "this hook's OWN
+        # narrower set" ruling (§6 of docs/specs/2026-10-02-serena-the-cheap-path.md) is
+        # SUPERSEDED. A narrower enforcement set arrives as a `worker.*` catalog key,
+        # never as a second module constant.
+        if file_path.endswith(SOURCE_SUFFIXES) and "limit" not in tool_input:
             return _deny(_PY_NAV_DENY)
         return None
     command = (tool_input.get("command") or "").strip()
     if not command:  # Bash-only condition
         return None
-    if not navigates_source(command, PY_NAV_SUFFIXES):
+    if not navigates_source(command, SOURCE_SUFFIXES):  # same set, by the ruling above
         return None
     return _deny(_PY_NAV_DENY)
 
