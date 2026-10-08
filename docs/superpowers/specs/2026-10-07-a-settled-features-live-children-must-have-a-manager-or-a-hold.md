@@ -1,19 +1,21 @@
 # A settled feature's live children must have a manager, or a hold
 
-Work order wo-a04f9d70. GitHub issue 881 and its 2026-10-07 follow-up comment. Design
-decided by Neo question 1393 — the three parts below are not re-opened here.
+Work order wo-a04f9d70. GitHub issue 881 and its 2026-10-07 follow-up comment. (b), (c)
+and (d) are Neo question 1393's design and are not re-opened here. (a) was REVERSED by the
+user on 2026-10-07 — issue 881's own fix (1) asked for `needs_review` and is overruled; the
+ruling is quoted in (a), and the issue's "Expected" still stands.
 
 ## The problem
 
 Three defects on one incident, in order of causation.
 
-### 1. A delivered child is settled as a failure
+### 1. A delivered child fails its feature, and the notice says only that a turn died
 
 fo-ac00376e went `failed` because its child wo-604b5b99's turn died in a stampede
 cleanup. The child **had delivered**: `pr_url` pointing at PR #839, open, and three
 assumptions on record.
 
-`src/jarvis/daemon.py:4956-4994`, `Daemon.settle_work_order`, the
+`src/jarvis/daemon.py:4994-5054`, `Daemon.settle_work_order`, the
 `turn["state"] == "failed"` branch. Once the pause is exhausted it writes, with no test
 of what the order produced:
 
@@ -23,13 +25,19 @@ if wo["status"] != "failed":
     store.flag_attention(wo["id"], "worker turn failed — review and retry")
 ```
 
-Settlement is derived from the TURN's fate, never from the ORDER's delivery. That is the
-root cause of the whole incident, and it is one branch wide: every other arm of that
-method reads `fresh["result_summary"]` and `pr_url` first (`daemon.py:5013` onwards).
+`failed` is the right label for the ORDER: the turn never finished. Two things are wrong
+with what the OS does around it.
 
-`failed` is then load-bearing twice over: `invariants.dead_feature_children`
-(`src/jarvis/invariants.py:537`) counts the child as dead, and `Daemon.settle_features`
-(`daemon.py:1362-1371`) fails the feature on it.
+First, what it concludes. `invariants.dead_feature_children` (`invariants.py:557`) counts
+the child as dead and `Daemon.settle_features` (`daemon.py:1372-1381`) fails the feature
+on it, neither one testing what the child produced. Root cause: the FEATURE's verdict is
+derived from one child's TURN fate and never from that child's delivery. It is one
+predicate wide.
+
+Second, what it says. The flag and the notification both read "worker turn failed", true
+of the turn and useless about the order — they name no delivery, no pull request, no
+assumption, so the user reads the Telegram ping and goes looking for a bug in the work
+instead of at a dead session. That is the follow-up comment's complaint.
 
 ### 2. Failing the feature killed its manager, and the siblings kept running headless
 
@@ -83,84 +91,128 @@ or not at all.
 
 ## The fix
 
-Four changes. (a) stops the misclassification, (b) makes the stranded-child case say so
-without reopening anything, (c) makes manager liveness derived at one site, (d) fixes the
-sentence.
+Four changes. (a) stops the feature being failed on a delivered child and makes the notice
+say what happened, (b) makes the stranded-child case say so without reopening anything,
+(c) makes manager liveness derived at one site, (d) fixes the sentence.
 
-### (a) A turn that dies after delivery settles to `needs_review`, not `failed`
+### (a) A turn that dies after delivery stays `failed` and stops failing its feature
 
-**Where.** `Daemon.settle_work_order`, `daemon.py:4973`, inside the existing
-`if wo["status"] != "failed":` block of the `turn["state"] == "failed"` branch — after
-the auth park and the `pause and not pause.exhausted` return, so retries are untouched.
+The user's ruling, verbatim: "if an order fails mid-duration then it should not show up in
+the user's queue of 'need review', rather it's state should be 'failed', with proper
+notification to the user about the failed order."
 
-**Predicate.** New module-level helper in `invariants.py`, beside
-`dead_feature_children` (it is the function whose input this changes):
+**So the status does not change.** `needs_review` is the queue the user works through to
+decide on DELIVERED work; an order whose turn died mid-flight does not belong in it however
+much it had already produced.
+
+**Where.** `invariants.dead_feature_children`, which gains the store:
 
 ```python
-def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
+def dead_feature_children(store: ProjectStore,
+                          children: list[dict[str, Any]]) -> list[dict[str, Any]]:
 ```
 
-True when `wo.get("pr_url")` is set, or `store.all_assumptions(wo["id"])` is non-empty.
-Not `result_summary`: a summary can be written by a worker that then kept working, while
-a pull request and an assumption are both artefacts the order cannot take back. In
-`invariants.py` rather than `ops.py` because the blocker below reads the same notion and
-the two must not drift; the daemon already holds the module as `invariants_mod`.
+It exempts a child with `status == "failed"` whose
+`store.events_of_kind(c["id"], TURN_DIED_AFTER_DELIVERY_EVENT)` is non-empty. `cancelled`
+and `superseded` are untouched.
 
-**Write.** When `has_delivered` is true:
+**Why there and not in `Daemon.settle_features`.** The function is deliberately ONE
+function so the settler and INV-FEATURE-FALSE-FAILURE cannot disagree
+(`invariants.py:558-562`). An exemption in the settler alone is exactly the flap that
+docstring warns about: `settle_features` would stop failing the feature while
+`check_feature_failures_are_real` kept un-failing it off the same child, every tick. All
+three call sites pass the store:
 
-- `store.set_status(wo["id"], "needs_review")`;
+1. `Daemon.settle_features`, `daemon.py:1372`;
+2. `invariants.check_feature_failures_are_real`, `invariants.py:3201`;
+3. `ops.resume_feature_order`, `ops.py:9825` (already a function-local import).
+
+**Why the predicate keys on the EVENT and not on a live `has_delivered` read.** The event
+names the CAUSE — this order's turn died after it delivered. A `pr_url` is a coincidence of
+state: keying on it would exempt every `failed` order that happens to hold one, including
+the ones that failed for every other reason after opening a pull request. `has_delivered`
+(`invariants.py:567`) survives, but only as the daemon's branch test for whether to WRITE
+the event.
+
+**The daemon's half.** `Daemon.settle_work_order`, the `turn["state"] == "failed"` branch,
+after the auth park and the `pause and not pause.exhausted` return, so retries are
+untouched. `store.set_status(wo["id"], "failed")` on both paths. What `has_delivered`
+branches is three writes:
+
 - `store.add_event(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT, {...})` carrying
-  `pause.attempts`/`pause.reason`/`pause.message` when there was a pause and
-  `turn.get("error")`, so the record never reads as a clean delivery. New constant
-  `TURN_DIED_AFTER_DELIVERY_EVENT = "turn_died_after_delivery"` in `invariants.py` next
-  to the blocker, because the writer is the daemon and the reader is the derivation;
-- `store.flag_attention(wo["id"], invariants_mod.true_blockers(store, fresh_row)[0])`,
-  not a literal. The existing `turn_retries_exhausted` event and the
-  `add_notification` call stay on both paths — the retries WERE spent, and the user
-  still wants to know the session died.
+  `turn.get("error")` and, when there was a pause, `pause.attempts`/`pause.reason`/
+  `pause.message`. The event is the predicate's input, so it must be written before the
+  flag;
+- `store.flag_attention(wo["id"], invariants_mod.true_blockers(store, fresh_row)[0])`, not
+  a literal, so the settler and the derivation say one sentence;
+- the notification, below.
 
-The `failed` path is unchanged for an order that delivered nothing.
+The existing `turn_retries_exhausted` event stays on both paths: the retries WERE spent.
 
-**The attention reason, worked out.** Two cases:
+**The notification half of the ruling.** The delivered path gets its own title and body:
 
-1. Assumptions pending — wo-604b5b99's case. `true_blockers` already derives
-   `"3 assumptions pending your review"` (`invariants.py:884`), and the `auto_review_at`
-   suppression at `invariants.py:872-879` does not apply, because
-   `neo_reviews_later` is False in `needs_review` and `_os_is_confirming` is false for an
-   assumption no confirmation pass ever ran on.
-2. `pr_url` recorded and nothing pending — **nothing correct is derivable today.** The
-   `governed and status == "needs_review"` ladder (`invariants.py:1049-1078`) falls
-   through `pr_state == "CLOSED"` (not closed), `validation_escalated` (no round),
-   `work_unlanded_open` (the work IS landed, on a branch with an open PR) and lands on
-   `IDLE_NO_FINISH_BLOCKER` — "the worker stopped mid-task without `jarvis wo finish`",
-   which is false twice: it finished, and the turn did not stop, it died.
+```python
+title=f"{wo['id']} delivered, then its worker session died"
+body=(f"{wo['pr_url']}\n" if wo.get("pr_url") else "")
+     + (f"{n} assumptions on record\n" if n else "")
+     + (turn.get("error") or "no error recorded")[:500]
+```
 
-   So add a line. New module-level constant in `invariants.py`, immediately after
-   `IDLE_NO_FINISH_BLOCKER` (`invariants.py:419`), under that constant's documented
-   obligation — the daemon raises it and this module re-derives it, or
-   INV-ATTENTION-REASON relabels it on the next tick:
+It names what is ON RECORD because the bare "worker turn failed" is what the issue
+complained about on Telegram: it sends the user looking for a bug in the work instead of at
+a dead session. The undelivered path keeps today's title and body exactly, including the
+"still failing after N retries" form.
 
-   ```python
-   TURN_DIED_AFTER_DELIVERY_BLOCKER = (
-       "its worker's session died after the work was delivered — the delivery is on "
-       "record; read it, then `jarvis wo review` or `jarvis wo done`")
-   ```
+**`invariants.true_blockers`, two edits and no new constant.**
 
-   No elapsed time in it (PARKED_BLOCKER's rule: `ack_attention` stores the string
-   verbatim).
+- The `turn_died_after_delivery` read MOVES from the last arm of the `needs_review` ladder
+  (`invariants.py:1158-1161`) to the `failed` arm (`invariants.py:964-965`): with the event
+  present it appends `TURN_DIED_AFTER_DELIVERY_BLOCKER`, else today's
+  `"worker failed — review and retry"`. Gated on the status already, so no other work order
+  pays for the query.
+- That ladder arm reverts to plain `IDLE_NO_FINISH_BLOCKER`. With the `needs_review` status
+  write gone the split is unreachable, and a branch nothing can satisfy is a branch that
+  rots into a lie about why it is there.
+- `TURN_DIED_AFTER_DELIVERY_BLOCKER`'s sentence is rewritten for the new status:
 
-   **Ranked by splitting case 4 of the ladder, nothing else moved.** The final
-   `elif not pending:` arm becomes: this blocker when
-   `store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)` is non-empty, else
-   `IDLE_NO_FINISH_BLOCKER`. That is the only arm whose sentence is wrong for this state,
-   and splitting it cannot reorder the three above it — the proof the ladder's comments
-   carry stays valid. The read is already behind `status == "needs_review"` and `not
-   pending`, so no other work order pays for the query.
+  ```python
+  TURN_DIED_AFTER_DELIVERY_BLOCKER = (
+      "its worker's session died after the work was delivered — the delivery is on "
+      "record, and the order is `failed` because the turn never finished; read it, then "
+      "`jarvis wo retry`, or `jarvis wo done`, or `jarvis wo review` for an assumption "
+      "still pending")
+  ```
 
-**Why `needs_review` and not a retry.** The order has delivered; there is nothing to
-re-run. `needs_review` is the status that means "a person decides what happens to
-delivered work", `dead_feature_children` never sees it, and the feature stays
-`executing` — defect 2 and 3 stop being reachable from this cause at all.
+  Keeps IDLE_NO_FINISH_BLOCKER's documented obligation (the daemon raises it, this module
+  re-derives it, or INV-ATTENTION-REASON relabels it next tick) and PARKED_BLOCKER's rule:
+  no elapsed time, because `ack_attention` stores the string verbatim.
+
+**The consequence, intended.** Such a child is dead to NEITHER rule. `settle_features`'s
+completion arm tests `all(c["status"] == "completed" for c in live)` and `live` excludes
+only `superseded` children (`daemon.py:1371-1382`), so — unlike a superseded child, which
+settles the feature neither way — the exempted child does not count towards completion
+either. The feature stays `executing` until the user acts ON THE CHILD: `jarvis wo retry`
+or `jarvis wo done`. That is honest — there is an open pull request outstanding and nobody
+has decided about it — and it is the price of keeping the label truthful.
+
+**`jarvis fo resume` is NOT a way out here.** `ops.resume_feature_order` supersedes
+`dead_feature_children(store, children)` — the FILTERED list (`ops.py:9826-9828`) — so an
+exempt child is never superseded, stays `failed` and still holds the feature out of
+completion after a resume. And a feature holding only such a child is `executing` anyway,
+where `fo resume` refuses outright (`ops.py:9818-9822`). Both remedies are child-level,
+which is why the blocker's sentence names only child-level commands.
+
+**Blast radius, accepted and not fixed here.** `failed` is a `DEPENDENCY_DEAD_STATUS`
+(`DEPENDENCY_DEAD_STATUSES`, `project_store.py:1633`), so a sibling with `--depends-on` on
+a delivered-death child now derives `DEAD_DEPENDENCY_BLOCKER` (`invariants.py:1530`,
+appended at `invariants.py:1061`) and raises attention, where under `needs_review` it would
+have waited quietly. That follows from the ruling and is accepted: the issue's "Expected"
+guaranteed that the feature would not fail and said nothing about dependents, and the
+dependent genuinely is waiting on a child nobody has decided about. If the user wants it
+quiet, the fix belongs in the DEPENDENCY-death predicate (`DEPENDENCY_DEAD_STATUSES` and
+its read at `invariants.py:1530`), not in this one: "does this child fail its feature" and
+"can this dependency ever complete" are different questions, and one shared exemption would
+couple them.
 
 ### (b) A live child under a settled feature carries a derived hold — never a reopen
 
@@ -337,22 +389,33 @@ for no gain.
    rejected it: `settle_features` re-fails it on the next tick off the same dead child,
    via the predicate the settler and the invariant deliberately share. The user watches
    it flap.
-2. **`jarvis wo retry` the delivered-then-killed child.** Nothing to retry — the work is
-   delivered and the pull request is open. It would re-open a session to tell the user
-   what the record already says, and it needs a person to type it.
-3. **Widen `dead_feature_children` to exempt a delivered `failed` child.** Leaves the
-   child's status a lie, where every other surface reads it: dependents treat `failed`
-   as a dead dependency, `true_blockers` says "worker failed — review and retry". Fix
-   the status, not the readers.
-4. **Write the hold as a flag at the settle site** (`settle_features`,
+2. **Settle the delivered-then-killed child to `needs_review`.** REJECTED BY THE USER on
+   2026-10-07, overruling issue 881's own proposed fix (1). `needs_review` is the queue the
+   user works through to decide on DELIVERED work; an order whose turn died mid-flight is
+   not that, however much it had produced, and putting it there makes the queue mean two
+   things. Do not re-propose it: the exemption in `dead_feature_children` buys the same
+   outcome for the feature without spending the status.
+3. **Have the OS `jarvis wo retry` the child by itself.** A turn that died with no result
+   is never replayed by the OS, only by the user — and here there may be nothing to re-run:
+   the work is delivered and the pull request is open. The user typing `jarvis wo retry` is
+   a named way out in the blocker's sentence; the OS typing it is not.
+4. **Exempt the child by reading `has_delivered` live instead of the event.** `pr_url` is
+   state, not cause: every order that failed for an unrelated reason while holding an open
+   pull request would stop failing its feature too. The event says why.
+5. **Widen `resume_feature_order` to supersede the UNFILTERED dead list**, so
+   `jarvis fo resume` could clear an exempt child. Superseding it drops an open pull request
+   out of the feature's completion accounting silently — the feature would then be free to
+   complete over delivered work nobody ever decided about. And the user's ruling was about
+   a status, not about what `fo resume` means.
+6. **Write the hold as a flag at the settle site** (`settle_features`,
    `_close_feature_manager`) instead of deriving it. Breaks kn-089de524: nothing
    re-derives it, so INV-ATTENTION-REASON relabels it on the next tick and the flag
    survives the feature being reopened.
-5. **Keep manager liveness at each call site** — add the revive to
+7. **Keep manager liveness at each call site** — add the revive to
    `resume_feature_order` and to the invariant, and leave `_manager_handoff` alone. That
    IS today's bug: liveness written at transitions is what left three paths out of step.
    Two callers today become five next year.
-6. **Have `_manager_handoff` create a replacement manager when the row is missing.** A
+8. **Have `_manager_handoff` create a replacement manager when the row is missing.** A
    manager carries the feature's whole conversation; a fresh one would be briefed on
    nothing and would answer a round of feedback blind. Flagging names a situation only
    the user can decide about.
@@ -364,13 +427,18 @@ In `tests/`, beside `tests/test_feature_order_resume.py` and
 
 1. **`tests/test_delivered_turn_death.py`** — a child with `pr_url` and three
    assumptions, a `failed` turn with an exhausted pause, one `Daemon.settle_work_order`
-   pass: the child is `needs_review`, a `turn_died_after_delivery` event is on its
-   timeline, the feature stays `executing` after `settle_features`, and
-   `dead_feature_children` returns `[]`. Control: the same turn death on a child with no
-   `pr_url` and no assumptions still lands `failed`. Reason cases: with assumptions
-   pending the flag reads `"3 assumptions pending your review"`; with a `pr_url` and
-   nothing pending it reads `TURN_DIED_AFTER_DELIVERY_BLOCKER` and survives a full
-   invariant pass — INV-ATTENTION-REASON must not relabel it.
+   pass: the child is **`failed`**, a `turn_died_after_delivery` event is on its timeline,
+   its flag reads `TURN_DIED_AFTER_DELIVERY_BLOCKER` and survives a full invariant pass
+   (INV-ATTENTION-REASON must not relabel it), and the notification body contains the
+   pull request URL. Then one `settle_features` pass: `dead_feature_children` returns `[]`
+   and the feature stays `executing` — and stays `executing` with every sibling
+   `completed`, which is the intended consequence and not a bug. Controls, proving the
+   exemption is narrow: a `failed` child with NO `turn_died_after_delivery` event still
+   fails its feature; a turn death on a child with no `pr_url` and no assumptions writes no
+   event, keeps the "worker turn failed" flag and notification, and fails its feature. One
+   more, for the shared predicate: `check_feature_failures_are_real` and
+   `ops.resume_feature_order` see the same exempted child as the settler does — no
+   violation, and nothing superseded.
 2. **`tests/test_settled_feature_hold.py`** — a live child under a `failed` feature:
    `true_blockers` leads with `SETTLED_FEATURE_BLOCKER` naming the feature and
    `jarvis fo resume`, and one reconcile tick raises the flag with that string
@@ -399,8 +467,12 @@ In `tests/`, beside `tests/test_feature_order_resume.py` and
 
 - The stampede cleanup that killed the turn. The turn died legitimately as far as this
   spec is concerned; the defect is what the OS concluded from it.
-- Any change to `Daemon.settle_features`, `dead_feature_children` or the feature state
-  machine. The fork stays as it is; the inputs to it stop being wrong.
+- Any change to `Daemon.settle_features`'s fork or to the feature state machine. The fork
+  stays as it is; one input to it stops counting a child whose turn died after delivering.
+- The work order status vocabulary. No new status: `failed` already says what happened.
+- `dead_feature_children` stops being a pure function: one `events_of_kind` per dead child
+  per tick, bounded by the dead children of a single feature. Left as it is. The cheaper
+  shape, if that ever matters, is a `wo_events` join inside `feature_children`.
 - Retroactive repair of features already settled this way. INV-FEATURE-FALSE-FAILURE
   plus (c) reopens them with a live manager once a child recovers; a feature whose child
   is still `failed` needs `jarvis fo resume`, which is the existing route and now revives

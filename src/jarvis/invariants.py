@@ -421,18 +421,26 @@ IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
 
-#: What a work order says when its turn died AFTER it had delivered — wo-604b5b99, whose
-#: session was killed in a stampede cleanup with PR #839 open. The state IDLE_NO_FINISH
-#: used to claim, and its sentence is false twice over there: the order finished, and the
-#: turn did not stop, it died. Nothing is left to re-run, so the way out is a person's.
+#: What a `failed` work order says when there is nothing more specific to say. A CONSTANT
+#: because `Daemon.settle_work_order` raises it and `true_blockers` re-derives it: the two
+#: carried different spellings of this one state ("worker turn failed" at the write site),
+#: so INV-ATTENTION-REASON relabelled every such flag on the next tick.
+WORKER_FAILED_BLOCKER = "worker failed — review and retry"
+
+#: What a `failed` work order says when its turn died AFTER it had delivered —
+#: wo-604b5b99, whose session was killed in a stampede cleanup with PR #839 open. Spec
+#: §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
+#: manager-or-a-hold.md.
 #:
 #: Under IDLE_NO_FINISH_BLOCKER's own obligation: `Daemon.settle_work_order` raises it and
 #: `true_blockers` re-derives it from here, or INV-ATTENTION-REASON relabels it on the next
 #: tick. FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule — `ack_attention` stores it
 #: verbatim.
 TURN_DIED_AFTER_DELIVERY_BLOCKER = (
-    "its worker's session died after the work was delivered — the delivery is on record; "
-    "read it, then `jarvis wo review` or `jarvis wo done`")
+    "its worker's session died after the work was delivered — the delivery is on record, "
+    "and the order is `failed` because the turn never finished, not because the work did; "
+    "`jarvis wo retry` resumes the session where it died, `jarvis wo done` closes it, and "
+    "`jarvis wo review` decides any assumption still pending")
 
 #: `kind` of the event the settler writes on that path, so the record never reads as a
 #: clean delivery. Here rather than in `daemon` because the writer is the daemon and the
@@ -554,23 +562,48 @@ FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver
                            "plan promised")
 
 
-def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def dead_feature_children(store: ProjectStore,
+                          children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The children that fail their feature: ended badly, and not answered for.
 
     ONE function because `Daemon.settle_features` and `check_feature_failures_are_real`
     must agree exactly. A settler that fails a feature on a child the invariant then
-    un-fails it on is an infinite loop, and the user watches it flap on every tick.
+    un-fails it on is an infinite loop, and the user watches it flap on every tick. That
+    obligation is also why the exemption below lives HERE and not in one caller.
+
+    EXEMPT: a `failed` child carrying `TURN_DIED_AFTER_DELIVERY_EVENT`. Its session died
+    after the work was delivered — wo-604b5b99, whose turn was killed in a stampede
+    cleanup with PR #839 open — and that is the turn's failure, not the feature's. Keyed
+    on the EVENT and never on a live `has_delivered`: the event names the CAUSE, where a
+    `pr_url` is a coincidence that would quietly exempt every failed order holding one.
+
+    The intended consequence: such a child is dead to NEITHER rule. Unlike a `superseded`
+    child it does not count towards completion either, so the feature stays `executing`
+    until the user acts on the child — `jarvis wo retry` or `jarvis wo done`. That is
+    honest: there is an open pull request outstanding.
+
+    NO FEATURE-LEVEL REMEDY, deliberately: a feature holding only such a child is
+    `executing`, which `jarvis fo resume` refuses, and widening `ops.resume_feature_order`
+    to supersede the exempt child would drop that open pull request out of the feature's
+    completion accounting in silence.
     """
-    return [c for c in children
-            if c["status"] in ("failed", "cancelled") and not c.get("superseded")]
+    dead = [c for c in children
+            if c["status"] in ("failed", "cancelled")
+            and not c.get("superseded")]
+    return [c for c in dead
+            if c["status"] != "failed"
+            or not store.events_of_kind(c["id"], TURN_DIED_AFTER_DELIVERY_EVENT)]
 
 
 def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this work order produced something a person has to decide about?
 
-    Beside `dead_feature_children` because it is the function whose input this changes:
-    a turn that dies after a delivery settles to `needs_review` instead of `failed`
-    (`Daemon.settle_work_order`), so the dead-child predicate never sees it.
+    Beside `dead_feature_children` because it is the function whose ANSWER this changes.
+    The STATUS is unchanged: a turn that dies after a delivery still settles `failed`
+    (`Daemon.settle_work_order`) — `needs_review` is the queue the user works through to
+    decide on delivered work, and a turn that died mid-flight does not belong in it. What
+    the delivery buys is the `TURN_DIED_AFTER_DELIVERY_EVENT` event the settler writes,
+    which is what exempts the child from the dead-child predicate.
 
     A pull request and an assumption are artefacts the order cannot take back. NOT
     `result_summary`: a worker can write one and keep working, so it does not say the
@@ -963,7 +996,15 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == budget.EXHAUSTED:
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
-        blockers.append("worker failed — review and retry")
+        # TWO SENTENCES, and the second is the one the generic line got wrong: a session
+        # that died AFTER the work was delivered did not "fail" in any sense the user can
+        # act on by retrying blind — there is a pull request and there may be assumptions.
+        # The read sits behind the status check, so no other work order pays for it.
+        # Spec §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-
+        # must-have-a-manager-or-a-hold.md
+        died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
+        blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
+                        else WORKER_FAILED_BLOCKER)
     # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
     # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
     # and above the `needs_review` triage, because it outranks both of the generic
@@ -1149,17 +1190,8 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         # 4. Nothing more specific: the worker stopped without finishing. Guarded,
         #    because a `needs_review` holding a pending assumption is doing exactly what
         #    that status is for, and this line would call it a worker that gave up.
-        #
-        #    SPLIT IN TWO, and nothing else moved: the SESSION DIED after the work was
-        #    delivered is the one state whose sentence this arm got wrong, and splitting
-        #    the last arm cannot reorder the three above it. The read sits behind
-        #    `needs_review` and `not pending`, so no other work order pays for it.
-        #    Spec §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-
-        #    must-have-a-manager-or-a-hold.md
         elif not pending:
-            died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
-            blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
-                            else IDLE_NO_FINISH_BLOCKER)
+            blockers.append(IDLE_NO_FINISH_BLOCKER)
     # A message the user sent that the worker will never see (GitHub issue 43). Derived
     # here rather than flagged at the delivery site because `deliver_messages` never runs
     # for these — the hold is the absence of an attempt, so there is no call site to
@@ -3199,7 +3231,7 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
     ).fetchall():
         fo_id = row["id"]
         children = store.feature_children(fo_id)
-        if not children or dead_feature_children(children):
+        if not children or dead_feature_children(store, children):
             continue
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)

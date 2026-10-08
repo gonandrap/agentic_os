@@ -9823,7 +9823,7 @@ def resume_feature_order(fo_id: str, fix: str = "",
     store = ProjectStore(path)
     try:
         children = store.feature_children(fo_id)
-        dead = dead_feature_children(children)
+        dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
         store.set_feature_status(fo_id, "executing")

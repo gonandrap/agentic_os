@@ -1369,7 +1369,7 @@ class Daemon:
             # A feature whose every child is superseded therefore completes, which is
             # right: nothing is outstanding.
             live = [c for c in children if not c["superseded"]]
-            dead = dead_feature_children(children)
+            dead = dead_feature_children(store, children)
             if dead:
                 first = dead[0]
                 template = (FEATURE_CHILD_FAILED if first["status"] == "failed"
@@ -5009,31 +5009,34 @@ class Daemon:
             if pause and not pause.exhausted:
                 return
             if wo["status"] != "failed":
-                # THE TURN'S FATE IS NOT THE ORDER'S. A session killed after the work was
-                # delivered leaves a pull request and assumptions nobody can take back,
-                # and `failed` makes the child dead to `dead_feature_children` — which
-                # failed fo-ac00376e off a delivered wo-604b5b99. Spec §(a),
+                # THE ORDER IS `failed` EITHER WAY — the turn died mid-duration, and
+                # `needs_review` is the queue the user works through to decide on
+                # DELIVERED work. What a session killed after delivery leaves behind is a
+                # pull request and assumptions nobody can take back, and the EVENT below
+                # is what records that: `dead_feature_children` reads it and exempts this
+                # child, so its feature is not failed off it (fo-ac00376e, off a delivered
+                # wo-604b5b99). Load-bearing, not decoration. Spec §(a),
                 # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-
                 # have-a-manager-or-a-hold.md
                 delivered = invariants_mod.has_delivered(store, wo)
+                store.set_status(wo["id"], "failed")
                 if delivered:
-                    store.set_status(wo["id"], "needs_review")
                     store.add_event(
                         wo["id"], invariants_mod.TURN_DIED_AFTER_DELIVERY_EVENT,
                         {"error": turn.get("error"),
                          **({"attempts": pause.attempts, "reason": pause.reason,
                              "message": pause.message} if pause else {})})
                     # ONLY IF THERE IS A BLOCKER TO FLAG. An UNGOVERNED order — one the
-                    # user injected — derives nothing from `needs_review` at all, and
-                    # asking it for nothing is correct (`retire_ungoverned`).
+                    # user injected — derives nothing from `failed` at all, because the
+                    # arm is behind `governed`, and asking it for nothing is correct
+                    # (`retire_ungoverned`).
                     fresh_row = store.get_work_order(wo["id"])
                     blockers = invariants_mod.true_blockers(store, fresh_row)
                     if blockers:
                         store.flag_attention(wo["id"], blockers[0])
                 else:
-                    store.set_status(wo["id"], "failed")
                     store.flag_attention(wo["id"],
-                                         "worker turn failed — review and retry")
+                                         invariants_mod.WORKER_FAILED_BLOCKER)
                 if pause:
                     # Retried until the OS ran out of patience. Say so plainly: the
                     # message the user needs is "this is not going to fix itself", and
@@ -5044,13 +5047,31 @@ class Daemon:
                                     {"attempts": pause.attempts,
                                      "reason": pause.reason,
                                      "error": pause.message})
-                store.add_notification(
-                    title=(f"{wo['id']} still failing after {pause.attempts} "
-                           f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
-                           else f"{wo['id']} worker turn failed"),
-                    body=(turn.get("error") or "no error recorded")[:500],
-                    level="warning", wo_id=wo["id"], source="reconciler",
-                )
+                if delivered:
+                    # THE PHONE HAS TO SAY WHICH FAILURE THIS IS. "worker turn failed"
+                    # about an order that had already delivered reads as a bug in the
+                    # work and sends the user looking for one — GitHub issue 881, where
+                    # it read as if the order were completed. ONE notification, never two:
+                    # this replaces the generic line rather than following it.
+                    title = f"{wo['id']} delivered, then its session died"
+                    said = ["The work was delivered and is on record; the order is "
+                            "`failed` because the turn never finished."]
+                    if wo.get("pr_url"):
+                        said.append(f"Pull request: {wo['pr_url']}.")
+                    n = len(store.all_assumptions(wo["id"]))
+                    if n:
+                        said.append(f"{n} assumption{'s' if n != 1 else ''} on record.")
+                    said.append(f"`jarvis wo retry {wo['id']}` resumes the session where "
+                                f"it died; `jarvis wo done {wo['id']}` closes it.")
+                    said.append(turn.get("error") or "no error recorded")
+                    body = " ".join(said)
+                else:
+                    title = (f"{wo['id']} still failing after {pause.attempts} "
+                             f"{worker_session.PAUSE_NOUN[pause.reason]} retries" if pause
+                             else f"{wo['id']} worker turn failed")
+                    body = (turn.get("error") or "no error recorded")[:500]
+                store.add_notification(title=title, body=body[:500], level="warning",
+                                       wo_id=wo["id"], source="reconciler")
             return
 
         # The turn is done. Everything below decides what the work order does next.
