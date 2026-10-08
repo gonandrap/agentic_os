@@ -862,6 +862,10 @@ def create_app() -> FastAPI:
         # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded
         # once, in `bill.SUBAGENT_REWRITE_ZERO`, and read by this page and `jarvis cost`.
         subagent_rewrite_zero=bill.SUBAGENT_REWRITE_ZERO,
+        # And one sentence further along: what a placeholder output figure means, worded
+        # once in `bill.PLACEHOLDER_NOTE` (spec 2026-10-08 §7).
+        placeholder_note=bill.PLACEHOLDER_NOTE,
+        placeholder_zero=bill.PLACEHOLDER_ZERO,
         # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason
         # the partial already gives about figures: an order computed in a renderer is
         # one the other renderer disagrees with (§10.7).

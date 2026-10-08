@@ -39,14 +39,38 @@ def transcript(tmp_path, monkeypatch):
     (root / "-proj").mkdir(parents=True)
     monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
 
-    def write(session_id: str, *, write_tok: int = 0, read: int = 0, out: int = 0):
-        row = {"type": "assistant",
-               "message": {"id": f"m-{session_id}", "model": "claude-opus-5",
+    def row(mid: str, write_tok: int, read: int, out: int, at: float | None,
+            stop_reason: str | None) -> dict:
+        one = {"type": "assistant",
+               "message": {"id": mid, "model": "claude-opus-5",
+                           "stop_reason": stop_reason,
                            "usage": {"input_tokens": 0,
                                      "cache_creation_input_tokens": write_tok,
                                      "cache_read_input_tokens": read,
                                      "output_tokens": out}}}
-        (root / "-proj" / f"{session_id}.jsonl").write_text(json.dumps(row) + "\n")
+        if at is not None:
+            one["timestamp"] = (datetime.fromtimestamp(at, tz=ZoneInfo("UTC"))
+                                .isoformat().replace("+00:00", "Z"))
+        return one
+
+    def write(session_id: str, *, write_tok: int = 0, read: int = 0, out: int = 0,
+              at: float | None = None, subagents: list[dict] | None = None):
+        """One session. `subagents` names each with its own `write_tok`/`read`/`out`, and
+        `placeholder=True` stages the two mid-stream rows Claude Code writes for a
+        message whose sealed row never arrives (spec 2026-10-08 §1)."""
+        (root / "-proj" / f"{session_id}.jsonl").write_text(
+            json.dumps(row(f"m-{session_id}", write_tok, read, out, at, "end_turn"))
+            + "\n")
+        for i, sub in enumerate(subagents or []):
+            sub_dir = root / "-proj" / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            stop = None if sub.get("placeholder") else "end_turn"
+            rows = [row(f"s{i}", sub.get("write_tok", 0), sub.get("read", 0),
+                        sub.get("out", 0), sub.get("at"), stop)]
+            if sub.get("placeholder"):
+                rows.append(dict(rows[0]))      # the second block, no sealed row ever
+            (sub_dir / f"agent-{i}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in rows))
 
     return write
 
@@ -207,7 +231,8 @@ def test_a_broken_transcript_read_never_takes_the_work_order_page_down(
 
 
 def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
-                      window: int = 1_000_000, at: float | None = None) -> None:
+                      window: int = 1_000_000, at: float | None = None,
+                      extra: dict | None = None) -> None:
     """A settled turn with its recorded usage envelope, as `_reap` would leave it.
 
     `at` is an explicit start time: the store stamps `db.now()`, so without it only the
@@ -221,6 +246,7 @@ def add_recorded_turn(project, wo_id: str, cost: float, peak: int,
                  "cache_read": 45689, "cache_1h": 2558, "cache_5m": 0, "output": 941,
                  "api_calls": 1, "context_peak": peak, "context_window": window,
                  "duration_api_ms": 1000, "cost_by_model": {"claude-opus-5": cost}}
+        usage.update(extra or {})
         store.finish_turn(turn["id"], "done", result="r", cost_usd=cost, num_turns=1,
                           usage_json=json.dumps(usage))
         if at is not None:
@@ -361,6 +387,54 @@ def test_the_bill_names_every_actor_and_the_tokens_each_spent(client, project,
     assert "1 call" in page.text
     # Tokens beside dollars on every actor line, not only on the headline.
     assert "210k" in page.text and "26k" in page.text
+
+
+def test_the_bill_page_names_the_residue_and_what_it_could_not_measure(
+        client, project, transcript):
+    """§7 and §9: the residue row, the placeholder sentence, and the three states a
+    reader must be able to tell apart — a residue, a measured zero, and a seal written
+    before the measurement existed (which renders as nothing, never as a zero)."""
+    now = time.time()
+    wo = ops.create_work_order("proj_a", "with a placeholder subagent")
+    transcript("sess-residue", write_tok=1_000, read=5_000, out=6_000, at=now + 5,
+               subagents=[{"write_tok": 1_000, "read": 2_000, "out": 5,
+                           "at": now + 20, "placeholder": True}])
+    give_session(project, wo["id"], "sess-residue")
+    add_recorded_turn(project, wo["id"], 0.5, 50_000, at=now,
+                      extra={"input": 0, "cache_write": 10_000, "cache_read": 100_000,
+                             "output": 100_000, "cache_1h": 0, "cache_5m": 10_000})
+
+    page = client.get(f"/cost/proj_a/{wo['id']}")
+
+    assert page.status_code == 200
+    assert "unattributed" in page.text
+    assert "API calls report placeholder" in page.text
+    assert "a measured zero" not in page.text
+    # The reworded captions, which used to assert the difference IS the subagents.
+    assert "what no transcript accounts\n  for" in page.text
+    assert "NEITHER accounts for" in page.text
+
+    # A bill with no placeholder call anywhere says so — a measured zero.
+    plain = ops.create_work_order("proj_a", "nothing hidden")
+    transcript("sess-plain-ph", write_tok=1_000, out=500, at=now + 5)
+    give_session(project, plain["id"], "sess-plain-ph")
+    add_recorded_turn(project, plain["id"], 0.1, 10_000, at=now)
+    plain_page = client.get(f"/cost/proj_a/{plain['id']}")
+    assert "a measured zero" in plain_page.text
+    assert "API calls report placeholder" not in plain_page.text
+
+    # And a seal from before the measurement renders NEITHER (§9).
+    store = ProjectStore(project)
+    try:
+        sealed = {k: v for k, v in ops.bill(plain["id"], live=True).items()
+                  if k != "placeholder"}
+        store.seal_bill(plain["id"], json.dumps(sealed))
+        store.set_status(plain["id"], "completed")
+    finally:
+        store.close()
+    old_page = client.get(f"/cost/proj_a/{plain['id']}")
+    assert "a measured zero" not in old_page.text
+    assert "API calls report placeholder" not in old_page.text
 
 
 def test_the_bill_says_which_way_a_turn_it_cannot_re_read_was_counted(client, project):

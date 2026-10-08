@@ -2911,18 +2911,23 @@ class FleetCostFixture:
 
     def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
                  input: int = 0, mid: str = "", model: str = "claude-opus-5",
-                 tools: Sequence[tuple[str, str, dict]] = ()) -> dict:
+                 tools: Sequence[tuple[str, str, dict]] = (),
+                 stop_reason: str | None = "end_turn") -> dict:
         """One assistant message — `usage.calls_of` reads one API call per row.
 
         `tools` is (tool_use_id, name, input) triples, and SEVERAL on one row is how
         Claude Code writes a parallel tool call: that is the case the char-proportional
         split of one exact context delta exists for (§10.2).
+
+        `stop_reason` defaults to a SEALED value; `placeholder_call_rows` stages the
+        other kind (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
         """
         return {
             "type": "assistant",
             "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
                           .isoformat().replace("+00:00", "Z")),
             "message": {"id": mid or f"m-{at}-{read}-{write}", "model": model,
+                        "stop_reason": stop_reason,
                         "usage": {"input_tokens": input,
                                   "cache_creation_input_tokens": write,
                                   "cache_read_input_tokens": read,
@@ -2931,6 +2936,23 @@ class FleetCostFixture:
                                      "input": arguments}
                                     for tid, name, arguments in tools]},
         }
+
+    def placeholder_call_rows(self, *, at: float, read: int = 0, write: int = 0,
+                              out: int = 5, mid: str = "",
+                              model: str = "claude-opus-5") -> list[dict]:
+        """The TWO mid-stream rows Claude Code writes for one message, and no third.
+
+        Both carry `stop_reason: null` and the same streaming `output_tokens`, so the
+        message's true output is not in the file at all (spec §1). One text block, one
+        tool_use block — the shape measured on wo-be05ab99's subagents.
+        """
+        mid = mid or f"ph-{at}-{read}-{write}"
+        return [
+            self.call_row(at=at, read=read, write=write, out=out, mid=mid, model=model,
+                          stop_reason=None),
+            self.call_row(at=at, read=read, write=write, out=out, mid=mid, model=model,
+                          stop_reason=None, tools=(("tu-" + mid, "Read", {}),)),
+        ]
 
     def result_row(self, *results: tuple[str, str], at: float,
                    is_error: bool = False) -> dict:

@@ -90,6 +90,15 @@ TURN_CALL_LIMIT = 200
 #:     total (`claude_cli.USAGE_SCHEMA_VERSION` 3). The ONLY version bump so far whose
 #:     re-derivation makes a bill SMALLER, which is why `_upgrade_seal` had to learn
 #:     that a correction is not a loss.
+#:
+#: NOT BUMPED for the subagent-attribution keys (`calls_cover_by_model` on a turn row,
+#: `placeholder` on the payload, `sealed` on a call row, the `unattributed` agent row):
+#: re-sealing every bill on disk would re-read transcripts that have part-expired, which
+#: turns an already-correct seal into a permanent unknown (kn-938b1878,
+#: docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §9). So the opposite
+#: convention to version 4's holds for them: ABSENT MEANS UNKNOWN, NOT ZERO, and every
+#: renderer tests PRESENCE (`if bill.get("placeholder") is not None`) so a measured zero
+#: and a seal that predates the measurement do not render the same.
 PAYLOAD_VERSION = 5
 
 #: The actor a line belongs to. Four, because they are four different KINDS of spend
@@ -433,6 +442,41 @@ LEAD_NOTE = ("the session's own conversation, with everything its subagents spen
 SUBAGENT_NOTE = ("spawned by the lead agent — its tokens are part of the total of the "
                  "turn it ran in, not on top of it")
 
+#: THE RESIDUE OF A TURN, NAMED — tokens the envelope reports that neither the lead's own
+#: API calls nor its subagents' transcripts account for. Beside `LEAD`/`LEAD_NOTE` for the
+#: `SUBAGENT_REWRITE_ZERO` reason: both renderers read the one wording
+#: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
+UNATTRIBUTED = "unattributed"
+UNATTRIBUTED_NOTE = (
+    "what no transcript accounts for: tokens this turn's envelope reports that neither "
+    "the lead agent's own API calls nor its subagents' transcripts can explain. A "
+    "subagent's transcript stores most of its assistant messages as mid-stream snapshots "
+    "whose `output_tokens` is a streaming placeholder, and the sealed row carrying the "
+    "real figure is never written — so the shortfall is mostly output and cannot honestly "
+    "be charged to an agent. A RESIDUE, not a measurement")
+
+#: §4: the lead's own transcript is gone, so its row is the turn less its subagents. A
+#: figure derived by subtraction is not a measurement — the `ABSENT_NOTES` doctrine.
+LEAD_UNMEASURED_NOTE = (
+    "the session's own conversation — what is LEFT of the turn after its subagents, "
+    "because the lead's own transcript has been pruned. Anything its subagents "
+    "under-reported is inside this figure rather than beside it, so it is a ceiling for "
+    "the lead and not a measurement of it")
+
+#: §6: said of a figure read from a transcript that holds placeholder output. One source
+#: for the running-turn line's note and for `cli`'s caption; the counts are printed beside
+#: it, never baked in, so the sentence can be matched on either surface.
+PLACEHOLDER_NOTE = (
+    "the sealed row carrying their real output is never written, so this figure is a "
+    "FLOOR and nothing here estimates the difference")
+
+#: THE MEASURED ZERO, said out loud (§9). A bill sealed before the measurement existed
+#: carries no `placeholder` block at all and must render as NOTHING — so the zero needs a
+#: sentence of its own, or the two cases would be indistinguishable on the page.
+PLACEHOLDER_ZERO = (
+    "every API call on this bill carries a sealed output figure — a measured zero, not a "
+    "missing measurement")
+
 
 def _turn_items(turn_rows: Sequence[dict[str, Any]],
                 session: Any) -> tuple[list[Item], list[str]]:
@@ -456,7 +500,7 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
     notes: list[str] = []
     recorded = _zero_tokens()
     subs_by_turn = _subagents_by_turn(turn_rows, session)
-    stranded = 0
+    stranded = {"subagent": 0, "lead": 0}
     for row in turn_rows:
         if not row.get("recorded"):
             continue
@@ -477,14 +521,23 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             cls: sum(getattr(s.usage, cls) for s in subs)
             for cls in usage_mod.TOKEN_CLASSES}
         turn_items, missed = _agent_items(row, models, subs)
-        stranded += missed
+        for side, count in missed.items():
+            stranded[side] += count
         items.extend(turn_items)
-    if stranded:
+    if stranded["subagent"]:
         notes.append(
-            f"{stranded:,} tokens a subagent's own transcript reports could not be taken "
-            "out of the turn it ran in, because the turn's own total does not contain "
-            "them. They stay inside the turn rather than being added to it: a bill that "
-            "grew when it looked closer would not be a bill.")
+            f"{stranded['subagent']:,} tokens a subagent's own transcript reports could "
+            "not be taken out of the turn it ran in, because the turn's own total does "
+            "not contain them. They stay inside the turn rather than being added to it: "
+            "a bill that grew when it looked closer would not be a bill.")
+    # Said about the right thing (§5): the sentence above is worded about subagents and
+    # would be a lie about a lead excess.
+    if stranded["lead"]:
+        notes.append(
+            f"{stranded['lead']:,} tokens the lead agent's own API calls report are more "
+            "than the turn's envelope reports for the whole turn, so they could not be "
+            "charged to its row. The excess stays inside the turn rather than being "
+            "added to it.")
     if not session.found:
         return items, notes
     whole = session.total
@@ -511,6 +564,11 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
             note = ("a turn writes its result JSON when it ends, so its spend is the "
                     "transcript's for now and moves onto its own turn line once it "
                     "settles")
+            # On the line that is actually low, not only in a summary block (§6).
+            if whole.placeholder_calls:
+                note += (f" · {whole.placeholder_calls:,} API call(s) report placeholder "
+                         f"output totalling {whole.placeholder_output:,} tokens — "
+                         + PLACEHOLDER_NOTE)
         else:
             label = "turns with no result JSON left"
             note = ("estimated from Claude Code's session transcript, at list prices — "
@@ -622,6 +680,17 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
                for cls in usage_mod.TOKEN_CLASSES},
             "total": sum(c.total_tokens for c in found),
         }
+        # The same cover PER MODEL, because the drawdown in `_agent_items` is per model
+        # and a flat figure cannot feed it. Its presence is "this turn's lead calls were
+        # found in the transcript", which is what §4 branches on (spec
+        # docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
+        by_model: dict[str, dict[str, int]] = {}
+        for call in found:
+            counts = by_model.setdefault(call.model or "unknown",
+                                         {cls: 0 for cls in usage_mod.TOKEN_CLASSES})
+            for cls in usage_mod.TOKEN_CLASSES:
+                counts[cls] += getattr(call, cls)
+        row["calls_cover_by_model"] = by_model
         # The context a turn actually reached, from the calls themselves. The envelope's
         # figure was right here by luck — its one sampled iteration happened to be the
         # turn's last and therefore its largest — and it is a floor in general.
@@ -633,7 +702,7 @@ def _attach_calls(turn_rows: Sequence[dict[str, Any]], session_id: str,
 
 
 def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
-                 subs: Sequence[Any]) -> tuple[list[Item], int]:
+                 subs: Sequence[Any]) -> tuple[list[Item], dict[str, int]]:
     """One turn, split into the agents that ran inside it. Returns (items, stranded).
 
     The turn's totals are the budget and the subagents are drawn from it PER MODEL and
@@ -641,6 +710,12 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
     to the turn no matter how the two sources disagree, and what a subagent's transcript
     claims beyond the turn's own total is reported as stranded rather than added — the
     two directions of the same rule that keeps this a bill and not a growing estimate.
+
+    THE LEAD IS DRAWN FROM THE SAME BUDGET, by its own API calls, and what neither side
+    accounts for is charged to nobody: a subagent's transcript under-reports its output by
+    construction, and handing the lead that difference made its row a figure the reader
+    acts on and the transcript denies (spec
+    docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §2).
 
     The turn's exact dollar figure is split across the rows in proportion to what they
     cost at list. Tokens are the figure that reconciles and dollars are derived and
@@ -651,13 +726,14 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
                                               for c in usage_mod.TOKEN_CLASSES}
               for m in models}
     drafts: list[tuple[str, str, dict[str, int], str]] = []
-    stranded = 0
+    stranded = {"subagent": 0, "lead": 0}
     for sub in subs:
         for model, counts in (sub.usage.tokens_by_model or {}).items():
             key = model if model in budget else next(iter(budget), "unknown")
             left = budget.get(key)
             if left is None:
-                stranded += sum(counts.get(c, 0) for c in usage_mod.TOKEN_CLASSES)
+                stranded["subagent"] += sum(counts.get(c, 0)
+                                            for c in usage_mod.TOKEN_CLASSES)
                 continue
             take = {}
             for cls in usage_mod.TOKEN_CLASSES:
@@ -665,12 +741,40 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
                 got = min(want, left[cls])
                 left[cls] -= got
                 take[cls] = got
-                stranded += want - got
+                stranded["subagent"] += want - got
             if any(take.values()):
                 drafts.append((sub.label, model, take, "subagent"))
-    for model, left in budget.items():
-        if any(left.values()) or not drafts:
-            drafts.append((LEAD, model, dict(left), "lead"))
+    # §2.1: with no subagent, nothing the lead's transcript misses belongs to anyone else
+    # — side-model calls and the CLI's own compaction are the lead's own spend — so the
+    # remainder goes to the lead unchanged. §4: and so it does with no cover to split on,
+    # under a note that says the figure is a subtraction.
+    cover = row.get("calls_cover_by_model") if subs else None
+    if not cover:
+        role = "lead" if not subs else "lead_unmeasured"
+        for model, left in budget.items():
+            if any(left.values()) or not drafts:
+                drafts.append((LEAD, model, dict(left), role))
+    else:
+        for model, mine in cover.items():
+            key = model if model in budget else next(iter(budget), "unknown")
+            left = budget.get(key)
+            if left is None:
+                stranded["lead"] += sum(mine.get(c, 0) for c in usage_mod.TOKEN_CLASSES)
+                continue
+            take = {}
+            for cls in usage_mod.TOKEN_CLASSES:
+                want = mine.get(cls, 0)
+                got = min(want, left[cls])
+                left[cls] -= got
+                take[cls] = got
+                stranded["lead"] += want - got
+            if any(take.values()) or not drafts:
+                drafts.append((LEAD, key, take, "lead"))
+        # Per model, like the lead's own rows: output is the dearest class and a residue
+        # priced in the wrong model's band is a wrong dollar figure.
+        for model, left in budget.items():
+            if any(left.values()):
+                drafts.append((UNATTRIBUTED, model, dict(left), "unattributed"))
     # Priced first, so the turn's one exact figure can be shared out by what each row
     # is worth. `list_usd` of a whole turn is never zero unless the turn is.
     priced = [(d, sum(usage_mod.class_costs(d[1], **d[2]).values())) for d in drafts]
@@ -692,7 +796,7 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
         # subagent is not a second countable act inside its turn: it is part of the one
         # turn already counted, so it carries no count of its own and the turn line
         # keeps saying "1 turn" instead of collapsing to a meaningless "2 charges".
-        counts = role == "lead" and not charged_turn
+        counts = role.startswith("lead") and not charged_turn
         charged_turn = charged_turn or counts
         leaf: tuple[str, ...] = (label,) if named else ()
         items.append(Item(
@@ -708,6 +812,8 @@ def _agent_items(row: dict[str, Any], models: Sequence[dict[str, Any]],
             calls=1 if counts else 0, unit="turn",
             usage_v=row.get("usage_v") or 1,
             note=(SUBAGENT_NOTE if role == "subagent" else
+                  UNATTRIBUTED_NOTE if role == "unattributed" else
+                  LEAD_UNMEASURED_NOTE if role == "lead_unmeasured" else
                   LEAD_NOTE if named else f"{row['kind']} turn"),
         ))
     return items, stranded
@@ -843,7 +949,8 @@ def _agent_view(items: Sequence[Item]) -> list[dict[str, Any]]:
                  label=lambda p: str(p[-1]))
     # The lead first, then the subagents in the order they were spawned; a bill reads
     # top-down and the agent that ran the order belongs at the top of its own list.
-    view.sort(key=lambda line: (line["label"] != LEAD,))
+    # ...and the residue last: it is not an agent, it is what no agent accounts for (§2).
+    view.sort(key=lambda line: (line["label"] != LEAD, line["label"] == UNATTRIBUTED))
     return view
 
 
@@ -1347,6 +1454,16 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "output": session.subagents.output,
             "billed_input": session.subagents.billed_input,
         },
+        # §6. Split by side for the reason `rewrite.by_side` is: the lead side is zero by
+        # shape (every lead row carries a `stop_reason`) and the subagent side is the
+        # finding. ABSENT on a seal written before this existed means UNKNOWN, not zero —
+        # see `PAYLOAD_VERSION` (§9).
+        "placeholder": {
+            "calls": total.placeholder_calls,
+            "output": total.placeholder_output,
+            "main_calls": session.main.placeholder_calls,
+            "subagent_calls": session.subagents.placeholder_calls,
+        },
         "rewrite": {
             "tokens": total.rewrite_excess,
             "list_usd": total.rewrite_cost_usd,
@@ -1433,6 +1550,7 @@ def reconcile(payload: dict[str, Any], tolerance: float = 1e-6) -> dict[str, Any
             problems.extend(_check_children(line))
     problems.extend(_check_agents(payload))
     problems.extend(_check_calls(payload))
+    problems.extend(_check_lead(payload))
     return {"balanced": not problems, "problems": problems}
 
 
@@ -1534,6 +1652,52 @@ def _check_agents(payload: dict[str, Any]) -> list[str]:
             problems.append(f"agents: {cls} sums to {summed}, the worker's session is "
                             f"{worker['tokens'][cls]}")
     return problems
+
+
+def _check_lead(payload: dict[str, Any]) -> list[str]:
+    """A lead row may never exceed what the lead's OWN API calls report.
+
+    The defect this fix is about, stated as arithmetic the bill can check on itself: the
+    lead used to be handed every token a subagent's placeholder rows failed to report —
+    69,460 output against its transcript's 17,421 on wo-be05ab99 turn 2 — and the fold
+    balanced throughout, because the money was in the right turn and on the wrong agent
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §8).
+
+    SKIPPED WHERE IT CANNOT SPEAK, the same discipline `_check_calls` keeps: a turn with
+    no `calls_cover_by_model` is §4's fallback, where the lead legitimately holds the
+    remainder, and a turn that is not `recorded` has no envelope to partition. The lead
+    line is found by LABEL rather than by a key shape, so the fold's key function is free
+    to change without this silently passing.
+    """
+    problems: list[str] = []
+    for row in payload.get("turn_rows") or []:
+        cover = row.get("calls_cover_by_model")
+        if not cover or not row.get("recorded"):
+            continue
+        line = _descendant(payload.get("turns") or [], str(row["seq"]), LEAD)
+        if line is None:
+            continue
+        for cls in usage_mod.TOKEN_CLASSES:
+            mine = sum(counts.get(cls, 0) for counts in cover.values())
+            if line["tokens"][cls] > mine:
+                problems.append(
+                    f"turn {row['seq']}: the lead agent is charged "
+                    f"{line['tokens'][cls]} {cls}, more than its own API calls report "
+                    f"({mine})")
+    return problems
+
+
+def _descendant(roots: Sequence[dict[str, Any]], key: str,
+                label: str) -> dict[str, Any] | None:
+    """The first line labelled `label` anywhere under the root keyed `key`."""
+    root = next((line for line in roots if line["key"] == key), None)
+    stack = list(root["children"] or []) if root else []
+    while stack:
+        line = stack.pop(0)
+        if line.get("label") == label:
+            return line
+        stack.extend(line.get("children") or [])
+    return None
 
 
 def _check_children(line: dict[str, Any]) -> list[str]:

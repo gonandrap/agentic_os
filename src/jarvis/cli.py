@@ -2016,7 +2016,8 @@ def _print_turn_calls(rows: list[dict]) -> None:
                                               + r.get("cache_read", 0)
                                               + r.get("output", 0)):
             print(f"{'':>4} {'':>5}  these are the lead agent's calls; the rest of "
-                  f"turn {r['seq']} is the subagents it spawned, itemised above")
+                  f"turn {r['seq']} is the subagents it spawned and what no transcript "
+                  f"accounts for, both itemised above")
 
 
 def _print_bill(bill: dict) -> None:
@@ -2049,7 +2050,8 @@ def _print_bill(bill: dict) -> None:
     _print_provenance(bill.get("accuracy") or {})
     for view, caption in (("actors", "by who spent it"),
                           ("turns", "the same tokens, turn by turn"),
-                          ("agents", "agent by agent — the lead, then what it spawned"),
+                          ("agents", "agent by agent — the lead, then what it spawned, "
+                                     "then what no transcript accounts for"),
                           ("orders", "the orders under it")):
         lines = bill.get(view) or []
         own = bill.get("own") if view == "orders" else None
@@ -2144,6 +2146,17 @@ def _print_bill(bill: dict) -> None:
         print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
               f"itemised above under the turn each ran in — drawn out of that turn's "
               f"total, never added to it")
+    # PRESENCE, never truthiness: absent means this seal predates the measurement, which
+    # must not render as a measured zero (spec 2026-10-08 §9).
+    placeholder = bill.get("placeholder")
+    if placeholder is not None and placeholder.get("calls"):
+        print(f"{placeholder['calls']:,} of those API calls report placeholder output "
+              f"totalling {placeholder['output']:,} tokens "
+              f"({placeholder['subagent_calls']:,} in a subagent's transcript, "
+              f"{placeholder['main_calls']:,} in the lead's) — "
+              + bill_mod.PLACEHOLDER_NOTE)
+    elif placeholder is not None:
+        print(bill_mod.PLACEHOLDER_ZERO)
     for note in bill.get("notes") or []:
         print(f"\n⚠ {note}")
     print(f"\nEvery figure above is {bill['floor_reason']}.")

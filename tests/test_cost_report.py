@@ -19,13 +19,16 @@ from jarvis.project_store import ProjectStore
 
 
 def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
-                  at: float | None = None) -> dict:
+                  at: float | None = None, stop_reason: str | None = "end_turn",
+                  blocks: list[dict] | None = None) -> dict:
+    """One assistant row. SEALED by default — see `placeholder_rows` for the other kind."""
     row = {
         "type": "assistant",
         "message": {
-            "id": mid, "model": "claude-opus-5",
+            "id": mid, "model": "claude-opus-5", "stop_reason": stop_reason,
             "usage": {"input_tokens": 0, "cache_creation_input_tokens": write,
                       "cache_read_input_tokens": read, "output_tokens": out},
+            **({"content": blocks} if blocks is not None else {}),
         },
     }
     if at is not None:
@@ -35,6 +38,24 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
         row["timestamp"] = (datetime.fromtimestamp(at, tz=timezone.utc)
                             .isoformat().replace("+00:00", "Z"))
     return row
+
+
+def placeholder_rows(mid: str, *, read: int = 0, write: int = 0, out: int = 5,
+                     at: float | None = None) -> list[dict]:
+    """The two rows Claude Code writes for one UNSEALED message, and no third.
+
+    A background subagent's assistant message is written once per content block with
+    `stop_reason: null` and a streaming `output_tokens` of 3-33; the sealed row carrying
+    the real output is never written, so the true figure is not in the file
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
+    """
+    return [
+        assistant_row(mid, write=write, read=read, out=out, at=at, stop_reason=None,
+                      blocks=[{"type": "text", "text": "thinking about it"}]),
+        assistant_row(mid, write=write, read=read, out=out, at=at, stop_reason=None,
+                      blocks=[{"type": "tool_use", "id": f"tu-{mid}", "name": "Read",
+                               "input": {"file_path": "/tmp/x"}}]),
+    ]
 
 
 @pytest.fixture()
