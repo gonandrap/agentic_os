@@ -137,6 +137,9 @@ def test_the_hold_says_so_when_the_worker_pushed_without_declaring_it():
     assert d.reason == autoreview.REFUSAL_UNDECLARED_REASON
     assert "pushed commits since without running `jarvis wo finish`" in d.reason
     assert "the OS has asked it to declare them" in d.reason
+    # Issue #975: a hold the user reads must end in something they can type.
+    assert "jarvis validation force" in d.reason
+    assert "send it a message asking it to finish" in d.reason
 
 
 def test_the_early_hold_carries_the_same_second_sentence():
