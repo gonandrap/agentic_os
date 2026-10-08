@@ -92,7 +92,12 @@ def test_core_contract_is_under_the_budget():
     # in one select — 325 chars of tool names, and the probe that made one line correct is
     # what bought back the retry sentence. The CORE budget above is untouched: this block
     # is after the index, which is the whole reason it goes there.
-    assert len(p) < 5900, f"bare worker prompt is {len(p)} chars"
+    # Raised 5900 -> 6400 for the markdown half of that block (spec
+    # 2026-10-06-navigate-specs-like-code.md SS6): 5846 before, 6347 after, +501 for
+    # `worker_brief._MARKDOWN_NAV`. It buys back one 5,187-token whole-spec read, which
+    # the same spec measured 199 of. CORE budget above untouched: 3862 either way, since
+    # the block is composed after the index and never inside the core.
+    assert len(p) < 6400, f"bare worker prompt is {len(p)} chars"
 
 
 def test_the_core_says_to_pass_a_reference_and_never_a_payload():
@@ -577,3 +582,114 @@ def test_template_version_bumped():
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     assert TEMPLATE_VERSION >= 13
+
+
+# -- specs are navigated like code (spec 2026-10-06-navigate-specs-like-code.md §6) -----
+
+#: §4.3 of that spec FIXES these three strings; every seat quotes them verbatim, so this
+#: suite holds the canonical copy and a drift in any module goes red here.
+SPEC_COMMANDS = (
+    "jarvis spec toc <path>",
+    "jarvis spec section <path> <n|name>",
+    'jarvis spec search "<words>"',
+)
+
+
+def _child_prompt(spec: ProjectSpec = SPEC) -> str:
+    from jarvis.dispatch import build_worker_prompt
+    return build_worker_prompt(
+        WO, spec,
+        design_doc={"section": "3. Schema", "repo_path": "docs/specs/exporter.md",
+                    "section_path": "/tmp/p1/.jarvis/features/fo-1/sections/wo-1.md",
+                    "path": "/tmp/p1/.jarvis/features/fo-1/exporter.md"})
+
+
+def _planner_prompt(spec: ProjectSpec = SPEC) -> str:
+    from jarvis import dispatch
+    return dispatch._planner_prompt({"id": "wo-plan01", "title": "An exporter",
+                                     "description": "Build it.",
+                                     "kind": "planner", "parent_id": "fo-1"}, spec)
+
+
+def test_the_markdown_posture_survives_serena_being_deselected():
+    """Markdown navigation needs no symbol index, so swallowing it inside the Serena
+    branch is the defect §6.1 asked to be decided and pinned."""
+    from jarvis import worker_brief
+
+    text = "\n".join(worker_brief.navigation_core(serena=False))
+
+    for command in SPEC_COMMANDS:
+        assert command in text, f"serena=False lost {command!r}"
+    assert SELECT_LINE not in text
+    assert "find_referencing_symbols" not in text, "the symbol half leaked"
+
+
+def test_the_navigation_section_carries_the_markdown_posture_in_both_branches():
+    from jarvis import worker_brief
+
+    for serena in (True, False):
+        text = worker_brief.navigation_section(serena=serena)
+        for command in SPEC_COMMANDS:
+            assert command in text, f"serena={serena} lost {command!r}"
+
+
+def test_the_three_spec_commands_are_byte_identical_in_every_seat():
+    """§4.3: `worker_brief`, `concision` and `dispatch` each hold their own literals
+    (`concision` may not import `worker_brief` — `worker_brief` imports `concision`), so
+    byte equality is a test, not an import."""
+    from jarvis import concision, worker_brief
+
+    seats = {
+        "worker_brief": "\n".join(worker_brief.navigation_core(serena=False)),
+        "concision": concision.subagent_context({}),
+        "dispatch (child)": _child_prompt(),
+        "dispatch (planner)": _planner_prompt(),
+    }
+    for seat, text in seats.items():
+        for command in SPEC_COMMANDS:
+            assert command in text, f"{seat} does not quote {command!r} verbatim"
+        assert "jarvis spec show" not in text, f"{seat} names a nonexistent command"
+
+
+def test_the_spec_commands_are_a_chain_a_worker_can_run_unprompted():
+    """Prose naming a command the preflight does not auto-allow stalls on a permission
+    prompt, which is the same as not shipping it."""
+    from jarvis import hooks
+
+    assert hooks.is_jarvis_command_chain("jarvis spec toc docs/specs/x.md") is True
+
+
+def test_the_child_spec_block_points_at_commands_not_at_a_whole_file():
+    """The sentence that produced the measured 5,187-token read is gone; the snapshot
+    path stays, as a command argument."""
+    p = _child_prompt()
+
+    assert "The whole spec is at" not in p
+    assert "if the section is not enough" not in p
+    assert "/tmp/p1/.jarvis/features/fo-1/sections/wo-1.md" in p
+    assert "read it first" in p
+    assert "/tmp/p1/.jarvis/features/fo-1/exporter.md" in p
+    assert "planner's branch" in p
+    for command in SPEC_COMMANDS:
+        assert command in p
+
+
+def test_the_planner_is_told_to_navigate_specs_rather_than_read_them():
+    """The heaviest spec reader in the fleet, and so the cheapest place to win (§6)."""
+    p = _planner_prompt()
+
+    for command in SPEC_COMMANDS:
+        assert command in p
+
+
+def test_the_common_briefing_tail_reaches_the_posture_through_worker_brief():
+    """No duplicated prose in `_common_briefing`: it composes
+    `worker_brief.navigation_section`, so asserting the tail carries the posture also
+    pins that there is exactly one source for it."""
+    from jarvis import dispatch, worker_brief
+
+    tail = "\n".join(dispatch._common_briefing([], WO, SPEC))
+
+    assert worker_brief.navigation_section() in tail
+    for command in SPEC_COMMANDS:
+        assert command in tail

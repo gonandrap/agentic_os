@@ -209,7 +209,10 @@ def test_a_project_with_no_standing_prompt_still_gets_the_style():
     context = _subagent(JARVIS_WO_ID="wo-conc01"
                         )["hookSpecificOutput"]["additionalContext"]
 
-    assert context == concision.house_style()
+    # Containment, not equality: the context also carries the spec-navigation block
+    # (spec 2026-10-06-navigate-specs-like-code.md §6).
+    assert concision.house_style() in context
+    assert "jarvis spec toc <path>" in context
 
 
 def test_a_session_the_user_opened_gets_nothing():
@@ -230,7 +233,13 @@ def test_the_hook_reads_the_standing_prompt_from_the_environment():
     imported |= {a.name for n in ast.walk(tree)
                  if isinstance(n, ast.Import) for a in n.names}
     assert not any((m or "").endswith("catalog") for m in imported), imported
-    assert concision.subagent_context({}) == concision.house_style()
+    # `worker_brief` is barred for the same reason plus a cycle: it imports `concision`
+    # (spec 2026-10-06-navigate-specs-like-code.md §6), so the navigation block below is
+    # this module's own literals.
+    assert not any((m or "").endswith("worker_brief") for m in imported), imported
+    context = concision.subagent_context({})
+    assert concision.house_style() in context
+    assert "jarvis spec toc <path>" in context
 
 
 # -- pass a reference, never a payload (SS5 of the bounded-model-inputs spec) -------------
