@@ -5499,7 +5499,8 @@ class Daemon:
         looks outside the machine, and it exists so the user does not have to type
         `jarvis wo done` after every merge they already performed.
 
-        Five answers, from `github.pr_view`:
+        Six answers, from `github.pr_view` — five about the pull request's own state,
+        mutually exclusive by construction, and one independent of them:
 
         * **merged** — the work landed; the work order ends (`ops.complete_merged`).
         * **closed, unmerged** — someone refused the work; it goes to `needs_review`
@@ -5517,19 +5518,32 @@ class Daemon:
         * **open, mergeable and green** — nothing to do, and nothing written unless a
           repair episode is being closed.
 
-        THE LAST ONE IS THE BUDGET, because it is the overwhelmingly common case: one
-        `gh` call and FOUR indexed reads per pull request, no write. The four are one
+        * **open, and the delivery was never declared** — a refusal answered with
+          commits and no `jarvis wo finish`, which is orthogonal to all of the above and
+          so is asked independently (`ops.PR_UNDECLARED`, and
+          docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md).
+
+        THE GREEN ONE IS THE BUDGET, because it is the overwhelmingly common case: one
+        `gh` call and SIX indexed reads per pull request, no write. The six are one
         per question this branch has to ask the timeline — was a closure already
         reported (`pr_closure_told`), is a conflict episode open, is a checks episode
-        open, and is a "waiting for the base" note still up (`ops.record_base_health`) —
-        and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing else on
-        the path touches the database: the work-order row itself is re-read only when a
-        clear has just run, and the step's `list_work_orders` is one query for the whole
-        project however many pull requests it has.
+        open, is a "waiting for the base" note still up (`ops.record_base_health`), is
+        this delivery undeclared (`invariants.undeclared_delivery`, which reads the
+        `reviewed` events and stops there on an order that never had a refusal), and is
+        an undeclared episode open — and they are reads of `wo_events` by
+        `(wo_id, kind)`, not scans. Nothing else on the path touches the database: the
+        work-order row itself is re-read only when a clear has just run, and the step's
+        `list_work_orders` is one query for the whole project however many pull requests
+        it has.
+
+        THE FIFTH IS PAID BY EVERY POLLED PULL REQUEST, including one in a project that
+        has never had a refusal anywhere: there is no cheaper way to ask "has this order
+        ever had a refusal" than that read. It is not conditional, and the spec above
+        says so plainly rather than pretending otherwise.
 
         That sentence used to say "one indexed read" and had been false since this body
         was rewritten. It is a claim worth keeping honest rather than deleting —
-        `tests/test_pr_checks.py` counts the statements, so a fifth read fails a test
+        `tests/test_pr_checks.py` counts the statements, so a seventh read fails a test
         instead of quietly costing the fleet a query every two minutes per open pull
         request.
 
@@ -5750,6 +5764,38 @@ class Daemon:
                     # The repair branches above call this too, `record_only` — which
                     # writes the hold and merges nothing, so that rule is untouched.
                     self.auto_merge(project, store, wo, pr, base_red=base_red)
+                # AN UNDECLARED DELIVERY IS ORTHOGONAL TO THE CHAIN ABOVE, so it is an
+                # independent block and not another `elif`: it can be true over a green
+                # pull request, a red one or a conflicting one. Spec
+                # docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md
+                # §2.3.
+                #
+                # The status test is REPEATED rather than inherited from position: the
+                # `merged` and `closed_unmerged` arms return through this same bottom,
+                # and `validating` reaches it by falling through to nothing.
+                #
+                # `row` AND NOT `wo`: the head cache above is written with
+                # `update_work_order` and the local `wo` dict is never refreshed, so
+                # `undeclared_delivery` reading `wo["pr_head_oid"]` would judge the
+                # PREVIOUS head — on the first tick after a push, the very tick this
+                # exists for, it would read the already-judged head and decline. An
+                # overlay and not a re-read: a `get_work_order` here would buy a row
+                # lookup on every polled pull request in the fleet.
+                #
+                # ORDER AND MUTUAL EXCLUSION ARE BOUGHT BY AN EXISTING GUARD:
+                # `heal_pull_request` returns on `store.queued_messages`, so a pull
+                # request the chain above just nudged about declines here in the same
+                # tick — no double nudge, no attempt spent. The undeclared nudge lands
+                # on the first tick where nothing else is queued, which is the right
+                # order: a worker asked to declare a head CI is about to reject would
+                # declare the wrong commit.
+                row = {**wo, "pr_head_oid": pr.head_oid or wo.get("pr_head_oid") or ""}
+                if wo["status"] in PR_REPAIR_STATUSES \
+                        and invariants_mod.undeclared_delivery(store, row):
+                    self.heal_pull_request(project, store, row, ops.PR_UNDECLARED,
+                                           "delivered without declaring it")
+                elif wo["status"] in PR_REPAIR_STATUSES:
+                    ops.clear_pr_repair(store, row, ops.PR_UNDECLARED)
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
@@ -7708,10 +7754,11 @@ class Daemon:
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                           repair: Any, what: str, **fields: Any) -> None:
-        """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
+        """Something the OS can ask this worker to fix itself: conflicts, a red build, or
+        a delivery it never declared.
 
-        ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
-        five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        ONE function for all three, because they are one mechanism — see `ops.PrRepair`.
+        The five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
         a nudge already queued, a turn already in flight, a validation round that owns
         the work order, and a privileged-action gate that would refuse everything the
         repair needs to run. Spec §3 for why each of the first three would otherwise

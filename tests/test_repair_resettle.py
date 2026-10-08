@@ -9,6 +9,7 @@ stale-finish check reported the OS's own repair turn as a worker that gave up (3
 
 from __future__ import annotations
 
+import json
 import string
 import time
 
@@ -18,6 +19,7 @@ from jarvis import invariants, ops
 from jarvis.catalog import load_catalog
 from jarvis.daemon import Daemon
 from jarvis.invariants import (
+    PR_UNDECLARED_BLOCKER,
     STALE_FINISH_BLOCKER,
     check_project,
     parked_reason,
@@ -310,6 +312,14 @@ def test_the_repair_sources_are_the_ones_the_nudge_writes(started, project, fake
     assert invariants.PR_REPAIR_SOURCES == tuple(r.source for r in ops.PR_REPAIRS)
 
 
+def test_every_repair_has_a_give_up_blocker_to_surface_it():
+    """A repair in one tuple and not the other derives a give-up nothing can say — the
+    asymmetry the comment at invariants.py:275-286 records as already costing a work
+    order."""
+    assert (tuple(r.name for r in ops.PR_REPAIRS)
+            == tuple(n for n, _ in invariants.PR_REPAIR_BLOCKERS))
+
+
 # -- all three together -------------------------------------------------------------
 
 
@@ -453,3 +463,167 @@ def test_every_repair_nudge_still_renders(started, project, repaired, repair):
     msg = store.queued_messages(repaired["id"])[-1]["content"]
     assert "{" not in msg and "}" not in msg
     assert ops.TARGETED_TESTS_LINE in msg
+
+
+# -- an undeclared delivery heals itself --------------------------------------------
+#
+# docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md: §2c of
+# the stale-blockers spec shipped a detector and no actor, so the order sat in
+# `needs_review` for ever holding an unjudged head. The poll is the actor.
+
+JUDGED = "1" * 40
+PUSHED = "9" * 40
+
+
+def check(name: str, conclusion: str) -> dict:
+    return {"__typename": "CheckRun", "name": name, "status": "COMPLETED",
+            "conclusion": conclusion}
+
+
+RED_CHECKS = [check("unit (3.11)", "FAILURE"), check("evals", "SUCCESS")]
+GREEN_CHECKS = [check("unit (3.11)", "SUCCESS"), check("evals", "SUCCESS")]
+
+
+def delivered(store, wo_id: str) -> list[dict]:
+    """Pretend the daemon delivered whatever is queued, and hand it back."""
+    msgs = store.queued_messages(wo_id)
+    for m in msgs:
+        store.mark_message(m["id"], "delivered")
+    return msgs
+
+
+@pytest.fixture()
+def undeclared(started, project, fake_gh):
+    """wo-f812739c's shape: judged, refused, then commits nobody declared.
+
+    Built on the store rather than on a worker's turn for the reason
+    `tests/test_pr_checks.py`'s `parked` is: the poll's inputs are the refusal, the
+    judged head, the session and the status, and a real rework turn adds a settle to
+    every assertion without adding an input.
+    """
+    wo = ops.create_work_order("proj_a", "add feature X")
+    ops.finish(wo["id"], "opened a PR", pr_url=PR)
+    store = ProjectStore(project)
+    round_ = store.open_validation_round(wo_id=wo["id"], fingerprint="fp")
+    store.set_validation_head(round_["id"], JUDGED)
+    store.close_validation_round(round_["id"], "passed", "green")
+    store.add_event(wo["id"], "reviewed", {"accepted": False})
+    store.set_status(wo["id"], "needs_review", pr_url=PR, pr_head_oid=JUDGED)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    fake_gh.set_pr(PR, "OPEN", head_oid=PUSHED, checks=GREEN_CHECKS)
+    return wo
+
+
+def enable_validation(catalog_file, daemon) -> None:
+    """Turn the panel on in the catalog FILE, which is what `ops.finish` reads."""
+    data = json.loads(catalog_file.read_text())
+    data["os"]["validation"] = {"enabled": True}
+    catalog_file.write_text(json.dumps(data))
+    daemon.catalog = load_catalog(catalog_file)
+
+
+def test_an_undeclared_delivery_is_nudged_on_the_first_poll(started, project, fake_gh,
+                                                            undeclared):
+    """THE defect: the detector was true and nothing acted. The push the poll SEES this
+    tick is the one it nudges about — the overlay, not the stale `wo` row."""
+    store = ProjectStore(project)
+
+    poll(started, store)
+
+    msgs = store.queued_messages(undeclared["id"])
+    assert [m["source"] for m in msgs] == ["pr-undeclared"]
+    assert "jarvis wo finish" in msgs[0]["content"]
+    assert "--evidence" in msgs[0]["content"]
+    nudged = [e for e in store.list_events(undeclared["id"])
+              if e["kind"] == "pr_undeclared_nudged"]
+    assert len(nudged) == 1
+    assert json.loads(nudged[0]["payload"])["was"] == "needs_review"
+
+
+def test_three_attempts_then_the_undeclared_delivery_asks_the_user(started, project,
+                                                                   fake_gh, undeclared):
+    """Same cap and same give-up as the other two repairs, and the blocker is the one
+    `true_blockers` can re-derive."""
+    store = ProjectStore(project)
+
+    for n in range(invariants.PR_REPAIR_MAX_ATTEMPTS):
+        poll(started, store)
+        assert delivered(store, undeclared["id"])
+        assert store.pr_repair_attempts(undeclared["id"], "undeclared") == n + 1
+
+    poll(started, store)
+
+    row = store.get_work_order(undeclared["id"])
+    assert row["needs_attention"]
+    assert row["attention_reason"] == PR_UNDECLARED_BLOCKER
+    assert true_blockers(store, row)[0] == PR_UNDECLARED_BLOCKER
+    assert not store.queued_messages(undeclared["id"])
+    gave_up = [e for e in store.list_events(undeclared["id"])
+               if e["kind"] == "pr_undeclared_unresolved"]
+
+    poll(started, store)
+
+    assert [e for e in store.list_events(undeclared["id"])
+            if e["kind"] == "pr_undeclared_unresolved"] == gave_up
+
+
+def test_the_declaration_clears_the_episode(started, project, fake_gh, undeclared):
+    """Validation off (the shipped state): the finish parks it in the merge queue and the
+    next poll closes the episode, so no origin snapshot is left to replay."""
+    store = ProjectStore(project)
+    poll(started, store)
+    delivered(store, undeclared["id"])
+
+    assert ops.finish(undeclared["id"], "declared what I pushed",
+                      pr_url=PR)["status"] == "waiting_pr_merge"
+    poll(started, store)
+
+    row = store.get_work_order(undeclared["id"])
+    assert any(e["kind"] == "pr_undeclared_cleared"
+               for e in store.list_events(undeclared["id"]))
+    assert store.pr_repair_attempts(undeclared["id"], "undeclared") == 0
+    assert ops.pr_repair_origin(store, undeclared["id"]) is None
+    assert row["status"] == "waiting_pr_merge"
+
+
+def test_the_declared_round_is_not_clobbered_by_the_episode(started, project, fake_gh,
+                                                            undeclared, catalog_file):
+    """Validation on: the finish opens a round over the NEW head and the order parks
+    `validating` — a status this block is deliberately not bounded to, so the episode's
+    `was=needs_review` can never replace the open round (spec §2.5 step 7)."""
+    store = ProjectStore(project)
+    poll(started, store)
+    delivered(store, undeclared["id"])
+    enable_validation(catalog_file, started)
+
+    assert ops.finish(undeclared["id"], "declared what I pushed",
+                      pr_url=PR)["status"] == "validating"
+    poll(started, store)
+
+    assert store.get_work_order(undeclared["id"])["status"] == "validating"
+    assert not [e for e in store.list_events(undeclared["id"])
+                if e["kind"] == "pr_undeclared_cleared"]
+
+
+def test_a_red_pull_request_is_nudged_about_the_build_first(started, project, fake_gh,
+                                                            undeclared):
+    """One message per tick, and the right one: a worker asked to declare a head CI is
+    about to reject would declare the wrong commit. Bought by `heal_pull_request`'s
+    queued-message guard, not by an `elif` (spec §2.3)."""
+    store = ProjectStore(project)
+    fake_gh.set_pr(PR, "OPEN", head_oid=PUSHED, checks=RED_CHECKS)
+
+    poll(started, store)
+
+    assert [m["source"] for m in store.queued_messages(undeclared["id"])] == \
+        ["pr-checks"]
+    assert not [e for e in store.list_events(undeclared["id"])
+                if e["kind"] == "pr_undeclared_nudged"]
+    assert store.pr_repair_attempts(undeclared["id"], "undeclared") == 0
+
+    fake_gh.set_pr(PR, "OPEN", head_oid=PUSHED, checks=GREEN_CHECKS)
+    delivered(store, undeclared["id"])
+    poll(started, store)
+
+    assert [m["source"] for m in store.queued_messages(undeclared["id"])] == \
+        ["pr-undeclared"]

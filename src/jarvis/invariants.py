@@ -216,11 +216,20 @@ PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "fail
 #: reversed without a cycle.
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
+#: The third: the worker pushed past a refusal and never declared it, so the OS asks it
+#: to run `jarvis wo finish`. Spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1.
+#:
+#: PR_REPAIR_STATUSES IS NOT WIDENED FOR IT: `UNDECLARED_DELIVERY_STATUSES` is a strict
+#: subset, so the pairing stated above holds unedited and this blocker is derivable in
+#: every status its detector can fire in.
+PR_UNDECLARED_REPAIR = "undeclared"
 
-#: `ops.PrRepair.source` for both repairs — the `wo_messages.source` a nudge is queued
-#: under. Derived from the names above at the one site that owns them, so `parked_reason`
-#: cannot drift from what `nudge_pr_repair` writes.
-PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}")
+#: `ops.PrRepair.source` for all three repairs — the `wo_messages.source` a nudge is
+#: queued under. Derived from the names above at the one site that owns them, so
+#: `parked_reason` cannot drift from what `nudge_pr_repair` writes.
+PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}",
+                     f"pr-{PR_UNDECLARED_REPAIR}")
 
 #: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
 #: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
@@ -272,6 +281,14 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
                      "them — do not merge it as it stands")
 
+#: The third: the worker answered a refusal with commits and never declared them, and the
+#: OS could not get it to. Same obligation as the two above — no count, no sha and no
+#: elapsed time, because `ack_attention` stores it verbatim and INV-ATTENTION-REASON
+#: compares it (kn-681db233 point 3).
+PR_UNDECLARED_BLOCKER = ("the worker pushed commits answering your refusal and would not "
+                         "declare them — nothing has been judged, so decide what to do "
+                         "with the branch as it stands")
+
 #: THE TWO GIVE-UPS, PAIRED AND ORDERED, because `true_blockers` derives them from this
 #: tuple at ONE site. They were derived at two — the red build above the `needs_review`
 #: triage and the conflict below it — and after issue #224 widened both onto
@@ -284,8 +301,14 @@ PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could
 #:
 #: Conflict first: a pull request that will not merge at all is not waiting on its
 #: checks, and if a worker somehow spent both budgets that is the one to act on.
+#:
+#: UNDECLARED LAST, for the same reason conflict is first: a branch that will not merge
+#: and a branch that is red are facts about the artifact, while this is a fact about the
+#: paperwork over an artifact that may be fine (spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1).
 PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
-                      (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER))
+                      (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER),
+                      (PR_UNDECLARED_REPAIR, PR_UNDECLARED_BLOCKER))
 
 #: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the
 #: round it would open is the one that reaches `validation.max_rounds`, and that last
@@ -1249,6 +1272,9 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
     `remedies.propose(..., "nudge")`, which files a gate request, and only a live grant
     lets `remedies.apply` say anything to a worker.
 
+    SILENT WHILE THE POLL IS HEALING IT. `ops.PR_UNDECLARED` made the poll the actor for
+    this condition, so the finding is now the GIVE-UP's — see the clause below.
+
     Raised ONCE per order while the condition stands: a finding per reconcile tick would
     fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
     exists to prevent one queue along.
@@ -1258,6 +1284,20 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
     readonly = getattr(store, "readonly", False)
     for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
         if not undeclared_delivery(store, wo):
+            continue
+        # THE OS IS ON IT: the nudge is the response, and the give-up is what reaches the
+        # user. Spec
+        # docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.4.
+        #
+        # `session_id` because `Daemon.heal_pull_request` returns on its absence before
+        # anything else — an order whose worker session is gone can never be nudged, so
+        # suppressing here would be silence for ever. NOT gave-up because
+        # `pr_repair_gave_up` is "has the OS said it is stopping" and is episode-scoped,
+        # so a cleared-then-reopened case starts silent again. Attempts `== 0` is
+        # deliberately NOT a clause: the next poll tick is two minutes away, and a
+        # finding raised in that window is one the OS answers itself.
+        if wo.get("session_id") and not store.pr_repair_gave_up(wo["id"],
+                                                                PR_UNDECLARED_REPAIR):
             continue
         if any(a["kind"] == UNDECLARED_DELIVERY_KIND for a in store.alarms_of(wo["id"])):
             continue
