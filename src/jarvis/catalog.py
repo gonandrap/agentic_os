@@ -1034,6 +1034,9 @@ DEFAULT_COST_MAX_ORDERS = 500
 #: which is why every figure derived from it reports its `token_basis` counts beside it.
 DEFAULT_COST_CHARS_PER_TOKEN = 4.0
 DEFAULT_COST_TOOL_ROWS = 20
+#: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting —
+#: §2 of docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+DEFAULT_COST_SESSION_WINDOW_HOURS = 5.0
 
 
 @dataclass
@@ -1043,7 +1046,7 @@ class CostConfig:
     Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
     project naming one key keeps the OS answer for the rest. Neo's rider on
     wo-38456776 — no module constant for anything tunable — and the reason is that all
-    seven of these move: a DST shift and an Anthropic policy change both move the reset,
+    eight of these move: a DST shift and an Anthropic policy change both move the reset,
     what counts as the tail of the distribution differs by project, and the tokens-per-
     character of a model family is Anthropic's to change.
 
@@ -1058,6 +1061,7 @@ class CostConfig:
     max_orders: int = DEFAULT_COST_MAX_ORDERS
     chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
     tool_rows: int = DEFAULT_COST_TOOL_ROWS
+    session_window_hours: float = DEFAULT_COST_SESSION_WINDOW_HOURS
 
 
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
@@ -2052,6 +2056,8 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
         max_orders=int(raw.get("max_orders", base.max_orders)),
         chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
         tool_rows=int(raw.get("tool_rows", base.tool_rows)),
+        session_window_hours=float(raw.get("session_window_hours",
+                                           base.session_window_hours)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -2070,6 +2076,11 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
                    f"a divisor, and a negative one would report negative tokens")
     if cfg.tool_rows < 1:
         raise _err(f"{where}.tool_rows must be >= 1")
+    # A LENGTH, not a count: 2.5 hours is a legal belief about the grid, so the test is
+    # strictly positive (§7 of the window-selector spec).
+    if cfg.session_window_hours <= 0:
+        raise _err(f"{where}.session_window_hours must be > 0 — "
+                   f"{cfg.session_window_hours} is not a length of time")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:

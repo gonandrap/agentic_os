@@ -15,6 +15,71 @@
   </span>
 </div>
 
+{# The WINDOW switcher. Links and a GET form, no JavaScript, so the selection is in the
+   URL and is shareable by construction — and it governs EVERY number on this page, not
+   only the distribution panel. §6 of
+   docs/superpowers/specs/2026-10-07-cost-window-selector.md. #}
+{% set wk = window.offset if window.window == 'week' else 0 %}
+{% set sess = window.offset if window.window == '5h' else 0 %}
+{# The DISPLAY zone rides on every link and on the form: dropping it when the reader
+   switches window would silently change the clock they are reading in (§11). #}
+{% macro at(name, n) -%}
+/cost?window={{ name }}&offset={{ n }}&project={{ project }}&tz={{ window.zone }}
+{%- endmacro %}
+<div class="panel" style="margin-top: 10px; padding: 10px 16px;">
+  <span class="kv">week:
+    <a href="{{ at('week', wk - 1) }}">‹ previous</a>
+    · <a href="{{ at('week', 0) }}"
+        >{{ '● ' if window.source == 'usage-week' }}current</a>
+    {# `next` only below zero: a window that has not happened yet is refused (§3). #}
+    {%- if window.window == 'week' and window.offset < 0 %}
+      · <a href="{{ at('week', wk + 1) }}">next ›</a>
+    {%- endif %}
+  </span>
+  <span class="kv" style="margin-left: 22px;">5h:
+    <a href="{{ at('5h', sess - 1) }}">‹ previous</a>
+    · <a href="{{ at('5h', 0) }}"
+        >{{ '● ' if window.source == 'session-window' and not window.offset }}current</a>
+    {%- if window.window == '5h' and window.offset < 0 %}
+      · <a href="{{ at('5h', sess + 1) }}">next ›</a>
+    {%- endif %}
+  </span>
+  <form method="get" action="/cost" class="kv" style="margin-top: 8px;">
+    <input type="hidden" name="project" value="{{ project }}">
+    <input type="hidden" name="tz" value="{{ window.zone }}">
+    <input type="datetime-local" name="since" value="{{ window_inputs.since }}">
+    to <input type="datetime-local" name="until" value="{{ window_inputs.until }}">
+    <button type="submit">go</button>
+    <span class="sub">{{ window.zone }} — the clock this page is rendered and read in</span>
+  </form>
+  {# A text input and not a <select>: any IANA name must be reachable, and the datalist
+     is a shortcut rather than the whole set of zones (§11). #}
+  <form method="get" action="/cost" class="kv" style="margin-top: 6px;">
+    <input type="hidden" name="project" value="{{ project }}">
+    {%- if window.source == 'flags' %}
+    <input type="hidden" name="since" value="{{ window_inputs.since_fixed }}">
+    <input type="hidden" name="until" value="{{ window_inputs.until_fixed }}">
+    {%- else %}
+    <input type="hidden" name="window" value="{{ window.window }}">
+    <input type="hidden" name="offset" value="{{ window.offset }}">
+    {%- endif %}
+    zone: <input type="text" name="tz" list="tz-options" value="{{ window.zone }}"
+                 style="width: 200px;">
+    <datalist id="tz-options">
+      <option value="America/Los_Angeles"><option value="America/New_York">
+      <option value="UTC"><option value="Europe/London">
+      <option value="Europe/Madrid"><option value="Europe/Berlin">
+      <option value="Asia/Tokyo">
+    </datalist>
+    <button type="submit">go</button>
+    <span class="sub">display only — no boundary moves</span>
+  </form>
+  {# Both labels, above the headline, because they describe the WHOLE page. #}
+  <p class="kv mono" style="margin: 8px 0 0;">
+    {{ window.label }} · {{ window.local_label }}
+  </p>
+</div>
+
 <div class="panel" style="margin-top: 14px; padding: 14px 16px;">
   <p style="margin: 0 0 6px; font-size: 22px;" class="mono">
     ~${{ '%.2f'|format(totals.total_cost_usd) }}</p>
@@ -45,6 +110,14 @@
           themselves — eval suites, scripts
         {%- else %}nothing recorded yet{% endif %}</span></span>
   </div>
+  {# Excluded AND counted, never silently dropped: a message with no readable timestamp
+     cannot be placed in a window (§5c). Silence when zero. #}
+  {% if totals.undated_messages %}
+  <p class="kv" style="margin: 6px 0 0;">
+    {{ totals.undated_messages }} transcript messages carried no readable timestamp and
+    are excluded from this window.
+  </p>
+  {% endif %}
   {% if totals.os_calls %}
   <p class="kv" style="margin: 6px 0 0;">
     That second figure is spend no work order's transcript contains: Neo, the panel and
