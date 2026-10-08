@@ -213,6 +213,14 @@ def _write_worker_settings(project: ProjectSpec, wo: dict[str, Any]) -> Path:
         # Whether `hooks.py_nav_decision` refuses a source-navigating Bash call at a
         # `.py` path (spec 2026-10-02-serena-the-cheap-path.md §6).
         "JARVIS_PY_NAV_HOOK": project.worker.py_nav_hook,
+        # Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a
+        # SPEC, and the line bar both of its arms share (spec §5 of
+        # docs/specs/2026-10-06-navigate-specs-like-code.md). The bar is the RESOLVED
+        # number — `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES` is only its fallback —
+        # and travels as a STRING because Claude Code's settings `env` is a
+        # `Record<string,string>`, like `MCP_TOOL_TIMEOUT` below.
+        "JARVIS_DOC_NAV_HOOK": project.worker.doc_nav_hook,
+        "JARVIS_DOC_READ_LIMIT_LINES": str(project.worker.doc_read_limit_lines),
         # The `jarvis wo finish --summary` word cap the PreToolUse hook enforces
         # (spec 2026-09-19 SS5.3). Env for `JARVIS_GATES`' reason, and more sharply:
         # `hooks.finish_summary_decision` runs on EVERY Bash command, and a catalog

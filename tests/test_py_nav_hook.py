@@ -113,6 +113,58 @@ def test_the_key_ships_off(project, jarvis_home):
     assert env["JARVIS_PY_NAV_HOOK"] == "off"
 
 
+def test_a_whole_file_read_of_a_py_is_refused_and_a_limited_one_is_not(repo):
+    """§5.1 of docs/specs/2026-10-06-navigate-specs-like-code.md: THE `.py` ARM HAS NO
+    SIZE THRESHOLD. A `Read` with no `limit` is whole-file and is refused; a `Read`
+    carrying ANY `limit` passes, however large. §1(a) is why — every expensive `.py`
+    `Read` passed no `limit` (487,048 tok over 133 calls) and every cheap one passed a
+    small one (1,242,656 tok over 1,422 calls). A test that only exercises a small
+    `limit` cannot tell "no threshold" from "a threshold someone will add later"."""
+    whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"},
+             "cwd": str(repo)}
+    limited = {"tool_name": "Read",
+               "tool_input": {"file_path": "src/a.py", "limit": 4000},
+               "cwd": str(repo)}
+
+    decision = hooks.preflight_decision(whole, ON)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "mcp__plugin_serena_serena__find_symbol" in _reason(decision)
+    assert hooks.preflight_decision(limited, ON) is None
+
+
+def test_a_py_read_in_a_repo_with_no_serena_index_is_untouched(tmp_path):
+    """§5.1: the `Read` arm shares the `.serena/project.yml` precondition. The refusal
+    names `find_symbol`, so firing it where there is no symbol index strands the worker
+    with neither symbols nor a whole-file read."""
+    (tmp_path / ".jarvis").mkdir()
+    whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"},
+             "cwd": str(tmp_path)}
+
+    assert hooks.preflight_decision(whole, ON) is None
+
+    (tmp_path / ".serena").mkdir()
+    (tmp_path / ".serena" / "project.yml").write_text("project_name: a\n")
+    decision = hooks.preflight_decision(whole, ON)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_a_py_read_with_no_cwd_is_untouched():
+    """No `cwd` means no project root to resolve, so the precondition cannot be checked
+    and the arm must not fire."""
+    whole = {"tool_name": "Read", "tool_input": {"file_path": "src/a.py"}}
+
+    assert hooks.preflight_decision(whole, ON) is None
+
+
+def test_a_read_of_a_non_py_path_is_untouched(repo):
+    """The suffix set stays `PY_NAV_SUFFIXES`, so a `.md` `Read` is the doc arm's
+    business (tests/test_doc_nav_hook.py), not this one's."""
+    md = {"tool_name": "Read", "tool_input": {"file_path": "docs/specs/x.md"},
+          "cwd": str(repo)}
+
+    assert hooks.py_nav_decision(md, ON) is None
+
+
 def test_the_refusal_is_reached_before_the_jarvis_auto_allow(repo):
     """The one that matters. `is_jarvis_command_chain` waves every `jarvis …` chain
     through, so an arm after it passes its unit test and does nothing in production.
