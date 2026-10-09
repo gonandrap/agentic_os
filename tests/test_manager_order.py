@@ -31,7 +31,7 @@ import pytest
 
 from jarvis import bootstrap, bus, dispatch, invariants, ops
 from jarvis.catalog import load_catalog
-from jarvis.daemon import Daemon
+from jarvis.daemon import FEATURE_HANDOFF_EVENT, FEATURE_MANAGER_MISSING, Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
 
@@ -423,13 +423,16 @@ def test_a_manager_is_told_the_feature_and_not_the_worker_contract(boot, store):
     for c in store.feature_children(fo_id):
         assert c["id"] in prompt
     assert "will not open a pull request" in prompt
-    assert "open a PR" not in prompt
+    # `--pr `, not "open a PR": the commit/PR prose rides in
+    # `git_briefing`/--append-system-prompt (kn-dfdab9f8), not the prompt positional.
+    assert "--pr " not in prompt
     assert f"jarvis wo finish {manager['id']}" not in prompt
     assert f"--parent {fo_id}" in prompt, "the one way it can file remediation work"
 
     worker_prompt = dispatch.build_worker_prompt(child, spec)
 
-    assert "open a PR" in worker_prompt
+    # Same substitution as above (kn-dfdab9f8).
+    assert "--pr " in worker_prompt
     assert f"jarvis wo finish {child['id']}" in worker_prompt
 
 
@@ -955,3 +958,97 @@ def test_the_migration_keeps_a_flag_that_survives_the_move(boot, store, settle_t
     assert fresh["status"] == "idle", "nothing was OUT, so the migration still runs"
     assert fresh["needs_attention"], "a decision the user owes outlives the status move"
     assert fresh["attention_reason"] == "1 assumption pending your review"
+
+
+# -- 7. the handoff never returns in silence -------------------------------------------
+#
+# docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-manager-or
+# -a-hold.md §(c). `_manager_handoff` tested `manager["status"] != "idle"` and returned, so
+# a feature reopened with a `completed` manager got neither the nudge nor
+# FEATURE_MANAGER_STALLED/SILENT. fo-ac00376e sat in `executing` for 5.4 days.
+
+
+def _judged(store: ProjectStore, fo_id: str) -> None:
+    """One settled round on the feature: the precondition the handoff is called under."""
+    opened = store.open_validation_round(fo_id=fo_id, fingerprint="aaaa1111",
+                                         summary="the exporter", evidence="pytest -q")
+    store.close_validation_round(opened["id"], "rejected", "no test covers the branch")
+
+
+def _handoff_actions(store: ProjectStore, fo_id: str) -> list:
+    return [json.loads(e["payload"]).get("action")
+            for e in ops.feature_events_of_kind(store, fo_id, FEATURE_HANDOFF_EVENT)]
+
+
+def _ready_for_handoff(boot, store, *, validation: bool = True) -> tuple:
+    """An `executing` feature with a judged round and every live child `completed`."""
+    daemon = boot(validation=validation)
+    fo_id = release(daemon, "CSV export", "one")
+    for child in store.feature_children(fo_id):
+        store.set_status(child["id"], "completed")
+    _judged(store, fo_id)
+    return daemon, daemon.catalog.project("proj_a"), fo_id
+
+
+def test_the_handoff_revives_a_settled_manager_instead_of_returning(boot, store):
+    """THE SILENT RETURN. A manager that is SETTLED has not "not finished reacting" — it
+    is gone, and the branch has to put one back before it can hand anything off."""
+    daemon, spec, fo_id = _ready_for_handoff(boot, store)
+    daemon._close_feature_manager(store, fo_id)
+    assert store.manager_work_order(fo_id)["status"] == "completed"
+
+    daemon._manager_handoff(spec, store, store.get_feature_order(fo_id))
+
+    manager = store.manager_work_order(fo_id)
+    assert manager["status"] == "idle"
+    assert [e for e in store.list_events(manager["id"])
+            if e["kind"] == "manager_revived"]
+    posted = [e for e in store.envelopes(subject_fo_id=fo_id)
+              if e["to_role"] == "manager"]
+    assert posted or store.get_feature_order(fo_id)["needs_attention"], (
+        "neither the nudge nor the flag: the feature has no signal of any kind")
+
+
+def test_a_feature_with_no_manager_row_flags_once(boot, store):
+    """A manager carries the feature's whole conversation, so a fresh one would answer a
+    round of feedback briefed on nothing (spec, rejected alternative 6). Flagging names a
+    situation only the user can decide about.
+
+    THE DEDUPE RIDES ON `carrier_for_feature`, the general carrier rule, because this is
+    the one branch with no manager to hold the event: `ops.feature_event` returns False
+    for exactly this case. Not on the live `attention_reason`, which an ack NULLs — that
+    would re-notify on the very next tick, which is kn-089de524."""
+    daemon, spec, fo_id = _ready_for_handoff(boot, store, validation=False)
+    assert store.manager_work_order(fo_id) is None
+    assert store.carrier_for_feature(fo_id) is not None, "the planner carries it"
+
+    daemon._manager_handoff(spec, store, store.get_feature_order(fo_id))
+
+    fo = store.get_feature_order(fo_id)
+    assert fo["needs_attention"]
+    assert fo["attention_reason"] == FEATURE_MANAGER_MISSING.format(fo_id=fo_id)
+    assert store.manager_work_order(fo_id) is None, "flagged, never replaced"
+
+    # ...and the user acking it is not undone on the next tick.
+    store.clear_feature_attention(fo_id)
+    for _ in range(2):
+        daemon._manager_handoff(spec, store, store.get_feature_order(fo_id))
+
+    assert not store.get_feature_order(fo_id)["needs_attention"]
+
+
+def test_a_running_manager_is_still_left_alone(boot, store):
+    """The control, and the behaviour that must not change: a manager that is running has
+    not finished reacting, so the branch returns exactly as it did — nothing posted,
+    nothing flagged, and no revival."""
+    daemon, spec, fo_id = _ready_for_handoff(boot, store)
+    manager = store.manager_work_order(fo_id)
+    store.set_status(manager["id"], "running")
+
+    daemon._manager_handoff(spec, store, store.get_feature_order(fo_id))
+
+    assert store.manager_work_order(fo_id)["status"] == "running"
+    assert not [e for e in store.envelopes(subject_fo_id=fo_id)
+                if e["to_role"] == "manager"]
+    assert not store.get_feature_order(fo_id)["needs_attention"]
+    assert _handoff_actions(store, fo_id) == []

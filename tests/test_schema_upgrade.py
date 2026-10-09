@@ -220,6 +220,69 @@ def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path
         store.close()
 
 
+def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
+    """NULLABLE, unlike `prompt_chars` beside it: a sub-millisecond call rounds to 0, so
+    0 cannot mean "not measured" here. Spec §3, docs/superpowers/specs/2026-10-01-neo-observability.md.
+    """
+    path = tmp_path / "legacy-latency.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_CENTRAL_SCHEMA.read_text())
+    old.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       ts REAL NOT NULL, project TEXT NOT NULL DEFAULT '',
+                       wo_id TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL,
+                       label TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                       question_id INTEGER, ok INTEGER NOT NULL DEFAULT 1,
+                       cost_usd REAL, input INTEGER NOT NULL DEFAULT 0,
+                       cache_write INTEGER NOT NULL DEFAULT 0,
+                       cache_read INTEGER NOT NULL DEFAULT 0,
+                       output INTEGER NOT NULL DEFAULT 0, usage_json TEXT)""")
+    old.execute("INSERT INTO agent_calls (ts, kind, wo_id) VALUES (1.0, 'neo_answer',"
+                " 'wo-old')")
+    old.commit()
+    before = schema_of(old)
+    old.close()
+    assert "latency_ms" not in before["agent_calls"]
+
+    store = CentralStore(path)         # the upgrade
+    try:
+        assert "latency_ms" in schema_of(store.conn)["agent_calls"]
+        (legacy,) = store.agent_calls(wo_id="wo-old")
+        assert legacy["latency_ms"] is None, "an untimed call is absent, never 0 ms"
+        store.add_agent_call("neo_answer", wo_id="wo-new", latency_ms=1234)
+        (fresh,) = store.agent_calls(wo_id="wo-new")
+        assert fresh["latency_ms"] == 1234
+    finally:
+        store.close()
+
+
+def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path):
+    """NULL on every pre-existing row, and NOT `NOT NULL DEFAULT ''`: the column is read
+    by a GROUP BY, where an empty-string bucket reads as a ninth cause. Spec §1,
+    docs/superpowers/specs/2026-10-01-neo-observability.md — and NO backfill from prose.
+    """
+    path = tmp_path / "legacy-cause.db"
+    old = sqlite3.connect(path)
+    old.executescript(SHIPPED_NEO_SCHEMA.read_text())
+    old.execute("INSERT INTO questions (ts, project, wo_id, question, status, "
+                "answer_reason) VALUES (1.0, 'proj_a', 'wo-old', 'which?', 'escalated',"
+                " 'the user must decide: this touches production')")
+    old.commit()
+    assert "escalation_cause" not in schema_of(old)["questions"]
+    old.close()
+
+    store = NeoStore(path)              # the upgrade
+    try:
+        assert "escalation_cause" in schema_of(store.conn)["questions"]
+        (legacy,) = [q for q in store.list_questions() if q["wo_id"] == "wo-old"]
+        assert legacy["escalation_cause"] is None
+        q = store.ask("proj_a", "wo-1", "and this?")
+        store.mark(q["id"], "escalated", reason="yours", cause="high-stakes")
+        assert store.get(q["id"])["escalation_cause"] == "high-stakes"
+    finally:
+        store.close()
+
+
 def test_the_config_version_ledger_and_its_index_arrive_on_a_central_upgrade(tmp_path):
     """`schema_of` returns `{table: {columns}}`, so an index is invisible to every
     column comparison in this file — including the one directly above, which would pass

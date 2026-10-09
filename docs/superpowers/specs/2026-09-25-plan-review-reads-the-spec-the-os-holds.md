@@ -43,7 +43,7 @@ reach — one the OS neither controls, refreshes nor records.
 
 Verbatim from `jarvis neo show 658`: the `context:` field is EMPTY. The answer denied the
 plan for scope drift, arguing that
-`docs/specs/2026-09-24-order-observability.md` *"stops at §9"* and quoting §8: *"Changing
+`docs/superpowers/specs/2026-09-24-order-observability.md` *"stops at §9"* and quoting §8: *"Changing
 the bill … This feature links to it and does not touch it"*.
 
 Both statements were true of spec revision `2ed7523` (PR 735) and FALSE of `7cd0dfb`,

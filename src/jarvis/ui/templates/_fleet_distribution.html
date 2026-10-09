@@ -1,0 +1,185 @@
+{# What a TYPICAL order costs — `ops.fleet_cost`, the same payload `jarvis cost --fleet
+   --json` prints. No arithmetic here: a figure computed in a renderer is a figure the
+   other renderer disagrees with. Spec §5 of
+   docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. #}
+
+{% macro figure(value, unit) -%}
+  {%- if value is none %}—
+  {%- elif unit == 'usd' %}${{ '%.2f'|format(value) }}
+  {%- elif unit == 'tokens' %}{{ fmt_tok(value|int) }}
+  {%- elif unit == 'seconds' %}{{ '%.0f'|format(value) }}s
+  {%- elif unit == 'share' %}{{ '%.1f'|format(100 * value) }}%
+  {%- else %}{{ '%.2f'|format(value) }}{% endif -%}
+{%- endmacro %}
+
+<div class="panel" style="margin-top: 14px; padding: 14px 16px;">
+  <p style="margin: 0 0 4px;"><strong>What a typical order costs</strong></p>
+  <p class="kv mono" style="margin: 0 0 10px;">
+    {{ fleet.window.label }} ({{ 'usage week' if fleet.window.source == 'usage-week'
+       else 'your window' }}) ·
+    {{ fleet.orders.n }} order{{ 's' if fleet.orders.n != 1 }} with a turn in it ·
+    {{ fleet.orders.live }} live ·
+    {{ fleet.orders.truncated }} truncated by the window ·
+    {{ fleet.orders.excluded_no_turns }} with no turn in it
+  </p>
+
+  {% if fleet.orders.n %}
+  <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <tr class="sub">
+      <th style="text-align: left;">metric</th>
+      <th style="text-align: right;">n</th>
+      <th style="text-align: right;">avg</th>
+      <th style="text-align: right;">p90</th>
+      <th style="text-align: right;">max</th>
+      <th style="text-align: left; padding-left: 10px;">basis</th>
+    </tr>
+    {% for name, m in fleet.metrics.items() %}
+    <tr>
+      <td>{{ name }}</td>
+      <td style="text-align: right;">{{ m.n }}</td>
+      <td style="text-align: right;">{{ figure(m.avg, m.unit) }}</td>
+      <td style="text-align: right;">{{ figure(m.p90, m.unit) }}</td>
+      {# p90 and max are both NEAREST-RANK, so each is a value an order actually had and
+         the max can name it. The id is the point of the column. #}
+      <td style="text-align: right;" title="{{ m.max.wo_id if m.max else '' }}">
+        {{ figure(m.max.value if m.max else none, m.unit) }}
+        {%- if m.max %} <span class="sub">{{ m.max.wo_id }}</span>{% endif -%}
+      </td>
+      <td class="sub" style="padding-left: 10px;">
+        {{ m.provenance }}
+        {%- if m.cost_basis and m.cost_basis.transcript and m.provenance == 'envelope' %}
+          — {{ m.cost_basis.envelope }} turn{{ 's' if m.cost_basis.envelope != 1 }} from
+          the CLI's envelope; {{ m.cost_basis.transcript }} floored from a transcript and
+          reported on their own line, never averaged in
+        {%- endif %}
+        {%- if m.excluded.running %} · {{ m.excluded.running }} still running, excluded
+        {%- endif %}
+        {%- if m.excluded.unrecorded %} · {{ m.excluded.unrecorded }} unrecorded
+        {%- endif %}
+        {%- if m.excluded.no_transcript %} · {{ m.excluded.no_transcript }} with no
+          transcript left{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <div class="empty">nothing ran in that window</div>
+  {% endif %}
+
+  {% if fleet.os_cost_by_kind %}
+  <p class="kv" style="margin: 12px 0 4px;">
+    <strong>What Jarvis itself spent in that window</strong>, by kind — dearest first,
+    and the $0.00 kinds are shown so the line reconciles against
+    <span class="mono">agent_calls</span>.
+  </p>
+  <p class="kv mono" style="margin: 0;">
+    {%- for row in fleet.os_cost_by_kind %}
+      {{ '· ' if not loop.first }}{{ row.kind }} {{ row.calls }}
+      (${{ '%.2f'|format(row.cost_usd) }})
+    {%- endfor %}
+    {%- if fleet.os_unattributed.calls %}
+      · no work order {{ fleet.os_unattributed.calls }}
+      (${{ '%.2f'|format(fleet.os_unattributed.cost_usd) }})
+    {%- endif %}
+  </p>
+  {% endif %}
+
+  {# §10.7: the same table the CLI prints, off the same `fleet.tools` payload. Bash is
+     one row PER SHAPE and never also a Bash total line, rows are carried-dollars
+     descending, and at most `cost.tool_rows` of them — `row_limit` in the payload,
+     so neither renderer decides it. #}
+  {% if fleet.tools and fleet.tools.totals.calls %}
+  {% set tools = fleet.tools %}
+  {% set rows = tool_table(tools) %}
+  <p class="kv" style="margin: 14px 0 4px;">
+    <strong>What the tools cost</strong> — a result is not an API call, it is a payload
+    that rides inside every LATER call's prefix, so the column that ranks them is
+    <span class="mono">carried $</span>: {{ tools.totals.calls }} call{{
+    's' if tools.totals.calls != 1 }} ·
+    {{ fmt_tok(tools.totals.result_tokens) }} result tok ·
+    {{ fmt_tok(tools.totals.carried_tokens) }} carried tok ·
+    ${{ '%.2f'|format(tools.totals.carried_usd) }} carried.
+  </p>
+  <table class="mono" style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <tr class="sub">
+      <th style="text-align: left;">tool</th>
+      <th style="text-align: right;">calls</th>
+      <th style="text-align: right;">result tok</th>
+      <th style="text-align: right;">carried tok</th>
+      <th style="text-align: right;">carried $</th>
+      <th style="text-align: right;">main / sub</th>
+    </tr>
+    {% for label, cost in rows %}
+    {% if loop.index <= tools.row_limit %}
+    <tr>
+      <td title="{{ label }}">{{ label }}</td>
+      <td style="text-align: right;">{{ cost.calls }}</td>
+      <td style="text-align: right;">{{ fmt_tok(cost.result_tokens) }}</td>
+      <td style="text-align: right;">{{ fmt_tok(cost.carried_tokens) }}</td>
+      <td style="text-align: right;">${{ '%.2f'|format(cost.carried_usd) }}</td>
+      <td style="text-align: right;" class="sub">
+        {%- set main = cost.by_caller.main.carried_usd %}
+        {%- set sub = cost.by_caller.subagent.carried_usd %}
+        {%- if main + sub > 0 %}
+          {{ '%.0f'|format(100 * main / (main + sub)) }}% /
+          {{ '%.0f'|format(100 * sub / (main + sub)) }}%
+        {%- else %}—{% endif -%}
+      </td>
+    </tr>
+    {% endif %}
+    {% endfor %}
+  </table>
+  {% if rows|length > tools.row_limit %}
+  <p class="sub mono" style="margin: 4px 0 0;">
+    ({{ rows|length - tools.row_limit }} more
+    tool{{ 's' if rows|length - tools.row_limit != 1 }},
+    {{ fmt_tok(rows[tools.row_limit:]|map(attribute='1.result_tokens')|sum) }}
+    result tok,
+    ${{ '%.2f'|format(rows[tools.row_limit:]
+        |map(attribute='1.carried_usd')|sum) }} carried)
+  </p>
+  {% endif %}
+  <p class="sub mono" style="margin: 4px 0 0;">
+    carried $ by cause: cache read
+    ${{ '%.2f'|format(tools.totals.carried_read_usd) }} · ttl-expiry re-write
+    {# `undecided` and never $0.00: with no `cold_prefix_floor` the split is left open,
+       and printing a zero there would read as "no TTL expiry". #}
+    {%- if tools.totals.carried_rewrite_ttl_usd is none %} undecided
+    {%- else %} ${{ '%.2f'|format(tools.totals.carried_rewrite_ttl_usd) }}{% endif %} ·
+    prefix-miss re-write
+    ${{ '%.2f'|format(tools.totals.carried_rewrite_prefix_usd) }} ·
+    {{ tools.totals.token_basis.context_delta }} sizes measured exactly,
+    {{ tools.totals.token_basis.chars }} estimated from characters ·
+    {{ tools.excluded.sessions_walked }}
+    transcript{{ 's' if tools.excluded.sessions_walked != 1 }} read
+    {# What the window hid, from the same payload key the CLI prints. Silent when zero:
+       nothing was hidden, so there is nothing to disclose. #}
+    {%- if tools.excluded.outside_window %} ·
+    {{ tools.excluded.outside_window }} tool results outside the window, excluded
+    {%- endif %}
+  </p>
+  {% for note in tools.notes %}
+  <p class="sub" style="margin: 4px 0 0;">{{ note[0]|upper }}{{ note[1:] }}.</p>
+  {% endfor %}
+  {% endif %}
+
+  {% if fleet.compaction_payoff.count %}
+  <p class="kv" style="margin: 12px 0 0;">
+    <strong>Did the compactions pay off?</strong>
+    {{ fleet.compaction_payoff.count }} compaction{{ 's' if fleet.compaction_payoff.count != 1 }}
+    cost ${{ '%.2f'|format(fleet.compaction_payoff.total_cost_usd) }} and saved
+    ${{ '%.2f'|format(fleet.compaction_payoff.total_savings_usd) }} —
+    net ${{ '%.2f'|format(fleet.compaction_payoff.net_usd) }}.
+    {%- if fleet.compaction_payoff.pct_paid_off is not none %}
+      {{ fleet.compaction_payoff.pct_paid_off }}% of the
+      {{ fleet.compaction_payoff.closed }} closed ones paid for themselves.
+    {%- endif %}
+  </p>
+  {% endif %}
+
+  {# The caveats come out of the payload, never out of this file: the CLI prints the
+     same sentences from the same keys. #}
+  {% for note in fleet.notes %}
+  <p class="sub" style="margin: 6px 0 0;">{{ note[0]|upper }}{{ note[1:] }}.</p>
+  {% endfor %}
+</div>

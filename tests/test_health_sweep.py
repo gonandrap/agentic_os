@@ -1050,7 +1050,14 @@ def test_a_live_hold_buys_no_second_refusal_and_expires_by_the_clock(
     """A recorded hold nobody reads is a quieter retry storm."""
     _enable(catalog_file)
     _wo(store, status="running", description="FORCE_HEALTH_CLEAR")
-    fake_claude.health_rate_limited(reset="11:50pm (America/Los_Angeles)")
+    # THE RELATIVE FORM, and that is what makes this test deterministic. `reset_at` is
+    # resolved against the REAL clock (`claude_cli.usage_limit`), while the hold is read
+    # against this file's hand-advanced `db.now` — so a wall-clock reset time put the
+    # second sweep 4 fake minutes past a real deadline, and the assertion below failed
+    # for every run that started between 23:46 and 23:50 America/Los_Angeles. "in 5h" is
+    # longer than the 4 minutes before the second sweep and shorter than the 25 hours
+    # before the third, which is exactly what the three phases need.
+    fake_claude.health_rate_limited(reset="in 5h")
     daemon = started()
 
     _sweep(daemon, clock)
@@ -1202,3 +1209,549 @@ def test_the_tick_hands_the_health_sweep_the_reading_it_already_took(
     while daemon.health_sweeping and time.monotonic() < deadline:
         time.sleep(0.01)
     assert seen["state"] is shut
+
+
+# -- the STUCK sweep: §§1-2 of docs/superpowers/specs/2026-09-30-an-order-that-stops-
+# moving-gets-investigated.md.
+#
+# Its own section and its own fixtures rather than the sweep's above: this pass ships
+# ENABLED and runs with `supervisor.enabled` off, so `_enable` has nothing to do with it.
+# The helpers are shared with tests/test_investigation_orders.py, tests/test_fleet_pause.py
+# and tests/test_budget.py, which import them by name.
+
+HOUR = 3600.0
+
+
+def stuck_catalog(tmp_path, projects: list[dict],
+                  name: str = "stuck-catalog.json", **os_extra):
+    """A REGISTERED catalog carrying `fleet_health` at its shipped defaults.
+
+    Registration is half of it: `ops.create_investigation_order` resolves a project
+    through the central store, so a catalog file alone would leave the sweep with
+    nowhere to file (`test_cost_report.registered`'s shape).
+    """
+    from jarvis.central_store import CentralStore
+
+    path = tmp_path / name
+    path.write_text(json.dumps({
+        "os": {"defaults": {"model": "sonnet", "max_in_flight": 50},
+               "notifications": {"sinks": ["log"]}, **os_extra},
+        "projects": projects,
+    }))
+    central = CentralStore()
+    try:
+        for p in projects:
+            central.upsert_project(p["name"], p["path"], p["name"])
+        central.set_state("catalog_path", str(path))
+        central.conn.commit()
+    finally:
+        central.close()
+    return path
+
+
+@pytest.fixture()
+def stuck_os(jarvis_home, project, tmp_path):
+    cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project),
+                                    "description": "test project"}])
+    store = ProjectStore(project)
+    try:
+        yield {"daemon": Daemon(load_catalog(cat)), "store": store, "path": cat}
+    finally:
+        store.close()
+
+
+def park_order(store, wo_id: str, status: str, hours: float) -> float:
+    """Back-date one order into `status` `hours` ago, on every clock the sweep reads.
+
+    SQL rather than an API for `tests/test_active_time.py::Record`'s reason: the store
+    stamps `db.now()` and there is no back-dating call.
+    """
+    store.set_status(wo_id, status)
+    at = time.time() - hours * HOUR
+    rows = store.conn.execute("SELECT id FROM wo_state_spans WHERE order_id=? "
+                              "ORDER BY id", (wo_id,)).fetchall()
+    for n, row in enumerate(reversed(rows)):
+        store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?",
+                           (at - n, row["id"]))
+    store.conn.execute("UPDATE wo_events SET ts=? WHERE wo_id=?", (at, wo_id))
+    store.conn.execute("UPDATE work_orders SET created_at=?, updated_at=? WHERE id=?",
+                       (at, at, wo_id))
+    store.conn.commit()
+    return at
+
+
+def usage_hold(store, wo_id: str, started: float, ended: float | None = None) -> None:
+    """One usage-limit hold on this order's timeline, open unless `ended` is given."""
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    events = [("turn_paused", {"reason": PAUSE_USAGE_LIMIT, "seq": 1}, started)]
+    if ended is not None:
+        events.append(("turn_resumed", {"retried_seq": 1}, ended))
+    for kind, payload, at in events:
+        store.add_event(wo_id, kind, payload)
+        store.conn.execute(
+            "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events)", (at,))
+    store.conn.commit()
+
+
+def test_usage_limit_hold_is_not_stuck(stuck_os):
+    """§2: the account's window is the one hold that excludes an order outright."""
+    from jarvis import stuck
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    store = stuck_os["store"]
+    wo = ops.create_work_order("proj_a", "parked behind the window")
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    usage_hold(store, wo["id"], started=at)
+
+    stuck_os["daemon"].stuck_tick(None)
+
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    thresholds = {"waiting_pr_merge": 3 * HOUR}
+    judged = stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 5 * HOUR,
+                          thresholds, 4 * HOUR, excluded_cause=PAUSE_USAGE_LIMIT)
+    assert judged.excluded == PAUSE_USAGE_LIMIT and not judged.stuck
+    # The same wall clock with nothing holding it IS stuck: the hold is the whole
+    # difference, which is what stops this passing on a threshold that can never fire.
+    assert stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 0.0,
+                        thresholds, 4 * HOUR).stuck
+
+
+def test_held_seconds_do_not_count(stuck_os):
+    """§2: the threshold is on ACTIVE seconds, so a reopened window still discounts."""
+    import jarvis.catalog as catalog_mod
+    from jarvis import stuck
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    # Held for all but half the shipped threshold, so `active_seconds` is what decides.
+    threshold = catalog_mod.DEFAULT_FLEET_HEALTH_THRESHOLDS["waiting_pr_merge"] * 60
+    wo = ops.create_work_order("proj_a", "held for almost all of its five hours")
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    usage_hold(store, wo["id"], started=at, ended=at + 5 * HOUR - threshold / 2)
+
+    daemon.stuck_tick(None)
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    judged = stuck.assess("waiting_pr_merge", 5 * HOUR, 5 * HOUR, 4 * HOUR,
+                          {"waiting_pr_merge": 3 * HOUR}, 4 * HOUR)
+    assert judged.active_seconds == HOUR and not judged.stuck
+
+    # Eight hours in status, the same four held: `active_seconds` alone now passes.
+    at = park_order(store, wo["id"], "waiting_pr_merge", hours=8)
+    usage_hold(store, wo["id"], started=at, ended=at + 4 * HOUR)
+    daemon.stuck_tick(None)
+    assert len(ops.list_investigation_orders("proj_a", include_settled=True)) == 1
+
+
+def test_assess_is_pure():
+    """§1: the predicate reaches no store, no model and not even the clock."""
+    import ast
+    from pathlib import Path
+
+    from jarvis import stuck
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(Path(stuck.__file__).read_text())):
+        if isinstance(node, ast.Import):
+            names.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add((node.module or "").lstrip(".").split(".")[0])
+            names.update(a.name for a in node.names)
+    forbidden = {"ops", "daemon", "claude_cli", "time"}
+    assert not names & forbidden, sorted(names & forbidden)
+    assert not [n for n in names if n.endswith("_store")], sorted(names)
+
+
+def test_a_projects_own_cadence_is_honoured(jarvis_home, project, tmp_path):
+    """Neo 1086 OVERRIDES §5: the cadence is a per-project catalog config. Neo 1148 set
+    the default to 60 ticks — 5 minutes at the default 5s poll interval, because a
+    30-minute cadence cannot see a 5-minute idle."""
+    import jarvis.catalog as catalog_mod
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+
+    assert catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS == 60
+    cat = load_catalog(stuck_catalog(
+        tmp_path, [{"name": "proj_a", "path": str(project),
+                    "fleet_health": {"sweep_every_ticks": 12}}],
+        name="stuck-cadence.json"))
+    assert cat.os.fleet_health.sweep_every_ticks == \
+        catalog_mod.DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+    cfg = cat.projects[0].fleet_health
+    assert cfg.sweep_every_ticks == 12
+    assert cfg.cooldown_minutes == catalog_mod.DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+
+    daemon = Daemon(cat)
+    assert daemon.stuck_cadence() == 12
+
+    def due(tick: int) -> list:
+        daemon.tick_count = tick
+        return [p.name for p in daemon.stuck_due_projects()]
+
+    assert due(1) == ["proj_a"]
+    assert due(2) == [], "not due again until its own 12 ticks have passed"
+    assert due(13) == ["proj_a"]
+
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    finally:
+        store.close()
+    daemon.stuck_tick(None)
+    central = CentralStore()
+    try:
+        assert db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})["scanned"] == 1
+    finally:
+        central.close()
+
+
+# -- the free re-assertion: a stale look at a unit the OS can already explain -----------
+#
+# docs/superpowers/specs/2026-10-02-the-health-sweep-must-not-pay-to-restate-a-fingerprint.md
+# The spend decision reads ONE more bit — is there a re-derivable reason this unit is
+# still — and a restatement of a judgement already on the record is written for free.
+
+
+def _blocked(store, title="the blocked one", **fields) -> str:
+    """A work order whose stillness the OS can already explain: an unmet dependency.
+
+    The dependency is `injected`, so it is UNGOVERNED and never a sweep candidate of its
+    own — every call count below is therefore about the blocked order alone.
+    """
+    dep = store.create_work_order("the thing it waits on", origin="injected",
+                                  status="running")["id"]
+    return _wo(store, title, status="pending", depends_on=[dep], **fields)
+
+
+def test_a_stale_unchanged_finding_on_a_blocked_order_is_re_asserted_for_free(
+        started, catalog_file, fake_claude, store, clock):
+    """THE DEFECT ITSELF: the second look learns nothing the fingerprint did not already
+    say, and the prior judgement is carried forward rather than bought again."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == 1
+    (paid,) = _reviews(store, subject_id=wo_id)
+    assert paid["outcome"] == "findings"
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 1, "the restatement must be free"
+    paid, free = _reviews(store, subject_id=wo_id)
+    assert free["trigger"] == "re-assert"
+    assert free["fingerprint"] == paid["fingerprint"]
+    assert [free[k] for k in ("outcome", "findings", "detail")] == \
+           [paid[k] for k in ("outcome", "findings", "detail")], (
+        "a re-assertion that records nothing is a silent drop")
+
+
+def test_a_prior_clear_still_buys_the_stale_call(
+        started, catalog_file, fake_claude, store, clock):
+    """A clear verdict found nothing, so there is no prior judgement to copy forward —
+    a free row there would be the OS inventing one."""
+    _enable(catalog_file)
+    wo_id = _blocked(store, description="FORCE_HEALTH_CLEAR")
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_an_unexplained_still_order_still_buys_the_stale_call(
+        started, catalog_file, fake_claude, store, clock):
+    """The regression that would hide a genuinely unexplained stall: no dependency, no
+    hold, nothing the OS can derive — so the stillness IS the news and is paid for."""
+    _enable(catalog_file)
+    wo_id = _wo(store, status="running")
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_a_changed_fingerprint_always_buys_a_call(
+        started, catalog_file, fake_claude, store, clock):
+    """The gate sits INSIDE the stale clause: a unit that moved is judged afresh however
+    well the OS can explain it."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    store.add_event(wo_id, "note", {"n": 1})
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "changed"]
+
+
+def test_a_re_assertion_raises_no_alarm_and_puts_no_flag_back(
+        started, catalog_file, fake_claude, store, clock):
+    """§6.3's wallpaper failure, arriving through the free path: the flag must not come
+    straight back, and the dedupe memory must say exactly what it said before."""
+    _enable(catalog_file)
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    findings_before = _findings(store)
+    fp = _reviews(store, subject_id=wo_id)[0]["fingerprint"]
+    reported_before = store.probes_reported_at("work_order", wo_id, fp)
+    store.clear_attention(wo_id)
+    finding_events = len(store.events_of_kind(wo_id, "health_finding"))
+    reviewed_events = len(store.events_of_kind(wo_id, "health_reviewed"))
+
+    _sweep(daemon, clock)
+
+    # BY ID, never by row: the cost-review drain claims and decides an alarm of its own
+    # accord, so the row moves for reasons that have nothing to do with the sweep.
+    assert [a["id"] for a in _findings(store)] == [a["id"] for a in findings_before]
+    assert store.get_work_order(wo_id)["needs_attention"] == 0
+    assert len(store.events_of_kind(wo_id, "health_finding")) == finding_events
+    assert len(store.events_of_kind(wo_id, "health_reviewed")) == reviewed_events, (
+        "no judge looked, so nothing says one did")
+    assert store.probes_reported_at("work_order", wo_id, fp) == reported_before
+
+
+def test_each_blocker_id_comes_from_its_canonical_source(store, monkeypatch):
+    """EVERY ID IS REUSED, NOT RE-DERIVED — which is how two surfaces come to disagree
+    about one order. Each case drives the canonical source and asserts the id follows it.
+    """
+    from jarvis import db as db_mod, health, invariants, ops as ops_mod, worker_session
+
+    cfg = catalog.SupervisorConfig()
+
+    def subject(wo_id):
+        return {"kind": "work_order", "row": store.get_work_order(wo_id)}
+
+    plain = _wo(store, "plain", status="running")
+    assert health.blocker(store, subject(plain), cfg) is None, (
+        "a running order with nothing known about it is unexplained and stays paid")
+
+    # 1. `user` — `invariants.true_blockers`, and first whatever else is also true.
+    with monkeypatch.context() as m:
+        m.setattr(invariants, "true_blockers",
+                  lambda s, wo, now=None: ["3 assumptions pending your review"])
+        assert health.blocker(store, subject(plain), cfg) == "user"
+
+    # 2. `dependency` — `ops.blocked_by`, which `true_blockers` is silent on by design.
+    blocked = _blocked(store)
+    assert health.blocker(store, subject(blocked), cfg) == "dependency"
+    with monkeypatch.context() as m:
+        m.setattr(ops_mod, "blocked_by", lambda s, wo: [])
+        assert health.blocker(store, subject(blocked), cfg) is None
+
+    # 3. `pull-request` — the row's own two columns, and no network.
+    parked = _wo(store, "parked", status="waiting_pr_merge")
+    store.update_work_order(parked, pr_url="https://example.invalid/pr/1")
+    assert health.blocker(store, subject(parked), cfg) == "pull-request"
+    store.update_work_order(parked, pr_url="")
+    assert health.blocker(store, subject(parked), cfg) is None
+
+    # 4. ONE ID PER TRANSPORT CAUSE, each an OPEN `holds.Hold` of its own cause (Neo
+    # q1241). Collapsed under `usage-limit` they could not be narrowed apart.
+    from jarvis import holds
+
+    assert set(health.transport_blockers().values()) == holds.TRANSPORT, (
+        "a fourth transport cause fails here, not as an unexplained stall")
+    for cause, expected in ((worker_session.PAUSE_USAGE_LIMIT, "usage-limit"),
+                            (worker_session.PAUSE_TRANSIENT, "api-outage"),
+                            (worker_session.PAUSE_AUTH, "expired-login")):
+        held = _wo(store, f"held by {cause}", status="running")
+        with monkeypatch.context() as m:
+            m.setattr(db_mod, "now", lambda: time.time() - 600)
+            store.add_event(held, "turn_paused", {"seq": 1, "reason": cause})
+        assert health.blocker(store, subject(held), cfg) == expected
+        narrowed = catalog.SupervisorConfig(health_reassert_blockers=("usage-limit",))
+        assert health.blocker(store, subject(held), narrowed) == (
+            expected if expected == "usage-limit" else None), (
+            "a catalog naming only the usage limit has said nothing about the others")
+
+    # 5. `assumptions` — `pstore.pending_assumptions`, where rule 1 declined it.
+    asking = _wo(store, "asking", status="running")
+    store.add_assumption(asking, "I assumed the console is the surface")
+    with monkeypatch.context() as m:
+        m.setattr(invariants, "true_blockers", lambda s, wo, now=None: [])
+        assert health.blocker(store, subject(asking), cfg) == "assumptions"
+
+
+def test_a_narrowed_blocker_set_buys_the_stale_call_again(
+        started, catalog_file, fake_claude, store, clock):
+    """The set is the CATALOG'S to narrow: a project that does not count a dependency as
+    an explanation pays for the stale look on a blocked order."""
+    from jarvis import health
+
+    _enable(catalog_file,
+            health_reassert_blockers=[b for b in health.BLOCKERS if b != "dependency"])
+    wo_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_narrowing_to_the_usage_limit_still_pays_for_an_expired_login(
+        started, catalog_file, fake_claude, store, clock):
+    """WHY THE TRANSPORT BLOCKER IS THREE IDS (Neo q1241): a project that counts a spent
+    window as an explanation has said nothing about an expired sign-in, and under one
+    collapsed id that order was re-asserted free."""
+    from jarvis import health, worker_session
+
+    _enable(catalog_file, health_reassert_blockers=["usage-limit"])
+    wo_id = _wo(store, "signed out", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(wo_id, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_AUTH})
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in _reviews(store, subject_id=wo_id)] == \
+           ["first-look", "stale"]
+
+    # The other half of the narrowing: the cause the catalog DID name goes free.
+    spent = _wo(store, "window spent", status="running")
+    with _MovedNow(db.now() - 600):
+        store.add_event(spent, "turn_paused",
+                        {"seq": 1, "reason": worker_session.PAUSE_USAGE_LIMIT})
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+    assert [r["trigger"] for r in _reviews(store, subject_id=spent)] == \
+           ["first-look", health.REASSERT]
+
+
+def test_a_re_assertion_does_not_spend_a_paid_slot(
+        started, catalog_file, fake_claude, store, clock):
+    """The cap bounds SPEND. A mostly-parked project that spent its cap on free rows
+    would starve the paid looks the cap's rotation exists to guarantee."""
+    _enable(catalog_file, health_max_units_per_tick=1)
+    blocked_id = _blocked(store)
+    daemon = started()
+
+    _sweep(daemon, clock)   # the blocked order alone: one paid first look
+    assert len(_health_calls(fake_claude)) == 1
+    moving_id = _wo(store, "the moving one", status="running")
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2, "one call: the unit nothing explains"
+    assert _reviews(store, subject_id=blocked_id)[-1]["trigger"] == "re-assert"
+    assert _reviews(store, subject_id=moving_id)[-1]["trigger"] == "first-look"
+
+
+def _blocked_feature(store, children: list[dict]) -> str:
+    """A feature and its children, each entry the `create_work_order` fields for one.
+
+    The children are `injected` for `_blocked`'s reason: ungoverned, so no child is a
+    sweep candidate in its own right and every count is about the feature.
+    """
+    fo_id = _feature(store)
+    for i, child in enumerate(children):
+        store.create_work_order(f"child {i}", parent_id=fo_id, origin="injected",
+                                **child)
+    return fo_id
+
+
+def test_a_feature_whose_every_child_is_blocked_is_re_asserted_for_free(
+        started, catalog_file, fake_claude, store, clock):
+    """fo-ac00376e's triple repeat of "Nothing is moving": every non-settled child has a
+    re-derivable blocker, which is the only thing that explains a feature's stillness."""
+    _enable(catalog_file)
+    dep = store.create_work_order("the thing they wait on", origin="injected",
+                                  status="running")["id"]
+    fo_id = _blocked_feature(store, [{"status": "pending", "depends_on": [dep]},
+                                     {"status": "completed"}])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    assert len(_health_calls(fake_claude)) == 1
+
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 1
+    reviews = _reviews(store, kind="feature_order", subject_id=fo_id)
+    assert [r["trigger"] for r in reviews] == ["first-look", "re-assert"]
+    assert reviews[1]["outcome"] == reviews[0]["outcome"]
+
+
+@pytest.mark.parametrize("child", [{"status": "running"},      # one child is moving
+                                   {"status": "pending"}])     # one is unexplained
+def test_a_feature_with_a_running_or_unexplained_child_still_buys_the_call(
+        started, catalog_file, fake_claude, store, clock, child):
+    """IT FAILS CLOSED: one child moving, or one nobody can explain, and the feature's
+    stillness is not accounted for — so it is paid for."""
+    _enable(catalog_file)
+    dep = store.create_work_order("the thing it waits on", origin="injected",
+                                  status="running")["id"]
+    fo_id = _blocked_feature(store, [{"status": "pending", "depends_on": [dep]}, child])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in
+            _reviews(store, kind="feature_order", subject_id=fo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_a_feature_with_no_children_at_all_stays_paid(
+        started, catalog_file, fake_claude, store, clock):
+    """Nothing is derived about a feature with nothing under it, so there is nothing to
+    re-assert."""
+    _enable(catalog_file)
+    fo_id = _blocked_feature(store, [])
+    daemon = started()
+
+    _sweep(daemon, clock)
+    _sweep(daemon, clock)
+
+    assert len(_health_calls(fake_claude)) == 2
+    assert [r["trigger"] for r in
+            _reviews(store, kind="feature_order", subject_id=fo_id)] == \
+           ["first-look", "stale"]
+
+
+def test_an_all_parked_project_keeps_the_os_sweep_invariant_green(
+        started, catalog_file, fake_claude, store, clock, monkeypatch):
+    """(d) IS DECIDED BEHAVIOUR: a re-assertion carries a copied `outcome`, so it counts
+    as a judgement and an all-parked project is not dark. The transport canary still
+    fires on a run of failures, which is what keeps that decision safe."""
+    from pathlib import Path
+
+    from jarvis import invariants, schedule
+
+    _enable(catalog_file)
+    _blocked(store)
+    daemon = started()
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(store.project_path) / "src" / "jarvis" / "schedule.py"))
+
+    _sweep(daemon, clock)
+    clock.advance(invariants.OS_HEALTH_SWEEP_DARK_MINUTES + STEP_MINUTES)
+    _sweep(daemon, clock)
+
+    assert [r["trigger"] for r in store.recent_health_reviews(1)] == ["re-assert"]
+    assert list(invariants.check_os_health_sweep_alive(store)) == [], (
+        "a free row is a judgement for this query, by design")
+
+    _force_failures(store, invariants.HEALTH_SWEEP_FAILURE_RUN)
+    assert list(invariants.check_health_sweep_produces_judgements(store)), (
+        "the transport canary must still see a broken sweep")

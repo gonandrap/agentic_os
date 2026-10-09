@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}Stuck — Jarvis{% endblock %}
+{% block content %}
+
+{# `alarms.html`'s split, for its reason: the top is the queue that is an ask, the bottom
+   is the record and is MEANT to be long. Merged, the record buries the asks. §7 of
+   docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md. #}
+
+<p class="kv" style="margin-top:18px">
+  Every open order judged on <em>time in state</em>, most overdue first. No model call
+  decides any of this — the sweep is arithmetic over rows the OS already writes, and the
+  spend it authorises is the investigation it opens. Seconds the account's usage window
+  held do not count.
+  <span class="counts">({{ over|length }} past its threshold ·
+  {{ rest|length }} on the record)</span>
+</p>
+
+<h2>Past its threshold</h2>
+<div class="panel">
+  {% for r in over %}
+  <div class="msg" id="stuck-{{ r.id }}">
+    <div class="who tone-warn">{{ r.project }} ·
+      <a href="/wo/{{ r.project }}/{{ r.id }}" class="mono">{{ r.id }}</a> ·
+      {{ r.status_label }} · {{ fmt_dur(r.seconds_in_status) }} in status</div>
+    <div style="margin:6px 0">{{ r.title }}</div>
+    <div class="sub">{{ r.reason }}</div>
+    <div class="sub">what the record says blocks it: {{ r.blocker }}</div>
+    {% if r.investigation %}
+    <div class="sub"><a href="{{ order_path(r.project, r.investigation.id) }}"
+      class="mono">{{ r.investigation.id }}</a> · {{ r.investigation.status }}
+      {%- if r.investigation.classification %} ·
+      {{ r.investigation.classification }}{% endif %}</div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="empty">nothing is stuck — every open order is inside its threshold</div>
+  {% endfor %}
+</div>
+
+<h2>On the record</h2>
+<div class="panel">
+  <p class="kv">
+    Every open order and the clock it is judged on. An order held by the account's usage
+    window, a fleet pause or the reopen ramp says so under <em>excluded</em>: nothing is
+    wrong there and an investigation would buy a session to be told so.
+  </p>
+  <table>
+    <tr><th>project / order</th><th>status</th><th>in status</th><th>since activity</th>
+      <th>threshold</th><th>clock</th><th>excluded</th><th>investigation</th></tr>
+    {% for r in rest %}
+    <tr>
+      <td class="mono" style="white-space:nowrap">{{ r.project }}<br>
+        <a href="/wo/{{ r.project }}/{{ r.id }}">{{ r.id }}</a></td>
+      <td class="mono">{{ r.status_label }}<div class="sub">{{ r.title }}</div></td>
+      <td class="mono">{{ fmt_dur(r.seconds_in_status) }}</td>
+      <td class="mono">{{ fmt_dur(r.seconds_since_activity) }}</td>
+      <td class="mono">{{ fmt_dur(r.threshold_seconds) }}</td>
+      <td class="mono">{{ r.clock }}</td>
+      <td class="mono">{{ r.excluded or '—' }}</td>
+      <td class="mono">{% if r.investigation %}<a
+        href="{{ order_path(r.project, r.investigation.id) }}">{{ r.investigation.id }}</a>
+        {{ r.investigation.classification }}{% else %}—{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">no project has `fleet_health` enabled</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+{# THE EVOLUTION VIEW IS LINKED, NOT BUILT: that page is fo-69ba1cc4's and did not land,
+   so this is TEXT and gains an href the day the route exists. No dead link. #}
+<p class="sub">the gap classes behind these:
+  <span class="mono">jarvis rules list</span> ·
+  one order in full: <span class="mono">jarvis stuck &lt;project&gt;</span></p>
+
+{% endblock %}

@@ -197,6 +197,21 @@ def _readable_automerge(detail: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def _readable_harvest(detail: dict[str, Any]) -> dict[str, Any]:
+    """The harvest collapsed to its one line, for HUMAN output.
+
+    `_readable_automerge`'s trick and its disappearing key: `--json` keeps the payload,
+    where the checkpoint sha and the branch are read from, while a person gets
+    `harvest: 3 commits on `wo-2ae…`, 1 uncommitted file checkpointed as 9f8e7d6` — what
+    the OS saved, in the words the dashboard uses above the retry button (spec §5).
+    """
+    row = dict(detail)
+    state = row.pop("harvest", None)
+    if state:
+        row["harvest"] = state["line"]
+    return row
+
+
 def _readable_autoreview(detail: dict[str, Any]) -> dict[str, Any]:
     """The automatic assumption review collapsed to its one line, and each assumption to
     `ops.assumption_line`, for HUMAN output.
@@ -291,19 +306,49 @@ def time_in_state_lines(payload: dict[str, Any]) -> list[str]:
     # read as a measurement (spec §3, Neo's ruling).
     if payload.get("approximate"):
         lines.append(f"({ops.FO_APPROXIMATE_NOTE})")
+    held_now = payload.get("held_now")
     for total in payload.get("totals") or []:
         entries = total["entries"]
         word = "entry" if entries == 1 else "entries"
+        held = float(total.get("held_seconds") or 0.0)
+        current = bool(total["status"]) and total["status"] == payload.get(
+            "current_status")
+        # The HEADLINE is active and wall is never deleted (Neo 1130, spec §3); a status
+        # never held renders byte for byte as it did before holds were read at all.
+        duration = total["active_human"] if held else total["seconds_human"]
         line = (f"{STATUS_ICON.get(total['status'], '•')} {total['status']:<18} "
-                f"{total['seconds_human']:>7}  {entries} {word:<8} "
+                f"{duration:>7}  {entries} {word:<8} "
                 f"{total['share'] * 100:>3.0f}%")
-        if total["status"] and total["status"] == payload.get("current_status"):
+        if held and not (current and held_now):
+            breakdown = ((payload.get("current_status_held_by") if current
+                          else total.get("held_by")) or [])
+            line += (f"   ({total['held_human']} held by {_held_phrase(breakdown)}, "
+                     f"{total['seconds_human']} wall)")
+        if current and held_now:
+            line += (f"   ← HELD {held_now['seconds_human']} by {held_now['phrase']}, "
+                     f"running {payload['current_status_active_age_human']} of "
+                     f"{payload['current_status_age_human']}")
+        elif current:
             idle = payload.get("last_activity_age_human")
             since = (f"nothing since {idle} ago" if idle
                      else "nothing on the record at all")
             line += f"   ← now, {payload['current_status_age_human']}, {since}"
         lines.append(line)
     return lines
+
+
+def _held_phrase(held_by: list[dict[str, Any]]) -> str:
+    """"a fleet usage limit and 2 others" — `holds.Hold.phrase` verbatim, biggest first.
+
+    Spec §3: the OS's own sentence for the cause, never a second spelling of it.
+    """
+    if not held_by:
+        return "a hold"
+    others = len(held_by) - 1
+    if not others:
+        return str(held_by[0]["phrase"])
+    return (f"{held_by[0]['phrase']} and {others} "
+            f"{'other' if others == 1 else 'others'}")
 
 
 def _readable_time_in_state(detail: dict[str, Any]) -> dict[str, Any]:
@@ -494,6 +539,33 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: the whole fleet)")
     sp.add_argument("--limit", type=int, default=50,
                     help="work orders per project to measure (default: 50)")
+    # The DISTRIBUTION, beside the listing rather than instead of it: what a typical
+    # order costs, over one usage week. Spec §5 of
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    sp.add_argument("--fleet", action="store_true",
+                    help="what a TYPICAL order costs: n, avg, p90 and max per metric "
+                         "over a window, plus what Jarvis itself spent by kind and "
+                         "whether the compactions paid off")
+    sp.add_argument("--since", type=_when,
+                    help="start of the window, a date or ISO datetime "
+                         "(default: this Claude usage week; naive = UTC)")
+    sp.add_argument("--until", type=_when, help="end of the window, exclusive")
+    # The window SELECTOR, beside the raw range rather than instead of it — §6 of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    sp.add_argument("--window", choices=["week", "5h"],
+                    help="which window to report over: the Claude usage week, or one 5h "
+                         "SLICE of it anchored on the weekly reset (nothing records "
+                         "Claude's own session boundary, so a 5h window is not a claim "
+                         "about its session accounting)")
+    sp.add_argument("--offset", type=int, default=0,
+                    help="step back whole windows: 0 is the current one, -1 the "
+                         "previous (--fleet only; 0 or negative)")
+    # §11 of the same spec: DISPLAY only, so the CLI label and the page label agree.
+    sp.add_argument("--tz", help="IANA time zone to DISPLAY the window in (default: the "
+                                 "catalog's cost.week_reset_zone). No boundary moves, "
+                                 "and --since/--until are still read as UTC when naive")
+    sp.add_argument("--project", help="one project instead of the whole fleet "
+                                      "(--fleet only)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
@@ -519,6 +591,25 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser(
+        "navigation",
+        help="how the fleet NAVIGATED code — symbol calls against shell reads, by "
+             "side, as shares of read volume",
+    )
+    sp.add_argument("target", nargs="?",
+                    help="a work-order id, a feature-order id, or a project name")
+    sp.add_argument("--project")
+    # OPT-IN, because the wide walk is 2.7G and 11,889 lead transcripts: a no-argument
+    # run is refused rather than answered expensively (§2.1).
+    sp.add_argument("--fleet", action="store_true",
+                    help="every project's transcripts, within --days")
+    sp.add_argument("--days", type=int, metavar="N",
+                    help="only transcripts modified in the last N days, for a project "
+                         "or --fleet; N must be positive (default: the project's "
+                         "os.navigation.window_days, "
+                         f"{catalog.DEFAULT_NAVIGATION_WINDOW_DAYS})")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser(
         "watch",
         help="what a work order's turn is doing RIGHT NOW: the tool in flight and how "
              "long it has been running — or, when nothing has been written, since when",
@@ -541,6 +632,49 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--kind", action="append", choices=list(SEARCH_KINDS),
                     help="restrict to one kind; repeatable")
     sp.add_argument("--limit", type=int, default=30, help="hits to show (default: 30)")
+    sp.add_argument("--json", action="store_true")
+
+    # §4.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: these three spellings are
+    # a contract two sibling sections quote verbatim.
+    spec_p = sub.add_parser(
+        "spec",
+        help="read a markdown document the way code is read — list its sections, open "
+             "one, or find which section says a thing",
+    ).add_subparsers(dest="spec_cmd", required=True)
+
+    sp = spec_p.add_parser("toc", help="every heading of one document, with an ESTIMATE "
+                                       "of each section's size")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser("section", help="one section of one document, by number or by "
+                                           "heading substring")
+    sp.add_argument("path", help="a path inside the project (a relative one is read "
+                                 "from the current directory, as the shell reads it)")
+    sp.add_argument("which", help="a section number (`4`, `4.2`) or part of its heading")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--json", action="store_true")
+
+    sp = spec_p.add_parser(
+        "search",
+        help="which SECTIONS of this project's documents contain every word — the next "
+             "step is `jarvis spec section`, and each hit prints it",
+        description="Every whitespace-separated word must appear in a line, "
+                    "case-insensitively, and the SECTION containing it is reported once. "
+                    "One project at a time: there is no --all and no comma-separated "
+                    "list. KEEP SHELL METACHARACTERS OUT OF THE QUERY: a command "
+                    "containing | ; ` $ < or > is refused by "
+                    "hooks.is_jarvis_command_chain, so it stops being auto-allowed and "
+                    "prompts instead — which stalls a background worker.",
+    )
+    sp.add_argument("words", help="the words to look for, quoted")
+    sp.add_argument("--project", help="one project, by name (default: the one owning the "
+                                      "current directory)")
+    sp.add_argument("--limit", type=int, default=40, help="hits to show (default: 40)")
     sp.add_argument("--json", action="store_true")
 
     # `jarvis issues [project]` keeps working verbatim: `_normalise_issues` inserts the
@@ -602,6 +736,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--project")
     sp.add_argument("--json", action="store_true")
 
+    # §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    # investigated.md — `cmd_alarms` in shape, over `ops.stuck_report`.
+    sp = sub.add_parser(
+        "stuck", help="open orders judged on time in status, most overdue first")
+    sp.add_argument("project", nargs="?", help="one project (default: the whole fleet)")
+    sp.add_argument("--limit", type=int, default=50, help="rows to show (default: 50)")
+    sp.add_argument("--json", action="store_true")
+
     # the supervisor's own settings, as opposed to what it decided —
     # docs/superpowers/specs/2026-09-02-supervisor-health-and-healing.md §2.
     sup = sub.add_parser(
@@ -645,7 +787,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--budget", metavar="USD", help="cap this order's spend at N dollars. It governs the WHOLE bill `jarvis cost` reports — the worker's turns plus what Jarvis spends on it (Neo, the validation panel) — and every turn is launched with no more than what is left. At the cap the order stops in `budget_exhausted` and asks you; raise it with `jarvis wo budget` and it carries on in the same session. Omit for no ceiling, which is the default and what the OS has always done")
 
     c.add_argument("--observability", choices=["off", "normal", "full"],
-                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). `off` stops only the per-turn context ledger — `jarvis watch`, `jarvis inspect`, `jarvis wo why` and the debug page read files that already exist and are never switched off. The full autopsy of the order — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level, so this flag governs only the per-turn context ledger")
+                   help="how much debug data Jarvis COLLECTS for this order (default: the project's setting, normally `normal`). The three levels: "
+                        "`off` — no per-turn context ledger and no sealed autopsy. It does NOT disable `jarvis watch`, `jarvis inspect`, `jarvis wo why` or the debug page: those read files that already exist, so the autopsy READING — every turn, its tools, its token classes and its context total, delta, peak and composition — is shown for every order at every level. What `off` stops is the autopsy being SEALED, so that reading survives only as long as Claude Code keeps the transcript. "
+                        "`normal` — the default: the per-turn context ledger, and the autopsy sealed onto the order when it settles. "
+                        "`full` — that, plus the detail a `full` seal retains: verbatim tool parameters and nested subagent anatomies")
 
     b = wo.add_parser("budget", help="show, set, raise or clear a work order's dollar "
                                      "ceiling — and resume it if it stopped at one")
@@ -679,7 +824,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true",
                    help="include plumbing entries (message delivery, session hooks)")
 
-    m = wo.add_parser("send", help="send feedback to the worker handling a work order")
+    # §9.2 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    m = wo.add_parser("send", help="send feedback to the worker handling a work order — "
+                                   "on a failed order this also revives the session; "
+                                   "`wo retry` is the named form")
     m.add_argument("wo_id")
     m.add_argument("message")
     m.add_argument("--project")
@@ -785,6 +933,16 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument("--force", action="store_true",
                     help="send the nudge even when nothing is stuck — it costs a full "
                          "re-send of the worker's conversation")
+
+    # §9.1 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    rt = wo.add_parser("retry", help="relaunch a FAILED work order in its own session — "
+                                     "the named form of `wo send`'s revive. Nothing "
+                                     "automatic: a turn that died with no result is "
+                                     "never replayed by the OS")
+    rt.add_argument("wo_id")
+    rt.add_argument("--message", help="what to tell the worker; omitted sends the OS's "
+                                      "own relaunch note, unattributed")
+    rt.add_argument("--project")
 
     wy = wo.add_parser("why", help="why is this order not moving: what it waits for, "
                                    "what has held it, what the OS spent on it, and the "
@@ -1022,6 +1180,14 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("inv_id")
     v.add_argument("--project")
 
+    v = inv.add_parser("budget", help="show, set, raise or clear an investigation's "
+                                      "family budget")
+    v.add_argument("inv_id")
+    v.add_argument("amount", nargs="?", metavar="USD",
+                   help="the new ceiling, in dollars. Omit to just show it")
+    v.add_argument("--clear", action="store_true", help="remove the ceiling")
+    v.add_argument("--project")
+
     v = inv.add_parser("verdict", help="(investigators) submit the verdict — the "
                                        "investigator's terminal action, and what settles "
                                        "the order")
@@ -1121,7 +1287,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--project")
 
     # rules (the self-healing detector/remedy registry) ----------------------------------
-    # docs/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. A TOP-LEVEL family and not
     # a verb under `jarvis gate`: that family answers "what counts as privileged", this
     # one answers "what does the OS recognise as its own recurring gap", and one verb
     # meaning two registries is how `jarvis gate rules` stops being readable. The
@@ -1284,7 +1450,8 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--topic")
     k.add_argument("--full", action="store_true", help="full text instead of headlines")
     k.add_argument("--limit", type=int, default=100)
-    k = kn.add_parser("search", help="full text of entries matching a term")
+    k = kn.add_parser("search", help="which entries match a term: headline, id, one "
+                                     "matching line (`learn show` for a body)")
     k.add_argument("term")
     k.add_argument("--project", help="this project + global entries")
     k.add_argument("--topic")
@@ -1343,6 +1510,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also show learnings scoped to this seat — a panel seat, or "
                         "`supervisor` for what your alarm reviews have taught the "
                         "supervisor (global rows alone are shown without it)")
+    n.add_argument("--json", action="store_true", help="machine-readable output")
+    n = ne.add_parser("stats", help="Neo's volume, outcomes, escalation causes, spend "
+                                    "and latency")
+    n.add_argument("--project", default="")
+    n.add_argument("--days", type=int, default=None,
+                   help="window in days; omit for all time")
     n.add_argument("--json", action="store_true", help="machine-readable output")
     n = ne.add_parser("export", help="Neo's whole ledger as one document: every "
                                      "question, learning and panel opinion")
@@ -1851,7 +2024,8 @@ def _print_turn_calls(rows: list[dict]) -> None:
                                               + r.get("cache_read", 0)
                                               + r.get("output", 0)):
             print(f"{'':>4} {'':>5}  these are the lead agent's calls; the rest of "
-                  f"turn {r['seq']} is the subagents it spawned, itemised above")
+                  f"turn {r['seq']} is the subagents it spawned and what no transcript "
+                  f"accounts for, both itemised above")
 
 
 def _print_bill(bill: dict) -> None:
@@ -1884,7 +2058,8 @@ def _print_bill(bill: dict) -> None:
     _print_provenance(bill.get("accuracy") or {})
     for view, caption in (("actors", "by who spent it"),
                           ("turns", "the same tokens, turn by turn"),
-                          ("agents", "agent by agent — the lead, then what it spawned"),
+                          ("agents", "agent by agent — the lead, then what it spawned, "
+                                     "then what no transcript accounts for"),
                           ("orders", "the orders under it")):
         lines = bill.get(view) or []
         own = bill.get("own") if view == "orders" else None
@@ -1959,11 +2134,37 @@ def _print_bill(bill: dict) -> None:
               + _rewrite_cause(rewrite.get("ttl_share"),
                                rewrite.get("ttl_boundaries") or 0,
                                rewrite["boundaries"]))
+        # WHICH SIDE PAID IT (spec 2026-10-02 §1.5). The note only where the subagent
+        # side is a structural zero: a non-zero one is a real finding and that sentence
+        # would be a lie about it, so the two sides are then printed plainly.
+        sides = rewrite.get("by_side") or {}
+        sub_side = sides.get("subagent") or {}
+        if sub_side.get("structural_zero"):
+            print(bill_mod.SUBAGENT_REWRITE_ZERO.format(
+                count=sub_side.get("count", 0),
+                written=f"{sub_side.get('cache_write', 0):,}"))
+        elif sub_side:
+            main_side = sides.get("main") or {}
+            print(f"by side — main {main_side.get('tokens', 0):,} tokens across "
+                  f"{main_side.get('boundaries', 0)}, "
+                  f"subagent {sub_side.get('tokens', 0):,} across "
+                  f"{sub_side.get('boundaries', 0)}")
     subagents = bill.get("subagents") or {}
     if subagents.get("count"):
         print(f"{subagents['count']} subagent(s), ~${subagents['list_usd']:.2f}, "
               f"itemised above under the turn each ran in — drawn out of that turn's "
               f"total, never added to it")
+    # PRESENCE, never truthiness: absent means this seal predates the measurement, which
+    # must not render as a measured zero (spec 2026-10-08 §9).
+    placeholder = bill.get("placeholder")
+    if placeholder is not None and placeholder.get("calls"):
+        print(f"{placeholder['calls']:,} of those API calls report placeholder output "
+              f"totalling {placeholder['output']:,} tokens "
+              f"({placeholder['subagent_calls']:,} in a subagent's transcript, "
+              f"{placeholder['main_calls']:,} in the lead's) — "
+              + bill_mod.PLACEHOLDER_NOTE)
+    elif placeholder is not None:
+        print(bill_mod.PLACEHOLDER_ZERO)
     for note in bill.get("notes") or []:
         print(f"\n⚠ {note}")
     print(f"\nEvery figure above is {bill['floor_reason']}.")
@@ -2009,6 +2210,27 @@ BAR_GLYPHS = {"generating": "█", "blocked": "▓", "tools": "▒", "idle": "�
 
 #: Fixed, so every turn's bar is comparable at a glance and the columns after it line up.
 BAR_WIDTH = 20
+
+#: A SUBAGENT'S FOUR CACHE STATES (spec 2026-10-02 §1.4), worded here beside
+#: `PART_LABELS` because the dashboard reads the payload and not these words. An empty
+#: floored list can never read as "nothing here": `no large writes` is deleted, because
+#: a subagent that wrote 334,427 tokens in 115 sub-floor writes rendered as that string
+#: (wo-fb7c0fc2, a8e11a7e).
+SUB_UNDER_FLOOR = ("wrote {total} in {calls} calls — no single write reached the "
+                   "{floor:,} floor (largest {largest})")
+SUB_NO_WRITES = "wrote nothing to the cache"
+#: THE FOURTH STATE, ahead of the other three: the figures are ABSENT, not zero. Every
+#: order sealed before §1.1 added them has no key to read, and naming the SEAL is the
+#: only wording that cannot be read as an absence of writes.
+SUB_NOT_SEALED = "cache anatomy not in this seal — sealed before it was recorded"
+#: The ZERO as the FINDING rather than as silence: a subagent's written volume never
+#: exceeds its own context peak and one continuous conversation has no cache read going
+#: backwards, so the arithmetic can give nothing else.
+SUB_NO_BOUNDARY = ("no boundary — one continuous conversation, so no re-write tax. "
+                   "STRUCTURAL, not small: {written} was still written")
+#: NEVER "0 prefix misses", which would read as a finding: with no floor the TTL-vs-prefix
+#: split is not measured (`usage.classify_boundaries`).
+SUB_UNCLASSIFIED = "unclassified (no os.cold_prefix_floor)"
 
 #: What a turn with no API call says, ahead of any duration breakdown. A fixed width so
 #: the split below it stays a column, and stated rather than left to be inferred from
@@ -2080,9 +2302,38 @@ def _print_subagent(sub: dict[str, Any], indent: str) -> None:
     """
     writes = ", ".join(f"{cause} {_tok(written)}"
                        for cause, written in (sub["writes_by_cause"] or {}).items())
+    total = sub.get("total_written")
+    if total is None:
+        # FIRST, ahead of the writes list: an old seal carries neither, and a floored
+        # list read off one says nothing about what was written (§1.4).
+        cache = SUB_NOT_SEALED
+    elif writes:
+        cache = "writes " + writes
+    elif total:
+        # THE FLOOR, NAMED. An empty list at a 20,000 floor is "nothing at that floor",
+        # and the threshold-free figures are the only thing that can say so (§1.4).
+        cache = SUB_UNDER_FLOOR.format(total=f"{total:,}",
+                                       calls=sub.get("api_call_count", 0),
+                                       floor=sub.get("write_floor", 0),
+                                       largest=f"{sub.get('max_write', 0):,}")
+    else:
+        cache = SUB_NO_WRITES
     print(f"{indent}⤷ {sub['label'] or sub['task_id']}  {_mins(sub['wall']):>7}  "
           f"{sub['api_calls']:>3} api calls  peak {_tok(sub['context_peak']):>5}  "
-          f"{'writes ' + writes if writes else 'no large writes'}")
+          f"{cache}")
+    census = sub.get("rewrite") or {}
+    if census.get("boundaries"):
+        parts = [f"{census['boundaries']} boundar"
+                 f"{'ies' if census['boundaries'] != 1 else 'y'}",
+                 f"re-write {_tok(census['tokens'])}"]
+        if census.get("undecided_boundaries"):
+            parts.append(SUB_UNCLASSIFIED)
+        else:
+            parts.append(f"ttl {_tok(census['ttl_write'])}, "
+                         f"prefix-miss {_tok(census['prefix_write'])}")
+        print(f"{indent}  {' · '.join(parts)}")
+    elif total:
+        print(f"{indent}  {SUB_NO_BOUNDARY.format(written=f'{total:,}')}")
     if sub["deeper"]:
         # Never imply completeness (spec §4b): one directory level is globbed, so a
         # subagent's own subagents are counted and their transcripts are not read.
@@ -2116,6 +2367,22 @@ def _print_params(turn: dict[str, Any], caps: dict[str, int]) -> None:
             print(f"               ({note})")
 
 
+def _print_autopsy_provenance(provenance: dict[str, Any] | None) -> None:
+    """Which reading answered — spec §4 of 2026-09-27-order-autopsy-durability.md.
+
+    COMPOSES NOTHING. The sentence, the level sentence and the sealed-floor warning are
+    all keys of the payload `autopsy.anatomy_for` returned, for `ago_phrase`'s reason: a
+    renderer that words one of them is one the dashboard will disagree with.
+    """
+    if not provenance:
+        return
+    print(f"  reading: {provenance['note']}")
+    for sentence in (provenance["level_note"], provenance["params_note"],
+                     provenance["floor_note"]):
+        if sentence:
+            print(f"           {sentence}")
+
+
 def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
                    params: bool = False) -> None:
     """One session taken apart, in the order the questions get asked.
@@ -2138,6 +2405,10 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
               f"{biggest['label']}: {biggest['prompt_chars']:,} characters of prompt, "
               f"{biggest['system_prompt_chars']:,} of system prompt "
               f"({biggest['model'] or 'model not recorded'})")
+    # ABOVE the transcript check, in `largest_os_input`'s position and for its reason:
+    # which reading answered is exactly what a reader needs when nothing was found, and
+    # a provenance line below the early return is invisible in the one case it matters.
+    _print_autopsy_provenance(unit.get("provenance"))
     if not unit["found"]:
         # The same answer `jarvis cost` gives, and for the same reason: Claude Code
         # prunes transcripts on its own schedule, and an unmeasurable clock is not a
@@ -2247,13 +2518,94 @@ def _print_anatomy(unit: dict[str, Any], write_floor: int, *,
             plural = "call " if row["calls"] == 1 else "calls"
             print(f"    {row['name']:<14}{row['calls']:>4} {plural}  "
                   f"{_mins(row['seconds']):>8} total  {_mins(row['mean']):>7} mean")
+        # §3: the sentence comes from the payload (`inspection.nav_line`), which the
+        # debug page renders too — one wording, never one per renderer.
+        if unit.get("nav_line"):
+            print(f"    {unit['nav_line']}")
+
+    # One reader, two surfaces (q1216): the same payload `jarvis navigation` prints,
+    # after the tools it is about.
+    _print_navigation(unit.get("navigation"), indent="  ")
+
+
+#: The two sides, spelled for the eye. Beside `PART_LABELS` for its reason: the strings
+#: live in `cli` because the dashboard reads the payload and not these words. The BEFORE
+#: figure is NOT here — it comes out of the payload (`nav_volume.BEFORE_NOTE`) so both
+#: surfaces quote the same number.
+NAV_SIDE_LABELS = {"lead": "lead", "subagent": "subagent"}
+
+
+def _print_navigation(payload: dict[str, Any] | None, indent: str = "") -> None:
+    """How this scope navigated code, by side.
+
+    THIS RENDERER DERIVES NOTHING. Every number and every share is a value out of
+    `nav_volume.NavigationVolume.as_dict()`; a renderer that computed one is one the
+    dashboard would disagree with (PR 65).
+    """
+    if not payload:
+        return
+    window = payload.get("window_days")
+    scope = (f"{indent}navigation"
+             + (f" — last {window} days" if window else ""))
+    print(f"\n{scope}:")
+    if not payload.get("found"):
+        # Absent is never zero (issue #227): no transcript is a different answer from
+        # no navigation.
+        print(f"{indent}  no transcript — nothing to measure")
+        return
+    for side in ("lead", "subagent"):
+        row = payload["sides"][side]
+        share = row["code_nav_share"]
+        # None and never 0.0: an unmeasured share is not a zero one.
+        share_text = ("not measured — no tool results"
+                      if share is None else f"{share * 100:.1f}%")
+        # Neo q1242: branch off the payload's flag — the per-order surface carries no
+        # call counts.
+        calls = (f"  {row['symbol_calls']:>4} symbol  "
+                 f"{row['text_search_calls']:>4} text-search  "
+                 f"{row['nav_bash_calls']:>4} bash-nav "
+                 f"({row['code_nav_bash_calls']} on code)  "
+                 f"{row['read_tool_calls']:>4} Read"
+                 if payload.get("calls_reported", True) else "")
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2: CALL counters behind
+        # the payload's flag, BYTE counters always.
+        doc_calls = (f"  {row['whole_file_read_calls']:>4} whole-file Read  "
+                     f"{row['doc_dump_bash_calls']:>4} doc dumps"
+                     if payload.get("calls_reported", True) else "")
+        print(f"{indent}  {NAV_SIDE_LABELS[side]:<9}"
+              f"{row['transcripts']:>4} transcripts{calls}{doc_calls}")
+        print(f"{indent}           code reads via bash: {share_text} of "
+              f"{_tok(row['result_bytes'])} bytes of tool results"
+              + (f" · {_tok(row['unattributed_bytes'])} bytes unattributed"
+                 if row["unattributed_bytes"] else ""))
+        print(f"{indent}           docs: {_tok(row['doc_read_bytes'])} bytes via Read · "
+              f"{_tok(row['doc_dump_bash_bytes'])} bytes dumped via bash · "
+              f"{_tok(row['read_tool_bytes'])} bytes of Read results")
+    print(f"{indent}  {payload['before']}")
+    print(f"{indent}  {payload['doc_before']}")
+
+
+def cmd_navigation(args: argparse.Namespace) -> int:
+    from . import ops
+
+    res = ops.navigation_report(args.target, args.project,
+                                fleet=args.fleet, days=args.days)
+    if args.json:
+        _print(res, True)
+        return 0
+    print(f"{res['scope']}")
+    _print_navigation(res)
+    return 0
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     from . import ops
 
+    # `with_navigation`: this renderer PRINTS that section, so this is the caller that
+    # pays for its second pass over the transcripts (`ops.inspect_report`'s docstring).
     res = ops.inspect_report(args.target, args.project,
-                             write_floor=args.writes_over, join_floor=args.joins_over)
+                             write_floor=args.writes_over, join_floor=args.joins_over,
+                             with_navigation=True)
     if args.json:
         _print(res, True)
         return 0
@@ -2384,8 +2736,8 @@ def _normalise_issues(argv: list[str]) -> list[str]:
 #: `jarvis investigate <subject>` takes a bare subject while every other spelling takes a
 #: sub-verb, so the second word is a sub-verb when it is one of these and a SUBJECT
 #: otherwise. A subject is always a `wo-`/`fo-`/`io-` id and can therefore never collide
-#: with one of these four words.
-INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict")
+#: with one of these words.
+INVESTIGATE_SUBCOMMANDS = ("create", "list", "show", "cancel", "verdict", "budget")
 
 
 def _normalise_investigate(argv: list[str]) -> list[str]:
@@ -2449,6 +2801,53 @@ def cmd_search(args: argparse.Namespace) -> int:
         if hit["snippet"]:
             print(f"  {hit['snippet']}")
         print(f"  {hit['ref']}")
+    return 0
+
+
+def cmd_spec(args: argparse.Namespace) -> int:
+    """`jarvis spec toc | section | search` — §4.2 of the navigate-specs-like-code spec.
+
+    THIS RENDERER DERIVES NOTHING: every ref, every command and every size is a value out
+    of the `ops.spec_*` payload, so the terminal and `--json` cannot disagree about what
+    the next call is.
+    """
+    from . import ops
+
+    if args.spec_cmd == "toc":
+        out = ops.spec_toc(args.path, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['tokens_estimate']} tokens (estimate)")
+        for row in out["sections"]:
+            print(f"  {'  ' * (row['level'] - 1)}{row['name']}  "
+                  f"line {row['line']}  ~{row['tokens_estimate']} tokens (estimate)")
+            print(f"  {'  ' * (row['level'] - 1)}  {row['command']}")
+        return 0
+
+    if args.spec_cmd == "section":
+        out = ops.spec_section(args.path, args.which, args.project)
+        if args.json:
+            _print(out, True)
+            return 0
+        print(f"{out['path']} — {out['which']} — {out['tokens_estimate']} tokens "
+              f"(estimate)")
+        print(out["content"])
+        return 0
+
+    out = ops.spec_search(args.words, args.project, limit=args.limit)
+    if args.json:
+        _print(out, True)
+        return 0
+    if not out["hits"]:
+        print(f"nothing in {out['project']} matches {out['words']!r}")
+        return 0
+    print(f"{out['count']} section(s) in {out['project']}"
+          + (f" — capped at --limit {out['limit']}" if out["truncated"] else ""))
+    for hit in out["hits"]:
+        print(f"\n{hit['path']}  line {hit['line']}")
+        print(f"  {hit['context']}")
+        print(f"  {hit['command']}")
     return 0
 
 
@@ -2528,6 +2927,50 @@ def cmd_alarms(args: argparse.Namespace) -> int:
     if live:
         print("\nack one with: jarvis wo ack <wo-id>")
     return 0
+
+
+def cmd_stuck(args: argparse.Namespace) -> int:
+    """The dashboard's `/stuck` page in the terminal. §7, and `cmd_alarms` in shape.
+
+    Over-threshold rows are marked `!` and come first; the rest are the record. Every
+    number comes from `ops.stuck_report` — nothing here computes a duration or a
+    threshold.
+    """
+    from . import ops
+
+    rows = ops.stuck_report(args.project)
+    if args.json:
+        _print(rows, True)
+        return 0
+    if not rows:
+        print("no open order is being judged — `fleet_health.enabled` is off, or there "
+              "is nothing open")
+        return 0
+    over = [r for r in rows if r["stuck"]]
+    print(f"{len(over)} past its threshold · {len(rows) - len(over)} on the record\n")
+    for row in rows[:args.limit]:
+        mark = "!" if row["stuck"] else " "
+        print(f"{mark} {row['id']}  {row['project']}  {row['status_label']}")
+        print(f"    {_hours(row['seconds_in_status'])} in status · "
+              f"{_hours(row['seconds_since_activity'])} since activity · "
+              f"threshold {_hours(row['threshold_seconds'])} on the "
+              f"{row['clock']} clock")
+        print(f"    {row['reason']}")
+        # Parity with `ui/templates/stuck.html`, worded the same (§7).
+        print(f"    what the record says blocks it: {row['blocker']}")
+        inv = row["investigation"]
+        if inv:
+            print(f"    {inv['id']}  {inv['status']}"
+                  f"{'  ' + inv['classification'] if inv['classification'] else ''}")
+    if over:
+        print("\nread one with: jarvis investigate show <inv-id>")
+    # TEXT, not a link: the Evolution view is fo-69ba1cc4's and has no route yet (§7).
+    print("the gap classes behind these: jarvis rules list")
+    return 0
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h"
 
 
 def cmd_alarms_show(args: argparse.Namespace) -> int:
@@ -2624,29 +3067,80 @@ def _one_line(text: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[:limit].rstrip() + "…"
 
 
+def _when(text: str) -> float:
+    """A `--since`/`--until` value, parsed the one way the OS parses a window bound.
+
+    Lazy import so the parser does not drag `usage` and the price tables into every
+    `jarvis` invocation.
+    """
+    from .compaction_payoff import parse_when
+
+    try:
+        return parse_when(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date or ISO datetime: {e}")
+
+
+def _cost_meter(picked: dict, project: str | None) -> dict | None:
+    """The meter subtree, or None. Its own `try`, as `/cost` has: the meter reads a
+    different table from the listing and losing it must not take the listing down."""
+    import logging
+
+    from . import ops
+
+    try:
+        return ops.cost_meter(resolved=picked, project=project)["meter"]
+    except Exception as e:                              # noqa: BLE001
+        logging.getLogger(__name__).warning("cost meter unavailable: %s", e)
+        return None
+
+
 def cmd_cost(args: argparse.Namespace) -> int:
     from . import ops
-    target = args.target
-    # One argument, three kinds of thing. Ids are prefixed and projects are not, so
-    # this never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project
-    # name. The feature-order half goes through the shared predicate rather than a third
+    # One argument, three kinds of thing. Ids are prefixed and projects are not, so this
+    # never has to guess: anything that is not `wo-…`/`fo-…`/`io-…` is a project name.
+    # The feature-order half goes through the shared predicate rather than a third
     # literal — §2.5 of docs/superpowers/specs/2026-09-23-improvement-orders.md.
     from .project_store import is_feature_order_id
 
+    target = args.target
     is_id = bool(target) and (target.startswith("wo-") or is_feature_order_id(target))
+    scope = args.project or (None if is_id else target) or None
+    # THE ZONE, THEN THE WINDOW, ONCE at the top and handed to every payload builder
+    # below (kn-9ccc429b: the display zone is resolved first and moves no boundary;
+    # kn-0c297bdd: a bad parameter is a refusal, never a silent fallback). Resolving
+    # twice is a function of `now` and can straddle a boundary, which is how
+    # `--window 5h` used to window the distribution and nothing else (§10).
+    zone = ops.cost_zone(args.tz, scope)
+    picked = ops.cost_window(project=scope, window=args.window, offset=args.offset,
+                             tz=zone, since=args.since, until=args.until)
+    # The distribution BRANCHES FIRST and the listing below is untouched: `--fleet` adds
+    # a section, it does not reshape a row (spec §5).
+    if getattr(args, "fleet", False):
+        payload = ops.fleet_cost(project=scope, resolved=picked)
+        meter = _cost_meter(picked, scope)
+        if args.json:
+            _print({**payload, **({"meter": meter} if meter else {})}, True)
+            return 0
+        _print_fleet(payload["fleet"])
+        if meter:
+            print(f"\n{meter['sentence']}")
+        return 0
     if is_id:
         # One order asks "where did MY tokens go", which is the bill's question. The
         # fleet view below asks "which orders cost the most", which is the report's.
+        # NO METER BLOCK: a bill's span is the ORDER's own life, not a window, and an
+        # account-level residual printed under one bill reads as that order's (§10).
         bill = ops.bill(target)
         if args.json:
             _print(bill, True)
             return 0
         _print_bill(bill)
         return 0
-    res = ops.cost_report(project=None if is_id else target,
-                          target=target if is_id else None, limit=args.limit)
+    res = ops.cost_report(project=scope, limit=args.limit, window=picked)
+    meter = _cost_meter(picked, scope)
     if args.json:
-        _print(res, True)
+        _print({**res, **({"meter": meter} if meter else {})}, True)
         return 0
 
     units = res["units"]
@@ -2658,20 +3152,34 @@ def cmd_cost(args: argparse.Namespace) -> int:
     if res["unmeasured"]:
         header += f", {res['unmeasured']} with no transcript left"
     print(f"{header}\n")
+    # VERBATIM from the payload: the page prints the same string, and two wordings of
+    # the same arithmetic is a difference the reader has to explain (§9).
+    if meter:
+        print(f"{meter['sentence']}\n")
     # `$` is the whole bill — the worker's conversation, what Jarvis itself spent on the
     # order, and what the worker spent below itself. `jarvis` and `sub` are how much of
     # it was each. A work order whose transcript is gone can still show those two: both
     # were recorded as they happened rather than read back from a file.
-    print(f"{'$':>7} {'jarvis':>7} {'sub':>7} {'turns':>5} {'output':>7} "
-          f"{'re-write':>9}  work order")
+    # `subproc` was called `sub`, next to a quantity five times larger that was never
+    # printed per order at all. It is `agent_calls.kind='worker_subprocess'` — bare
+    # `claude` processes a worker's own tool calls spawned — and ~$0.57 fleet-wide for a
+    # week, so the dashes were honest about what they measured. `subagent` is the other
+    # quantity: Task-tool subagents, already computed as `subagent_cost_usd` and until
+    # now shown only in the footer total. On wo-6dcd484a that was $3.12 of a $7.03 bill
+    # (spec §5, defect 3).
+    print(f"{'$':>7} {'jarvis':>7} {'subproc':>8} {'subagent':>9} {'turns':>5} "
+          f"{'output':>7} {'re-write':>9}  work order")
     for u in units:
         os_cost = f"{u['os_cost_usd']:.2f}" if u["os_calls"] else "—"
         sub_cost = f"{u['subproc_cost_usd']:.2f}" if u.get("subproc_calls") else "—"
+        agent_cost = (f"{u['subagent_cost_usd']:.2f}"
+                      if u.get("subagent_count") else "—")
         if not u["found"]:
-            print(f"{'—':>7} {os_cost:>7} {sub_cost:>7} {'—':>5} {'—':>7} {'—':>9}  "
-                  f"{u['id']}  {u['title'][:44]}")
+            print(f"{'—':>7} {os_cost:>7} {sub_cost:>8} {agent_cost:>9} {'—':>5} "
+                  f"{'—':>7} {'—':>9}  {u['id']}  {u['title'][:44]}")
             continue
-        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {sub_cost:>7} {u['turns']:>5} "
+        print(f"{u['total_cost_usd']:>7.2f} {os_cost:>7} {sub_cost:>8} "
+              f"{agent_cost:>9} {u['turns']:>5} "
               f"{_tok(u['output']):>7} {_tok(u['rewrite_excess']):>9}  "
               f"{u['id']}  {u['title'][:44]}")
 
@@ -2713,6 +3221,11 @@ def cmd_cost(args: argparse.Namespace) -> int:
             print(f"               {cause.strip()}")
     if totals["subagent_cost_usd"]:
         print(f"  subagents     ~${totals['subagent_cost_usd']:.2f}")
+    # Silence when zero: nothing was excluded, so there is nothing to disclose (§5c of
+    # docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+    if totals.get("undated_messages"):
+        print(f"  {totals['undated_messages']} transcript messages carried no readable "
+              f"timestamp and are excluded from this window")
     _print_write_ttl(totals)
     unattributed = res.get("os_unattributed") or {}
     if unattributed.get("os_calls"):
@@ -2726,10 +3239,164 @@ def cmd_cost(args: argparse.Namespace) -> int:
         print(f"\nEvery figure above is {res['floor_reason']}.")
     print("List prices, as a common unit for comparing token kinds — not a bill.")
     # Money is all this command has ever shown, and the complaint behind spec §7 of
-    # docs/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
+    # docs/superpowers/specs/2026-09-24-order-observability.md is that nothing said where the rest is.
     print("Where the time went: `jarvis inspect <id>` · what a turn is doing right now: "
           "`jarvis watch <id>` · why one is not moving: `jarvis wo why <id>`.")
     return 0
+
+
+def _fleet_value(value: float | None, unit: str) -> str:
+    """One figure, formatted by its UNIT — the renderer never guesses the metric."""
+    if value is None:
+        return "—"
+    if unit == "usd":
+        return f"${value:,.2f}"
+    if unit == "tokens":
+        return _tok(int(value))
+    if unit == "seconds":
+        return f"{value:,.0f}s"
+    if unit == "share":
+        return f"{100 * value:.1f}%"
+    return f"{value:,.2f}"
+
+
+def _tool_label(name: str, width: int = 28) -> str:
+    """A tool name at display width, middle-elided. `--json` always has it in full."""
+    if len(name) <= width:
+        return name
+    head = (width - 1) // 2
+    return f"{name[:head]}…{name[head + 1 - width:]}"
+
+
+def _main_sub(cost: dict) -> str:
+    """The carried-dollar split as whole percents, or `—` where nothing was carried."""
+    callers = cost.get("by_caller") or {}
+    main = (callers.get("main") or {}).get("carried_usd", 0.0)
+    sub = (callers.get("subagent") or {}).get("carried_usd", 0.0)
+    if main + sub <= 0:
+        return "—"
+    return f"{round(100 * main / (main + sub))}% / {round(100 * sub / (main + sub))}%"
+
+
+def _print_tool_cost(tools: dict) -> None:
+    """§10.7: one compact table, the fleet's dearest TOOL habits, dearest first.
+
+    Every caveat comes out of `tools['notes']`, which `_print_fleet` prints with the
+    rest — the dashboard prints the same sentences from the same keys.
+    """
+    totals = tools.get("totals") or {}
+    if not totals.get("calls"):
+        return
+    print(f"\ntool cost — {totals['calls']:,} calls · "
+          f"{_tok(totals['result_tokens'])} result tok · "
+          f"{_tok(totals['carried_tokens'])} carried tok · "
+          f"${totals['carried_usd']:,.2f} carried")
+    print(f"{'tool':<30} {'calls':>7} {'result tok':>11} {'carried tok':>12} "
+          f"{'carried $':>10}  main/sub")
+    from jarvis import fleetcost
+
+    rows = fleetcost.tool_table(tools)
+    limit = tools.get("row_limit") or len(rows)
+    for label, cost in rows[:limit]:
+        print(f"{_tool_label(label):<30} {cost['calls']:>7,} "
+              f"{_tok(cost['result_tokens']):>11} "
+              f"{_tok(cost['carried_tokens']):>12} "
+              f"{cost['carried_usd']:>10,.2f}  {_main_sub(cost)}")
+    rest = rows[limit:]
+    if rest:
+        print(f"({len(rest)} more tool{'s' if len(rest) != 1 else ''}, "
+              f"{_tok(sum(c['result_tokens'] for _, c in rest))} result tok, "
+              f"${sum(c['carried_usd'] for _, c in rest):,.2f} carried)")
+    # The three money fields are never summed without their names, and the TTL one is
+    # `undecided` rather than $0.00 when no `cold_prefix_floor` could decide the split.
+    ttl = totals["carried_rewrite_ttl_usd"]
+    print(f"  carried $ by cause: cache read ${totals['carried_read_usd']:,.2f} · "
+          f"ttl-expiry re-write "
+          f"{'undecided' if ttl is None else f'${ttl:,.2f}'} · "
+          f"prefix-miss re-write ${totals['carried_rewrite_prefix_usd']:,.2f}")
+    basis = totals["token_basis"]
+    excluded = tools["excluded"]
+    walked = excluded["sessions_walked"]
+    # Silent when zero: nothing was hidden, so there is nothing to disclose.
+    late = excluded["outside_window"]
+    print(f"  {basis['context_delta']:,} result sizes measured exactly, "
+          f"{basis['chars']:,} estimated from characters · "
+          f"{walked:,} transcript{'s' if walked != 1 else ''} read · "
+          f"{excluded['unmatched_calls']:,} calls with no result, excluded"
+          + (f" · {late:,} tool results outside the window, excluded" if late else ""))
+
+
+def _print_fleet(fleet: dict) -> None:
+    """The distribution: one line per metric, then the OS's spend, then the payoff.
+
+    Every caveat comes out of the PAYLOAD (`notes`, `floor_reason`) rather than being
+    written here, for `ops.COST_FLOOR_NOTE`'s reason — the dashboard prints the same
+    sentences from the same keys.
+    """
+    orders = fleet["orders"]
+    print(f"{fleet['scope']} — {fleet['window']['label']} "
+          f"({fleet['window']['source']})")
+    # Both clocks: UTC is what `agent_calls.ts` is comparable to, the local one is what
+    # the reset is specified in (§4).
+    if fleet["window"].get("local_label"):
+        print(f"  {fleet['window']['local_label']}")
+    print(f"{orders['n']} order{'s' if orders['n'] != 1 else ''} with a turn in the "
+          f"window · {orders['live']} live · {orders['truncated']} truncated by it · "
+          f"{orders['excluded_no_turns']} with no turn in it\n")
+    if not orders["n"]:
+        print("nothing ran in that window — try --since/--until")
+        return
+    print(f"{'metric':<38} {'n':>4} {'avg':>10} {'p90':>10} {'max':>10}  basis")
+    for name, m in fleet["metrics"].items():
+        unit = m["unit"]
+        top = m["max"] or {}
+        basis = m["provenance"]
+        if m["cost_basis"] and m["cost_basis"]["transcript"] and basis == "envelope":
+            # Both sub-populations exist, so the reader is told so beside the figure —
+            # the counts travel in `cost_basis` and the two are never averaged together.
+            basis = (f"envelope ({m['cost_basis']['envelope']} turns; "
+                     f"{m['cost_basis']['transcript']} floored, reported separately)")
+        print(f"{name:<38} {m['n']:>4} {_fleet_value(m['avg'], unit):>10} "
+              f"{_fleet_value(m['p90'], unit):>10} "
+              f"{_fleet_value(top.get('value'), unit):>10}  {basis}"
+              f"{'  ' + top['wo_id'] if top.get('wo_id') else ''}")
+
+    kinds = fleet["os_cost_by_kind"]
+    if kinds:
+        print("\nwhat jarvis itself spent, by kind (dearest first, $0 kinds included)")
+        for row in kinds:
+            print(f"  {row['kind']:<22} {row['calls']:>6} "
+                  f"call{'s' if row['calls'] != 1 else ' '}  "
+                  f"${row['cost_usd']:>10,.2f}")
+        un = fleet["os_unattributed"]
+        if un["calls"]:
+            print(f"  {'(no work order)':<22} {un['calls']:>6} "
+                  f"call{'s' if un['calls'] != 1 else ' '}  "
+                  f"${un['cost_usd']:>10,.2f}")
+
+    _print_tool_cost(fleet.get("tools") or {})
+
+    payoff = fleet["compaction_payoff"]
+    if payoff["count"]:
+        print(f"\ncompactions {payoff['count']} · "
+              f"cost ${payoff['total_cost_usd']:,.2f} · "
+              f"saved ${payoff['total_savings_usd']:,.2f} · "
+              f"net ${payoff['net_usd']:,.2f}")
+        if payoff["pct_paid_off"] is not None:
+            line = (f"  {payoff['pct_paid_off']}% of {payoff['closed']} closed one"
+                    f"{'s' if payoff['closed'] != 1 else ''} paid off")
+            if payoff["break_even_turn_median"] is not None:
+                line += (f"; break-even at {payoff['break_even_turn_median']} turns "
+                         f"(median)")
+            print(line)
+    print()
+    notes = list(fleet["notes"])
+    tools = fleet.get("tools") or {}
+    if (tools.get("totals") or {}).get("calls"):
+        notes += tools["notes"]
+    for note in notes:
+        print(f"{note[0].upper()}{note[1:]}.")
+    print(f"\nEvery figure above is {fleet['floor_reason']}.")
 
 
 def _print_orphans(orphans: list[dict]) -> None:
@@ -2789,8 +3456,11 @@ def _budget_arg(args: argparse.Namespace) -> float | None:
 def _print_context(res: dict[str, Any]) -> None:
     """`jarvis wo context` for a human. DERIVES NOTHING: every number and every sentence
     here is a key of `ops.context_report`'s payload, so --json and this cannot disagree
-    (spec docs/specs/2026-09-24-order-observability.md §5)."""
+    (spec docs/superpowers/specs/2026-09-24-order-observability.md §5)."""
     print(f"{res['wo_id']}  {res['project']}  {res['title']}")
+    # Above the early return, `_print_anatomy`'s rule: a reader whose ledger is empty is
+    # the one who most needs to know which reading was consulted.
+    _print_autopsy_provenance(res.get("provenance"))
     if not res["recorded"]:
         print(f"\n  {res['note']}")
         return
@@ -2968,6 +3638,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
                 # rule, and the reason it is not folded into those rounds is that an
                 # order judged four times filed into four fragments with no total.
                 "issues": ops.issue_index(store, args.wo_id),
+                # WHAT THE OS READ OFF DISK when this order's latest turn died without
+                # writing a result. Same never-always rule: no line at all for a turn
+                # that was never harvested — spec §5 of
+                # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+                **({"harvest": h} if (h := ops.harvest_state(store, wo)) else {}),
                 # Whether the OS merged this pull request, is waiting for permission to,
                 # or is holding — and why. NOT always present, unlike the keys above: a
                 # work order the mechanism never touched has no line here at all, which
@@ -3012,9 +3687,9 @@ def cmd_wo(args: argparse.Namespace) -> int:
             store.close()
         detail["budget"] = ops.work_order_budget(args.wo_id, name)
         _print(_readable_spec(_readable_config(_readable_review(_readable_autoreview(
-            _readable_automerge(_readable_alarms(_readable_time_in_state(
-                _readable_rounds(_readable_issues(
-                    _readable_conversation(detail))))))))))
+            _readable_automerge(_readable_harvest(_readable_alarms(
+                _readable_time_in_state(_readable_rounds(_readable_issues(
+                    _readable_conversation(detail)))))))))))
                if not args.json else detail, args.json)
 
     elif args.wo_cmd == "send":
@@ -3069,6 +3744,11 @@ def cmd_wo(args: argparse.Namespace) -> int:
     elif args.wo_cmd == "resume-auto":
         _print(ops.resume_in_auto(args.wo_id, project_name=args.project,
                                   force=args.force), args.json)
+    elif args.wo_cmd == "retry":
+        # `relay=True` as `send` does: `ops.user_authorship` decides whether this process
+        # is a surface the human reaches, and `ops.retry` drops it for its own note.
+        _print(ops.retry(args.wo_id, message=args.message,
+                         project_name=args.project, relay=True), args.json)
     elif args.wo_cmd == "why":
         diagnosis = ops.diagnose(args.wo_id, project_name=args.project)
         if args.json:
@@ -3131,6 +3811,8 @@ def _print_diagnosis(d: dict[str, Any]) -> None:
         for episode in held["episodes"]:
             mark = " (still held)" if episode["open"] else ""
             print(f"  {episode['phrase']} — {episode['seconds_human']}{mark}")
+    # Where `_diagnose_holds`' reading surfaces, so its provenance belongs here.
+    _print_autopsy_provenance(held.get("provenance"))
     residual = held["unexplained"]
     if residual["seconds"] is None:
         print(f"  unexplained: none measurable — {residual['note']}")
@@ -3443,12 +4125,16 @@ def cmd_io(args: argparse.Namespace) -> int:
 
     elif args.io_cmd == "budget":
         # The family here is the order plus its analyst, so the feature-order arithmetic
-        # is already correct with no children — §2.6, which is why nothing is reimplemented.
+        # is already correct with no children — §2.6, which is why nothing is
+        # reimplemented. Through the KIND-GUARDED wrappers, like every other `io` verb:
+        # this was the one that routed straight at the feature-order functions, so `/api`
+        # and every future caller had no guard at all.
         if args.amount is None and not args.clear:
-            _print(ops.feature_order_budget(args.io_id, args.project), args.json)
+            _print(ops.improvement_order_budget(args.io_id, args.project), args.json)
         else:
             amount = None if args.clear else _parse_budget_amount(args.amount)
-            _print(ops.set_feature_budget(args.io_id, amount, args.project), args.json)
+            _print(ops.set_improvement_budget(args.io_id, amount, args.project),
+                   args.json)
 
     return 0
 
@@ -3519,6 +4205,16 @@ def cmd_investigate(args: argparse.Namespace) -> int:
 
     elif args.inv_cmd == "cancel":
         _print(ops.cancel_investigation_order(args.inv_id, args.project), args.json)
+
+    elif args.inv_cmd == "budget":
+        # THE SECOND STEP OF THE TOP-UP, and the command a parked child's note names.
+        # Same shape as `jarvis io budget`, through the kind-guarded wrappers.
+        if args.amount is None and not args.clear:
+            _print(ops.investigation_order_budget(args.inv_id, args.project), args.json)
+        else:
+            amount = None if args.clear else _parse_budget_amount(args.amount)
+            _print(ops.set_investigation_budget(args.inv_id, amount, args.project),
+                   args.json)
 
     elif args.inv_cmd == "verdict":
         path = Path(args.from_file)
@@ -3755,6 +4451,11 @@ def _print_rules_list(data: dict) -> None:
     noun = "rule" if c["total"] == 1 else "rules"
     print(f"{c['total']} {noun}: {c['armed']} armed, {c['dry_run']} in dry run, "
           f"{c['retracted']} retracted")
+    # SAID ON ITS OWN LINE, above the rules rather than in the closing note, because it
+    # changes what every number below MEANS: with the pass off, a rule showing no fires
+    # has not failed to match, it has never been looked at.
+    if data.get("enabled") is False:
+        print("  the evaluation pass is OFF — nothing evaluates these rules")
     for r in data["rules"]:
         scope = r["project"] or "fleet-wide"
         retired = " ⊘ retracted" if r["retired_at"] else ""
@@ -3800,6 +4501,13 @@ def _print_rules_show(data: dict) -> None:
         print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
               # A fire is one line: the stored detail stays at rules.FACTS_CHARS.
               + (f" · {_one_line(f['detail'], 110)}" if f["detail"] else ""))
+    for rec in data["recurrences"]:
+        # The verdict, the order it recurred on, and what happened on the tracker — the
+        # three fields a person judging THIS rule reads (spec §8, Neo question 974). The
+        # `filed_note` is the local account and can be long, so it is clipped the way a
+        # fire's detail is; the stored value is untouched.
+        print(f"  recurrence {rec['id']} {rec['verdict']} · {rec['order_id']}"
+              + (f" · {_one_line(rec['filed_note'], 110)}" if rec["filed_note"] else ""))
 
 
 def _print_rules_dry_run(data: dict) -> None:
@@ -4156,6 +4864,131 @@ def _print_knowledge_usage(res: dict[str, Any], as_json: bool) -> None:
             print(f"      → {e['id']}  {e['headline'][:62]}")
 
 
+#: What an absent figure prints. One spelling, because the dashboard has one too
+#: (`bill.html`'s `<span class="sub">not recorded</span>`) and a report that said "0%" on
+#: one surface and "not recorded" on the other would be read as two different findings.
+NOT_RECORDED = "not recorded"
+
+
+def _pct(rate: float | None) -> str:
+    """A rate as a percentage, or "not recorded" — NEVER `0%` for an absent one.
+
+    Zero settled questions and zero escalations are different answers (spec §4's zero
+    rule, docs/superpowers/specs/2026-10-01-neo-observability.md).
+    """
+    return NOT_RECORDED if rate is None else f"{rate * 100:.0f}%"
+
+
+def _ms(value: int | None) -> str:
+    return NOT_RECORDED if value is None else f"{value}ms"
+
+
+def _print_neo_stats(res: dict[str, Any], as_json: bool) -> None:
+    """`jarvis neo stats` for a person, in the order the user asked the questions:
+    volume and outcomes, the trend, the causes, the kinds, per-order averages, then spend
+    and latency last.
+
+    `--json` prints the ops dict unchanged — `_print_knowledge_usage`'s contract, and what
+    keeps the dashboard and the terminal reading the same report.
+    """
+    if as_json:
+        _print(res, True)
+        return
+    q = res["questions"]
+    window = f", last {res['days']}d" if res["days"] else ", all time"
+    print(f"{res['scope']}{window} — {q['asked']} question"
+          f"{'' if q['asked'] == 1 else 's'} asked\n")
+
+    print("OUTCOMES")
+    print(f"  answered by Neo   {q['answered']}")
+    print(f"  escalated         {q['escalated']}")
+    print(f"  unreachable       {q['failed']}  (Neo was never reached — NOT judged)")
+    print(f"  still open        {q['open']}")
+    print(f"  superseded        {q['superseded']}  (decided elsewhere, out of the rate)")
+    print(f"  escalation rate   {_pct(q['escalation_rate'])}  "
+          f"(over settled questions only)")
+    # Its own figure, never blended into the escalation rate: a crash is not a decision.
+    print(f"  unreachable rate  {_pct(q['unreachable_rate'])}  "
+          f"(same denominator — NOT escalations)")
+
+    if res["by_day"]:
+        print("\nTHE TREND — one line per day, newest last")
+        for d in res["by_day"]:
+            print(f"  {d['day']}  asked {d['asked']:>3} · answered {d['answered']:>3} · "
+                  f"escalated {d['escalated']:>3} · rate {_pct(d['escalation_rate'])} · "
+                  f"never reached {d['failed']:>3} · unreachable "
+                  f"{_pct(d['unreachable_rate'])}")
+
+    causes = res["causes"]
+    print("\nWHAT IT ESCALATES FOR — three classes, because WHO DECIDED has three "
+          "answers")
+    # Three labelled groups, each with the sentence that says what the class means. A flat
+    # list of fifteen labels would not answer the question the report exists for (§3 of
+    # docs/superpowers/specs/2026-10-01-neo-observability.md and Neo's ruling on question 1170).
+    groups = (("chosen", "Neo chose to hand it back", "Neo chose this label"),
+              ("overridden", "Neo answered and the OS overrode it",
+               "the OS derived it from Neo's answer"),
+              ("failed", "Neo never answered",
+               "the OS derived it — no judgement at all"))
+    for key, heading, per_row in groups:
+        bucket = causes[key]
+        print(f"  {heading}")
+        if not bucket:
+            print(f"    {NOT_RECORDED} — none in this window")
+            continue
+        for cause, n in sorted(bucket.items(), key=lambda kv: -kv[1]):
+            print(f"    {cause:<24} {n:>4}   ({per_row})")
+    if causes["not_recorded"]:
+        # NOT printed as a cause: nobody may read the backlog as a finding about Neo.
+        print(f"  {causes['not_recorded']} escalation"
+              f"{'' if causes['not_recorded'] == 1 else 's'} predate cause recording")
+    # The class that is in NO count above, said as what the reader cannot see here.
+    print(f"  note: {res['causes_note']}")
+
+    print("\nBY KIND")
+    for kind, k in sorted(res["by_kind"].items(), key=lambda kv: -kv[1]["asked"]):
+        print(f"  {kind:<12} asked {k['asked']:>4} · answered {k['answered']:>4} · "
+              f"escalated {k['escalated']:>4} · rate {_pct(k['escalation_rate'])} · "
+              f"never reached {k['failed']:>4} · unreachable "
+              f"{_pct(k['unreachable_rate'])}")
+    if res["by_kind"]:
+        print(f"  note: {res['by_kind_note']}")
+
+    per = res["per_order"]
+    print("\nPER ORDER — triage questions excluded (they have no order behind them)")
+    wo_avg = per["questions_per_wo"]
+    fo_avg = per["questions_per_fo"]
+    print(f"  {per['work_orders']} work order"
+          f"{'' if per['work_orders'] == 1 else 's'}, "
+          f"{NOT_RECORDED if wo_avg is None else f'{wo_avg} questions each'}")
+    print(f"  {per['feature_orders']} feature order"
+          f"{'' if per['feature_orders'] == 1 else 's'}, "
+          f"{NOT_RECORDED if fo_avg is None else f'{fo_avg} questions each'}")
+
+    spend, totals = res["spend"], res["spend"]["totals"]
+    print(f"\nWHAT NEO COST — {totals['calls']} call"
+          f"{'' if totals['calls'] == 1 else 's'}, "
+          f"${totals['recorded_cost_usd']:.2f} recorded / "
+          f"~${totals['list_cost_usd']:.2f} at list prices")
+    for kind, s in sorted(spend["by_kind"].items(), key=lambda kv: -kv[1]["calls"]):
+        print(f"  {kind:<18} {s['calls']:>4} calls · {s['input']:>8} in · "
+              f"{s['cache_write']:>9} cache write · {s['cache_read']:>10} cache read · "
+              f"{s['output']:>7} out · ${s['recorded_cost_usd']:.2f}")
+
+    lat = res["latency"]
+    print("\nHOW LONG IT TOOK")
+    for kind, entry in sorted(lat["by_kind"].items(), key=lambda kv: -kv[1]["calls"]):
+        print(f"  {kind:<18} {entry['measured']}/{entry['calls']} timed · "
+              f"p50 {_ms(entry['p50_ms'])} · p90 {_ms(entry['p90_ms'])} · "
+              f"max {_ms(entry['max_ms'])}")
+    if lat["unmeasured"]:
+        print(f"  {lat['unmeasured']} call"
+              f"{'' if lat['unmeasured'] == 1 else 's'} in this window were never timed")
+    if not lat["by_kind"]:
+        print(f"  {NOT_RECORDED} — no call in this window")
+    print(f"\nThe spend and latency figures are {res['floor_reason']}")
+
+
 def cmd_learn(args: argparse.Namespace) -> int:
     import os
 
@@ -4194,6 +5027,28 @@ def cmd_learn(args: argparse.Namespace) -> int:
             out.append(row)
         return out
 
+    def excerpted(rows: list[dict[str, Any]], term: str) -> list[dict[str, Any]]:
+        """`search`'s index form: `digested` plus what a reader needs to choose.
+
+        `chars` prices `jarvis learn show <id>` before it is paid for, and `excerpt` quotes
+        the first body line a query word appears in — bounded by `headline()`, which IS the
+        bound, so no truncated body ever leaves here. Omitted when the only match is the
+        first line (the headline already shows it) or when nothing in the body matched (an
+        FTS5 stem hit, or a hit on `topic`/`tags`): the row is still a hit, it just has
+        nothing to quote.
+        """
+        words = [w.lower() for w in (term or "").split() if any(c.isalnum() for c in w)]
+        out = []
+        for row, r in zip(digested(rows), rows, strict=True):
+            row["chars"] = len(r["content"] or "")
+            for line in (r["content"] or "").split("\n")[1:]:
+                low = line.lower()
+                if any(w in low for w in words) and headline(line):
+                    row["excerpt"] = headline(line)
+                    break
+            out.append(row)
+        return out
+
     central = CentralStore()
     try:
         if args.kn_cmd == "add":
@@ -4219,12 +5074,22 @@ def cmd_learn(args: argparse.Namespace) -> int:
         elif args.kn_cmd == "search":
             rows = central.search_knowledge(args.term, limit=args.limit,
                                             project=args.project, topic=args.topic)
-            central.record_knowledge_read("search", rows, term=args.term,
-                                          project=reader_project, wo_id=acting_wo)
+            index = excerpted(rows, args.term)
+            # Charged for what was PRINTED, like the `list` branch above: the index rows,
+            # not the bodies they point at. Without this `jarvis learn stats` keeps
+            # reporting text nobody received (spec
+            # docs/superpowers/specs/2026-10-02-learn-search-returns-an-index.md).
+            central.record_knowledge_read(
+                "search", rows, term=args.term, project=reader_project, wo_id=acting_wo,
+                chars=sum(len(r["headline"]) + len(r.get("excerpt", "")) for r in index))
             if not rows and not args.json:
                 print(f"no knowledge matching {args.term!r} — "
                       f"try `jarvis learn topics` for what is recorded")
-            _print(rows, args.json)
+            elif not args.json:
+                print("index only — `excerpt` is ONE quoted matching line, never the "
+                      "entry; `jarvis learn show <id>` for a body "
+                      "(`chars` prices it first)")
+            _print(index, args.json)
         elif args.kn_cmd == "show":
             rows = [r for r in (central.get_knowledge(i) for i in args.ids) if r]
             central.record_knowledge_read("show", rows, term=" ".join(args.ids),
@@ -4305,7 +5170,9 @@ def cmd_brief(args: argparse.Namespace) -> int:
 
     print(worker_brief.render_section(args.section, wo_id=wo_id, project=project,
                                       gates_enabled=gates_enabled,
-                                      serena=os.environ.get("JARVIS_SERENA") != "0"))
+                                      serena=os.environ.get("JARVIS_SERENA") != "0",
+                                      tool_search=os.environ.get(
+                                          "JARVIS_TOOL_SEARCH", "cli")))
     return 0
 
 
@@ -4408,6 +5275,9 @@ def cmd_neo(args: argparse.Namespace) -> int:
                       f"({r['source']}) {r['content']}{retired}")
             if not rows:
                 print("Neo has no learnings yet — review its answers to teach it")
+    elif args.neo_cmd == "stats":
+        _print_neo_stats(ops.neo_stats_report(project=args.project or None,
+                                              days=args.days), args.json)
     elif args.neo_cmd == "export":
         _print(ops.neo_export(), args.json)
     elif args.neo_cmd == "learn":
@@ -4627,6 +5497,9 @@ def main(argv: list[str] | None = None) -> int:
         return main_hook()
     from .bugreport import BugReportError
     from .catalog import CatalogError
+    # A refusal a worker can act on, not a crash. Spec §4:
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    from .neo_store import QuestionTooLargeError
     from .ops import OpsError
     try:
         if args.cmd == "start":
@@ -4645,12 +5518,18 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cost(args)
         if args.cmd == "inspect":
             return cmd_inspect(args)
+        if args.cmd == "navigation":
+            return cmd_navigation(args)
         if args.cmd == "watch":
             return cmd_watch(args)
         if args.cmd == "alarms":
             return cmd_alarms(args)
+        if args.cmd == "stuck":
+            return cmd_stuck(args)
         if args.cmd == "search":
             return cmd_search(args)
+        if args.cmd == "spec":
+            return cmd_spec(args)
         if args.cmd == "issues":
             return (cmd_issues_start(args) if args.issues_cmd == "start"
                     else cmd_issues(args))
@@ -4696,7 +5575,7 @@ def main(argv: list[str] | None = None) -> int:
             from .daemon import run_daemon
             run_daemon(args.catalog, poll_interval=args.poll_interval)
             return 0
-    except (OpsError, CatalogError, BugReportError) as e:
+    except (OpsError, CatalogError, BugReportError, QuestionTooLargeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

@@ -1,5 +1,5 @@
 {# Shared furniture for the four blocks of the debugging page (spec §7 of
-   docs/specs/2026-09-24-order-observability.md).
+   docs/superpowers/specs/2026-09-24-order-observability.md).
 
    `failed` is the whole of "degradation is a feature, not an error page": each block is
    read independently and one that could not be read says so, in the sentence the route
@@ -20,6 +20,27 @@
 
 {% macro note(text) %}
 {% if text %}<div class="sub" style="padding: 10px 16px; color: var(--ink-2);">{{ text }}</div>{% endif %}
+{% endmacro %}
+
+{# WHICH READING ANSWERED — spec §4 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md.
+   A sealed reading and a fresh one must never disagree on the same order, and a
+   disagreement nobody can attribute is one nobody can fix. Every sentence is a key of
+   `autopsy.anatomy_for`'s provenance; this macro words none of them, and a sealed-floor
+   warning is rendered as a WARNING because a short list under a lower floor reads as
+   "there were none". #}
+{% macro provenance(p) %}
+{% if p %}
+<div class="panel" style="margin-bottom: 10px;">
+  <div class="row">
+    <span class="kv" style="width: 90px;">{{ p.source }}</span>
+    <span class="grow sub">{{ p.note }}</span>
+  </div>
+  {% if p.level_note %}<div class="row"><span class="grow sub">{{ p.level_note }}</span></div>{% endif %}
+  {% if p.floor_note %}
+  <div class="row"><span class="st tone-warn wrap"><span class="i">⚠</span>{{ p.floor_note }}</span></div>
+  {% endif %}
+</div>
+{% endif %}
 {% endmacro %}
 
 {# The per-turn partition bar. Widths come STRAIGHT off `share`, which `inspection`
@@ -78,10 +99,38 @@
   <span class="kv mono">{{ fmt_dur(s.wall) }} · {{ s.api_calls }} API calls ·
     peak {{ fmt_tok(s.context_peak) }}</span>
 </div>
-{% if s.writes_by_cause %}
+{# THE SAME FOUR STATES AS `cli._print_subagent` (spec 2026-10-02 §1.4): an empty
+   floored list is a FLOOR and never an absence, so the threshold-free total is printed
+   beside it. #}
+{% if s.total_written is none %}
+{# THE FOURTH STATE, ahead of the rest: the figures are ABSENT, not zero, on every order
+   sealed before they were recorded. Names the SEAL, never an absence of writes. #}
+<div class="sub" style="padding: 0 16px 8px;">cache anatomy not in this seal — sealed
+  before it was recorded.</div>
+{% elif s.writes_by_cause %}
 <div class="sub" style="padding: 0 16px 8px;">cache writes:
   {% for cause, written in s.writes_by_cause.items() %}<span class="mono">{{ cause }}</span> {{ fmt_tok(written) }}{{ " · " if not loop.last }}{% endfor %}
 </div>
+{% elif s.total_written %}
+<div class="sub" style="padding: 0 16px 8px;">wrote
+  <span class="mono">{{ '{:,}'.format(s.total_written) }}</span> in
+  {{ s.api_call_count }} calls — no single write reached the
+  {{ '{:,}'.format(s.write_floor) }} floor
+  (largest {{ '{:,}'.format(s.max_write) }}).</div>
+{% else %}
+<div class="sub" style="padding: 0 16px 8px;">wrote nothing to the cache.</div>
+{% endif %}
+{% if s.rewrite and s.rewrite.boundaries %}
+<div class="sub" style="padding: 0 16px 8px;">{{ s.rewrite.boundaries }}
+  boundar{{ 'ies' if s.rewrite.boundaries != 1 else 'y' }} ·
+  re-write {{ fmt_tok(s.rewrite.tokens) }} ·
+  {% if s.rewrite.undecided_boundaries %}unclassified (no
+  <code>os.cold_prefix_floor</code>){% else %}ttl {{ fmt_tok(s.rewrite.ttl_write) }},
+  prefix-miss {{ fmt_tok(s.rewrite.prefix_write) }}{% endif %}</div>
+{% elif s.total_written %}
+<div class="sub" style="padding: 0 16px 8px;">no boundary — one continuous conversation,
+  so no re-write tax. STRUCTURAL, not small:
+  {{ '{:,}'.format(s.total_written) }} was still written.</div>
 {% endif %}
 <div class="sub" style="padding: 0 16px 8px;">{{ s.deeper }} subagent(s) of its own,
   counted and not read — this report reads {{ s.depth_read }} level deep.</div>

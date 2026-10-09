@@ -1,6 +1,6 @@
 """The registry the OS uses to recognise its own recurring gaps — grammar and evaluator.
 
-docs/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
+docs/superpowers/specs/2026-09-27-self-evolution.md §3. This module is the LEAF of that
 feature: the condition grammar, the pure evaluator, the `Facts` shape, the lookup
 contract `resolve`, and the five seed rows. It holds no store, fires nothing and acts on
 nothing.
@@ -102,6 +102,25 @@ REFUSED = "refused"        # the remedy path declined — allow-list, grant, pre
 UNREADABLE = "unreadable"  # something could not be READ; nothing was decided
 CLEARED = "cleared"        # the fire closed because the condition no longer holds
 FIRE_OUTCOMES = (RECORDED, PROPOSED, APPLIED, REFUSED, UNREADABLE, CLEARED)
+
+#: `rule_recurrences.verdict`: WHICH HALF OF THE RULE did not hold when a gap the OS
+#: already has a detector for happened again (spec §8). Four values, not the three the
+#: spec's own DDL comment listed — Neo question 974 added `unreadable`, because an armed
+#: detector whose fire says "nothing could be READ" decided nothing, and calling that
+#: `missed` would claim the condition was evaluated and came back false. The pinned
+#: ruling is that the OS never fabricates a default answer from a failure to find one,
+#: and a verdict is the thing a finding is filed against, so the wrong one sends the fix
+#: at the wrong half.
+#:
+#: `UNREADABLE_RECURRENCE` reuses the `UNREADABLE` string on purpose: one word means one
+#: thing across both columns, and a reader comparing a fire's outcome with a recurrence's
+#: verdict should not have to translate. The NAME differs only because `UNREADABLE` is
+#: already bound to the fire outcome in this module's namespace.
+MISSED = "missed"
+REMEDY_FAILED = "remedy_failed"
+NOT_ARMED = "not_armed"
+UNREADABLE_RECURRENCE = UNREADABLE
+RECURRENCE_VERDICTS = (NOT_ARMED, MISSED, REMEDY_FAILED, UNREADABLE_RECURRENCE)
 
 #: How deep and how wide a condition may be. Not a performance limit — the documents are
 #: tiny. It is a REVIEWABILITY limit: a person arming a rule is authorising what it will
@@ -209,6 +228,9 @@ FACT_FIELDS: dict[str, FactField] = _fields(
     # `ops.state_durations`. Everything here is derived from the timeline, so it is the
     # source that makes "has been like this for an hour" expressible at all.
     ("seconds_in_status", NUM, "state_durations", "since the last status change"),
+    ("seconds_in_status_active", NUM, "state_durations",
+     "since the last status change, minus every interval `holds` says the order was not "
+     "permitted to run"),
     ("seconds_since_activity", NUM, "state_durations", "since the newest timeline event"),
     ("lifetime_seconds", NUM, "state_durations", "since the order was created"),
     ("last_activity_kind", STR, "state_durations", "the newest timeline event's kind"),
@@ -683,13 +705,35 @@ def explain(cond: Mapping[str, Any], evaluation: Evaluation) -> str:
     return f"did not match: {render_condition(cond)}"
 
 
-def facts(store: Any, wo: Mapping[str, Any], *, now: float) -> Facts:
-    """Build one order's `Facts`. DECLARED HERE, BODY OWNED BY THE EVALUATION PASS.
+def facts(store: Any, wo: Mapping[str, Any], *, now: float,
+          sources: Any = None) -> Facts:
+    """Build one order's `Facts`. DECLARED HERE, IMPLEMENTED BY `ops.rule_facts`.
 
     The signature is this section's and the body is a sibling section's (spec §3, the
     evaluation-and-firing pass): the two are built in parallel and neither worker can see
     the other's text, so the contract is written down where the grammar is and the
     implementation follows. Deliberate, not an oversight.
+
+    **WHY THE READERS LIVE IN `ops` AND THIS DELEGATES THROUGH A CALL-TIME IMPORT.**
+    Every reader behind a `FactField.source` slug sits ABOVE this module — `ops` itself,
+    `holds`, `invariants`, `budget` — so writing them here would end the leaf property
+    this module's docstring states, and that property is not decoration: `remedies` and
+    `central_store` both import `rules` inside function bodies precisely because it is
+    cheap, and dragging `project_store`, `neo_store` and `budget` in behind it was
+    measured at 0.127s of eager import in the sibling section's own note.
+
+    The leaf claim is about the IMPORT GRAPH, which is what decides that cost, and a
+    `from . import ops` inside this function body does not touch it: nothing is imported
+    until somebody asks for a snapshot, by which time the caller already holds a store
+    and therefore already imported `ops`. The alternative considered and rejected was to
+    raise here and make every caller reach `ops.rule_facts` directly — which would leave
+    TWO public spellings of one contract, and the surfaces that build a snapshot (the
+    sweep, `jarvis rules dry-run`) would each have to know where the readers live. One
+    contract, one implementation, and the import stays where it costs nothing.
+
+    `sources` is the union of `sources_used(cond)` over the detectors that will actually
+    be evaluated; `None` reads everything and is for a single-order dry run, never a
+    sweep.
 
     THE CONTRACT the implementation must keep:
 
@@ -711,10 +755,9 @@ def facts(store: Any, wo: Mapping[str, Any], *, now: float) -> Facts:
       about `status` costs one row read;
     * `now` is passed in, never read here, for the reason `Facts.now` gives.
     """
-    raise NotImplementedError(
-        "rules.facts is declared by the grammar section and implemented by the "
-        "evaluation pass (spec §3, the evaluation-and-firing section), which owns the "
-        "readers behind every FactField.source slug")
+    from . import ops
+
+    return ops.rule_facts(store, dict(wo), now=now, sources=sources)
 
 
 # -- the lookup contract ----------------------------------------------------------------
@@ -778,6 +821,113 @@ def effective_status(detector: Mapping[str, Any],
     rem = RETRACTED if _retired(remedy_rule) else str(
         remedy_rule.get("status") or DRY_RUN)
     return det if _STRENGTH.get(det, 0) <= _STRENGTH.get(rem, 0) else rem
+
+
+# -- the recurrence lookup and verdict (spec §8) --------------------------------------
+#
+# When an investigation lands on a `gap_class` a detector ALREADY exists for, the thing
+# that happened is not "a new bug": either the condition missed the symptom, or it
+# matched and the remedy failed, or the rule was still in `dry_run` and never acted.
+# Both functions below are PURE — they take rows and return words — so the ledger write
+# and the tracker act (`ops.record_recurrence`) can be tested against a derived verdict
+# instead of a guessed one.
+
+
+def recurrence(detectors: Iterable[Mapping[str, Any]], gap_class: str, *,
+               project: str = "") -> Mapping[str, Any] | None:
+    """The ONE live detector for `gap_class` in `project`'s scope, or `None`. PURE.
+
+    `None` means no rule for this gap exists, which is a DIFFERENT finding from a rule
+    that failed: the caller must file a new gap, never a recurrence with an invented
+    verdict.
+
+    Scope is `CentralStore.list_detectors`' scope, restated because this function is also
+    handed rows a caller read some other way: a `project` of `''` is fleet-wide and
+    always in scope, a named one matches only itself. Retired rows are skipped by both
+    spellings the table records, `_retired`'s reason.
+
+    TIE-BREAK, and it is a RULING rather than a derivation (the work order's lead, on this
+    section): a PROJECT-SCOPED detector beats a fleet-wide one, because it was learned
+    from this project's own evidence; among equally scoped rows the OLDEST `ts` wins,
+    because the recurrence links back to the ORIGINAL issue and the original detector is
+    the one whose `issue_url` and `fix_wo_id` carry that thread. Crediting the newest
+    would start a second thread about the same gap, which is the one thing §8 exists to
+    prevent.
+    """
+    live = [row for row in detectors
+            if not _retired(row)
+            and str(row.get("gap_class") or "") == gap_class
+            and str(row.get("project") or "") in ("", project)]
+    if not live:
+        return None
+    return min(live, key=lambda row: (0 if row.get("project") else 1,
+                                      float(row.get("ts") or 0.0),
+                                      str(row.get("id") or "")))
+
+
+def recurrence_verdict(detector: Mapping[str, Any],
+                       fire: Mapping[str, Any] | None) -> str:
+    """Which half of the rule did not hold. PURE, and derived from the FIRE RECORD.
+
+    THE ONE PLACE that explains what each verdict blames; the schema comment and
+    `ops._RECURRENCE_NOTES` point here rather than restating it.
+
+    `fire` is the newest fire this detector has on the order in question, cleared or
+    not, or `None` when it has none.
+
+    THERE IS NO STUCKNESS CHECK, on Neo question 1529: §8's "stuck anyway" reads as the
+    moment of the ORIGINAL fire, not now, and a recurrence is itself the evidence the
+    remedy did not hold — so the fire outcome alone is the whole predicate.
+
+    - A detector that is not `armed` gives `not_armed` whatever the fire says: a
+      `dry_run` rule acts on nothing, so neither its condition nor its remedy can be
+      blamed, and the recurrence is evidence FOR arming it. A retired row lands here too
+      and cannot be blamed either, though `recurrence` never returns one.
+    - `armed` with no fire is `missed`: the condition did not match what happened, and
+      the finding is about the condition.
+    - `armed` with a `proposed`, `refused` or `applied` fire is `remedy_failed`.
+      `applied` is in that set on Neo question 974's ruling: the remedy RAN and the gap
+      recurred anyway, so the remedy is still the half that failed — a remedy that leaves
+      the gap standing is not a remedy that worked.
+    - `armed` with an `unreadable` fire gives `unreadable`, its OWN verdict and never
+      `missed`. Calling it `missed` would claim a decision that was never read, which the
+      pinned ruling against fabricating a default answer from a failure forbids. It is
+      also NOT evidence for arming: nothing was evaluated.
+    - `armed` with a `recorded` or `cleared` fire is treated as NO USABLE FIRE, so
+      `missed`. A `recorded` fire is a dry-run artefact that cannot exist under an armed
+      detector, and a `cleared` fire is a condition that stopped holding — neither says
+      the rule acted on what is happening now.
+    """
+    if _retired(detector) or str(detector.get("status") or DRY_RUN) != ARMED:
+        return NOT_ARMED
+    outcome = str((fire or {}).get("outcome") or "")
+    if outcome in (PROPOSED, REFUSED, APPLIED):
+        return REMEDY_FAILED
+    if outcome == UNREADABLE:
+        return UNREADABLE_RECURRENCE
+    return MISSED
+
+
+def recurrence_comment(*, order_id: str, gap_class: str, verdict: str,
+                       detector_id: str) -> str:
+    """The comment that goes on the ORIGINAL public issue. THE REDACTION BOUNDARY.
+
+    §8's "redact before it leaves the OS": the tracker is PUBLIC, so this carries the
+    order id, the gap class, the verdict and the detector id, AND NOTHING ELSE. There is
+    no fifth parameter — not the order's title, not its description, not a fire's
+    `detail` (which is text a worker wrote), not an attention reason, not the condition in
+    prose — so there is no path any of them could reach a public comment through. The
+    full local account lives in `rule_recurrences.filed_note`, which is not published.
+    """
+    return (
+        "**This gap recurred: the OS already had a rule for it and the rule did not "
+        "hold.**\n\n"
+        f"- gap class: `{gap_class}`\n"
+        f"- detector: `{detector_id}`\n"
+        f"- verdict: `{verdict}`\n"
+        f"- seen again on: `{order_id}`\n\n"
+        "Filed by Jarvis against the original issue rather than as a new one, so the "
+        "gap stays one thread.\n")
 
 
 def readable_detectors(

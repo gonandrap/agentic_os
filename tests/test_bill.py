@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from jarvis import agent_usage, bill as bill_mod, ops, usage
+from jarvis import agent_usage, bill as bill_mod, ops, project_store, usage
 from jarvis.central_store import CentralStore
 from jarvis.project_store import ProjectStore
 
@@ -27,8 +27,8 @@ from jarvis.project_store import ProjectStore
 # two divergent definitions of "a recorded turn" is exactly how two accountings of one
 # work order get built.
 from tests.test_cost_report import (  # noqa: F401
-    add_turn, assistant_row, give_session, recorded_usage, registered, store,
-    transcripts,
+    add_turn, assistant_row, give_session, placeholder_rows, recorded_usage, registered,
+    store, transcripts,
 )
 
 
@@ -325,6 +325,202 @@ def test_a_subagent_bigger_than_its_turn_cannot_inflate_the_bill(store, wo,
     assert gap["tokens"]["cache_write"] == 99_999
 
 
+# -- what no transcript measured is not the lead's --------------------------------------
+#
+# docs/superpowers/specs/2026-10-08-subagent-output-attribution.md. A subagent's
+# transcript reports a fraction of its real output (every row mid-stream, no sealed row
+# ever written), and the lead used to be handed the whole difference: 69,460 output
+# tokens on wo-be05ab99 turn 2 against its own transcript's 17,421.
+
+
+def with_placeholder_subagent(store, wo, transcripts, *, started: float = 1_000.0,
+                              output: int = 100_000, lead_at: float | None = None):
+    """One recorded turn: a lead whose three calls are SEALED, a subagent that is not.
+
+    The envelope reports `output` for the whole turn; the lead's own transcript accounts
+    for 20,000 of it and the subagent's placeholder rows for 5. The rest is measured by
+    nothing, which is the case the whole spec is about.
+    """
+    give_session(store, wo["id"], "sess-ph")
+    first = started + 5 if lead_at is None else lead_at
+    transcripts(
+        "sess-ph",
+        [assistant_row("m1", write=1_000, read=5_000, out=6_000, at=first),
+         assistant_row("m2", write=1_000, read=5_000, out=7_000, at=first + 1),
+         assistant_row("m3", write=1_000, read=5_000, out=7_000, at=first + 2)],
+        subagents=[(placeholder_rows("s1", write=1_000, read=50_000, out=5,
+                                     at=started + 20),
+                    {"agentType": "Explore", "description": "read the code"})])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=10_000, cache_read=100_000,
+                                          output=output, cache_1h=0, cache_5m=10_000))
+    at(store, turn["id"], started, started + 60)
+    return turn
+
+
+def agent_rows(b: dict, turn_label: str = "turn 1") -> dict:
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    turn_line = next(c for c in worker["children"] if c["label"] == turn_label)
+    return {child["label"]: child for child in turn_line["children"]}
+
+
+def test_the_lead_is_charged_its_own_calls_and_not_the_remainder(store, wo, transcripts):
+    """The defect: the lead row was the turn minus its subagents, so every token a
+    subagent's placeholder rows failed to report was charged to the lead."""
+    with_placeholder_subagent(store, wo, transcripts)
+
+    b = ops.bill(wo["id"])
+    rows = agent_rows(b)
+
+    lead = rows[bill_mod.LEAD]
+    assert lead["tokens"]["output"] == 20_000          # its own calls, not ~85k
+    assert lead["tokens"]["cache_write"] == 3_000
+    assert lead["tokens"]["cache_read"] == 15_000
+    assert lead["note"] == bill_mod.LEAD_NOTE
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    for cls in ("input", "cache_write", "cache_read", "output", "total"):
+        assert sum(line["tokens"][cls] for line in b["agents"]) \
+            == worker["tokens"][cls], cls
+
+
+def test_what_no_transcript_accounts_for_is_its_own_row_not_the_leads(store, wo,
+                                                                      transcripts):
+    """The residue gets a row that says it is a residue."""
+    with_placeholder_subagent(store, wo, transcripts)
+
+    b = ops.bill(wo["id"])
+    rows = agent_rows(b)
+
+    residue = rows[bill_mod.UNATTRIBUTED]
+    assert residue["tokens"]["output"] == 100_000 - 20_000 - 5
+    assert residue["tokens"]["cache_write"] == 10_000 - 3_000 - 1_000
+    assert residue["tokens"]["cache_read"] == 100_000 - 15_000 - 50_000
+    assert residue["note"] == bill_mod.UNATTRIBUTED_NOTE
+    assert residue["calls"] == 0                       # not a countable act
+    # Priced in the envelope's own band, like the lead's row: a residue in the wrong
+    # model's band is a wrong dollar figure.
+    assert residue["models"] == rows[bill_mod.LEAD]["models"]
+    # And it is its own agent line, last — the lead reads first, the residue is not one.
+    assert [line["label"] for line in b["agents"]][-1] == bill_mod.UNATTRIBUTED
+    assert bill_mod.reconcile(b)["balanced"], bill_mod.reconcile(b)["problems"]
+
+
+def test_jarvis_cost_prints_the_residue_and_the_placeholder_sentence(store, wo,
+                                                                     transcripts,
+                                                                     capsys):
+    """§7, the terminal half: both reworded captions, and §9's UNKNOWN-not-zero rule."""
+    from jarvis import cli
+
+    with_placeholder_subagent(store, wo, transcripts)
+    b = ops.bill(wo["id"], live=True)
+
+    cli._print_bill(b)
+    out = capsys.readouterr().out
+
+    assert bill_mod.UNATTRIBUTED in out
+    assert "then what no transcript accounts for" in out
+    assert bill_mod.PLACEHOLDER_NOTE in out
+    # A seal written before the measurement existed has no `placeholder` block, and
+    # prints NEITHER sentence — unknown, never a zero.
+    cli._print_bill({k: v for k, v in b.items() if k != "placeholder"})
+    old = capsys.readouterr().out
+    assert bill_mod.PLACEHOLDER_NOTE not in old
+    assert bill_mod.PLACEHOLDER_ZERO not in old
+
+
+def test_a_turn_with_no_subagents_is_unchanged(store, wo, transcripts):
+    """The regression guard, and the common case: with no subagent the only things the
+    lead's transcript cannot cover are side-model calls and CLI self-compaction, and both
+    are the lead's own spend."""
+    give_session(store, wo["id"], "sess-alone")
+    transcripts("sess-alone",
+                [assistant_row("m1", write=1_000, read=5_000, out=6_000, at=1_005)])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=10_000, cache_read=100_000,
+                                          output=100_000, cache_1h=0, cache_5m=10_000))
+    at(store, turn["id"], 1_000.0, 1_060.0)
+
+    b = ops.bill(wo["id"])
+
+    labels = {line["label"] for line in b["agents"]} \
+        | {leaf["label"] for leaf in leaves({"children": b["actors"]})} \
+        | {leaf["label"] for leaf in leaves({"children": b["turns"]})}
+    assert bill_mod.UNATTRIBUTED not in labels
+    lead = next(line for line in b["agents"] if line["label"] == bill_mod.LEAD)
+    assert [lead["tokens"][cls] for cls in
+            ("input", "cache_write", "cache_read", "output")] == \
+        [0, 10_000, 100_000, 100_000]
+    assert b["checks"]["balanced"], b["checks"]["problems"]
+
+
+def test_a_pruned_lead_transcript_still_gives_the_lead_the_remainder_and_says_so(
+        store, wo, transcripts):
+    """§4: with no lead cover there is no figure to split on, so the old behaviour
+    stands — and the note stops it reading as a measurement."""
+    with_placeholder_subagent(store, wo, transcripts, lead_at=100.0)
+
+    b = ops.bill(wo["id"])
+    rows = agent_rows(b)
+
+    assert next(r for r in b["turn_rows"] if r["seq"] == 1)["calls_source"] == "envelope"
+    assert bill_mod.UNATTRIBUTED not in rows
+    lead = rows[bill_mod.LEAD]
+    assert lead["tokens"]["output"] == 100_000 - 5     # the whole remainder
+    assert lead["note"] == bill_mod.LEAD_UNMEASURED_NOTE
+
+
+def test_a_lead_transcript_bigger_than_its_turn_cannot_inflate_the_bill(store, wo,
+                                                                        transcripts):
+    """§5: the clamp, and the excess it must not swallow. Sibling of
+    `test_a_subagent_bigger_than_its_turn_cannot_inflate_the_bill`, worded about the
+    right thing — the existing sentence is about subagents and would be a lie here."""
+    with_placeholder_subagent(store, wo, transcripts, output=10_000)
+
+    b = ops.bill(wo["id"])
+    rows = agent_rows(b)
+
+    # Clamped to its envelope share: the subagent's 5 first, the lead the 9,995 left —
+    # not the 20,000 its own transcript claims.
+    assert rows[bill_mod.LEAD]["tokens"]["output"] == 10_000 - 5
+    # Nothing is left over in the class that was squeezed; the other three still have a
+    # residue, and that residue is a different fact (test above).
+    assert rows[bill_mod.UNATTRIBUTED]["tokens"]["output"] == 0
+    worker = next(line for line in b["actors"] if line["key"] == "worker")
+    turn_line = next(c for c in worker["children"] if c["label"] == "turn 1")
+    assert turn_line["tokens"]["output"] == 10_000     # the envelope, not more
+    assert any("more than the turn's envelope reports" in note for note in b["notes"])
+    # Said about the LEAD, not in the subagent's words.
+    assert not any("a subagent's own transcript reports" in note for note in b["notes"])
+
+
+def test_a_running_turn_declares_its_placeholder_calls(store, wo, transcripts):
+    """§6: a turn in flight is charged from the transcript, which under-reports a
+    subagent's output by construction. The line that is LOW is the line that says so —
+    and it says it without estimating the difference (decision 3)."""
+    give_session(store, wo["id"], "sess-live-ph")
+    transcripts(
+        "sess-live-ph",
+        [assistant_row("m1", write=100_000, out=5_000, at=1_005)],
+        subagents=[(placeholder_rows("s1", write=1_000, read=2_000, out=5, at=1_010),
+                    {"agentType": "Task"})])
+    turn = store.create_turn(wo["id"], kind="dispatch", prompt="p")
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (1_000.0, turn["id"]))
+    store.conn.commit()
+
+    b = ops.bill(wo["id"])
+
+    assert b["placeholder"] == {"calls": 1, "output": 5, "main_calls": 0,
+                                "subagent_calls": 1}
+    line = next(leaf for leaf in leaves({"children": b["actors"]})
+                if "still running" in leaf["label"])
+    assert bill_mod.PLACEHOLDER_NOTE in line["note"]
+    # The half that guards decision 3: the figure is the MAX-merged transcript sum, so
+    # nothing was scaled or synthesised to cover the shortfall it just disclosed.
+    assert line["tokens"]["output"] == 5_000 + 5
+    assert b["checks"]["balanced"], b["checks"]["problems"]
+
+
 def test_a_turn_that_spawned_nothing_gets_no_agent_level(store, wo, transcripts):
     """A level that always says "the lead agent" and nothing else is noise.
 
@@ -478,6 +674,52 @@ def test_a_turn_bigger_than_everything_inside_it_fails_the_checks(store, wo,
 
     assert not b["checks"]["balanced"]
     assert any("everything inside it" in p for p in b["checks"]["problems"])
+
+
+def lead_line(label: str, output: int, children: list | None = None) -> dict:
+    """One bill line carrying `output` tokens and nothing else, for `reconcile`."""
+    return {
+        "key": label, "label": label, "note": "", "calls": 1, "unit": "turn",
+        "tokens": {"input": 0, "cache_write": 0, "cache_read": 0, "output": output,
+                   "cache_1h": 0, "cache_5m": 0, "billed_input": 0, "cached_input": 0,
+                   "total": output},
+        "cost": {"list_usd": 0.0, "exact_usd": 0.0, "by_class": {},
+                 "write_rate": 1.25},
+        "exact_missing": 0, "models": [], "usage_versions": [],
+        "children": children or [],
+    }
+
+
+def lead_payload(charged: int, cover: dict | None) -> dict:
+    """A one-turn bill whose lead row is charged `charged` output, over `cover`."""
+    lead = lead_line(bill_mod.LEAD, charged)
+    worker = lead_line(bill_mod.WORKER, charged, [lead])
+    row = {"seq": 1, "recorded": True, "input": 0, "cache_write": 0, "cache_read": 0,
+           "output": charged}
+    if cover is not None:
+        row["calls_cover_by_model"] = cover
+    return {
+        "total": lead_line("total", charged),
+        "turns": [lead_line("1", charged, [worker])],
+        "turn_rows": [row],
+    }
+
+
+def test_a_lead_row_can_never_exceed_the_leads_own_transcript(store):
+    """§8: the one direction that is a defect rather than something a transcript cannot
+    see. `_check_calls` already calls the same shape a defect for a turn's calls."""
+    cover = {"claude-opus-5": {"input": 0, "cache_write": 0, "cache_read": 0,
+                               "output": 20_000}}
+
+    inflated = bill_mod.reconcile(lead_payload(30_000, cover))
+    assert not inflated["balanced"]
+    assert "turn 1: the lead agent is charged 30000 output, more than its own API " \
+           "calls report (20000)" in inflated["problems"]
+
+    assert bill_mod.reconcile(lead_payload(20_000, cover))["balanced"]
+    # §4's fallback: with no cover the lead legitimately holds the remainder, and a check
+    # that cannot speak says nothing rather than guessing.
+    assert bill_mod.reconcile(lead_payload(30_000, None))["balanced"]
 
 
 def test_a_seal_counted_as_the_session_is_corrected_downward(store, wo, transcripts,
@@ -702,6 +944,21 @@ def test_a_corrected_seal_says_what_it_corrected_rather_than_what_it_added(
     printed = capsys.readouterr().out
     assert "saw every token the seal held" not in printed
     assert "the whole session's running total" in printed
+
+
+def test_the_bills_provenance_renderer_is_not_the_autopsys(store, wo, capsys):
+    """TWO FUNCTIONS, TWO NAMES. `read_session` exists twice across two modules and cost
+    §4 of 2026-09-27-order-autopsy-durability.md a whole AST pin; a second
+    `_print_provenance` inside ONE module would be that trap with no pin at all, because
+    Python would simply bind the later definition over this one.
+    """
+    from jarvis import cli
+
+    cli._print_provenance({"sealed_at": 1_000.0, "gaps": [], "complete": True})
+    printed = capsys.readouterr().out
+
+    assert "sealed when this order settled" in printed
+    assert cli._print_provenance is not cli._print_autopsy_provenance
 
 
 def test_a_seal_stands_when_the_shrink_is_a_transcript_that_was_pruned(
@@ -1148,6 +1405,39 @@ def test_an_old_seal_stands_once_the_evidence_is_gone(store, wo, transcripts,
     assert not b["accuracy"].get("resealed_at")
 
 
+def test_an_old_seal_is_not_restaled_by_the_new_keys(store, wo, transcripts):
+    """§9's decided tradeoff: the attribution keys are ADDITIVE at version 5.
+
+    Bumping the version would mark every sealed bill stale and re-read transcripts that
+    may have part-expired, turning an already-correct seal into a permanent unknown
+    (kn-938b1878). So a version-5 seal written before this release keeps its numbers and
+    simply has no `placeholder` block — which a reader must read as UNKNOWN, not zero.
+    """
+    give_session(store, wo["id"], "sess-v5")
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=1_000, cache_read=600, output=50,
+                                          cache_1h=0, cache_5m=1_000))
+    transcripts("sess-v5", [assistant_row("m1", write=1_000, read=600, out=50,
+                                          at=turn["started_at"] + 1)])
+    store.set_status(wo["id"], "completed")
+    sealed = bill_mod.seal("proj_a", store.project_path, store.get_work_order(wo["id"]))
+    at_sealed = store.get_work_order(wo["id"])["bill_sealed_at"]
+
+    # A seal from before this release: version 5, and none of the new keys.
+    stale = {k: v for k, v in sealed.items() if k != "placeholder"}
+    for row in stale["turn_rows"]:
+        row.pop("calls_cover_by_model", None)
+    store.seal_bill(wo["id"], json.dumps(stale), at=at_sealed)
+    order = store.get_work_order(wo["id"])
+
+    assert bill_mod._upgrade_seal("proj_a", store.project_path, order,
+                                  json.loads(order["bill_json"]), feature=False) is None
+    served = ops.bill(wo["id"])
+    assert "placeholder" not in served                 # unknown, and rendered as nothing
+    assert served["total"]["tokens"] == sealed["total"]["tokens"]
+    assert "resealed_at" not in served["accuracy"]     # no transcript was re-read
+
+
 def test_a_bill_without_a_catalog_fails_loudly_rather_than_guessing(store, wo,
                                                                     transcripts):
     """No catalog, no classification — and the error says which key is missing.
@@ -1212,7 +1502,7 @@ def test_a_catalog_that_cannot_be_parsed_fails_the_bill_too(store, wo, transcrip
 
 # -- the observability class -------------------------------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. Money spent LOOKING at the order,
 # reported as its own class for `WORKER_SUBPROCESS`'s reason: mixing it with what was spent
 # DOING the order answers neither question. Zero dollars beside a non-zero count and wall
 # clock is the honest rendering of a mechanical path, not a bug.
@@ -1308,6 +1598,86 @@ def test_a_metered_look_has_no_reading_so_it_discloses_no_under_reading(store, w
     assert envelope["wall_ms"] == 12 and "usage_v" not in envelope
 
 
+# -- the re-write tax, labelled by side (spec 2026-10-02 §1.5) ------------------------
+
+
+def two_sided(store, wo, transcripts) -> None:
+    """A session whose MAIN side pays a re-write tax and whose subagent cannot.
+
+    Main: three writes against a context peak smaller than their sum, with one cache
+    read going backwards. Subagent: monotonic reads far above what it wrote, which is
+    every real subagent — so its excess and its boundaries are 0 BY ARITHMETIC.
+    """
+    give_session(store, wo["id"], "sess-sides")
+    transcripts(
+        "sess-sides",
+        [assistant_row("m1", write=60_000, read=50_000, out=10, at=1_001),
+         assistant_row("m2", write=60_000, read=1_000, out=10, at=1_002),
+         assistant_row("m3", write=60_000, read=2_000, out=10, at=1_003)],
+        subagents=[[assistant_row("s1", write=5_000, read=100_000, out=5, at=1_005),
+                    assistant_row("s2", write=5_000, read=120_000, out=5, at=1_006)]])
+    turn = add_turn(store, wo["id"], dict(recorded_usage(0.05), input=0,
+                                          cache_write=190_000, cache_read=273_000,
+                                          output=40))
+    at(store, turn["id"], 1_000.0, 1_060.0)
+
+
+def test_the_rewrite_tax_names_the_subagent_side_and_its_zero(store, wo, transcripts):
+    """The unlabelled rollup read as "subagent cache spend is negligible". It is not
+    negligible; it was unattributable from that number."""
+    two_sided(store, wo, transcripts)
+
+    rewrite = ops.bill(wo["id"], live=True)["rewrite"]
+    side = rewrite["by_side"]
+
+    assert side["main"]["tokens"] == rewrite["tokens"] > 0
+    assert side["main"]["boundaries"] == rewrite["boundaries"] == 1
+    assert side["subagent"]["tokens"] == 0
+    assert side["subagent"]["boundaries"] == 0
+    assert side["subagent"]["cache_write"] == 10_000
+    assert side["subagent"]["count"] == 1
+    assert side["subagent"]["structural_zero"] is True
+    # The TOTAL is untouched: `jarvis cost`'s headline arithmetic must not move.
+    assert rewrite["cache_write"] == (side["main"]["cache_write"]
+                                      + side["subagent"]["cache_write"])
+
+
+def test_the_structural_zero_is_printed_with_what_the_subagents_wrote(store, wo,
+                                                                      transcripts,
+                                                                      capsys):
+    from jarvis import cli
+
+    two_sided(store, wo, transcripts)
+
+    cli._print_bill(ops.bill(wo["id"], live=True))
+    out = capsys.readouterr().out
+
+    assert "a STRUCTURAL zero" in out and "10,000" in out
+    assert "1 subagent(s) still wrote" in out
+
+
+def test_a_non_zero_subagent_side_prints_the_two_sides_and_no_note(store, wo,
+                                                                  transcripts, capsys):
+    """A real finding, so the sentence above would be a lie about it (§1.5).
+
+    The subagent side is hand-set on a REAL bill rather than a hand-built payload: the
+    arithmetic cannot produce this case, and the renderer must still be right if some
+    future measurement does.
+    """
+    from jarvis import cli
+
+    two_sided(store, wo, transcripts)
+    payload = ops.bill(wo["id"], live=True)
+    payload["rewrite"]["by_side"]["subagent"].update(
+        tokens=400, boundaries=1, structural_zero=False)
+
+    cli._print_bill(payload)
+    out = capsys.readouterr().out
+
+    assert "a STRUCTURAL zero" not in out
+    assert "main " in out and "subagent 400" in out
+
+
 def test_the_absent_sentences_have_one_source(store, wo):
     """The four sentences were duplicated in `cli._print_bill` and in bill.html; wording
     that differs between two renderers is wording the reader stops trusting."""
@@ -1319,3 +1689,165 @@ def test_the_absent_sentences_have_one_source(store, wo):
     assert set(keys) == {bill_mod.WORKER, bill_mod.JARVIS, bill_mod.SUBPROC}
     assert set(bill_mod.ABSENT_NOTES) == {bill_mod.WORKER, bill_mod.JARVIS,
                                           bill_mod.SUBPROC, bill_mod.OBSERVE}
+
+
+# -- a compaction is counted once ------------------------------------------------------
+# docs/superpowers/specs/2026-10-08-count-a-compaction-once.md
+
+
+def compact_turn(store, wo_id: str, usage: dict | None, state: str = "done") -> dict:
+    """A `compact` turn row: the OS's `/compact`, recorded as a turn like any other."""
+    turn = store.create_turn(wo_id, kind=project_store.COMPACT_TURN, prompt="/compact")
+    if state == "running":
+        return store.get_turn(turn["id"])
+    store.finish_turn(turn["id"], state, result="r",
+                      cost_usd=usage["total_cost_usd"] if usage else None,
+                      num_turns=1,
+                      usage_json=json.dumps(usage) if usage else None)
+    return store.get_turn(turn["id"])
+
+
+def compaction_call(wo_id: str, ts: float | None = None, cost: float = 0.3) -> None:
+    os_call(wo_id, agent_usage.COMPACTION, label="compaction", ts=ts, cost=cost,
+            question_id=None)
+
+
+COMPACTION_TOKENS = 10 + 5_000 + 20_000 + 900
+TURN_TOKENS = 2 + 2_558 + 45_689 + 941
+
+
+def test_compaction_is_not_charged_to_the_worker(store, wo):
+    """One compaction, one charge: on the Jarvis half, never on both."""
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    add_turn(store, wo["id"], recorded_usage(0.07))
+    compact_turn(store, wo["id"], recorded_usage(0.3))
+    compaction_call(wo["id"])
+
+    b = ops.bill(wo["id"])
+    actors = {line["key"]: line for line in b["actors"]}
+
+    assert b["total"]["tokens"]["total"] == 2 * TURN_TOKENS + COMPACTION_TOKENS
+    assert actors["worker"]["tokens"]["total"] == 2 * TURN_TOKENS
+    assert actors["jarvis"]["tokens"]["total"] == COMPACTION_TOKENS
+
+
+def test_compaction_keeps_its_turn_line(store, wo):
+    """The turn does not disappear from the by-turn table; it changes actor."""
+    first = add_turn(store, wo["id"], recorded_usage(0.05))
+    at(store, first["id"], 1_000, 1_090)
+    compact = compact_turn(store, wo["id"], recorded_usage(0.3))
+    at(store, compact["id"], 1_100, 1_190)
+    compaction_call(wo["id"], ts=1_150)
+
+    b = ops.bill(wo["id"])
+    line = next(line for line in b["turns"] if line["key"] == str(compact["seq"]))
+
+    assert [child["key"] for child in line["children"]] \
+        == [f"{compact['seq']}/{bill_mod.JARVIS}"]
+    assert line["tokens"]["total"] == COMPACTION_TOKENS
+
+
+def test_compaction_does_not_mask_a_transcript_gap(store, wo, transcripts):
+    """`recorded` inflated by a compaction swallowed a real gap under `max(0, …)`."""
+    give_session(store, wo["id"], "sess-compact-gap")
+    transcripts("sess-compact-gap",
+                [assistant_row("m1", write=20_000, read=45_689, out=941)])
+    add_turn(store, wo["id"], recorded_usage(0.05))
+    add_turn(store, wo["id"], None)
+    compact_turn(store, wo["id"], dict(recorded_usage(0.3), cache_write=100_000))
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    gap = labels["turns with no result JSON left"]
+    assert gap["tokens"]["cache_write"] == 20_000 - 2_558
+
+
+def test_in_flight_compaction_does_not_mislabel_the_gap(store, wo, transcripts):
+    """A running compact turn is not one of the worker's unrecorded turns."""
+    give_session(store, wo["id"], "sess-compact-live")
+    transcripts("sess-compact-live",
+                [assistant_row("m1", write=50_000, out=2_000, at=1_005)])
+    lost = add_turn(store, wo["id"], None)
+    at(store, lost["id"], 1_000, 1_090)
+    running = compact_turn(store, wo["id"], None, state="running")
+    store.conn.execute("UPDATE wo_turns SET started_at=? WHERE id=?",
+                       (1_100.0, running["id"]))
+    store.conn.commit()
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    gap = labels["turns with no result JSON left"]
+    assert gap["calls"] == 1
+
+
+def test_only_compact_turns_reads_as_no_turns_on_record(store, wo, transcripts):
+    """An order whose only row is a compaction has no worker turns at all."""
+    give_session(store, wo["id"], "sess-compact-only")
+    transcripts("sess-compact-only",
+                [assistant_row("m1", write=50_000, read=1_000, out=2_000)])
+    compact_turn(store, wo["id"], recorded_usage(0.3))
+
+    b = ops.bill(wo["id"])
+    labels = {leaf["label"]: leaf for leaf in leaves({"children": b["actors"]})}
+
+    assert "the conversation, from its transcript" in labels
+    assert "turns with no result JSON left" not in labels
+
+
+def _double_counted(*, worker_child: bool, jarvis_child: bool) -> dict:
+    """A payload shaped like the defect: a compact turn with one or both children."""
+    seq = 3
+    children = []
+    if worker_child:
+        children.append(bill_mod._line(f"{seq}/{bill_mod.WORKER}", "the worker"))
+    if jarvis_child:
+        jarvis = bill_mod._line(f"{seq}/{bill_mod.JARVIS}", "jarvis")
+        jarvis["children"].append(bill_mod._line(
+            f"{seq}/{bill_mod.JARVIS}/{agent_usage.describe(agent_usage.COMPACTION)}",
+            agent_usage.describe(agent_usage.COMPACTION)))
+        children.append(jarvis)
+    line = bill_mod._line(str(seq), f"turn {seq}")
+    line["children"] = children
+    return {
+        "total": bill_mod._line("total", "total"),
+        "turns": [line],
+        "actors": [],
+        "turn_rows": [{"seq": seq, "kind": project_store.COMPACT_TURN,
+                       "recorded": True}],
+    }
+
+
+def test_double_counted_compaction_fails_reconcile():
+    """A check the fold invariants cannot make: `wo_turns` against `agent_calls`."""
+    both = bill_mod.reconcile(_double_counted(worker_child=True, jarvis_child=True))
+
+    assert not both["balanced"]
+    assert any("turn 3" in p and "counted twice" in p for p in both["problems"])
+    # The worker child alone is a pruned `agent_calls` row; the Jarvis child alone is
+    # the fixed state. Neither is a double count.
+    for kwargs in ({"worker_child": True, "jarvis_child": False},
+                   {"worker_child": False, "jarvis_child": True}):
+        checks = bill_mod.reconcile(_double_counted(**kwargs))
+        assert checks["balanced"], checks["problems"]
+
+
+def test_shortfall_check_survives_a_compaction(store, wo, transcripts):
+    """A compaction sets no `calls_cover`, which disabled the shortfall check whole."""
+    give_session(store, wo["id"], "sess-compact-short")
+    compact = compact_turn(store, wo["id"], recorded_usage(0.3))
+    at(store, compact["id"], 1_000, 1_090)
+    inflated = add_turn(store, wo["id"], dict(recorded_usage(2.5), usage_v=3, input=0,
+                                              cache_write=500_000,
+                                              cache_read=9_000_000, output=36_000,
+                                              cache_1h=0, cache_5m=500_000))
+    at(store, inflated["id"], 1_200, 1_290)
+    transcripts("sess-compact-short", [
+        assistant_row("m1", write=100_000, read=1_000_000, out=6_000, at=1_205),
+    ])
+
+    b = ops.bill(wo["id"])
+
+    assert not b["checks"]["balanced"]
+    assert any("everything inside it" in p for p in b["checks"]["problems"])

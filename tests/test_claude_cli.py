@@ -330,6 +330,20 @@ def test_the_input_size_lands_on_the_result_and_in_the_envelope(fake_claude,
     assert result.usage["system_prompt_chars"] == 8
 
 
+def test_the_call_is_timed_and_the_latency_rides_on_both(fake_claude, tmp_path) -> None:
+    """The only latency the OS records on a default fleet (the panel ships disabled), so
+    it is measured here, one layer below every caller. Spec §3,
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
+
+    BOTH places for `prompt_chars`' reason: `agent_usage.record` reads the dataclass when
+    a caller hands it one and the envelope when the caller passes `usage=result.usage`.
+    """
+    result = claude_cli.run_headless_result("hello there", cwd=tmp_path)
+
+    assert result.latency_ms is not None and result.latency_ms >= 0
+    assert result.usage["latency_ms"] == result.latency_ms
+
+
 def test_no_system_prompt_measures_zero_not_none(fake_claude, tmp_path) -> None:
     """`len(system_prompt or "")`: a call with no system prompt sent no system prompt."""
     result = claude_cli.run_headless_result("hi", cwd=tmp_path)

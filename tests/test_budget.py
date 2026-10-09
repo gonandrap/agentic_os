@@ -37,6 +37,7 @@ from jarvis.catalog import CatalogError, parse_catalog
 from jarvis.claude_cli import turn_args
 from jarvis.daemon import Daemon
 from jarvis.project_store import (
+    COMPACT_TURN,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     NOT_RETRIED,
@@ -122,15 +123,23 @@ def worker_calls(fake_claude) -> list[dict]:
                                       or "--resume" in c["argv"])]
 
 
-def bill_the_turn(store: ProjectStore, wo_id: str, usd: float) -> None:
+def bill_the_turn(store: ProjectStore, wo_id: str, usd: float, *,
+                  kind: str = "message", usage_v: int | None = None,
+                  outfile: str = "") -> None:
     """Charge a settled turn `usd`, the way a reaped turn's envelope would.
 
     Writes the column `budget.spent` sums rather than going through a fake turn, so a
     test about the ARITHMETIC of the ceiling is not also a test of the transport.
     """
-    turn = store.create_turn(wo_id, kind="message", prompt="work")
+    turn = store.create_turn(wo_id, kind=kind, prompt="work")
+    if outfile:
+        store.conn.execute("UPDATE wo_turns SET outfile=? WHERE id=?",
+                           (outfile, turn["id"]))
+    envelope: dict = {"total_cost_usd": usd}
+    if usage_v is not None:
+        envelope["usage_v"] = usage_v
     store.finish_turn(turn["id"], "done", result="done", cost_usd=usd,
-                      usage_json=json.dumps({"total_cost_usd": usd}))
+                      usage_json=json.dumps(envelope))
 
 
 # -- the flag, and what the CLI does with it ------------------------------------------
@@ -218,6 +227,36 @@ def test_the_ceiling_counts_both_halves_of_the_bill(started, store):
     assert spend.jarvis_usd == 1.0
     assert cap is not None
     assert cap.remaining_usd == 6.0
+
+
+def test_a_compaction_is_counted_once_against_the_ceiling(started, store):
+    """docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2."""
+    from jarvis.central_store import CentralStore
+
+    wo = ops.create_work_order("proj_a", "compacted", description="do it",
+                               budget_usd=10.0)
+    bill_the_turn(store, wo["id"], 3.0)
+    bill_the_turn(store, wo["id"], 1.5, kind=COMPACT_TURN)
+    central = CentralStore()
+    try:
+        central.add_agent_call("compaction", label="compaction", model="sonnet",
+                               project="proj_a", wo_id=wo["id"], ok=True,
+                               usage={"total_cost_usd": 1.5})
+        spend = budget.spent(store, central, wo["id"])
+    finally:
+        central.close()
+    assert spend.worker_usd == 3.0
+    assert spend.jarvis_usd == 1.5
+    assert spend.total_usd == 4.5
+
+
+def test_a_stale_compact_turn_still_fires_the_repair(started, store):
+    """The staleness aggregate must keep seeing every row, compact ones included."""
+    wo = ops.create_work_order("proj_a", "stale compact", description="do it")
+    bill_the_turn(store, wo["id"], 1.5, kind=COMPACT_TURN, usage_v=2,
+                  outfile="/nonexistent/turn.json")
+
+    assert budget._worker_row(store, wo["id"])["stale"] == 1
 
 
 def test_a_ceiling_re_reads_turns_counted_as_the_whole_session(started, store,
@@ -1029,6 +1068,8 @@ def test_topping_a_child_up_with_a_broke_feature_says_to_raise_the_feature(
     out = ops.set_work_order_budget(child["id"], 500.0)
     assert not out["resumed"]
     assert "its feature's slice" in out["note"]
+    # The NEGATIVE CONTROL for the kind-derived raise verb below: `jarvis fo budget` is
+    # right here and only here.
     assert "jarvis fo budget" in out["note"]
     assert "unreserved" in out["note"]
 
@@ -1052,4 +1093,377 @@ def test_the_post_condition_exempts_the_window_the_settler_declines(started, sto
     store.set_status(wo["id"], "running")
     assert [v.invariant for v in check_budgets_are_enforced(store)] == [
         "INV-BUDGET-OVERSPENT"]
+
+
+@pytest.mark.parametrize("knob", [None, 7.5])
+def test_no_second_budget_knob(jarvis_home, project, tmp_path, knob):
+    """Neo's one condition on 1073: the stuck sweep passes NO `budget_usd`, so the only
+    per-session ceiling is `worker.investigation_budget_usd` (§4 of
+    docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)."""
+    from test_health_sweep import park_order, stuck_catalog
+
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    spec = {"name": "proj_a", "path": str(project)}
+    if knob is not None:
+        spec["worker"] = {"investigation_budget_usd": knob}
+    cat = load_catalog(stuck_catalog(tmp_path, [spec]))
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+        Daemon(cat).stuck_tick(None)
+        opened = ops.list_investigation_orders("proj_a", include_settled=True)
+        assert len(opened) == 1
+        assert opened[0]["budget_usd"] == budget.investigation_default_for(
+            cat.project("proj_a"))
+        if knob is not None:
+            assert opened[0]["budget_usd"] == knob
+    finally:
+        store.close()
+
+
+# -- a family that is not a feature ----------------------------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: every budget
+# path above runs over `feature_orders` rows, and an improvement or investigation order
+# IS one of those rows. No test exercised a non-feature family, which is why six kind
+# leaks shipped green.
+
+
+def _an_investigation(store, budget_usd: float | None = None) -> dict:
+    """An `inv-` family, filed the way the CLI files one. Its one child is the daemon's."""
+    subject = store.create_work_order("ship the CSV export", description=ASK)
+    store.update_work_order(subject["id"], status="validating")
+    return ops.create_investigation_order(
+        "proj_a", subject["id"],
+        "it has been validating for six hours with no turn in flight. Find out what is "
+        "holding it.",
+        budget_usd=budget_usd)
+
+
+def _an_improvement(budget_usd: float | None = None) -> dict:
+    return ops.create_improvement_order(
+        "proj_a", "first turns re-read the dispatch path",
+        description="Three work orders in a row spent their first turn re-reading it.",
+        refs=["wo-11111111"], budget_usd=budget_usd)
+
+
+def _the_one_child(started, store, fo: dict, kind: str, spent: float,
+                   reserved: float | None = None) -> str:
+    """The state the daemon leaves a non-feature family in: ONE child, the family's whole
+    slice cut for it, parked on it — and the parent in `planning`.
+
+    THE PARKING IS THE DAEMON'S: the child is created `running` with its turn billed
+    over its reserve, and the tick here lets `settle_work_order` write
+    `budget_exhausted` itself. So the fixture pins the state the OS actually produces,
+    not a status hand-written past the code that decides it.
+
+    The PARENT's `planning` and `plan_wo_id` stay store-written: a real dispatch spawns a
+    `claude` process for the planner/analyst/investigator, which no unit test wants.
+    """
+    child = store.create_work_order(f"work on {fo['id']}", description="look",
+                                    kind=kind, parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=child["id"])
+    store.set_feature_status(fo["id"], "planning")
+    if reserved is None:
+        reserved = fo.get("budget_usd")
+    store.update_work_order(child["id"], budget_reserved_usd=reserved,
+                            status="running")
+    bill_the_turn(store, child["id"], spent)
+    started.tick()
+    assert store.get_work_order(child["id"])["status"] == budget.EXHAUSTED
+    return child["id"]
+
+
+def test_topping_up_an_investigation_puts_it_back_to_planning(started, store):
+    """Obligation 1. An investigation family runs in `planning` — `executing` is a status
+    its lifecycle never enters — so the budget pass has to escalate it AND restore it
+    there."""
+    inv = _an_investigation(store, budget_usd=2.0)
+    _the_one_child(started, store, inv, "investigator", spent=9.0)
+    started.tick()
+    assert store.get_feature_order(inv["id"])["status"] == "budget_exhausted"
+
+    ops.set_investigation_budget(inv["id"], 100.0)
+    started.tick()
+    row = store.get_feature_order(inv["id"])
+    assert row["status"] == "planning"
+    assert not row["needs_attention"]
+
+
+def test_topping_up_an_improvement_order_puts_it_back_to_planning(started, store):
+    """Obligation 1, the other non-feature kind — its `planning` reads "analysing"."""
+    io = _an_improvement(budget_usd=2.0)
+    _the_one_child(started, store, io, "analyst", spent=9.0)
+    started.tick()
+    assert store.get_feature_order(io["id"])["status"] == "budget_exhausted"
+
+    ops.set_improvement_budget(io["id"], 100.0)
+    started.tick()
+    assert store.get_feature_order(io["id"])["status"] == "planning"
+
+
+def test_the_settlement_pass_never_reaches_a_non_feature_family(started, store):
+    """Obligation 2. An investigation settles from its VERDICT, so a dead investigator
+    must not fail the order under it.
+
+    THIS PASSES ON MAIN AND IS NOT A REGRESSION TEST. It is a standing guard over two
+    independent defences, and it goes red only if BOTH are dropped: the settlement pass
+    being `kind="feature"`, and `ProjectStore.feature_children` returning `kind='worker'`
+    rows only. Measured 2026-10-02: widening the pass to
+    `statuses=("executing","planning"), kind=None` leaves this test GREEN, because the
+    investigator child is `kind='investigator'` and `feature_children` does not return
+    it. It would go red if the pass were merged back into one AND read its children
+    kind-agnostically (`budget.family`)."""
+    inv = _an_investigation(store)
+    child = store.create_work_order(f"investigate {inv['id']}", kind="investigator",
+                                    parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    store.set_status(child["id"], "failed")
+
+    started.tick()
+    row = store.get_feature_order(inv["id"])
+    assert row["status"] == "planning"
+
+
+def test_the_note_names_the_raise_verb_of_its_parents_own_kind(started, store):
+    """Obligation 3. `jarvis fo budget` on an `io-`/`inv-` row refuses — the OS telling
+    the user to run a command it will reject."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+    note = ops.set_work_order_budget(child, 500.0)["note"]
+    assert "jarvis investigate budget" in note
+    assert "jarvis fo budget" not in note
+
+    io = _an_improvement(budget_usd=3.0)
+    io_child = _the_one_child(started, store, io, "analyst", spent=9.0)
+    io_note = ops.set_work_order_budget(io_child, 500.0)["note"]
+    assert "jarvis io budget" in io_note
+    assert "jarvis fo budget" not in io_note
+
+
+def test_the_show_path_explains_the_cap_in_the_same_words(started, store):
+    """Obligation 4. The reporter had `budget_usd=10`, `cap_usd=2.0036`,
+    `cap_source='feature'` and `feature_unreserved_usd=0.0` and could not assemble them.
+    ONE HOME: the set path and the show path state the same fact, and two wordings of it
+    is how two users come to believe different things."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+
+    set_note = ops.set_work_order_budget(child, 500.0)["note"]
+    shown = ops.work_order_budget(child)
+    assert shown["note"] == set_note
+    assert "its feature's slice" not in shown["note"]       # it is not a feature
+    assert f"{shown['cap_usd']:.2f}" in shown["note"]       # the family's slice
+    assert "$3.00" in shown["note"]                         # the family budget
+    assert "unreserved" in shown["note"]
+    assert "jarvis investigate budget" in shown["note"]
+
+
+def test_a_broke_family_reads_zero_and_not_a_dash(started, store):
+    """`budget.format_usd` renders 0.0 and None identically as an em dash, and 0.00 is
+    the ONLY unreserved figure this note ever carries — nothing left is the whole
+    condition for showing it. An em dash there reads as "unknown" when the fact is
+    "zero", and zero is what tells the user to raise the FAMILY, not the child again."""
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+
+    note = ops.set_work_order_budget(child, 500.0)["note"]
+    assert "$0.00 unreserved" in note
+    assert "—" not in note                      # the sentence reads on one pass
+    assert note == ops.work_order_budget(child)["note"]
+
+
+def test_the_family_is_not_the_worker_children(started, store):
+    """Obligation 5 (Neo question 1198). The family budget is ENFORCED over
+    `budget.family` and was REPORTED over `ProjectStore.feature_children`, which is the
+    `kind='worker'` children only. A non-feature family's one child is reached as the
+    parent's `plan_wo_id`, so for those two kinds the sets do not even intersect."""
+    inv = _an_investigation(store, budget_usd=2.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+    fo = store.get_feature_order(inv["id"])
+
+    assert [c["id"] for c in budget.family(store, fo)] == [child]
+    assert store.feature_children(inv["id"]) == []
+
+
+def test_a_planner_overspending_never_parks_the_feature(started, store):
+    """A FEATURE in `planning` is out of the budget pass, and that is why the pass runs
+    per kind. `budget.family` counts the planner, so admitting `planning` for
+    `kind='feature'` would park the feature on its planner's spend and then restore it to
+    `executing` — past plan approval, with no approved plan and no children. §4 of
+    docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  budget_usd=2.0)
+    planner = store.create_work_order(f"plan {fo['id']}", description=ASK,
+                                      kind="planner", parent_id=fo["id"])
+    store.update_feature_order(fo["id"], plan_wo_id=planner["id"])
+    store.set_feature_status(fo["id"], "planning")
+    store.update_work_order(planner["id"], budget_reserved_usd=2.0)
+    bill_the_turn(store, planner["id"], 9.0)
+
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
+
+    ops.set_feature_budget(fo["id"], 100.0)
+    started.tick()
+    assert store.get_feature_order(fo["id"])["status"] == "planning"
+
+
+def test_raising_a_features_budget_still_names_its_parked_child(started, store):
+    """The negative control for that split: a feature's worker children are in the
+    family too, so the list `jarvis fo budget` prints must not change for them."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK,
+                                  budget_usd=2.0)
+    child = store.create_work_order("export it", description="work",
+                                    kind="worker", parent_id=fo["id"])
+    store.update_work_order(child["id"], budget_reserved_usd=2.0,
+                            status=budget.EXHAUSTED)
+
+    out = ops.set_feature_budget(fo["id"], 100.0)
+    assert out["exhausted_children"] == [child["id"]]
+    assert child["id"] in [c["wo_id"]
+                           for c in ops.feature_order_budget(fo["id"])["children"]]
+
+
+def test_a_parked_investigation_child_is_not_told_a_feature_capped_it(started, store):
+    """The attention line is the loudest surface — `jarvis status` and the attention
+    strip read nothing else — and it still called an investigation's family a feature.
+    The card, the status label and the flash were made kind-aware; this is the last."""
+    from jarvis.central_store import CentralStore
+
+    inv = _an_investigation(store, budget_usd=3.0)
+    child = _the_one_child(started, store, inv, "investigator", spent=9.0)
+    store.set_status(child, "running")
+
+    central = CentralStore()
+    try:
+        row = store.get_work_order(child)
+        out = budget.exhaustion(store, central, row)
+        assert out is not None
+        budget.escalate(store, row, out)
+    finally:
+        central.close()
+
+    line = store.get_work_order(child)["attention_reason"]
+    assert "its investigation's slice" in line
+    assert "its investigation has" in line
+    assert "feature" not in line
+
+
+def test_a_parked_feature_child_still_says_feature(started, store):
+    """The negative control: the default family word is unchanged."""
+    from jarvis.central_store import CentralStore
+
+    fo = a_feature(started, store, "reader", "writer", budget_usd=12.0)
+    for _ in range(4):
+        started.tick()
+    child = store.feature_children(fo["id"])[0]
+    bill_the_turn(store, child["id"], (child["budget_reserved_usd"] or 0) + 1)
+
+    central = CentralStore()
+    try:
+        row = store.get_work_order(child["id"])
+        out = budget.exhaustion(store, central, row)
+        assert out is not None
+        budget.escalate(store, row, out)
+    finally:
+        central.close()
+
+    line = store.get_work_order(child["id"])["attention_reason"]
+    assert "its feature's slice" in line
+    assert "its feature has" in line
+
+
+def test_a_zero_spend_against_a_budget_reads_as_zero(started, store):
+    """`budget.status_note` rendered a real 0.0 through `format_usd` as an em dash, so an
+    order that has spent nothing read `— of $5.00`. Zero is a number here."""
+    from jarvis.central_store import CentralStore
+
+    wo = store.create_work_order("nothing spent yet", description="look")
+    store.update_work_order(wo["id"], budget_usd=5.0)
+
+    central = CentralStore()
+    try:
+        note = budget.status_note(store, central, store.get_work_order(wo["id"]))
+    finally:
+        central.close()
+    assert note == "$0.00 of $5.00"
+    assert budget.format_money(0.0) == "$0.00"
+    assert budget.format_usd(0.0) == "—"       # left alone: it means "absent"
+
+
+
+# -- nothing is owed on work that is over ---------------------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md
+# §2.2, GitHub issue 906. `ops.submit_verdict` writing `completed` is necessary and not
+# sufficient: the turn is still running when the verdict is stored, so the cap can be
+# crossed AFTER the status write, and `Daemon._deliver` escalates whatever the status is.
+
+
+WHY = ("wo-11111111 has been `validating` for six hours with no turn in flight. Find "
+       "out what is holding it.")
+
+
+def _investigator(store, *, verdict: bool) -> str:
+    """An investigator work order, with its verdict filed or still being worked on."""
+    from jarvis.testing import a_verdict
+
+    subject = store.create_work_order("ship the CSV export", description="the ask")
+    inv = ops.create_investigation_order("proj_a", subject["id"], WHY)
+    child = store.create_work_order(f"investigate {inv['id']}", kind="investigator",
+                                    parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.set_feature_status(inv["id"], "planning")
+    if verdict:
+        ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject["id"]))
+    else:
+        store.update_work_order(child["id"], status="running")
+    return child["id"]
+
+
+def over_its_cap(started, store, wo_id: str) -> budget.Exhaustion:
+    """Past the cap on the accounting, which is the only thing `escalate` acts on."""
+    store.update_work_order(wo_id, budget_usd=2.0)
+    bill_the_turn(store, wo_id, 5.0)
+    out = budget.exhaustion(store, started.central, store.get_work_order(wo_id))
+    assert out is not None, "`exhaustion` is untouched by §2.2 — only the parking is"
+    return out
+
+
+def test_a_settled_investigator_is_never_parked_on_its_budget(started, store):
+    from jarvis.central_store import CentralStore
+
+    investigator = _investigator(store, verdict=True)
+    out = over_its_cap(started, store, investigator)
+
+    assert not budget.escalate(store, store.get_work_order(investigator), out)
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    assert store.events_of_kind(investigator, "budget_exhausted") == []
+    central = CentralStore()
+    try:
+        assert [i for i in central.unacked_inbox() if i["wo_id"] == investigator] == []
+    finally:
+        central.close()
+
+
+def test_a_live_investigator_with_no_verdict_still_parks(started, store):
+    """The control for the guard above, so it cannot widen into "investigators never run
+    out of money": the §2.8 cap on a diagnosis still in progress is doing its job."""
+    investigator = _investigator(store, verdict=False)
+    out = over_its_cap(started, store, investigator)
+
+    assert budget.escalate(store, store.get_work_order(investigator), out)
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == budget.EXHAUSTED
+    assert row["needs_attention"]
+    assert len(store.events_of_kind(investigator, "budget_exhausted")) == 1
 

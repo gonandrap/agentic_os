@@ -51,12 +51,15 @@ def store(started):
 
 def _seal(store, *, cache_write, ttl_write, prefix_write, boundaries=BOUNDARIES_EACH,
           ttl_boundaries=2, compact_write=0, compact_boundaries=0, age_days=1.0,
-          version=4):
+          version=5):
     """One settled order with a frozen bill, as `bill._worker_extras` writes it.
 
     `version=2` is a bill sealed before the raw split existed. It is NOT a zero: the
     order billed real tokens no half of this arithmetic can see, which is why
     `CacheWrites` counts it separately rather than diluting the ratios with it.
+
+    `version=4` is a bill sealed before the by-side split: real, still on this box, and
+    carrying the whole rollup with no way to say which side wrote it (q1215).
 
     `tokens` is deliberately NOT `ttl_write + prefix_write`. The tax has its own
     threshold-free definition and the two raw writes are observations beside it, so a
@@ -80,6 +83,15 @@ def _seal(store, *, cache_write, ttl_write, prefix_write, boundaries=BOUNDARIES_
     if version >= 4:
         rewrite |= {"compact_write": compact_write,
                     "compact_boundaries": compact_boundaries}
+    if version >= 5:
+        # Whole rollup on the main side, subagent side a structural zero: these cohorts
+        # model single-session workers, and `_worker_extras` is what fixes the shape.
+        rewrite |= {"by_side": {
+            "main": {"tokens": tax, "boundaries": boundaries,
+                     "cache_write": cache_write},
+            "subagent": {"tokens": 0, "boundaries": 0, "cache_write": 0,
+                         "count": 0, "structural_zero": True},
+        }}
     payload = {"payload_v": version, "total": {"cost": {"list_usd": 10.0}},
                "rewrite": rewrite}
     store.seal_bill(wo["id"], json.dumps(payload), at=db.now() - age_days * DAY)
@@ -332,6 +344,11 @@ def test_the_fixture_is_shaped_like_a_real_bill(store):
     wo_id = _seal(store, cache_write=1_000, ttl_write=400, prefix_write=100)
     sealed = json.loads(store.get_work_order(wo_id)["bill_json"])["rewrite"]
     assert set(sealed) == set(real)
+    # The by-side block is nested, so a key renamed one level down would pass the check
+    # above while nothing wrote what the reader looks for (q1215).
+    assert set(sealed["by_side"]) == set(real["by_side"])
+    for side in real["by_side"]:
+        assert set(sealed["by_side"][side]) == set(real["by_side"][side])
 
 
 def test_prefix_stability_is_written_down_as_the_authoritative_measurement():

@@ -7,6 +7,8 @@ sessions by three different transports and any one of them can break alone.
 
 import json
 
+import pytest
+
 from jarvis.bootstrap import ASSETS, bootstrap_project, build_settings
 from jarvis.catalog import ProjectSpec
 from jarvis.dispatch import _write_worker_settings
@@ -156,6 +158,41 @@ def test_the_section_names_the_knowledge_it_argues_from():
         assert heading in text
     # Concision is never an excuse to drop evidence.
     assert "correctness" in text
+
+
+# -- the message cap's transport (§5 of the bounded-model-inputs spec) -------------------
+
+def test_the_message_cap_travels_to_the_worker_by_env(project, jarvis_home):
+    """Same transport as the summary cap and for the same reason: the hook runs on every
+    Bash call and must not parse a catalog to decide it has nothing to do. Asserted
+    against the file `_write_worker_settings` actually wrote, so a project's setting and
+    what the hook reads cannot drift."""
+    from jarvis import concision
+    from jarvis.catalog import ConcisionConfig
+
+    written = json.loads(
+        _write_worker_settings(_spec(project), {"id": "wo-conc04"}).read_text())
+    assert written["env"][concision.MESSAGE_CAP_ENV] == str(
+        concision.DEFAULT_MESSAGE_MAX_CHARS)
+
+    tighter = json.loads(_write_worker_settings(
+        _spec(project, concision=ConcisionConfig(message_max_chars=2500)),
+        {"id": "wo-conc05"}).read_text())
+    assert tighter["env"][concision.MESSAGE_CAP_ENV] == "2500"
+    assert concision.message_cap(tighter["env"]) == 2500
+
+
+def test_a_project_can_switch_the_message_cap_off_but_not_set_a_nonsense_one():
+    """`0` is off, which a project is entitled to. A positive value under 1000 leaves no
+    message that can pass, which is a typo rather than a policy — the same shape
+    `summary_max_words` refuses 1-19 in."""
+    from jarvis.catalog import CatalogError, _parse_concision
+
+    assert _parse_concision({"message_max_chars": 0}).message_max_chars == 0
+    assert _parse_concision({"message_max_chars": 9000}).message_max_chars == 9000
+    for bad in (500, -1):
+        with pytest.raises(CatalogError):
+            _parse_concision({"message_max_chars": bad})
 
 
 # -- the subagent transport (SS5.1) -----------------------------------------------------

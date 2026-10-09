@@ -43,11 +43,16 @@ docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md).
 
 The OS never fires "label it now" at GitHub and hopes. `desired_state` turns a work
 order's status into one of three tracker states, `apply` moves the issue there, and the
-`issue_state` column records what was last applied — so the daemon's sweep is a
-comparison, costs nothing while the two agree, and RETRIES for free when `gh` is
-unreachable. That is what makes E (fail closed, never half-apply) and D (idempotency,
+`issue_state` column records what was last applied — so the daemon's sweep asks
+`needs_sync`, costs nothing while there is nothing to do, and RETRIES for free when `gh`
+is unreachable. That is what makes E (fail closed, never half-apply) and D (idempotency,
 reopening, a human who closed it first) fall out of the design rather than out of a
 guard per call site.
+
+It is NOT a bare comparison: `apply` may return a state that is not the desired one, so
+`needs_sync` carries the terminal case a comparison alone could never converge on — a
+column latched at CLOSED (issue #961,
+docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md).
 
 The OS never fights a human. An issue a person reopened or closed by hand is left where
 they put it — `apply` re-reads the issue before it writes, and records what it found.
@@ -81,6 +86,13 @@ ISSUE_VERBS = (("issue", "view"), ("issue", "edit"), ("issue", "comment"),
                # is here rather than in `github.py` because that module may build no
                # command against a repository it was not given by `origin`.
                ("issue", "create"), ("issue", "list"),
+               # `issue reopen` is the recurrence path's write (spec §8): the OS links a
+               # gap that came back to its ORIGINAL issue instead of filing a second
+               # report, and an original the OS already fixed is normally closed. Declared
+               # here, and pinned in `test_the_declared_verbs_are_exactly_these_writes_
+               # and_these_three_reads`, so widening this set stays a reviewed decision
+               # (`kn-2531869c`).
+               ("issue", "reopen"),
                # A READ, in a list that is otherwise writes — same shape as
                # `("issue", "list")` above. It is here rather than in `github.py` for
                # that module's own reason: it may build no command against a repository
@@ -438,6 +450,16 @@ def comment(url: str, body: str, repo: str | None = None) -> None:
     _run(["issue", "comment", url, "--body-file", "-"], url=url, stdin=body)
 
 
+def reopen(url: str, body: str) -> None:
+    """Reopen the issue, carrying `body` as the comment that explains why.
+
+    ONE call for `close`'s exact reason: two have a gap in which the comment lands and
+    the reopen does not, and the retry would then post the comment again. `gh issue
+    reopen --comment` is atomic from this side.
+    """
+    _run(["issue", "reopen", checked_issue_url(url), "--comment", body], url=url)
+
+
 def close(url: str, body: str) -> None:
     """Close the issue, carrying `body` as the closing comment.
 
@@ -589,6 +611,75 @@ def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict) and r.get("url")]
 
 
+# -- recurrences: the gap came back and the OS already had a rule for it ---------------
+#
+# docs/superpowers/specs/2026-09-27-self-evolution.md §8. The OS links, it never duplicates: the
+# ORIGINAL issue is reopened if closed and commented on if open, and carries this label so
+# "a rule we already shipped did not hold" is visible on the tracker without reading the
+# thread. `ops.record_recurrence` is the one caller.
+
+#: What marks the original issue as a regression rather than a fresh report. Only a label:
+#: unlike `FOLLOW_UP_LABEL` it is NOT the dedupe's search term, because the search runs
+#: against issues filed before this label existed (`recurrence_issues`).
+REGRESSION_LABEL = "regression"
+
+#: Its own colour and blurb, distinct from the bug label's green and the follow-up's blue,
+#: so a tracker carrying all three reads apart at a glance. The blurb says what the label
+#: MEANS rather than who applied it: a reader seeing it needs to know the OS already
+#: shipped a rule for this, which is the fact a second report would have hidden.
+REGRESSION_COLOUR = "d93f0b"
+REGRESSION_DESCRIPTION = ("This gap recurred: Jarvis already had a detector for it and "
+                          "the rule did not hold.")
+
+
+def ensure_regression_label(repo: str) -> None:
+    """`ensure_label` with the regression's own colour and blurb.
+
+    Not `ensure_label(REGRESSION_LABEL, repo)`: that one describes a label meaning "a work
+    order is on this", and a recurrence comment states the opposite — the OS already ran
+    an order on this gap and the gap is back.
+    """
+    repo = checked_repo(repo)
+    _run(["label", "create", checked_label(REGRESSION_LABEL), "--repo", repo,
+          "--color", REGRESSION_COLOUR, "--description", REGRESSION_DESCRIPTION],
+         url=repo, tolerate="already exists")
+
+
+def recurrence_issues(detector_id: str, gap_class: str,
+                      repo: str | None = None) -> list[dict[str, Any]]:
+    """Issues on the tracker about this DETECTOR and this GAP CLASS, open or closed.
+
+    **THE SEARCH KEYS ON THE CAUSE, AND NEVER ON THE ORDER ID.** kn-2b03830f retracted
+    and reversed kn-5d8a396a on exactly this point: an issue whose body names an order id
+    is usually about a DIFFERENT cause — a validation follow-up the panel filed on that
+    order, an earlier filing that happened to quote it — so an order-id hit links a
+    recurrence to the wrong issue, and the recurrence comment then lands on a thread about
+    something else. The detector id and the gap class are what the recurrence is about,
+    and they are what identifies the original. Never a proposed title either: titles are
+    written by whoever filed, and two reports of one gap rarely share one.
+
+    **`--state all`, and that keyword carries the correctness.** `gh issue list` defaults
+    to OPEN issues only, which is `follow_ups_filed`'s reason restated one layer out and
+    sharper here: the original of a gap the OS already FIXED is normally CLOSED, so
+    without this the one issue worth finding is the one that drops out of the answer — and
+    a closed original that cannot be found can never be reopened, which is the duplicate
+    §8 exists to prevent.
+
+    `repo` defaults to the OS's own tracker. Output that will not parse returns [], the
+    same answer as "nothing filed": the caller files no comment either way and says so in
+    `filed_note`. An unreachable `gh` raises, and `ops.record_recurrence` records that.
+    """
+    repo = checked_repo(repo or bug_repo())
+    stdout = _run(["issue", "list", "--repo", repo, "--state", "all",
+                   "--search", f"{detector_id} {gap_class} in:body", "--limit", "100",
+                   "--json", "number,title,url,state"], url=repo)
+    try:
+        rows = json.loads(stdout or "[]")
+    except ValueError:
+        return []
+    return [r for r in rows if isinstance(r, dict) and r.get("url")]
+
+
 # -- back-references: how many work orders have pointed at this issue ----------------
 #
 # The half of the relation that did not exist before: an issue recorded only the order
@@ -704,6 +795,35 @@ def desired_state(store: Any, wo: dict[str, Any]) -> str:
     if wo["status"] == "completed" and not store.work_unlanded_open(wo_id):
         return CLOSED
     return RELEASED
+
+
+def needs_sync(store: Any, wo: dict[str, Any]) -> bool:
+    """Is there anything left the sweep MAY do to this issue? Issue #961.
+
+    The comparison `desired_state(...) != issue_state` has no fixed point on its own,
+    because `apply` is allowed to return a state that is not the desired one: it returns
+    CLOSED for an issue a person already closed, whatever the want was, so an order whose
+    want is IN_PROGRESS or RELEASED over a closed issue disagrees with its column for
+    ever — one `gh issue view`, one log line and one duplicate `issue_closed` event per
+    tick, per order.
+
+    So a stored CLOSED is TERMINAL. It is where a person (or a converged pass) put the
+    issue and there is nothing left to do there: `apply` would return CLOSED again, the
+    column already says it, and the comment went out on the sweep that discovered the
+    close. The loss is that a human REOPENING is not re-labelled by this sweep, which is
+    `apply`'s existing never-fight-a-human rule reached one step earlier and without the
+    `gh` call. Full reasoning:
+    docs/superpowers/specs/2026-10-07-a-closed-issue-the-os-cannot-move-converges.md.
+
+    The latch lives here and not in the daemon because `record_applied` has a second
+    caller (`promote_confirmed`), so both read the same policy. `desired_state` STAYS
+    PURE — derived from the work order alone, never from `issue_state`; putting the latch
+    there would let the filing path RE-CLOSE an issue a human reopened (Neo question
+    1410).
+    """
+    if (wo.get("issue_state") or "") == CLOSED:
+        return False
+    return desired_state(store, wo) != (wo.get("issue_state") or "")
 
 
 def closing_comment(wo: dict[str, Any]) -> str:

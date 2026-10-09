@@ -80,6 +80,37 @@ SYSTEM_PROMPT_ARGV_LIMIT = 64 * 1024
 #: stdin). Spec: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
 PROMPT_ARGV_LIMIT = 64 * 1024
 
+#: The BACKSTOP ceiling on `prompt + system_prompt` for one OS-side call, in chars.
+#: MEASURED: the largest legitimate OS call is 285,929 chars — `validation._run_chair`
+#: on a FEATURE round (`build_shared_prefix` over an `EvidencePacket` at the shipped
+#: 150,000-char diff cap, spec_section 20,000, description 8,000, declared 4,000,
+#: summary 2,000, 120 files, 30 dropped_files, 6 side_effects, 3 history rounds, 8
+#: children, with the real 592-entry `jarvis_os` knowledge brief: system 246,274, plus
+#: `build_chair_prompt` over 4 blocking opinions at 39,655). Work-order chair 281,548;
+#: non-chair feature seat 254,572; largest non-validation call a Neo approval at 71,818.
+#: 400,000 leaves ~40% headroom for knowledge-base growth and the packet's unbounded
+#: fields while staying near 100k tokens, well inside a 200k window.
+#: Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+DEFAULT_MAX_OS_PROMPT_CHARS = 400_000
+
+#: A floor guard just above the measured worst case: a ceiling below this silently
+#: disables validation, which is worse than the bug being fixed. `catalog` refuses one
+#: at boot. Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+MAX_OS_PROMPT_CHARS_MIN = 300_000
+
+#: The live ceiling. Module-level and seeded from the default, overridden ONCE at
+#: startup by `set_max_os_prompt_chars` — Neo, question 1077: a caller with no ceiling
+#: is exactly the bug this fixes, whereas a stale-but-safe default is not.
+#: The two constants live HERE and `catalog` imports them, because the other direction
+#: is a cycle: catalog -> project_store -> claude_cli.
+MAX_OS_PROMPT_CHARS = DEFAULT_MAX_OS_PROMPT_CHARS
+
+
+def set_max_os_prompt_chars(limit: int) -> None:
+    """Arm the backstop from the catalog, at startup. Spec §4 (see above)."""
+    global MAX_OS_PROMPT_CHARS
+    MAX_OS_PROMPT_CHARS = int(limit)
+
 
 class ClaudeCliError(RuntimeError):
     pass
@@ -93,6 +124,27 @@ class InputTooLargeError(ClaudeCliError):
     retry is only a delay. Distinguished from every transient outage by that fact.
     Spec §4: docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
     """
+
+
+class PromptTooLargeError(ClaudeCliError):
+    """The combined prompt was past `MAX_OS_PROMPT_CHARS` and the call was not made.
+
+    A ClaudeCliError subclass so every existing handler treats it as a transport
+    failure that decides nothing, but a SEPARATE class because it is deterministic:
+    the same call will fail the same way for ever, so a retry is only a delay.
+
+    The sizes ride as `prompt_chars` / `system_prompt_chars` / `ceiling` and NOT as
+    `limit`: `seats._run_seat` does `refused=getattr(e, "limit", None)` and puts what
+    it finds on the Opinion as a `UsageLimit`, so an int there would poison it.
+    Spec §4: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+    """
+
+    def __init__(self, message: str, *, prompt_chars: int, system_prompt_chars: int,
+                 ceiling: int) -> None:
+        super().__init__(message)
+        self.prompt_chars = prompt_chars
+        self.system_prompt_chars = system_prompt_chars
+        self.ceiling = ceiling
 
 
 class AttributionRefused(RuntimeError):
@@ -1587,6 +1639,9 @@ class HeadlessResult:
     #: spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md.
     prompt_chars: int = 0
     system_prompt_chars: int = 0
+    #: How long the subprocess took, in milliseconds. 0 means NOT MEASURED, which is what
+    #: a hand-built result is — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+    latency_ms: int = 0
 
 
 def _attribute_subprocess(result: HeadlessResult, record: Any = None) -> None:
@@ -1777,7 +1832,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
     Serena); `settings` passes `--settings` for the same one. Spec:
     docs/superpowers/specs/2026-09-25-a-headless-call-that-starts-from-nothing.md
 
-    THE INPUT IS MEASURED AND NOTHING IS CAPPED (spec §3,
+    THE INPUT IS MEASURED, AND CAPPED BY A BACKSTOP: past `MAX_OS_PROMPT_CHARS` the
+    call is REFUSED with `PromptTooLargeError` before anything runs, never trimmed
+    silently (spec §3 and §4,
     docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). A call that raises
     `ClaudeCliError` produces no `HeadlessResult`, so its size is recorded NOWHERE —
     a deliberate gap: there is no row for a call that never came back.
@@ -1790,12 +1847,25 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         _check_kind(records_itself.kind)
     elif records_itself:
         _check_records_itself(records_itself)
-    # THE PROMPT'S SECOND DOOR, spec §2:
-    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
-    # How big our own input was, kept whether or not the reply parses. Measurement only,
-    # no cap (spec §3, docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
+    # How big our own input was, kept whether or not the reply parses (spec §3,
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
     prompt_chars = len(prompt)
     system_prompt_chars = len(system_prompt or "")
+    # THE BACKSTOP, spec §4 of the same spec — here beside the attribution check, so a
+    # refused call spends nothing and writes no `agent_calls` row.
+    if prompt_chars + system_prompt_chars > MAX_OS_PROMPT_CHARS:
+        kind = (records_itself.kind if isinstance(records_itself, Authorisation)
+                else (records_itself or "unattributed"))
+        # NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt: this message
+        # reaches the inbox, which the user reads and the digest sends to a model.
+        raise PromptTooLargeError(
+            f"refused a {kind} call: prompt {prompt_chars} chars + system prompt "
+            f"{system_prompt_chars} chars = {prompt_chars + system_prompt_chars}, "
+            f"over the {MAX_OS_PROMPT_CHARS}-char ceiling (os.max_os_prompt_chars)",
+            prompt_chars=prompt_chars, system_prompt_chars=system_prompt_chars,
+            ceiling=MAX_OS_PROMPT_CHARS)
+    # THE PROMPT'S SECOND DOOR, spec §2:
+    # docs/superpowers/specs/2026-09-26-a-prompt-too-big-for-argv.md
     over = len(prompt.encode()) > PROMPT_ARGV_LIMIT
     args: list[str] = ["-p", *([] if over else [prompt]), "--output-format", "json",
                        "--no-session-persistence"]
@@ -1818,8 +1888,13 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
                      "--setting-sources", "", "--disable-slash-commands"]
         args += stack.enter_context(
             _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
+        # AROUND THE SUBPROCESS AND NOTHING ELSE — §3 of
+        # docs/superpowers/specs/2026-10-01-neo-observability.md: argument assembly and JSON parsing
+        # are not the model's time.
+        started = time.monotonic()
         out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
                    stdin_text=prompt if over else None)
+        latency_ms = int((time.monotonic() - started) * 1000)
     data: Any = None
     try:
         data = json.loads(out)
@@ -1830,7 +1905,8 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         # `run_headless` has always returned here), and there is nothing to account.
         result = HeadlessResult(text=out, model=model or "",
                                 prompt_chars=prompt_chars,
-                                system_prompt_chars=system_prompt_chars)
+                                system_prompt_chars=system_prompt_chars,
+                                latency_ms=latency_ms)
     else:
         served = [name for name in (data.get("modelUsage") or {})]
         result = HeadlessResult(
@@ -1838,6 +1914,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
             usage=derive_turn_usage(data),
             prompt_chars=prompt_chars,
             system_prompt_chars=system_prompt_chars,
+            latency_ms=latency_ms,
             session_id=data.get("session_id") or "",
             # One key is the ordinary case; more than one means the call was served by
             # several models and no single name is honest, so the requested one stands.
@@ -1851,6 +1928,9 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         # sizes would record as zero (spec §3).
         result.usage["prompt_chars"] = prompt_chars
         result.usage["system_prompt_chars"] = system_prompt_chars
+        # Same reason one field along: the sites that hand over `usage=result.usage` never
+        # see the dataclass — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+        result.usage["latency_ms"] = latency_ms
     if not records_itself:
         _attribute_subprocess(result, record)
     return result

@@ -19,6 +19,9 @@
 </div>
 
 {% for u in a.units %}
+{# ABOVE the `found` short-circuit, `cli._print_anatomy`'s rule: which reading answered is
+   exactly what a reader needs when nothing was found. #}
+{{ ui.provenance(u.provenance) }}
 {% if not u.found %}
 {# The same answer `jarvis cost` and `cli._print_anatomy` give, in their words: Claude
    Code prunes transcripts on its own schedule, and an unmeasurable clock is not a zero
@@ -109,6 +112,10 @@
 
 {% if u.tools %}
 <h2>Tool profile</h2>
+{% if u.nav_line %}
+{# §3: the sentence travels WITH the reading, so `jarvis inspect` prints these words too. #}
+<div class="panel"><span class="mono">{{ u.nav_line }}</span></div>
+{% endif %}
 <div class="panel"><table>
   <tr><th>tool</th><th>calls</th><th>total</th><th>mean</th><th>never returned</th></tr>
   {% for row in u.tools %}

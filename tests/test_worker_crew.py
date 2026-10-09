@@ -103,6 +103,37 @@ def test_implementer_states_tdd_no_background_and_no_lead_commands(project, jarv
     assert "jarvis wo finish" in text and "gh pr create" in text
 
 
+def test_implementer_holds_serena_for_the_whole_task(project, jarvis_home):
+    """§4 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md. The old
+    heading — "Before anything else" — scoped the posture to the START of the task, and
+    the observed behaviour matched it exactly: activate Serena once, then `cat`/`sed
+    -n`/`grep` for the rest."""
+    root = _crew_root(bootstrap.install_agent_assets(project, kind="worker"))
+    text = (root / ".claude" / "agents" / "jarvis-implementer.md").read_text()
+    assert "Before anything else" not in text
+    assert "whole task" in text
+    lower = text.lower()
+    for word in ("relapse", "minute 30", "after an edit"):
+        assert word in lower, f"the relapse pattern is not named: {word!r}"
+    # Word for word with the worker block (worker_brief.navigation_core) so the lead and
+    # the seat cannot drift.
+    assert "does NOT govern code navigation" in text
+
+
+def test_no_prefixed_serena_name_appears_in_a_seat_body(project, jarvis_home):
+    """`bootstrap._strip_serena` substitutes `_SERENA_TOOL_ENTRY` out of the FRONT MATTER
+    only, so a prefixed name in the BODY would survive an unwired install as a dangling
+    tool name — which is what `test_serena_stripped_when_unwired` catches, after the
+    fact. This is the same rule stated where someone pasting a `ToolSearch` select line
+    into a seat would read it (§4)."""
+    root = _crew_root(bootstrap.install_agent_assets(project, kind="worker"))
+    for seat in (root / ".claude" / "agents").glob("*.md"):
+        body = seat.read_text().split("---\n", 2)[-1]
+        assert "mcp__serena__" not in body, f"{seat.name} body names a prefixed tool"
+        assert "mcp__plugin_serena_serena__" not in body, (
+            f"{seat.name} body names a prefixed tool")
+
+
 def test_spec_writer_states_the_problem_and_fix_contract(project, jarvis_home):
     root = _crew_root(bootstrap.install_agent_assets(project, kind="worker"))
     text = (root / ".claude" / "agents" / "jarvis-spec-writer.md").read_text()

@@ -9,12 +9,12 @@
   <span class="kv">
     <a href="/cost{{ '?project=' ~ bill.project if bill.project }}">← all work orders</a> ·
     {% if bill.kind == 'feature_order' %}
-      <a href="/fo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a>
+      <a href="{{ order_path(bill.project, bill.id) }}" class="mono">{{ bill.id }}</a>
     {% else %}
       <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a> ·
       {# This page shows only money, on purpose. Where the TIME went, what the turn is
          doing now and why it is not moving are one click away — spec §7 of
-         docs/specs/2026-09-24-order-observability.md. Work orders only: a feature order
+         docs/superpowers/specs/2026-09-24-order-observability.md. Work orders only: a feature order
          has no session, no turn and no live frame. #}
       <a href="/wo/{{ bill.project }}/{{ bill.id }}/debug">where the time went</a>
     {% endif %} ·
@@ -150,7 +150,8 @@
 <h2>Every API call</h2>
 <p class="sub" style="margin: -4px 0 10px;">
   These sum to their turn, class by class — they are the LEAD agent's calls, so on a
-  turn that spawned subagents the difference is those, itemised in the bill above.
+  turn that spawned subagents the difference is those plus what no transcript accounts
+  for, both itemised in the bill above.
   <code>context</code> is what one call carried; <code>read</code> is what it was billed
   for reading. Watch the first call of each turn after the first: it writes the whole
   conversation again instead of reading it, and that is the re-write tax below.
@@ -210,6 +211,23 @@
     Jarvis cannot fix it; what it can do is cost fewer boundaries, which is why sending
     a worker one message beats sending it three.
   </p>
+  {# WHICH SIDE PAID IT (spec 2026-10-02 §1.5). The sentence comes from
+     `bill.SUBAGENT_REWRITE_ZERO`, read by `jarvis cost` too, and ONLY where the subagent
+     side is a structural zero: a non-zero one is a real finding. #}
+  {% if bill.rewrite.by_side and bill.rewrite.by_side.subagent.structural_zero %}
+  <p class="sub" style="margin: 6px 0 0;">
+    {{ subagent_rewrite_zero.format(
+         count=bill.rewrite.by_side.subagent.count,
+         written='{:,}'.format(bill.rewrite.by_side.subagent.cache_write)) }}
+  </p>
+  {% elif bill.rewrite.by_side %}
+  <p class="sub" style="margin: 6px 0 0;">
+    by side — main {{ '{:,}'.format(bill.rewrite.by_side.main.tokens) }} tokens across
+    {{ bill.rewrite.by_side.main.boundaries }}, subagent
+    {{ '{:,}'.format(bill.rewrite.by_side.subagent.tokens) }} across
+    {{ bill.rewrite.by_side.subagent.boundaries }}.
+  </p>
+  {% endif %}
 </div>
 {% endif %}
 
@@ -223,13 +241,30 @@
 {% if bill.agents and worker %}
 <h2>Agent by agent</h2>
 <p class="sub" style="margin: -4px 0 0;">
-  The lead agent — the session Jarvis drives — and every subagent it spawned, each drawn
-  OUT of the turn it ran in rather than added to it. Add these up and you have the
-  worker's whole session, exactly:
+  The lead agent — the session Jarvis drives — every subagent it spawned, and what
+  NEITHER accounts for, each drawn OUT of the turn it ran in rather than added to it. Add
+  these up and you have the worker's whole session, exactly:
   <span class="mono">{{ fmt_tok(bill.total.tokens.total) }} for the order
     − {{ fmt_tok(bill.total.tokens.total - worker.tokens.total) }} spent by the OS and by
     the worker's own subprocesses = {{ fmt_tok(worker.tokens.total) }}</span>.
 </p>
+{# PRESENCE, never truthiness: a seal written before this measurement existed has no
+   `placeholder` block, and that is UNKNOWN rather than a zero (spec 2026-10-08 §9). The
+   sentence comes from `bill.PLACEHOLDER_NOTE`, read by `jarvis cost` too. #}
+{% set ph = bill.get('placeholder') %}
+{% if ph is not none %}
+{% if ph.calls %}
+<p class="sub" style="margin: 6px 0 0;">
+  {{ '{:,}'.format(ph.calls) }} of those API calls report placeholder
+  output totalling {{ '{:,}'.format(ph.output) }} tokens
+  ({{ '{:,}'.format(ph.subagent_calls) }} in a subagent's transcript,
+  {{ '{:,}'.format(ph.main_calls) }} in the lead's) —
+  {{ placeholder_note }}
+</p>
+{% else %}
+<p class="sub" style="margin: 6px 0 0;">{{ placeholder_zero }}</p>
+{% endif %}
+{% endif %}
 {{ bill_ui.view(bill.agents, worker, 'every agent of ' ~ bill.id) }}
 {% endif %}
 

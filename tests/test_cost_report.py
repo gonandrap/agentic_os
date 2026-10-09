@@ -19,13 +19,16 @@ from jarvis.project_store import ProjectStore
 
 
 def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
-                  at: float | None = None) -> dict:
+                  at: float | None = None, stop_reason: str | None = "end_turn",
+                  blocks: list[dict] | None = None) -> dict:
+    """One assistant row. SEALED by default — see `placeholder_rows` for the other kind."""
     row = {
         "type": "assistant",
         "message": {
-            "id": mid, "model": "claude-opus-5",
+            "id": mid, "model": "claude-opus-5", "stop_reason": stop_reason,
             "usage": {"input_tokens": 0, "cache_creation_input_tokens": write,
                       "cache_read_input_tokens": read, "output_tokens": out},
+            **({"content": blocks} if blocks is not None else {}),
         },
     }
     if at is not None:
@@ -35,6 +38,24 @@ def assistant_row(mid: str, *, write: int = 0, read: int = 0, out: int = 0,
         row["timestamp"] = (datetime.fromtimestamp(at, tz=timezone.utc)
                             .isoformat().replace("+00:00", "Z"))
     return row
+
+
+def placeholder_rows(mid: str, *, read: int = 0, write: int = 0, out: int = 5,
+                     at: float | None = None) -> list[dict]:
+    """The two rows Claude Code writes for one UNSEALED message, and no third.
+
+    A background subagent's assistant message is written once per content block with
+    `stop_reason: null` and a streaming `output_tokens` of 3-33; the sealed row carrying
+    the real output is never written, so the true figure is not in the file
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
+    """
+    return [
+        assistant_row(mid, write=write, read=read, out=out, at=at, stop_reason=None,
+                      blocks=[{"type": "text", "text": "thinking about it"}]),
+        assistant_row(mid, write=write, read=read, out=out, at=at, stop_reason=None,
+                      blocks=[{"type": "tool_use", "id": f"tu-{mid}", "name": "Read",
+                               "input": {"file_path": "/tmp/x"}}]),
+    ]
 
 
 @pytest.fixture()
@@ -721,3 +742,191 @@ def test_the_cli_prints_no_own_line_when_the_parent_spent_nothing_of_its_own(
     out = capsys.readouterr().out
     assert "the orders under it" in out
     assert bill_mod.OWN_LABEL not in out
+
+
+# -- the window: the report FILTERS with it and never computes one ----------------------
+#
+# §5 of docs/superpowers/specs/2026-10-07-cost-window-selector.md. The boundary
+# arithmetic is `fleetcost.resolve_window`'s; everything here is about which population
+# the existing keys speak for once one is given.
+
+SINCE = 1_790_654_400.0        # Mon 2026-09-29 04:00 UTC — the acceptance week's reset
+UNTIL = SINCE + 7 * 86_400
+INSIDE = SINCE + 32 * 3_600
+
+
+def turn_at(store, wo_id: str, at: float, *, cost: float = 1.0) -> None:
+    """A settled turn at a CHOSEN time — `create_turn` stamps `db.now()`."""
+    store.conn.execute(
+        """INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at, ended_at,
+                                 cost_usd, cost_source)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM wo_turns WHERE wo_id=?),
+                   'dispatch', 'go', 'done', ?, ?, ?, 'envelope')""",
+        (wo_id, wo_id, at, at + 60, cost))
+    store.conn.commit()
+
+
+def os_call_at(wo_id: str, at: float, *, cost: float = 0.25,
+               project: str = "proj_a") -> None:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        central.conn.execute(
+            """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
+                                        cost_usd, input, cache_write, cache_read, output)
+               VALUES (?, ?, ?, 'neo_answer', 'question', 'claude-opus-5', 1,
+                       ?, 10, 0, 0, 100)""", (at, project, wo_id, cost))
+        central.conn.commit()
+    finally:
+        central.close()
+
+
+def test_window_filters_orders_before_the_limit(store, transcripts):
+    """APPLIED IN SQL: filtering after `LIMIT 50` reports an empty last week."""
+    old = store.create_work_order("ran inside the window", "")
+    store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                       (SINCE - 86_400, old["id"]))
+    store.conn.commit()
+    turn_at(store, old["id"], INSIDE)
+    for i in range(60):
+        store.create_work_order(f"filler {i}", "")
+
+    window = ops.cost_window(since=SINCE, until=UNTIL)
+    res = ops.cost_report(project="proj_a", window=window, limit=50)
+
+    assert [u["id"] for u in res["units"]] == [old["id"]]
+    assert res["window"] == window
+    # The trap this guards: without the window the order is past the limit entirely.
+    plain = ops.cost_report(project="proj_a", limit=50)
+    assert old["id"] not in [u["id"] for u in plain["units"]]
+    assert plain["window"] is None
+
+
+def test_window_filters_os_calls_and_transcripts(store, transcripts):
+    inside = store.create_work_order("a turn and calls inside", "")
+    give_session(store, inside["id"], "sess-win")
+    turn_at(store, inside["id"], INSIDE)
+    transcripts("sess-win", [
+        assistant_row("m-before", write=1_000_000, at=SINCE - 3_600),
+        assistant_row("m-inside", write=100_000, at=INSIDE),
+        assistant_row("m-after", write=1_000_000, at=UNTIL + 3_600),
+    ])
+    os_call_at(inside["id"], INSIDE)
+    os_call_at(inside["id"], UNTIL + 10)
+    # No turn in the window at all — only Neo answering between turns (§5a).
+    asked = store.create_work_order("Neo answered it mid-window", "")
+    turn_at(store, asked["id"], UNTIL + 7_200)
+    os_call_at(asked["id"], INSIDE)
+
+    res = ops.cost_report(project="proj_a", window=ops.cost_window(since=SINCE,
+                                                                   until=UNTIL))
+    rows = {u["id"]: u for u in res["units"]}
+
+    assert set(rows) == {inside["id"], asked["id"]}
+    assert rows[inside["id"]]["cache_write"] == 100_000
+    assert rows[inside["id"]]["os_calls"] == 1
+    assert rows[asked["id"]]["os_calls"] == 1
+
+
+def test_undated_transcript_message_is_excluded_and_counted(store, transcripts):
+    """A message that cannot be PLACED is excluded and disclosed, never counted in."""
+    wo = store.create_work_order("a transcript with unreadable stamps", "")
+    give_session(store, wo["id"], "sess-undated")
+    turn_at(store, wo["id"], INSIDE)
+    malformed = assistant_row("m-malformed", write=500_000)
+    malformed["timestamp"] = "not a timestamp"
+    transcripts("sess-undated", [assistant_row("m-inside", write=100_000, at=INSIDE),
+                                 assistant_row("m-missing", write=500_000), malformed])
+
+    windowed = ops.cost_report(project="proj_a",
+                               window=ops.cost_window(since=SINCE, until=UNTIL))
+    unit = next(u for u in windowed["units"] if u["id"] == wo["id"])
+
+    assert unit["undated_messages"] == 2
+    assert unit["cache_write"] == 100_000, "their tokens are in no total"
+    assert windowed["totals"]["undated_messages"] == 2
+    # Nothing is excluded without a window, so there is nothing to disclose.
+    plain = next(u for u in ops.cost_report(project="proj_a")["units"]
+                 if u["id"] == wo["id"])
+    assert plain["undated_messages"] == 0
+    assert plain["cache_write"] == 1_100_000
+
+
+def test_the_cli_prints_the_undated_message_count(store, monkeypatch, capsys):
+    """The sentence rides on the payload, so every surface says it the same way."""
+    from jarvis import cli
+
+    payload = ops.cost_report(project="proj_a")
+    payload["units"] = [{"id": "wo-undated", "project": "proj_a", "title": "an order",
+                         "found": False, "os_calls": 0, "os_cost_usd": 0.0,
+                         "subproc_calls": 0, "subproc_cost_usd": 0.0,
+                         "subagent_count": 0, "subagent_cost_usd": 0.0,
+                         "undated_messages": 3}]
+    payload["totals"]["undated_messages"] = 3
+    monkeypatch.setattr(ops, "cost_report", lambda **_k: payload)
+
+    assert cli.main(["cost", "proj_a"]) == 0
+
+    assert ("3 transcript messages carried no readable timestamp and are excluded from "
+            "this window") in capsys.readouterr().out
+
+
+@pytest.fixture()
+def proj_b(registered, tmp_path, claude_json):
+    """A SECOND registered project — `_os_groups` is read fleet-wide, one store at a time."""
+    from jarvis.central_store import CentralStore
+    from jarvis.testing import make_git_project
+
+    path = make_git_project(tmp_path, "proj_b")
+    claude_json(path)
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_b", str(path), "second test project")
+        central.conn.commit()
+    finally:
+        central.close()
+    return path
+
+
+def test_a_windowed_fleet_report_spans_two_projects(store, proj_b, transcripts):
+    """`_os_groups` is FLEET-WIDE and `get_work_order` RAISES on a foreign id.
+
+    So the by-id pass of §5a must never look proj_b's order up in proj_a's database:
+    unguarded, a fleet-wide `/cost` 500s as soon as two projects have in-window calls.
+    """
+    a = store.create_work_order("Neo answered proj_a mid-window", "")
+    turn_at(store, a["id"], UNTIL + 7_200)
+    os_call_at(a["id"], INSIDE)
+    other = ProjectStore(proj_b)
+    try:
+        b = other.create_work_order("Neo answered proj_b mid-window", "")
+        turn_at(other, b["id"], UNTIL + 7_200)
+    finally:
+        other.close()
+    os_call_at(b["id"], INSIDE, project="proj_b")
+
+    res = ops.cost_report(window=ops.cost_window(since=SINCE, until=UNTIL))
+    rows = {u["id"]: u for u in res["units"]}
+
+    assert set(rows) == {a["id"], b["id"]}
+    assert rows[a["id"]]["project"] == "proj_a"
+    assert rows[b["id"]]["project"] == "proj_b"
+    assert rows[a["id"]]["os_calls"] == 1 and rows[b["id"]]["os_calls"] == 1
+
+
+def test_a_targets_bill_ignores_the_window(store, transcripts):
+    """One order's bill is the WHOLE order: a truncated bill stops reconciling."""
+    wo = store.create_work_order("a long-running order", "")
+    give_session(store, wo["id"], "sess-target")
+    turn_at(store, wo["id"], INSIDE)
+    transcripts("sess-target", [
+        assistant_row("m-inside", write=100_000, at=INSIDE),
+        assistant_row("m-after", write=900_000, at=UNTIL + 3_600),
+    ])
+
+    bill = ops.cost_report(target=wo["id"], project="proj_a",
+                           window=ops.cost_window(since=SINCE, until=UNTIL))
+
+    assert bill["units"][0]["cache_write"] == 1_000_000
+    assert bill["units"][0]["undated_messages"] == 0

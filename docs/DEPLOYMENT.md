@@ -14,7 +14,7 @@ running fleet.
 | Purpose | develop/test Jarvis OS itself | run the real fleet (dev work + prod monitoring) |
 | Location | `~/workspace/agentic_os` | `$PRODUCTION_CODE/jarvis_os` (default `~/workspace/production/jarvis_os`) |
 | Git | branch `main` (trunk) | detached at tag `jarvis-X.Y.Z` |
-| Run | `uv run jarvis …` (manual) | `systemctl --user … jarvis` / `jarvis-ui` (services) |
+| Run | `uv run jarvis …` (manual; resolves this checkout's own venv, never PATH) | `jarvis …` (wrapper in `~/.local/bin`, from `scripts/install_prod_cli.sh`) + `systemctl --user … jarvis` / `jarvis-ui` (services) |
 | `JARVIS_HOME` | `~/.jarvis` (default) | `$PRODUCTION_CODE/state` |
 | `JARVIS_ENV` | unset | `production` (set by the units) |
 | Catalog | `catalogs/gonzalo.json` (empty / test projects) | `$PRODUCTION_CODE/config/catalog.json` (real fleet) |
@@ -91,8 +91,16 @@ because staging is also what makes the release verifiable and what protects a ho
 has fallen back to the direct transport:
 
 ```bash
-scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345
+scripts/shipit.sh --stage 1.4.0 --wo wo-abc12345 --base <sha>
 ```
+
+`--base` is REQUIRED in staged mode (2026-10-01 spec): a release approval authorises a
+byte-exact command string, so the commit being shipped has to be in it — the release
+branch is then cut from that sha and not from `origin/main`'s tip, whatever has merged
+since. Resolve it before asking for the gate: the newest commit on `origin/main` that
+carries every fix being shipped and whose CI is green, in full (40 characters); a red or
+unreadable base means say so and stop. Dropping or changing `--base` after approval
+invalidates the grant: the approved string names the commit.
 
 This performs every release step — preconditions, release branch, bump + tag, push,
 deploy of the tag to `$PRODUCTION_CODE/jarvis_os`, `uv sync` — **except** the service
@@ -101,7 +109,8 @@ restarts and the Telegram notify, then writes a marker file
 
 ```json
 {"wo_id": "wo-abc12345", "project": "jarvis_os", "version": "1.4.0",
- "tag": "jarvis-1.4.0", "staged_at": 1786500000, "state": "staged"}
+ "tag": "jarvis-1.4.0", "base": "442729f0c1e4b7a9d3f5068b2c4e7a1d9b0f3c58",
+ "staged_at": 1786500000, "state": "staged"}
 ```
 
 The daemon finishes the job (`src/jarvis/release.py`):
@@ -135,7 +144,15 @@ mkdir -p "$PRODUCTION_CODE/secrets"                 # 2. place secrets (KEY=VALU
 printf 'JARVIS_TELEGRAM_TOKEN=…\nJARVIS_TELEGRAM_CHAT_ID=…\n' > "$PRODUCTION_CODE/secrets/jarvis.env"
 chmod 600 "$PRODUCTION_CODE/secrets/jarvis.env"
 scripts/install_prod_service.sh                     # 3. install + enable + start the service
+scripts/install_prod_cli.sh                         # 4. put a production jarvis on PATH
 ```
+
+Step 4 is what makes a typed `jarvis` mean production: the wrapper it writes to
+`~/.local/bin/jarvis` carries the units' `JARVIS_HOME`, `PRODUCTION_CODE` and
+`JARVIS_ENV`, so a command run by hand and a command the daemon runs reach one fleet.
+Without it `jarvis` is command-not-found, and the obvious fallback — the deployed venv's
+binary by full path — drives the DEV instance at `~/.jarvis` silently (issue 757). It
+starts and restarts nothing; `jarvis doctor`'s `INV-PROD-CLI` reports it missing.
 
 Start-on-boot needs user lingering (survives logout/reboot):
 
@@ -193,6 +210,14 @@ with no `gh`.
 | `scripts/shipit.sh` step 5a | re-renders both units from the tag being deployed (`install_prod_service.sh --no-restart`; the restarts stay with shipit, which owns their order) | every release, staged or not |
 | `bugreport.heal_path` | appends the missing `GH_SEARCH_DIRS` to the daemon's own `os.environ["PATH"]` at start-up, which every worker then inherits — appends, never prepends, so nothing shadows the prod venv | every daemon start |
 | `INV-SERVICE-PATH` | reports an installed unit whose PATH cannot reach `gh`, reading the file rather than the healed process | `jarvis doctor` |
+
+The `jarvis` wrapper on PATH is kept applied the same way, for the same reason — it
+names `$PROD_DIR`, so it goes stale exactly as a unit does:
+
+| | What it does | When |
+|---|---|---|
+| `scripts/shipit.sh` step 5a2 | re-renders `~/.local/bin/jarvis` from the tag being deployed (`install_prod_cli.sh`; unconditional, before the staged hand-off, and it starts and restarts nothing) | every release, staged or not |
+| `INV-PROD-CLI` | reports a wrapper that is missing, not ours, or pointing at another checkout or `JARVIS_HOME` — reading the file, since a session that has the variables is not the broken one | `jarvis doctor` |
 
 ### Worker turns run outside the daemon's cgroup
 

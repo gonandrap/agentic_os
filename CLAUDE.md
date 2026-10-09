@@ -246,6 +246,26 @@ jarvis wo resume-auto <id>                 # what is this work order ACTUALLY wa
                                            # that were waiting correctly and re-sent
                                            # their whole conversation. `--force` sends
                                            # it anyway.
+jarvis wo retry <id> [--message "…"]       # RELAUNCH A FAILED ORDER in its own session,
+                                           # from where its worker died — the named form
+                                           # of the revive `wo send` has always done as a
+                                           # side effect. `--message` is optional: empty
+                                           # sends the OS's own relaunch note, which asks
+                                           # the worker where it got to rather than
+                                           # telling it. `failed` ONLY — a delivered order
+                                           # has `validation force` and `wo review`, a
+                                           # live one has a worker to talk to, and one
+                                           # that failed before ever opening a
+                                           # conversation is refused: there is no session
+                                           # to resume. It writes no status, so the order
+                                           # stays `failed` — and stays flagged — until
+                                           # jarvisd launches the turn. Pending
+                                           # assumptions do NOT block it and are NOT
+                                           # buried: they stay on `jarvis wo review`.
+                                           # NOT AUTOMATIC: a turn that died with no
+                                           # result is never replayed by the OS, only by
+                                           # the user. Same control on the work order's
+                                           # dashboard page.
 jarvis wo inject <session-id>              # hand the user's OWN Claude session to Jarvis.
                                            # Jarvis never adopts a session it finds: one
                                            # the user started is theirs. Injecting only
@@ -367,6 +387,13 @@ jarvis neo list                            # Neo's Q&A: pending reviews + escala
 jarvis neo review <qid> [--correct "…"]    # approve or teach; corrections become learnings
 jarvis neo answer <qid> "…"                # answer a question Neo escalated to the user
 jarvis neo learnings [--project p]         # what Neo has been taught, with ids
+jarvis neo stats [--project p] [--days n]  # IS NEO EARNING ITS KEEP: volume, outcomes,
+                                           # the escalation rate day by day, what it
+                                           # escalates FOR, per-order averages, spend and
+                                           # latency. The causes read as three answers to
+                                           # "who decided": Neo handed it back, Neo
+                                           # answered and the OS overrode it, or Neo never
+                                           # answered. Same report at /neo/stats
 jarvis neo retract <id> --reason "…"       # retire a ruling the user has REVERSED. Both
                                            # ledgers are append-only, so without this a
                                            # superseded ruling stays in every prompt

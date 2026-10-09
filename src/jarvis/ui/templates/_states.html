@@ -26,23 +26,53 @@
 <div class="panel">
   {% for t in states.totals %}
   {% set colour = tone_colour.get(meta.get(t.status, {}).get('tone', 'muted'), 'var(--ink-3)') %}
+  {% set current = t.status == states.current_status %}
+  {% set held_by = states.current_status_held_by if current else t.held_by %}
   <div class="row">
     <span class="mono" style="width: 16px; color: {{ colour }};">{{ meta.get(t.status, {}).get('icon', '•') }}</span>
     <span class="grow">{{ t.label }}
-      {%- if t.status == states.current_status %}
+      {# The wall figure rides INSIDE the label's `grow` span, where the held-now sentence
+         below already lives: a sibling after the duration would eat the fixed columns and
+         shove duration, entries and the bar out of alignment on exactly the rows a reader
+         is comparing. #}
+      {%- if t.held_seconds and not (current and states.held_now) %}
+      <span class="sub">({{ t.held_human }} held by {{ held_phrase(held_by) }},
+        {{ t.seconds_human }} wall)</span>{% endif %}
+      {%- if current %}
       {# TWO FIGURES, LABELLED DIFFERENTLY. Equal numbers are the common case, and one
-         number shown twice reads as a bug (spec §7). #}
+         number shown twice reads as a bug (spec §7). While a hold is OPEN the line says
+         HELD instead: the headline is active and wall is never deleted (Neo 1130, spec
+         §3 of docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-limit-hold-as-running.md). #}
+      {%- if states.held_now %}
+      <span class="sub">HELD {{ states.held_now.seconds_human }} by {{ states.held_now.phrase }},
+        running {{ states.current_status_active_age_human }} of
+        {{ states.current_status_age_human }}</span>
+      {%- else %}
       <span class="sub">in this status {{ fmt_dur(states.current_status_age) }} ·
         {% if states.last_activity_age is none %}nothing on the record at all
         {%- else %}nothing on the record for {{ fmt_dur(states.last_activity_age) }}
-        {%- endif %}</span>{% endif %}</span>
-    <span class="mono" style="width: 70px; text-align: right;">{{ fmt_dur(t.seconds) }}</span>
+        {%- endif %}</span>{% endif %}{% endif %}</span>
+    {# The duration column is ACTIVE once a hold touched this status; wall moves into the
+       parenthesis beside the label and is never dropped. A status never held renders
+       exactly as it did before holds were read at all. #}
+    <span class="mono" style="width: 70px; text-align: right;">
+      {{- fmt_dur(t.active_seconds) if t.held_seconds else fmt_dur(t.seconds) }}</span>
     <span class="mono" style="width: 80px; text-align: right;">{{ t.entries }}
       {{- ' entry' if t.entries == 1 else ' entries' }}</span>
+    {# GEOMETRY STAYS WALL (spec §4): the width is `t.share`, as before, because the bar
+       is laid out against the wall lifetime. The held part is the same bar at reduced
+       opacity — the browser divides it by the two payload figures (`flex-grow`), so the
+       template still computes nothing. #}
     <div style="display: flex; height: 9px; width: 160px; margin-left: 12px;
                 border: 1px solid var(--line); border-radius: 3px; overflow: hidden;
                 background: var(--raised);">
-      <div title="{{ t.label }}" style="width: {{ t.share * 100 }}%; background: {{ colour }};"></div>
+      <div title="{{ t.label }}" style="display: flex; width: {{ t.share * 100 }}%;
+                  background: {{ colour }};">
+        {%- if t.held_seconds %}
+        <div style="flex-grow: {{ t.active_seconds }};"></div>
+        <div title="{{ t.held_human }} held"
+             style="flex-grow: {{ t.held_seconds }}; background: var(--raised);
+                    opacity: 0.55;"></div>{% endif %}</div>
     </div>
   </div>
   {% endfor %}
@@ -77,7 +107,8 @@
       {{ s.trigger or no_trigger_phrase }}{% if s.open %} · still in it
       {%- if states.last_activity_ts is not none and states.last_activity_ts > s.entered %}
        · active {{ fmt_dur(states.last_activity_age) }} ago
-      {%- endif %}{% endif %}</span>
+      {%- endif %}{% endif %}
+      {%- if s.held_seconds %} · {{ fmt_dur(s.held_seconds) }} held{% endif %}</span>
     <span class="mono">{{ fmt_dur(s.seconds) }}</span>
   </div>
   {% endfor %}

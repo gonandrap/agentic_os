@@ -98,6 +98,12 @@ STATUS_LABEL = {
 }
 
 
+#: What the OS read off disk when a turn died without writing a result. A SIGNAL kind and
+#: deliberately not in `DEBUG_KINDS`: it is the only statement about the WORK that a
+#: failed turn leaves behind (spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5).
+TURN_HARVESTED = "turn_harvested"
+
+
 def event_level(kind: str) -> str:
     """"debug" for plumbing, "signal" for anything the user should see by default.
 
@@ -223,8 +229,32 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # then `message_delivered` (spec 2026-09-29 §3.6).
         return ("Dispatch held behind a compaction",
                 "the prompt goes out once the conversation is summarised")
+    # §7: the verdict on THIS order, written here because the investigator's own work
+    # order is not what a reader of this one opens.
+    if kind == "investigation_verdict":
+        return (f"Investigated: {p.get('classification') or 'no classification'}",
+                " · ".join(x for x in (p.get("investigation"), p.get("filed")) if x))
     if kind == "turn_failed":
         return "Worker turn failed", (p.get("error") or "")[:200]
+    if kind == TURN_HARVESTED:
+        # §5 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+        if p.get("empty"):
+            return ("Nothing to harvest",
+                    "the worktree was clean and the turn said nothing")
+        authored = p.get("authored") or {}
+        commits = int(authored.get("commits") or 0)
+        dirty = list(authored.get("dirty") or ())
+        parts = []
+        if commits:
+            parts.append(f"{commits} commit{'s' if commits != 1 else ''}")
+        if dirty:
+            parts.append(f"{len(dirty)} uncommitted file"
+                         f"{'s' if len(dirty) != 1 else ''}"
+                         + (f" checkpointed as {p['checkpoint']}"
+                            if p.get("checkpoint") else " left uncommitted"))
+        if p.get("said"):
+            parts.append("its last message")
+        return "Harvested what the turn left behind", ", ".join(parts)
     # The self-healing trio. Deliberately NOT filed under "Worker turn failed": nothing
     # about the WORK went wrong — the transport did, either by refusing the turn (the
     # usage window) or by dropping it (the API) — and the OS puts itself right. What the
@@ -341,7 +371,7 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # second one had.
         #
         # NO `alarm_id` MEANS THE USER ASKED (§11 of
-        # docs/specs/2026-09-24-order-observability.md): `remedies.propose_fix` writes no
+        # docs/superpowers/specs/2026-09-24-order-observability.md): `remedies.propose_fix` writes no
         # alarm row because none was raised, and naming the supervisor here would credit a
         # judgement nobody made.
         detail = f"{p.get('remedy') or 'a remedy'}: {p.get('argument') or ''}"
@@ -860,6 +890,11 @@ def _describe(kind: str, p: dict[str, Any]) -> tuple[str, str]:
         # The user closed it, not the worker — worth telling apart on the record.
         return "Marked done by you", (
             "the worker's turn was stopped" if p.get("session_stopped") else "")
+    if kind == "retry_requested":
+        # §8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        return ("You retried this order",
+                "with your message" if p.get("authored")
+                else "the OS's own relaunch note — you sent no message")
     if kind == "hidden":
         return ("Hidden" if p.get("hidden") else "Unhidden"), ""
     if kind == "invariant":

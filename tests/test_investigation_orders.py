@@ -14,12 +14,18 @@ exists to protect, in the spec's own order of how much they matter:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
+# The stuck sweep's fixtures and back-dating helpers, shared rather than redeclared: what
+# the sweep files is what this file is about.
+from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
+                               stuck_os)
 
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
 from jarvis.catalog import load_catalog
+from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
 
@@ -182,12 +188,231 @@ def test_the_write_denial_is_reachable_through_preflight(worktree):
         _write(worktree, "verdict.json"), _env())) == "allow"
 
 
+def test_the_heredoc_refusal_tells_an_investigator_how_to_write_its_verdict(worktree):
+    """§2.6 of the 2026-10-01 spec: the enforcement was right, the message pointed
+    elsewhere — `Edit` is refused on every path and `Write` on every path but one."""
+    heredoc = f"cat > {worktree / hooks.VERDICT_FILE} <<'EOF'\n{{}}\nEOF"
+    denied = hooks.heredoc_write_decision(_bash(heredoc, worktree), _env())
+    assert _decision(denied) == "deny"
+    reason = _reason(denied)
+    assert "`Write`" in reason
+    assert f"--from-file {hooks.VERDICT_FILE}" in reason
+    # `Edit` may be NAMED as refused; it may never be offered as the remedy.
+    assert "Use `Edit` or `Write`" not in reason
+    assert "`Edit` is refused" in reason
+    # The control: an ordinary worker keeps the existing text.
+    worker = hooks.heredoc_write_decision(_bash(heredoc, worktree), _env("worker"))
+    assert _decision(worker) == "deny"
+    assert _reason(worker) == hooks._HEREDOC_DENY
+
+
 def test_jarvis_verbs_reads_each_segment_and_leaves_the_chain_predicate_alone():
     assert hooks.jarvis_verbs("cd /tmp && jarvis wo show wo-1") == (("wo", "show"),)
     assert hooks.jarvis_verbs("jarvis status") == (("status", ""),)
     assert hooks.jarvis_verbs("git log") == ()
     # Untouched, so no other kind's behaviour changes (§2.6).
     assert hooks.is_jarvis_command_chain("cd /tmp && jarvis bug report x")
+    # …and still False for a prose-quoted command: #905's fix is deliberately NOT given
+    # to the chain predicate.
+    assert not hooks.is_jarvis_command_chain("jarvis wo ask wo-1 'a > b; c'")
+
+
+# -- #905: the four permitted writes carry PROSE, and prose is not shell structure ----
+
+#: wo-6be2ab21's own two refused commands, trimmed: a DOUBLE-quoted outer argument with
+#: SINGLE-quoted inner quotes, which is the shape the transcript shows.
+REAL_REFUSED_ASKS = (
+    'jarvis wo ask wo-6be2ab21 "Gap-class choice. \'jarvis validation show '
+    "wo-33e1d0b4' -> 'no validation has run on this work order', so automerge holds "
+    'for ever."',
+    'jarvis wo ask wo-6be2ab21 "Gap-class choice. Subject is a RELEASE order, so no '
+    'validation round can ever open; automerge then holds for ever while PR 899 is '
+    'green."',
+)
+
+#: The four writes the contract names, as a template for one prose argument.
+WRITE_TEMPLATES = (
+    "jarvis wo ask wo-inv001 {}",
+    "jarvis wo assume wo-inv001 {}",
+    "jarvis learn add {} --project proj_a",
+    "jarvis investigate verdict inv-1234abcd --from-file verdict.json {}",
+)
+
+#: One metacharacter each, inside a DOUBLE-quoted argument: `;` `|` `>` `<` and a bare
+#: `$`, every one of them inert there.
+DOUBLE_QUOTED_PROSE = (
+    '"automerge then holds for ever; nothing re-derives the hold"',
+    '"validation_applies returns False | no round can open"',
+    '"jarvis validation show wo-1 -> no validation has run"',
+    '"the hold is < one tick old"',
+    '"the bill was $56.88 and $HOME was unset"',
+)
+
+#: A backtick is prose only inside SINGLE quotes — inside double quotes the shell runs it.
+SINGLE_QUOTED_PROSE = ("'ops.validation_applies `returns` False; no round opens'",)
+
+
+def _prose_writes():
+    for template in WRITE_TEMPLATES:
+        for prose in DOUBLE_QUOTED_PROSE + SINGLE_QUOTED_PROSE:
+            yield template.format(prose)
+
+
+def test_the_two_commands_wo_6be2ab21_was_refused_are_allowed():
+    """#905: both arguments are one inert shell word, and both were denied."""
+    for command in REAL_REFUSED_ASKS:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "allow", command
+
+
+def test_prose_in_each_permitted_write_is_not_shell_structure():
+    for command in _prose_writes():
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "allow", command
+
+
+def test_an_ampersand_pair_inside_quotes_is_one_segment():
+    command = "jarvis learn add 'a && b' --project proj_a"
+    assert hooks.jarvis_verbs(command) == (("learn", "add"),)
+    assert _decision(hooks.investigator_bash_decision(
+        _bash(command), _env())) == "allow"
+
+
+#: COMMAND SUBSTITUTION INSIDE DOUBLE QUOTES. The shell interpolates there, so each of
+#: these is a jarvis command on its face and a write when it runs.
+SUBSTITUTION_IN_DOUBLE_QUOTES = tuple(
+    template.format(arg)
+    for template in WRITE_TEMPLATES
+    for arg in ('"$(sed -i s/a/b/ src/jarvis/ops.py)"',
+                '"`sed -i s/a/b/ src/jarvis/ops.py`"')
+)
+
+#: Real structure, unquoted: a second command, a redirection, a pipe into a shell.
+REAL_STRUCTURE = (
+    "jarvis wo ask wo-1 'q' ; git commit -am x",
+    "jarvis wo show wo-1 > f",
+    "jarvis wo show wo-1 | sh",
+)
+
+#: The refused verbs, now with a prose argument carrying a metacharacter — the new path
+#: to them (§3.1).
+PROSE_MUTATIONS = (
+    "jarvis bug report 'a stale hold; it never clears' -d x -e y -a z -p high",
+    'jarvis issues start 790 --note "a > b"',
+    'jarvis wo finish wo-inv001 --summary "done; the hold cleared"',
+)
+
+
+def test_command_substitution_in_a_double_quoted_write_is_still_refused():
+    """The asymmetry: `$` and a backtick are judged with ONLY single quotes masked,
+    because masking double quotes for them would hand this kind arbitrary execution
+    through the one branch that exists to let it talk to Neo."""
+    for command in SUBSTITUTION_IN_DOUBLE_QUOTES:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_real_shell_structure_and_the_refused_verbs_stay_refused():
+    for command in REAL_STRUCTURE + PROSE_MUTATIONS:
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+# -- review round 1: a BACKSLASH-ESCAPED quote does not open a span (spec DELTA 2) ----
+
+#: The regex masks took each `\"`/`\'` for the start of a quoted span, so the real `;`
+#: between them was masked and bash ran `git commit` as its own command.
+ESCAPED_QUOTE_ESCAPES = (
+    'jarvis wo ask wo-1 \\" ; git commit -am x ; \\"',
+    "jarvis wo ask wo-1 \\' ; git commit -am x ; \\'",
+    "jarvis wo ask wo-1 \\' $(sed -i s/a/b/ src/x.py) \\'",
+)
+
+
+def test_a_backslash_escaped_quote_does_not_mask_real_structure():
+    for command in ESCAPED_QUOTE_ESCAPES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_leaves_the_next_quote_a_real_quote():
+    """A literal backslash, so the `"` after it still opens a span."""
+    command = 'jarvis wo ask wo-1 \\\\" ; git commit -am x "'
+    assert hooks.jarvis_verbs(command) == (("wo", "ask"),)
+    assert _decision(hooks.investigator_bash_decision(
+        _bash(command), _env())) == "allow", command
+
+
+#: An unterminated quote has no knowable structure. Round 1 pinned this at the
+#: `jarvis_verbs` level only; both decision entry points must refuse it too.
+UNTERMINATED_QUOTES = (
+    'jarvis wo ask wo-1 "oops',
+    "jarvis wo ask wo-1 'oops",
+)
+
+#: An ESCAPED BACKSLASH is a literal backslash, so it does NOT escape the character
+#: after it: the pair-blanking must not swallow the real `;`/`$(` that follows.
+ESCAPED_BACKSLASH_THEN_STRUCTURE = (
+    "jarvis wo ask wo-1 \\\\; git commit -am x",
+    "jarvis wo ask wo-1 \\\\$(sed -i s/a/b/ src/x.py)",
+)
+
+
+def test_an_unterminated_quote_fails_closed():
+    for command in UNTERMINATED_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_an_escaped_backslash_does_not_hide_the_structure_after_it():
+    for command in ESCAPED_BACKSLASH_THEN_STRUCTURE:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+# -- review round 2: BRACE PARAMETER EXPANSION inside double quotes (spec DELTA 3) ----
+
+#: `${...}` inside double quotes is NOT a value: `:=` assigns and the assigned text is
+#: then prompt-expanded, and `a[$(cmd)]` is evaluated as an arithmetic subscript. The
+#: escaped `\$` is blanked by the scanner, so `_SHELL_SUBSTITUTION` never sees a `$(`.
+BRACE_EXPANSION_IN_DOUBLE_QUOTES = (
+    'jarvis wo ask wo-1 "${x:=\\$(touch /tmp/p)}"',
+    'jarvis wo ask wo-1 "${x:=a[\\$(touch /tmp/p)]}"',
+)
+
+
+def test_brace_parameter_expansion_in_a_double_quoted_write_is_refused():
+    for command in BRACE_EXPANSION_IN_DOUBLE_QUOTES:
+        assert hooks.jarvis_verbs(command) == (), command
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "deny", command
+        assert _decision(hooks.preflight_decision(
+            _bash(command), _env())) == "deny", command
+
+
+def test_the_prose_fixtures_leave_every_other_kind_alone():
+    for command in (REAL_REFUSED_ASKS + tuple(_prose_writes())
+                    + SUBSTITUTION_IN_DOUBLE_QUOTES + REAL_STRUCTURE
+                    + PROSE_MUTATIONS + BRACE_EXPANSION_IN_DOUBLE_QUOTES):
+        assert hooks.investigator_bash_decision(
+            _bash(command), _env("worker")) is None, command
 
 
 #: A read the git/gh pair test clears on its FIRST TWO WORDS while the rest of the command
@@ -638,6 +863,314 @@ def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_orde
         ops.show_investigation_order(improvement_order["id"])
 
 
+def test_fo_show_refuses_an_investigation_and_names_investigate_show(started, store):
+    """GitHub issue #997, the other half: the guard has to name the verb for the kind
+    the row ACTUALLY is."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    with pytest.raises(ops.OpsError) as e:
+        ops.show_feature_order(inv["id"])
+    assert "jarvis investigate show" in str(e.value)
+    assert "an investigation order" in str(e.value)
+
+
+# -- the family budget (2026-10-01-a-family-capped-raise-must-say-so.md) ---------------
+
+
+def test_the_family_budget_works_on_an_inv_id_and_refuses_every_other(started, store,
+                                                                     improvement_order):
+    """Obligation 5. The two-step top-up's second step: the command the child's note
+    prints has to exist. The family here is the order plus its one investigator, so the
+    feature-order arithmetic is already correct (§2.6)."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(2.00)
+    assert ops.set_investigation_budget(inv["id"], 9.0)["budget_usd"] == 9.0
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == 9.0
+    assert ops.set_investigation_budget(inv["id"], None)["budget_usd"] is None
+
+    for other in (improvement_order["id"],
+                  ops.create_feature_order("proj_a", "CSV export",
+                                           description="the whole ask")["id"]):
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.investigation_order_budget(other)
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.set_investigation_budget(other, 9.0)
+
+
+def test_the_cli_shows_and_sets_the_investigation_budget(started, store, capsys):
+    """Obligation 5 through the surface the note names, word for word."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert cli.main(["investigate", "budget", inv["id"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(2.00)
+
+    assert cli.main(["investigate", "budget", inv["id"], "$12.50", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == 12.5
+    assert store.get_feature_order(inv["id"])["budget_usd"] == 12.5
+
+    assert cli.main(["investigate", "budget", inv["id"], "--clear", "--json"]) == 0
+    capsys.readouterr()
+    assert store.get_feature_order(inv["id"])["budget_usd"] is None
+
+    assert cli.main(["investigate", "budget", "wo-11111111"]) != 0
+
+
+def test_raising_the_budget_names_the_parked_investigator(started, store):
+    """Obligation 5, the half that was silent (Neo question 1198). `exhausted_children`
+    is the whole instruction — which `jarvis wo budget <child>` to run next — and it was
+    read off `feature_children`, which is the `kind='worker'` children only."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY, budget_usd=2.0)
+    child = store.create_work_order("investigate it", description="look",
+                                    kind="investigator", parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.update_work_order(child["id"], budget_reserved_usd=2.0,
+                            status="budget_exhausted")
+
+    out = ops.set_investigation_budget(inv["id"], 20.0)
+    assert out["exhausted_children"] == [child["id"]]
+    # The read path's per-child breakdown has the same hole: its totals are the
+    # family's, so the rows under them have to be the family's too.
+    shown = ops.investigation_order_budget(inv["id"])
+    assert [c["wo_id"] for c in shown["children"]] == [child["id"]]
+
+
+def test_a_settled_flagged_investigation_still_lists(started, store):
+    """Obligation 6. `submit_verdict` settles a `WAITING_ON_USER` to `completed` AND
+    flags it in the same transaction — four live attention items against an empty
+    `jarvis investigate list` is that pair."""
+    inv_id, _investigator, _out = _submitted(started, store, "WAITING_ON_USER")
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "completed" and row["needs_attention"]
+    assert inv_id in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+
+    quiet, _i, _o = _submitted(started, store, "TRANSIENT")
+    assert not store.get_feature_order(quiet)["needs_attention"]
+    assert quiet not in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+    assert quiet in [r["id"] for r in
+                     ops.list_investigation_orders("proj_a", include_settled=True)]
+
+
+# -- a submitted verdict settles its investigator too ---------------------------------
+#
+# docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
+# GitHub issue 906. The verdict settled the investigation and handed the INVESTIGATOR to
+# `ops.finish` — the contract for an order that authored code — so five mechanisms built
+# for a submission that must be judged, landed and funded acted on an order whose output
+# was already stored.
+
+
+def _panel_on(catalog_file) -> None:
+    """Validation on in the catalog FILE, which is the copy `ops.finish` reads.
+
+    Written rather than set through `ops.set_config`, which a worker session is refused
+    (`_refuse_worker_write`) — the suite runs inside one.
+    """
+    data = json.loads(Path(catalog_file).read_text())
+    data["projects"][0]["validation"] = {"enabled": True}
+    Path(catalog_file).write_text(json.dumps(data))
+
+
+def test_a_verdict_settles_the_investigator_completed_and_stops_it(
+        started, store, catalog_file, fake_claude):
+    """§2.1: `close_out`, not `finish` — completed, flag down, session dead."""
+    from jarvis.daemon import Daemon
+
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    fake_claude.hold_turns()
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.tick()
+    investigator = _investigators(store)[0]["id"]
+    turn = store.latest_turn(investigator)
+    assert claude_cli.process_alive(turn["pid"])
+
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    assert row["result_summary"]
+    kinds = [e["kind"] for e in store.list_events(investigator)]
+    assert "verdict_submitted_settled" in kinds
+    assert "session_stopped" in kinds
+    assert not claude_cli.process_alive(turn["pid"])
+    assert store.validation_rounds(wo_id=investigator) == []
+
+
+def test_a_pending_assumption_does_not_hold_a_settled_investigator(started, store,
+                                                                  catalog_file):
+    """§2.1, wo-1aa88b2f exactly: the row stays pending and holds nothing."""
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    store.add_assumption(investigator,
+                         f"read {subject}'s prompt as truncated at 200 chars")
+
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    row = store.get_work_order(investigator)
+    assert row["status"] == "completed"
+    assert not row["needs_attention"]
+    pending = store.pending_assumptions(investigator)
+    assert len(pending) == 1 and pending[0]["status"] == "pending"
+
+
+def test_an_investigator_assumption_is_never_put_to_neo(started, store, catalog_file):
+    """§2.3: one kind test beside the status test covers both passes."""
+    from jarvis.daemon import Daemon
+    from jarvis.neo_store import NeoStore
+
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.project("proj_a")
+    spec.validation.enabled = True
+    spec.validation.auto_review = True
+    for status in ("needs_review", "running"):
+        wo = store.create_work_order(f"investigate ({status})", kind="investigator")
+        store.update_work_order(wo["id"], status=status)
+        store.add_assumption(wo["id"], "the hold is never re-derived, so it is stale")
+
+    daemon.auto_review(spec, store)
+
+    neo = NeoStore()
+    try:
+        assert [q for q in neo.list_questions() if q["kind"] == "assumption"] == []
+    finally:
+        neo.close()
+    for wo in _investigators(store):
+        assert [e for e in store.list_events(wo["id"])
+                if e["kind"] == "autoreview_asked"] == []
+
+
+def test_no_validation_round_opens_over_an_investigator(started, store, catalog_file):
+    """§2.4, first of the three call sites."""
+    _panel_on(catalog_file)
+    cfg = load_catalog(catalog_file).project("proj_a").validation
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    assert not ops.validation_applies(cfg, store.get_work_order(investigator), store)
+    assert store.validation_rounds(wo_id=investigator) == []
+    # The control, in the same breath: an ordinary worker still goes to the panel.
+    worker = store.create_work_order("ship the exporter")
+    assert ops.validation_applies(cfg, store.get_work_order(worker["id"]), store)
+
+
+def test_a_release_order_still_skips_the_panel(started, store, catalog_file):
+    """§2.4's regression guard on the SHARED predicate: a release order's own exemption is
+    untouched by the investigator one beside it. The landing halves are
+    tests/test_validation_release_skip.py's; this is the predicate."""
+    from jarvis import release
+
+    _panel_on(catalog_file)
+    cfg = load_catalog(catalog_file).project("proj_a").validation
+    rel = store.create_work_order("Ship the fix", metadata={
+        release.BATCH_KEY: ["https://github.com/acme/proj/issues/826"]})
+
+    row = store.get_work_order(rel["id"])
+    assert release.is_release_order(row)
+    assert not ops.validation_applies(cfg, row, store)
+    assert not ops.exempt_from_validation(store, row), "a release claims the OTHER one"
+
+
+def test_an_investigator_is_not_parked_in_validating_by_the_join(started, store,
+                                                                catalog_file):
+    """§2.4's lockstep half: the landing is TOLD, so it re-reads no round."""
+    _panel_on(catalog_file)
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    store.add_assumption(investigator, "the subject's own hold is the stale one")
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    out = ops.review_work_order(investigator, accept=True)
+
+    assert out["status"] == "completed"
+    assert store.get_work_order(investigator)["status"] == "completed"
+    assert store.validation_rounds(wo_id=investigator) == []
+
+
+# -- §2.5: the WAITING_ON_USER flag comes down when the subject is clear ---------------
+
+
+def _blocked_subject(store) -> str:
+    """A subject that genuinely owes the user: `failed` is one `true_blockers` derives."""
+    wo = store.create_work_order("ship the CSV export", description="the ask")
+    store.update_work_order(wo["id"], status="failed")
+    return wo["id"]
+
+
+def _waiting_on_user(started, store, subject: str) -> tuple[str, str]:
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    investigator = _investigating(store, inv)
+    ops.submit_verdict(inv["id"], a_verdict("WAITING_ON_USER", subject=subject))
+    assert store.get_feature_order(inv["id"])["needs_attention"]
+    return inv["id"], investigator
+
+
+def _cleared_events(store, investigator: str) -> list[dict]:
+    return [e for e in store.list_events(investigator)
+            if e["kind"] == "investigation_attention_cleared"]
+
+
+def test_a_waiting_on_user_flag_clears_once_the_subject_is_clear(started, store,
+                                                                catalog_file):
+    from jarvis.daemon import RECONCILE_EVERY_TICKS, Daemon
+
+    subject = _blocked_subject(store)
+    inv_id, investigator = _waiting_on_user(started, store, subject)
+    daemon = Daemon(load_catalog(catalog_file))
+    daemon.tick()
+    assert store.get_feature_order(inv_id)["needs_attention"], "the subject still owes"
+
+    store.set_status(subject, "completed")
+    # Through `tick`, so the wiring is asserted and not just the method — on the
+    # reconcile cadence, which is where §2.5 puts it.
+    for _ in range(RECONCILE_EVERY_TICKS):
+        daemon.tick()
+
+    row = store.get_feature_order(inv_id)
+    assert not row["needs_attention"]
+    assert not row["attention_reason"]
+    (event,) = _cleared_events(store, investigator)
+    assert json.loads(event["payload"])["subject"] == subject
+
+
+def test_a_tick_never_re_raises_a_cleared_investigation_flag(started, store,
+                                                            catalog_file):
+    """kn-089de524: the sweep is CLEAR-ONLY — a tick may lower this flag, never raise it."""
+    from jarvis.daemon import Daemon
+
+    subject = _blocked_subject(store)
+    inv_id, investigator = _waiting_on_user(started, store, subject)
+    daemon = Daemon(load_catalog(catalog_file))
+    spec = daemon.catalog.project("proj_a")
+
+    # The user acked it while the subject is still blocked.
+    store.clear_feature_attention(inv_id)
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+    assert _cleared_events(store, investigator) == []
+
+    # ...and with the flag up and the subject still blocked, nothing is re-stated.
+    store.flag_feature_attention(inv_id, "as-4: the user owes something")
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    row = store.get_feature_order(inv_id)
+    assert row["needs_attention"]
+    assert row["attention_reason"] == "as-4: the user owes something"
+    assert _cleared_events(store, investigator) == []
+
+    # One clear, and one event, however many ticks follow it.
+    store.set_status(subject, "completed")
+    for _ in range(3):
+        daemon.clear_answered_investigations(spec, store)
+    assert not store.get_feature_order(inv_id)["needs_attention"]
+    assert len(_cleared_events(store, investigator)) == 1
+
+
 # -- §2.7: the daemon seam ------------------------------------------------------------
 
 
@@ -810,7 +1343,9 @@ def test_the_investigator_prompt_is_a_fourth_branch_and_not_the_worker_contract(
     assert "open a PR" not in body and "pull request" not in body.lower()
     # The controls: the worker IS told to open one and to finish, and the analyst is its
     # own branch.
-    assert "open a PR" in worker and "jarvis wo finish" in worker
+    # `--pr `, not "open a PR": that prose rides in `git_briefing`/--append-system-prompt
+    # (kn-dfdab9f8) and is no longer in the prompt positional.
+    assert "--pr " in worker and "jarvis wo finish" in worker
     assert "jarvis io report" in analyst and "jarvis investigate verdict" not in analyst
 
 
@@ -823,6 +1358,35 @@ def test_the_prompt_names_the_four_classifications_and_what_it_cannot_file(
     assert "jarvis bug report" in prompt
     assert str(verdicts.MAX_VERDICT_CHARS) in prompt
     assert str(verdicts.MIN_QUOTE_CHARS) in prompt
+
+
+def test_every_write_the_prompt_promises_clears_the_hook(store, project_spec):
+    """#905: the hook's allow list pinned to the CONTRACT's list, derived from the
+    prompt, so a fifth write fails here instead of silently being unreachable."""
+    prompt = _prompt(store, "investigator", project_spec)
+    body = prompt.split("Writes — EXACTLY four, and nothing else is permitted:", 1)[1]
+    writes = []
+    for line in body.splitlines():
+        if line.startswith("- `jarvis "):
+            writes.append(line.split("`")[1])
+        elif writes:
+            break
+    assert len(writes) == 4, writes
+    for write in writes:
+        command = write.replace("<question>", "why does the hold hold; nothing clears it")
+        command = command.replace("<call you made with no doubt>", "the hold is written once")
+        command = command.replace("...", "a stale hold parks an order")
+        assert _decision(hooks.investigator_bash_decision(
+            _bash(command), _env())) == "allow", command
+
+
+def test_the_prompt_names_the_write_tool_for_the_verdict(store, project_spec):
+    """§2.6 of the 2026-10-01 spec: "Write it to `verdict.json`" reads as prose, and the
+    session spent turns being refused a heredoc instead."""
+    prompt = _prompt(store, "investigator", project_spec)
+    assert "`Write` tool" in prompt
+    assert "heredoc" in prompt
+    assert "--from-file verdict.json" in prompt
 
 
 def test_serena_reaches_the_investigator_read_only():
@@ -890,3 +1454,219 @@ def test_the_investigator_prompt_demands_a_gap_class_and_shows_the_registry(
     assert "mechanical" in lowered and "self-heal" in lowered
     # The control: the worker's prompt carries none of it.
     assert "gap_class" not in _prompt(store, "worker", project_spec)
+
+
+# -- the caller the seam was built for: §§3, 5 and 6 of
+# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+# The fixtures are the stuck sweep's own, imported rather than redeclared.
+
+
+def _opened(project_name: str | None = None) -> list[dict]:
+    return ops.list_investigation_orders(project_name, include_settled=True)
+
+
+def _settle(store, inv_id: str, hours_ago: float) -> None:
+    """One investigation settled `hours_ago` — the cooldown's clock (§6b)."""
+    store.set_feature_status(inv_id, "completed")
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - hours_ago * HOUR, inv_id))
+    store.conn.commit()
+
+
+def test_stuck_order_gets_exactly_one_investigation(stuck_os):
+    """§5 end to end, and §6a: the second sweep spends no attempt to learn it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    assert opened[0]["kind"] == "investigation" and opened[0]["origin"] == "fleet_health"
+    assert ops.live_investigation("proj_a", wo["id"]) == opened[0]["id"]
+    assert ops.show_investigation_order(opened[0]["id"])["subject"] == wo["id"]
+
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+
+def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
+    """§6b: the cooldown AND the fingerprint, and either one alone refuses."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "parked and staying parked")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    daemon.stuck_tick(None)
+    first = _opened("proj_a")[0]["id"]
+
+    # Past the 720-minute cooldown with nothing about the situation changed.
+    _settle(store, first, hours_ago=13)
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    # The situation HAS changed, but the cooldown has not run: "it moved" and "it is
+    # better" are not the same claim.
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - 13 * HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 2
+
+
+def test_daily_cap_holds_fleet_wide(jarvis_home, project, tmp_path):
+    """§6c: the cap holds across the whole fleet, and cuts the LEAST overdue.
+
+    The cap is NAMED here rather than taken from the default: Neo 1148 raised the shipped
+    `max_per_day` to 48 so a 5-minute threshold cannot spend the day's allowance in the
+    first hour, and what this test is about is the cap's ARITHMETIC, not its value.
+    """
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project)},
+                                   {"name": "proj_b", "path": str(other)}],
+                        name="stuck-two.json", fleet_health={"max_per_day": 4})
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+    overdue = {}
+    try:
+        for name, hours in (("proj_a", (9, 8, 7)), ("proj_b", (6, 5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+                overdue[wo["id"]] = h
+
+        Daemon(load_catalog(cat)).stuck_tick(None)
+
+        opened = _opened()
+        assert len(opened) == 4
+        subjects = {ops.show_investigation_order(i["id"])["subject"] for i in opened}
+        assert subjects == set(sorted(overdue, key=lambda i: -overdue[i])[:4])
+    finally:
+        for store in stores.values():
+            store.close()
+
+
+def test_daily_cap_counts_projects_not_due_this_tick(jarvis_home, project, tmp_path):
+    """§6c against Neo 1086's PER-PROJECT cadence: the cap counts wider than the scan.
+
+    Two projects on different `sweep_every_ticks`. A spends the whole day's allowance on
+    a tick of its own; a later tick that sweeps ONLY B must open nothing. Counting
+    `opened_today` over the due projects alone would let every cadence have its own
+    allowance — the one spend ceiling on this pass, failing open.
+    """
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(
+        tmp_path,
+        [{"name": "proj_a", "path": str(project),
+          "fleet_health": {"sweep_every_ticks": 1000}},
+         {"name": "proj_b", "path": str(other), "fleet_health": {"sweep_every_ticks": 3}}],
+        name="stuck-cadences.json", fleet_health={"max_per_day": 4})
+    daemon = Daemon(load_catalog(cat))
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+
+    def run_row() -> dict:
+        central = CentralStore()
+        try:
+            return db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})
+        finally:
+            central.close()
+
+    try:
+        for name, hours in (("proj_a", (9, 8, 7, 6)), ("proj_b", (5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+
+        daemon.tick_count = 1
+        daemon.stuck_tick(None, projects=daemon.stuck_due_projects())
+        assert run_row()["opened"] == 4
+        assert len(_opened("proj_a")) == 4
+
+        daemon.tick_count = 4
+        due = daemon.stuck_due_projects()
+        assert [p.name for p in due] == ["proj_b"], "only the finer cadence is due"
+        daemon.stuck_tick(None, projects=due)
+
+        run = run_row()
+        assert run["opened"] == 0
+        assert run["skipped"]["daily_cap"] == 2
+        assert _opened("proj_b") == []
+    finally:
+        for store in stores.values():
+            store.close()
+
+
+def test_an_investigation_is_never_a_subject(stuck_os):
+    """§6's third layer: the SWEEP skips it, and `ops` still refuses it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    subject = ops.create_work_order("proj_a", "the order being diagnosed")
+    inv = ops.create_investigation_order("proj_a", subject["id"], why=WHY)
+    investigator = store.create_work_order(
+        title=f"investigate {subject['id']}", kind="investigator", parent_id=inv["id"])
+    park_order(store, investigator["id"], "waiting_input", hours=20)
+
+    daemon.stuck_tick(None)
+
+    assert [i["id"] for i in _opened("proj_a")] == [inv["id"]]
+    with pytest.raises(ops.OpsError, match="investigator"):
+        ops.create_investigation_order("proj_a", investigator["id"], why=WHY)
+
+
+def test_a_user_owed_order_is_investigated(stuck_os):
+    """§3: an order that reads as the user's is swept on exactly the same terms."""
+    from jarvis import invariants
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the review could not be satisfied")
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute(
+        "UPDATE work_orders SET needs_attention=1, attention_reason=? WHERE id=?",
+        (invariants.VALIDATION_STUCK_BLOCKER, wo["id"]))
+    store.conn.commit()
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    why = opened[0]["description"]
+    for question in ("Is the blocker true, current and correctly worded?",
+                     "Is it the user's call, or is it the OS failing to decide?",
+                     "Does the user have the reason and the link they need to decide?"):
+        assert question in why
+
+
+def test_verdict_reaches_the_subject_timeline(started, store):
+    """§7: the verdict lands where the reader of the STUCK order will see it, and the
+    kind is an observer kind so looking cannot move the cooldown's fingerprint."""
+    from jarvis import health, stuck
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+
+    def fp() -> str:
+        return stuck.fingerprint("validating", 0.0, "a blocker", store.count_events(
+            subject, exclude=health.observer_kinds()))
+
+    before = fp()
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    events = [e for e in store.list_events(subject)
+              if e["kind"] == "investigation_verdict"]
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["classification"] == "TRANSIENT"
+    assert payload["investigation"] == inv["id"]
+    assert "investigation_verdict" in health.observer_kinds()
+    assert fp() == before

@@ -88,7 +88,7 @@ SUBPROCESS_KINDS = frozenset({WORKER_SUBPROCESS})
 
 #: What the user spent LOOKING at an order — the five observability paths, each metered at
 #: its own definition by `observability.metered` (§10 of
-#: docs/specs/2026-09-24-order-observability.md). A THIRD CLASS beside the worker's turns
+#: docs/superpowers/specs/2026-09-24-order-observability.md). A THIRD CLASS beside the worker's turns
 #: and Jarvis's overhead, for `WORKER_SUBPROCESS`'s reason exactly: money spent looking at
 #: an order is not money spent doing it, and a bill that mixes them answers neither
 #: question.
@@ -107,6 +107,15 @@ OBSERVE_CONTEXT_WRITE = "observe_context_write"
 
 OBSERVABILITY_KINDS = frozenset({OBSERVE_LIVE, OBSERVE_INSPECT, OBSERVE_CONTEXT,
                                  OBSERVE_WHY, OBSERVE_CONTEXT_WRITE})
+
+#: What Neo COSTS — §4 of docs/superpowers/specs/2026-10-01-neo-observability.md. A FOURTH CLASS,
+#: named here in the module that owns the vocabulary rather than as a literal list in the
+#: report, for `SUBPROCESS_KINDS`' reason: every call Jarvis makes to decide something on
+#: the user's behalf. Excluded: `COMPACTION`, `WORKER_SUBPROCESS` and every
+#: `OBSERVABILITY_KINDS` member — the worker's own spend and the user's looking, by the
+#: classes above.
+NEO_KINDS = frozenset({"neo_answer", "panel_seat", "validation_seat",
+                       "stakes_classifier", "digest", "supervisor", "health"})
 
 #: What kind of OS work a call was, as stored in `agent_calls.kind`. Open by design —
 #: an unknown kind records fine and shows up in the report under its own name — but the
@@ -194,6 +203,9 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     belongs in the fleet total even though no single work order caused it.
     """
     prompt_chars = system_prompt_chars = 0
+    #: None, never 0: a sub-millisecond call rounds to 0 and the report must not print
+    #: "0 ms" for a call nobody timed (§3 of docs/superpowers/specs/2026-10-01-neo-observability.md).
+    latency_ms: int | None = None
     if isinstance(usage, claude_cli.HeadlessResult):
         model = model or usage.model
         # How big the OS's own input was (spec §3,
@@ -201,6 +213,8 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
         # here, off the envelope below — both are what a call site has to hand.
         prompt_chars = usage.prompt_chars
         system_prompt_chars = usage.system_prompt_chars
+        # Off the dataclass here, off the envelope below — `prompt_chars`' rule exactly.
+        latency_ms = usage.latency_ms or None
         # The session the CLI minted for this call, taken here because this is the last
         # place it exists: a one-shot `claude -p` returns it once and Jarvis keeps no
         # other handle on it. It is what lets an OS call be opened up per API call the
@@ -213,6 +227,8 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
     if isinstance(usage, dict) and not prompt_chars and not system_prompt_chars:
         prompt_chars = int(usage.get("prompt_chars") or 0)
         system_prompt_chars = int(usage.get("system_prompt_chars") or 0)
+    if isinstance(usage, dict) and latency_ms is None:
+        latency_ms = int(usage.get("latency_ms") or 0) or None
     own = store is None
     try:
         # `spend_db_path()` is None in every ordinary case, which is the daemon writing
@@ -223,7 +239,8 @@ def record(kind: str, *, usage: Any = None, project: str = "", wo_id: str = "",
                                     model=model, question_id=question_id, ok=ok,
                                     session_id=session_id, usage=usage,
                                     prompt_chars=prompt_chars,
-                                    system_prompt_chars=system_prompt_chars)
+                                    system_prompt_chars=system_prompt_chars,
+                                    latency_ms=latency_ms)
     except Exception:  # noqa: BLE001 — see the module docstring: never raise
         log.warning("could not record %s usage for %s", kind, wo_id or "the OS",
                     exc_info=True)

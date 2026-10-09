@@ -1,6 +1,6 @@
 """The debugging page — `GET /wo/{name}/{wo_id}/debug` — and the JSON the poll reads.
 
-§7 of docs/specs/2026-09-24-order-observability.md. The four payloads (`ops.diagnose`,
+§7 of docs/superpowers/specs/2026-09-24-order-observability.md. The four payloads (`ops.diagnose`,
 `ops.live_report`, `ops.inspect_report`, `ops.context_report`) are each covered by their
 own file; what is left here is the two ways ONE page over four readings can lie:
 
@@ -24,7 +24,7 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from jarvis import cli, inspection, ops, uilog, usage  # noqa: E402
+from jarvis import autopsy, cli, inspection, ops, uilog, usage  # noqa: E402
 from jarvis.catalog import load_catalog  # noqa: E402
 from jarvis.central_store import CentralStore  # noqa: E402
 from jarvis.project_store import ProjectStore  # noqa: E402
@@ -313,6 +313,9 @@ def test_an_order_with_no_session_says_so_instead_of_reporting_zeroes(client):
     assert "no transcript" in page.text                # the anatomy's `found: false`
     assert ops.NOT_RECORDED in page.text               # the ledger's forward-only note
     assert "0 turns" not in page.text and "0 tokens" not in page.text
+    # §4 of 2026-09-27: and the page says WHICH reading gave that answer — rendered above
+    # the `found` short-circuit, so it is visible in the one case it matters.
+    assert page.text.count(autopsy.NOT_RECORDED_NOTE) >= 2  # anatomy AND the ledger
 
 
 def test_an_order_predating_the_context_ledger_renders_the_forward_only_note(
@@ -326,6 +329,29 @@ def test_an_order_predating_the_context_ledger_renders_the_forward_only_note(
     assert page.status_code == 200
     assert ops.NOT_RECORDED in page.text
     assert ops.TURN_NOT_RECORDED in page.text
+    # An unsealed order's ledger says it was DERIVED: the forward-only note is about the
+    # ledger, the provenance is about the reading, and the two absences are not one.
+    assert "derived from the session transcript" in page.text
+
+
+def test_a_sealed_order_says_on_the_page_that_it_was_read_from_its_seal(
+        client, dispatched, transcripts):
+    """§4: every surface PRINTS which reading answered. The transcript is deleted here,
+    which is the case the seal exists for — the page still shows the anatomy."""
+    from jarvis import autopsy
+
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"), assistant_row(at + 2, "m1", write=60_000)])
+    name, path, _row = ops.find_work_order(wo_id)
+    autopsy.seal(name, path, store.get_work_order(wo_id))
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug")
+
+    assert page.status_code == 200
+    assert "SEALED autopsy" in page.text
+    assert autopsy.autopsy_level_note(autopsy.NORMAL) in page.text
 
 
 # -- 5. the JSON the poll reads -------------------------------------------------------
@@ -496,3 +522,24 @@ def test_tool_parameters_are_html_escaped(client, dispatched, transcripts):
 
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
     assert "<script>alert(1)</script>" not in page
+
+
+def test_the_anatomy_page_shows_the_navigation_counts(client, dispatched, transcripts):
+    """§3: the page and `jarvis inspect` read the SAME literals, so neither can report a
+    navigation reading the other contradicts."""
+    store, wo_id = dispatched["store"], dispatched["wo_id"]
+    at = _inside(store, wo_id, 1)
+    transcripts(dispatched["session"],
+                [prompt_row(at, "go"),
+                 *tool_rows(at, at + 1, "t1", "Bash",
+                            {"command": "grep -rn total_for src/pricing.py"}),
+                 *tool_rows(at + 1, at + 2, "t2", "mcp__serena__find_symbol",
+                            {"name_path_pattern": "a"}),
+                 *tool_rows(at + 2, at + 3, "t3", "Bash", {"description": "no command"}),
+                 assistant_row(at + 4, "m1")])
+
+    page = client.get(f"/wo/proj_a/{wo_id}/debug").text
+    (unit,) = ops.inspect_report(wo_id, "proj_a")["units"]
+
+    assert unit["nav"] == {"symbol_calls": 1, "source_nav_calls": 1, "unclassified": 1}
+    assert inspection.nav_line(unit["nav"]) in page

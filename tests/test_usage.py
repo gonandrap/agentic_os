@@ -16,6 +16,7 @@ proves it can return two.
 from __future__ import annotations
 
 import json
+from typing import Sequence
 
 import pytest
 
@@ -29,12 +30,17 @@ FLOOR = 5_000
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
         model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
-        at: str = "2026-08-09T00:00:00.000Z") -> dict:
+        at: str = "2026-08-09T00:00:00.000Z",
+        stop_reason: str | None = "end_turn") -> dict:
     """One assistant row, in the shape Claude Code writes.
 
     `cache_creation` — the TTL the write bought — is nested one level down and is only
     written when a test asks for it, because most rows in the wild predate it and the
     module has to price those too.
+
+    `stop_reason` defaults to a SEALED value: a row carrying none is a mid-stream
+    snapshot whose `output_tokens` is a placeholder
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
     """
     usage_obj: dict = {
         "input_tokens": plain,
@@ -48,7 +54,8 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
     return {
         "type": "assistant",
         "timestamp": at,
-        "message": {"id": mid, "model": model, "usage": usage_obj},
+        "message": {"id": mid, "model": model, "usage": usage_obj,
+                    "stop_reason": stop_reason},
     }
 
 
@@ -101,6 +108,32 @@ def test_streamed_duplicates_count_once_but_distinct_messages_both_count(transcr
     assert total.cache_write == 700            # 500 + 200, not 1500 + 200
     assert total.output == 200                 # 140 + 60: the max copy, not the first
     assert total.cache_read == 500
+
+
+def test_a_message_whose_every_row_is_mid_stream_is_counted_not_estimated(transcripts):
+    """The defect this parser can only DISCLOSE: a message with no sealed row at all.
+
+    Claude Code writes a subagent's assistant message once per content block with
+    `stop_reason: null` and a streaming `output_tokens`, and never writes the sealed row
+    carrying the real figure. Counted, flagged, and NOT estimated — `output` stays the
+    MAX-merged placeholder, which is what fails if someone later scales it
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1, decision 3).
+
+    Paired with a sealed message in the same transcript, so "1 placeholder call" cannot
+    pass against a parser that calls everything a placeholder.
+    """
+    path = transcripts("s1", [
+        row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
+        row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
+        row("msg_b", write=100, read=200, out=700),
+    ])
+    total = usage.read_session("s1", FLOOR).total
+
+    assert total.placeholder_calls == 1
+    assert total.placeholder_output == 5
+    assert total.output == 705          # 5 + 700: the MAX merge, nothing synthesised
+    assert [call.sealed for call in usage.calls_of(path)] == [False, True]
+    assert total.as_dict()["placeholder_calls"] == 1
 
 
 def test_output_takes_the_max_not_the_last_row(transcripts):
@@ -327,6 +360,36 @@ def test_subagents_are_counted_separately_and_included_in_the_total(transcripts)
     assert session.total.output == 22
 
 
+def test_the_subagent_rewrite_tax_is_a_structural_zero_not_a_small_one(transcripts):
+    """Spec 2026-10-02 §1.5, asserted as a PROPERTY and not as a constant.
+
+    The main side's cache read goes BACKWARDS once, so it has a boundary and an excess.
+    The subagent's never does and its written volume never exceeds its own context peak,
+    so `rewrite_excess` and `resume_boundaries` can only be 0 — while it still wrote
+    real tokens. That is the zero `jarvis cost` has to label.
+    """
+    transcripts(
+        "structural",
+        [row("m1", write=60_000, read=50_000, at="2026-08-09T00:00:00.000Z"),
+         row("m2", write=60_000, read=1_000, at="2026-08-09T01:00:00.000Z"),
+         row("m3", write=60_000, read=2_000, at="2026-08-09T02:00:00.000Z")],
+        subagents={"agent-aaa": [
+            row("s1", write=5_000, read=100_000, at="2026-08-09T00:10:00.000Z"),
+            row("s2", write=5_000, read=120_000, at="2026-08-09T00:11:00.000Z")]})
+    session = usage.read_session("structural", FLOOR)
+
+    assert session.subagents.cache_write == 10_000
+    assert session.subagents.rewrite_excess == 0
+    assert session.subagents.resume_boundaries == 0
+    assert session.main.rewrite_excess > 0 and session.main.resume_boundaries == 1
+    # `Usage.__add__` sums both sides, so the total carries the main side's tax alone —
+    # which is why an unlabelled rollup reads as "subagent cache spend is negligible".
+    assert session.total.rewrite_excess == session.main.rewrite_excess
+    assert session.total.resume_boundaries == session.main.resume_boundaries
+    assert session.total.cache_write == (session.main.cache_write
+                                         + session.subagents.cache_write)
+
+
 def test_an_empty_subagent_transcript_is_not_counted_as_an_agent(transcripts):
     """Claude Code leaves behind stub files for agents that produced nothing."""
     transcripts("s1", [row("m1", write=100)], subagents={"agent-empty": []})
@@ -512,3 +575,154 @@ def test_rows_without_usage_are_ignored(transcripts):
         row("m1", write=100, out=10),
     ])
     assert usage.read_session("s1", FLOOR).total.messages == 1
+
+
+# --- the tool_use/tool_result walk (spec 2026-10-06-fleet-cost-per-tool.md §10.2-§10.3)
+
+
+def call_row(mid: str, *, read: int = 0, out: int = 0, write: int = 0, plain: int = 0,
+             tools: Sequence[tuple[str, str]] = (),
+             at: str = "2026-10-06T00:00:00.000Z") -> dict:
+    """One assistant row with `usage` and optional `tool_use` blocks.
+
+    `tools` is (id, name) pairs: the parallel-call case is several blocks on ONE row,
+    which is how Claude Code writes it and the case the char split exists for.
+    """
+    return {
+        "type": "assistant",
+        "timestamp": at,
+        "message": {
+            "id": mid, "model": "claude-opus-5",
+            "usage": {"input_tokens": plain, "cache_creation_input_tokens": write,
+                      "cache_read_input_tokens": read, "output_tokens": out},
+            "content": [{"type": "tool_use", "id": tid, "name": name,
+                         "input": {"command": f"echo {tid}"}}
+                        for tid, name in tools],
+        },
+    }
+
+
+def result_row(*results: tuple[str, str], at: str = "2026-10-06T00:00:01.000Z",
+               is_error: bool = False) -> dict:
+    """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs."""
+    return {
+        "type": "user",
+        "timestamp": at,
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                 "content": text, "is_error": is_error}
+                                for tid, text in results]},
+    }
+
+
+def write_jsonl(path, rows_out: Sequence[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows_out))
+    return path
+
+
+def test_tool_results_pairs_a_use_with_its_result_and_sizes_it_by_context_delta(
+        tmp_path):
+    """The pair, and the unmatched call beside it so "one result" cannot be a stub.
+
+    Paired on purpose: a `tool_use` whose result never arrived (the turn was killed
+    mid-call) must come back unmatched and WITHOUT tokens, never zero-filled into the
+    averages — §10.2's `excluded.unmatched_calls`.
+    """
+    path = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
+        result_row(("t1", "x" * 40)),
+        call_row("m2", read=1200, out=10, tools=[("t2", "Bash")]),
+    ])
+    found = usage.tool_results(path)
+    assert [(r.tool_use_id, r.name, r.matched) for r in found] == [
+        ("t1", "Read", True), ("t2", "Bash", False)]
+    first, unmatched = found
+    # 1200 - 1000 - 50: the tokens call m2 was asked to read that m1 was not.
+    assert (first.tokens, first.token_basis) == (150, usage.BASIS_CONTEXT_DELTA)
+    assert (first.chars, first.is_error, first.caller) == (40, False, usage.CALLER_MAIN)
+    assert (unmatched.tokens, unmatched.token_basis) == (0, "")
+
+
+def test_parallel_results_split_char_proportionally_and_sum_to_the_delta(tmp_path):
+    """K results between one call pair share ONE exact delta, 1:1:2 by characters.
+
+    The sum is the assertion that matters: 150 split three ways has a remainder, and a
+    per-result rounding that loses it would under-report the fleet's tool cost.
+    """
+    path = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50,
+                 tools=[("t1", "Read"), ("t2", "Read"), ("t3", "Bash")]),
+        result_row(("t1", "a" * 10), ("t2", "b" * 10), ("t3", "c" * 20)),
+        call_row("m2", read=1200),
+    ])
+    found = usage.tool_results(path)
+    assert sum(r.tokens for r in found) == 150
+    assert sorted(r.tokens for r in found) == [37, 38, 75]
+    assert {r.token_basis for r in found} == {usage.BASIS_CONTEXT_DELTA}
+
+
+def test_a_compaction_between_the_calls_falls_back_to_chars(tmp_path):
+    """The context goes DOWN at a `compact_boundary`, so the delta is not the result.
+
+    Divisor comes from the caller (`cost.chars_per_token`), which is why the same file
+    is sized twice here: 40 characters is 10 tokens at 4.0 and 20 at 2.0.
+    """
+    path = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
+        result_row(("t1", "x" * 40)),
+        {"type": "system", "subtype": "compact_boundary",
+         "timestamp": "2026-10-06T00:00:02.000Z",
+         "compactMetadata": {"trigger": "auto", "preTokens": 1000, "postTokens": 100}},
+        call_row("m2", read=1200),
+    ])
+    only, = usage.tool_results(path)
+    assert (only.tokens, only.token_basis) == (10, usage.BASIS_CHARS)
+    other, = usage.tool_results(path, chars_per_token=2.0)
+    assert other.tokens == 20
+
+
+def test_a_user_prompt_between_the_calls_falls_back_to_chars(tmp_path):
+    """Otherwise the user's own typing is charged to the tool."""
+    path = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
+        result_row(("t1", "x" * 40)),
+        {"type": "user", "timestamp": "2026-10-06T00:00:02.000Z",
+         "message": {"content": "now do the other thing"}},
+        call_row("m2", read=1200),
+    ])
+    only, = usage.tool_results(path)
+    assert (only.tokens, only.token_basis) == (10, usage.BASIS_CHARS)
+
+
+def test_a_non_positive_delta_falls_back_to_chars(tmp_path):
+    """A context that did not grow cannot be evidence of what the tool appended."""
+    path = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
+        result_row(("t1", "x" * 40)),
+        call_row("m2", read=900),
+    ])
+    only, = usage.tool_results(path)
+    assert (only.tokens, only.token_basis) == (10, usage.BASIS_CHARS)
+
+
+def test_a_sidechain_result_is_attributed_to_the_subagent_not_the_main_chain(tmp_path):
+    """Caller is the FILE the row came from — `read_session`'s own split (§10.3).
+
+    Paired: the same walk over the parent transcript must say `main`, or "subagent"
+    would be indistinguishable from a constant.
+    """
+    parent = write_jsonl(tmp_path / "s1.jsonl", [
+        call_row("m1", read=1000, out=50, tools=[("t1", "Read")]),
+        result_row(("t1", "x" * 40)),
+        call_row("m2", read=1200),
+    ])
+    sub = write_jsonl(tmp_path / "s1" / "subagents" / "agent-a.jsonl", [
+        call_row("n1", read=500, out=10, tools=[("u1", "Grep")]),
+        result_row(("u1", "y" * 8)),
+        call_row("n2", read=600),
+    ])
+    assert [r.caller for r in usage.tool_results(parent)] == [usage.CALLER_MAIN]
+    sub_result, = usage.tool_results(sub)
+    assert sub_result.caller == usage.CALLER_SUBAGENT
+    # 600 - 500 - 10, measured inside the subagent's own chain.
+    assert (sub_result.tokens, sub_result.name) == (90, "Grep")

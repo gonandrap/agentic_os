@@ -110,9 +110,11 @@ def git_briefing(model: str | None = None) -> str:
     text is byte-identical for every turn of a given work order.
 
     Deliberately NOT a copy of the CLI's "commit only when the user asks": for a worker
-    the work order IS the ask, and the operating contract already tells it to commit and
-    open a PR. Copying that line verbatim would have the system prompt contradict the
-    contract.
+    the work order IS the ask. Copying that line verbatim would contradict the commit and
+    PR rules below — and THIS BLOCK IS NOW THE ONLY PLACE THOSE RULES ARE STATED. The
+    core operating contract used to restate them; that prose was cut to pay for the
+    pass-a-reference rule (Neo question 946), so a trim here removes them from the
+    worker's prompt altogether.
     """
     return "\n".join([
         "# Git",
@@ -173,7 +175,8 @@ def section_names() -> list[str]:
 def render_section(name: str, *, wo_id: str | None = None,
                    project: str | None = None,
                    gates_enabled: tuple[str, ...] | None = None,
-                   serena: bool = True) -> str:
+                   serena: bool = True,
+                   tool_search: str = "cli") -> str:
     """One full section, rendered with real ids when the caller has them.
 
     Read-only and total: every listed name renders non-empty text with placeholders
@@ -189,7 +192,7 @@ def render_section(name: str, *, wo_id: str | None = None,
     if name == "record":
         return record_section(wo)
     if name == "navigation":
-        return navigation_section(serena)
+        return navigation_section(serena, tool_search=tool_search)
     if name == "concision":
         return concision_section()
     if name == "knowledge":
@@ -214,10 +217,11 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
     lines = [
         "# Operating contract",
         "You MUST follow it. This is the compressed core; the full contract with "
-        "all its reasoning is one read-only command away — see \"Full briefings on "
-        "demand\" below.",
-        "- Work only inside your assigned worktree (you start in it). Commit your "
-        "work and open a PR per this repo's conventions. Never push to main.",
+        "all its reasoning is one read-only command away — see the index below.",
+        # The commit/PR half of this bullet is gone from the CORE: `git_briefing` states
+        # both in every prompt, and the room bought the pass-a-reference rule below (Neo
+        # question 946). The full `contract` section still carries it.
+        "- Work only inside your assigned worktree (you start in it).",
         f"- **The PR title MUST start with `[{wo_id}] `** — e.g. "
         f"`[{wo_id}] {title[:40]}`. `gh pr create` with any other title is blocked.",
         f"- **Neo is your first responder. Any doubt goes to it.** "
@@ -243,8 +247,8 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         *([
             f"- READ the OS knowledge base before you touch an area it covers — it "
             f"is INDEXED at the end of this prompt, not pasted into it: "
-            f"`jarvis learn show <id>`, `jarvis learn search \"<term>\" "
-            f"--project {project}`.",
+            f"`jarvis learn show <id>` for a body, `jarvis learn search \"<term>\" "
+            f"--project {project}` to find which entries match.",
         ] if has_knowledge else []),
         f"- The OS knowledge base is the ONLY memory that survives you: "
         f"`jarvis learn add \"...\" --project {project} --topic \"<topic>\"`. Your "
@@ -283,12 +287,16 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
         f"what the user and Neo decide from. The summary is the HEADLINE — capped "
         f"at {SUMMARY_MAX_WORDS} words, longer REFUSED — your final message is the "
         f"report, and where detail goes.",
+        # What to do when review feedback asks for more moved into `record_section`
+        # (Neo question 946): this bullet paid for the one below it, and nothing was lost.
         f"- Add `--evidence \"<what you ran and what it showed>\"` to that same "
-        f"finish: the tests, evals and checks you actually ran, and what they "
-        f"reported. The summary says what you built; the evidence says how you "
-        f"know it works, and it is read beside your diff. Review feedback may come "
-        f"back asking for more — do what it asks, then finish again with the "
-        f"fuller account.",
+        f"finish: the tests, evals and checks you ran, and what they reported. It says "
+        f"how you know it works, and review feedback may ask for more.",
+        f"- **Pass a REFERENCE, never a payload.** No diff, log, file or JSON dump in "
+        f"a `jarvis` command, message or question: pass a pull request URL, commit "
+        f"SHA, path with a line range, or the command that reproduces it. An "
+        f"oversized argument and a `$(git diff …)` are refused before the command "
+        f"runs.",
         # spec 2026-09-23-the-crew-a-worker-must-use.md SS6 — worker only; a planner
         # has its own team prose in `dispatch._planner_prompt`.
         *([
@@ -301,8 +309,7 @@ def core_contract(wo_id: str, title: str, project: str, has_knowledge: bool,
             "work-order record (messages, assumptions, the finish summary), and REVIEW "
             "of what they hand back — it is a draft until you have read it.",
             "- Your OWN `Edit`/`Write` inside the worktree is refused by a hook, so "
-            "route the change through `jarvis-implementer` rather than arguing with "
-            "the tool.",
+            "route it through `jarvis-implementer`.",
         ] if kind == "worker" else []),
     ]
     return lines
@@ -352,7 +359,7 @@ def _question_shape(wo_id: str) -> list[str]:
         f"recommendation. Do NOT paste context — whoever answers already holds this "
         f"work order's title and description, and when your paragraph references "
         f"the design artifact it argues from in-text (e.g. `from section 3 of "
-        f"design doc \"docs/specs/feature.md\": …`) that section is delivered "
+        f"design doc \"docs/superpowers/specs/feature.md\": …`) that section is delivered "
         f"alongside it automatically. Questions over {QUESTION_MAX_CHARS} "
         f"characters are refused.",
         "  - The trigger is DOUBT, not importance. If you catch yourself weighing "
@@ -408,12 +415,14 @@ def contract_section(wo_id: str = WO_PLACEHOLDER,
         f"order suggested it, and tells you nothing back, because nothing you do "
         f"next should depend on the answer.",
         f"- READ the OS knowledge base on demand: `jarvis learn show <id>` for an "
-        f"entry your prompt's index lists, `jarvis learn search \"<term>\" "
-        f"--project {project}` to sweep for one. Look up any area you are about to "
+        f"entry your prompt's index lists — it is the only verb that returns a "
+        f"body — and `jarvis learn search \"<term>\" --project {project}` to find "
+        f"which entries match, which answers with headlines, ids and one matching "
+        f"line each. Look up any area you are about to "
         f"touch BEFORE you touch it, and before you ask or assume about it — a "
-        f"past worker probably already paid for the lesson. A headline is a "
-        f"truncated first line, never the whole entry: if it looks relevant, fetch "
-        f"it rather than acting on the summary.",
+        f"past worker probably already paid for the lesson. A headline or a quoted "
+        f"line is never the whole entry: if it looks relevant, `show` it rather "
+        f"than acting on the summary.",
         f"- WRITE to it too: the OS knowledge base is the ONLY memory that "
         f"survives you: `jarvis learn add \"...\" --project {project} --topic "
         f"\"<topic>\"`. Anything durable you learn — project state, gotchas, "
@@ -493,7 +502,9 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
         f"says how you know it works, and it is read beside your diff by someone "
         f"who was not in this session and takes nothing on trust. \"Ran the "
         f"suite\" is not evidence; \"`uv run pytest tests/test_thing.py -q` — 412 "
-        f"passed, 0 failed, including the 6 new cases\" is.",
+        f"passed, 0 failed, including the 6 new cases\" is. Review feedback may come "
+        f"back asking for more — do what it asks, then finish again with the fuller "
+        f"account.",
         "",
         "RUN THE TARGETED TESTS, NOT THE WHOLE SUITE. The tests for what you changed "
         "belong in a worker turn; the full suite belongs to CI, which runs it on more "
@@ -546,14 +557,106 @@ def record_section(wo_id: str = WO_PLACEHOLDER) -> str:
     return "\n".join(lines)
 
 
-def navigation_section(serena: bool = True) -> str:
+#: The ToolSearch recovery call, as the worker must type it. Both prefixes in ONE select
+#: — `mcp__serena__` from `claude mcp add serena`, `mcp__plugin_serena_serena__` from a
+#: plugin install (`dispatch.SERENA_TOOL_PREFIXES`) — because an absent name is silently
+#: ignored and the rest of the select survives: probed on 2.1.284, where a select naming
+#: both spellings of `find_symbol` on a plugin install returned only the plugin one. Four
+#: tools, not eleven: these are the ones the defect is about. §3 item 1 of
+#: docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md.
+NAV_SELECT_TOOLS = ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                    "activate_project")
+NAV_SELECT_LINE = "select:" + ",".join(
+    f"{prefix}{tool}"
+    for tool in NAV_SELECT_TOOLS
+    for prefix in ("mcp__serena__", "mcp__plugin_serena_serena__"))
+
+
+#: The markdown half of the posture, and it is INDEPENDENT of Serena: the specs are
+#: navigated with a `jarvis` verb over headings, not with a symbol index, so a project
+#: that deselected Serena still gets it. The three command strings are §4.3 of
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md, quoted verbatim —
+#: `jarvis spec show` does not exist. Measured cause (§1(b) of that spec): 199 whole-file
+#: `.md` reads at 5,187 tokens each, and the prompt is what decides the FIRST call.
+_MARKDOWN_NAV = [
+    "# Finding things in specs and docs: navigate them like code",
+    "A spec is a tree of headings, so read the heading you need and not the file: "
+    "`jarvis spec toc <path>` lists the sections, "
+    "`jarvis spec section <path> <n|name>` returns one of them, and "
+    "`jarvis spec search \"<words>\"` finds which spec says a thing at all.",
+    "- `grep`, `rg` and `find` over markdown stay fine for TEXT questions — a phrase, "
+    "a filename, who mentions a key. Reading a whole spec to reach one section is the "
+    "waste, not text search.",
+]
+
+
+def navigation_core(serena: bool = True, tool_search: str = "cli") -> list[str]:
+    """The navigation posture INLINE in the bare worker prompt — spec §3.
+
+    Cause 3 of the defect: an ordinary lead gets one index line pointing at
+    `jarvis brief navigation` and the measured fetch behaviour is that it does not
+    fetch, so the posture never reaches the session the brief was written for. The
+    planner and the analyst already get the full section inline through
+    `dispatch._common_briefing`.
+
+    Composed AFTER `section_index` rather than inside the core: the core has 38 chars of
+    headroom against CORE_BUDGET_CHARS and every sentence in it is A/B-graded as a unit
+    (evals/llm/test_worker_contract_ab.py), so 500 ungraded chars in there would dilute a
+    claim, not just a number.
+
+    `serena=False` renders the MARKDOWN half alone (`_MARKDOWN_NAV`) and no symbol half:
+    ruled by spec 2026-10-06-navigate-specs-like-code.md §6.1, because navigating a spec
+    needs no symbol index, so swallowing it inside the Serena branch would withhold the
+    posture from the projects that never had it. The symbol half still goes: the index
+    already swaps in NO_SERENA_HOOK and the fetched section already carries the grep
+    posture.
+
+    `tool_search="off"` means `dispatch` wrote `ENABLE_TOOL_SEARCH=false`, so the tools
+    are in the tool list with full schemas: the DEFERRED wording and the recovery call
+    would be a falsehood and a wasted call (spec 2026-10-02-serena-the-cheap-path.md §4).
+    """
+    # Spec 2026-10-06-navigate-specs-like-code.md §6.1.
+    if not serena:
+        return list(_MARKDOWN_NAV)
+    tail = [
+        "- The bash-first reminder does NOT govern code navigation: `cat`/`sed "
+        "-n`/`grep` answer text questions, never symbol ones.",
+        "- `find_referencing_symbols` for callers — grep has no equivalent; "
+        "`get_symbols_overview` before opening a file whole; `find_symbol` instead of "
+        "`grep -rn \"def foo\"`.",
+        "- `activate_project` on the repo root if a call says no project is active.",
+    ]
+    # Spec 2026-10-02-serena-the-cheap-path.md §4.
+    if tool_search == "off":
+        return [
+            "# Finding code: your symbol tools are IN your tool list",
+            "They are listed with full schemas — `find_symbol`, "
+            "`find_referencing_symbols`, `get_symbols_overview` and `activate_project` "
+            "are callable directly, with no lookup call to make first.",
+            *tail,
+            "",
+            *_MARKDOWN_NAV,
+        ]
+    return [
+        "# Finding code: your symbol tools are DEFERRED, not absent",
+        "They are NOT in your tool list — this CLI resolves them on demand. One "
+        "`ToolSearch` call with this select brings back the four that matter (both "
+        "prefixes; a name this install lacks is ignored):",
+        NAV_SELECT_LINE,
+        *tail,
+        "",
+        *_MARKDOWN_NAV,
+    ]
+
+
+def navigation_section(serena: bool = True, tool_search: str = "cli") -> str:
     """Serena before grep, for every session Jarvis dispatches.
 
     Prose rather than a capability restriction, and it has to be: a worker needs
     `Grep` and `Bash` for its actual job, so the seats' trick of simply not
-    granting the tool is not available. Stated conditionally because whether a
-    worker has Serena depends on the user's own Claude configuration and on whether
-    the project is indexed.
+    granting the tool is not available. The two cases are separate BRANCHES rather
+    than one hedged paragraph: `dispatch` writes `JARVIS_SERENA` from the project's
+    real wiring, so each branch can state its own case unconditionally.
 
     `serena=False` is the one case Jarvis DOES know about: the project deselected it
     on /config, so `dispatch` did not wire it. Recommending it there would send every
@@ -577,12 +680,19 @@ def navigation_section(serena: bool = True) -> str:
             "sweep would have missed rather than claiming it was exhaustive.",
             "- Read a file's imports and its module docstring before its body: on a "
             "project with a written map, the map is cheaper than the code.",
+            "",
+            # Spec 2026-10-06-navigate-specs-like-code.md §6.
+            *_MARKDOWN_NAV,
         ])
     lines = [
         "# Navigating the code: Serena first, grep second",
-        "If this project has Serena (its symbol tools appear in your tool list, or "
-        "`.serena/project.yml` is in the repo), use it to find code and do NOT "
-        "grep for symbols. Serena has a language-server symbol index, so "
+        # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md
+        ("Serena is wired to this project, and its symbol tools are listed with full "
+         "schemas — so use them to find code and do NOT grep for symbols."
+         if tool_search == "off" else
+         "Serena is wired to this project, and its symbol tools are DEFERRED behind "
+         "`ToolSearch` rather than listed — so use them to find code and do NOT "
+         "grep for symbols.") + " Serena has a language-server symbol index, so "
         "`find_symbol`, `get_symbols_overview` and especially "
         "`find_referencing_symbols` answer where something is defined and who "
         "calls it as facts, in one call. Grep answers a different question — where "
@@ -602,9 +712,8 @@ def navigation_section(serena: bool = True) -> str:
         "- If the symbol tools say no project is active, `activate_project` on the "
         "repo root first.",
         "",
-        "If the project has no Serena, `Glob` and `Grep` are the fallback and "
-        "there is nothing to apologise for — just expect to work harder for a less "
-        "complete picture.",
+        # Spec 2026-10-06-navigate-specs-like-code.md §6.
+        *_MARKDOWN_NAV,
     ]
     return "\n".join(lines)
 
@@ -647,6 +756,14 @@ def concision_section() -> str:
         "`open-a-pull-request` skill has it, and a `gh pr create` missing a "
         "section is denied "
         "(docs/superpowers/specs/2026-08-24-a-pull-request-a-reviewer-can-read.md).",
+        "",
+        "## Pass a REFERENCE, never a payload",
+        "A diff, a log, a file or a JSON dump never goes into a `jarvis` command, a "
+        "message or a question: pass a pull request URL, a commit SHA, a path with a "
+        "line range or the command that reproduces it, because whoever reads it can "
+        "run that and nobody needs it pasted — an oversized argument, and a `$(git "
+        "diff …)` substitution, are refused before the command runs "
+        "(docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).",
         "",
         "## Say each thing once, across the whole record",
         "The description, your questions, your messages and your finish summary "
@@ -776,14 +893,17 @@ def knowledge_section(project: str = PROJECT_PLACEHOLDER) -> str:
         "touch it, and before you ask or assume about it; a past worker probably "
         "already paid for the lesson:",
         "```bash",
-        f'jarvis learn search "<term>" --project {project}  # full text of matches',
-        "jarvis learn show <id> [<id> ...]  # full text of specific entries",
+        f'jarvis learn search "<term>" --project {project}  # which entries match: '
+        f"headline, id, one matching line",
+        "jarvis learn show <id> [<id> ...]  # full text of specific entries — the only "
+        "verb that returns a body",
         f"jarvis learn list --project {project} --topic <t>  # everything in a "
         f"topic",
         f"jarvis learn topics --project {project}  # what topics exist",
         "```",
-        "A headline is a truncated first line, never the whole entry: if it looks "
-        "relevant, fetch it rather than acting on the summary. And LOOK IT UP "
+        "A headline is a truncated first line and an excerpt is one quoted matching "
+        "line, never the whole entry: if it looks relevant, `show` it rather than "
+        "acting on the summary. And LOOK IT UP "
         "FIRST when a headline names the area you are unsure about — a lookup is "
         "not a doubt, so it comes before `jarvis wo ask`. When nothing in the "
         "index fits, ask; never let searching become a substitute for recording a "

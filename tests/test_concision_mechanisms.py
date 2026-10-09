@@ -209,7 +209,10 @@ def test_a_project_with_no_standing_prompt_still_gets_the_style():
     context = _subagent(JARVIS_WO_ID="wo-conc01"
                         )["hookSpecificOutput"]["additionalContext"]
 
-    assert context == concision.house_style()
+    # Containment, not equality: the context also carries the spec-navigation block
+    # (spec 2026-10-06-navigate-specs-like-code.md §6).
+    assert concision.house_style() in context
+    assert "jarvis spec toc <path>" in context
 
 
 def test_a_session_the_user_opened_gets_nothing():
@@ -230,4 +233,281 @@ def test_the_hook_reads_the_standing_prompt_from_the_environment():
     imported |= {a.name for n in ast.walk(tree)
                  if isinstance(n, ast.Import) for a in n.names}
     assert not any((m or "").endswith("catalog") for m in imported), imported
-    assert concision.subagent_context({}) == concision.house_style()
+    # `worker_brief` is barred for the same reason plus a cycle: it imports `concision`
+    # (spec 2026-10-06-navigate-specs-like-code.md §6), so the navigation block below is
+    # this module's own literals.
+    assert not any((m or "").endswith("worker_brief") for m in imported), imported
+    context = concision.subagent_context({})
+    assert concision.house_style() in context
+    assert "jarvis spec toc <path>" in context
+
+
+# -- pass a reference, never a payload (SS5 of the bounded-model-inputs spec) -------------
+
+def _payload(command: str, **env):
+    return hooks.payload_reference_decision(
+        {"tool_name": "Bash", "tool_input": {"command": command}},
+        {"JARVIS_WO_ID": "wo-conc01", **env})
+
+
+def _reason(decision) -> str:
+    assert decision is not None
+    out = decision["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    return out["permissionDecisionReason"]
+
+
+def test_an_oversized_wo_send_is_refused_and_told_what_to_pass_instead():
+    """A `wo send` body goes WHOLE into the target worker's next turn, so a pasted diff
+    is paid for by a session that never asked for it. The refusal has to name the size,
+    the cap and the reference that would have done the job — a worker told only "too
+    long" splits the paste in two."""
+    reason = _reason(_payload(f'jarvis wo send wo-target "{"x" * 9000}"'))
+
+    assert "9000 characters" in reason
+    assert "6000" in reason
+    assert "wo send" in reason
+    for alternative in ("pull request URL", "commit SHA", "line range",
+                        "command that reproduces it"):
+        assert alternative in reason, f"refusal does not offer {alternative!r}"
+
+
+def test_an_oversized_wo_assume_is_refused():
+    reason = _reason(_payload(f'jarvis wo assume wo-conc01 "{"y" * 7000}"'))
+    assert "7000 characters" in reason and "wo assume" in reason
+
+
+def test_an_oversized_question_is_refused_before_the_command_runs():
+    """`ops.ask_question` already refuses this after the fact. The hook is the same rule
+    one layer earlier, and that layer is the only one that runs before a substitution in
+    the argument has been expanded into the worker's own context."""
+    from jarvis import sections
+
+    reason = _reason(_payload(f'jarvis wo ask wo-conc01 "{"q" * 4500}"'))
+    assert "4500 characters" in reason
+    assert str(sections.QUESTION_MAX_CHARS) in reason
+
+
+def test_the_hooks_question_cap_is_the_same_number_as_ops_enforces():
+    """Two layers, ONE rule. A second number here would mean a question the hook let
+    through and `ops.ask_question` refused, or the reverse."""
+    from jarvis import sections
+
+    assert concision.QUESTION_MAX_CHARS == sections.QUESTION_MAX_CHARS
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 3999}"') is None
+    assert _payload(f'jarvis wo ask wo-conc01 "{"q" * 4001}"') is not None
+
+
+@pytest.mark.parametrize("substitution,producer", [
+    ("$(git diff)", "git diff"),
+    ("`git diff`", "git diff"),
+    ("$(git log --oneline -20)", "git log"),
+    ("$(cat src/jarvis/hooks.py)", "cat"),
+    ("$(gh pr diff 828)", "gh pr diff"),
+    ("$(gh pr view 828 --json body)", "gh pr view"),
+    ("$(curl -s https://example.com)", "curl"),
+    ("$(tail -n 500 /tmp/log)", "tail"),
+])
+def test_an_unbounded_substitution_is_refused_however_short_the_command(substitution,
+                                                                       producer):
+    """The half `ops` cannot do: by the time `ops.ask_question` sees the text the shell
+    has already expanded the substitution into this worker's argv AND its context, so
+    the flood is paid for whatever `ops` then decides. Length is no defence — `$(git
+    diff)` is 11 characters before the shell runs it."""
+    reason = _reason(_payload(f'jarvis wo send wo-target "see {substitution}"'))
+
+    assert producer in reason
+    assert "before" in reason and "context" in reason
+
+
+@pytest.mark.parametrize("substitution", [
+    "$(git rev-parse HEAD)",
+    "$(date)",
+    "$(pwd)",
+    "$(git branch --show-current)",
+])
+def test_a_bounded_substitution_is_not_this_hooks_business(substitution):
+    """A commit SHA, a branch name and a date are exactly what the rule asks a worker to
+    pass instead. Refusing them would leave no way to write the reference."""
+    assert _payload(f'jarvis wo send wo-target "at {substitution}"') is None
+
+
+def test_a_quoted_payload_still_reaches_the_check():
+    """kn-21d73ac2: the shell strips the quotes before anything downstream sees the
+    text, so a denylist applied to raw text fails open. Parsed words only."""
+    assert _payload('jarvis wo send wo-x "$(git diff)"') is not None
+    assert _payload("jarvis wo send wo-x '$(git diff)'") is not None
+    assert _payload("jarvis wo send wo-x $(git diff)") is not None
+
+
+def test_the_payload_check_is_reachable_around_by_nothing_the_auto_allow_covers():
+    """Same ordering trap as the `--summary` cap above: `preflight_decision` auto-allows
+    every `jarvis …` command, so a check wired after it is dead code."""
+    payload = {"tool_name": "Bash", "tool_input": {
+        "command": f'jarvis wo send wo-target "{"x" * 9000}"'}}
+
+    decision = hooks.preflight_decision(payload, {"JARVIS_WO_ID": "wo-conc01"})
+
+    assert decision is not None
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("command", [
+    'jarvis wo send wo-x "PR 828 is green; see src/jarvis/hooks.py:825-871."',
+    "jarvis wo list",
+    'echo "jarvis wo send wo-x $(git diff)"',       # the words, not the command
+])
+def test_commands_the_payload_check_has_no_opinion_about(command):
+    assert _payload(command) is None
+
+
+def test_a_send_reached_through_a_cd_chain_or_an_absolute_path_still_counts():
+    long = f'"{"x" * 9000}"'
+    assert _payload(f'cd /tmp && jarvis wo send wo-x {long}') is not None
+    assert _payload(f'/usr/local/bin/jarvis wo send wo-x {long}') is not None
+
+
+def test_the_message_cap_is_a_project_setting_and_zero_switches_it_off():
+    body = f'jarvis wo send wo-x "{"x" * 5000}"'
+
+    assert _payload(body) is None                                     # under the 6000
+    assert _payload(body, JARVIS_MESSAGE_MAX_CHARS="1000") is not None
+    assert _payload(body, JARVIS_MESSAGE_MAX_CHARS="0") is None       # off for a project
+
+
+def test_an_unparseable_message_cap_falls_back_rather_than_blocking_every_message():
+    """Both failure directions are worse than the default: a typo in a catalog must not
+    deny every message in the fleet, nor silently switch the rule off."""
+    assert concision.message_cap({"JARVIS_MESSAGE_MAX_CHARS": "banana"}) == 6000
+    assert concision.message_cap({}) == 6000
+    assert concision.message_cap({"JARVIS_MESSAGE_MAX_CHARS": ""}) == 6000
+    # A negative is a typo, not a request to switch the cap off; `0` is how off is asked
+    # for, and clamping to 0 here would be the silent switch-off.
+    assert concision.message_cap({"JARVIS_MESSAGE_MAX_CHARS": "-5"}) == 6000
+
+
+def test_an_interactive_session_is_never_refused_a_payload():
+    assert hooks.payload_reference_decision(
+        {"tool_name": "Bash", "tool_input": {
+            "command": f'jarvis wo send wo-x "{"x" * 9000}"'}},
+        {}) is None
+
+
+def test_the_parser_imports_only_the_standard_library_and_sections():
+    """The hook runs on EVERY Bash call in every worker, so `catalog`, `ops` or `store`
+    here is a defect and not a style point: a catalog parse is ~60ms against a ~155ms
+    hook process. `.sections` is admissible because it imports `re` and nothing else."""
+    import ast
+    import inspect
+    import sys
+
+    tree = ast.parse(inspect.getsource(concision))
+    local: set[str] = set()
+    external: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            (local if node.level else external).add(node.module or "")
+        elif isinstance(node, ast.Import):
+            external |= {a.name.split(".")[0] for a in node.names}
+
+    assert local <= {"sections"}, f"concision reached into the OS: {local}"
+    for module in external:
+        assert module in sys.stdlib_module_names, f"not standard library: {module}"
+
+
+# -- fail shut, and cover the abbreviations argparse accepts (round-1 review of SS5) ------
+
+def _preflight(command: str, **env):
+    return hooks.preflight_decision(
+        {"tool_name": "Bash", "tool_input": {"command": command}},
+        {"JARVIS_WO_ID": "wo-conc01", **env})
+
+
+@pytest.mark.parametrize("command", [
+    'jarvis wo send wo-x "$(git diff)',
+    "jarvis wo send wo-x 'unclosed",
+    'jarvis wo assume wo-x "$(git diff)',
+    'jarvis wo ask wo-x "why is this "quoted\' wrong',
+    'cd /tmp && jarvis wo send wo-x "$(cat src/jarvis/hooks.py)',
+])
+def test_an_unparseable_jarvis_command_is_refused_rather_than_guessed_at(command):
+    """kn-21d73ac2's fail-open direction, one layer out: `_segments` returns nothing when
+    `shlex.split` raises, so an unbalanced quote used to walk straight past the payload
+    check and let the shell expand whatever it decided the words were."""
+    reason = _reason(_preflight(command))
+
+    assert "quot" in reason                     # names the cause
+    assert "jarvis" in reason
+
+
+def test_an_unparseable_non_jarvis_command_is_not_this_checks_business():
+    """The predicate refuses, so matching widely is the safe direction — but not so
+    widely that every half-typed shell line in the fleet is denied by this check."""
+    assert _payload('grep -r "unclosed src/') is None
+    assert _payload('echo "unbalanced') is None
+    assert concision.unparseable_jarvis_command('grep -r "unclosed src/') is False
+    assert concision.unparseable_jarvis_command('jarvis wo send wo-x "unclosed') is True
+    assert concision.unparseable_jarvis_command('jarvis wo list') is False
+
+
+@pytest.mark.parametrize("spelling", ["--summ", "--s", "--summar"])
+def test_an_abbreviated_summary_option_is_capped_like_the_full_spelling(spelling):
+    """`jarvis` uses argparse with the default `allow_abbrev=True`, so the CLI accepts
+    any unambiguous prefix. kn-21d73ac2 names this exact fail-open: matching the option
+    name exactly leaves `--summ "<500 words>"` unchecked."""
+    long = " ".join(["word"] * 500)
+
+    reason = _reason(_preflight(f'jarvis wo finish wo-x {spelling} "{long}"'))
+    assert "500 words" in reason and "120" in reason
+
+    reason = _reason(_preflight(f'jarvis wo finish wo-x {spelling}="{long}"'))
+    assert "500 words" in reason
+
+    # Under the cap the abbreviation is ordinary work: `preflight_decision` allows every
+    # `jarvis …` chain, so what is asserted is that it is not DENIED.
+    allowed = _preflight(f'jarvis wo finish wo-x {spelling} "short enough"')
+    assert allowed["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert concision.finish_summary(f'jarvis wo finish wo-x {spelling}="ok"') == "ok"
+
+
+def test_an_abbreviation_is_only_honoured_while_it_stays_unambiguous():
+    """The rule argparse applies, pinned directly: a prefix two options share selects
+    neither. None of `wo finish`'s four options collide, so this drives the matcher with
+    a synthetic sibling set rather than pretending one does."""
+    siblings = ("--summary", "--summarise", "--pr")
+
+    assert concision._option_matches("--summary", "--summary", siblings)
+    assert concision._option_matches("--summaris", "--summarise", siblings)
+    assert not concision._option_matches("--summ", "--summary", siblings)
+    assert not concision._option_matches("--summ", "--summarise", siblings)
+    assert not concision._option_matches("--", "--summary", siblings)
+    assert not concision._option_matches("--x", "--summary", siblings)
+
+    # And what the four real ones mean today: `--p` is `--pr` and nothing else.
+    assert concision._WO_FINISH_OPTIONS == (
+        "--summary", "--pr", "--evidence", "--abandon")
+    assert concision._option_matches("--p", "--pr", concision._WO_FINISH_OPTIONS)
+    assert not concision._option_matches("--p", "--summary",
+                                         concision._WO_FINISH_OPTIONS)
+
+
+def test_an_abbreviated_option_still_consumes_its_value_in_the_positional_walk():
+    """The text argument is found by POSITION, so an option whose value was mistaken for
+    a positional would cap the wrong word — or nothing."""
+    long = "x" * 9000
+
+    assert _reason(_preflight(f'jarvis wo send wo-x "{long}" --sou jarvis'))
+    assert _reason(_preflight(f'jarvis wo send --proj jarvis_os wo-x "{long}"'))
+    assert concision.jarvis_payload_args(
+        'jarvis wo send --proj jarvis_os wo-x "body"') == [
+        ("wo send", "message", "body")]
+
+
+@pytest.mark.parametrize("payload", ["$(git diff)", "$(cat src/jarvis/hooks.py)"])
+def test_quoting_a_payload_changes_nothing_about_the_decision(payload):
+    """A rule a quote can move is a rule a worker can step around by accident."""
+    bare = _preflight(f"jarvis wo send wo-x {payload}")
+    double = _preflight(f'jarvis wo send wo-x "{payload}"')
+    single = _preflight(f"jarvis wo send wo-x '{payload}'")
+
+    assert _reason(bare) == _reason(double) == _reason(single)

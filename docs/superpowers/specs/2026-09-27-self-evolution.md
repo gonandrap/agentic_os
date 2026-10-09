@@ -773,8 +773,9 @@ judging existence, which this design forbids; a checklist with no refusal is adv
 
 When an investigation lands on a `gap_class` for which a detector ALREADY exists, something
 specific happened and it is not "a new bug": either the condition missed the symptom, or it
-matched and the remedy failed, or the rule was still in `dry_run` and never acted. Filing that as
-a fresh issue loses the one fact that matters — that the OS already tried.
+matched and the remedy failed, or the rule was still in `dry_run` and never acted, or something
+could not be read and nothing was decided at all. Filing that as a fresh issue loses the one fact
+that matters — that the OS already tried.
 
 ```sql
 CREATE TABLE IF NOT EXISTS rule_recurrences (
@@ -783,7 +784,7 @@ CREATE TABLE IF NOT EXISTS rule_recurrences (
     detector_id TEXT NOT NULL REFERENCES detectors(id),
     project TEXT NOT NULL, order_id TEXT NOT NULL,
     io_id TEXT NOT NULL DEFAULT '',
-    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed
+    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed | unreadable
     original_fix_wo_id TEXT NOT NULL DEFAULT '',
     original_issue_url TEXT NOT NULL DEFAULT '',
     filed_note TEXT NOT NULL DEFAULT '', -- what happened on the tracker, or why nothing did
@@ -802,14 +803,22 @@ it:
 - `remedy_failed` — the detector is `armed`, has a fire on this order, and that fire's outcome is
   `proposed` or `refused` while the order is stuck anyway. The finding is about the remedy, or
   about the gate that refused it.
+- `unreadable` — the detector is `armed` and that fire's outcome is `unreadable`: something could
+  not be READ, so nothing was decided. A FOURTH verdict, added by Neo question 974, because
+  recording it as `missed` would claim the condition was evaluated and came back false, and the
+  OS never fabricates a default answer from a failure. It is NOT evidence for arming either. The
+  finding is about what the condition reads.
 
 **What it does with that: it links, it never duplicates.** The recurrence row is written and
 `detectors.recurrences` increments; the ORIGINAL issue is reopened if closed and commented on if
 open, carrying the order, the verdict and a `regression` label; the new fix order carries the
 original's `fix_wo_id` so the provenance is one thread and not two. Reuse `issues.py`'s existing
-client for both — do not add a second `gh` wrapper — and take kn-5d8a396a's lesson: search the
-tracker by the SUBJECT ID and the gap class, keep `--state all`, and never by a proposed title,
-or a closed duplicate drops out of the answer and is re-filed for ever.
+client for both — do not add a second `gh` wrapper — and take kn-2b03830f's lesson (it retracted
+and reversed kn-5d8a396a, on Neo question 974): the tracker search keys on the CAUSE — the
+detector id and the gap class — with `--state all`, and NEVER on the order id, nor on a proposed
+title. An issue whose body names an order id is usually about a different cause, so an order-id
+hit links a recurrence to the wrong issue; and without `--state all` a closed duplicate drops out
+of the answer and is re-filed for ever.
 
 **When `gh` cannot be reached the recurrence row is still written** and the failure is recorded
 in `filed_note`. The ledger is the OS's own record; the tracker is a mirror of it, and a network
@@ -821,9 +830,9 @@ from a hand-set field: `not_armed` (a `dry_run` detector), `missed` (an `armed` 
 fire on the order), `remedy_failed` (an `armed` detector with a `proposed` or `refused` fire and
 the order still stuck). Plus the fourth path that has no verdict: `gh` unreachable — the
 recurrence row IS written, `filed_note` carries the failure, and `ops.record_recurrence` returns
-normally rather than raising. And one asserting the tracker search uses the subject id and the gap
-class with `--state all`, since a closed duplicate dropping out of that answer is the failure
-kn-5d8a396a describes.
+normally rather than raising. And one asserting the tracker search uses the detector id and the
+gap class with `--state all` and NOT the order id, since an order-id hit is the wrong-issue link
+kn-2b03830f describes and a closed duplicate dropping out of that answer is re-filed for ever.
 
 **Redact before it leaves the OS.** The tracker is PUBLIC. A recurrence comment carries the order
 ID, the gap class, the verdict and the detector id — and nothing else. No order title, no
@@ -931,7 +940,7 @@ the dashboard's existing idiom, and the numbers come from the report.
 
 You are a Jarvis OS engineer building one slice of the self-evolution feature. Other workers are
 building the other slices in parallel and you will never see their sessions. Your section of
-`docs/specs/2026-09-27-self-evolution.md` is your job; the rest of the spec is context you may
+`docs/superpowers/specs/2026-09-27-self-evolution.md` is your job; the rest of the spec is context you may
 read and must not implement.
 
 **What you must know about this codebase.**
