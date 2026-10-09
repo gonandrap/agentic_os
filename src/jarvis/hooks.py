@@ -1496,7 +1496,8 @@ def py_nav_decision(payload: dict[str, Any],
     command = (tool_input.get("command") or "").strip()
     if not command:  # Bash-only condition
         return None
-    if not navigates_source(command, SOURCE_SUFFIXES):  # same set, by the ruling above
+    # §6: a sweep counts only when its own scope names `.py` (issue 936).
+    if not navigates_source(command, SOURCE_SUFFIXES, scoped_sweeps=True):
         return None
     return _deny(_PY_NAV_DENY)
 
