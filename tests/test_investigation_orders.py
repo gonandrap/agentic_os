@@ -863,6 +863,16 @@ def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_orde
         ops.show_investigation_order(improvement_order["id"])
 
 
+def test_fo_show_refuses_an_investigation_and_names_investigate_show(started, store):
+    """GitHub issue #997, the other half: the guard has to name the verb for the kind
+    the row ACTUALLY is."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    with pytest.raises(ops.OpsError) as e:
+        ops.show_feature_order(inv["id"])
+    assert "jarvis investigate show" in str(e.value)
+    assert "an investigation order" in str(e.value)
+
+
 # -- the family budget (2026-10-01-a-family-capped-raise-must-say-so.md) ---------------
 
 

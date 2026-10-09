@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import (background, bugreport, bus, claude_cli, db, fleet, holds, inspection,
-               notify, release, worker_session)
+               notify, release, usage_meter, worker_session)
 from . import budget as budget_mod
 from .catalog import Catalog, ProjectSpec, load_catalog
 from .central_store import CentralStore
@@ -143,6 +143,17 @@ SECONDS_PER_HOUR = 3600    # a unit, not a setting
 #: limit. Not catalog-configurable on purpose: a knob nobody will tune is a knob that
 #: only ever gets set wrong.
 PR_POLL_EVERY_TICKS = 24
+
+#: Read the account's usage meter every N ticks — one minute at the default 5s interval.
+#: ONE MINUTE IS THE SPEC'S OWN UNIT and not a tuned number: the meter moves in whole
+#: percent, and at the fleet's observed ~$0.82/point a minute is well under one point of
+#: movement, so a coarser sample would put a reset in the middle of an interval and leave
+#: the segment sum guessing. One HTTPS request per minute, ~1.4k/day, is nothing against
+#: what one worker turn costs. Not catalog-configurable, for `PR_POLL_EVERY_TICKS`'
+#: reason: how often the OS reads its own meter is not a decision anyone has information
+#: to make — the alarm thresholds are the settings. §3 of
+#: docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+USAGE_SAMPLE_EVERY_TICKS = 12
 
 #: How often orders that have stopped moving are swept is `fleet_health.sweep_every_ticks`
 #: — A PER-PROJECT CATALOG CONFIG AND NOT A CONSTANT HERE, per Neo 1086, which overrides §5
@@ -258,6 +269,53 @@ CACHE_TTL_EVERY_TICKS = 4320
 #: cost on every boot and never reach a later tick to do the scan it skipped. Five minutes
 #: in is past the start-up burst and still inside any session anybody is watching.
 CACHE_TTL_TICK_OFFSET = 60
+
+#: Reconcile the meter against measured spend every N ticks — 30 minutes at the default
+#: 5s interval. The subject is a 5h window, so half-hourly is six looks per window: often
+#: enough that a runaway interactive session is named while it is still running, rare
+#: enough that a transcript walk over the fleet is not on a 30-second beat (the argument
+#: `CACHE_TTL_EVERY_TICKS` makes, one order of magnitude in). §8 of
+#: docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+METER_RECONCILE_EVERY_TICKS = 360
+
+#: The two kinds `check_meter_residual` raises, and the inbox title of each. Spend the OS
+#: did not dispatch and spend nobody can account for are different faults with different
+#: remedies, so they are never merged into one.
+METER_OUTSIDE_ALARM = "cost_outside_spend_high"
+METER_RESIDUAL_ALARM = "cost_residual_high"
+METER_INBOX_TITLE = {
+    METER_OUTSIDE_ALARM: "sessions Jarvis did not dispatch are spending the window",
+    METER_RESIDUAL_ALARM: "the usage meter and the measured spend do not reconcile",
+}
+
+#: How many outside sessions the outside alarm NAMES, with session id, project and first
+#: prompt: the user has to be able to go and stop them (§8).
+METER_ALARM_SESSIONS = 3
+
+
+def meter_alarm_reason(kind: str, meter: dict[str, Any]) -> str:
+    """One alarm's reason, written from the subtree the user can read for themselves.
+
+    Here and not in `usage_meter` for `inspection.hour_alarms`' reason: the arithmetic
+    module does not name the OS's alarm kinds.
+    """
+    from . import usage_meter as meter_mod
+
+    spend = meter["spend"]
+    implied = float(spend["implied_usd"] or 0.0)
+    if kind == METER_RESIDUAL_ALARM:
+        return (f"${spend['residual_usd']:.2f} of the ~${implied:.2f} implied by the 5h "
+                f"meter ({round(100 * (spend['residual_share'] or 0.0))}%) is "
+                f"unexplained — {meter_mod.RESIDUAL_LABEL}.")
+    rows = meter["outside"]["sessions"][:METER_ALARM_SESSIONS]
+    named = "; ".join(
+        f"{row['session_id'][:8]} in {row['project'] or row['project_dir']} "
+        f"(${row['usd']:.2f})" + (f' — "{row["title"]}"' if row["title"] else "")
+        for row in rows)
+    return (f"sessions on this machine Jarvis did not dispatch spent "
+            f"${meter['outside']['total_usd']:.2f} of the ~${implied:.2f} implied by "
+            f"the 5h meter ({round(100 * (spend['outside_share'] or 0.0))}%). "
+            f"Dearest first: {named}.")
 
 #: How many dashboard digests one batch may produce. Bounds the cost of the FIRST batch
 #: on an instance upgrading into the feature with a backlog of long questions already in
@@ -647,6 +705,9 @@ class Daemon:
         # The systemd seam for staged releases (src/jarvis/release.py). None means the
         # real thing; tests inject a fake so no test can ever touch real systemctl.
         self.release_runner: Any = None
+        # The usage meter's `urlopen` seam, injected exactly as `release_runner` is: no
+        # test performs a real request (§1 of the usage-meter spec).
+        self.meter_opener: Any = None
         # What the catalog file looked like when this catalog was loaded, SEEDED HERE so
         # the first tick over an untouched file reloads nothing and cannot undo an
         # in-memory edit. See `reload_catalog`.
@@ -672,6 +733,58 @@ class Daemon:
         """
         return {p.name: self.store_for(p)
                 for p in self.catalog.projects if p.path.is_dir()}
+
+    # -- the account's usage meter ----------------------------------------------
+
+    def sample_usage_meter(self) -> None:
+        """One reading of the account's meter, or one gap row saying why there is none.
+
+        Swallows every exception into a gap row and a `log.warning` — the daemon's one
+        rule, that a failing pass must not take the tick down (§3).
+        """
+        try:
+            sample = usage_meter.sample_once(self.central, opener=self.meter_opener)
+        except Exception as e:  # noqa: BLE001 — never the token, never the body
+            log.warning("usage meter sampler failed: %s", type(e).__name__)
+            try:
+                usage_meter.record(self.central, usage_meter.Sample(
+                    ts=db.now(), ok=False,
+                    reason=f"the sampler itself failed ({type(e).__name__})"))
+                self.central.conn.commit()
+            except Exception:  # noqa: BLE001 — a database that cannot be written is next
+                log.exception("usage meter gap row could not be recorded")
+            return
+        if not sample.ok:
+            log.warning("usage meter unreadable: %s", sample.reason)
+        self.notice_meter_gap()
+
+    def notice_meter_gap(self) -> None:
+        """One `warning` inbox row per failure STREAK, marked in `os_state` (§8).
+
+        `os_state` and not a `pr_poll_warned`-style in-memory set: a rotated token
+        survives a restart, and a daemon in a restart loop would re-notify every boot.
+        """
+        cfg = self.catalog.os.cost
+        streak = usage_meter.gap_streak(self.central)
+        marked = self.central.get_state(usage_meter.NOTICE_STREAK_KEY) or ""
+        if streak.gap_rows == 0:
+            if marked:
+                self.central.set_state(usage_meter.NOTICE_STREAK_KEY, "")
+                self.central.conn.commit()
+            return
+        if streak.gap_rows < cfg.meter_gap_notice_samples:
+            return
+        if marked == str(streak.first_ts):
+            return
+        minutes = int(streak.gap_rows * usage_meter.SAMPLE_SECONDS / 60)
+        self.central.add_inbox(
+            "", "the account's usage meter cannot be read",
+            f"{streak.gap_rows} consecutive failed reads (~{minutes} minutes): "
+            f"{streak.reason}. Every cost surface loses its second, independent number "
+            f"until this is fixed — the measured spend has nothing to reconcile against.",
+            level="warning")
+        self.central.set_state(usage_meter.NOTICE_STREAK_KEY, str(streak.first_ts))
+        self.central.conn.commit()
 
     # -- configuration reload ---------------------------------------------------
 
@@ -850,6 +963,10 @@ class Daemon:
         run_schedule = self.tick_count % SCHEDULE_EVERY_TICKS == 1
         scan_cache_ttl = \
             self.tick_count % CACHE_TTL_EVERY_TICKS == CACHE_TTL_TICK_OFFSET
+        # The same offset and for the same reason: this walks transcripts too, and tick 1
+        # is the daemon's first, when it is starting the fleet.
+        reconcile_meter = \
+            self.tick_count % METER_RECONCILE_EVERY_TICKS == CACHE_TTL_TICK_OFFSET
         # `None` means "the roster was not read this tick" — either nothing is injected
         # or the listing failed — and is NOT the same as an empty roster, which would
         # mean every injected session ended. Session tracking is skipped on None.
@@ -870,6 +987,10 @@ class Daemon:
         # AFTER `announce`, which is what records a reopen: the ramp it starts has to be
         # in force on the very tick the backlog comes due (issue #843).
         fleet.attach(state, self.central)
+        # OUTSIDE the project loop, beside `fleet.read`: the meter is an ACCOUNT fact, so
+        # a fleet with ten projects must make one request, not ten (§3).
+        if self.tick_count % USAGE_SAMPLE_EVERY_TICKS == 1:
+            self.sample_usage_meter()
         # The roster is a subprocess, and tracking injected sessions is the only thing
         # left that reads it. With nothing injected there is nothing to track, so the
         # common case — a project driven entirely by dispatched work orders — pays
@@ -942,6 +1063,10 @@ class Daemon:
                 # Only the OS-owning project does any work here — see `check_cache_ttl`.
                 if scan_cache_ttl:
                     self.check_cache_ttl(project, store)
+                # Its own cadence, and the OS-owning project only — see
+                # `check_meter_residual`, which is `check_cache_ttl`'s shape throughout.
+                if reconcile_meter:
+                    self.check_meter_residual(project, store)
                 # IMMEDIATELY BEFORE dispatch, not after: `sync_issues` files a release
                 # order late in one tick and this claim takes it early in the next, so a
                 # hold running after dispatch holds nothing on the first opportunity.
@@ -5156,9 +5281,28 @@ class Daemon:
 
         for v in violations:
             # `level` and `detail` ride along so a standing CRITICAL one can reach the
-            # attention list from state alone — Neo 1084, `ops.os_status`.
-            if not store.open_violation_report(v.invariant, v.wo_id, level=v.level,
-                                               detail=v.detail):
+            # attention list from state alone — Neo 1084, `ops.os_status`. `owed` rides
+            # along for the same reason and is written FIRST, so the row exists before
+            # the derivation below reads it.
+            first = store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+                                                detail=v.detail, owed=v.owed)
+            # A DECISION IS OWED: raise the work order's own flag, with the reason
+            # DERIVED rather than written — and do it before the dedupe `continue`, so a
+            # flag something else cleared comes back while the violation stands. An
+            # ACKED one leaves `true_blockers`, so the derivation is empty and re-running
+            # every tick cannot re-raise it. Spec docs/superpowers/specs/
+            # 2026-10-09-an-unrepairable-invariant-owes-a-decision.md §4
+            routed = bool(v.owed and v.wo_id)
+            if routed:
+                try:
+                    wo = store.get_work_order(v.wo_id)
+                except KeyError:
+                    wo = None       # named an order deleted since the check ran
+                if wo is not None and not wo["needs_attention"]:
+                    blockers = invariants_mod.true_blockers(store, wo)
+                    if blockers:
+                        store.flag_attention(wo["id"], blockers[0])
+            if not first:
                 continue
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
@@ -5166,8 +5310,13 @@ class Daemon:
                     "invariant": v.invariant, "detail": v.detail,
                     "repaired": v.repaired, "repair": v.repair, **v.context,
                 })
-            if not v.repaired:
-                # Nothing deterministic to do about it — this one needs a human.
+            if not v.repaired and not routed:
+                # Nothing deterministic to do about it — this one needs a human. NOT for
+                # a violation `routed` to the work order's attention flag above: the
+                # attention item REPLACES this line, and two surfaces for one decision is
+                # the double-report that buried wo-1abd3886 in a 230-item pile. One with
+                # `owed` and no `wo_id` is project-level, has no order to flag, and keeps
+                # its notification (spec §4).
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
                     body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
@@ -5401,6 +5550,65 @@ class Daemon:
                 wo_id=carrier["id"])
             log.info("[%s] %s: %s", project.name, alarm.kind, alarm.reason)
 
+    def check_meter_residual(self, project: ProjectSpec, store: ProjectStore) -> None:
+        """Reconcile the account's meter against measured spend, and raise the two gaps.
+
+        FROM THE SUPERVISOR PATH AND NEVER FROM A COST QUERY: a read must never write, so
+        `jarvis cost` and `/cost` compute the same subtree and raise nothing (§8).
+
+        `check_cache_ttl`'s shape throughout, for its reasons: only the project
+        `schedule.os_owner` names does any work (the reading is a FLEET fact, and N
+        projects raising it is N-1 alarms nobody reads), the carrier is the latest settled
+        order and stands for nothing but the foreign key (the subject is a session the OS
+        never dispatched), and the dedupe is one alarm per kind per WINDOW.
+
+        The thresholds are not re-derived here: `usage_meter.alerts` decides, beside the
+        arithmetic, so the payload the user reads and the alarm they are sent can never
+        disagree.
+        """
+        from . import fleetcost
+        from .project_store import NO_TURN
+
+        if project.name != self._os_owner():
+            return
+        cfg = project.cost
+        try:
+            resolved = fleetcost.resolve_window(window=fleetcost.SESSION, cfg=cfg)
+            meter = usage_meter.reconciliation(resolved=resolved,
+                                               project=None, cfg=cfg)["meter"]
+        except Exception:  # noqa: BLE001 — a failing pass must not take the tick down
+            log.exception("[%s] the usage meter could not be reconciled", project.name)
+            return
+        raised = [kind for kind, flag in (
+            (METER_OUTSIDE_ALARM, meter["alerts"]["outside"]),
+            (METER_RESIDUAL_ALARM, meter["alerts"]["residual"])) if flag]
+        if not raised:
+            return
+        carrier = store.latest_settled_order()
+        if carrier is None:
+            # Nothing to hang the foreign key on. The finding is not lost: it is still
+            # true next pass, and the first order this project settles carries it then.
+            log.info("[%s] the meter does not reconcile, but no settled order can carry "
+                     "the alarm yet", project.name)
+            return
+        for kind in raised:
+            last = store.last_alarm_of_kind(kind)
+            if last is not None and float(last["ts"] or 0.0) >= resolved["since"]:
+                continue
+            reason = meter_alarm_reason(kind, meter)
+            row = store.add_finding(carrier["id"], kind=kind, reason=reason,
+                                    seq=NO_TURN, source="cost")
+            store.add_event(carrier["id"], "cost_alarm",
+                            {"kind": kind, "seq": NO_TURN, "reason": reason,
+                             "alarm_id": row["id"]})
+            self.central.add_inbox(
+                project=project.name, level="warning", title=METER_INBOX_TITLE[kind],
+                body=f"{reason}\n"
+                     f"The supervisor will look before you have to. "
+                     f"Read it with: jarvis alarms show {row['id']}",
+                wo_id=carrier["id"])
+            log.info("[%s] %s: %s", project.name, kind, reason)
+
     def settle_turns(self, project: ProjectSpec, store: ProjectStore) -> None:
         """Reap finished turns, then move each work order to where its turn says it is.
 
@@ -5425,6 +5633,20 @@ class Daemon:
             try:
                 self.settle_work_order(project, store, wo)
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
+                log.exception("[%s] settling %s failed", project.name, wo["id"])
+        # A DEFERRED LANDING IS OWED IN `validating` AND NOWHERE ELSE, and that status is
+        # not in the sweep above — so the recovery in `settle_work_order` was unreachable
+        # for every row it exists for (wo-9f00e3b5 stuck 7.5d). Only rows with a landing
+        # owed are passed on; the generic sweep stays exactly as narrow as it was. Spec
+        # §3.2, docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        for wo in store.list_work_orders(statuses=("validating",)):
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue
+            if _landing_deferred(store, wo["id"]) is None:
+                continue
+            try:
+                self.settle_work_order(project, store, wo)
+            except Exception:  # noqa: BLE001 — same isolation as the sweep above
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
@@ -5469,6 +5691,22 @@ class Daemon:
             # carrying a `result_summary` and a `pr_url`, so without this return the
             # reconciler would set `waiting_pr_merge` on the very next tick and put
             # unvalidated work on the user's merge queue. The runner is what moves it.
+            #
+            # EXCEPT THE LANDING THE ROUND MACHINE ALREADY OWES — a deferral only ever
+            # happens in this status, so the branch below the return could never serve
+            # one (spec §3.2, docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md).
+            # Narrower than the return on purpose: only a round that PASSED, and only
+            # with no turn and no queued message, so nothing writes under a live turn.
+            from . import ops as ops_mod
+
+            deferred = (_landing_deferred(store, wo["id"])
+                        if round_open == "passed" else None)
+            if (deferred is not None
+                    and worker_session.busy(store, wo["id"]) is None
+                    and not store.queued_messages(wo["id"])):
+                fresh = store.get_work_order(wo["id"])
+                ops_mod.land_when_cleared(store, fresh)
+                store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
 
         turn = store.latest_turn(wo["id"])

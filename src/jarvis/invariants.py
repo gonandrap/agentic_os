@@ -256,6 +256,11 @@ PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 #: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
 INV_BASE_RED = "INV-BASE-BRANCH-RED"
 
+#: A completed work order whose recorded pull request has not merged. Shared with `ops`,
+#: which closes the report the moment `--abandon` records the decision (spec
+#: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §8).
+INV_WORK_LANDED = "INV-WORK-LANDED"
+
 #: What a work order says while its base is broken. NOT an attention reason and NOT a
 #: blocker: nobody owes a decision, the OS is waiting for a build that is already
 #: running, and `true_blockers` deliberately does not derive it. It exists because the
@@ -556,6 +561,12 @@ class Violation:
     #: attention flag says `critical` (spec
     #: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
     level: str = "warning"
+    #: NOT REPAIRABLE, AND A DECISION IS OWED BY THE USER. Non-empty means the blocker
+    #: sentence, authored by the checker, naming the decision and the command that takes
+    #: it — and it must carry NO elapsed time and nothing else that changes tick to tick,
+    #: or it can never be acked down (spec
+    #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1).
+    owed: str = ""
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -1035,6 +1046,17 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
         blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
                         else WORKER_FAILED_BLOCKER)
+    # AN INVARIANT THE OS CANNOT REPAIR, WHICH OWES THE USER A DECISION. UNGATED BY
+    # STATUS, and that is the point rather than an oversight: INV-WORK-LANDED fires on
+    # `completed`, and a settled order is exactly what every branch here used to skip —
+    # so an open pull request nobody merged had no surface but the inbox. The sentence is
+    # the checker's own and reaches the flag through this function, so
+    # INV-ATTENTION-REASON can re-derive it and a Claude Code hook cannot relabel it.
+    # Ranked here documentarily, for the next owed checker: nothing it can co-occur with
+    # today, since every later branch is gated on an open or parked status. Spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §3
+    for report in store.owed_violations(wo["id"]):
+        blockers.append(report["owed"])
     # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
     # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
     # and above the `needs_review` triage, because it outranks both of the generic
@@ -2398,14 +2420,23 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you.
 
-    Covers the "I acked it and it is still in my face" case: once a work order is
-    completed or cancelled there is nothing the user can act on, so a lingering flag is
-    pure noise on the dashboard and in the attention list.
+    Covers the "I acked it and it is still in my face" case: a lingering flag with
+    nothing behind it is pure noise on the dashboard and in the attention list.
+
+    IT USED TO SAY that once a work order is completed or cancelled there is nothing the
+    user can act on, and that is now false: an unrepairable invariant owes a DECISION and
+    derives a blocker on a settled order (INV-WORK-LANDED on an open pull request). So the
+    test is the derivation and not the status — it clears only what `true_blockers` cannot
+    re-derive. Narrow by construction: no other branch of `true_blockers` fires for
+    `completed` or `cancelled`, and `failed` is not terminal. Spec
+    docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5
 
     Repairable: clear the flag.
     """
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
         if not wo["needs_attention"]:
+            continue
+        if true_blockers(store, wo):
             continue
         store.clear_attention(wo["id"])
         yield Violation(
@@ -3209,6 +3240,10 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
     adds that loop), and an invariant covering half the units would look like one
     covering all of them.
+
+    SECOND ARM, work orders only: a round that PASSED and never landed — same defect, a
+    unit under review nothing will move again, in its other state. See
+    `_passed_round_never_landed`.
     """
     per_round = _validation_timeout()
     threshold = 2 * per_round
@@ -3252,6 +3287,76 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
                          "unit": kind,
                          "fo_id": None if id_col == "wo_id" else unit_id},
             )
+    yield from _passed_round_never_landed(store)
+
+
+def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED, second arm — a round that PASSED and never landed.
+
+    `Daemon._validate_work_order` lands a passed round only while no worker turn is in
+    flight and delegates the rest to `Daemon.settle_work_order`, which returns early for
+    exactly the `validating` status a deferral is always taken under. So the landing is
+    held in ONE control-flow path and nowhere in the STATE, and three measured orders sat
+    `validating` on a passed round for 2-8 days with the merge poll, the conflict repair
+    and the auto-merge gate never run over delivered, passed work.
+
+    Predicate, work orders only: `status='validating'`, latest round `passed`, no worker
+    turn in flight. No threshold of its own — a passed round is finished being judged, so
+    once nothing is typing there is nothing left that could move it.
+
+    Repaired by the settler's own act, `ops.land_when_cleared` on a RE-READ row, then the
+    daemon's `VALIDATION_LANDED` event with the round id so the settler cannot land the
+    same round twice.
+
+    Spec docs/superpowers/specs/2026-10-09-a-passed-round-that-never-landed-is-stranded.md.
+    """
+    from .daemon import VALIDATION_LANDED
+
+    rows = store.conn.execute(
+        "SELECT id FROM work_orders WHERE status='validating'").fetchall()
+    readonly = getattr(store, "readonly", False)
+    for row in rows:
+        wo_id = row["id"]
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is None or latest["outcome"] != "passed":
+            continue
+        if worker_session.busy(store, wo_id) is not None:
+            continue  # the deferral is correct there: a worker is typing
+        landed = store.last_event_of_kind(wo_id, VALIDATION_LANDED)
+        done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") \
+            if landed else None
+        if done is not None and int(done) == int(latest["id"]):
+            continue  # spec §1: this round's landing is already recorded
+        detail = (
+            f"work order {wo_id} is `validating` on a round that PASSED — round "
+            f"{latest['round']} is closed and no worker turn is in flight, so nothing in "
+            f"the OS will ever land it. The landing was deferred and its delegate is "
+            f"unreachable for this status."
+        )
+        context = {"round_id": latest["id"], "round": latest["round"],
+                   "unit": "work order", "fo_id": None}
+        if readonly:
+            # `jarvis doctor` without --repair. `land_finished` reaches
+            # `CentralStore.mark_backlog`, which no proxy over the project store can
+            # intercept — so the landing is described, not run.
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+                repaired=True,
+                repair="would land the passed round — `ops.land_when_cleared`",
+                context=context,
+            )
+            continue
+        from . import ops as ops_mod
+
+        fresh_wo = store.get_work_order(wo_id)
+        status = ops_mod.land_when_cleared(store, fresh_wo)
+        store.add_event(wo_id, VALIDATION_LANDED, {"round_id": int(latest["id"])})
+        yield Violation(
+            invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+            repaired=True,
+            repair=f"landed the passed round — the work order is now `{status}`",
+            context=context,
+        )
 
 
 def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
@@ -3726,12 +3831,17 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         # one is a decision somebody already made and has to be reversed or ratified.
         remedy = ("Merge it" if found.verdict == landing.AWAITING_MERGE
                   else "Re-open and merge it")
-        yield Violation(
-            invariant="INV-WORK-LANDED",
-            wo_id=wo_id,
-            detail=(f"completed, but its pull request has not merged: {found.detail}. "
+        # BUILT ONCE and assigned to both: it is the detail AND the owed decision, and a
+        # second copy would be a second sentence to keep free of elapsed time. Spec
+        # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §6
+        sentence = (f"completed, but its pull request has not merged: {found.detail}. "
                     f"{remedy}, or record the decision to drop it with `jarvis wo "
-                    f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`."),
+                    f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`.")
+        yield Violation(
+            invariant=INV_WORK_LANDED,
+            wo_id=wo_id,
+            detail=sentence,
+            owed=sentence,
             context={"verdict": found.verdict, "pr_url": found.pr_url,
                      "pr_state": found.pr_state},
         )
@@ -4721,6 +4831,53 @@ def check_os_identity() -> Iterator[Violation]:
     )
 
 
+def check_usage_meter_stale() -> Iterator[Violation]:
+    """INV-USAGE-METER-STALE — the account's usage meter has not been readable for N
+    minutes.
+
+    Account-wide, so OS-level and not per project. DERIVED FROM THE ROWS and nothing
+    else — the newest sample and the length of the trailing run of gap rows — so it cannot
+    go stale against an `os_state` key anyone forgot to clear. §8 of
+    docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+    """
+    from . import usage_meter
+    from .catalog import CostConfig
+    from .central_store import CentralStore
+
+    catalog = _live_catalog()
+    cfg = getattr(getattr(catalog, "os", None), "cost", None) or CostConfig()
+    central = CentralStore()
+    try:
+        streak = usage_meter.gap_streak(central)
+    finally:
+        central.close()
+    if streak.gap_rows == 0:
+        return
+    since = streak.last_ok_ts if streak.last_ok_ts is not None else streak.first_ts
+    stale_for = db.now() - float(since or db.now())
+    if stale_for <= cfg.meter_stale_minutes * 60:
+        return
+    yield Violation(
+        invariant="INV-USAGE-METER-STALE",
+        detail=(f"the account's usage meter has not been readable for "
+                f"{stale_for / 60:.0f} minutes ({streak.gap_rows} consecutive failed "
+                f"reads, the first at {_stamp(streak.first_ts)}): {streak.reason}. Every "
+                f"cost surface is back to a lower bound of unknown size until this is "
+                f"fixed — there is no second, independent number to reconcile the "
+                f"measured spend against."),
+        context={"last_ok_ts": streak.last_ok_ts, "gap_rows": streak.gap_rows,
+                 "reason": streak.reason},
+    )
+
+
+def _stamp(ts: float | None) -> str:
+    from datetime import datetime, timezone
+
+    if ts is None:
+        return "unknown"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_ui_wedged,
@@ -4732,6 +4889,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_cache_ttl_trigger,
     check_prefix_stable,
     check_os_identity,
+    check_usage_meter_stale,
 )
 
 

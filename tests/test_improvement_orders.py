@@ -229,6 +229,17 @@ def test_the_feature_verbs_refuse_an_improvement_order(started, store):
     assert "jarvis io" in str(e.value)
 
 
+def test_fo_show_refuses_an_improvement_order_and_names_io_show(started):
+    """GitHub issue #997: `show_feature_order` was the one `show_*` with no kind guard,
+    so an `io-` id came back as a feature order with an empty child tree."""
+    io = ops.create_improvement_order("proj_a", "slow first turns",
+                                      description=OBSERVATION, refs=REFS)
+    with pytest.raises(ops.OpsError) as e:
+        ops.show_feature_order(io["id"])
+    assert "jarvis io show" in str(e.value)
+    assert "an improvement order" in str(e.value)
+
+
 def test_the_io_verbs_refuse_a_feature_order(started):
     fo = ops.create_feature_order("proj_a", "CSV export", description="the whole ask")
     for call in (ops.show_improvement_order, ops.cancel_improvement_order):

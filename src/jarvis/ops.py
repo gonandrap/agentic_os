@@ -237,7 +237,9 @@ def resume_fleet(order_ids: list[str] | None = None,
 
 def _resolve_order_id(order_id: str) -> str:
     """A work or feature order id that exists — a typo must not silently allow nothing."""
-    if order_id.startswith("fo-"):
+    # `project_store.is_feature_order_id`, not a `fo-` literal: an `io-`/`inv-` id was
+    # looked up as a work order and refused as a typo (issue #997).
+    if is_feature_order_id(order_id):
         find_feature_order(order_id)
     else:
         find_work_order(order_id)
@@ -728,6 +730,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # it stands, because the report row is the dedupe (`open_violation_report`)
                 # and `close_violation_reports` is what takes it away again.
                 for report in store.standing_violations(level="critical"):
+                    # …EXCEPT ONE THAT OWES A DECISION: the work order's own attention
+                    # flag already carries it, and two lines for one decision is the
+                    # double-report the strip exists to prevent. No owed checker is
+                    # `critical` today; the skip is what keeps that safe when one is. Spec
+                    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                    # decision.md §7
+                    if report.get("owed"):
+                        continue
                     attention.append({
                         "project": p["name"], "wo_id": report["wo_id"] or None,
                         "title": f"OS invariant violated: {report['invariant']}",
@@ -6498,6 +6508,16 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # cleared one alert and got a different one back. The abandonment is
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
+                #
+                # THE REPORT GOES WITH IT, so the blocker stops deriving on the next
+                # reconcile tick and INV-ATTENTION-PHANTOM lowers the flag through its
+                # ordinary path. Without this the user waits up to an hour for the next
+                # landing sweep — clearing one alert and watching it sit there, which is
+                # the shape the comment above is already about. Singular: the plural
+                # deletes every report not in the iterable it is given. Spec
+                # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                # decision.md §8
+                store.close_violation_report(invariants.INV_WORK_LANDED, wo_id)
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
         # AFTER the `finished` event, so `refusal_answered` still dates correctly, and
         # after the `abandon` branch: 2026-09-29 spec §1.
@@ -8409,6 +8429,22 @@ _KIND_FAMILY = {
 }
 
 
+#: Per kind: the verb that SHOWS one. Beside the two tables above for their reason, and
+#: read by `show_feature_order`'s guard — the one refusal that has to name the command for
+#: the kind the row ACTUALLY is, because the user got there from a `/fo/` link or a
+#: `jarvis fo show` of an id they pasted (GitHub issue #997).
+_KIND_SHOW_VERBS = {
+    "feature": "jarvis fo show",
+    "improvement": "jarvis io show",
+    "investigation": "jarvis investigate show",
+}
+
+
+def show_verb(kind: str | None) -> str:
+    """The command that shows a `feature_orders` row of this kind."""
+    return _KIND_SHOW_VERBS.get(kind or "feature", _KIND_SHOW_VERBS["feature"])
+
+
 def family_prose(kind: str | None) -> tuple[str, str]:
     """`(what the family is called, the command that raises its budget)` for one kind."""
     return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
@@ -9459,6 +9495,10 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
     from . import plans
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    # The verb for the kind the row ACTUALLY is: this is the surface an id of another kind
+    # reaches by accident, so "use `jarvis fo show`" would name the command that just
+    # refused (GitHub issue #997).
+    _require_kind(fo, "feature", show_verb(fo.get("kind")))
     store = ProjectStore(path)
     try:
         plan = db.from_json(fo.get("plan"), None)
@@ -12620,6 +12660,27 @@ def cost_window(**kwargs: Any) -> dict[str, Any]:
     project = kwargs.pop("project", None)
     kwargs.setdefault("cfg", fleetcost.cost_config(project))
     return fleetcost.resolve_window(**kwargs)
+
+
+def cost_meter(**kwargs: Any) -> dict[str, Any]:
+    """The account's usage meter reconciled against measured spend — see
+    `usage_meter.reconciliation`.
+
+    A THIRD payload beside `cost_report` and `fleet_cost`, built from the same resolved
+    window: `fleetcost.report` is per-ORDER distribution and must not grow an
+    account-level, network-sourced time series (§10). Lazy import for `fleet_cost`'s
+    reason.
+    """
+    from . import usage_meter
+
+    return usage_meter.reconciliation(**kwargs)
+
+
+def meter_samples(**kwargs: Any) -> list[dict[str, Any]]:
+    """The raw usage-meter series for one span — see `usage_meter.sample_rows`."""
+    from . import usage_meter
+
+    return usage_meter.sample_rows(**kwargs)
 
 
 def cost_zone(tz: str | None = None, project: str | None = None) -> str:

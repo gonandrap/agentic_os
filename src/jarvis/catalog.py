@@ -1217,6 +1217,29 @@ DEFAULT_COST_TOOL_ROWS = 20
 #: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting —
 #: §2 of docs/superpowers/specs/2026-10-07-cost-window-selector.md.
 DEFAULT_COST_SESSION_WINDOW_HOURS = 5.0
+#: The usage meter — §§4, 5 and 8 of
+#: docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md. Settings
+#: rather than module constants for the standing rider's reason: every one of them is a
+#: belief about an account the OS does not control.
+DEFAULT_COST_METER_NEAREST_SECONDS = 300
+DEFAULT_COST_METER_CALIBRATION_MIN_MINUTES = 30
+DEFAULT_COST_METER_CALIBRATION_MIN_POINTS = 5
+DEFAULT_COST_METER_CALIBRATION_DAYS = 7
+#: Measured on this machine 2026-10-08: ~$0.82 of list-price spend per 5h point. The
+#: SEED, labelled as one everywhere it is shown and never printed as a measurement.
+DEFAULT_COST_METER_DOLLARS_PER_POINT = 0.82
+#: Fifteen consecutive failed minutes is a broken token or a broken network, where three
+#: is a blip.
+DEFAULT_COST_METER_STALE_MINUTES = 15
+DEFAULT_COST_METER_GAP_NOTICE_SAMPLES = 10
+#: Rows of the outside-session table SHOWN. The cap is on rows, never on the dollars
+#: counted: the remainder stays in `total_usd` and is disclosed as `n` (§9).
+DEFAULT_COST_METER_OUTSIDE_ROWS = 10
+#: The two alarm shares and the floor under both (§8). A quarter of a $1 window is 25
+#: cents, and alarming on it would teach the user to ignore the alarm.
+DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE = 0.25
+DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE = 0.25
+DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
 
 
 @dataclass
@@ -1242,6 +1265,17 @@ class CostConfig:
     chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
     tool_rows: int = DEFAULT_COST_TOOL_ROWS
     session_window_hours: float = DEFAULT_COST_SESSION_WINDOW_HOURS
+    meter_nearest_seconds: int = DEFAULT_COST_METER_NEAREST_SECONDS
+    meter_calibration_min_minutes: int = DEFAULT_COST_METER_CALIBRATION_MIN_MINUTES
+    meter_calibration_min_points: float = DEFAULT_COST_METER_CALIBRATION_MIN_POINTS
+    meter_calibration_days: int = DEFAULT_COST_METER_CALIBRATION_DAYS
+    meter_dollars_per_point: float = DEFAULT_COST_METER_DOLLARS_PER_POINT
+    meter_stale_minutes: int = DEFAULT_COST_METER_STALE_MINUTES
+    meter_gap_notice_samples: int = DEFAULT_COST_METER_GAP_NOTICE_SAMPLES
+    meter_outside_rows: int = DEFAULT_COST_METER_OUTSIDE_ROWS
+    meter_outside_alert_share: float = DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE
+    meter_residual_alert_share: float = DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE
+    meter_alert_min_usd: float = DEFAULT_COST_METER_ALERT_MIN_USD
 
 
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
@@ -2329,6 +2363,27 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
         tool_rows=int(raw.get("tool_rows", base.tool_rows)),
         session_window_hours=float(raw.get("session_window_hours",
                                            base.session_window_hours)),
+        meter_nearest_seconds=int(raw.get("meter_nearest_seconds",
+                                          base.meter_nearest_seconds)),
+        meter_calibration_min_minutes=int(raw.get(
+            "meter_calibration_min_minutes", base.meter_calibration_min_minutes)),
+        meter_calibration_min_points=float(raw.get(
+            "meter_calibration_min_points", base.meter_calibration_min_points)),
+        meter_calibration_days=int(raw.get("meter_calibration_days",
+                                           base.meter_calibration_days)),
+        meter_dollars_per_point=float(raw.get("meter_dollars_per_point",
+                                              base.meter_dollars_per_point)),
+        meter_stale_minutes=int(raw.get("meter_stale_minutes",
+                                        base.meter_stale_minutes)),
+        meter_gap_notice_samples=int(raw.get("meter_gap_notice_samples",
+                                             base.meter_gap_notice_samples)),
+        meter_outside_rows=int(raw.get("meter_outside_rows", base.meter_outside_rows)),
+        meter_outside_alert_share=float(raw.get("meter_outside_alert_share",
+                                                base.meter_outside_alert_share)),
+        meter_residual_alert_share=float(raw.get("meter_residual_alert_share",
+                                                 base.meter_residual_alert_share)),
+        meter_alert_min_usd=float(raw.get("meter_alert_min_usd",
+                                          base.meter_alert_min_usd)),
     )
     if not 0 <= cfg.week_reset_weekday <= 6:
         raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
@@ -2352,6 +2407,29 @@ def _parse_cost(raw: Any, base: CostConfig | None = None,
     if cfg.session_window_hours <= 0:
         raise _err(f"{where}.session_window_hours must be > 0 — "
                    f"{cfg.session_window_hours} is not a length of time")
+    # The meter's seven. Each takes the vocabulary it belongs to: LENGTHS and a DIVISOR
+    # are refused at or below zero, COUNTS below 1 (§§4, 5, 8 of the usage-meter spec).
+    for name in ("meter_nearest_seconds", "meter_calibration_min_minutes",
+                 "meter_calibration_min_points", "meter_calibration_days",
+                 "meter_dollars_per_point"):
+        if getattr(cfg, name) <= 0:
+            raise _err(f"{where}.{name} must be > 0 — {getattr(cfg, name)} is not a "
+                       f"length, a count of points or a price")
+    for name in ("meter_stale_minutes", "meter_gap_notice_samples",
+                 "meter_outside_rows"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"{where}.{name} must be >= 1 — zero would fire on the first "
+                       f"failed read, which is a blip and not an outage")
+    # A SHARE of the implied spend, so strictly inside (0, 1]: zero alarms on every
+    # window and above one can never fire (§8).
+    for name in ("meter_outside_alert_share", "meter_residual_alert_share"):
+        if not 0 < getattr(cfg, name) <= 1:
+            raise _err(f"{where}.{name} must be inside (0, 1] — {getattr(cfg, name)} "
+                       f"is not a share of the implied spend")
+    # A FLOOR in dollars, and zero is legal: it means every window is big enough.
+    if cfg.meter_alert_min_usd < 0:
+        raise _err(f"{where}.meter_alert_min_usd must be >= 0 — "
+                   f"{cfg.meter_alert_min_usd} is not an amount of money")
     try:
         zoneinfo.ZoneInfo(cfg.week_reset_zone)
     except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:

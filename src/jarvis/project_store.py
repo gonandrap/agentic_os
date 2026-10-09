@@ -494,6 +494,32 @@ def is_feature_order_id(unit_id: str) -> bool:
     spec above, which exists because three sites had grown their own `fo-` literal."""
     return unit_id.startswith(("fo-", "io-", "inv-"))
 
+
+#: The URL segment each order id prefix is rendered under. DERIVED from the prefixes the
+#: store mints (`FO_ID_PREFIXES`) rather than written out again: a fifth kind must not be
+#: able to get a page and still link to `/fo/`. The segment IS the prefix for every kind,
+#: which is why this is a set and not a map.
+ORDER_SEGMENTS = {"wo", "fo", *FO_ID_PREFIXES.values()}
+
+
+def order_path(project: str, order_id: str) -> str:
+    """The page that renders this order, from its id PREFIX.
+
+    The ONE derivation every surface links through — here, beside the prefixes it reads
+    and the shared id predicate above, because `search.py` needs it too and must not
+    import the FastAPI module. GitHub issue #997: three templates built
+    `/fo/<project>/<id>` for whatever they had, so an `io-`/`inv-` id rendered with the
+    feature template — "Release this plan?", an empty child tree — and the decision the
+    user owed was only on its own page.
+    """
+    prefix = order_id.split("-", 1)[0]
+    # Unknown prefix: the FEATURE page, never `/wo/`. An id that names no kind we know is
+    # a `feature_orders` row far more often than a work order, and that page refuses by
+    # kind; `/wo/` would 404 with nothing to say.
+    segment = prefix if prefix in ORDER_SEGMENTS else "fo"
+    return f"/{segment}/{project}/{order_id}"
+
+
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
 # do. Value: {"by": "neo", "scope": "<what is pre-approved, in words>", ...}.
@@ -1611,9 +1637,13 @@ ADDED_COLUMNS = {
     # is the dedupe: a `critical` one raises ONE attention item for as long as it stands
     # (Neo 1084), and `ops.os_status` cannot ask the checker again — it reads state. Every
     # row written before this reads `warning`, which is what they all were.
+    # …and WHETHER A DECISION IS OWED on it, which `invariants.true_blockers` reads to
+    # route the violation to the work order's own attention flag (spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §2).
     "violation_reports": {
         "level": "TEXT NOT NULL DEFAULT 'warning'",
         "detail": "TEXT NOT NULL DEFAULT ''",
+        "owed": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -4463,7 +4493,8 @@ class ProjectStore:
     # -- invariant violation reports -------------------------------------------
 
     def open_violation_report(self, invariant: str, wo_id: str | None = None,
-                              level: str = "warning", detail: str = "") -> bool:
+                              level: str = "warning", detail: str = "",
+                              owed: str = "") -> bool:
         """Note that this violation is standing. True the FIRST time it is seen.
 
         The caller announces on True and says nothing on False — `invariants.py` rule 3,
@@ -4472,7 +4503,8 @@ class ProjectStore:
 
         `level` and `detail` are kept for a READER rather than for the announcement:
         `standing_violations` is what puts a critical one on the attention list, and the
-        row is the dedupe that makes it one item (Neo 1084).
+        row is the dedupe that makes it one item (Neo 1084). `owed` is the third such
+        reader, through `owed_violations` below.
         """
         key = (invariant, wo_id or "")
         now = db.now()
@@ -4482,13 +4514,27 @@ class ProjectStore:
         if row is None:
             self.conn.execute(
                 "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen,"
-                " level, detail) VALUES (?,?,?,?,?,?)",
-                (*key, now, now, level, detail))
+                " level, detail, owed) VALUES (?,?,?,?,?,?,?)",
+                (*key, now, now, level, detail, owed))
             return True
         self.conn.execute(
-            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?"
-            " WHERE invariant=? AND wo_id=?", (now, level, detail, *key))
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?,"
+            " owed=? WHERE invariant=? AND wo_id=?",
+            (now, level, detail, owed, *key))
         return False
+
+    def owed_violations(self, wo_id: str) -> list[dict[str, Any]]:
+        """Standing violations on this work order that OWE THE USER A DECISION.
+
+        `invariants.true_blockers` appends each row's `owed` sentence, which is what
+        routes an unrepairable invariant to the attention flag instead of the inbox
+        (spec docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+        decision.md §2). The row is the dedupe and it survives a process restart.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM violation_reports WHERE wo_id=? AND owed<>''"
+            " ORDER BY first_seen", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def standing_violations(self, level: str = "") -> list[dict[str, Any]]:
         """Reports still standing, optionally only those at one level. Neo 1084's read."""
