@@ -352,6 +352,92 @@ def test_validation_show_carries_the_delivered_envelopes_too(
     assert "delivered" in deep
 
 
+def _lost_manager_envelope(project) -> tuple[str, str, str]:
+    """fo-ac00376e's shape: a settled manager, a live child, and the child's deferral
+    request to role `manager` lost because nobody fills the role.
+
+    Returns (fo_id, manager wo id, subject wo id).
+    """
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order(title="CSV export", description="export things")
+        store.set_feature_status(fo["id"], "executing")
+        manager = store.create_manager_order(fo["id"])
+        store.set_status(manager["id"], "completed")
+        child = store.create_work_order(title="the live one", description="do it",
+                                        origin="jarvis", kind="worker",
+                                        parent_id=fo["id"])
+        store.set_status(child["id"], "running")
+        env = store.post_envelope(from_role="implementor", to_role="manager",
+                                  kind="deferral_request", subject_wo_id=child["id"],
+                                  payload={"title": "split the writer",
+                                           "why": "out of scope"})
+        store.mark_envelope(env, "undeliverable",
+                            note=f"the manager work order {manager['id']} is completed, "
+                                 f"so nothing can act on this")
+        return fo["id"], manager["id"], child["id"]
+    finally:
+        store.close()
+
+
+def test_the_lost_manager_envelope_leads_with_the_settled_manager(jarvis_home,
+                                                                  catalog_file, project):
+    """The user read wo-3db50904 as the completed order. The settled fact — its manager is
+    completed — is what makes the sentence make sense, and it arrived last or not at all.
+
+    Spec §(d), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-
+    have-a-manager-or-a-hold.md.
+    """
+    from jarvis import invariants
+
+    ops.start_os(str(catalog_file), foreground=True)
+    fo_id, manager_id, subject_id = _lost_manager_envelope(project)
+    store = ProjectStore(project)
+    try:
+        found = [v for v in invariants.check_project(store)
+                 if v.invariant == "INV-ENVELOPE-LOST"]
+    finally:
+        store.close()
+
+    assert len(found) == 1
+    detail = found[0].detail
+    assert detail.index(manager_id) < detail.index(subject_id)
+    assert detail.startswith(f"the manager work order {manager_id} is completed under "
+                             f"feature {fo_id}")
+    assert "reached nobody" in detail
+    assert f"{subject_id} is held until the feature is live again" in detail
+    assert found[0].context["manager_wo_id"] == manager_id
+    assert found[0].context["manager_status"] == "completed"
+
+
+def test_a_lost_implementor_envelope_keeps_the_old_sentence(jarvis_home, catalog_file,
+                                                            project):
+    """The control: only the manager case had a second order in it to confuse."""
+    from jarvis import invariants
+
+    ops.start_os(str(catalog_file), foreground=True)
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("ship the exporter")
+        store.set_status(wo["id"], "running")
+        env = store.post_envelope(from_role="reviewer", to_role="implementor",
+                                  kind="review_feedback", subject_wo_id=wo["id"],
+                                  payload={"round": 1, "outcome": "rejected",
+                                           "reason": "no tests"})
+        store.mark_envelope(env, "undeliverable",
+                            note="no work order fills role implementor")
+        found = [v for v in invariants.check_project(store)
+                 if v.invariant == "INV-ENVELOPE-LOST"]
+    finally:
+        store.close()
+
+    assert len(found) == 1
+    assert found[0].detail == (
+        f"envelope {env} (review_feedback to role implementor) about {wo['id']} reached "
+        f"nobody: no work order fills role implementor")
+    assert found[0].context.get("manager_wo_id") is None
+
+
 # -- the review control an escalated round owes -----------------------------------------
 #
 # docs/superpowers/specs/2026-09-27-a-review-control-for-an-escalated-round.md §2, §4.

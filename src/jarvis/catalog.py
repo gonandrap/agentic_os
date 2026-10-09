@@ -953,6 +953,120 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+# -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
+# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+
+#: Ships ON. The sweep makes no model call — its whole cost is indexed reads — and the
+#: spend it can authorise is rationed twice over, by `max_per_day` and by
+#: `worker.investigation_budget_usd`.
+DEFAULT_FLEET_HEALTH_ENABLED = True
+
+#: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
+#: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
+#: — means something is wrong, and thirty minutes of it is unacceptable. `running` is
+#: still judged on time since the last ACTIVITY and not since entry
+#: (`stuck.ACTIVITY_STATUSES`), which is what makes a five-minute number safe for a turn
+#: that is working: a long turn that keeps calling tools is never over threshold.
+#: Neo 1073 set the earlier entries; SUPERSEDED BY THE USER, Neo 1148 accepting.
+DEFAULT_FLEET_HEALTH_THRESHOLDS: dict[str, int] = {
+    "pending": 30,
+    "dispatching": 5,
+    "running": 5,
+    "validating": 15,
+    "needs_review": 60,
+    "waiting_pr_merge": 60,
+    "waiting_input": 60,
+}
+
+#: The answer for an open status the mapping does not name — `idle`, `budget_exhausted`,
+#: and anything added to `WO_STATUSES` later, which is watched on the day it ships rather
+#: than silently unwatched. The user's 2026-10-01 bar, Neo 1148: an unnamed open status
+#: idle for half an hour is reported.
+DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES = 30
+
+#: How long one subject waits before a second investigation, Neo 1073. It holds even when
+#: the fingerprint has changed: "it moved" and "it is better" are not the same claim (§6b).
+DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES = 720
+
+#: Investigations the sweep may open in a day, FLEET-WIDE and counted from the records
+#: themselves (§6c). Neo 1073 set 4; Neo 1148 raised it to 48 under the user's tighter
+#: bar, because at five-minute sensitivity a cap of 4 is spent in the first hour and then
+#: fails CLOSED exactly when a genuinely stuck order appears.
+#: `worker.investigation_budget_usd` is the real money ceiling, so this cap rations
+#: BURSTS rather than the day. The per-subject cooldown
+#: (`DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES`) is unchanged, Neo 1148 explicitly: one stuck
+#: order must not eat the burst.
+DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 48
+
+#: Ticks between sweeps of one project — 5 minutes at the default 5s `poll_interval`.
+#: A CATALOG CONFIG AND NOT A MODULE CONSTANT, per Neo 1086, which overrides §5: the user
+#: has turned down the module-constant precedent before and prefers a per-project config.
+#: 5 minutes and not 30 (Neo 1148): a 30-minute cadence cannot see a 5-minute idle —
+#: detection would lag the threshold by up to six times the threshold itself.
+DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
+
+#: How long the stuck sweep itself may be silent before the user is told
+#: (`invariants.check_stuck_sweep_alive`, §8) — `OS_HEALTH_SWEEP_DARK_MINUTES`' value and
+#: its reasoning: a daemon restart or one capped tick cannot trip it, and a sweep switched
+#: off by a bad edit is named the same working day. A FLEET number, see
+#: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
+DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
+
+#: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
+#: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
+#: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
+#: silently leaving that status unwatched.
+FLEET_HEALTH_MAP_KEYS = ("thresholds",)
+
+#: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
+#: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
+#: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
+#: (`Daemon.STUCK_RUN_KEY`). No arrangement of per-project numbers can express either.
+FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
+    "max_per_day": "No arrangement of per-project numbers can ration a fleet-wide "
+                   "daily cap.",
+    "sweep_dark_minutes": "The stuck sweep writes ONE fleet-wide run record, so no "
+                          "arrangement of per-project numbers can say how long that one "
+                          "record may be silent.",
+}
+
+
+@dataclass
+class FleetHealthConfig:
+    """When the OS decides one order has stopped moving, and how often it may say so.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_fleet_health`) — and `thresholds` inherits PER STATUS, so a project naming one
+    status keeps the fleet answer for the other eight (`probes.resolve`'s merge-by-id rule,
+    for its reason).
+
+    `max_per_day` and `sweep_dark_minutes` are FLEET numbers and are refused on a project
+    (`FLEET_HEALTH_FLEET_ONLY_KEYS`): no arrangement of per-project numbers can ration a
+    fleet-wide daily cap, nor bound the silence of one fleet-wide run record.
+
+    There is no money key here and there must not be one — Neo's one condition on 1073.
+    `max_per_day` rations the number of sessions and `worker.investigation_budget_usd`
+    rations each one; two answers to "what may this cost" is how a ceiling stops being
+    checkable.
+    """
+
+    enabled: bool = DEFAULT_FLEET_HEALTH_ENABLED
+    thresholds: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_FLEET_HEALTH_THRESHOLDS))
+    fallback_minutes: int = DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES
+    cooldown_minutes: int = DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+    max_per_day: int = DEFAULT_FLEET_HEALTH_MAX_PER_DAY
+    #: Neo 1086: how often this project is swept, per project rather than a constant.
+    sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+    #: Fleet-only: how long the sweep's own run record may be silent (§8).
+    sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+
+    def threshold_seconds(self, status: str) -> float:
+        """This status's threshold, in the seconds `stuck.assess` compares — the named one
+        or the fallback, so every open status has an answer."""
+        return float(self.thresholds.get(status, self.fallback_minutes)) * 60.0
+
+
 # -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216,
 # §2.3 of
 # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
@@ -1425,6 +1539,7 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    fleet_health: FleetHealthConfig = field(default_factory=FleetHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
@@ -1561,6 +1676,7 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    fleet_health: FleetHealthConfig = field(default_factory=FleetHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
     cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
@@ -1972,6 +2088,55 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
             if value < 0:
                 raise _err(f"{where}.{name} must be >= 0")
         elif name != "enabled" and value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
+                        where: str = "os.fleet_health") -> FleetHealthConfig:
+    """`os.fleet_health`, or a project's override of it — `_parse_inspect`'s shape.
+
+    Field-level inheritance, and `thresholds` inherits per STATUS rather than whole: a
+    project disabling one threshold must not drop the other eight.
+
+    Three refusals, each where the message can name the key — `GateConfig.parse`'s rule
+    that a typo must not silently leave a status unwatched, and `fleet.py`'s opening
+    paragraph for the third.
+    """
+    from .project_store import OPEN_STATUSES
+
+    base = base or FleetHealthConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    if where != "os.fleet_health":
+        for key, why in FLEET_HEALTH_FLEET_ONLY_KEYS.items():
+            if key in raw:
+                raise _err(f"{where}.{key} is a FLEET number — set "
+                           f"os.fleet_health.{key}. {why}")
+    thresholds = dict(base.thresholds)
+    named = raw.get("thresholds", {})
+    if not isinstance(named, dict):
+        raise _err(f'"{where}.thresholds" must be an object')
+    for status, minutes in named.items():
+        if status not in OPEN_STATUSES:
+            raise _err(f"{where}.thresholds: {status!r} is not an open status "
+                       f"(known: {sorted(OPEN_STATUSES)})")
+        if int(minutes) < 1:
+            raise _err(f"{where}.thresholds.{status} must be >= 1")
+        thresholds[status] = int(minutes)
+    cfg = FleetHealthConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        thresholds=thresholds,
+        fallback_minutes=int(raw.get("fallback_minutes", base.fallback_minutes)),
+        cooldown_minutes=int(raw.get("cooldown_minutes", base.cooldown_minutes)),
+        max_per_day=int(raw.get("max_per_day", base.max_per_day)),
+        sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
+        sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":
+            continue
+        if value < 1:
             raise _err(f"{where}.{name} must be >= 1")
     return cfg
 
@@ -2519,6 +2684,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        fleet_health=_parse_fleet_health(os_raw.get("fleet_health", {})),
         navigation=_parse_navigation(os_raw.get("navigation", {})),
         cost=_parse_cost(os_raw.get("cost", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
@@ -2666,6 +2832,9 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        fleet_health_cfg = _parse_fleet_health(
+            p.get("fleet_health", {}), base=os_cfg.fleet_health,
+            where=f"projects[{i}] ({name}).fleet_health")
         navigation_cfg = _parse_navigation(
             p.get("navigation", {}), base=os_cfg.navigation,
             where=f"projects[{i}] ({name}).navigation")
@@ -2711,6 +2880,7 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                fleet_health=fleet_health_cfg,
                 navigation=navigation_cfg,
                 cost=cost_cfg,
                 observability=observability_cfg,

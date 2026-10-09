@@ -142,8 +142,8 @@ def prefix_rate(call: Call, previous: Call | None, first: bool) -> tuple[str, fl
 def per_token(model: str) -> float:
     """One input token at list price. Public for `quantile`'s reason: a second caller.
 
-    `fleetcost.tool_costs` prices a tool result's share of every later call it rode
-    along in, and that share is `result_tokens * rate * per_token(model)` — the same
+    `fleetcost.tool_costs` prices a tool result's share of every later IN-WINDOW call
+    it rode along in, and that share is `result_tokens * rate * per_token(model)` — the same
     arithmetic this module's own savings use, so it is reused rather than restated.
     """
     return usage.price_for(model)[0] / 1_000_000
