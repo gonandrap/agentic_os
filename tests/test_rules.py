@@ -25,6 +25,7 @@ on both. (Neo, question 878.)
 
 from __future__ import annotations
 
+import inspect
 import json
 from unittest import mock
 
@@ -401,3 +402,107 @@ def test_bound_records_the_cap_it_applied():
     out = rules.bound(long)
     assert out.startswith("x" * rules.FACTS_CHARS)
     assert str(rules.FACTS_CHARS) in out[rules.FACTS_CHARS:]
+
+
+# -- the recurrence lookup, the verdict and the redaction boundary (§8) -------------------
+
+
+def _det(**kw):
+    """A detector row as the table holds it, carrying only what the lookup reads."""
+    kw.setdefault("id", "dt-1")
+    kw.setdefault("gap_class", "stale-panel-hold")
+    kw.setdefault("project", "")
+    kw.setdefault("ts", 1.0)
+    kw.setdefault("status", rules.DRY_RUN)
+    kw.setdefault("retired_at", None)
+    return kw
+
+
+def test_recurrence_verdicts_are_four_and_reuse_the_unreadable_string():
+    """Neo question 974: `unreadable` is a verdict of its OWN, not a fourth spelling of
+    `missed`. It reuses the fire outcome's string so one word means one thing."""
+    assert rules.RECURRENCE_VERDICTS == (
+        rules.NOT_ARMED, rules.MISSED, rules.REMEDY_FAILED,
+        rules.UNREADABLE_RECURRENCE)
+    assert rules.UNREADABLE_RECURRENCE == rules.UNREADABLE
+    assert len(set(rules.RECURRENCE_VERDICTS)) == 4
+
+
+def test_a_project_scoped_detector_beats_a_fleet_wide_one():
+    fleet = _det(id="dt-fleet", project="", ts=1.0)
+    scoped = _det(id="dt-scoped", project="acme", ts=9.0)
+    got = rules.recurrence([fleet, scoped], "stale-panel-hold", project="acme")
+    assert got["id"] == "dt-scoped"
+
+
+def test_among_equals_the_oldest_detector_wins():
+    old = _det(id="dt-old", ts=1.0)
+    new = _det(id="dt-new", ts=2.0)
+    assert rules.recurrence([new, old], "stale-panel-hold",
+                            project="acme")["id"] == "dt-old"
+
+
+def test_a_retracted_or_retired_detector_is_never_returned():
+    assert rules.recurrence([_det(status=rules.RETRACTED)], "stale-panel-hold") is None
+    assert rules.recurrence([_det(retired_at=5.0)], "stale-panel-hold") is None
+
+
+def test_a_detector_scoped_to_another_project_is_out_of_scope():
+    assert rules.recurrence([_det(project="other")], "stale-panel-hold",
+                            project="acme") is None
+    assert rules.recurrence([_det(project="")], "stale-panel-hold",
+                            project="acme") is not None
+
+
+def test_the_gap_class_must_match_exactly():
+    assert rules.recurrence([_det(gap_class="stale-panel-hold")], "stale-panel") is None
+
+
+def test_a_dry_run_detector_is_not_armed_whatever_the_fire_says():
+    for outcome in rules.FIRE_OUTCOMES:
+        assert rules.recurrence_verdict(
+            _det(status=rules.DRY_RUN), {"outcome": outcome}) == rules.NOT_ARMED
+    assert rules.recurrence_verdict(_det(status=rules.DRY_RUN), None) == rules.NOT_ARMED
+
+
+def test_an_armed_detector_with_no_fire_missed_it():
+    assert rules.recurrence_verdict(_det(status=rules.ARMED), None) == rules.MISSED
+
+
+@pytest.mark.parametrize("outcome", [rules.PROPOSED, rules.REFUSED, rules.APPLIED])
+def test_an_armed_detector_that_fired_and_acted_is_a_remedy_failure(outcome):
+    """`applied` is in the set on Neo question 974's ruling: the remedy ran and the gap
+    recurred anyway, so the remedy is still the half that failed."""
+    assert rules.recurrence_verdict(_det(status=rules.ARMED),
+                                    {"outcome": outcome}) == rules.REMEDY_FAILED
+
+
+def test_an_unreadable_fire_is_its_own_verdict_and_never_missed():
+    got = rules.recurrence_verdict(_det(status=rules.ARMED),
+                                   {"outcome": rules.UNREADABLE})
+    assert got == rules.UNREADABLE_RECURRENCE
+    assert got != rules.MISSED
+
+
+@pytest.mark.parametrize("outcome", [rules.RECORDED, rules.CLEARED])
+def test_a_recorded_or_cleared_fire_is_no_usable_fire(outcome):
+    assert rules.recurrence_verdict(_det(status=rules.ARMED),
+                                    {"outcome": outcome}) == rules.MISSED
+
+
+def test_the_recurrence_comment_carries_the_four_fields_and_nothing_else():
+    """§8's redaction boundary: the tracker is PUBLIC, so the comment is BUILT from four
+    arguments and there is no parameter anything private could arrive through."""
+    body = rules.recurrence_comment(order_id="wo-77", gap_class="stale-panel-hold",
+                                    verdict=rules.MISSED, detector_id="dt-9")
+    for field in ("wo-77", "stale-panel-hold", rules.MISSED, "dt-9"):
+        assert field in body
+    detector = _det(summary="SENTINEL-SUMMARY", condition="SENTINEL-CONDITION")
+    fire = {"outcome": rules.PROPOSED, "detail": "SENTINEL-DETAIL"}
+    assert detector["summary"] and fire["detail"]
+    for sentinel in ("SENTINEL-SUMMARY", "SENTINEL-CONDITION", "SENTINEL-DETAIL",
+                     "SENTINEL-TITLE", "SENTINEL-ATTENTION"):
+        assert sentinel not in body
+    params = inspect.signature(rules.recurrence_comment).parameters
+    assert set(params) == {"order_id", "gap_class", "verdict", "detector_id"}
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
