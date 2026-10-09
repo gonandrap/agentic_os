@@ -316,9 +316,29 @@ def test_reading_configuration_is_not_blocked_for_a_worker(catalog, monkeypatch)
     # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md).
     ("projects.x.navigation.bash_commands", "hot"),
     ("os.navigation.window_days", "hot"),
+    # Re-resolved per probe round and per daemon tick, so no restart is needed (§6 of
+    # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md).
+    ("os.ui_health.probe_interval_seconds", "hot"),
+    ("projects.p.ui_health.trip_threshold", "hot"),
 ])
 def test_every_class_in_the_design_table(path, cls):
     assert ops.apply_class(path) == cls
+
+
+def test_a_ui_health_key_can_be_set_fleet_wide_and_per_project(catalog):
+    """Every new key must reach the console and the file: a threshold nobody can change
+    without a release is the thing §6 exists to prevent."""
+    fleet = ops.set_config("os.ui_health.trip_threshold", 5)
+    mine = ops.set_config("ui_health.probe_interval_seconds", 30, project="proj_a")
+
+    assert document_of(catalog)["os"]["ui_health"]["trip_threshold"] == 5
+    assert mine["path"] == "projects.proj_a.ui_health.probe_interval_seconds"
+    assert fleet["apply"] == mine["apply"] == "hot"
+    assert ops.config_show()["resolved"]["os.ui_health.trip_threshold"] == 5
+    # Field-level inheritance, through the console: the project's own key is set and the
+    # fleet's answer is still the one it reads for the rest.
+    assert ops.config_show()[
+        "resolved"]["projects.proj_a.ui_health.trip_threshold"] == 5
 
 
 def test_settings_overrides_says_why_it_is_inert_rather_than_accepting_it_silently(

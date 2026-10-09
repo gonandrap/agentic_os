@@ -66,6 +66,9 @@ from . import invariants as invariants_mod
 from .invariants import PR_REPAIR_STATUSES, RETRY_HELD_RESTATE
 from .neo_store import QuestionTooLargeError
 from .paths import daemon_pidfile, ensure_home, logs_dir
+# The `os_state` keys the dashboard's self-heal keeps, spelled in `uilog` so this daemon
+# and `invariants.check_ui_wedged` cannot drift onto two sets of names.
+from .uilog import UI_HEALTHZ_OK_AT, UI_WEDGE_CAPPED_AT, UI_WEDGE_RESTARTS
 from .project_store import (
     COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
@@ -96,6 +99,39 @@ log = logging.getLogger("jarvisd")
 #: §6.6 of docs/superpowers/specs/2026-09-23-an-assumption-judged-while-the-worker-still-
 #: runs.md.
 OBJECTION_WITHDRAWN_REASON = "the order stopped before it could be delivered"
+
+def fetch_healthz(url: str, timeout: float) -> dict[str, Any] | None:
+    """`GET /healthz` as a dict, or None when the dashboard did not answer.
+
+    A module function, so a test replaces it the way the suite replaces
+    `uilog.read_errors` — and so "it timed out", "it refused the connection" and "it
+    answered something that is not the payload" all arrive at the caller as one None.
+
+    A 503 IS AN ANSWER. `urlopen` raises on it, but the body is the payload the caller
+    has to read: the endpoint answers 503 for a human with `curl` the moment one probe
+    fails, and the debounce that decides a wedge is `trip_threshold` inside that payload.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+        body = db.from_json(raw.decode("utf-8", errors="replace"), None)
+    except Exception:  # noqa: BLE001 — every other failure is one verdict (spec §4.2)
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _limiter_line(figures: dict[str, Any]) -> str:
+    """The anyio capacity limiter, as the inbox item states it."""
+    return (f"borrowed {figures.get('borrowed', '?')} / available "
+            f"{figures.get('available', '?')} of {figures.get('total', '?')}, "
+            f"{figures.get('waiting', '?')} waiting")
+
 
 RECONCILE_EVERY_TICKS = 6  # refresh `claude agents --json` every N ticks (injected only)
 SECONDS_PER_HOUR = 3600    # a unit, not a setting
@@ -1076,6 +1112,13 @@ class Daemon:
             self.check_ui_log()
         except Exception:  # noqa: BLE001 — never let the UI watch stall the tick
             log.exception("ui log check failed")
+        # Beside it, under the same discipline: a wedge found this tick is notified on
+        # this tick. The dashboard raises no error when it wedges, so this is the only
+        # positive liveness signal the OS has (spec §4).
+        try:
+            self.check_ui_health()
+        except Exception:  # noqa: BLE001 — same rule
+            log.exception("ui health check failed")
 
         from .notify import route_new_inbox
         route_new_inbox(self.central, self.catalog)
@@ -1903,6 +1946,147 @@ class Daemon:
         )
         log.warning("dashboard errors: %d new (latest: %s)", len(errors), latest.summary)
         return len(errors)
+
+    def check_ui_health(self, now: float | None = None) -> str:
+        """Is the dashboard still serving, and restart it if it is not.
+
+        §4 of
+        docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+        Runs beside `check_ui_log` for that method's reason: a wedge found this tick is
+        notified on this tick rather than the next one.
+
+        TIMEOUT, CONNECTION FAILURE AND "REPORTS WEDGED" ARE THE SAME VERDICT. A wedged
+        process answers nothing at all if the event loop went with the pool, so a check
+        that only believed a 503 would miss the worse case. The payload, never the status
+        code, is what says "wedged": `trip_threshold` is the UI's own debounce, and
+        believing a single slow probe would restart a dashboard that was merely building
+        `/cost`.
+
+        A dashboard that has NEVER answered healthily is not a wedge — nobody started it.
+        Without that, a daemon on a machine with no `jarvis ui` would restart
+        `jarvis-ui.service` on every tick it could.
+
+        A unit that is not ACTIVE is `down`, not wedged: `systemctl --user stop
+        jarvis-ui` leaves the port refusing connections, which is indistinguishable from
+        a dead loop over HTTP alone. The measured fault had the unit `active (running)`,
+        so that is the discriminator — and without it the OS would restart the dashboard
+        the user had just stopped, three times, and tell them about it each time.
+
+        Returns what happened, for the log and the tests: `off`, `down`, `unseen`,
+        `healthy`, `cooldown`, `capped`, `restarted` or `restart_failed`.
+        """
+        from . import release, systemd_units, uilog
+        from .notify import ui_base_url
+
+        cfg = self.catalog.os.ui_health
+        if not cfg.enabled:
+            return "off"
+        now = time.time() if now is None else now
+        try:
+            body = fetch_healthz(f"{ui_base_url(self.catalog)}/healthz",
+                                 cfg.healthz_timeout_seconds)
+        except Exception:  # noqa: BLE001 — an unreachable dashboard is the finding
+            body = None
+        wedged = body is None or bool(body.get("wedged"))
+        if not wedged:
+            self.central.set_state(UI_HEALTHZ_OK_AT, f"{now:.3f}")
+            self.central.set_state(UI_WEDGE_CAPPED_AT, "")
+            return "healthy"
+        # Deliberately stopped, not wedged. The sighting is LEFT ALONE: the dashboard did
+        # serve, and starting it again must not have to earn that back.
+        if not systemd_units.unit_active(release.UI_UNIT):
+            return "down"
+        if not (self.central.get_state(UI_HEALTHZ_OK_AT) or "").strip():
+            return "unseen"
+
+        figures = (body or {}).get("limiter") or {}
+        dump = (body or {}).get("stack_dump") or str(uilog.stack_dump_path())
+        restarts = [t for t in self._ui_restarts() if now - t < 24 * 3600]
+        if restarts and now - max(restarts) < cfg.restart_cooldown_seconds:
+            # Stops a restart loop against a dashboard that wedges on boot.
+            return "cooldown"
+        if len(restarts) >= cfg.max_restarts_per_day:
+            # At the cap the check keeps probing and the UI keeps dumping; what it must
+            # not do is fall silent, which would reproduce the original defect one level
+            # up. One item per entry into the capped state, not one per tick.
+            if not (self.central.get_state(UI_WEDGE_CAPPED_AT) or "").strip():
+                self.central.set_state(UI_WEDGE_CAPPED_AT, f"{now:.3f}")
+                self.central.add_inbox(
+                    project="os", level="critical",
+                    title="the dashboard is wedged and its restart cap is spent",
+                    body=(f"`{release.UI_UNIT}` has been restarted "
+                          f"{len(restarts)} times in the last 24h, which is the cap "
+                          f"(`ui_health.max_restarts_per_day` = "
+                          f"{cfg.max_restarts_per_day}). It will NOT be restarted again "
+                          f"until that window rolls — a fourth wedge in a day is a "
+                          f"different, worse fault than the one a restart fixes.\n"
+                          f"Limiter: {_limiter_line(figures)}\n"
+                          f"Stacks: {dump}\n"
+                          f"Stamp: {uilog.wedge_stamp_path()}"),
+                )
+            return "capped"
+
+        runner = self.release_runner or release.SystemdRunner()
+        # ATTEMPTED BEFORE IT IS ANNOUNCED, and the attempt is recorded whether or not it
+        # raised. The other order claims a restart that may not have happened, and — with
+        # no timestamp written — leaves no cooldown, so the next tick five seconds later
+        # repeats the whole thing: an inbox item per tick, the flood `check_ui_log`'s
+        # one-item-per-batch rule exists to prevent.
+        #
+        # `jarvis-ui.service` can never host this process (`DAEMON_UNIT` is a different
+        # unit), so the inline restart is the correct one — `restart_unit_detached`
+        # exists for the opposite case. APPROVED FOR THIS UNIT AND NOTHING ELSE: no unit
+        # name comes from a catalog key and no project may nominate one (spec §4.5).
+        error = ""
+        try:
+            runner.restart_unit(release.UI_UNIT)
+        except Exception as e:  # noqa: BLE001 — report what happened, do not re-raise
+            error = f"{type(e).__name__}: {e}"
+        restarts.append(now)
+        self.central.set_state(UI_WEDGE_RESTARTS,
+                               db.to_json([round(t, 3) for t in restarts]))
+        self.central.set_state(UI_WEDGE_CAPPED_AT, "")
+        evidence = (f"Limiter: {_limiter_line(figures)}\n"
+                    f"Stacks: {dump}\n"
+                    f"Stamp: {uilog.wedge_stamp_path()}")
+        if error:
+            self.central.add_inbox(
+                project="os", level="critical",
+                title=f"the dashboard is wedged and {release.UI_UNIT} could not be "
+                      f"restarted",
+                body=(f"The restart was attempted and FAILED: {error}. The dashboard is "
+                      f"still wedged and the OS cannot heal it — restart it by hand "
+                      f"(`systemctl --user restart {release.UI_UNIT}`).\n"
+                      f"The attempt counts against `ui_health.max_restarts_per_day`, so "
+                      f"this is said once rather than on every tick.\n"
+                      f"{evidence}"),
+            )
+            log.warning("dashboard wedged: restarting %s failed (%s)",
+                        release.UI_UNIT, error)
+            return "restart_failed"
+        self.central.add_inbox(
+            project="os", level="warning",
+            title=f"the dashboard was wedged — restarted {release.UI_UNIT}",
+            body=(f"Every routed page had stopped answering while the process stayed "
+                  f"`active (running)`. The dashboard dumped every thread's Python "
+                  f"stack before the restart; that dump is the only evidence of what "
+                  f"held the threadpool.\n"
+                  f"{evidence}"),
+        )
+        log.warning("dashboard wedged: restarted %s (%d in 24h)",
+                    release.UI_UNIT, len(restarts))
+        return "restarted"
+
+    def _ui_restarts(self) -> list[float]:
+        """When this daemon has self-restarted the dashboard, as epochs."""
+        rows = db.from_json(self.central.get_state(UI_WEDGE_RESTARTS), []) or []
+        out: list[float] = []
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                out.append(float(row))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     # -- 1. notifications ----------------------------------------------------------
 
@@ -6061,7 +6245,8 @@ class Daemon:
         looks outside the machine, and it exists so the user does not have to type
         `jarvis wo done` after every merge they already performed.
 
-        Five answers, from `github.pr_view`:
+        Six answers, from `github.pr_view` — five about the pull request's own state,
+        mutually exclusive by construction, and one independent of them:
 
         * **merged** — the work landed; the work order ends (`ops.complete_merged`).
         * **closed, unmerged** — someone refused the work; it goes to `needs_review`
@@ -6079,19 +6264,32 @@ class Daemon:
         * **open, mergeable and green** — nothing to do, and nothing written unless a
           repair episode is being closed.
 
-        THE LAST ONE IS THE BUDGET, because it is the overwhelmingly common case: one
-        `gh` call and FOUR indexed reads per pull request, no write. The four are one
+        * **open, and the delivery was never declared** — a refusal answered with
+          commits and no `jarvis wo finish`, which is orthogonal to all of the above and
+          so is asked independently (`ops.PR_UNDECLARED`, and
+          docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md).
+
+        THE GREEN ONE IS THE BUDGET, because it is the overwhelmingly common case: one
+        `gh` call and SIX indexed reads per pull request, no write. The six are one
         per question this branch has to ask the timeline — was a closure already
         reported (`pr_closure_told`), is a conflict episode open, is a checks episode
-        open, and is a "waiting for the base" note still up (`ops.record_base_health`) —
-        and they are reads of `wo_events` by `(wo_id, kind)`, not scans. Nothing else on
-        the path touches the database: the work-order row itself is re-read only when a
-        clear has just run, and the step's `list_work_orders` is one query for the whole
-        project however many pull requests it has.
+        open, is a "waiting for the base" note still up (`ops.record_base_health`), is
+        this delivery undeclared (`invariants.undeclared_delivery`, which reads the
+        `reviewed` events and stops there on an order that never had a refusal), and is
+        an undeclared episode open — and they are reads of `wo_events` by
+        `(wo_id, kind)`, not scans. Nothing else on the path touches the database: the
+        work-order row itself is re-read only when a clear has just run, and the step's
+        `list_work_orders` is one query for the whole project however many pull requests
+        it has.
+
+        THE FIFTH IS PAID BY EVERY POLLED PULL REQUEST, including one in a project that
+        has never had a refusal anywhere: there is no cheaper way to ask "has this order
+        ever had a refusal" than that read. It is not conditional, and the spec above
+        says so plainly rather than pretending otherwise.
 
         That sentence used to say "one indexed read" and had been false since this body
         was rewritten. It is a claim worth keeping honest rather than deleting —
-        `tests/test_pr_checks.py` counts the statements, so a fifth read fails a test
+        `tests/test_pr_checks.py` counts the statements, so a seventh read fails a test
         instead of quietly costing the fleet a query every two minutes per open pull
         request.
 
@@ -6312,6 +6510,38 @@ class Daemon:
                     # The repair branches above call this too, `record_only` — which
                     # writes the hold and merges nothing, so that rule is untouched.
                     self.auto_merge(project, store, wo, pr, base_red=base_red)
+                # AN UNDECLARED DELIVERY IS ORTHOGONAL TO THE CHAIN ABOVE, so it is an
+                # independent block and not another `elif`: it can be true over a green
+                # pull request, a red one or a conflicting one. Spec
+                # docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md
+                # §2.3.
+                #
+                # The status test is REPEATED rather than inherited from position: the
+                # `merged` and `closed_unmerged` arms return through this same bottom,
+                # and `validating` reaches it by falling through to nothing.
+                #
+                # `row` AND NOT `wo`: the head cache above is written with
+                # `update_work_order` and the local `wo` dict is never refreshed, so
+                # `undeclared_delivery` reading `wo["pr_head_oid"]` would judge the
+                # PREVIOUS head — on the first tick after a push, the very tick this
+                # exists for, it would read the already-judged head and decline. An
+                # overlay and not a re-read: a `get_work_order` here would buy a row
+                # lookup on every polled pull request in the fleet.
+                #
+                # ORDER AND MUTUAL EXCLUSION ARE BOUGHT BY AN EXISTING GUARD:
+                # `heal_pull_request` returns on `store.queued_messages`, so a pull
+                # request the chain above just nudged about declines here in the same
+                # tick — no double nudge, no attempt spent. The undeclared nudge lands
+                # on the first tick where nothing else is queued, which is the right
+                # order: a worker asked to declare a head CI is about to reject would
+                # declare the wrong commit.
+                row = {**wo, "pr_head_oid": pr.head_oid or wo.get("pr_head_oid") or ""}
+                if wo["status"] in PR_REPAIR_STATUSES \
+                        and invariants_mod.undeclared_delivery(store, row):
+                    self.heal_pull_request(project, store, row, ops.PR_UNDECLARED,
+                                           "delivered without declaring it")
+                elif wo["status"] in PR_REPAIR_STATUSES:
+                    ops.clear_pr_repair(store, row, ops.PR_UNDECLARED)
             except Exception:  # noqa: BLE001
                 log.exception("[%s] settling %s against its PR failed", project.name,
                               wo["id"])
@@ -8274,10 +8504,11 @@ class Daemon:
 
     def heal_pull_request(self, project: ProjectSpec, store: ProjectStore, wo: dict,
                           repair: Any, what: str, **fields: Any) -> None:
-        """A pull request the OS can ask its own worker to fix: conflicts, or a red build.
+        """Something the OS can ask this worker to fix itself: conflicts, a red build, or
+        a delivery it never declared.
 
-        ONE function for both, because they are one mechanism — see `ops.PrRepair`. The
-        five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
+        ONE function for all three, because they are one mechanism — see `ops.PrRepair`.
+        The five guards are all this adds over `ops.nudge_pr_repair`: no session to resume,
         a nudge already queued, a turn already in flight, a validation round that owns
         the work order, and a privileged-action gate that would refuse everything the
         repair needs to run. Spec §3 for why each of the first three would otherwise

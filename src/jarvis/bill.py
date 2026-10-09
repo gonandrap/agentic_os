@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import db, usage as usage_mod
+from .project_store import COMPACT_TURN
 
 #: How many `agent_calls` rows one order's bill will read. Far above any real order (a
 #: heavy one runs to dozens), and counted rather than assumed: a truncated bill would
@@ -452,12 +453,15 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
     tidy. Clamped at zero per class: a turn running right now is in the transcript and
     not yet in the recorded rows, and a negative charge would be a fiction either way.
     """
+    # A compaction is the OS's call, charged on the Jarvis half from `agent_calls`
+    # (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §1).
+    worker_rows = [r for r in turn_rows if r.get("kind") != COMPACT_TURN]
     items: list[Item] = []
     notes: list[str] = []
     recorded = _zero_tokens()
-    subs_by_turn = _subagents_by_turn(turn_rows, session)
+    subs_by_turn = _subagents_by_turn(worker_rows, session)
     stranded = 0
-    for row in turn_rows:
+    for row in worker_rows:
         if not row.get("recorded"):
             continue
         models = row.get("by_model") or [{
@@ -499,10 +503,10 @@ def _turn_items(turn_rows: Sequence[dict[str, Any]],
         # turn running RIGHT NOW has not written its result JSON yet and will settle
         # into its own line within the minute; a settled turn with no usage will never
         # have one. Calling both "gone" would read as data loss on every live page.
-        live = [r for r in turn_rows
+        live = [r for r in worker_rows
                 if not r.get("recorded") and r.get("state") == "running"]
-        unrecorded = [r for r in turn_rows if not r.get("recorded")]
-        if not turn_rows:
+        unrecorded = [r for r in worker_rows if not r.get("recorded")]
+        if not worker_rows:
             label = "the conversation, from its transcript"
             note = ("no turns on record at all — this session predates turn capture, "
                     "or was never Jarvis-driven")
@@ -1460,6 +1464,41 @@ CALL_COVER_SLACK = 2.0
 CALL_COVER_RESIDUE = 1_500_000
 
 
+def _check_compaction_once(payload: dict[str, Any],
+                           rows: Sequence[dict[str, Any]]) -> list[str]:
+    """A compaction charged to the worker AND recorded as a Jarvis compaction.
+
+    The SHAPE of the defect, not a number: it compares a `wo_turns` row against an item
+    sourced from `agent_calls`, which are the two tables the double count spans and the
+    one thing the fold invariants cannot see. BOTH children are required — the worker
+    child alone is an order whose `agent_calls` row was pruned or never written, and the
+    Jarvis child alone is the fixed state
+    (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §3).
+    """
+    from . import agent_usage
+
+    described = agent_usage.describe(agent_usage.COMPACTION)
+    problems: list[str] = []
+    by_key = {line.get("key"): line for line in payload.get("turns") or []}
+    for row in rows:
+        if row.get("kind") != COMPACT_TURN:
+            continue
+        seq = row.get("seq")
+        line = by_key.get(str(seq))
+        if not line:
+            continue
+        children = {child.get("key"): child for child in line.get("children") or []}
+        jarvis = children.get(f"{seq}/{JARVIS}")
+        compaction = any(
+            grand.get("key") == f"{seq}/{JARVIS}/{described}"
+            for grand in (jarvis or {}).get("children") or [])
+        if f"{seq}/{WORKER}" in children and compaction:
+            problems.append(
+                f"turn {seq}: the compaction is charged to the worker AND recorded as "
+                "a Jarvis compaction — one compaction, counted twice")
+    return problems
+
+
 def _check_calls(payload: dict[str, Any]) -> list[str]:
     """Per-call rows are a PARTITION of their turn: they may not exceed it, and — with
     the turn's subagents beside them — they may not fall hopelessly short of it either.
@@ -1482,6 +1521,8 @@ def _check_calls(payload: dict[str, Any]) -> list[str]:
     """
     problems: list[str] = []
     rows = payload.get("turn_rows") or []
+    problems.extend(_check_compaction_once(payload, rows))
+    rows = [row for row in rows if row.get("kind") != COMPACT_TURN]
     for row in rows:
         cover = row.get("calls_cover")
         # A turn with no result JSON yet — one in flight — has no figure of its own to
