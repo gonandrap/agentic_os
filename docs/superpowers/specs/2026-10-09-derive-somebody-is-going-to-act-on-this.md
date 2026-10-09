@@ -36,7 +36,9 @@ cannot go stale loudly.
 One derivation answers it: `ops.scheduled_actor` names the pass that will next touch an
 open order, and why it is eligible. The readers consume that one answer. An open order
 with no scheduled actor and no user-owed blocker becomes an attention item BY
-CONSTRUCTION — not because someone remembered to list its status.
+CONSTRUCTION — not because someone remembered to list its status. And the surfaces that
+print a status read that same verdict, so none of them keeps promising a review that
+nobody is going to run (section 8).
 
 ### What it must not do
 
@@ -535,7 +537,86 @@ This section does NOT re-rank `health.BLOCKERS`, does not touch
 `set(BLOCKED_SENTENCES) == {*health.BLOCKERS, health.CHILDREN}`, so the new line is its
 own thing and not a blocker sentence. The catalog rework is backlogged.
 
-## 8. Out of scope
+## 8. The surfaces stop asserting it too
+
+Needs sections 5 and 6. The last section, and the one the improvement order's own symptom
+line asks for.
+
+`io-df4fa1e3` records what the user actually saw for three orders stalled 2-8 days:
+
+> They appear only in the project listing with the label `validating — review round 1 of
+> 3`, which states that a round is in progress when the round had passed days earlier and
+> nothing was running.
+
+Sections 3-5 make such a row an attention item. They do NOT stop that label being printed.
+A row that is flagged AND labelled `review round 1 of 3` tells the reader two different
+things, and the label is the one on every listing.
+
+### One funnel, already built
+
+`invariants.status_label` (`src/jarvis/invariants.py:1711`) is where every surface gets its
+wording — its own docstring says so, and the callers confirm it: `jarvis wo list` and
+`jarvis status` (`cli.py:1741`, `cli.py:3533`, `cli.py:3578`), `ops.os_status`
+(`ops.py:703`), `ops.diagnose` (`ops.py:2380`), the feature child tree (`ops.py:9468`), the
+dashboard's work-order page (`ui/app.py:1560` into `work_order.html:56-61`), the project
+page, the stuck page, and `stuck.WHY`. So this section edits ONE function and every surface
+changes with it: no new page, no new widget, no second derivation — the feature applied to
+itself.
+
+The `validating` arm (`invariants.py:1726-1740`) is the liar, and it is FIRST in the
+function by deliberate design (the comment at `invariants.py:1722-1725` says why). When
+`ops.scheduled_actor` returns `None` for that row, the round-count label is a false promise
+and must not be printed. When it returns an `Actor`, today's label is correct and stays
+BYTE-IDENTICAL.
+
+### The pass name goes on the debug surface, never on the label
+
+`Actor.pass_name` is a Python symbol — `Daemon.retry_paused_turns`. It belongs where an
+operator is debugging, not in a listing a user skims. Two audiences, two strings:
+
+- **`status_label`** gets plain words for the no-actor case ONLY. It never prints
+  `pass_name` and never prints the word `scheduled_actor`.
+- **`ops.diagnose`** (`jarvis wo why`, and the dashboard's diagnosis panel through
+  `_debug_diagnosis.html`) gains ONE payload key carrying the verdict — `pass_name`, `why`
+  and `predicate` when there is an actor, `None` when there is not. `diagnose` is PURE
+  COMPOSITION by its own docstring (`ops.py:2349-2354`), and this is one more
+  already-derived answer composed into it, rewriting none of them.
+
+Rendered in that template's first panel beside `waiting on`, and printed by
+`cli._print_diagnosis` in the order the template asks the questions. The payload boundary
+at `ops.py:2360-2364` holds: a pass name and an OS-authored sentence are OS-authored text,
+not worker prose and not a gate's command.
+
+### `jarvis doctor` needs no new check, and saying so is the point
+
+`io-df4fa1e3` observes "no doctor invariant covers 'passed round but still validating'".
+Section 5 ALREADY answers it: with `BLOCKED_STATUSES` gone,
+`check_blocked_work_is_surfaced` selects `project_store.OPEN_STATUSES + ('failed',)`, so
+such a row is an INV-ATTENTION-MISSING violation and `ops.run_doctor` prints it. A second
+check asking the same question is the duplicate expression this feature exists to delete.
+This section adds NO member to `INVARIANTS` or `OS_INVARIANTS`. If the worker finds a
+`jarvis doctor` path section 5 does not in fact reach, that is a FINDING to record, not a
+check to write.
+
+### What must not change
+
+1. **No label change for a row that HAS an actor.** The pin parametrises `OPEN_STATUSES`
+   and asserts the label is byte-for-byte today's whenever `scheduled_actor` returns an
+   `Actor`. The existing label tests ARE that specification and none of them is edited:
+   `tests/test_budget.py:856-906`, `tests/test_fleet_cap.py:374-390`,
+   `tests/test_parked_retry.py:289-320`, `tests/test_base_heal.py:223-247`,
+   `tests/test_usage_window_is_account_wide.py:197-229`,
+   `tests/test_waiting_on_neo.py:522-532`, `tests/test_invariants.py:606-615`.
+2. **No new blocker string.** Section 5 added the one this feature gets. A label is not a
+   blocker, `ProjectStore.ack_attention` never stores one, and INV-ATTENTION-REASON never
+   re-derives one.
+3. **Section 2's cost budget still binds.** `status_label` runs once per row per listing, so
+   the actor read here is that same cheapest-first derivation and nothing more.
+4. **`validation_hold_note` and `fleet_hold_note` keep their place.** A held round and a
+   spent window are NAMED actors whose turn is delayed; those notes are correct and stay
+   exactly where they are.
+
+## 9. Out of scope
 
 Each of these is pushed out deliberately, not forgotten.
 
@@ -550,15 +631,18 @@ Each of these is pushed out deliberately, not forgotten.
 4. **Fleet-hold arithmetic** — `fleet.Fleet`, the post-reopen ramp, the `holds.held`
    overlap maths. Already correct, already exempted, and per section 2 it stays outside
    `scheduled_actor` entirely.
-5. **`jarvis doctor` / dashboard surfacing of the actor verdict** — `bl-1f2261d9`. New UI.
-   The finding asks for the attention flag, and section 5 delivers it.
+5. **A new dashboard page, column or sort for the verdict.** Section 8 changes the one
+   funnel every existing surface already renders, plus the one debug payload. It adds no
+   page, no column and no ordering. `bl-1f2261d9` asked for the surfacing and section 8
+   delivers it, so close that item against this feature rather than leaving it to ask
+   again.
 
 ## Agent profile
 
 You are a Jarvis OS engineer working on the OS's own attention derivation — the code that
 decides whether an open work order needs the user. You are working inside
 `src/jarvis/`: `ops.py`, `invariants.py`, `project_store.py`, `daemon.py`, `health.py`,
-`supervisor.py`.
+`supervisor.py`, `cli.py` and `ui/`.
 
 Your bias is derivation over declaration. When you find a decision expressed as a
 hand-maintained list of names, you treat the list as the bug and the derivation as the fix

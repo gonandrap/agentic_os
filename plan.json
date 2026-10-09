@@ -1,5 +1,5 @@
 {
-  "summary": "One derivation replaces three hand-maintained status allow-lists: ops.scheduled_actor names the daemon pass that will next touch an open work order and why it is eligible, both readers consume that single answer, and an open order with no actor and no user-owed blocker becomes an attention item by construction.",
+  "summary": "One derivation replaces three hand-maintained status allow-lists: ops.scheduled_actor names the daemon pass that will next touch an open work order and why it is eligible, both readers consume that single answer, an open order with no actor and no user-owed blocker becomes an attention item by construction, and the one status-label funnel every surface renders stops promising a review nobody is going to run.",
   "design_doc": "docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md",
   "children": [
     {
@@ -41,6 +41,14 @@
       "description": "Your files: `supervisor.py` (`build_evidence`'s work-order arm), `health.py` ONLY as far as exposing the actor verdict to it, and `tests/test_supervisor.py`. Do NOT re-rank `health.BLOCKERS`, do not touch `health_reassert_blockers`, do not widen `supervisor.BLOCKED_SENTENCES`, and do not change `true_blockers` or any blocker string: the `readers` child owns the blocker set. Done when the packet carries the named pass and why when an actor exists, emits NO line at all when there is none, and `health.blocker` is still pure.",
       "needs": ["actors", "readers"],
       "acceptance": "`build_evidence`'s work-order section carries ONE positive line naming the pass that will next touch the subject when `scheduled_actor` returns one, at a fixed index, and NO line at all when it returns None — never the string `scheduled_actor: none`. `health.blocker` stays pure: no network, no session file, no model, and its `true_blockers(..., now=db.now())` call keeps that clock. `uv run pytest tests/test_supervisor.py tests/test_health_sweep.py -q` green with `EXPECTED_WORK_ORDER_PACKET` updated once, here."
+    },
+    {
+      "key": "surface",
+      "title": "Every surface reads the verdict: the status label stops promising a review nobody will run",
+      "spec_section": "8",
+      "description": "Your files: `invariants.py` (`status_label`'s `validating` arm ONLY), `ops.py` (`diagnose`'s payload), `cli.py` (`_print_diagnosis`), `ui/templates/_debug_diagnosis.html` and their tests. Do NOT touch `parked_reason`, `true_blockers` or any blocker string — the `readers` child owns them — and do NOT add a member to `INVARIANTS` or `OS_INVARIANTS`: section 5 already puts a no-actor open order on `jarvis doctor`. `status_label` must NEVER print a pass name. Done when no existing label test needed editing.",
+      "needs": ["readers", "waiting_on"],
+      "acceptance": "`invariants.status_label`'s `validating` arm reads `ops.scheduled_actor` and prints the `review round N of M` label ONLY when an `Actor` exists; `ops.diagnose` gains ONE payload key carrying `pass_name`, `why` and `predicate`, None when there is no actor, rendered by `_debug_diagnosis.html` and printed by `cli._print_diagnosis`. `uv run pytest tests/test_invariants.py tests/test_budget.py tests/test_fleet_cap.py tests/test_parked_retry.py tests/test_base_heal.py tests/test_usage_window_is_account_wide.py tests/test_waiting_on_neo.py tests/test_wo_why.py tests/test_ui.py -q` green with NONE of those label assertions edited, plus a pin over OPEN_STATUSES that the label is byte-identical to today's whenever an actor exists, and a test that a round-less `validating` row's label does NOT contain `review round`."
     }
   ]
 }
