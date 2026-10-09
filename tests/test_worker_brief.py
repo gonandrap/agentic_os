@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis.catalog import ProjectSpec
+from jarvis.catalog import ProjectSpec, WorkerDefaults
 from jarvis.gates import GateConfig
 
 WO = {"id": "wo-brief01", "title": "Add exporter",
@@ -33,6 +33,11 @@ WO = {"id": "wo-brief01", "title": "Add exporter",
 SPEC = ProjectSpec(name="p1", path=Path("/tmp/p1"))
 GATED = ProjectSpec(name="p1", path=Path("/tmp/p1"),
                     gates=GateConfig(enabled=("release", "pr_merge")))
+# §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md — the deferral states, named.
+TS_ON = ProjectSpec(name="p1", path=Path("/tmp/p1"),
+                    worker=WorkerDefaults(tool_search="on"))
+TS_OFF = ProjectSpec(name="p1", path=Path("/tmp/p1"),
+                     worker=WorkerDefaults(tool_search="off"))
 
 SECTION_NAMES = ["contract", "gates", "record", "navigation", "concision",
                  "knowledge"]
@@ -81,7 +86,18 @@ def test_core_contract_is_under_the_budget():
         f"{worker_brief.CORE_BUDGET_CHARS} budget")
     # The whole bare prompt shrank: it measured 6032 chars before the split. 4500 until
     # the crew block (spec 2026-09-23-the-crew-a-worker-must-use.md SS6) bought its place.
-    assert len(p) < 5000, f"bare worker prompt is {len(p)} chars"
+    # Raised 5000 -> 5900 for the inlined navigation block (spec
+    # 2026-10-01-the-steer-that-beat-the-brief.md SS3): 4911 before, 5846 after. 935 of
+    # that, not the ~500 the spec estimated, because SELECT_LINE names BOTH tool prefixes
+    # in one select — 325 chars of tool names, and the probe that made one line correct is
+    # what bought back the retry sentence. The CORE budget above is untouched: this block
+    # is after the index, which is the whole reason it goes there.
+    # Raised 5900 -> 6400 for the markdown half of that block (spec
+    # 2026-10-06-navigate-specs-like-code.md SS6): 5846 before, 6347 after, +501 for
+    # `worker_brief._MARKDOWN_NAV`. It buys back one 5,187-token whole-spec read, which
+    # the same spec measured 199 of. CORE budget above untouched: 3862 either way, since
+    # the block is composed after the index and never inside the core.
+    assert len(p) < 6400, f"bare worker prompt is {len(p)} chars"
 
 
 def test_the_core_says_to_pass_a_reference_and_never_a_payload():
@@ -200,7 +216,7 @@ def test_contract_section_contains_everything_the_old_contract_had():
         "it is not an escalation",
         "does not interrupt the user",
         "one paragraph: the decision, the concrete options, your recommendation",
-        'section 3 of design doc "docs/specs/feature.md"',
+        'section 3 of design doc "docs/superpowers/specs/feature.md"',
         "characters are refused",
         "The trigger is DOUBT, not importance",
         "either would work",
@@ -259,8 +275,117 @@ def test_navigation_section_is_the_full_navigation_briefing():
     from jarvis import worker_brief
     text = worker_brief.render_section("navigation")
     for phrase in ("Serena first, grep second", "find_referencing_symbols",
-                   "If this project has Serena", "no Serena", "read_memory"):
+                   "DEFERRED", "read_memory"):
         assert phrase in text, f"lost from the navigation section: {phrase!r}"
+    # §3 item 3 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md:
+    # the symbol tools are DEFERRED behind `ToolSearch`, so "appear in your tool list"
+    # reads FALSE at the moment the worker reads it — a test it fails by design.
+    assert "appear in your tool list" not in text
+    assert "If this project has Serena" not in text
+
+
+# -- the inlined navigation block (spec 2026-10-01-the-steer-that-beat-the-brief.md §3) --
+
+#: The recovery call, asserted as a literal because it is the one call the block is
+#: allowed to cost and a typo in a tool name spends it for nothing. Both prefixes in one
+#: select: `mcp__serena__` from `claude mcp add serena`, `mcp__plugin_serena_serena__`
+#: from a plugin install, and an absent name is silently ignored — probed on 2.1.284,
+#: where a select naming both spellings of `find_symbol` on a plugin install returned
+#: only `mcp__plugin_serena_serena__find_symbol` and the rest of the select survived.
+SELECT_LINE = (
+    "select:mcp__serena__find_symbol,mcp__plugin_serena_serena__find_symbol,"
+    "mcp__serena__find_referencing_symbols,"
+    "mcp__plugin_serena_serena__find_referencing_symbols,"
+    "mcp__serena__get_symbols_overview,"
+    "mcp__plugin_serena_serena__get_symbols_overview,"
+    "mcp__serena__activate_project,mcp__plugin_serena_serena__activate_project")
+
+
+def test_the_navigation_block_is_inlined_after_the_section_index():
+    """Cause 3 of the defect: an ordinary lead is never told the posture at all — it gets
+    one index line pointing at `jarvis brief navigation`, and the measured fetch
+    behaviour is that it does not fetch. So the block is INLINE.
+
+    After the index, not inside `# Operating contract`: the core has 38 chars of headroom
+    against CORE_BUDGET_CHARS, and every sentence in it is A/B-graded as a unit by
+    evals/llm/test_worker_contract_ab.py (§3, rejected alternative 7)."""
+    p = _prompt()
+    assert SELECT_LINE in p, "the ToolSearch recovery call is not in the bare prompt"
+    assert p.index("# Full briefings on demand") < p.index(SELECT_LINE)
+
+
+def test_the_navigation_block_says_the_tools_are_deferred_not_absent():
+    """At the tool-search-ON state, which is the state the wording is TRUE in: with the
+    deferral off the tools carry full schemas and "DEFERRED" would be a falsehood (§4)."""
+    p = _prompt(TS_ON)
+    assert "DEFERRED" in p
+    assert "appear in your tool list" not in p
+
+
+def test_the_navigation_block_does_not_call_the_tools_deferred_when_tool_search_is_off():
+    """`worker.tool_search=off` puts the symbol tools in the tool list with full schemas,
+    so the deferral wording and the recovery call are a falsehood and a wasted call."""
+    p = _prompt(TS_OFF)
+    assert "DEFERRED" not in p
+    assert SELECT_LINE not in p
+    assert "ToolSearch" not in p
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+    assert "does NOT govern code navigation" in p
+
+
+@pytest.mark.parametrize("spec", [TS_ON, SPEC])
+def test_the_select_line_survives_for_the_tool_search_on_states(spec):
+    """`on` and `cli` both leave the tools deferred, so the recovery call must still be
+    there byte for byte — the off state is the only one that drops it (§4)."""
+    p = _prompt(spec)
+    assert SELECT_LINE in p
+    assert "DEFERRED" in p
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+
+
+def test_the_navigation_section_does_not_claim_deferral_when_tool_search_is_off():
+    """The fetched section is the same claim as the inline block, and `jarvis brief
+    navigation` is a separate process — it reads the state from `JARVIS_TOOL_SEARCH`."""
+    from jarvis import worker_brief
+
+    text = worker_brief.navigation_section(tool_search="off")
+    assert "DEFERRED" not in text
+    assert "ToolSearch" not in text
+    for call in ("find_symbol", "find_referencing_symbols", "get_symbols_overview",
+                 "activate_project"):
+        assert call in text, f"the navigation section never names {call}"
+
+
+def test_the_navigation_block_overrides_the_bash_first_steer():
+    """Belt and braces on §1: it survives a project setting `relaxed` or `cli`, and it
+    survives the per-session cohort draw if a future CLI re-introduces the steer under a
+    different name."""
+    assert "does NOT govern code navigation" in _prompt(TS_ON)
+
+
+def test_the_navigation_block_ranks_the_calls_by_what_grep_cannot_do():
+    p = _prompt(TS_ON)
+    for call in ("find_referencing_symbols", "get_symbols_overview", "find_symbol",
+                 "activate_project"):
+        assert call in p, f"the navigation block never names {call}"
+
+
+def test_the_navigation_block_is_absent_when_serena_is_deselected():
+    """`section_index` already swaps in NO_SERENA_HOOK and the fetched section already
+    carries the grep posture, so a block recommending a server this same dispatch removed
+    would be the incoherence `wiring.serena_wired` exists to prevent."""
+    from jarvis.catalog import WiringConfig
+    unwired = ProjectSpec(
+        name="p1", path=Path("/tmp/p1"),
+        wiring=WiringConfig(disabled_plugins=("serena@claude-plugins-official",)))
+    p = _prompt(unwired)
+    assert SELECT_LINE not in p
+    assert "mcp__serena__" not in p
+    assert "DEFERRED" not in p
 
 
 def test_gates_section_is_the_full_gate_briefing():
@@ -457,3 +582,114 @@ def test_template_version_bumped():
     from jarvis.bootstrap import TEMPLATE_VERSION
 
     assert TEMPLATE_VERSION >= 13
+
+
+# -- specs are navigated like code (spec 2026-10-06-navigate-specs-like-code.md §6) -----
+
+#: §4.3 of that spec FIXES these three strings; every seat quotes them verbatim, so this
+#: suite holds the canonical copy and a drift in any module goes red here.
+SPEC_COMMANDS = (
+    "jarvis spec toc <path>",
+    "jarvis spec section <path> <n|name>",
+    'jarvis spec search "<words>"',
+)
+
+
+def _child_prompt(spec: ProjectSpec = SPEC) -> str:
+    from jarvis.dispatch import build_worker_prompt
+    return build_worker_prompt(
+        WO, spec,
+        design_doc={"section": "3. Schema", "repo_path": "docs/superpowers/specs/exporter.md",
+                    "section_path": "/tmp/p1/.jarvis/features/fo-1/sections/wo-1.md",
+                    "path": "/tmp/p1/.jarvis/features/fo-1/exporter.md"})
+
+
+def _planner_prompt(spec: ProjectSpec = SPEC) -> str:
+    from jarvis import dispatch
+    return dispatch._planner_prompt({"id": "wo-plan01", "title": "An exporter",
+                                     "description": "Build it.",
+                                     "kind": "planner", "parent_id": "fo-1"}, spec)
+
+
+def test_the_markdown_posture_survives_serena_being_deselected():
+    """Markdown navigation needs no symbol index, so swallowing it inside the Serena
+    branch is the defect §6.1 asked to be decided and pinned."""
+    from jarvis import worker_brief
+
+    text = "\n".join(worker_brief.navigation_core(serena=False))
+
+    for command in SPEC_COMMANDS:
+        assert command in text, f"serena=False lost {command!r}"
+    assert SELECT_LINE not in text
+    assert "find_referencing_symbols" not in text, "the symbol half leaked"
+
+
+def test_the_navigation_section_carries_the_markdown_posture_in_both_branches():
+    from jarvis import worker_brief
+
+    for serena in (True, False):
+        text = worker_brief.navigation_section(serena=serena)
+        for command in SPEC_COMMANDS:
+            assert command in text, f"serena={serena} lost {command!r}"
+
+
+def test_the_three_spec_commands_are_byte_identical_in_every_seat():
+    """§4.3: `worker_brief`, `concision` and `dispatch` each hold their own literals
+    (`concision` may not import `worker_brief` — `worker_brief` imports `concision`), so
+    byte equality is a test, not an import."""
+    from jarvis import concision, worker_brief
+
+    seats = {
+        "worker_brief": "\n".join(worker_brief.navigation_core(serena=False)),
+        "concision": concision.subagent_context({}),
+        "dispatch (child)": _child_prompt(),
+        "dispatch (planner)": _planner_prompt(),
+    }
+    for seat, text in seats.items():
+        for command in SPEC_COMMANDS:
+            assert command in text, f"{seat} does not quote {command!r} verbatim"
+        assert "jarvis spec show" not in text, f"{seat} names a nonexistent command"
+
+
+def test_the_spec_commands_are_a_chain_a_worker_can_run_unprompted():
+    """Prose naming a command the preflight does not auto-allow stalls on a permission
+    prompt, which is the same as not shipping it."""
+    from jarvis import hooks
+
+    assert hooks.is_jarvis_command_chain("jarvis spec toc docs/superpowers/specs/x.md") is True
+
+
+def test_the_child_spec_block_points_at_commands_not_at_a_whole_file():
+    """The sentence that produced the measured 5,187-token read is gone; the snapshot
+    path stays, as a command argument."""
+    p = _child_prompt()
+
+    assert "The whole spec is at" not in p
+    assert "if the section is not enough" not in p
+    assert "/tmp/p1/.jarvis/features/fo-1/sections/wo-1.md" in p
+    assert "read it first" in p
+    assert "/tmp/p1/.jarvis/features/fo-1/exporter.md" in p
+    assert "planner's branch" in p
+    for command in SPEC_COMMANDS:
+        assert command in p
+
+
+def test_the_planner_is_told_to_navigate_specs_rather_than_read_them():
+    """The heaviest spec reader in the fleet, and so the cheapest place to win (§6)."""
+    p = _planner_prompt()
+
+    for command in SPEC_COMMANDS:
+        assert command in p
+
+
+def test_the_common_briefing_tail_reaches_the_posture_through_worker_brief():
+    """No duplicated prose in `_common_briefing`: it composes
+    `worker_brief.navigation_section`, so asserting the tail carries the posture also
+    pins that there is exactly one source for it."""
+    from jarvis import dispatch, worker_brief
+
+    tail = "\n".join(dispatch._common_briefing([], WO, SPEC))
+
+    assert worker_brief.navigation_section() in tail
+    for command in SPEC_COMMANDS:
+        assert command in tail

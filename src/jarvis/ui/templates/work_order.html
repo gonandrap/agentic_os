@@ -219,7 +219,7 @@
   {% endif %}
   {# The four readings this page does not carry: why it is not moving, what its turn is
      doing right now, where the time went and what was in the window (spec §7 of
-     docs/specs/2026-09-24-order-observability.md). Linked from here as well as from the
+     docs/superpowers/specs/2026-09-24-order-observability.md). Linked from here as well as from the
      bill, because a page reachable only from the bill is unreachable in practice. #}
   <p class="kv mono" style="margin-bottom:0;">
     <a href="/wo/{{ project }}/{{ wo.id }}/debug">why it is not moving, and where the
@@ -243,12 +243,15 @@
               >~${{ '%.2f'|format(cap.live_spent_usd) }}</span>
       {%- else %} ${{ '%.2f'|format(cap.spent_usd) }}
       {%- endif %} of ${{ '%.2f'|format(cap.cap_usd) }}
-      {%- if cap.cap_source == 'feature' %} (its feature's slice){% endif %}
+      {#- The NOUN comes from the parent's kind (`ops.family_prose`), never from
+          `cap_source`: 'feature' is the allocator's name for the family's cap, and
+          rendering it raw told an investigation's child about "its feature's slice". #}
+      {%- if cap.cap_source == 'feature' %} (its {{ cap.family or 'feature' }}'s slice){% endif %}
       {%- if cap.live_remaining_usd > 0 %} ·
         {%- if cap.in_flight_usd %} ~{% endif %}${{ '%.2f'|format(cap.live_remaining_usd) }} left
       {%- else %} · spent{% endif %}
       {% if cap.feature_unreserved_usd is not none %}
-        · its feature has ${{ '%.2f'|format(cap.feature_unreserved_usd) }} unreserved
+        · its {{ cap.family or 'feature' }} has ${{ '%.2f'|format(cap.feature_unreserved_usd) }} unreserved
       {% endif %}
     {% else %}
       <span class="sub">No budget — this order runs uncapped.</span>
@@ -271,7 +274,46 @@
    behind a tab is an ask that does not happen (§6 of the work-order-record spec).
    Nothing here decides anything — `ops.retry_state` says whether the control exists at
    all, `ops.retry_refusal` says why it is disabled in the words the CLI refuses with.
-   See docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b. #}
+   See docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b. #}
+{# WHAT THE OS SAVED when the last turn died without writing a result, immediately above
+   the button that relaunches it: the reader decides whether to retry knowing what is
+   already on disk. `ops.harvest_state` says whether there is a line at all.
+   See docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5. #}
+{% if harvest %}
+<h2 id="harvest">What the OS saved from the last turn</h2>
+<div class="panel">
+  <div class="row">
+    <div class="grow">
+      <p class="sub">That turn's process ended without writing a result, so the OS read
+        the worktree while it could still see it. Nobody reviewed any of this.</p>
+      <p>{{ harvest.line }}</p>
+      {% if harvest.checkpoint %}
+      <p class="sub">Checkpoint commit <code>{{ harvest.checkpoint }}</code> on
+        <code>{{ harvest.branch }}</code>, trailer
+        <code>Jarvis-Checkpoint: {{ wo.id }}/{{ harvest.seq }}</code> — local only, never
+        pushed. Amend, reset or rewrite it freely.</p>
+      {% elif harvest.checkpoint_skipped %}
+      <p class="sub">◌ No checkpoint commit: {{ harvest.checkpoint_skipped }}</p>
+      {% endif %}
+      {% if harvest.said %}
+      <p class="sub">It last said: “{{ harvest.said }}”</p>
+      {% endif %}
+      {% if harvest.unpushed %}
+      <p class="sub">{{ harvest.unpushed }}
+        commit{{ '' if harvest.unpushed == 1 else 's' }} not pushed to
+        <code>{{ harvest.upstream }}</code>.</p>
+      {% endif %}
+      {% if harvest.pr_url %}
+      <p class="sub">Pull request: <a href="{{ harvest.pr_url }}">{{ harvest.pr_url }}</a></p>
+      {% endif %}
+      {% if harvest.unreadable %}
+      <p class="sub">◌ The worktree could not be read: {{ harvest.unreadable }}</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {% if retry %}
 <h2 id="retry">Retry this work order</h2>
 <div class="panel">
@@ -492,8 +534,11 @@
        of the reader lives above the tabs (spec §7). #}
     <button role="tab" data-panel="tab-states" aria-selected="false"
             aria-controls="tab-states">Time in state
+      {# ACTIVE, falling back to wall: a badge reading 5.4h on an order that was let work
+         45m is the headline complaint of issue 887 (spec §3). #}
       {%- if states.current_status_age_human %}
-      <span class="n">{{ states.current_status_age_human }}</span>{% endif %}</button>
+      <span class="n">{{ states.current_status_active_age_human
+                         or states.current_status_age_human }}</span>{% endif %}</button>
   </div>
 
 <section class="tabpanel on" id="tab-conversation" role="tabpanel">

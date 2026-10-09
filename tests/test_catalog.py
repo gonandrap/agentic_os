@@ -114,8 +114,136 @@ def test_absent_and_null_are_different():
     assert cat.projects[1].worker.autocompact_window is None
 
 
+def test_tool_search_defaults_and_overrides_per_project():
+    """§4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: a three-state string enum,
+    fleet-wide with a per-project override. The default PINS DEFERRAL ON — deferral is
+    what makes a worker's first navigation call a symbol call (7/7 deferred against 1/10
+    with the tools present, wo-ab5d81db), so `cli` would leave that outcome to a vendor
+    default and `off` is a measured regression on it."""
+    from jarvis.catalog import DEFAULT_WORKER_TOOL_SEARCH, VALID_TOOL_SEARCH
+
+    assert DEFAULT_WORKER_TOOL_SEARCH == "on"
+    assert VALID_TOOL_SEARCH == ("off", "on", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_tool_search == "on"
+    assert cat.projects[0].worker.tool_search == "on"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"tool_search": "off"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"tool_search": "on"}},
+        ],
+    })
+    assert cat.os.default_tool_search == "off"
+    assert cat.projects[0].worker.tool_search == "off"      # inherits the fleet value
+    assert cat.projects[1].worker.tool_search == "on"
+
+
+def test_an_invalid_tool_search_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
+    re-parses the document to validate (spec §4)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"tool_search": "true"}}]})
+    assert "worker.tool_search" in str(e.value)
+    for value in ("off", "on", "cli"):
+        assert value in str(e.value)
+
+
+def test_py_nav_hook_defaults_off_and_overrides_per_project():
+    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: TWO states, not three —
+    `cli` exists only where Jarvis defers to a vendor behaviour, and this hook is
+    entirely Jarvis's own. Default OFF: the hook measures ZERO contribution to first-call
+    order, and on fleet-wide a worker cannot search the tree for ANY text (issue 936);
+    wo-d2d777dc owns that fix and the flip is sequenced behind it (wo-ab5d81db)."""
+    from jarvis.catalog import DEFAULT_WORKER_PY_NAV_HOOK, VALID_PY_NAV_HOOK
+
+    assert DEFAULT_WORKER_PY_NAV_HOOK == "off"
+    assert VALID_PY_NAV_HOOK == ("off", "on")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_py_nav_hook == "off"
+    assert cat.projects[0].worker.py_nav_hook == "off"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"py_nav_hook": "on"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"py_nav_hook": "off"}},
+        ],
+    })
+    assert cat.os.default_py_nav_hook == "on"
+    assert cat.projects[0].worker.py_nav_hook == "on"       # inherits the fleet value
+    assert cat.projects[1].worker.py_nav_hook == "off"
+
+
+def test_an_invalid_py_nav_hook_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows (spec §6)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"py_nav_hook": "true"}}]})
+    assert "worker.py_nav_hook" in str(e.value)
+    for value in ("off", "on"):
+        assert value in str(e.value)
+
+
+def test_bash_first_defaults_off_and_overrides_per_project():
+    """§1 of docs/superpowers/specs/2026-10-01-the-steer-that-beat-the-brief.md: a string
+    enum, fleet-wide with a per-project override, and the DEFAULT DISABLES — `relaxed` is
+    a softer copy of the instruction that already beat the brief at a measured 0% hit
+    rate."""
+    from jarvis.catalog import DEFAULT_WORKER_BASH_FIRST, VALID_BASH_FIRST
+
+    assert DEFAULT_WORKER_BASH_FIRST == "off"
+    assert VALID_BASH_FIRST == ("off", "relaxed", "strict", "cli")
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.default_bash_first == "off"
+    assert cat.projects[0].worker.bash_first == "off"
+
+    cat = parse_catalog({
+        "os": {"defaults": {"bash_first": "relaxed"}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b", "worker": {"bash_first": "cli"}},
+        ],
+    })
+    assert cat.os.default_bash_first == "relaxed"
+    assert cat.projects[0].worker.bash_first == "relaxed"   # inherits the fleet value
+    assert cat.projects[1].worker.bash_first == "cli"
+
+
+@pytest.mark.parametrize("value", ["off", "relaxed", "strict", "cli"])
+def test_every_bash_first_value_parses(value):
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                       "worker": {"bash_first": value}}]})
+    assert cat.projects[0].worker.bash_first == value
+
+
+def test_an_invalid_bash_first_names_the_key_and_the_valid_values():
+    """The enum check IS the error message `jarvis config set` shows: `ops.set_config`
+    re-parses the document to validate (spec §1)."""
+    with pytest.raises(CatalogError) as e:
+        parse_catalog({"projects": [{"name": "a", "path": "/x",
+                                     "worker": {"bash_first": "true"}}]})
+    assert "worker.bash_first" in str(e.value)
+    for value in ("off", "relaxed", "strict", "cli"):
+        assert value in str(e.value)
+
+
 @pytest.mark.parametrize("bad,msg", [
     ({"projects": "nope"}, "projects"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"bash_first": "yes"}}]},
+     "bash_first"),
+    ({"os": {"defaults": {"bash_first": "on"}}}, "os.defaults.bash_first"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"tool_search": "yes"}}]},
+     "tool_search"),
+    ({"os": {"defaults": {"tool_search": "relaxed"}}}, "os.defaults.tool_search"),
+    ({"projects": [{"name": "a", "path": "/x", "worker": {"py_nav_hook": "cli"}}]},
+     "py_nav_hook"),
+    ({"os": {"defaults": {"py_nav_hook": "yes"}}}, "os.defaults.py_nav_hook"),
     ({"projects": [{"path": "/x"}]}, "name"),
     ({"projects": [{"name": "a"}]}, "path"),
     ({"projects": [{"name": "a", "path": "/x"}, {"name": "a", "path": "/y"}]}, "duplicate"),
@@ -513,7 +641,7 @@ def test_worker_require_crew_parsed():
 
 # -- observability: what debug data is COLLECTED ----------------------------------------
 #
-# §10 of docs/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
+# §10 of docs/superpowers/specs/2026-09-24-order-observability.md. `off` gates exactly one write,
 # §5's per-turn ingredient row, and no read.
 
 
@@ -600,3 +728,342 @@ def test_sweep_dark_minutes_is_refused_on_a_project():
     assert cat.projects[0].fleet_health.sweep_dark_minutes == 20
     assert jarvis.catalog.FleetHealthConfig().sweep_dark_minutes == \
         jarvis.catalog.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+
+
+# -- the backstop ceiling on an OS-side prompt (spec §4,
+# docs/superpowers/specs/2026-09-26-bounded-model-inputs.md) -------------------------
+
+
+def test_the_os_prompt_ceiling_defaults_to_the_measured_number():
+    """400,000 is a MEASURED default: the worst legitimate OS call is 285,929 chars."""
+    from jarvis.catalog import DEFAULT_MAX_OS_PROMPT_CHARS
+
+    assert DEFAULT_MAX_OS_PROMPT_CHARS == 400_000
+    assert parse_catalog({"projects": []}).os.max_os_prompt_chars == 400_000
+    assert parse_catalog({"os": {"max_os_prompt_chars": 500_000},
+                          "projects": []}).os.max_os_prompt_chars == 500_000
+
+
+def test_a_ceiling_below_the_floor_is_refused_at_boot():
+    """Below the floor the ceiling silently disables validation, which is worse than
+    the bug it fixes — so it fails where it was typed."""
+    from jarvis.catalog import MAX_OS_PROMPT_CHARS_MIN
+
+    assert MAX_OS_PROMPT_CHARS_MIN == 300_000
+    with pytest.raises(CatalogError) as caught:
+        parse_catalog({"os": {"max_os_prompt_chars": 150_000}, "projects": []})
+    msg = str(caught.value).replace(",", "")
+    assert "150000" in msg
+    assert str(MAX_OS_PROMPT_CHARS_MIN) in msg
+    assert "validation" in msg
+    for bad in ("400000", True, 0, -1, MAX_OS_PROMPT_CHARS_MIN - 1):
+        with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+            parse_catalog({"os": {"max_os_prompt_chars": bad}, "projects": []})
+
+
+def test_the_knowledge_hint_bounds_round_trip():
+    """Spec test 15 of 2026-10-02-learn-search-returns-an-index.md — a pointer, not a
+    second index, so the defaults are deliberately small and separate from the digest."""
+    from jarvis.catalog import OsConfig
+
+    assert (OsConfig().knowledge_hint_limit, OsConfig().knowledge_hint_chars) == (3, 400)
+    cat = parse_catalog({"os": {"knowledge_hint_limit": 5, "knowledge_hint_chars": 900},
+                         "projects": []})
+    assert (cat.os.knowledge_hint_limit, cat.os.knowledge_hint_chars) == (5, 900)
+    # and the digest budget is untouched by either
+    assert cat.os.knowledge_digest_chars == 4000
+
+
+def test_the_ceiling_has_no_off_switch():
+    """A backstop with an off switch is not a backstop: null is refused, not honoured."""
+    with pytest.raises(CatalogError, match="max_os_prompt_chars"):
+        parse_catalog({"os": {"max_os_prompt_chars": None}, "projects": []})
+
+
+def test_loading_a_catalog_arms_the_transport_ceiling(tmp_path):
+    """The seam Neo ruled on (q1077): one override at startup, not a parameter plumbed
+    through twenty call sites."""
+    from jarvis import claude_cli
+
+    before = claude_cli.MAX_OS_PROMPT_CHARS
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps({"os": {"max_os_prompt_chars": 450_000}, "projects": []}))
+    try:
+        load_catalog(f)
+        assert claude_cli.MAX_OS_PROMPT_CHARS == 450_000
+    finally:
+        claude_cli.set_max_os_prompt_chars(before)
+
+
+def test_the_blocker_set_is_the_catalogs_to_narrow(tmp_path):
+    """`supervisor.health_reassert_blockers` is a CATALOG SETTING and never a module
+    constant (kn-1cec46b5, Neo q1217). An unknown id is refused with the known ones
+    named — `_parse_remedies`' rule — and a project overrides the list field by field
+    while the rest of `os.supervisor` is inherited.
+
+    It also pins the `_SUPERVISOR_NON_NUMERIC` trap: a field missing from that set is a
+    `TypeError` on every catalog load, which this test is the first to see.
+    """
+    from jarvis import health
+
+    with pytest.raises(CatalogError, match=", ".join(health.BLOCKERS)):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": ["the-weather"]}}, "projects": []})
+    with pytest.raises(CatalogError, match="list of blocker ids"):
+        parse_catalog({"os": {"supervisor": {
+            "health_reassert_blockers": "dependency"}}, "projects": []})
+
+    cat = parse_catalog({"os": {"supervisor": {"health_stale_minutes": 90,
+                                              "health_reassert_blockers": ["user"]}},
+                         "projects": [{"name": "p", "path": str(tmp_path)},
+                                      {"name": "q", "path": str(tmp_path),
+                                       "supervisor": {"health_reassert_blockers":
+                                                      ["dependency"]}}]})
+    assert cat.os.supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[0].supervisor.health_reassert_blockers == ("user",)
+    assert cat.projects[1].supervisor.health_reassert_blockers == ("dependency",)
+    assert cat.projects[1].supervisor.health_stale_minutes == 90, (
+        "a project naming the blockers keeps the fleet's answer for everything else")
+
+
+def test_the_sweep_cadence_defaults_do_not_move(tmp_path):
+    """The free re-assertion buys quiet by SPENDING less, never by watching less — the
+    spec's "out of scope" list, and the alternative it rejected."""
+    cfg = parse_catalog({"os": {}, "projects": []}).os.supervisor
+    assert (cfg.health_every_ticks, cfg.health_min_interval_minutes,
+            cfg.health_stale_minutes, cfg.health_max_units_per_tick) == (20, 30, 720, 4)
+
+
+# -- navigation: the classifier's patterns are DATA, never module constants -------------
+#
+# q1216's condition, §2.3 of
+# docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
+# re-measuring under a different definition of "navigation" must not need a release.
+
+
+def test_navigation_ships_the_measured_defaults_fleet_wide_and_per_project():
+    from jarvis.catalog import (
+        DEFAULT_NAVIGATION_BASH_COMMANDS,
+        DEFAULT_NAVIGATION_CODE_SUFFIXES,
+        DEFAULT_NAVIGATION_SYMBOL_TOOLS,
+        DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS,
+        DEFAULT_NAVIGATION_WINDOW_DAYS,
+    )
+
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+
+    assert DEFAULT_NAVIGATION_BASH_COMMANDS == ("cat", "head", "sed", "grep", "rg",
+                                                "find")
+    assert DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS == ("Grep", "Glob")
+    assert DEFAULT_NAVIGATION_CODE_SUFFIXES == (".py",)
+    assert DEFAULT_NAVIGATION_WINDOW_DAYS == 7
+    # text search with a Serena name is NOT a symbol call (kn-a397fb52)
+    assert "search_for_pattern" not in DEFAULT_NAVIGATION_SYMBOL_TOOLS
+    assert cat.os.navigation.bash_commands == DEFAULT_NAVIGATION_BASH_COMMANDS
+    assert cat.projects[0].navigation.symbol_tools == DEFAULT_NAVIGATION_SYMBOL_TOOLS
+    assert cat.projects[0].navigation.enabled is True
+
+
+def test_a_project_naming_one_navigation_key_inherits_the_rest():
+    """`_parse_inspect`'s field-level inheritance: the project object is the ANSWER, so
+    no caller consults two objects."""
+    cat = parse_catalog({
+        "os": {"navigation": {"window_days": 30}},
+        "projects": [
+            {"name": "a", "path": "/tmp/a"},
+            {"name": "b", "path": "/tmp/b",
+             "navigation": {"bash_commands": ["cat", "rg"]}},
+        ],
+    })
+
+    assert cat.os.navigation.window_days == 30
+    assert cat.projects[0].navigation.window_days == 30
+    assert cat.projects[1].navigation.window_days == 30
+    assert cat.projects[1].navigation.bash_commands == ("cat", "rg")
+    assert cat.projects[1].navigation.code_suffixes == (".py",)
+
+
+def test_an_empty_navigation_pattern_list_is_refused_naming_the_key():
+    """An empty classifier reports 0% everywhere and looks like a win."""
+    with pytest.raises(CatalogError, match="navigation.bash_commands"):
+        parse_catalog({"os": {"navigation": {"bash_commands": []}}, "projects": []})
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).navigation"):
+        parse_catalog({"projects": [
+            {"name": "a", "path": "/tmp/a", "navigation": {"symbol_tools": []}}]})
+
+
+def test_a_navigation_pattern_list_that_is_not_strings_is_refused():
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"navigation": {"bash_commands": "cat"}}, "projects": []})
+    with pytest.raises(CatalogError, match="must be a list of strings"):
+        parse_catalog({"os": {"navigation": {"text_search_tools": [1, 2]}},
+                       "projects": []})
+    with pytest.raises(CatalogError, match="must be an object"):
+        parse_catalog({"os": {"navigation": "on"}, "projects": []})
+
+
+def test_a_suffix_without_a_leading_dot_and_a_zero_window_are_refused():
+    with pytest.raises(CatalogError, match="code_suffixes"):
+        parse_catalog({"os": {"navigation": {"code_suffixes": ["py"]}},
+                       "projects": []})
+    with pytest.raises(CatalogError, match="window_days"):
+        parse_catalog({"os": {"navigation": {"window_days": 0}}, "projects": []})
+
+
+# -- `os.cost`: the fleet distribution's tunables ---------------------------------------
+#
+# §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md. Neo's rider: no
+# module constant for anything tunable, so the usage-week reset and the percentile are
+# catalog settings, resolvable fleet-wide AND per project.
+
+
+def test_cost_defaults_ship_on_both_config_objects(tmp_path):
+    cat = parse_catalog({"projects": [{"name": "a", "path": str(tmp_path)}]})
+    for cfg in (cat.os.cost, cat.projects[0].cost):
+        assert cfg.week_reset_weekday == 0            # Monday
+        assert cfg.week_reset_hour == 21
+        assert cfg.week_reset_zone == "America/Los_Angeles"
+        assert cfg.percentile == 0.9
+        assert cfg.max_orders == 500
+        # §10.10 of the per-tool addendum: the `chars` estimator's divisor and the row
+        # cap of the tool table, both catalog settings for the same stated reason.
+        assert cfg.chars_per_token == 4.0
+        assert cfg.tool_rows == 20
+        # §7 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: the 5h grid's
+        # length is a belief about the usage grid, so it is a setting and not a constant.
+        assert cfg.session_window_hours == 5.0
+
+
+def test_a_non_positive_session_window_hours_is_refused():
+    """A fractional length is a legal belief about the grid; zero is not a length."""
+    for bad in (0, -1, -2.5):
+        with pytest.raises(CatalogError, match="session_window_hours must be > 0"):
+            parse_catalog({"os": {"cost": {"session_window_hours": bad}},
+                           "projects": []})
+    assert parse_catalog({"os": {"cost": {"session_window_hours": 2.5}},
+                          "projects": []}).os.cost.session_window_hours == 2.5
+
+
+def test_a_non_positive_chars_per_token_is_refused():
+    """Zero or less is not a divisor, and a negative one would report negative tokens."""
+    for bad in (0, -1, -0.5):
+        with pytest.raises(CatalogError, match="chars_per_token"):
+            parse_catalog({"os": {"cost": {"chars_per_token": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"chars_per_token": 3.5}},
+                          "projects": []}).os.cost.chars_per_token == 3.5
+
+
+def test_a_cost_tool_rows_below_one_is_refused():
+    """Zero rows is a table with a truncation line and nothing above it."""
+    for bad in (0, -5):
+        with pytest.raises(CatalogError, match="tool_rows"):
+            parse_catalog({"os": {"cost": {"tool_rows": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"tool_rows": 1}},
+                          "projects": []}).os.cost.tool_rows == 1
+
+
+def test_a_project_overrides_one_cost_key_and_inherits_the_rest(tmp_path):
+    """Field-level inheritance, `_parse_inspect`'s shape (kn-6ca2bcd9): the project
+    object is the ANSWER, so no caller consults two objects."""
+    from jarvis import config_version
+
+    cat = parse_catalog({
+        "os": {"cost": {"percentile": 0.95, "max_orders": 50}},
+        "projects": [
+            {"name": "a", "path": str(tmp_path)},
+            {"name": "b", "path": str(tmp_path), "cost": {"percentile": 0.5}},
+        ],
+    })
+    assert cat.os.cost.percentile == 0.95
+    assert cat.projects[0].cost.percentile == 0.95          # inherited from os
+    assert cat.projects[1].cost.percentile == 0.5           # its own
+    assert cat.projects[1].cost.max_orders == 50            # inherited from os
+    assert cat.projects[1].cost.week_reset_hour == 21       # inherited from the default
+    resolved = config_version.resolve(cat)
+    assert resolved["os.cost.percentile"] == 0.95
+    assert resolved["projects.b.cost.percentile"] == 0.5
+    assert resolved["os.cost.week_reset_zone"] == "America/Los_Angeles"
+
+
+def test_midnight_is_a_legal_cost_week_reset_hour():
+    """Zero is legal here: `_parse_inspect`'s ">= 1" rule would reject midnight, and
+    an hour is not a count."""
+    cat = parse_catalog({"os": {"cost": {"week_reset_hour": 0,
+                                         "week_reset_weekday": 0}}, "projects": []})
+    assert cat.os.cost.week_reset_hour == 0
+    assert cat.os.cost.week_reset_weekday == 0
+
+
+def test_an_out_of_range_cost_reset_day_or_hour_is_refused_naming_the_key():
+    for bad in (-1, 7, 99):
+        with pytest.raises(CatalogError, match="week_reset_weekday"):
+            parse_catalog({"os": {"cost": {"week_reset_weekday": bad}}, "projects": []})
+    for bad in (-1, 24, 100):
+        with pytest.raises(CatalogError, match="week_reset_hour"):
+            parse_catalog({"os": {"cost": {"week_reset_hour": bad}}, "projects": []})
+
+
+def test_a_cost_percentile_outside_the_open_interval_is_refused():
+    """Both ends exclusive: 0 names no value and 1 is the max, which `max` already is."""
+    for bad in (0, 1, -0.5, 1.5):
+        with pytest.raises(CatalogError, match="percentile"):
+            parse_catalog({"os": {"cost": {"percentile": bad}}, "projects": []})
+    assert parse_catalog({"os": {"cost": {"percentile": 0.99}},
+                          "projects": []}).os.cost.percentile == 0.99
+
+
+def test_a_cost_max_orders_below_one_is_refused():
+    for bad in (0, -5):
+        with pytest.raises(CatalogError, match="max_orders"):
+            parse_catalog({"os": {"cost": {"max_orders": bad}}, "projects": []})
+
+
+def test_an_unknown_cost_time_zone_is_refused_naming_the_bad_value(tmp_path):
+    """A zone that no `ZoneInfo` can construct makes every window wrong, so it fails
+    where it was typed."""
+    with pytest.raises(CatalogError) as caught:
+        parse_catalog({"os": {"cost": {"week_reset_zone": "Mars/Olympus"}},
+                       "projects": []})
+    assert "Mars/Olympus" in str(caught.value)
+    assert "week_reset_zone" in str(caught.value)
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\).cost"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "cost": {"week_reset_zone": "Nowhere/At_All"}}]})
+    with pytest.raises(CatalogError, match="must be an object"):
+        parse_catalog({"os": {"cost": "weekly"}, "projects": []})
+
+
+def test_cost_paths_have_an_explicit_apply_class():
+    """ops.APPLY_RULES decides it rather than falling through (spec §6.2)."""
+    from jarvis import ops
+
+    assert any(glob == "*.cost.*" for glob, _ in ops.APPLY_RULES)
+    assert ops.apply_class("os.cost.percentile") == "hot"
+    assert ops.apply_class("projects.a.cost.week_reset_hour") == "hot"
+
+
+def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide():
+    """§4 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md:
+    how long the reconciler waits for a merged child's commit to appear on the default
+    branch is a per-project habit, so it is a catalog key with this block's ordinary
+    field-level fallback rather than a module constant."""
+    assert (parse_catalog({"projects": []}).os.validation.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    inherits, own = projects_validation(
+        {"feature_merge_wait_minutes": 30}, {},
+        {"validation": {"feature_merge_wait_minutes": 5}})
+    assert inherits.feature_merge_wait_minutes == 30
+    assert own.feature_merge_wait_minutes == 5
+
+    [silent] = projects_validation(None, {})
+    assert (silent.feature_merge_wait_minutes
+            == jarvis.catalog.DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES)
+
+    # 0 is legal and means "never defer": check once, flag immediately.
+    assert validation_of(
+        {"feature_merge_wait_minutes": 0}).feature_merge_wait_minutes == 0
+    with pytest.raises(CatalogError,
+                       match="os.validation.feature_merge_wait_minutes must be >= 0"):
+        validation_of({"feature_merge_wait_minutes": -1})

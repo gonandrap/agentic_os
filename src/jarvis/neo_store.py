@@ -94,6 +94,55 @@ SUPERVISOR_SEAT = "supervisor"
 # widens against this; every roster validator stays on `SEATS`.
 LEARNING_SCOPES = SEATS + (SUPERVISOR_SEAT,)
 
+# WHY an escalation happened, as one groupable label — §1 of
+# docs/superpowers/specs/2026-10-01-neo-observability.md. Here, beside the vocabularies above, for
+# `SEATS`' reason exactly: the personas, the CLI and the report all need it and none
+# should have to depend on another.
+#
+# THREE TUPLES, because "who decided" has THREE answers (Neo's ruling on question 1170)
+# and one tuple invites a report that adds them up. CHOSEN is a label the model picked,
+# and every member is tied to the persona text that asks for it (no member exists that no
+# persona mentions).
+ESCALATION_CAUSES_CHOSEN = (
+    "high-stakes",
+    "no-learning-applies",
+    "conflicting-authority",
+    "ambiguous-intent",
+    "scope-too-large",
+    "privileged-action",
+    "evidence-insufficient",
+    "user-decision",
+)
+# OVERRIDDEN is the third answer and the largest escalation population: NEO ANSWERED AND
+# THE OS DID NOT TAKE THE ANSWER. Every member is derived mechanically by
+# `autoreview.escalation_cause` from facts the code holds — a stakes word, a denial with
+# no machine rejection behind it, a child count — and NONE is ever read off a reply or
+# matched out of prose. The four daemon sites that re-mark a question `escalated` after
+# Neo answered write these, and `kind='assumption'` is the kind they cover.
+ESCALATION_CAUSES_OVERRIDDEN = (
+    "stakes-high",            # Neo accepted and flagged it high; the OS obeyed
+    "stakes-unclassified",    # no readable stakes, and silence is not routine
+    "stakes-unreadable",      # a stakes word the OS cannot read as routine
+    "neo-denied",             # `verdict: deny`, and there is no machine rejection
+    "scope-over-cap",         # children at or over `plans.CHILD_CAP`
+)
+# FAILED is derived by the OS at the code path too, and the distinction from OVERRIDDEN
+# is that NEO NEVER ANSWERED AT ALL.
+#
+# `classifier-unreachable` / `classifier-unparseable` were REMOVED: `stakes`'
+# `HIGH_UNREACHABLE` / `HIGH_UNPARSEABLE` reach `autoreview.HELD_HIGH_STAKES`, which
+# holds the review before any question row exists, so nothing could ever write them. A
+# class nothing can write is better documented as invisible than left in the enum (Neo,
+# question 1170) — the report names it, through `ops.NEO_ESCALATION_INVISIBLE_NOTE`.
+ESCALATION_CAUSES_FAILED = (
+    "transport-unreachable",
+    "attempts-exhausted",
+    "prompt-refused",
+    "unparseable-reply",
+)
+ESCALATION_CAUSES = (ESCALATION_CAUSES_CHOSEN + ESCALATION_CAUSES_OVERRIDDEN
+                     + ESCALATION_CAUSES_FAILED)
+
 # How one seat's contribution ended. A seat that errors or times out is recorded as
 # `abstained` and the panel proceeds; `failed` is for a call that came back unusable.
 OPINION_STATUSES = ("ok", "abstained", "failed")
@@ -118,6 +167,29 @@ MAX_ANSWER_ATTEMPTS = 3
 #: reached" from "Neo was reached and could not settle it" wherever only the reason is to
 #: hand. Spec docs/superpowers/specs/2026-09-18-a-failure-is-not-an-answer.md §2.
 UNREACHABLE_PREFIX = "neo could not be reached: "
+
+
+class QuestionTooLargeError(ValueError):
+    """`ask` refused to persist a question past the ceiling. Spec §4:
+    docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+
+    A `ValueError` subclass so every existing handler still catches it, NAMED so the
+    `jarvis wo ask` path can render it as one loud line: a worker told the size, the
+    ceiling and the setting can shorten and retry, and a traceback tells it nothing.
+
+    The sizes ride as `question_chars` / `context_chars` / `ceiling` and NOT as `limit`,
+    `claude_cli.PromptTooLargeError`'s rule: `seats._run_seat` does
+    `refused=getattr(e, "limit", None)` and an int there poisons a `UsageLimit`.
+    `Daemon.prompt_refusal_payload` renders both refusals from these.
+    """
+
+    def __init__(self, message: str, *, question_chars: int, context_chars: int,
+                 ceiling: int) -> None:
+        super().__init__(message)
+        self.question_chars = question_chars
+        self.context_chars = context_chars
+        self.ceiling = ceiling
+
 
 #: How long a question held back by a transport failure waits before it may be claimed
 #: again, indexed by how many attempts it has already spent.
@@ -148,6 +220,9 @@ CREATE TABLE IF NOT EXISTS questions (
     answer TEXT,
     answered_by TEXT,                        -- neo | user
     answer_reason TEXT,                      -- Neo's stated reasoning / escalation reason
+    -- ESCALATION_CAUSES, or NULL for "not recorded". Also in ADDED_COLUMNS, where the
+    -- reasoning for the nullability is.
+    escalation_cause TEXT,
     answered_at REAL,
     review_status TEXT NOT NULL DEFAULT 'unreviewed',
     review_feedback TEXT,
@@ -203,6 +278,11 @@ ADDED_COLUMNS = {
         # predates this feature is, and what the daemon looks for. It is a DISPLAY
         # artefact: nothing that reaches Neo, a worker or a learning is built from it.
         "digest": "TEXT",
+        # Why this escalation happened — §1 of docs/superpowers/specs/2026-10-01-neo-observability.md.
+        # NULLABLE, and NOT `NOT NULL DEFAULT ''` like its siblings above: this column is
+        # read by a GROUP BY, where an empty-string bucket beside the real causes reads as
+        # one more cause. NULL on every pre-existing row and never backfilled from prose.
+        "escalation_cause": "TEXT",
     },
     "learnings": {
         "seat": "TEXT NOT NULL DEFAULT ''",
@@ -240,6 +320,25 @@ class NeoStore:
     def ask(self, project: str, wo_id: str, question: str, context: str = "",
             kind: str = "question") -> dict[str, Any]:
         assert kind in Q_KINDS, kind
+        # REFUSE, never trim, and never persist: a question is stored before it is ever
+        # sent, so the store is the last place that can refuse one, and a trimmed
+        # question would be answered as if it were the question asked (Neo, q1078,
+        # option A). The SAME ceiling as the transport's rather than a second setting:
+        # it is a backstop, not the binding limit, and one number cannot fall out of
+        # step with itself. Spec §4:
+        # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+        from . import claude_cli
+
+        size = len(question) + len(context)
+        ceiling = claude_cli.MAX_OS_PROMPT_CHARS
+        if size > ceiling:
+            # Numbers only — no fragment of the question: this reaches the inbox.
+            raise QuestionTooLargeError(
+                f"refused to store a {kind}: question + context is {size} chars, over "
+                f"the {ceiling}-char ceiling (os.max_os_prompt_chars) — shorten it and "
+                f"ask again, referencing what you would have pasted",
+                question_chars=len(question), context_chars=len(context),
+                ceiling=ceiling)
         cur = self.conn.execute(
             "INSERT INTO questions (ts, project, wo_id, question, context, kind) "
             "VALUES (?,?,?,?,?,?)",
@@ -315,6 +414,7 @@ class NeoStore:
             for r in self.conn.execute(
                 """UPDATE questions
                       SET status='failed',
+                          escalation_cause='attempts-exhausted',
                           answer_reason='neo could not be reached: stranded in '
                                         || 'answering after ' || attempts
                                         || ' reclaim attempt(s) — nobody has judged this'
@@ -387,11 +487,15 @@ class NeoStore:
         attempts = int(q["attempts"] or 0)
         reason = f"{UNREACHABLE_PREFIX}{detail}"
         if attempts >= max_attempts:
+            # `max_attempts=0` is the REFUSAL contract: the only callers that pass it are
+            # the prompt/input ceiling clauses, where no call was ever made. §1 of
+            # docs/superpowers/specs/2026-10-01-neo-observability.md.
+            cause = "prompt-refused" if max_attempts == 0 else "transport-unreachable"
             self.conn.execute(
-                "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=? "
-                "WHERE id=?",
+                "UPDATE questions SET status='failed', claimed_at=NULL, answer_reason=?, "
+                "escalation_cause=? WHERE id=?",
                 (f"{reason} (after {attempts} retries — nobody has judged this)",
-                 question_id))
+                 cause, question_id))
             return "unreachable"
         self.conn.execute(
             "UPDATE questions SET status='queued', attempts=attempts+1, claimed_at=NULL, "
@@ -433,11 +537,17 @@ class NeoStore:
         self.record_answer(question_id, answer, answered_by="os", reason=reason)
         return True
 
-    def mark(self, question_id: int, status: str, reason: str = "") -> None:
+    def mark(self, question_id: int, status: str, reason: str = "",
+             cause: str = "") -> None:
+        # `cause` is ESCALATION_CAUSES or "" for "not recorded" — §2 of
+        # docs/superpowers/specs/2026-10-01-neo-observability.md.
         assert status in Q_STATUSES, status
+        assert cause == "" or cause in ESCALATION_CAUSES, cause
         self.conn.execute(
-            "UPDATE questions SET status=?, answer_reason=COALESCE(NULLIF(?,''), answer_reason) WHERE id=?",
-            (status, reason, question_id),
+            "UPDATE questions SET status=?, "
+            "answer_reason=COALESCE(NULLIF(?,''), answer_reason), "
+            "escalation_cause=COALESCE(NULLIF(?,''), escalation_cause) WHERE id=?",
+            (status, reason, cause, question_id),
         )
 
     # -- digests (the dashboard's shortened rendering — see `jarvis.digest`) ----
@@ -555,6 +665,71 @@ class NeoStore:
         q.append("ORDER BY _score DESC, ts DESC LIMIT ?")
         rows = self.conn.execute(" ".join(q), (*params, limit)).fetchall()
         return db.rows_to_dicts(rows)
+
+    def question_outcomes(self, project: str = "",
+                          since: float | None = None) -> list[dict[str, Any]]:
+        """Every question in the window, grouped on (kind, project, day, outcome).
+
+        One query behind every count in `ops.neo_stats_report` — §4 of
+        docs/superpowers/specs/2026-10-01-neo-observability.md. `answered_by` rides in the key because
+        `answered_by='os'` is a SUPERSEDED question, which is neither Neo answering nor
+        Neo handing back and must not reach the escalation rate's denominator.
+
+        The day bucket is SQL's, as `counts`' GROUP BY above already is.
+        """
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT kind, project, status, COALESCE(answered_by, '') AS answered_by,
+                       strftime('%Y-%m-%d', ts, 'unixepoch', 'localtime') AS day,
+                       COUNT(*) AS n
+                FROM questions {clause}
+                GROUP BY kind, project, status, answered_by, day
+                ORDER BY day""", params).fetchall())
+
+    def escalation_cause_counts(self, project: str = "",
+                                since: float | None = None) -> list[dict[str, Any]]:
+        """`GROUP BY escalation_cause` over the handed-back questions. NULL included: the
+        bucket that says how many escalations predate cause recording (spec §4)."""
+        where = ["status IN ('escalated','failed')"]
+        params: list[Any] = []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT escalation_cause AS cause, COUNT(*) AS n
+                FROM questions WHERE {' AND '.join(where)}
+                GROUP BY escalation_cause""", params).fetchall())
+
+    def questions_per_order(self, project: str = "",
+                            since: float | None = None) -> list[dict[str, Any]]:
+        """Questions in the window by the order that asked, TRIAGE EXCLUDED.
+
+        A triage question has no work order behind it and its `wo_id` is empty (`Q_KINDS`),
+        so dividing it by an order count would be arithmetic over two populations — spec
+        §4. They stay in `question_outcomes`.
+        """
+        where = ["kind != 'triage'", "wo_id != ''"]
+        params: list[Any] = []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        if since is not None:
+            where.append("ts >= ?")
+            params.append(since)
+        return db.rows_to_dicts(self.conn.execute(
+            f"""SELECT project, wo_id, COUNT(*) AS n
+                FROM questions WHERE {' AND '.join(where)}
+                GROUP BY project, wo_id""", params).fetchall())
 
     def counts(self) -> dict[str, int]:
         by_status = {

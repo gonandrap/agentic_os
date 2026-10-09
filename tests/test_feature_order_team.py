@@ -196,10 +196,14 @@ def test_the_worker_briefing_ranks_serena_over_grep(project):
     from jarvis import worker_brief
     section = worker_brief.render_section("navigation")
     assert "find_referencing_symbols" in section
-    # Conditional, because Jarvis configures no MCP server itself: an unconditional
-    # instruction would be a lie in every project that has no Serena.
-    assert "If this project has Serena" in section
-    assert "no Serena" in section
+    # Conditionality lives in the flag, not in hedged prose: `dispatch.py` writes
+    # `JARVIS_SERENA` from the project's real wiring, so each branch states its own
+    # case. serena=True says Serena IS wired and its tools are deferred.
+    assert "Serena is wired to this project" in section
+    assert "DEFERRED" in section
+    no_serena = worker_brief.render_section("navigation", serena=False)
+    assert "does not wire Serena" in no_serena
+    assert "find_referencing_symbols" not in no_serena
 
 
 def test_the_planner_briefing_ranks_serena_too(project):

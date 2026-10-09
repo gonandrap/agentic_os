@@ -19,11 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import ops, paths, seats, validation
+from jarvis import claude_cli, ops, paths, seats, validation
 from jarvis.bootstrap import ASSETS
 from jarvis.catalog import ValidationConfig
 from jarvis.evidence import EvidencePacket
 from jarvis.project_store import VALIDATOR_SEATS, ProjectStore
+from tests.test_validation_loop import fleet  # noqa: F401 — the booted-OS fixture
 
 SEAT_DIR = ASSETS / "validator-seats"
 NON_CHAIR = tuple(s for s in VALIDATOR_SEATS if s != "chair")
@@ -1379,3 +1380,143 @@ def test_a_chair_finding_is_never_filed_as_a_follow_up():
 
     assert filed == [{"seat": "maintainer", "title": "t", "detail": "d", "round": 4,
                       "file": "", "symbol": "", "failure": ""}]
+
+
+# -- the ceiling: an oversized seat prompt is refused, not abstained ----------------------
+
+#: Planted in the diff and the summary the packet carries, so it really is in the prompt
+#: that was refused. Nothing the user reads may repeat it. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+CEILING_MARKER = "SEAT-PROMPT-MARKER-4c1e"
+
+
+TINY_CEILING = 2_000
+
+
+@pytest.fixture()
+def tiny_ceiling():
+    """A ceiling any real seat prefix is over, PINNED for the test and restored after it.
+
+    Pinned because `catalog.load_catalog` re-arms the backstop from the catalog file
+    every time it runs, and `ops.finish` and `Daemon.reload_catalog` both run it — so a
+    plain `set_max_os_prompt_chars` is back at 400,000 by the first tick. The catalog
+    cannot carry 2,000 instead: `catalog._max_os_prompt_chars_or_err` refuses anything
+    below 300,000 at boot.
+
+    Both the value and the setter are restored by hand. `monkeypatch.undo()` would also
+    revert this test's `JARVIS_HOME` (mem:testing).
+    """
+    before_value = claude_cli.MAX_OS_PROMPT_CHARS
+    before_setter = claude_cli.set_max_os_prompt_chars
+    claude_cli.set_max_os_prompt_chars(TINY_CEILING)
+    claude_cli.set_max_os_prompt_chars = lambda limit: None
+    try:
+        yield TINY_CEILING
+    finally:
+        claude_cli.set_max_os_prompt_chars = before_setter
+        claude_cli.set_max_os_prompt_chars(before_value)
+
+
+def _ceiling_inbox(wo_id: str) -> list[dict]:
+    from jarvis.central_store import CentralStore
+
+    central = CentralStore()
+    try:
+        return [r for r in central.unacked_inbox()
+                if r["wo_id"] == wo_id and "too large" in r["title"]]
+    finally:
+        central.close()
+
+
+def _refused_round(fleet, fake_claude, tiny_ceiling, monkeypatch):
+    """One round over the REAL seats with the ceiling below the prefix. Returns
+    `(wo, ceiling, refusals, calls_before)`.
+
+    Four drains, past the three-attempt outage budget: a refusal that took the retry
+    path would have spent every attempt by the last of them.
+    """
+    from jarvis.daemon import Daemon
+    from tests.test_validation_loop import finish
+
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], f"print('{CEILING_MARKER}')\n")
+    finish(fleet, wo["id"], summary=f"done, {CEILING_MARKER}")
+
+    refusals = []
+    real = Daemon._validation_refused
+
+    def spy(self, store, project, wo_row, round_id, n, error):
+        refusals.append(error)
+        return real(self, store, project, wo_row, round_id, n, error)
+
+    monkeypatch.setattr(Daemon, "_validation_refused", spy)
+    calls_before = len(fake_claude.calls)
+    for _ in range(4):
+        fleet.drain()
+    return wo, tiny_ceiling, refusals, calls_before
+
+
+def test_an_oversized_seat_prompt_escalates_once_and_spends_no_subprocess(
+        fleet, fake_claude, tiny_ceiling, monkeypatch):
+    """THE SEAT PATH, which `_run_chair`'s re-raise does not cover. `seats._run_seat`
+    catches every `ClaudeCliError` and abstains, and `PromptTooLargeError` is a subclass,
+    so without a pre-flight the refusal never reaches
+    `Daemon._validate_work_order`'s `isinstance(failure, claude_cli.PromptTooLargeError)`
+    branch at all.
+
+    The priming call must not be spent either: it carries the same over-ceiling prefix.
+    """
+    wo, ceiling, refusals, calls_before = _refused_round(
+        fleet, fake_claude, tiny_ceiling, monkeypatch)
+
+    assert len(refusals) == 1, "the refusal was retried, or never reached the daemon"
+    assert refusals[0].ceiling == ceiling
+    assert len(fake_claude.calls) == calls_before, (
+        "a seat or the priming call ran on a prompt the OS had already refused")
+
+    store = fleet.store()
+    try:
+        assert store.os_prompt_refusal_open(wo["id"]) is not None
+    finally:
+        store.close()
+
+    rows = _ceiling_inbox(wo["id"])
+    assert len(rows) == 1 and rows[0]["level"] == "critical"
+
+
+def test_a_refused_round_records_no_opinion_and_reaches_no_verdict(
+        fleet, fake_claude, tiny_ceiling, monkeypatch):
+    """QUORUM IS NOT SHRUNK — it is never reached. Four abstentions are four rows and a
+    panel that judged nothing while looking as though it had."""
+    wo, _ceiling, _refusals, _before = _refused_round(
+        fleet, fake_claude, tiny_ceiling, monkeypatch)
+
+    store = fleet.store()
+    try:
+        rounds = store.validation_rounds(wo_id=wo["id"])
+        assert [(r["round"], r["outcome"]) for r in rounds] == [(1, "escalated")]
+        assert store.validation_opinions(int(rounds[0]["id"])) == []
+    finally:
+        store.close()
+
+
+def test_the_refusal_never_repeats_a_byte_of_the_prompt_it_refused(
+        fleet, fake_claude, tiny_ceiling, monkeypatch):
+    """NUMBERS AND IDENTIFIERS ONLY, on all three surfaces the user reads."""
+    wo, _ceiling, refusals, _before = _refused_round(
+        fleet, fake_claude, tiny_ceiling, monkeypatch)
+
+    store = fleet.store()
+    try:
+        fresh = store.get_work_order(wo["id"])
+        assert CEILING_MARKER in str(fresh["result_summary"]), (
+            "the marker never reached the packet, so the rule below is vacuous")
+        assert CEILING_MARKER not in str(fresh["attention_reason"])
+    finally:
+        store.close()
+
+    (row,) = _ceiling_inbox(wo["id"])
+    assert CEILING_MARKER not in row["title"]
+    assert CEILING_MARKER not in row["body"]
+    assert CEILING_MARKER not in str(refusals[0])
+    assert "os.max_os_prompt_chars" in row["body"]

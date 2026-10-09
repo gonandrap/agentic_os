@@ -148,6 +148,15 @@
   .error-flash { background: color-mix(in srgb, var(--red) 15%, var(--surface));
                  border: 1px solid var(--red); border-radius: 8px; padding: 10px 16px;
                  margin: 14px 0; }
+  /* The NON-ERROR half of the flash channel: a POST that succeeded and still owes the
+     user a sentence (§7 of
+     docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md). Cyan, the
+     stylesheet's "this is active, nothing is wrong" tone — the same choice `.brake.ramp`
+     makes — because a red ✗ over "your budget WAS raised" is a second false statement,
+     and the user who reads it raises the same number again instead of the family's. */
+  .note-flash { background: color-mix(in srgb, var(--cyan) 10%, var(--surface));
+                border: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent);
+                border-radius: 8px; padding: 10px 16px; margin: 14px 0; }
   .empty { color: var(--ink-3); padding: 14px 16px; font-style: italic; }
   .timeline { list-style: none; margin: 0; padding: 0; font-family: var(--mono);
               font-size: 12.5px; }
@@ -283,6 +292,9 @@
   </div>
   {% if request.query_params.get('error') %}
     <div class="error-flash">{{ request.query_params.get('error') }}</div>
+  {% endif %}
+  {% if request.query_params.get('note') %}
+    <div class="note-flash" role="status">{{ request.query_params.get('note') }}</div>
   {% endif %}
   {% block content %}{% endblock %}
 </div>

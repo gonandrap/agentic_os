@@ -280,3 +280,103 @@ def test_the_feature_page_labels_a_coarse_span_as_approximate(browser, project):
 
     assert "Time in state" in page
     assert "a feature order keeps no event trail" in page
+
+
+# -- a usage-limit hold on the page (spec 2026-09-30 §3) ----------------------------
+
+#: 5h24m in `running`, of which the order was let work 24m — figures deliberately away
+#: from a rounding edge, since the render happens a fraction of a second after `now`.
+HELD_WALL = 5 * 3600 + 24 * 60
+HELD_WORKED = 24 * 60
+
+
+def _event_at(store: ProjectStore, wo_id: str, kind: str, ts: float,
+              payload: dict) -> None:
+    store.add_event(wo_id, kind, payload)
+    store.conn.execute(
+        "UPDATE wo_events SET ts=? WHERE id=(SELECT MAX(id) FROM wo_events WHERE wo_id=?)",
+        (ts, wo_id))
+
+
+def _held_order(project, *, resumed: bool):
+    """Issue 887 on the page: 45m worked of 5h24m in `running`, the rest held."""
+    from jarvis.worker_session import PAUSE_USAGE_LIMIT
+
+    now = time.time()
+    t0 = now - HELD_WALL
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("ship the exporter")
+        store.set_status(wo["id"], "running")
+        spans = [r["id"] for r in store.conn.execute(
+            "SELECT id FROM wo_state_spans WHERE order_id=? ORDER BY id", (wo["id"],))]
+        for span_id, ts in zip(spans, (t0 - 3600, t0)):
+            store.conn.execute("UPDATE wo_state_spans SET ts=? WHERE id=?",
+                               (ts, span_id))
+        store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                           (t0 - 3600, wo["id"]))
+        turn = store.create_turn(wo["id"], kind="message", prompt="go")
+        store.finish_turn(turn["id"], state="done")
+        store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
+                           (t0, t0 + HELD_WORKED, turn["id"]))
+        _event_at(store, wo["id"], "turn_paused", t0 + HELD_WORKED,
+                  {"reason": PAUSE_USAGE_LIMIT, "seq": 1})
+        if resumed:
+            _event_at(store, wo["id"], "turn_resumed", now, {"retried_seq": 1})
+        store.conn.commit()
+    finally:
+        store.close()
+    return wo
+
+
+def test_a_status_never_held_renders_without_a_held_suffix(browser, project):
+    """The common case acquires no noise: no parenthesis, no `held`, no `wall`."""
+    store = ProjectStore(project)
+    try:
+        wo = store.create_work_order("ship the exporter")
+        store.set_status(wo["id"], "needs_review")
+        store.add_event(wo["id"], "turn_ended")
+    finally:
+        store.close()
+
+    page = browser.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert "held by" not in page
+    assert "wall)" not in page
+    assert "held</span>" not in page
+
+
+def _text(page: str) -> str:
+    return " ".join(page.split())
+
+
+def test_the_page_headlines_active_and_keeps_wall_beside_it(browser, project):
+    """`running 24m (5.0h held by a fleet usage limit, 5.4h wall)` — Neo 1130."""
+    wo = _held_order(project, resumed=True)
+
+    page = browser.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert '<span class="mono" style="width: 70px; text-align: right;">24m</span>' in page
+    assert "(5.0h held by a fleet usage limit, 5.4h wall)" in _text(page)
+    # the Gantt line for the held span says how much of it was a hold
+    assert "· 5.0h held" in _text(page)
+
+
+def test_an_open_hold_reads_as_held_on_the_page(browser, project):
+    """While the hold is open the current-status line says HELD, not `in this status`."""
+    wo = _held_order(project, resumed=False)
+
+    page = browser.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert "HELD 5.0h by a fleet usage limit, running 24m of 5.4h" in _text(page)
+    assert "in this status" not in page
+
+
+def test_the_tab_badge_shows_active_not_wall(browser, project):
+    """A badge reading 5.4h on an order that was let work 24m is the issue's headline."""
+    wo = _held_order(project, resumed=False)
+
+    page = browser.get(f"/wo/proj_a/{wo['id']}").text
+
+    assert '<span class="n">24m</span>' in page
+    assert '<span class="n">5.4h</span>' not in page

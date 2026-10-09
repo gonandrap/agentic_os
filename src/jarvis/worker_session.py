@@ -333,7 +333,7 @@ def start(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any],
     this differs from `send`/`retry` in: `dispatch.dispatch_work_order` records the
     context ledger for the seq-1 turn, and `briefing_for` REWRITES the worker settings
     file — so dispatch must be handed the briefing rather than rebuilding it to measure
-    it (spec docs/specs/2026-09-24-order-observability.md §5).
+    it (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
     """
     wo_id = wo["id"]
     session_id = wo.get("session_id") or new_session_id()
@@ -725,6 +725,10 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     store.add_event(wo_id, "turn_started", {
         "seq": turn["seq"], "kind": kind, "pid": spawned.pid, "unit": spawned.unit,
         "session_id": wo["session_id"], "resumed": resume,
+        # Where the branch stood when this turn began, so a harvest can scope its
+        # reading to the TURN rather than the whole order — §2 of
+        # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. "" when git cannot say.
+        "head": _head_sha(cwd),
     })
     log.info("[%s] %s turn %s for %s (pid %s%s)", project.name, kind, turn["seq"],
              wo_id, spawned.pid, f", unit {spawned.unit}" if spawned.unit else "")
@@ -739,10 +743,21 @@ def _launch(store: ProjectStore, project: ProjectSpec, wo: dict[str, Any], promp
     # only caller holding the `KnowledgeBrief` the knowledge block is measured from. The
     # partition is by (kind, seq) and not by kind: a RETRIED dispatch turn takes a fresh
     # seq, so it lands here, and every turn is therefore recorded exactly once by exactly
-    # one writer (spec docs/specs/2026-09-24-order-observability.md §5).
+    # one writer (spec docs/superpowers/specs/2026-09-24-order-observability.md §5).
     if kind != "dispatch" or turn["seq"] > 1:
         context.record(store, project, wo, fresh, briefing)
     return fresh  # type: ignore[return-value]
+
+
+def _head_sha(cwd: Path | None) -> str:
+    """`git rev-parse HEAD` in the directory the turn runs in, or "". One subprocess per
+    turn, on `branchproof.run`'s timeout — spec §2 of
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md."""
+    from . import branchproof
+
+    if cwd is None:
+        return ""
+    return (branchproof.run(Path(cwd), "rev-parse", "HEAD") or "").strip()
 
 
 def _release_background_owner(store: ProjectStore, wo: dict[str, Any]) -> None:
@@ -831,8 +846,25 @@ def _reap(store: ProjectStore, turn: dict[str, Any],
         # The envelope is what `cost_usd` normally comes from and there is none, so the
         # transcript answers instead. Without this the turn is billed $0.00 for ever.
         cost = lost_turn_cost(store, wo_id, turn)
-        return store.finish_turn(turn["id"], "failed", error=error, cost_usd=cost,
-                                 cost_source=COST_FROM_TRANSCRIPT)
+        settled = store.finish_turn(turn["id"], "failed", error=error, cost_usd=cost,
+                                    cost_source=COST_FROM_TRANSCRIPT)
+        if not auth:
+            # WHAT THE TURN LEFT ON DISK, on the `turn_failed` outcome alone — a pause
+            # resumes the same session and a checkpoint commit under a live worker
+            # surprises it mid-task. After `finish_turn` and wrapped here rather than
+            # inside the module, so a daemon killed mid-harvest leaves a SETTLED turn
+            # with no harvest and an ImportError is caught too (spec §7):
+            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
+            try:
+                from . import harvest
+
+                harvest.write(store, store.get_work_order(wo_id), turn,
+                              said=_last_assistant_message(store, wo_id, turn))
+            # noqa below: the harvest is best effort, the settlement above is not.
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not harvest turn %s of %s: %s", turn["seq"], wo_id,
+                            exc)
+        return settled
     # Recorded on BOTH outcomes: a failed turn's tokens were spent just the same — the
     # turn that motivated this hit a 429 having already paid $0.07 for the attempt.
     usage_json = json.dumps(result.usage) if result.usage else None

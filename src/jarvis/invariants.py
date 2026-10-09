@@ -45,13 +45,14 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from . import budget, db, worker_session
 # A leaf module (logging, subprocess, dataclasses): the import cannot cycle back here.
-from .automerge import HELD_SHA_MOVED
+from .automerge import HELD_NOT_PASSED, HELD_SHA_MOVED
 from .catalog import DEFAULT_VALIDATION_MAX_ROUNDS, DEFAULT_VALIDATION_TIMEOUT
 from .neo_store import USER_HELD_Q_STATUSES
 from .project_store import (
     ACTIVE_STATUSES,
     DEPENDENCY_DEAD_STATUSES,
     FO_OPEN_STATUSES,
+    FO_TERMINAL_STATUSES,
     OPEN_STATUSES,
     RETRY_SWEEP_STATUSES,
     RUNNABLE_VALIDATION_OUTCOMES,
@@ -372,6 +373,22 @@ AUTOMERGE_DENIED_BLOCKER = ("the automatic merge of the commit the panel accepte
 VALIDATION_STUCK_BLOCKER = ("the review could not be satisfied — the work needs your "
                             "judgement")
 
+#: THE SAME GIVE-UP, ONE STATUS LATER. `VALIDATION_STUCK_BLOCKER` above is raised only in
+#: `needs_review`; accepting the assumptions lands the order in `waiting_pr_merge`
+#: (`ops.land_when_cleared`) and nothing re-derives it there, so the panel's give-up went
+#: silent for 47h on wo-3615faf7 (issue 902). A SEPARATE SENTENCE because the remedy is
+#: different: in `needs_review` the user decides the work, here the work is decided and
+#: the PULL REQUEST is what will not move — `jarvis wo review` has nothing to review and
+#: would send them looking for a prompt that is not there.
+#:
+#: FREE OF ANY ELAPSED TIME AND OF THE SHA, on AUTOMERGE_DENIED_BLOCKER's rule:
+#: `ack_attention` stores this verbatim and INV-ATTENTION-REASON compares it, so a reason
+#: that ticked could never be acknowledged.
+PARKED_GIVE_UP_BLOCKER = ("the panel gave up on this and no commit was ever accepted, so "
+                          "the automatic merge will never arm — merge it yourself, "
+                          "re-judge it (`jarvis validation force`), or give it another "
+                          "round (`validation.max_rounds`)")
+
 #: What a work order says when its turn died because Claude Code could not authenticate
 #: (`worker_session.PAUSE_AUTH`). Nothing here is wrong with the work and nothing is wrong
 #: with the API: the account cannot answer until a human signs in, and then it can. So
@@ -403,6 +420,32 @@ AUTH_BLOCKER = ("Claude Code could not authenticate — sign in again and it res
 IDLE_NO_FINISH_BLOCKER = ("the worker stopped mid-task without `jarvis wo finish` — "
                           "nothing it started is still running; read its last message, "
                           "then `jarvis wo send` or `jarvis wo done`")
+
+#: What a `failed` work order says when there is nothing more specific to say. A CONSTANT
+#: because `Daemon.settle_work_order` raises it and `true_blockers` re-derives it: the two
+#: carried different spellings of this one state ("worker turn failed" at the write site),
+#: so INV-ATTENTION-REASON relabelled every such flag on the next tick.
+WORKER_FAILED_BLOCKER = "worker failed — review and retry"
+
+#: What a `failed` work order says when its turn died AFTER it had delivered —
+#: wo-604b5b99, whose session was killed in a stampede cleanup with PR #839 open. Spec
+#: §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
+#: manager-or-a-hold.md.
+#:
+#: Under IDLE_NO_FINISH_BLOCKER's own obligation: `Daemon.settle_work_order` raises it and
+#: `true_blockers` re-derives it from here, or INV-ATTENTION-REASON relabels it on the next
+#: tick. FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule — `ack_attention` stores it
+#: verbatim.
+TURN_DIED_AFTER_DELIVERY_BLOCKER = (
+    "its worker's session died after the work was delivered — the delivery is on record, "
+    "and the order is `failed` because the turn never finished, not because the work did; "
+    "`jarvis wo retry` resumes the session where it died, `jarvis wo done` closes it, and "
+    "`jarvis wo review` decides any assumption still pending")
+
+#: `kind` of the event the settler writes on that path, so the record never reads as a
+#: clean delivery. Here rather than in `daemon` because the writer is the daemon and the
+#: reader is the derivation above: the two must not drift.
+TURN_DIED_AFTER_DELIVERY_EVENT = "turn_died_after_delivery"
 
 SECONDS_PER_MINUTE = 60  # a unit, not a setting
 SECONDS_PER_HOUR = 3600  # ditto
@@ -518,16 +561,84 @@ FEATURE_CHILD_FAILED = "{id} failed — this feature cannot finish without it"
 FEATURE_CHILD_CANCELLED = ("{id} was cancelled — this feature will not deliver what the "
                            "plan promised")
 
+#: What a FEATURE order says when a merged child's commit never reached the head a round
+#: would judge, past the bound. §3 of
+#: docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+FEATURE_CHILD_NOT_INTEGRATED = (
+    "{id}'s merge commit {commit} is not in {head}, the commit on the default branch a "
+    "review would judge — so a panel would report its work as missing. Nothing has been "
+    "judged.")
 
-def dead_feature_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
+
+def dead_feature_children(store: ProjectStore,
+                          children: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The children that fail their feature: ended badly, and not answered for.
 
     ONE function because `Daemon.settle_features` and `check_feature_failures_are_real`
     must agree exactly. A settler that fails a feature on a child the invariant then
-    un-fails it on is an infinite loop, and the user watches it flap on every tick.
+    un-fails it on is an infinite loop, and the user watches it flap on every tick. That
+    obligation is also why the exemption below lives HERE and not in one caller.
+
+    EXEMPT: a `failed` child carrying `TURN_DIED_AFTER_DELIVERY_EVENT`. Its session died
+    after the work was delivered — wo-604b5b99, whose turn was killed in a stampede
+    cleanup with PR #839 open — and that is the turn's failure, not the feature's. Keyed
+    on the EVENT and never on a live `has_delivered`: the event names the CAUSE, where a
+    `pr_url` is a coincidence that would quietly exempt every failed order holding one.
+
+    The intended consequence: such a child is dead to NEITHER rule. Unlike a `superseded`
+    child it does not count towards completion either, so the feature stays `executing`
+    until the user acts on the child — `jarvis wo retry` or `jarvis wo done`. That is
+    honest: there is an open pull request outstanding.
+
+    NO FEATURE-LEVEL REMEDY, deliberately: a feature holding only such a child is
+    `executing`, which `jarvis fo resume` refuses, and widening `ops.resume_feature_order`
+    to supersede the exempt child would drop that open pull request out of the feature's
+    completion accounting in silence.
     """
-    return [c for c in children
-            if c["status"] in ("failed", "cancelled") and not c.get("superseded")]
+    dead = [c for c in children
+            if c["status"] in ("failed", "cancelled")
+            and not c.get("superseded")]
+    return [c for c in dead
+            if c["status"] != "failed"
+            or not store.events_of_kind(c["id"], TURN_DIED_AFTER_DELIVERY_EVENT)]
+
+
+def has_delivered(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Has this work order produced something a person has to decide about?
+
+    The STATUS is unchanged: a turn that dies after a delivery still settles `failed`
+    (`Daemon.settle_work_order`) — `needs_review` is the queue the user works through to
+    decide on delivered work, and a turn that died mid-flight does not belong in it. What
+    the delivery buys is the `TURN_DIED_AFTER_DELIVERY_EVENT` event the settler writes,
+    which is what exempts the child from the dead-child predicate.
+
+    A pull request and an assumption are artefacts the order cannot take back. NOT
+    `result_summary`: a worker can write one and keep working, so it does not say the
+    order has nothing left to run.
+    """
+    return bool(wo.get("pr_url")) or bool(store.all_assumptions(wo["id"]))
+
+
+#: What a live child says when the feature it belongs to has settled under it —
+#: wo-3db50904 and wo-0cb6dc6b, which kept running under a `failed` fo-ac00376e with no
+#: addressee for the `manager` role and nothing on their faces to say so. A HOLD and never
+#: a reopen (Neo question 1393): reopening the feature at the fork flaps, because
+#: `Daemon.settle_features` re-fails it on the next tick off the same dead child.
+#:
+#: FREE OF ANY ELAPSED TIME, on PARKED_BLOCKER's rule, and derived by `true_blockers`
+#: alone — no call site raises it, so nothing can drift from it.
+SETTLED_FEATURE_BLOCKER = ("its feature order {fo_id} is {status} — nothing will "
+                           "coordinate this work order until the feature is live "
+                           "again; {remedy}")
+
+#: One remedy per settled status, because the way out genuinely differs: `jarvis fo
+#: resume` refuses anything but `failed` (`ops.resume_feature_order`), so naming it under
+#: a cancelled feature would send the user at a command that errors.
+SETTLED_FEATURE_REMEDY = {
+    "failed": "`jarvis fo resume {fo_id}`",
+    "cancelled": "`jarvis wo cancel {wo_id}` if this work order is not wanted either",
+    "completed": "`jarvis wo done {wo_id}`, or `jarvis wo cancel {wo_id}`",
+}
 
 #: What a work order says when something it depends on can never complete. A dependency
 #: that is `cancelled` or `failed` will not come back, so the dependent would sit in
@@ -545,6 +656,31 @@ DEAD_DEPENDENCY_BLOCKER = "blocked by a dependency that can never complete"
 RELEASE_BASE_RED_BLOCKER = ("`{base}` has been red for {hours}h — `{workflow}` failed at "
                             "{sha} ({run_url}). The release is waiting on that build, "
                             "not on anything about the release.")
+
+
+#: What a work order says when an OS-built prompt for it was past the ceiling, so the
+#: call was never made. NUMBERS AND IDENTIFIERS ONLY — never a fragment of the prompt:
+#: this string is rendered to the user and read back by the digest model. Spec §4:
+#: docs/superpowers/specs/2026-09-26-bounded-model-inputs.md
+OS_PROMPT_REFUSED_BLOCKER = (
+    "the OS built a {call} prompt of {total} chars for this work order ({prompt} + "
+    "{system} system), over the {ceiling}-char ceiling (os.max_os_prompt_chars), so "
+    "the call was never made and nobody has judged the work. Raise the ceiling or "
+    "shrink what that call carries.")
+
+
+def os_prompt_refused_blocker(said: dict[str, Any]) -> str:
+    """OS_PROMPT_REFUSED_BLOCKER filled from the event the refusing call site wrote.
+
+    ONE renderer for both ends, RELEASE_BASE_RED_BLOCKER's rule: the call site flags it
+    and this module re-derives it, or INV-ATTENTION-REASON relabels the flag on the
+    next reconcile tick.
+    """
+    return OS_PROMPT_REFUSED_BLOCKER.format(
+        call=said.get("call") or "model", total=said.get("total") or 0,
+        prompt=said.get("prompt_chars") or 0,
+        system=said.get("system_prompt_chars") or 0,
+        ceiling=said.get("ceiling") or 0)
 
 
 def release_base_red_blocker(said: dict[str, Any]) -> str:
@@ -679,6 +815,40 @@ def automerge_denied(store: ProjectStore, wo: dict[str, Any]) -> bool:
                 and str(newest.get("head_sha") or "") != sha):
             return False
     return True
+
+
+def parked_on_a_give_up(store: ProjectStore, wo: dict[str, Any]) -> bool:
+    """Is the panel's give-up the thing holding this parked pull request?
+
+    TWO FACTS: the latest validation round ESCALATED, and the newest automatic-merge hold
+    is `not_passed` — the one code `decide` reaches when no commit was ever accepted, so
+    it is the precise statement that the give-up is what the merge waits on. Without the
+    second fact this fires on every parked order in a project running with `auto_merge`
+    off, which writes no hold at all and where the pull request merges on GitHub with
+    nothing stuck. The hold check is folded in here rather than left to the branch for
+    the reason `rejudge_exhausted` above folds in its own: both facts answer one
+    question, and a predicate answering half of it would carry a name that lied.
+
+    Derived, never stored. A flag written where the hold is written sits on the daemon's
+    poll path and re-raises itself over `jarvis wo ack` every tick (kn-089de524);
+    INV-ATTENTION-MISSING raises it from here, which is the path that honours
+    `acknowledged_blockers`.
+
+    SELF-CLEARING by construction, and without waiting for a poll. Fact 1 reads the
+    LATEST round only, so a later round that passes or merely opens clears it on the same
+    tick, with no new hold event. Fact 2 clears it when the hold changes code — the head
+    moved, CI went red, the pull request closed — each of which has its own sentence and
+    its own machinery, and this one must not sit over them.
+
+    Spec 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
+    """
+    if not validation_escalated(store, wo):
+        return False
+    held = store.events_of_kind(wo["id"], "automerge_held")
+    if not held:
+        return False
+    newest = db.from_json(held[-1]["payload"], {})
+    return str(newest.get("code") or "") == HELD_NOT_PASSED
 
 
 def neo_reviews_later(store: ProjectStore, wo: dict[str, Any]) -> bool:
@@ -833,7 +1003,26 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     if wo["status"] == budget.EXHAUSTED:
         blockers.append(budget_blocker(store, wo))
     if governed and wo["status"] == "failed":
-        blockers.append("worker failed — review and retry")
+        # TWO SENTENCES, and the second is the one the generic line got wrong: a session
+        # that died AFTER the work was delivered did not "fail" in any sense the user can
+        # act on by retrying blind — there is a pull request and there may be assumptions.
+        # The read sits behind the status check, so no other work order pays for it.
+        # Spec §(a), docs/superpowers/specs/2026-10-07-a-settled-features-live-children-
+        # must-have-a-manager-or-a-hold.md
+        died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
+        blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
+                        else WORKER_FAILED_BLOCKER)
+    # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
+    # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
+    # and above the `needs_review` triage, because it outranks both of the generic
+    # sentences it would otherwise sit under: a question Neo "could not answer" and a
+    # panel that "could not be satisfied" both point the user at the wrong remedy when
+    # the cause is a prompt nobody ever sent. Gated on the status so no settled work
+    # order pays for the query, as the neighbouring blockers are.
+    if wo["status"] in OPEN_STATUSES:
+        refusal = store.os_prompt_refusal_open(wo["id"])
+        if refusal is not None:
+            blockers.append(os_prompt_refused_blocker(refusal))
     # Parked on the user's Claude Code sign-in (`Daemon._park_on_signin`). Before the
     # `waiting_input` branch below, whose generic "waiting on your input" would send the
     # user looking for a session to type into — the thing to do is `/login`, and once
@@ -884,6 +1073,24 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # edge (`jarvis wo unblock`). That is the difference between waiting and stranded.
     if wo["status"] == "pending" and dead_dependencies(store, wo):
         blockers.append(DEAD_DEPENDENCY_BLOCKER)
+    # THE FEATURE THIS CHILD BELONGS TO HAS SETTLED UNDER IT. A fact about the work
+    # order's context rather than about its own delivery, so it sits below the assumptions
+    # line it must not displace and above the `needs_review` triage. Gated on the status
+    # and on the column so no other work order pays for the read; a manager is skipped,
+    # because `_close_feature_manager` settling it with its feature is correct. Spec §(b),
+    # docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-
+    # manager-or-a-hold.md
+    if (wo["status"] in OPEN_STATUSES and wo.get("parent_id")
+            and wo.get("kind") != "manager"):
+        try:
+            parent = store.get_feature_order(wo["parent_id"])
+        except KeyError:
+            parent = None  # deleted out from under the child: nothing left to name
+        if parent is not None and parent["status"] in FO_TERMINAL_STATUSES:
+            remedy = SETTLED_FEATURE_REMEDY.get(parent["status"], "")
+            blockers.append(SETTLED_FEATURE_BLOCKER.format(
+                fo_id=parent["id"], status=parent["status"],
+                remedy=remedy.format(fo_id=parent["id"], wo_id=wo["id"])))
     # A RELEASE THAT WAITED OUT THE THRESHOLD ON A RED BASE (2026-09-29 spec §3). Gated
     # on the status so no other work order pays the query; the ordinary re-park raises
     # nothing at all, because `pending` behind a hold is the OS waiting, not the user.
@@ -937,6 +1144,11 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
     # `sha_moved` on the judged head, this one needs no such hold.
     if wo["status"] == "waiting_pr_merge" and automerge_denied(store, wo):
         blockers.append(AUTOMERGE_DENIED_BLOCKER)
+    # THE GIVE-UP, SURVIVING INTO THE STATUS THAT DROPPED IT (issue 902). Ranked last of
+    # the four documentarily: none of them can co-occur, proved in section 4 of spec
+    # 2026-10-01-an-escalated-round-on-a-parked-order-raises-nothing.md.
+    if wo["status"] == "waiting_pr_merge" and parked_on_a_give_up(store, wo):
+        blockers.append(PARKED_GIVE_UP_BLOCKER)
     if governed and wo["status"] == "needs_review":
         # THREE WAYS TO ARRIVE AT `needs_review`, ranked, and each asking the user for
         # something different. The `not pending` guards are PER LINE and not on the
@@ -1123,9 +1335,12 @@ def undeclared_delivery(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """Has this worker pushed past a refusal without declaring it? Spec §2c of
     docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
 
-    `ops.refusal_answered` is CALLED rather than re-derived, and it stays finish-only:
-    the finish is the declaration, and widening it would let the panel judge a submission
-    nobody declared. This is the detector the OS lacked, so that an unanswered refusal
+    `ops.refusal_answered` is CALLED rather than re-derived, and a finish OR a passed
+    user-rework round answers the refusal: the user forcing that round IS the
+    declaration, and once a panel has passed the pushed head, nudging the worker for a
+    `wo finish` is noise (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
+    This is the detector the OS lacked, so that an unanswered refusal
     with commits behind it self-heals into a nudge instead of parking on the user for
     ever.
 
@@ -1502,8 +1717,21 @@ def status_label(store: ProjectStore, wo: dict[str, Any],
         if cap is None:
             # The budget was cleared and the tick that moves the status has not run.
             return "budget spent — cleared, resuming shortly"
-        return (f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
-                + (" (its feature's slice)" if cap.source == "feature" else ""))
+        line = f"budget spent — ${cap.spent_usd:.2f} of ${cap.cap_usd:.2f}"
+        if cap.source != "feature":
+            return line
+        # `source == 'feature'` is the ALLOCATOR's word for "the family's cap" and says
+        # nothing about the parent's kind, so the noun comes from the kind table every
+        # other surface reads (`ops.family_prose`) — this label and the budget card sit
+        # on the same page and called the same family two different things.
+        from .ops import family_prose
+        parent = None
+        if wo.get("parent_id"):
+            try:
+                parent = store.get_feature_order(wo["parent_id"])
+            except KeyError:
+                parent = None
+        return f"{line} (its {family_prose((parent or {}).get('kind'))[0]}'s slice)"
     # A booked retry on one of the settled-looking statuses the sweep reaches and the
     # branch above does not (issue #259). Ranked over the round note below it: a turn the
     # transport dropped is why nothing is moving, and it names the moment that changes.
@@ -2880,14 +3108,36 @@ def check_no_lost_feedback(store: ProjectStore) -> Iterator[Violation]:
             still_open = False
         if not still_open:
             continue
+        lost = (f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
+                f"about {subject} reached nobody: {env['note'] or 'undeliverable'}")
+        # LEADS WITH WHAT IS SETTLED for a lost `manager` envelope: the user read the
+        # SUBJECT as the completed order, because the settled fact arrived last or not at
+        # all. Derived, never stored, and only the manager case had a second order in it
+        # to confuse. Spec §(d), docs/superpowers/specs/2026-10-07-a-settled-features-live-
+        # children-must-have-a-manager-or-a-hold.md
+        manager, fo_id = None, None
+        if env["to_role"] == "manager":
+            from .bus import _feature_of
+
+            fo_id = _feature_of(store, env)
+            manager = store.manager_work_order(fo_id) if fo_id else None
+        if manager is not None:
+            detail = (f"the manager work order {manager['id']} is {manager['status']} "
+                      f"under feature {fo_id}, so {lost}")
+            if env["subject_wo_id"]:
+                detail += (f". {env['subject_wo_id']} is held until the feature is live "
+                           f"again")
+        else:
+            detail = lost
         yield Violation(
             invariant="INV-ENVELOPE-LOST",
             wo_id=env["subject_wo_id"],
-            detail=(f"envelope {env['id']} ({env['kind']} to role {env['to_role']}) "
-                    f"about {subject} reached nobody: {env['note'] or 'undeliverable'}"),
+            detail=detail,
             context={"envelope_id": env["id"], "kind": env["kind"],
                      "to_role": env["to_role"], "state": env["state"],
-                     "subject_fo_id": env["subject_fo_id"]},
+                     "subject_fo_id": env["subject_fo_id"],
+                     "manager_wo_id": manager["id"] if manager else None,
+                     "manager_status": manager["status"] if manager else None},
         )
 
 
@@ -2991,10 +3241,19 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
     ).fetchall():
         fo_id = row["id"]
         children = store.feature_children(fo_id)
-        if not children or dead_feature_children(children):
+        if not children or dead_feature_children(store, children):
             continue
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # A reopened feature with a `completed` manager has no addressee for its next
+        # round's feedback. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+        # features-live-children-must-have-a-manager-or-a-hold.md
+        from .ops import lower_settled_feature_holds, revive_feature_manager
+
+        revived = revive_feature_manager(store, fo_id, why="INV-FEATURE-FALSE-FAILURE")
+        # ...and the children's holds go down with it: SETTLED_FEATURE_BLOCKER is now
+        # false and nothing re-derives a stored flag.
+        lower_settled_feature_holds(store, children)
         yield Violation(
             invariant="INV-FEATURE-FALSE-FAILURE",
             detail=(f"feature order {fo_id} is `failed` — \"{row['attention_reason']}\" "
@@ -3002,9 +3261,11 @@ def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
                     f"cancelled any more. The child recovered after the feature settled, "
                     f"and nothing re-derives a settled feature."),
             repaired=True,
-            repair="back to `executing` — the next tick settles it on the real state",
+            repair=("back to `executing` — the next tick settles it on the real state"
+                    + (", manager revived" if revived else "")),
             context={"fo_id": fo_id, "children": len(children),
-                     "stale_reason": row["attention_reason"]},
+                     "stale_reason": row["attention_reason"],
+                     "manager_revived": revived["id"] if revived else None},
         )
 
 
@@ -3117,9 +3378,13 @@ def _live_catalog() -> Any:
 def _os_owning_project(store: ProjectStore) -> Any:
     """This store's `ProjectSpec` if it is the project that runs the OS, else None.
 
-    Derived, NEVER hardcoded: `schedule.os_owner` over the live catalog, compared on the
+    Derived, NEVER hardcoded: `schedule.os_project` over the live catalog, compared on the
     RESOLVED PATH rather than on a name, because a store knows its directory and not
     what the catalog calls it.
+
+    Identity is BY GIT ORIGIN (issue 956). Asked by path containment this check was dead
+    in production, where the running package is in the deployed checkout and no catalog
+    path contains it.
     """
     from . import schedule
 
@@ -3127,9 +3392,7 @@ def _os_owning_project(store: ProjectStore) -> Any:
     if catalog is None:
         return None
     try:
-        # §5: no fallback — an arbitrary first-in-catalog project is not the OS.
-        owner = schedule.os_owner(((p.name, p.path) for p in catalog.projects),
-                                  fallback=False)
+        owner = schedule.os_project((p.name, p.path) for p in catalog.projects)
         if owner is None:
             return None
         spec = catalog.project(owner)
@@ -3947,6 +4210,79 @@ def check_production_clean() -> Iterator[Violation]:
     )
 
 
+def check_prod_cli() -> Iterator[Violation]:
+    """INV-PROD-CLI — the `jarvis` a human types must mean production.
+
+    Issue 757. `JARVIS_HOME`, `PRODUCTION_CODE` and `JARVIS_ENV` live only in the two
+    systemd units, so they reach the daemon and every worker it spawns and reach nothing
+    typed in a shell: `jarvis` is command-not-found, and the obvious fallback — the
+    deployed venv's binary by full path — runs production CODE against `~/.jarvis`, the
+    DEV instance's state, with no error and with the dashboard badge saying `production`.
+    `scripts/install_prod_cli.sh` installs a wrapper carrying those three exports; this
+    is the third member of the family `check_service_path` and `check_production_clean`
+    started, watching an install step a human runs once and nothing ever compares.
+
+    Reads the FILE, not `os.environ`: a session that HAS the variables is not the session
+    that is broken. Keys on the MACHINE's deployment, not `paths.deployment_env()` —
+    the subject is the interactive shell, which is neither instance, so `jarvis doctor`
+    run from the dev checkout on a host that also runs production does report, and must.
+
+    A `jarvis doctor` check only (see `check_config_drift` on why `OS_INVARIANTS` stays
+    off the reconcile tick). Not repairable: writing an executable onto the user's PATH
+    is an install action, not a derivation a read-only check may perform.
+    """
+    from . import release
+    from .paths import production_code_dir
+
+    prod = production_code_dir()
+    if not (prod / ".git").exists() or not os.access(prod / ".venv/bin/jarvis", os.X_OK):
+        return  # no production deployment on this machine
+    wrapper = release.cli_wrapper()
+    expected_target = str(prod / ".venv/bin/jarvis")
+    expected_home = f"{prod.parent}/state"
+    facts = release.cli_wrapper_facts()
+    if facts is None:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"no production `jarvis` on PATH: {wrapper} does not exist, so "
+                    f"`jarvis` in an interactive shell is either command-not-found or — "
+                    f"worse — the venv binary with no `JARVIS_HOME`, which drives the "
+                    f"DEV instance at ~/.jarvis silently (issue 757). Install it with "
+                    f"scripts/install_prod_cli.sh (it starts and restarts nothing)."),
+            context={"wrapper": str(wrapper), "target": None, "jarvis_home": None,
+                     "expected_target": expected_target, "expected_home": expected_home,
+                     "generated": False},
+        )
+        return
+    target, home = facts["target"], facts["env"].get("JARVIS_HOME")
+    context = {"wrapper": str(wrapper), "target": target, "jarvis_home": home,
+               "expected_target": expected_target, "expected_home": expected_home,
+               "generated": facts["generated"]}
+    if not facts["generated"]:
+        # Most likely a dev install pointing at ~/.jarvis — the defect's second half. The
+        # detail says it was not generated here, so a deliberate install can be kept.
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} is a `jarvis` this OS did not generate (no "
+                    f"`{release.CLI_MARKER}` marker), so typing `jarvis` reaches "
+                    f"something other than the fleet the units run — most likely a dev "
+                    f"install writing to ~/.jarvis (issue 757). Replace it by running "
+                    f"scripts/install_prod_cli.sh, or keep it deliberately."),
+            context=context,
+        )
+        return
+    if target != expected_target or home != expected_home:
+        yield Violation(
+            invariant="INV-PROD-CLI",
+            detail=(f"{wrapper} execs {target} and exports JARVIS_HOME={home}, but "
+                    f"production on this machine is {prod} with "
+                    f"JARVIS_HOME={expected_home} — every `jarvis` typed in a shell is "
+                    f"therefore driving a different fleet from the one the units run. "
+                    f"Re-render it with scripts/install_prod_cli.sh."),
+            context=context,
+        )
+
+
 # -- cache health ----------------------------------------------------------------------
 #
 # Two post-conditions on the fleet's cache configuration, from findings 2 and 4 of
@@ -4231,14 +4567,58 @@ def check_prefix_stable() -> Iterator[Violation]:
     )
 
 
+def check_os_identity() -> Iterator[Violation]:
+    """INV-OS-IDENTITY — the OS's own project must be identifiable.
+
+    Issue 956: `schedule.os_project` returning None makes the three release guards, the
+    health-sweep invariant and the config refusal all INERT, and inert is invisible —
+    production filed six release orders for fixes it was already running before anyone
+    looked. Every one of those callers is right to do nothing on None, so None is the
+    thing that has to be reported rather than acted on.
+
+    KEYED ON A CANDIDATE EXISTING, never on None alone: a pip-installed OS driving
+    projects that are not it has no candidate and no identity, and that deployment is
+    correct. What fires is a catalog that HOLDS a checkout of this repository while
+    identity still resolves to nothing, and AMBIGUITY is the only way that happens: two
+    or more projects on this code's origin. That is the complete set — a single candidate
+    always resolves, and a path whose origin cannot be read is never a candidate, since
+    `os_candidates` keeps only paths whose origin EQUALS this code's.
+
+    NOT repairable: which of two checkouts of this repository is the OS is the user's to
+    say, by removing one from the catalog.
+    """
+    from . import schedule
+
+    catalog = _live_catalog()
+    if catalog is None:
+        return
+    projects = [(p.name, p.path) for p in getattr(catalog, "projects", ())]
+    candidates = schedule.os_candidates(projects)
+    if not candidates or schedule.os_project(projects) is not None:
+        return
+    yield Violation(
+        invariant="INV-OS-IDENTITY",
+        detail=(f"the catalog holds {len(candidates)} projects that are checkouts of the "
+                f"OS's own repository ({', '.join(candidates)}), so which one IS the OS "
+                f"has no answer — and every caller of that question does nothing on no "
+                f"answer. The release guards file duplicate release orders for fixes "
+                f"already live, the OS's health sweep is never checked for liveness, and "
+                f"`jarvis config set` stops refusing a write that switches that sweep "
+                f"off. Leave one of them in the catalog."),
+        level="critical", context={"candidates": candidates},
+    )
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
     check_production_clean,
+    check_prod_cli,
     check_cache_ttl_trigger,
     check_prefix_stable,
+    check_os_identity,
 )
 
 

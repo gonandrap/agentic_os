@@ -1319,6 +1319,11 @@ SEED_CANARIES: tuple[tuple[str, str], ...] = (
     ("pr_merge", "gh api --method PUT repos/o/r/pulls/31/merge"),
     ("release", "./scripts/shipit.sh"),
     ("release", "bash scripts/shipit.sh --dry-run"),
+    # The only release command the OS itself asks for since the 2026-10-01 spec §7, and
+    # the most argument-shaped of this group — the shape an exemption about "a long
+    # quoted argument" would most plausibly clear by accident.
+    ("release", "scripts/shipit.sh --stage --wo wo-1234abcd "
+                "--base 442729f0c1e4b7a9d3f5068b2c4e7a1d9b0f3c58"),
     ("release", "gh release create jarvis-1.2.3"),
     ("release", "npm publish"),
     ("release", "uv publish"),

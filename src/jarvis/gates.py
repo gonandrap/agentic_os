@@ -756,7 +756,10 @@ Output STRICT JSON, nothing else:
   {"escalate": false, "verdict": "dismiss",  "reason": "<one line: why this command \
 performs no privileged action>", "exempt_pattern": "<regex for the family, or omit>"}
   {"escalate": true,  "verdict": "deny",     "reason": "<one line: why the user must \
-decide>"}"""
+decide>"}
+An escalation may carry one optional label, which is grouped and reported:
+  "cause": "<on an escalation, name the cause from this list; omit it if none fits: \
+privileged-action | evidence-insufficient>\""""
 
 
 HISTORY_LIMIT = 8

@@ -1,6 +1,6 @@
 """`jarvis wo retry` — the named way to relaunch a `failed` work order.
 
-docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. The revive existed as an
+docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. The revive existed as an
 unnamed side effect of `wo send`; these tests are about the NAME having a refusal, a
 record and a surface, and about the two things the spec forbids: no status write, and no
 user stamp on the OS's own relaunch note.

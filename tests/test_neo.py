@@ -873,7 +873,10 @@ def test_parse_verdict_tolerates_fences():
                  # `assumption` kind reads this, and `autoreview.read_ruling` treats an
                  # empty string as `routine` — which is safe ONLY because accepting
                  # needs an explicit `approve` as well, never the absence of a warning.
-                 "stakes": ""}
+                 "stakes": "",
+                 # And an answer that names no escalation cause names none: "" stores as
+                 # NULL and renders "not recorded" (spec §2).
+                 "cause": ""}
     v = neo_mod.parse_verdict("total nonsense")
     assert v["escalate"] is True
 
@@ -953,3 +956,216 @@ def test_answer_question_does_not_log_a_reply_it_could_parse(
 
     assert verdict["answer"] == "go"
     assert not [r for r in caplog.records if "raw reply" in r.getMessage()]
+
+
+# -- escalation causes (spec §1/§2, docs/superpowers/specs/2026-10-01-neo-observability.md) --------
+#
+# The grouping the report exists to provide, and the one rule that governs it: a label
+# the model did not pick is NULL, never a guess and never a synthetic escalation.
+
+#: The wording every persona's `cause` field uses, verbatim. The test below reads the
+#: SHIPPED prose through it — mem:neo-panel's rule.
+CAUSE_MARKER = "name the cause from this list; omit it if none fits:"
+
+
+def _persona_causes(text: str) -> list[str]:
+    """The cause members one persona actually offers the model."""
+    out: list[str] = []
+    for chunk in text.split(CAUSE_MARKER)[1:]:
+        listed = chunk.split('>"')[0]
+        out += [m.strip() for m in listed.split("|") if m.strip()]
+    return out
+
+
+def test_parse_verdict_normalises_a_cause_the_persona_offered():
+    v = neo_mod.parse_verdict(
+        '{"escalate": true, "answer": "", "reason": "r", "cause": " HIGH-STAKES "}')
+    assert v["cause"] == "high-stakes"
+    assert not v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
+
+
+@pytest.mark.parametrize("raw_cause", ["", '"nonsense"', '"transport-unreachable"',
+                                       "null", "17"])
+def test_a_cause_that_is_not_a_chosen_member_reads_empty_and_keeps_the_verdict(raw_cause):
+    """Absent, unknown, or a FAILED-class member the model cannot know about.
+
+    None of them may reject the verdict: `structured.coerce`'s `on_invalid` is
+    `_unparseable_verdict`, so raising here would manufacture an escalation Neo never
+    made — question 388's bug one field along.
+    """
+    tail = f', "cause": {raw_cause}' if raw_cause else ""
+    v = neo_mod.parse_verdict(
+        '{"escalate": false, "answer": "use CSV", "reason": "r"' + tail + "}")
+    assert v["cause"] == ""
+    assert (v["escalate"], v["answer"]) == (False, "use CSV")
+    assert not v["reason"].startswith(neo_mod.UNPARSEABLE_PREFIX)
+
+
+def test_unparseable_output_carries_the_mechanical_cause():
+    v = neo_mod.parse_verdict("I think you should maybe do the thing?")
+    assert (v["escalate"], v["cause"]) == (True, "unparseable-reply")
+
+
+def test_every_chosen_cause_is_asked_for_by_at_least_one_persona():
+    """Asserted over the SHIPPED prose: the enum is what the report groups on, and the
+    persona text is the only thing that makes a member reachable."""
+    from jarvis import autoreview, gates, plans, supervisor
+    from jarvis.neo_store import ESCALATION_CAUSES_CHOSEN
+
+    personas = {
+        "neo": neo_mod.PERSONA,
+        "gates": gates.REVIEWER_PERSONA,
+        "plans": plans.PLAN_REVIEWER_PERSONA,
+        "supervisor": supervisor.ALARM_REVIEWER_PERSONA,
+        "autoreview": autoreview.ASSUMPTION_REVIEWER_PERSONA,
+    }
+    offered = {name: _persona_causes(text) for name, text in personas.items()}
+    for name, members in offered.items():
+        assert members, f"{name} offers no cause at all"
+        # No persona names a member outside the enum: a label the report cannot group is
+        # one the model was asked for and nobody can read.
+        for member in members:
+            assert member in ESCALATION_CAUSES_CHOSEN, (name, member)
+    every = {m for members in offered.values() for m in members}
+    assert set(ESCALATION_CAUSES_CHOSEN) == every
+
+
+def test_the_three_classes_are_disjoint_and_sum_to_the_enum():
+    """Three tuples because "who decided" has three answers (Neo, question 1170). One
+    tuple would invite a report that adds them up, which is the reading this exists to
+    prevent."""
+    from jarvis.neo_store import (ESCALATION_CAUSES, ESCALATION_CAUSES_CHOSEN,
+                                  ESCALATION_CAUSES_FAILED,
+                                  ESCALATION_CAUSES_OVERRIDDEN)
+
+    chosen, overridden, failed = (set(ESCALATION_CAUSES_CHOSEN),
+                                  set(ESCALATION_CAUSES_OVERRIDDEN),
+                                  set(ESCALATION_CAUSES_FAILED))
+    assert not chosen & overridden and not chosen & failed
+    assert not overridden & failed
+    assert chosen | overridden | failed == set(ESCALATION_CAUSES)
+    assert len(ESCALATION_CAUSES) == len(set(ESCALATION_CAUSES))
+    assert overridden == {"stakes-high", "stakes-unclassified", "stakes-unreadable",
+                          "neo-denied", "scope-over-cap"}
+
+
+def test_a_model_may_never_name_an_overridden_cause(jarvis_home):
+    """These five are facts about what the OS did with Neo's answer. A model claiming one
+    is describing something it cannot know, so `parse_verdict` drops it — and a persona
+    that offered one would be asking for a label nobody could trust."""
+    from jarvis import autoreview, gates, plans, supervisor
+    from jarvis.neo_store import ESCALATION_CAUSES_OVERRIDDEN
+
+    v = neo_mod.parse_verdict('{"escalate": true, "answer": "", "reason": "r",'
+                              ' "cause": "stakes-high"}')
+    assert v["cause"] == ""
+    for text in (neo_mod.PERSONA, gates.REVIEWER_PERSONA, plans.PLAN_REVIEWER_PERSONA,
+                 supervisor.ALARM_REVIEWER_PERSONA,
+                 autoreview.ASSUMPTION_REVIEWER_PERSONA):
+        for member in ESCALATION_CAUSES_OVERRIDDEN:
+            assert member not in text
+
+
+def test_mark_records_a_cause_from_the_overridden_class(jarvis_home):
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.mark(q["id"], "escalated", reason="r", cause="scope-over-cap")
+        assert neo.get(q["id"])["escalation_cause"] == "scope-over-cap"
+    finally:
+        neo.close()
+
+
+def test_mark_refuses_a_cause_outside_the_enum(jarvis_home):
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        with pytest.raises(AssertionError):
+            neo.mark(q["id"], "escalated", reason="r", cause="made-up")
+    finally:
+        neo.close()
+
+
+def test_a_second_mark_does_not_erase_a_recorded_cause(jarvis_home):
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.mark(q["id"], "escalated", reason="r", cause="high-stakes")
+        neo.mark(q["id"], "escalated", reason="again")
+        assert neo.get(q["id"])["escalation_cause"] == "high-stakes"
+        # and a question nobody labelled stays NULL, never ''
+        other = neo.ask("proj_a", "wo-1", "and this?")
+        neo.mark(other["id"], "escalated", reason="r")
+        assert neo.get(other["id"])["escalation_cause"] is None
+    finally:
+        neo.close()
+
+
+def test_the_escalate_branch_writes_the_cause_to_the_row(jarvis_home):
+    neo = NeoStore()
+    try:
+        neo.ask("proj_a", "wo-1", "may I rotate the production key?")
+        neo_mod.drain_queue(
+            neo, "claude-sonnet-4-5",
+            answer=lambda *a, **k: neo_mod.parse_verdict(
+                '{"escalate": true, "answer": "", "reason": "yours",'
+                ' "cause": "high-stakes"}'))
+        row = neo.get(1)
+        assert (row["status"], row["escalation_cause"]) == ("escalated", "high-stakes")
+    finally:
+        neo.close()
+
+
+def test_a_transport_failure_and_a_refused_prompt_write_their_own_causes(jarvis_home):
+    """Derived by the OS at the code path, never read off a reply (spec §1)."""
+    from jarvis import claude_cli
+    from jarvis.neo_store import MAX_ANSWER_ATTEMPTS
+
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.conn.execute("UPDATE questions SET attempts=? WHERE id=?",
+                         (MAX_ANSWER_ATTEMPTS, q["id"]))
+
+        def boom(*a, **k):
+            raise claude_cli.ClaudeCliError("no transport")
+
+        neo_mod.drain_queue(neo, "m", answer=boom)
+        assert neo.get(q["id"])["escalation_cause"] == "transport-unreachable"
+
+        refused = neo.ask("proj_a", "wo-1", "and this?")
+
+        def too_large(*a, **k):
+            raise claude_cli.PromptTooLargeError(
+                "too big", prompt_chars=9, system_prompt_chars=9, ceiling=1)
+
+        neo_mod.drain_queue(neo, "m", answer=too_large)
+        assert neo.get(refused["id"])["escalation_cause"] == "prompt-refused"
+    finally:
+        neo.close()
+
+
+def test_a_stranded_claim_given_up_on_records_attempts_exhausted(jarvis_home):
+    from jarvis.neo_store import MAX_ANSWER_ATTEMPTS
+
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.conn.execute(
+            "UPDATE questions SET status='answering', attempts=?, claimed_at=0 "
+            "WHERE id=?", (MAX_ANSWER_ATTEMPTS, q["id"]))
+        assert neo.reclaim_stale()["failed"] == [q["id"]]
+        assert neo.get(q["id"])["escalation_cause"] == "attempts-exhausted"
+    finally:
+        neo.close()
+
+
+def test_a_usage_limit_hold_writes_no_cause(jarvis_home):
+    """A window that will reopen is not an escalation (spec §1)."""
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", "wo-1", "which?")
+        neo.hold_claim(q["id"], "limit reached", reopens_at=1.0)
+        assert neo.get(q["id"])["escalation_cause"] is None
+    finally:
+        neo.close()

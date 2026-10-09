@@ -97,7 +97,7 @@ PAYLOAD_VERSION = 5
 #: one thing: the worker's own conversation, what Jarvis spent thinking about the order
 #: while the worker slept, what the worker's own tool calls spawned beneath it, and what
 #: the user spent LOOKING at the order rather than doing it (§10 of
-#: docs/specs/2026-09-24-order-observability.md).
+#: docs/superpowers/specs/2026-09-24-order-observability.md).
 WORKER, JARVIS, SUBPROC = "worker", "jarvis", "subprocesses"
 OBSERVE = "observability"
 
@@ -143,6 +143,18 @@ ABSENT_NOTES = {
              "meter existed or nobody has opened a report on it, and neither of those is "
              "a figure of zero spent.",
 }
+
+
+#: THE SUBAGENT SIDE'S ZERO, NAMED — beside `ABSENT_NOTES` for that block's stated
+#: reason: a caveat worded differently in two renderers is one the reader learns to
+#: ignore. Printed by `cli._print_bill` and by ui/templates/bill.html, and only when
+#: `rewrite.by_side.subagent.structural_zero` is true (spec 2026-10-02 §1.5).
+SUBAGENT_REWRITE_ZERO = (
+    "of that, subagents contributed 0 tokens across 0 boundaries — a STRUCTURAL zero and "
+    "not a small one: a subagent's written volume never exceeds its own context peak, and "
+    "one continuous subagent conversation has no cache read going backwards, so the "
+    "arithmetic can give nothing else. Those {count} subagent(s) still wrote {written} "
+    "cache-creation tokens, itemised under the turn each ran in.")
 
 
 def absent_notes(payload: dict[str, Any]) -> list[tuple[str, str]]:
@@ -1018,7 +1030,7 @@ def _call_versions(rows: Sequence[dict[str, Any]]) -> set[int]:
     — no reading was taken, so there is none to be old.
 
     AN OBSERVABILITY ROW IS SKIPPED FOR THAT SAME REASON, envelope or not (§10 of
-    docs/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
+    docs/superpowers/specs/2026-09-24-order-observability.md): a metered look bought no model call, so
     its `wall_ms`-and-zeros envelope carries no reading that could be old, and counting it
     as version 1 would make every bill holding one disclose an under-reading that is not
     there.
@@ -1353,6 +1365,22 @@ def _worker_extras(session: Any) -> dict[str, Any]:
             "compact_write": total.rewrite_compact_write,
             "compact_boundaries": total.boundaries_compact,
             "cache_write": total.cache_write,
+            # q1215: the order-level rollup, LABELLED by side. `total` already summed
+            # both (`Usage.__add__`, `usage.py:279-280`); what no surface could say is
+            # which side contributed what, and the subagent side is ZERO BY ARITHMETIC,
+            # never by being small.
+            "by_side": {
+                "main": {"tokens": session.main.rewrite_excess,
+                         "boundaries": session.main.resume_boundaries,
+                         "cache_write": session.main.cache_write},
+                "subagent": {"tokens": session.subagents.rewrite_excess,
+                             "boundaries": session.subagents.resume_boundaries,
+                             "cache_write": session.subagents.cache_write,
+                             "count": session.subagent_count,
+                             "structural_zero": (
+                                 session.subagents.rewrite_excess == 0
+                                 and session.subagents.resume_boundaries == 0)},
+            },
         },
         "context_peak": total.context_peak,
     }

@@ -24,8 +24,10 @@ expires, and sealing would freeze an episode that was OPEN at seal time. `from_s
 `wo_turns.usage_json` and `wo_turns.context_json` are not sealed either: already durable.
 The module legends (`hold_causes`, `PARTS`, `subagent_depth_read`, `param_caps`) are
 re-derived at render, so a raised cap is reflected on an old seal. And span `params` are
-not sealed AT EITHER LEVEL here: tool parameters are what the `full` level buys, which is
-§6 of docs/specs/2026-09-27-order-autopsy-durability.md and not this module's.
+sealed AT `full` AND AT NO OTHER LEVEL: tool parameters are what that level buys, which is
+§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md — redacted file contents and Bash
+command lines in a store that does not expire, so at `normal` the payload holds no `params`
+key at all rather than an empty one.
 
 ## Nothing is ever silently dropped
 
@@ -49,7 +51,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import db, inspection, observability
+from . import db, inspection, navigation, observability
 from . import usage as usage_mod
 from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal keeps"
 
@@ -58,7 +60,8 @@ from .bill import TURN_CALL_LIMIT  # ONE definition of "how many calls a seal ke
 #: the stored payload alone.
 #:
 #: 1 — the original payload.
-PAYLOAD_VERSION = 1
+#: 2 — `ToolSpan.navigates_source`, the navigation reading of §3.
+PAYLOAD_VERSION = 2
 
 #: How many tool spans one TURN carries into a seal, the dearest by seconds. A long turn
 #: can run to thousands of spans and a seal is stored, not derived on demand; the rest are
@@ -78,8 +81,8 @@ NORMAL, FULL = "normal", "full"
 #: ambiguous between "sealed at `normal`" and "this order ran no tools".
 UNKNOWN = "unknown"
 
-#: What the ceiling gives up, in order. The two params rungs ship present and unreachable:
-#: params are only sealed at `full`, which is §6.
+#: What the ceiling gives up, in order. The two params rungs bite on a `full` seal only:
+#: params are sealed at `full` and at no other level, which is §6.
 _DROP_ORDER = ("params", "subagent_params", "subagent_spans", "spans_over_limit")
 
 #: Per-turn keys that hold folded NUMBERS rather than sealed objects — carried across an
@@ -100,10 +103,20 @@ def level_of(payload: dict[str, Any]) -> str:
 # -- sealing ---------------------------------------------------------------------------
 
 
-def _span(span: inspection.ToolSpan) -> dict[str, Any]:
-    # Boundaries only: `params` belong to §6's `full` level and are never sealed here.
-    return {"name": span.name, "tool_id": span.tool_id, "started": span.started,
-            "ended": span.ended, "detail": span.detail}
+def _span(span: inspection.ToolSpan, *, params: bool) -> dict[str, Any]:
+    # `backgrounded` at EVERY level: `ToolSpan.is_join` derives from it (Neo 1124).
+    row: dict[str, Any] = {"name": span.name, "tool_id": span.tool_id,
+                           "started": span.started, "ended": span.ended,
+                           "detail": span.detail, "backgrounded": span.backgrounded,
+                           # §3: at EVERY level, for `backgrounded`'s reason — the
+                           # command it was derived from is only sealed at `full`.
+                           "navigates_source": span.navigates_source}
+    # §6: the parameters are what `full` buys, so at `normal` none of the three keys exist.
+    if params:
+        row["params"] = span.params
+        row["params_truncated"] = span.params_truncated
+        row["params_dropped"] = span.params_dropped
+    return row
 
 
 def _call(call: usage_mod.Call) -> dict[str, Any]:
@@ -181,7 +194,7 @@ def _fold_calls(calls: Sequence[usage_mod.Call]) -> dict[str, Any]:
             "cache_write": sum(c.cache_write for c in calls)}
 
 
-def _turn(turn: inspection.Turn) -> dict[str, Any]:
+def _turn(turn: inspection.Turn, *, params: bool) -> dict[str, Any]:
     spans = sorted(turn.spans, key=lambda s: s.seconds, reverse=True)
     kept_spans, folded_spans = spans[:TURN_SPAN_LIMIT], spans[TURN_SPAN_LIMIT:]
     calls = sorted(turn.calls, key=lambda c: c.total_tokens, reverse=True)
@@ -192,9 +205,11 @@ def _turn(turn: inspection.Turn) -> dict[str, Any]:
         "awaiting_since": turn.awaiting_since,
         "triggers": [_prompt(p) for p in turn.triggers],
         # Back in transcript order: the seal is read as a story, not as a ranking.
-        "spans": [_span(s) for s in sorted(kept_spans, key=lambda s: s.started)],
+        "spans": [_span(s, params=params)
+                  for s in sorted(kept_spans, key=lambda s: s.started)],
         "calls": [_call(c) for c in sorted(kept_calls, key=lambda c: c.ts)],
-        "subagents": [_subagent(s) for s in turn.subagents[:SUBAGENT_LIMIT]],
+        "subagents": [_subagent(s, params=params)
+                      for s in turn.subagents[:SUBAGENT_LIMIT]],
     }
     if folded_spans:
         payload["spans_folded"] = _fold_spans(folded_spans)
@@ -205,10 +220,15 @@ def _turn(turn: inspection.Turn) -> dict[str, Any]:
     return payload
 
 
-def _subagent(sub: inspection.SubagentAnatomy) -> dict[str, Any]:
+def _subagent(sub: inspection.SubagentAnatomy, *, params: bool) -> dict[str, Any]:
     return {"task_id": sub.task_id, "label": sub.label, "deeper": sub.deeper,
-            "turns": [_turn(t) for t in sub.turns],
-            "writes": [_write(w) for w in sub.writes]}
+            "turns": [_turn(t, params=params) for t in sub.turns],
+            "writes": [_write(w) for w in sub.writes],
+            # THRESHOLD-FREE, and sealed for the reason spec 2026-10-02 §1.3 gives: a
+            # field the seal drops silently becomes zero on every settled order.
+            "total_written": sub.total_written, "max_write": sub.max_write,
+            "write_floor": sub.write_floor, "api_call_count": sub.api_call_count,
+            "boundaries": [_boundary(b) for b in sub.boundaries]}
 
 
 def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
@@ -217,6 +237,8 @@ def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
     `level` is the CALLER'S argument and is recorded from day one: with no gate this
     child's `seal_autopsies` can only pass `normal`, and §5 is what makes `full` reachable.
     """
+    # §6: the tool parameters are what `full` buys, decided once for the whole payload.
+    params = level == FULL
     payload = {
         "payload_v": PAYLOAD_VERSION,
         "autopsy_level": level,
@@ -230,8 +252,9 @@ def to_seal(anatomy: inspection.Anatomy, *, level: str) -> dict[str, Any]:
         "writes": [_write(w) for w in anatomy.writes],
         # Classified ONCE over the session and attributed per turn on the way back in.
         "boundaries": [_boundary(b) for b in anatomy.boundaries],
-        "unattached_subagents": [_subagent(s) for s in anatomy.unattached_subagents],
-        "turns": [_turn(t) for t in anatomy.turns],
+        "unattached_subagents": [_subagent(s, params=params)
+                                 for s in anatomy.unattached_subagents],
+        "turns": [_turn(t, params=params) for t in anatomy.turns],
     }
     return _fit(payload)
 
@@ -267,7 +290,7 @@ def _subagent_turns(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _drop_params(turns: Sequence[dict[str, Any]]) -> bool:
-    """Rung 1 and 2: the tool parameters. Present and unreachable at `normal` — §6."""
+    """Rung 1 and 2: the tool parameters, which only a `full` seal carries — §6."""
     gone = False
     for turn in turns:
         for span in turn.get("spans") or []:
@@ -305,10 +328,32 @@ _RUNGS = {
 # -- rehydrating -----------------------------------------------------------------------
 
 
+def _nav_of(row: dict[str, Any]) -> bool | None:
+    """The span's navigation reading, or None when this payload never held one.
+
+    §3: NO default and never `bool(...)` — `bool(None)` is a measured False over a call
+    nobody classified (kn-4d32fe12). A v1 payload is re-derived from the stored
+    `params["command"]` where there is one, and that re-derivation is LOSSY: at `normal`
+    no params were sealed and a `params_dropped` key cannot be recovered, so those spans
+    stay unclassified rather than becoming zero.
+    """
+    if "navigates_source" in row:
+        return row["navigates_source"]
+    command = str((row.get("params") or {}).get("command") or "")
+    if row.get("name") != "Bash" or not command:
+        return None
+    return navigation.navigates_source(command, navigation.SOURCE_SUFFIXES)
+
+
 def _read_span(row: dict[str, Any]) -> inspection.ToolSpan:
     return inspection.ToolSpan(name=row["name"], tool_id=row["tool_id"],
                                started=row["started"], ended=row["ended"],
-                               detail=row.get("detail", ""))
+                               detail=row.get("detail", ""),
+                               params=row.get("params") or {},
+                               params_truncated=list(row.get("params_truncated") or []),
+                               params_dropped=list(row.get("params_dropped") or []),
+                               backgrounded=bool(row.get("backgrounded")),
+                               navigates_source=_nav_of(row))
 
 
 def _read_call(row: dict[str, Any]) -> usage_mod.Call:
@@ -351,7 +396,15 @@ def _read_subagent(row: dict[str, Any]) -> inspection.SubagentAnatomy:
         task_id=row["task_id"], label=row.get("label", ""),
         deeper=row.get("deeper", 0),
         turns=[_read_turn(t) for t in row.get("turns") or []],
-        writes=[_read_write(w) for w in row.get("writes") or []])
+        writes=[_read_write(w) for w in row.get("writes") or []],
+        # NO `0` DEFAULT (spec 2026-10-02 §1.3, as it lands on seals written BEFORE the
+        # keys existed): absent must stay distinguishable from a measured zero, or the
+        # renderer says `wrote nothing to the cache` about 334,427 tokens.
+        total_written=row.get("total_written"),
+        max_write=row.get("max_write"),
+        write_floor=row.get("write_floor"),
+        api_call_count=row.get("api_call_count"),
+        boundaries=[_read_boundary(b) for b in row.get("boundaries") or []])
 
 
 def from_seal(payload: dict[str, Any], *,
@@ -541,6 +594,34 @@ _LEVEL_NOTES = {
            "redacted"),
 }
 
+#: An EMPTY `params` as three DIFFERENT claims (§6). A different question from
+#: `_LEVEL_NOTES`, which describes what the level keeps: this one says what the emptiness
+#: MEANS, and one sentence for all three would make the level's answer read as the order's.
+_PARAMS_NOTES = {
+    UNKNOWN: ("this autopsy predates the recorded level, so whether it ever held tool "
+              "parameters cannot be told from it"),
+    NORMAL: ("no tool parameters here because they are not recorded at this level, which "
+             "is this level's answer and not this order's"),
+    FULL: ("this order ran no tools: the level records every parameter and there were "
+           "none to record"),
+}
+
+#: The FOURTH claim, and the one that outranks all three above (§6): the params were
+#: recorded at this level and then given up by the ceiling's rungs. Missing from this SEAL,
+#: never from this ORDER — which is the opposite of what `_PARAMS_NOTES[FULL]` would say.
+_PARAMS_DROPPED_NOTE = ("{which} tool parameters were recorded at this level and then "
+                        "dropped to fit the payload ceiling, so they are missing from "
+                        "this SEAL and not from this ORDER")
+
+#: Which rungs went, as the sentence's subject. Rung 1 is the lead's params, rung 2 the
+#: nested subagents' — and only rung 1 going is why the dropped case cannot wait behind
+#: `any_params`.
+_DROPPED_WHICH = {
+    ("params",): "the lead's",
+    ("subagent_params",): "the nested subagents'",
+    ("params", "subagent_params"): "the lead's and the nested subagents'",
+}
+
 #: Rule (b) at the state that is neither a reading nor a seal: no session was ever
 #: recorded, so there is nothing to read and nothing was frozen.
 NOT_RECORDED_NOTE = ("no session id on this order and no sealed autopsy: its clock is "
@@ -572,6 +653,22 @@ _DERIVED_BELOW_NOTE = ("derived from the session transcript at a write floor of 
 def autopsy_level_note(level: str) -> str:
     """What a seal taken at `level` kept — three states, three sentences."""
     return _LEVEL_NOTES.get(level, _LEVEL_NOTES[UNKNOWN])
+
+
+def params_note(level: str, any_params: bool,
+                dropped: Sequence[str] = ()) -> str:
+    """What an EMPTY `params` means at this level — §6. Nothing, when there are any.
+
+    The CEILING is answered first and before `any_params`: with only rung 1 gone the
+    subagents' params are still there, so a short-circuit would leave the lead's missing
+    ones unexplained, and at `full` with both gone the "ran no tools" sentence is false.
+    """
+    went = tuple(rung for rung in ("params", "subagent_params") if rung in dropped)
+    if went:
+        return _PARAMS_DROPPED_NOTE.format(which=_DROPPED_WHICH[went])
+    if any_params:
+        return ""
+    return _PARAMS_NOTES.get(level, _PARAMS_NOTES[UNKNOWN])
 
 
 def _at_floors(sealed: dict[str, Any], spans: Sequence[inspection.Hold],
@@ -621,12 +718,16 @@ def _provenance(source: str, *, anatomy: inspection.Anatomy,
                 f"derived from the session transcript at a write floor of "
                 f"{anatomy.write_floor:,} tokens and a join floor of "
                 f"{anatomy.join_floor:.0f}s")
+    any_params = source == DERIVED or "params" in _keys(sealed or {})
     return {"source": source, "sealed_at": at, "level": level,
             "level_note": autopsy_level_note(level) if sealed is not None else "",
             "write_floor": anatomy.write_floor, "join_floor": anatomy.join_floor,
             # Whether the reading carries tool parameters at all: a derived one does, a
             # seal only at `full` (§6).
-            "params": source == DERIVED or "params" in _keys(sealed or {}),
+            "params": any_params,
+            # §6: what an EMPTY `params` means, which the level alone cannot say.
+            "params_note": params_note(level, any_params,
+                                       (sealed or {}).get("dropped_for_size") or ()),
             "floor_note": floor_note, "note": note}
 
 

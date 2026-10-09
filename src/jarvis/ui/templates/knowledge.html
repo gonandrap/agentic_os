@@ -5,8 +5,9 @@
 <h2>Knowledge base <span class="sub">({{ rows|length }} entries)</span></h2>
 <p class="sub">
   Workers get this as an <strong>index</strong> and pull entries on demand
-  (<code>jarvis learn search</code> / <code>jarvis learn show &lt;id&gt;</code>), so the
-  base can grow without inflating every prompt. <strong>Pinned</strong> entries are the
+  (<code>jarvis learn search</code> says which entries match — headline, id and one
+  matching line; <code>jarvis learn show &lt;id&gt;</code> is the only verb that returns a
+  body), so the base can grow without inflating every prompt. <strong>Pinned</strong> entries are the
   exception — they are pasted verbatim into every worker prompt. Pin sparingly: safety
   rails only.
 </p>

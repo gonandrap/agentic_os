@@ -850,7 +850,7 @@ def test_an_old_forced_row_with_no_cause_still_reads_as_a_rebind():
 
 
 def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
-    """§8 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
+    """§8 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md, and kn-3f133363:
     an unlabelled kind renders as a bare kind plus a JSON blob while `event_level` calls
     it signal. THE VERB SAYS WHO — this event is only ever written by a user-facing
     surface and must never read afterwards as something the OS decided."""
@@ -863,3 +863,21 @@ def test_a_retry_says_who_asked_for_it_and_whether_they_said_anything():
     assert entries[0]["detail"] == "with your message"
     assert entries[1]["detail"] == ("the OS's own relaunch note — you sent no message")
     assert "{" not in "".join(e["label"] + e["detail"] for e in entries)
+
+
+def test_turn_harvested_is_signal():
+    """What the OS read off disk when a turn died is the story, not the plumbing —
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md §5."""
+    from jarvis.timeline import TURN_HARVESTED
+
+    assert event_level(TURN_HARVESTED) == "signal"
+    full = build_timeline({}, [ev(TURN_HARVESTED, 1.0, seq=7, version=1, empty=False,
+                                  authored={"branch": "wo-2ae", "base": "origin/main",
+                                            "commits": 3, "dirty": ["src/a.py"]},
+                                  checkpoint="9f8e7d6")], [])[0]
+    assert full["label"] == "Harvested what the turn left behind"
+    assert full["detail"] == "3 commits, 1 uncommitted file checkpointed as 9f8e7d6"
+    empty = build_timeline({}, [ev(TURN_HARVESTED, 1.0, seq=7, version=1, empty=True,
+                                   authored={}, checkpoint="")], [])[0]
+    assert empty["label"] == "Nothing to harvest"
+    assert empty["detail"] == "the worktree was clean and the turn said nothing"

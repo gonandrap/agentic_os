@@ -14,7 +14,7 @@
       <a href="/wo/{{ bill.project }}/{{ bill.id }}" class="mono">{{ bill.id }}</a> ·
       {# This page shows only money, on purpose. Where the TIME went, what the turn is
          doing now and why it is not moving are one click away — spec §7 of
-         docs/specs/2026-09-24-order-observability.md. Work orders only: a feature order
+         docs/superpowers/specs/2026-09-24-order-observability.md. Work orders only: a feature order
          has no session, no turn and no live frame. #}
       <a href="/wo/{{ bill.project }}/{{ bill.id }}/debug">where the time went</a>
     {% endif %} ·
@@ -210,6 +210,23 @@
     Jarvis cannot fix it; what it can do is cost fewer boundaries, which is why sending
     a worker one message beats sending it three.
   </p>
+  {# WHICH SIDE PAID IT (spec 2026-10-02 §1.5). The sentence comes from
+     `bill.SUBAGENT_REWRITE_ZERO`, read by `jarvis cost` too, and ONLY where the subagent
+     side is a structural zero: a non-zero one is a real finding. #}
+  {% if bill.rewrite.by_side and bill.rewrite.by_side.subagent.structural_zero %}
+  <p class="sub" style="margin: 6px 0 0;">
+    {{ subagent_rewrite_zero.format(
+         count=bill.rewrite.by_side.subagent.count,
+         written='{:,}'.format(bill.rewrite.by_side.subagent.cache_write)) }}
+  </p>
+  {% elif bill.rewrite.by_side %}
+  <p class="sub" style="margin: 6px 0 0;">
+    by side — main {{ '{:,}'.format(bill.rewrite.by_side.main.tokens) }} tokens across
+    {{ bill.rewrite.by_side.main.boundaries }}, subagent
+    {{ '{:,}'.format(bill.rewrite.by_side.subagent.tokens) }} across
+    {{ bill.rewrite.by_side.subagent.boundaries }}.
+  </p>
+  {% endif %}
 </div>
 {% endif %}
 

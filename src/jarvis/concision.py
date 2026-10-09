@@ -375,6 +375,20 @@ def house_style() -> str:
     ])
 
 
+#: Three lines, not a section: injected on every `SubagentStart` fleet-wide. The command
+#: strings are fixed by §4.3 of
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md and must stay verbatim.
+SPEC_NAVIGATION = "\n".join([
+    "# Specs and docs are navigated, never read whole",
+    "A spec is a tree of headings: `jarvis spec toc <path>` lists its sections, "
+    "`jarvis spec section <path> <n|name>` returns one, and "
+    "`jarvis spec search \"<words>\"` finds which spec covers a thing. Reach for those "
+    "before `Read` with no `limit`, `cat` or `sed -n` on a `.md` file.",
+    "`grep`, `rg` and `find` over markdown stay fine for text questions — a phrase, a "
+    "filename. Reading the whole document to reach one section is the waste.",
+])
+
+
 def subagent_context(env: dict[str, str] | None = None) -> str:
     """What a `SubagentStart` hook injects: the house style, plus the project's standing
     worker instructions when it has any.
@@ -386,11 +400,21 @@ def subagent_context(env: dict[str, str] | None = None) -> str:
     worker was given out of band have to be re-delivered here or the subagent writes
     without either.
 
+    THE SPEC-NAVIGATION BLOCK IS HERE FOR THAT SAME INHERITANCE GAP, and it is the whole
+    cause of §1(b) of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: the
+    sessions doing the 5,187-token whole-spec reads are Task subagents, and no mechanism
+    had ever told them anything about navigation — not the worker brief (an
+    `--append-system-prompt`), not the agent persona, not `SessionStart`. A few lines
+    only: this fires on every `SubagentStart` in every project and is pure overhead for a
+    subagent that never opens a spec.
+
     The standing prompt is read from the environment, never from `catalog`: see the
-    module docstring.
+    module docstring. The command strings are literals here rather than imported from
+    `worker_brief` — that module imports this one, so the import would be a cycle (§4.3
+    sanctions the repetition; `tests/test_worker_brief.py` pins them byte-identical).
     """
     standing = (env if env is not None else os.environ).get(STANDING_PROMPT_ENV) or ""
-    parts = [house_style()]
+    parts = [house_style(), SPEC_NAVIGATION]
     if standing.strip():
         parts.append("# Standing instructions for this project\n\n" + standing.strip())
     return "\n\n".join(parts)

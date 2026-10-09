@@ -371,6 +371,144 @@ def test_a_question_that_does_not_exist_says_so(client):
     assert "not found" in r.text
 
 
+def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
+    """§6 of docs/superpowers/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
+    and an absent ratio reads "not recorded" rather than 0%."""
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert '<span class="sub">not recorded</span>' in page.text
+    # past the stylesheet, whose own percentages are not figures
+    body = page.text.split("</style>")[-1]
+    assert "0%" not in body, "an absent rate must never render as a measured zero"
+    # a measured zero IS printed: the question census has a row for everything
+    assert "0 question" in page.text
+
+
+def test_the_neo_page_links_to_the_report_and_is_otherwise_unchanged(client):
+    page = client.get("/neo")
+    assert page.status_code == 200
+    assert 'href="/neo/stats"' in page.text
+    # no statistics block among the review forms — the reason the report is its own page
+    assert "escalation rate" not in page.text
+
+
+def test_the_neo_stats_page_prints_the_counts_and_the_cause_split(client, daemon,
+                                                                 project):
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="high-stakes")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "high-stakes" in page
+    assert "1 question" in page
+    assert "Neo chose this label" in page
+
+
+def test_the_stats_page_reads_the_causes_as_three_answers_to_who_decided(client, daemon,
+                                                                        project):
+    """Neo, question 1170: an override is a THIRD answer to "who decided", and the class
+    nothing can write is named rather than left to vanish."""
+    from jarvis import ops as ops_mod
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "FORCE_ESCALATE: may I rotate the production key?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "escalated", cause="stakes-unclassified")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "stakes-unclassified" in page
+    assert "Neo answered and the OS overrode it" in page
+    assert "Neo chose to hand it back" in page
+    assert "Neo never answered" in page
+    assert ops_mod.NEO_ESCALATION_INVISIBLE_NOTE in page
+
+
+def test_the_stats_page_renders_spend_and_latency_over_several_neo_kinds(client, project):
+    """Two kinds is the case the page is FOR, and it is where sorting by a bucket breaks:
+    `dictsort(by='value')` compares the bucket dicts themselves and raises
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'`.
+
+    Found by scripts/screenshot_neo_stats.py — every earlier test seeded at most one kind.
+    """
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project))
+        for kind, model, latency in (("neo_answer", "claude-sonnet-4-5", 240),
+                                     ("panel_seat", "claude-opus-5", None)):
+            central.add_agent_call(
+                kind, project="proj_a", wo_id="wo-1", model=model, latency_ms=latency,
+                usage={"input": 10, "cache_write": 20, "cache_read": 30, "output": 40,
+                       "total_cost_usd": 0.01})
+        central.conn.commit()
+    finally:
+        central.close()
+
+    page = client.get("/neo/stats")
+    assert page.status_code == 200
+    assert "neo_answer" in page.text and "panel_seat" in page.text
+    # the latency block's "measured/calls" rendering, with the untimed kind at 0/1
+    assert "0/1 timed" in page.text and "1/1 timed" in page.text
+
+
+def test_the_stats_page_trend_counts_stay_on_one_line(client, daemon, project):
+    """wo-327f211c: at 1280px "10 asked · 1 escalated" wrapped inside a 150px span, so the
+    trend block rendered at twice its height. bill.html:110 idiom is white-space: nowrap."""
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+
+    page = client.get("/neo/stats").text
+    trend = [ln for ln in page.splitlines() if "asked ·" in ln and "style" in ln]
+    assert trend, "no inline-styled trend row found"
+    for line in trend:
+        assert "white-space: nowrap" in line, line
+
+
+def test_the_stats_page_trend_row_carries_the_unreachable_count_and_rate(client, daemon,
+                                                                        project):
+    """Spec §4: a bar may never contradict the counts beside it."""
+    from jarvis.neo_store import NeoStore
+
+    wo = ops.create_work_order("proj_a", "pick a format")
+    daemon.tick()
+    ops.ask_question(wo["id"], "which format?")
+    daemon._neo_drain()
+    neo = NeoStore()
+    try:
+        neo.mark(1, "failed", cause="transport-unreachable")
+    finally:
+        neo.close()
+
+    page = client.get("/neo/stats").text
+    assert "never reached" in page
+    block = page.split("The trend")[1].split("<h2>")[0]
+    assert "never reached" in block
+    assert "unreachable" in block
+    # the bar stays driven by the ESCALATION rate, which is 0 here, so none is drawn
+    assert "0%" in block
+
+
+def test_an_unregistered_project_on_the_stats_page_is_an_error_not_a_crash(client):
+    page = client.get("/neo/stats?project=nope")
+    assert page.status_code == 200
+    assert "not registered" in page.text
+
+
 def test_the_question_page_reviews_the_answer_and_stays_put(client, daemon, project):
     """The timeline sends the reader here; the decision has to be here too.
 
@@ -2772,6 +2910,106 @@ def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(clie
         assert ops.work_order_budget(wo["id"])["budget_usd"] is None
 
 
+def _broke_family(project, *, budget_usd: float = 3.0,
+                  kind: str = "investigation") -> tuple[str, str]:
+    """A family whose money is gone and one child parked on its slice.
+
+    Written through the store rather than ticked into existence: these two tests are about
+    the ROUTE's non-error channel, not about the allocator, which
+    tests/test_budget.py owns.
+    """
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order("why is it stuck", description="it is stuck",
+                                        kind=kind, budget_usd=budget_usd)
+        store.set_feature_status(fo["id"], "planning")
+        # The child's kind is the family's, not a free choice: `store.feature_children`
+        # selects `kind='worker'` only, and a non-feature family's one child reaches
+        # `budget.family` as the parent's `plan_wo_id` instead (tests/test_budget.py's
+        # `_the_one_child`). Get either wrong and the pool sees no spend at all.
+        child = store.create_work_order(
+            "diagnose it", description="look", parent_id=fo["id"],
+            kind="worker" if kind == "feature" else "investigator")
+        if kind != "feature":
+            store.update_feature_order(fo["id"], plan_wo_id=child["id"])
+        store.update_work_order(child["id"], budget_reserved_usd=budget_usd,
+                                status="budget_exhausted")
+        turn = store.create_turn(child["id"], kind="message", prompt="work")
+        store.finish_turn(turn["id"], "done", result="done", cost_usd=9.0,
+                          usage_json=json.dumps({"total_cost_usd": 9.0}))
+        return fo["id"], child["id"]
+    finally:
+        store.close()
+
+
+def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, project):
+    """Obligation 8 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
+    The reporter's literal path: the budget WAS raised and the page said nothing. A red ✗
+    would be the second false statement — a refusal is not an error, and a user who sees
+    one raises the child's number again instead of the family's."""
+    _fo_id, child = _broke_family(project)
+    r = client.post(f"/wo/proj_a/{child}/budget", data={"amount": "$10"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location
+    assert "error=" not in location
+    assert "jarvis+investigate+budget" in location or \
+        "jarvis%20investigate%20budget" in location
+
+    page = client.get(f"/wo/proj_a/{child}{location[location.index('?'):]}").text
+    assert "jarvis investigate budget" in html.unescape(page)
+    # The rendered DIV, not the class name: base.html's stylesheet defines
+    # `.error-flash` on every page, so a bare substring check can never fail.
+    assert '<div class="error-flash">' not in page
+    assert '<div class="note-flash"' in page
+
+
+def test_the_budget_card_calls_the_family_by_its_kind(client, project):
+    """The card beside the flash said "its feature's slice" for an investigation.
+    `Ceiling.source == 'feature'` is the ALLOCATOR's word for "the family's cap", not a
+    claim about the parent's kind — the two surfaces must agree, so the card reads the
+    same `ops.family_prose` table the note does."""
+    _fo_id, child = _broke_family(project)
+    page = html.unescape(client.get(f"/wo/proj_a/{child}").text)
+    assert "its investigation's slice" in page
+    assert "its feature's slice" not in page
+    assert "its investigation has $0.00 unreserved" in page
+
+
+def test_raising_a_family_with_parked_children_names_them(client, project):
+    """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to
+    the user — `jarvis wo budget <child> <amount>` is what spends the new money."""
+    fo_id, child = _broke_family(project, kind="feature")
+    r = client.post(f"/fo/proj_a/{fo_id}/budget", data={"amount": "$50"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location and "error=" not in location
+
+    page = html.unescape(client.get(f"/fo/proj_a/{fo_id}"
+                                    f"{location[location.index('?'):]}").text)
+    assert child in page
+    assert "jarvis wo budget" in page
+    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN
+    # ceiling, not on "their own ceiling".
+    assert "1 work order still parked on its own ceiling" in page
+
+
+def test_api_status_carries_every_feature_order_kind(client, project):
+    """Obligation 7 at the surface that reads the payload: `/api/status` and
+    `jarvis status --json` are its only consumers, Jarvis's own pulse check included."""
+    store = ProjectStore(project)
+    try:
+        io = store.create_feature_order("slow first turns", description="three in a row",
+                                        kind="improvement")
+        store.set_feature_status(io["id"], "planning")
+    finally:
+        store.close()
+    rows = client.get("/api/status").json()["projects"][0]["feature_orders"]
+    row = next(r for r in rows if r["id"] == io["id"])
+    assert row["kind"] == "improvement"
+    assert row["status_label"] == "analysing"
+
+
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     """It is the only blocker the reader cannot answer by reading: the order is stopped
     and spending nothing until they decide."""
@@ -3085,7 +3323,7 @@ def test_the_terminal_names_the_blocker_too(client, project, capsys):
 
 
 # -- the retry control -----------------------------------------------------------------
-# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
 
 #: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
 #: the timeline or the conversation, which also talk about retries (kn-d51713af).
