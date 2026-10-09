@@ -59,7 +59,7 @@ _SWEEP_COMMANDS = ("grep", "rg", "find")
 _WRAPPERS = ("sudo", "command", "env", "nohup", "setsid", "time")
 
 #: Flags by which a sweep names its OWN scope. §6 of
-#: docs/specs/2026-10-02-serena-the-cheap-path.md.
+#: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 _SCOPE_FLAGS = ("-name", "-iname", "-path", "-ipath", "--include", "-g", "--glob")
 
 #: `sed` reads a file only with `-n`; without it, it is an edit.
@@ -173,7 +173,7 @@ def navigates_source(command: str, suffixes: tuple[str, ...],
     or a pipeline navigates when ANY statement does.
 
     `scoped_sweeps` makes a sweep count only when the sweep's own scope names a
-    configured suffix (§6 of docs/specs/2026-10-02-serena-the-cheap-path.md). DEFAULT
+    configured suffix (§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md). DEFAULT
     OFF: `nav_volume.BEFORE_NOTE`'s baseline was measured with unscoped sweeps counting,
     so the counter's reading stays byte-identical.
 

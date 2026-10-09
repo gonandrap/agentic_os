@@ -40,7 +40,7 @@ def test_a_recursive_sweep_of_the_tree_navigates_source():
 
 
 def test_an_unscoped_sweep_does_not_navigate_source_with_scoped_sweeps_on():
-    """§6 of docs/specs/2026-10-02-serena-the-cheap-path.md: under the flag a sweep counts
+    """§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md: under the flag a sweep counts
     only when its own scope names a configured suffix."""
     assert navigation.navigates_source('grep -rn "def foo" .', (".py",),
                                        scoped_sweeps=True) is False
