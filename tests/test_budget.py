@@ -1056,6 +1056,35 @@ def test_the_post_condition_exempts_the_window_the_settler_declines(started, sto
         "INV-BUDGET-OVERSPENT"]
 
 
+@pytest.mark.parametrize("knob", [None, 7.5])
+def test_no_second_budget_knob(jarvis_home, project, tmp_path, knob):
+    """Neo's one condition on 1073: the stuck sweep passes NO `budget_usd`, so the only
+    per-session ceiling is `worker.investigation_budget_usd` (§4 of
+    docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md)."""
+    from test_health_sweep import park_order, stuck_catalog
+
+    from jarvis.catalog import load_catalog
+    from jarvis.daemon import Daemon
+
+    spec = {"name": "proj_a", "path": str(project)}
+    if knob is not None:
+        spec["worker"] = {"investigation_budget_usd": knob}
+    cat = load_catalog(stuck_catalog(tmp_path, [spec]))
+    store = ProjectStore(project)
+    try:
+        wo = ops.create_work_order("proj_a", "parked")
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+        Daemon(cat).stuck_tick(None)
+        opened = ops.list_investigation_orders("proj_a", include_settled=True)
+        assert len(opened) == 1
+        assert opened[0]["budget_usd"] == budget.investigation_default_for(
+            cat.project("proj_a"))
+        if knob is not None:
+            assert opened[0]["budget_usd"] == knob
+    finally:
+        store.close()
+
+
 # -- a family that is not a feature ----------------------------------------------------
 #
 # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: every budget
