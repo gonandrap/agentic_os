@@ -1081,7 +1081,7 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
             # naming the question rather than the generic one below, which would send
             # them looking for a session to type into.
             blockers.append(neo_question_blocker(question))
-        elif (question is None and not _waiting_on_neo_gate(store, wo)
+        elif (question is None and not waiting_on_neo_gate(store, wo)
                 and not store.queued_messages(wo["id"])):
             # A queued message is the reply already on its way: `ops.send_message` clears
             # the flag the moment the user writes it, and this line put it back on the
@@ -2057,7 +2057,7 @@ def _mentions_assumptions(reason: str | None) -> bool:
     return "assumption" in (reason or "").lower()
 
 
-def _waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
+def waiting_on_neo_gate(store: ProjectStore, wo: dict[str, Any]) -> bool:
     """True when this work order is parked on a privileged-action request the user does
     not hold. Not a user blocker either way — but for two different reasons.
 

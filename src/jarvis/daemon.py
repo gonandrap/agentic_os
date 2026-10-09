@@ -236,6 +236,138 @@ _FAMILY_RUNNING_STATUS = {
     "investigation": "planning",
 }
 
+#: Which statuses `Daemon.settle_turns` sweeps — the pass's own filter, named so
+#: `ops.scheduled_actor` can ask the same question of one row (section 3 of
+#: docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md).
+SETTLE_STATUSES = ("running", "idle", "waiting_input", "dispatching")
+
+#: How long after a claim `settle_work_order` waits for the launch to record its turn.
+TURN_CLAIM_GRACE_SECONDS = 300
+
+
+def settle_grace_holds(wo: dict[str, Any], now: float | None = None) -> bool:
+    """Still inside the post-claim grace — section 3 of the 2026-10-09 spec."""
+    return (now or time.time()) - wo["updated_at"] <= TURN_CLAIM_GRACE_SECONDS
+
+
+def settles_turn(store: ProjectStore, wo: dict[str, Any],
+                 now: float | None = None) -> bool:
+    """True when `Daemon.settle_turns` will act on this row — 2026-10-09 spec §3.
+
+    THE GRACE IS IN IT DELIBERATELY. It is the only thing that tells "just claimed"
+    from "the daemon died between the two writes": dropping it would claim an actor
+    for a row no pass will ever touch again, which is the hole this feature exists to
+    close rather than to paper over.
+
+    Cheapest first: two free row fields, then the free grace, then one indexed read.
+    """
+    if wo["status"] not in SETTLE_STATUSES:
+        return False
+    if wo["origin"] in UNGOVERNED_ORIGINS:
+        return False
+    return settle_grace_holds(wo, now) or store.latest_turn(wo["id"]) is not None
+
+
+def retries_turn(store: ProjectStore, wo: dict[str, Any],
+                 now: float | None = None) -> worker_session.TurnPause | None:
+    """The pause `Daemon.retry_paused_turns` will relaunch, or None — 2026-10-09 §3."""
+    if wo["status"] not in RETRY_SWEEP_STATUSES:
+        return None
+    if wo["origin"] in UNGOVERNED_ORIGINS:
+        return None
+    pause = worker_session.turn_pause(store, wo["id"])
+    if pause is not None and pause.resumable and pause.due(now=now):
+        return pause
+    return None
+
+
+def delivers_message(store: ProjectStore, wo: dict[str, Any],
+                     now: float | None = None, *,
+                     queued: list[dict[str, Any]] | None = None) -> bool:
+    """True when `Daemon.deliver_messages` will send a queued turn — 2026-10-09 §3."""
+    msgs = queued if queued is not None else store.queued_messages(wo["id"])
+    if not msgs:
+        return False
+    return worker_session.delivery_hold(store, wo, now=now) is None
+
+
+def feature_wakes_manager(store: ProjectStore, wo: dict[str, Any],
+                          now: float | None = None) -> bool:
+    """True when this manager's feature is still live, so the bus routes to it — §3.
+
+    No parent is unreachable: `idle` is only ever written to a manager, and a manager
+    always carries one (`Daemon.settle_work_order` and `ops.revive_feature_manager`).
+    True keeps the extracted branch identical for it. A DELETED feature raises
+    KeyError, exactly as the branch this came from does.
+    """
+    parent = wo.get("parent_id")
+    if not parent:
+        return True
+    return store.get_feature_order(parent)["status"] not in FO_TERMINAL_STATUSES
+
+
+def runnable_round(store: ProjectStore, wo: dict[str, Any],
+                   now: float | None = None) -> dict[str, Any] | None:
+    """The round `Daemon.validation_tick` will judge, or None — 2026-10-09 §3.
+
+    `ProjectStore.work_orders_awaiting_validation`'s SQL restricted to ONE row: the
+    same `RUNNABLE_VALIDATION_OUTCOMES` and `OPEN_STATUSES` bound, with
+    `latest_validation_round` being the `MAX(round)` that query joins on — plus the
+    pass's own hold test. This round met a window of its own and the refusal named
+    when it lifts; `failed` is RUNNABLE, so without that test the same closed window
+    is walked into every tick (`_validation_held`).
+
+    `work_orders_awaiting_validation` must NOT be called here: it takes no `wo_id`,
+    so it would be a project-wide query per order per reconcile tick.
+    """
+    if wo["status"] not in OPEN_STATUSES:
+        return None
+    row = store.latest_validation_round(wo_id=wo["id"])
+    if not row or row.get("outcome") not in RUNNABLE_VALIDATION_OUTCOMES:
+        return None
+    if validation_hold_until(store.events_of_kind(wo["id"], "validation_failed"),
+                             int(row["round"])) > (now or time.time()):
+        return None
+    return row
+
+
+def polls_pull_request(store: ProjectStore, wo: dict[str, Any],
+                       now: float | None = None, *,
+                       recorded: Any = None) -> bool:
+    """True when `Daemon.poll_pull_requests` will ask GitHub about this row — §3.
+
+    `recorded` is the caller's ONE bulk `work_orders_with_event("pr_url_recorded", …)`
+    read: an id absent from it has no such event, which is
+    `routes_on_pull_request`'s legacy arm already proved.
+    """
+    if wo["status"] not in PR_POLL_STATUSES:
+        return False
+    if not wo.get("pr_url"):
+        return False
+    if recorded is not None and wo["id"] not in recorded:
+        return True
+    from . import ops
+    return bool(ops.routes_on_pull_request(store, wo))
+
+
+def answers_question(store: ProjectStore, wo: dict[str, Any],
+                     now: float | None = None) -> dict[str, Any] | None:
+    """The question Neo still holds for this row, or None — 2026-10-09 §3."""
+    from . import invariants
+    q = invariants.awaiting_neo(wo["id"])
+    from .neo_store import NEO_HELD_Q_STATUSES
+    if q is not None and q["status"] in NEO_HELD_Q_STATUSES:
+        return q
+    return None
+
+
+def reviews_gate(store: ProjectStore, wo: dict[str, Any],
+                 now: float | None = None) -> bool:
+    """True when a privileged-action request the user does not hold is open — §3."""
+    from . import invariants
+    return invariants.waiting_on_neo_gate(store, wo)
+
+
 #: Walk the transcript tree for one-hour cache writes every N ticks — six hours at the
 #: default 5s interval. ITS OWN CADENCE BECAUSE IT IS BY FAR THE DEAREST READ IN THE
 #: DAEMON: a substring pass over every transcript on the machine (843MB and 4,584 files
@@ -2117,14 +2249,12 @@ class Daemon:
         budget = project.max_concurrent - store.count_active()
         for wo in store.list_work_orders(statuses=RETRY_SWEEP_STATUSES):
             held = state.blocked(wo["id"]) if state is not None else ""
-            if wo["origin"] in UNGOVERNED_ORIGINS:
-                continue  # the user's own session; Jarvis does not drive it
             try:
-                pause = worker_session.turn_pause(store, wo["id"])
+                pause = retries_turn(store, wo)
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] could not diagnose %s", project.name, wo["id"])
                 continue
-            if pause is None or not pause.resumable or not pause.due():
+            if pause is None:
                 continue
             # BELOW the filter above, so only an order that was going to be relaunched
             # on this pass is ever recorded — nothing else is being held.
@@ -2299,7 +2429,7 @@ class Daemon:
             # it as the next turn once the hold clears. The same call answers
             # `invariants.stuck_message`, which is what keeps "nothing is coming" and
             # "this is why" from drifting apart.
-            if worker_session.delivery_hold(store, wo) is not None:
+            if not delivers_message(store, wo, queued=[msg]):
                 continue
             pending.setdefault(wo["id"], []).append(dict(msg))
         # Chronological, because `queued_messages` is and a dict keeps insertion order:
@@ -2393,15 +2523,8 @@ class Daemon:
             if state is not None and state.pause is not None \
                     and not state.pause.allows(wo_id):
                 continue  # the user paused the fleet; the panel spends on this too (#843)
-            round_row = store.latest_validation_round(wo_id=wo_id)
-            if round_row is None:  # pragma: no cover - the query selected on this round
-                continue
-            # This round met a window of its own, and the refusal named when it lifts.
-            # `failed` is RUNNABLE, so without this the same closed window is walked into
-            # every tick — which is how `VALIDATION_OUTAGE_LIMIT` used to be spent in
-            # fifteen seconds against an eleven-hour outage (`_validation_held`).
-            if validation_hold_until(store.events_of_kind(wo_id, "validation_failed"),
-                                     int(round_row["round"])) > time.time():
+            round_row = runnable_round(store, wo)
+            if round_row is None:
                 continue
             self.validating.add(wo_id)
             future = self.validate_pool.submit(
@@ -5418,8 +5541,7 @@ class Daemon:
         # invariant pass that would otherwise read it as blocked on the user. It also
         # keeps an idle manager reachable by the branch that closes it when its feature
         # settles.
-        for wo in store.list_work_orders(
-                statuses=("running", "idle", "waiting_input", "dispatching")):
+        for wo in store.list_work_orders(statuses=SETTLE_STATUSES):
             if wo["origin"] in UNGOVERNED_ORIGINS:
                 continue  # not ours to run; track_injected_sessions follows these
             try:
@@ -5473,7 +5595,7 @@ class Daemon:
 
         turn = store.latest_turn(wo["id"])
         if turn is None:
-            if time.time() - wo["updated_at"] <= 300:
+            if settle_grace_holds(wo):
                 return  # just claimed; give the launch a moment to record its turn
             if wo.get("session_id") or wo.get("job_id"):
                 # In flight when this release landed: dispatched under the background
@@ -5713,10 +5835,8 @@ class Daemon:
             # a closed feature, with nothing left that would ever look at it again.
             # Re-derived from the feature rather than guarded with a lock: noticing is
             # what a reconciler is for.
-            parent = wo.get("parent_id")
-            feature = store.get_feature_order(parent) if parent else None
-            if feature and feature["status"] in FO_TERMINAL_STATUSES:
-                self._close_feature_manager(store, str(parent))
+            if not feature_wakes_manager(store, wo):
+                self._close_feature_manager(store, str(wo["parent_id"]))
             elif user_facing_wait(store, wo["id"]):
                 # HOLD IT WHERE IT IS. `waiting_input` is the only carrier of the fact
                 # that this manager ASKED for something, and re-statusing it `idle` would
@@ -6070,8 +6190,8 @@ class Daemon:
         # rare, so `routes_on_pull_request` is asked only about the ids it names.
         recorded = store.work_orders_with_event("pr_url_recorded",
                                                 [wo["id"] for wo in candidates])
-        parked = [wo for wo in candidates
-                  if wo["id"] not in recorded or ops.routes_on_pull_request(store, wo)]
+        parked = [wo for wo in candidates if polls_pull_request(store, wo,
+                                                                recorded=recorded)]
         if not parked:
             return
 
