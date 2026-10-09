@@ -39,6 +39,7 @@ Five properties beyond the ten seed tests:
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import time
@@ -406,11 +407,15 @@ SEEDS = [
 
 
 def _build(make, store, project):
-    """Two shapes of builder — one needs the project path for Neo's DB."""
-    try:
+    """Two shapes of builder — one needs the project path for Neo's DB.
+
+    Chosen by SIGNATURE: a `try`/`except TypeError` around the two-argument call also
+    swallows a genuine TypeError raised INSIDE the builder and retries it with the wrong
+    arity, reporting the second failure instead of the real one.
+    """
+    if len(inspect.signature(make).parameters) == 2:
         return make(store, project)
-    except TypeError:
-        return make(store)
+    return make(store)
 
 
 @pytest.mark.parametrize("gap_class,make_bad,_make_good",
@@ -938,3 +943,30 @@ def test_a_settled_cursor_resumes_at_the_order_created_after_it(
 
     assert seen == ["wo-bbb", "wo-aaa", "wo-ccc"], (
         f"expected the order created after the cursor first, got {seen}")
+
+
+# -- 11. the pass runs AFTER the invariants, within one tick -----------------------------
+
+
+def test_the_rules_pass_runs_after_the_invariants_within_one_tick(started, monkeypatch):
+    """Spec §5.1: `check_invariants` REPAIRS what is unambiguous on this same tick, so a
+    detector pass running before it fires on conditions the OS was about to fix itself.
+
+    Pinned by OBSERVATION, not by reading the source: both methods are replaced on the
+    daemon and record their own name as `tick` calls them.
+    """
+    calls: list[str] = []
+
+    def recorder(name: str):
+        def run(*_a, **_k):
+            calls.append(name)
+            return {}
+        return run
+
+    monkeypatch.setattr(started, "check_invariants", recorder("check_invariants"))
+    monkeypatch.setattr(started, "rules_tick", recorder("rules_tick"))
+
+    started.tick()
+
+    assert calls == ["check_invariants", "rules_tick"], (
+        f"the rules pass did not run after the invariants: {calls}")
