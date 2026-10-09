@@ -4092,6 +4092,78 @@ def check_ui_healthy() -> Iterator[Violation]:
     )
 
 
+def check_ui_wedged() -> Iterator[Violation]:
+    """INV-UI-WEDGED — the dashboard has stopped serving and said so about itself.
+
+    The other half of `check_ui_healthy`, and the half that was missing: that one reads
+    `[ERROR]` entries, and a WEDGE raises no exception at all — every routed page went
+    silent while `systemctl` reported `active (running)` and `ui.log` stayed empty, so
+    silence was indistinguishable from health. §5 of
+    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+
+    Reads the stamp the UI process writes through `uilog`, never by parsing `ui.log`.
+    Never repairable, like every member of `OS_INVARIANTS`: `jarvis doctor` reports and
+    the daemon heals.
+    """
+    from . import release, uilog
+
+    stamp = uilog.read_wedge()
+    if not stamp:
+        return
+    try:
+        last = float(stamp.get("at") or stamp.get("since") or 0)
+        since = float(stamp.get("since") or 0)
+    except (TypeError, ValueError):
+        return
+    # Window-based, exactly as `check_ui_healthy` is and for its reason: the restarted
+    # dashboard is a new process and never comes back to delete the stamp, so a report
+    # that did not expire would say "wedged" for ever after one wedge.
+    if not last or time.time() - last > uilog.ERROR_WINDOW_SECONDS:
+        return
+    age = max(0.0, time.time() - since) if since else 0.0
+    restarts, cap, cap_spent = _ui_restart_counts()
+    yield Violation(
+        invariant="INV-UI-WEDGED",
+        detail=(f"the dashboard reported its threadpool wedged "
+                f"{int(age // 60)} minutes ago and dumped every thread's stack to "
+                f"{stamp.get('dump') or uilog.stack_dump_path()} — the OS has "
+                f"self-restarted {release.UI_UNIT} {restarts} time"
+                f"{'s' if restarts != 1 else ''} in the last 24h"
+                f"{f', which is the cap of {cap}' if cap_spent else ''} "
+                f"(stamp: {uilog.wedge_stamp_path()})"),
+        level="critical" if cap_spent else "warning",
+        context={"since": since, "age_seconds": int(age),
+                 "dump": stamp.get("dump"), "limiter": stamp.get("limiter"),
+                 "version": stamp.get("version"), "restarts": restarts,
+                 "cap": cap, "cap_spent": cap_spent},
+    )
+
+
+def _ui_restart_counts() -> tuple[int, int, bool]:
+    """Self-restarts inside the rolling 24h, the cap, and whether it is spent."""
+    from . import db, ops, uilog
+    from .central_store import CentralStore
+
+    cap = int(getattr(ops.ui_health_config(), "max_restarts_per_day", 0) or 0)
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — a check must not fail on an unopenable store
+        return 0, cap, False
+    try:
+        rows = db.from_json(central.get_state(uilog.UI_WEDGE_RESTARTS), []) or []
+    finally:
+        central.close()
+    cutoff = time.time() - 24 * 3600
+    recent = 0
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            if float(row) >= cutoff:
+                recent += 1
+        except (TypeError, ValueError):
+            continue
+    return recent, cap, bool(cap) and recent >= cap
+
+
 def check_config_drift() -> Iterator[Violation]:
     """INV-CONFIG-DRIFT — the catalog on disk must be the version the ledger calls head.
 
@@ -4651,6 +4723,7 @@ def check_os_identity() -> Iterator[Violation]:
 
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
+    check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
