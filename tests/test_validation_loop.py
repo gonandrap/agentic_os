@@ -1724,6 +1724,113 @@ def test_a_passed_round_does_not_land_an_order_whose_worker_is_typing(fleet,
         store.close()
 
 
+def _defer_under_a_live_turn(fleet, fake_claude, store, wo_id: str):
+    """Park `wo_id` in `validating` WITH a worker turn in flight, then let a `passed`
+    round defer its landing. Returns the hold gate.
+
+    The status is written by hand because no fixture route produces the pair: delivering
+    a message is the only way to start a turn on a validating order, and delivery itself
+    moves the status to `running`. The rows measured in production — wo-9f00e3b5,
+    wo-12b4e416, wo-d2d777dc — were all `validating` when their landing was deferred.
+    """
+    held = Validator(passed())
+    held.block()
+    fleet.daemon.validator = held
+    gate = fake_claude.hold_turns()
+
+    store.queue_message(wo_id, "one more thing")
+    fleet.tick()  # the turn goes out and the round starts behind it
+    assert held.entered.wait(timeout=15), "the round never reached the validator"
+    store.set_status(wo_id, "validating")  # the measured pair: validating + live turn
+    held.release.set()
+    deadline = time.monotonic() + 15
+    while fleet.daemon.validating and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not fleet.daemon.validating
+
+    assert store.latest_validation_round(wo_id=wo_id)["outcome"] == "passed"
+    kinds = [e["kind"] for e in store.list_events(wo_id)]
+    assert "validation_landing_deferred" in kinds
+    assert "validation_landed" not in kinds
+    assert store.get_work_order(wo_id)["status"] == "validating"
+    assert not store.queued_messages(wo_id)
+    return gate
+
+
+def test_a_deferred_landing_is_taken_when_the_order_is_still_validating(fleet,
+                                                                       fake_claude):
+    """The shape nothing else covers: the deferral happened while the status WAS
+    `validating`, which is the only state it can happen in. The recovery used to sit
+    below `settle_work_order`'s `validating` return, so it was unreachable in every case
+    it exists for — measured stuck on wo-9f00e3b5 (7.5d), wo-12b4e416 (8d) and
+    wo-d2d777dc (2d), each with a `passed` round and no round open."""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    store = fleet.store()
+    try:
+        gate = _defer_under_a_live_turn(fleet, fake_claude, store, wo["id"])
+
+        gate.unlink()
+        assert _settle(store, wo["id"])
+        fleet.tick()
+
+        assert store.get_work_order(wo["id"])["status"] == "waiting_pr_merge"
+        assert [e["kind"] for e in store.list_events(wo["id"])].count(
+            "validation_landed") == 1
+    finally:
+        store.close()
+
+
+def test_the_deferred_landing_waits_while_the_worker_is_still_typing(fleet,
+                                                                    fake_claude):
+    """The pairing: the hoisted recovery must keep the deferral's own predicate. A
+    landing written under a live turn is the thing the deferral exists to prevent."""
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    store = fleet.store()
+    try:
+        gate = _defer_under_a_live_turn(fleet, fake_claude, store, wo["id"])
+
+        fleet.tick()  # the turn is still held
+
+        assert store.get_work_order(wo["id"])["status"] == "validating"
+        assert "validation_landed" not in [e["kind"]
+                                           for e in store.list_events(wo["id"])]
+        gate.unlink()
+        assert _settle(store, wo["id"])
+    finally:
+        store.close()
+
+
+def test_a_pending_round_still_stops_the_settler_at_validating(fleet):
+    """The return the recovery was hoisted above is not widened: a round still open owns
+    the work order, and the settler must leave it alone — a done turn with a summary and
+    a `pr_url` would otherwise reach the merge queue unjudged."""
+    held = Validator(passed())
+    held.block()  # the round stays `pending` across the tick
+    fleet.daemon.validator = held
+
+    wo = fleet.dispatch()
+    fleet.change(wo["id"], "print('one')\n")
+    finish(fleet, wo["id"])
+
+    store = fleet.store()
+    try:
+        fleet.tick()
+        assert store.latest_validation_round(wo_id=wo["id"])["outcome"] == "pending"
+        assert store.get_work_order(wo["id"])["status"] == "validating"
+        assert "validation_landed" not in [e["kind"]
+                                           for e in store.list_events(wo["id"])]
+    finally:
+        held.release.set()
+        fleet.drain()
+        store.close()
+
+
 def test_a_give_up_survives_the_turn_that_follows_it(fleet, fake_claude):
     """The mirror of the test above, and the case where the landing must NOT be
     deferred: a give-up writes `needs_review` under a possibly-live turn because

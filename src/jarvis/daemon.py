@@ -5426,6 +5426,20 @@ class Daemon:
                 self.settle_work_order(project, store, wo)
             except Exception:  # noqa: BLE001 — one work order must not stall the rest
                 log.exception("[%s] settling %s failed", project.name, wo["id"])
+        # A DEFERRED LANDING IS OWED IN `validating` AND NOWHERE ELSE, and that status is
+        # not in the sweep above — so the recovery in `settle_work_order` was unreachable
+        # for every row it exists for (wo-9f00e3b5 stuck 7.5d). Only rows with a landing
+        # owed are passed on; the generic sweep stays exactly as narrow as it was. Spec
+        # §3.2, docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md.
+        for wo in store.list_work_orders(statuses=("validating",)):
+            if wo["origin"] in UNGOVERNED_ORIGINS:
+                continue
+            if _landing_deferred(store, wo["id"]) is None:
+                continue
+            try:
+                self.settle_work_order(project, store, wo)
+            except Exception:  # noqa: BLE001 — same isolation as the sweep above
+                log.exception("[%s] settling %s failed", project.name, wo["id"])
 
     def settle_work_order(self, project: ProjectSpec, store: ProjectStore,
                           wo: dict) -> None:
@@ -5469,6 +5483,22 @@ class Daemon:
             # carrying a `result_summary` and a `pr_url`, so without this return the
             # reconciler would set `waiting_pr_merge` on the very next tick and put
             # unvalidated work on the user's merge queue. The runner is what moves it.
+            #
+            # EXCEPT THE LANDING THE ROUND MACHINE ALREADY OWES — a deferral only ever
+            # happens in this status, so the branch below the return could never serve
+            # one (spec §3.2, docs/superpowers/specs/2026-09-25-a-cap-hold-must-say-so.md).
+            # Narrower than the return on purpose: only a round that PASSED, and only
+            # with no turn and no queued message, so nothing writes under a live turn.
+            from . import ops as ops_mod
+
+            deferred = (_landing_deferred(store, wo["id"])
+                        if round_open == "passed" else None)
+            if (deferred is not None
+                    and worker_session.busy(store, wo["id"]) is None
+                    and not store.queued_messages(wo["id"])):
+                fresh = store.get_work_order(wo["id"])
+                ops_mod.land_when_cleared(store, fresh)
+                store.add_event(wo["id"], VALIDATION_LANDED, {"round_id": deferred})
             return
 
         turn = store.latest_turn(wo["id"])
