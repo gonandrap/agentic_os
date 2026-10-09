@@ -1582,6 +1582,12 @@ class RemedyConfig:
     allowed: tuple[str, ...] = ()
 
 
+#: How many samples a median in the evolution report needs before it is reported as one
+#: (§9 of docs/superpowers/specs/2026-09-27-self-evolution.md). A median over fewer than
+#: three samples is one sample wearing a statistic's name.
+DEFAULT_RULES_MIN_SAMPLES = 3
+
+
 @dataclass
 class RulesConfig:
     """Whether the self-evolution registry is EVALUATED at all. §5.2 of
@@ -1595,12 +1601,19 @@ class RulesConfig:
     between "no rule has ever matched" and "nothing has ever looked".
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
-    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. One
-    field today, and the shape is the house one so the arming threshold and the remedy
-    allow-list §6 adds do not arrive as a second config object.
+    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. The
+    shape is the house one so the arming threshold and the remedy allow-list §6 adds do
+    not arrive as a second config object.
+
+    `min_samples` is the floor under every median the §9 evolution report prints. It
+    lives here rather than as a module constant in `ops` because how much history a
+    project needs before it believes its own numbers is a judgement about that project,
+    and the report says "fewer than N" in its own notes — so the N a reader is shown and
+    the N the report applied are the same value, read once.
     """
 
     enabled: bool = False
+    min_samples: int = DEFAULT_RULES_MIN_SAMPLES
 
 
 @dataclass
@@ -2494,13 +2507,20 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
                  where: str = "os.rules") -> RulesConfig:
     """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
 
-    Nothing to validate beyond the shape: one boolean, whose default is the shipped
-    `False` when neither the fleet nor the project names it.
+    `enabled` needs no validation: a boolean whose default is the shipped `False` when
+    neither the fleet nor the project names it. `min_samples` does, the way
+    `_parse_concision` refuses a negative cap: 1 is the floor, because a "median" over
+    zero samples is not a statistic that could be computed at all, and the report's own
+    note promises the reader a number of samples it waited for.
     """
     base = base or RulesConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)))
+    min_samples = int(raw.get("min_samples", base.min_samples))
+    if min_samples < 1:
+        raise _err(f"{where}.min_samples must be 1 or more, got {min_samples}")
+    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)),
+                       min_samples=min_samples)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,

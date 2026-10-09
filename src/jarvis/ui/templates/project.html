@@ -191,6 +191,17 @@
    own (Neo, question 410). #}
 {{ issues_ui.board(issue_board, project_name) }}
 
+{# A LINK, not a second copy of the report: every figure there is
+   `ops.evolution_report`'s and a paraphrase here would be a third renderer of the same
+   registry. §9 of docs/superpowers/specs/2026-09-27-self-evolution.md. #}
+<h2>Is the OS getting better at running this project?</h2>
+<div class="panel">
+  <p class="kv">What share of this project's stuck orders a rule resolved on its own,
+    which gap classes keep coming back, and what the OS has learned about it —
+    <a href="/evolution/{{ project_name }}">the evolution report for {{ project_name }} →</a>
+  </p>
+</div>
+
 {% if backlog %}
 <h2>Open backlog for this project</h2>
 <div class="panel">

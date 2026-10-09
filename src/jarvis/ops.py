@@ -11563,6 +11563,503 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
     return out
 
 
+# -- the evolution report (§9) ----------------------------------------------------------
+#
+# docs/superpowers/specs/2026-09-27-self-evolution.md §9: is the OS actually getting
+# better at running itself, and WHERE. `evolution_report` computes every number ONCE and
+# returns a plain dict; the CLI and the dashboard render it verbatim and derive nothing,
+# for `rules_list`'s reason — two renderers each doing their own arithmetic is how the
+# two surfaces start disagreeing about the same registry.
+#
+# The three rules the shape follows, in the order they bite:
+#
+# 1. ABSENT IS NEVER ZERO. No armed rule is not a mechanical share of 0%, a detector with
+#    no fires has no hit rate, a week nothing happened in is not a point of zero, and
+#    fewer than `min_samples` samples is not a median. Every one of those ships `None`
+#    PLUS a `*_note` sentence the surfaces print instead of a digit — the `_rule_entry`
+#    idiom, extended to every figure here.
+# 2. A FAILURE NEVER BECOMES A DEFAULT ANSWER. A project store that will not open and a
+#    fire whose detector cannot be resolved are recorded as UNREADABLE and leave every
+#    other number intact. A zero there would be a measurement nobody took.
+# 3. No new column and no new table: everything below is already recorded.
+
+#: Generous caps on the three ledgers. `CentralStore`'s readers are newest-first with a
+#: `limit`, and the WINDOW filter is this module's — so the limit has to be well clear of
+#: a real window's volume rather than equal to it.
+_EVOLUTION_FIRE_LIMIT = 20_000
+_EVOLUTION_RECURRENCE_LIMIT = 5_000
+_EVOLUTION_KNOWLEDGE_LIMIT = 2_000
+_EVOLUTION_INVESTIGATION_LIMIT = 2_000
+
+#: The sentence an empty denominator ships INSTEAD of a number. Nothing writes `applied`
+#: fires until a rule is armed (§6), so today this is the normal answer and the sentence
+#: is the entire content of the key. It deliberately contains no digit: "0%" or "0.0" in
+#: the prose would be read as the share the OS measured, when the truth is that nothing
+#: has ever been given the chance to resolve anything mechanically.
+_NO_MECHANICAL_SHARE_NOTE = (
+    "no rule has been armed yet, so there is no mechanical share to report — which is "
+    "not a share of zero")
+
+#: `rules.effective_status`' precedence, as a lookup this module can sort by. `rules`
+#: keeps its own private copy for the pair comparison; this one is only ever used to pick
+#: the STRONGEST pair a detector has, and an unknown string sorts weakest rather than
+#: raising — a row from a future release must not take the report down.
+_EVOLUTION_STATUS_STRENGTH = {rules.RETRACTED: 0, rules.DRY_RUN: 1, rules.ARMED: 2}
+
+
+def _evolution_min_samples(project: str | None) -> int:
+    """The RESOLVED `rules.min_samples` for this scope (Neo q1575).
+
+    Never a module constant here: how much history a project needs before it believes its
+    own medians is a catalog judgement, and the report's notes quote the number back to
+    the reader. `fleetcost.cost_config`'s idiom exactly, including its two fallbacks — a
+    catalog that will not load, and a project the catalog does not name, both keep the
+    fleet answer rather than raising. A report is a read; failing to read a config file
+    must not be able to deny one.
+    """
+    from .catalog import DEFAULT_RULES_MIN_SAMPLES
+
+    try:
+        resolved = resolve_catalog()
+    except (OpsError, CatalogError, OSError, ValueError):
+        return DEFAULT_RULES_MIN_SAMPLES
+    cfg = resolved.os.rules
+    if project:
+        try:
+            cfg = resolved.project(project).rules
+        except CatalogError:
+            cfg = resolved.os.rules
+    return max(1, int(getattr(cfg, "min_samples", DEFAULT_RULES_MIN_SAMPLES)))
+
+
+def _evolution_zone(project: str | None) -> tuple[str, Any, str | None]:
+    """The timezone the week boundary is resolved in: `(name, tzinfo, note)`.
+
+    Neo q1574: NOT UTC and NOT a hardcoded zone. Evolution weeks must line up with every
+    other weekly surface the user reads — the cost week above all — so the boundary comes
+    from the CONFIGURED week-reset zone and from nowhere else. A zone the host has no
+    tzdata for falls back to UTC and SAYS SO in the note, because a silently shifted week
+    boundary would make two weekly surfaces disagree with no visible cause.
+    """
+    from datetime import timezone
+    from zoneinfo import ZoneInfo
+
+    from . import fleetcost
+    from .catalog import DEFAULT_COST_WEEK_RESET_ZONE
+
+    try:
+        name = fleetcost.cost_config(project or None).week_reset_zone
+    except Exception:  # noqa: BLE001 - a report is a read; see `_evolution_min_samples`
+        name = DEFAULT_COST_WEEK_RESET_ZONE
+    try:
+        return name, ZoneInfo(name), None
+    except Exception:  # noqa: BLE001 - missing tzdata
+        return name, timezone.utc, (
+            f"the configured week-reset zone {name!r} could not be loaded on this host, "
+            f"so these weeks are bucketed in UTC and may not line up with the cost week")
+
+
+def _evolution_week(ts: float, zone: Any) -> str:
+    """The ISO date of the Monday of the LOCAL week containing `ts`, `YYYY-MM-DD`.
+
+    ONE helper, used by both `mechanical_share["series"]` and `by_gap_class`, so the two
+    cannot drift into bucketing the same fire into different weeks (Neo q1574).
+    """
+    from datetime import datetime, timedelta
+
+    local = datetime.fromtimestamp(float(ts), zone)
+    return (local.date() - timedelta(days=local.weekday())).isoformat()
+
+
+def _evolution_median(values: Sequence[float]) -> float | None:
+    """The median, or `None` on no samples. The CALLER applies `min_samples`: how many
+    samples are enough is a catalog judgement and this is arithmetic."""
+    xs = sorted(float(v) for v in values)
+    if not xs:
+        return None
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2.0
+
+
+def _evolution_links(**pairs: Any) -> dict[str, str]:
+    """A timeline event's links, with every ABSENT one left out of the dict entirely.
+
+    §9: a missing link is absent, never a broken URL. An empty string kept under its key
+    is exactly what renders as a dead link, so the key does not survive the filter.
+    """
+    return {k: str(v) for k, v in pairs.items() if v}
+
+
+def _evolution_investigations(scope: str, since: float, until: float,
+                              unreadable: list[str]) -> dict[str, list[float]]:
+    """`{order_id: [created_at, …]}` for every investigation opened in the window.
+
+    `ops.live_investigation`'s idiom — the subject is read off `metadata[SUBJECT_KEY]`,
+    per project, through the `ProjectStore` — with one deliberate difference: `statuses`
+    is None, so a SETTLED investigation still counts. §9 asks what share of stuck orders
+    the OS resolved mechanically rather than by opening an investigation, and an
+    investigation that has since finished is still an investigation that was needed.
+
+    A store that will not open, or a query that fails inside one, appends the project name
+    to `unreadable` and contributes nothing. It must never contribute a zero: "this
+    project opened no investigations" and "this project could not be read" are different
+    facts and only one of them is about the project's orders.
+    """
+    out: dict[str, list[float]] = {}
+    try:
+        paths = registered_project_paths()
+    except Exception:  # noqa: BLE001 - the project registry itself is unreadable
+        return out
+    for name in ([scope] if scope else sorted(paths)):
+        path = paths.get(name)
+        if path is None:
+            continue
+        try:
+            store = ProjectStore(path)
+        except Exception:  # noqa: BLE001
+            unreadable.append(name)
+            continue
+        try:
+            for row in store.list_feature_orders(
+                    statuses=None, kind="investigation",
+                    limit=_EVOLUTION_INVESTIGATION_LIMIT):
+                created = float(row.get("created_at") or 0.0)
+                if not since <= created <= until:
+                    continue
+                metadata = db.from_json(row.get("metadata"), {}) or {}
+                subject = str(metadata.get(SUBJECT_KEY) or "")
+                if subject:
+                    out.setdefault(subject, []).append(created)
+        except Exception:  # noqa: BLE001
+            unreadable.append(name)
+        finally:
+            store.close()
+    return out
+
+
+def _evolution_knowledge(central: CentralStore, scope: str) -> list[dict[str, Any]]:
+    """Every knowledge row in scope, retracted ones included — §9 reports retractions.
+
+    `relevant_knowledge` is a SCOPE reader (`project=? OR project=''`), so a fleet report
+    asks it once per registered project plus once for the global rows and deduplicates by
+    id. That is `jarvis learn list`'s reader rather than SQL of this module's own: the
+    report must see exactly what the user sees listed.
+    """
+    scopes = [scope] if scope else ["", *(p["name"] for p in central.list_projects())]
+    rows: dict[str, dict[str, Any]] = {}
+    for one in scopes:
+        for row in central.relevant_knowledge(one, limit=_EVOLUTION_KNOWLEDGE_LIMIT,
+                                              include_retired=True):
+            rows[str(row["id"])] = row
+    return list(rows.values())
+
+
+def evolution_report(project: str | None = None, *, days: int = 90) -> dict:
+    """Is the OS getting better at running itself — and where is it still weak? §9.
+
+    ONE plain dict, every number computed here. See the section comment above for the
+    three rules that decide its shape; the keys are:
+
+    * `window`, `project`, `min_samples` — the scope, and the sample floor the notes
+      quote back so a reader knows what "fewer than N" meant.
+    * `mechanical_share` — orders a rule resolved, over those plus the ones an
+      investigation had to be opened on. ORDERS, never fires: a condition standing twice
+      on one order is one order that resolved itself, and counting fires could put the
+      share above 1.0.
+    * `by_gap_class`, `per_rule`, `recurrences`, `stuck_resolution`, `timeline`.
+    * `unreadable` — what could not be read, so nothing below had to invent an answer.
+    """
+    scope = (project or "").strip()
+    until = db.now()
+    since = until - float(days) * 86400.0
+    min_samples = _evolution_min_samples(scope or None)
+    zone_name, zone, zone_note = _evolution_zone(scope or None)
+    unreadable: dict[str, list[str]] = {"projects": [], "detectors": [], "fires": []}
+
+    central = CentralStore()
+    try:
+        # `include_retired=True`: §9 reports RETRACTIONS, and a report that dropped the
+        # retracted rows would show a registry that had never changed its mind.
+        detectors = central.list_detectors(project=scope, include_retired=True)
+        all_fires = central.list_rule_fires(project=scope, limit=_EVOLUTION_FIRE_LIMIT)
+        recurrence_rows = [
+            r for r in central.list_recurrences(project=scope,
+                                                limit=_EVOLUTION_RECURRENCE_LIMIT)
+            if since <= float(r["ts"]) <= until]
+        entries = [_rule_entry(central, d) for d in detectors]
+        knowledge = _evolution_knowledge(central, scope)
+        # Exemptions only: §9's claim is about what the OS LEARNED is not privileged.
+        # `include_retired=True` for the retraction half, as above.
+        gate_exemptions = central.gate_rules(role="exempt", include_retired=True)
+    finally:
+        central.close()
+
+    fires = [f for f in all_fires if since <= float(f["ts"]) <= until]
+    gap_of: dict[str, str] = {str(d["id"]): str(d["gap_class"]) for d in detectors}
+
+    # -- the mechanical share ------------------------------------------------------------
+    # The numerator counts DISTINCT ORDERS with an `applied` fire that then CLEARED: the
+    # remedy ran and the condition stopped holding, which is the only evidence that the
+    # mechanism resolved anything. An `applied` fire still standing is a remedy that ran
+    # and did not work yet, and counting it would report a success nobody observed.
+    resolved_weeks: dict[str, set[str]] = {}
+    for f in fires:
+        detector_id = str(f["detector_id"])
+        if detector_id not in gap_of:
+            # House rule 2: a fire whose detector cannot be resolved is NAMED, not
+            # silently dropped into a bucket it may not belong in.
+            unreadable["fires"].append(str(f["id"]))
+            continue
+        if f["outcome"] == rules.APPLIED and f["cleared_at"] is not None:
+            resolved_weeks.setdefault(str(f["order_id"]), set()).add(
+                _evolution_week(f["ts"], zone))
+    investigated = _evolution_investigations(scope, since, until,
+                                             unreadable["projects"])
+    # UNION, so an order that both resolved itself and was investigated is one order.
+    denominator_orders = set(resolved_weeks) | set(investigated)
+    numerator = len(resolved_weeks)
+    denominator = len(denominator_orders)
+
+    # One point per week WITH DATA. A week nobody measured is absent from the list rather
+    # than present with a zero, which would draw a line through it (§9, house rule 1).
+    week_resolved: dict[str, set[str]] = {}
+    week_investigated: dict[str, set[str]] = {}
+    for order_id, weeks in resolved_weeks.items():
+        for week in weeks:
+            week_resolved.setdefault(week, set()).add(order_id)
+    for order_id, created_list in investigated.items():
+        for created in created_list:
+            week_investigated.setdefault(_evolution_week(created, zone), set()).add(
+                order_id)
+    series = []
+    for week in sorted(set(week_resolved) | set(week_investigated)):
+        got = week_resolved.get(week, set())
+        both = got | week_investigated.get(week, set())
+        series.append({"week": week, "numerator": len(got), "denominator": len(both),
+                       "value": (len(got) / len(both)) if both else None})
+
+    mechanical_share = {
+        "value": (numerator / denominator) if denominator else None,
+        "note": None if denominator else _NO_MECHANICAL_SHARE_NOTE,
+        "numerator": numerator, "denominator": denominator, "series": series,
+        "unreadable_projects": unreadable["projects"],
+    }
+
+    # -- by gap class --------------------------------------------------------------------
+    # Two fires in one week are ONE bucket with a count of 2 — the bucketer is the shared
+    # `_evolution_week`, so this and the series above cannot disagree about which week a
+    # fire fell in.
+    buckets: dict[str, dict[str, int]] = {}
+    for f in fires:
+        gap_class = gap_of.get(str(f["detector_id"]))
+        if gap_class is None:
+            continue
+        week = _evolution_week(f["ts"], zone)
+        weeks_of = buckets.setdefault(gap_class, {})
+        weeks_of[week] = weeks_of.get(week, 0) + 1
+    by_gap_class = [
+        {"gap_class": gap_class,
+         "weeks": [{"week": w, "count": n} for w, n in sorted(weeks.items())],
+         "total": sum(weeks.values())}
+        for gap_class, weeks in sorted(buckets.items())]
+
+    # -- per rule ------------------------------------------------------------------------
+    fires_by_detector: dict[str, list[dict[str, Any]]] = {}
+    for f in fires:
+        fires_by_detector.setdefault(str(f["detector_id"]), []).append(f)
+    per_rule = []
+    for detector, entry in zip(detectors, entries, strict=True):
+        if not entry["readable"]:
+            # The condition would not parse. The ROW still reports everything the row
+            # knows; only the condition is unreadable, and it is named.
+            unreadable["detectors"].append(str(detector["id"]))
+        # The weaker of detector and remedy, through `rules.effective_status`, which owns
+        # that precedence. A detector with several remedies reports the STRONGEST pair:
+        # "is anything here armed" is the question the status answers, and the per-remedy
+        # detail is on `jarvis rules show`.
+        pairs = [rules.effective_status(detector, r) for r in entry["remedies"]]
+        if pairs:
+            status = max(pairs, key=lambda s: _EVOLUTION_STATUS_STRENGTH.get(s, 0))
+        else:
+            status = (rules.RETRACTED if detector["retired_at"]
+                      else str(detector["status"]))
+        cleared = [f["cleared_seconds"]
+                   for f in fires_by_detector.get(str(detector["id"]), [])
+                   if f["cleared_seconds"] is not None]
+        enough = len(cleared) >= min_samples
+        per_rule.append({
+            "id": detector["id"], "gap_class": detector["gap_class"],
+            "summary": detector["summary"], "status": status,
+            "hits": detector["hits"], "false_positives": detector["false_positives"],
+            "recurrences": detector["recurrences"],
+            "last_fired": detector["last_fired"],
+            "last_cleared": detector["last_cleared"],
+            # Straight off `_rule_entry` rather than recomputed: the registry listing and
+            # this report must not be able to quote different hit rates for one rule.
+            "hit_rate": entry["hit_rate"], "hit_rate_note": entry["hit_rate_note"],
+            "readable": entry["readable"],
+            "condition_problems": entry["condition_problems"],
+            "median_cleared_seconds": _evolution_median(cleared) if enough else None,
+            "median_cleared_seconds_note": None if enough else (
+                f"{len(cleared)} cleared fires in this window, fewer than the "
+                f"{min_samples} this median needs — not a median yet"),
+        })
+
+    # -- recurrences ---------------------------------------------------------------------
+    verdict_counts = {v: 0 for v in rules.RECURRENCE_VERDICTS}
+    for r in recurrence_rows:
+        verdict = str(r["verdict"])
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+    missed = verdict_counts.get(rules.MISSED, 0)
+    remedy_failed = verdict_counts.get(rules.REMEDY_FAILED, 0)
+    # kn-289d4b89: `unreadable` and `not_armed` are COUNTED and REPORTED and never folded
+    # into either side. An unreadable recurrence is the record that nothing could be
+    # judged, and a not-armed one is a fact about the switch above the rule — attributing
+    # either to the condition or to the remedy blames a half that did not fail.
+    excluded = {rules.UNREADABLE_RECURRENCE:
+                verdict_counts.get(rules.UNREADABLE_RECURRENCE, 0),
+                rules.NOT_ARMED: verdict_counts.get(rules.NOT_ARMED, 0)}
+    if missed == remedy_failed == 0:
+        weaker, half_note = None, (
+            "no recurrence has been recorded in this window that was either missed or "
+            "whose remedy failed, so neither conditions nor remedies can be called the "
+            "weaker half — which is not the two of them being equally good")
+    elif missed == remedy_failed:
+        weaker, half_note = None, (
+            f"conditions and remedies have each failed {missed} times in this window — "
+            f"equally often, which is not a tie to be broken: both halves want work")
+    elif missed > remedy_failed:
+        weaker, half_note = "conditions", (
+            f"conditions are the weaker half: {missed} recurrences the condition missed "
+            f"against {remedy_failed} where the remedy did not hold")
+    else:
+        weaker, half_note = "remedies", (
+            f"remedies are the weaker half: {remedy_failed} recurrences where the remedy "
+            f"did not hold against {missed} the condition missed")
+    recurrences = {
+        "rows": recurrence_rows, "verdict_counts": verdict_counts,
+        "weaker_half": {
+            "weaker": weaker, "missed": missed, "remedy_failed": remedy_failed,
+            "note": half_note, "excluded": excluded,
+            "excluded_note": (
+                "`unreadable` and `not_armed` recurrences are counted here and kept out "
+                "of that comparison: neither is evidence about a condition or a remedy"),
+        },
+    }
+
+    # -- stuck resolution ----------------------------------------------------------------
+    # Does arming a rule actually shorten how long the gap stands? Dry-run medians against
+    # armed ones, per gap class. Below `min_samples` on EITHER side there is no comparison
+    # to make, and the entry says how far short it is rather than printing two numbers one
+    # sample wide.
+    samples: dict[str, dict[str, list[float]]] = {}
+    for f in fires:
+        gap_class = gap_of.get(str(f["detector_id"]))
+        if gap_class is None or f["cleared_seconds"] is None:
+            continue
+        side = str(f["mode"])
+        samples.setdefault(gap_class, {rules.DRY_RUN: [], rules.ARMED: []}).setdefault(
+            side, []).append(float(f["cleared_seconds"]))
+    stuck_resolution = []
+    for gap_class, sides in sorted(samples.items()):
+        dry = sides.get(rules.DRY_RUN, [])
+        armed = sides.get(rules.ARMED, [])
+        if len(dry) < min_samples or len(armed) < min_samples:
+            stuck_resolution.append({
+                "gap_class": gap_class, "dry_run_median": None, "armed_median": None,
+                "delta": None,
+                "note": (f"{len(dry)} dry-run and {len(armed)} armed samples, fewer "
+                         f"than the {min_samples} this median needs — not enough "
+                         f"history to compare yet")})
+            continue
+        dry_median = _evolution_median(dry)
+        armed_median = _evolution_median(armed)
+        stuck_resolution.append({
+            "gap_class": gap_class, "dry_run_median": dry_median,
+            "armed_median": armed_median,
+            # Negative is the improvement: armed clears faster than dry run.
+            "delta": (armed_median or 0.0) - (dry_median or 0.0), "note": None,
+            "dry_run_samples": len(dry), "armed_samples": len(armed)})
+
+    # -- the timeline --------------------------------------------------------------------
+    timeline: list[dict[str, Any]] = []
+
+    def _add(ts: Any, kind: str, ident: Any, headline: str,
+             links: dict[str, str] | None = None) -> None:
+        if ts is None or not since <= float(ts) <= until:
+            return
+        timeline.append({"ts": float(ts), "kind": kind, "id": str(ident),
+                         "headline": headline, "links": links or {}})
+
+    for d in detectors:
+        links = _evolution_links(io=d["io_id"], fix_wo=d["fix_wo_id"],
+                                 issue=d["issue_url"], pr=d["pr_url"])
+        _add(d["ts"], "detector_added", d["id"],
+             f"a detector for {d['gap_class']} was registered"
+             + (f": {d['summary']}" if d["summary"] else ""), links)
+        _add(d["armed_at"], "detector_armed", d["id"],
+             f"{d['gap_class']} was armed"
+             + (f" by {d['armed_by']}" if d["armed_by"] else "")
+             + (f": {d['armed_reason']}" if d["armed_reason"] else ""), links)
+        _add(d["retired_at"], "detector_retracted", d["id"],
+             f"the {d['gap_class']} detector was retracted"
+             + (f": {d['retired_reason']}" if d["retired_reason"] else ""), links)
+
+    for k in knowledge:
+        # `fix_wo` names the work order responsible, the same key the detector events use
+        # for the same kind of link, so a renderer has one link vocabulary and not two.
+        _add(k["ts"], "knowledge_added", k["id"],
+             f"learned: {str(k['content'])[:120]}",
+             _evolution_links(fix_wo=k.get("wo_id")))
+        _add(k["retired_at"], "knowledge_retracted", k["id"],
+             f"retracted: {str(k.get('retired_reason') or '')[:120]}",
+             _evolution_links(fix_wo=k.get("retired_by_wo_id")))
+
+    for g in gate_exemptions:
+        _add(g["ts"], "gate_exemption_learned", g["id"],
+             f"learned that {g['pattern']!r} is not a privileged action"
+             + (f": {g['reason']}" if g["reason"] else ""),
+             _evolution_links(fix_wo=g.get("wo_id")))
+        _add(g["retired_at"], "gate_exemption_retracted", g["id"],
+             f"the exemption for {g['pattern']!r} was retracted"
+             + (f": {g['retired_reason']}" if g["retired_reason"] else ""),
+             _evolution_links(fix_wo=g.get("wo_id")))
+
+    # A gap class FIRST SEEN, from the OS's OWN records — the earliest detector row or
+    # fire for that class. `gaps.GAP_CLASSES` is a static dict with no timestamps, so the
+    # date a class entered the OS's vocabulary is only knowable from what it wrote down.
+    first_seen: dict[str, float] = {}
+    for d in detectors:
+        gap_class = str(d["gap_class"])
+        ts = float(d["ts"])
+        first_seen[gap_class] = min(first_seen.get(gap_class, ts), ts)
+    for f in all_fires:
+        gap_class = gap_of.get(str(f["detector_id"]))
+        if gap_class is None:
+            continue
+        ts = float(f["ts"])
+        first_seen[gap_class] = min(first_seen.get(gap_class, ts), ts)
+    for gap_class, ts in first_seen.items():
+        _add(ts, "gap_class_first_seen", gap_class,
+             f"the OS recognised {gap_class} for the first time")
+
+    timeline.sort(key=lambda e: e["ts"], reverse=True)
+
+    return {
+        "window": {"days": int(days), "since": since, "until": until,
+                   "week_zone": zone_name, "week_zone_note": zone_note},
+        "project": scope or None,
+        "min_samples": min_samples,
+        "mechanical_share": mechanical_share,
+        "by_gap_class": by_gap_class,
+        "per_rule": per_rule,
+        "recurrences": recurrences,
+        "stuck_resolution": stuck_resolution,
+        "timeline": timeline,
+        "unreadable": unreadable,
+    }
+
+
 # -- the recurrence ledger (spec §8) ----------------------------------------------------
 #
 # A gap the OS ALREADY has a detector for happened again. That is not "a new bug", and

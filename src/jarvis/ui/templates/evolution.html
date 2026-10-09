@@ -1,0 +1,253 @@
+{% extends "base.html" %}
+{% block title %}Evolution — Jarvis{% endblock %}
+{% block content %}
+
+{# THIS TEMPLATE DERIVES NO NUMBER. Not a total, not a percentage, not a count, not a
+   delta — no `|sum`, no `|length` where the dict already carries a count, no `{% set %}`
+   arithmetic. `ops.evolution_report` computes every figure ONCE and
+   `jarvis rules summary` renders the same dict; the moment one surface works a figure
+   out for itself the two
+   start disagreeing about one registry, which this codebase has shipped before. §9 of
+   docs/superpowers/specs/2026-09-27-self-evolution.md.
+
+   The ONLY arithmetic here is presentational formatting of a value the dict already
+   holds: `'%.0f' % (v * 100)` to show a share as a percentage, the way knowledge.html
+   already does, and `fmt_ts` / `fmt_age` / `fmt_dur` for a timestamp or a duration.
+
+   ABSENT IS NEVER ZERO (§9, house rule 1). Every figure is paired with a `*_note` that
+   is None when the figure is present and a SENTENCE when it is not. This page prints the
+   SENTENCE — never a digit, never a dash, never "0%". No armed rule is not a mechanical
+   share of zero, a detector that never fired has no hit rate, and fewer than
+   `min_samples` samples is not a median.
+
+   AND IT MUST RENDER AGAINST AN EMPTY REGISTRY, which is what every install starts with.
+   `uilog.record_error` plus INV-UI-HEALTHY turn a 500 here into an inbox item, so every
+   loop has its `{% else %}` arm and nothing indexes a key an empty report omits — a
+   timeline entry's `links` dict leaves an ABSENT link out entirely, so it is iterated
+   and never subscripted.
+
+   READ-ONLY BY SCOPE BOUNDARY: no form, no POST, no button that changes anything.
+   `jarvis rules retract` stays the only way to retract a rule. #}
+
+<p class="kv" style="margin-top:18px">
+  Is the OS getting better at running itself — and where is it still weak? Every figure
+  below is <span class="mono">ops.evolution_report</span>'s, the same dict
+  <span class="mono">jarvis rules summary</span> prints.
+  <span class="counts">({{ report.window.days }} days ·
+    {% if report.project %}{{ report.project }}{% else %}the whole fleet{% endif %} ·
+    weeks bucketed in {{ report.window.week_zone }} ·
+    medians need {{ report.min_samples }} samples)</span>
+</p>
+{% if report.window.week_zone_note %}
+{# Shown only when it exists: a week boundary that silently shifted is what makes two
+   weekly surfaces disagree with no visible cause (Neo q1574). #}
+<p class="sub">{{ report.window.week_zone_note }}</p>
+{% endif %}
+
+<h2>Resolved mechanically</h2>
+<div class="panel">
+  {% if report.mechanical_share.value is none %}
+  {# The sentence IS the figure. Printing "0%" here would report a measurement nobody
+     took — nothing has ever been given the chance to resolve anything mechanically. #}
+  <p class="empty">{{ report.mechanical_share.note }}</p>
+  {% else %}
+  <p class="kv" style="font-size:22px">
+    {{ '%.0f' % (report.mechanical_share.value * 100) }}%
+    <span class="sub">of orders a rule resolved —
+      {{ report.mechanical_share.numerator }} of
+      {{ report.mechanical_share.denominator }} orders that either cleared through an
+      armed remedy or had an investigation opened on them. Orders, never fires: one
+      condition standing twice on one order is one order.</span>
+  </p>
+  {% endif %}
+  {% if report.mechanical_share.unreadable_projects %}
+  <p class="sub">could not be read, and so contributed nothing rather than a zero:
+    {% for name in report.mechanical_share.unreadable_projects %}
+    <span class="mono">{{ name }}</span>{% endfor %}</p>
+  {% endif %}
+
+  {# A TABLE, not a chart. No script tag, no SVG sparkline, no library — the numbers are
+     the report's and the dashboard already renders numbers this way. A week with no data
+     is ABSENT from the series rather than plotted at zero. #}
+  <table>
+    <tr><th>week</th><th>resolved</th><th>of</th><th>share</th></tr>
+    {% for point in report.mechanical_share.series %}
+    <tr>
+      <td class="mono">{{ point.week }}</td>
+      <td class="mono">{{ point.numerator }}</td>
+      <td class="mono">{{ point.denominator }}</td>
+      <td class="mono">{% if point.value is none %}<span class="empty">nothing to
+        measure in this week</span>{% else %}{{ '%.0f' % (point.value * 100) }}%{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="4" class="empty">no week in this window has a measurement — which is
+      not a run of empty weeks, it is no measurement at all</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Fires by gap class</h2>
+<div class="panel">
+  <table>
+    <tr><th>gap class</th><th>total</th><th>by week</th></tr>
+    {% for row in report.by_gap_class %}
+    <tr>
+      <td class="mono">{{ row.gap_class }}</td>
+      <td class="mono">{{ row.total }}</td>
+      <td class="sub">
+        {% for week in row.weeks %}
+        <span class="mono">{{ week.week }}</span>&nbsp;{{ week.count }}{% if not loop.last %} · {% endif %}
+        {% else %}<span class="empty">no fire in this window</span>{% endfor %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="3" class="empty">no detector has fired in this window</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Does arming it shorten the gap?</h2>
+<div class="panel">
+  <p class="kv">Dry-run medians against armed ones, per gap class. A negative delta is
+    the improvement: armed cleared faster than dry run.</p>
+  <table>
+    <tr><th>gap class</th><th>dry run</th><th>armed</th><th>delta</th><th>samples</th></tr>
+    {% for row in report.stuck_resolution %}
+    <tr>
+      <td class="mono">{{ row.gap_class }}</td>
+      {% if row.note %}
+      {# Below `min_samples` on either side there is no comparison to make, and two
+         numbers one sample wide would read as one. The note says how far short it is. #}
+      <td colspan="4" class="empty">{{ row.note }}</td>
+      {% else %}
+      <td class="mono">{{ fmt_dur(row.dry_run_median) }}</td>
+      <td class="mono">{{ fmt_dur(row.armed_median) }}</td>
+      <td class="mono">{{ fmt_dur(row.delta) }}</td>
+      <td class="sub">{{ row.dry_run_samples }} dry run / {{ row.armed_samples }} armed</td>
+      {% endif %}
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="empty">no gap class has cleared fires on both sides to
+      compare</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Rule by rule</h2>
+<div class="panel">
+  <table>
+    <tr><th>detector</th><th>gap class</th><th>status</th><th>hits</th>
+      <th>false positives</th><th>recurrences</th><th>hit rate</th>
+      <th>median to clear</th><th>last fired</th></tr>
+    {% for row in report.per_rule %}
+    <tr>
+      {# The id, the way alarms.html links an alarm id — through the dashboard's own
+         search, which resolves an id typed in full. There is no detector PAGE to point
+         at yet, and a link to one that does not exist is the broken link §9 forbids. #}
+      <td><a href="/search?q={{ row.id }}" class="mono">{{ row.id }}</a>
+        <div class="sub">{{ row.summary }}</div>
+        {% if not row.readable %}
+        {# A condition that would not parse is NAMED, never silently treated as false:
+           house rule 2, a failure never becomes a default answer. #}
+        <div class="sub tone-warn">its condition could not be read:
+          {% for problem in row.condition_problems %}{{ problem }}{% if not loop.last %} · {% endif %}
+          {% else %}no reason was recorded{% endfor %}</div>
+        {% endif %}
+      </td>
+      <td class="mono">{{ row.gap_class }}</td>
+      <td class="mono">{{ row.status }}</td>
+      <td class="mono">{{ row.hits }}</td>
+      <td class="mono">{{ row.false_positives }}</td>
+      <td class="mono">{{ row.recurrences }}</td>
+      <td class="mono">{% if row.hit_rate is none %}<span class="empty">{{ row.hit_rate_note }}</span>{% else %}{{ '%.0f' % (row.hit_rate * 100) }}%{% endif %}</td>
+      <td class="mono">{% if row.median_cleared_seconds is none %}<span class="empty">{{ row.median_cleared_seconds_note }}</span>{% else %}{{ fmt_dur(row.median_cleared_seconds) }}{% endif %}</td>
+      <td class="mono">{{ fmt_ts(row.last_fired) }}
+        <div class="sub">cleared {{ fmt_ts(row.last_cleared) }}</div></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="empty">the registry has no detector in this scope — which
+      is what every install starts with</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>Recurrences</h2>
+<div class="panel">
+  {# The weaker half is a VERDICT the report reached, not a comparison made here: when
+     neither side can be named the note says so and this page names no side. #}
+  <p class="kv">{{ report.recurrences.weaker_half.note }}</p>
+  {% if report.recurrences.weaker_half.excluded_note %}
+  <p class="sub">{{ report.recurrences.weaker_half.excluded_note }}:
+    {% for verdict, count in report.recurrences.weaker_half.excluded.items() %}
+    <span class="mono">{{ verdict }}</span>&nbsp;{{ count }}{% if not loop.last %} · {% endif %}
+    {% else %}none{% endfor %}</p>
+  {% endif %}
+  <p class="counts">
+    {% for verdict, count in report.recurrences.verdict_counts.items() %}
+    {{ verdict }} {{ count }}{% if not loop.last %} · {% endif %}
+    {% else %}no verdict has been recorded in this window{% endfor %}
+  </p>
+  <table>
+    <tr><th>when</th><th>gap class</th><th>verdict</th><th>order</th><th>what happened</th></tr>
+    {% for row in report.recurrences.rows %}
+    <tr>
+      <td class="mono">{{ fmt_ts(row.ts) }}<div class="sub">{{ fmt_age(row.ts) }} ago</div></td>
+      <td class="mono">{{ row.gap_class }}</td>
+      <td class="mono">{{ row.verdict }}</td>
+      <td class="mono">{{ row.order_id }}</td>
+      <td>{{ row.note }}<div class="sub">{{ row.filed_note }}</div></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="empty">no gap the OS already has a detector for has
+      happened again in this window</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<h2>What the OS learned</h2>
+<div class="panel">
+  <ul class="timeline" id="evolution-timeline">
+    {% for event in report.timeline %}
+    <li>
+      <span class="mono">{{ fmt_ts(event.ts) }}</span> ·
+      <span class="mono">{{ event.kind }}</span> ·
+      <span class="mono">{{ event.id }}</span>
+      <span class="detail">{{ event.headline }}</span>
+      {# ITERATED, never subscripted: `_evolution_links` drops an absent link's KEY, so
+         `links.pr` into an href is exactly the broken link §9 forbids. A link whose
+         value is an id rather than a URL goes through the dashboard's search, for the
+         reason given on the rule table above. #}
+      {% for name, target in event.links.items() %}
+      <a class="mono" href="{{ target if target.startswith('http') else '/search?q=' ~ target }}">{{ name }}</a>
+      {% endfor %}
+    </li>
+    {% else %}
+    <li class="empty">the OS has recorded nothing it learned in this window</li>
+    {% endfor %}
+  </ul>
+</div>
+
+{% if report.unreadable.projects or report.unreadable.detectors or report.unreadable.fires %}
+<h2>Could not be read</h2>
+<div class="panel">
+  <p class="kv">House rule 2: a failure never becomes a default answer. These are named
+    here and contributed nothing above — a zero in their place would be a measurement
+    nobody took.</p>
+  {% if report.unreadable.projects %}
+  <p class="sub">projects: {% for name in report.unreadable.projects %}
+    <span class="mono">{{ name }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% if report.unreadable.detectors %}
+  <p class="sub">detectors whose condition would not parse:
+    {% for name in report.unreadable.detectors %}
+    <span class="mono">{{ name }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+  {% if report.unreadable.fires %}
+  <p class="sub">fires whose detector could not be resolved:
+    {% for name in report.unreadable.fires %}
+    <span class="mono">{{ name }}</span>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}

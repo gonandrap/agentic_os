@@ -1327,6 +1327,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="an order to evaluate against. Omit to just see what the "
                         "condition reads")
 
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §9. The PROJECT is a positional
+    # here and a `--project` flag on `list`, because this verb's whole subject is one
+    # scope's history: `jarvis rules summary proj_a` reads the way `jarvis cost proj_a`
+    # does, and the report is the same shape the dashboard renders.
+    r = ru.add_parser("summary", help="what the project learned, and whether it is "
+                                      "compounding")
+    r.add_argument("project", nargs="?", default="",
+                   help="one project's history. Omit for the whole fleet")
+    r.add_argument("--days", type=int, default=90,
+                   help="how far back the window reaches (default 90)")
+
     for r in ru.choices.values():
         r.add_argument("--json", action="store_true", help="machine-readable output")
 
@@ -4526,6 +4537,129 @@ def _print_rules_dry_run(data: dict) -> None:
     print(f"\n{data['note']}")
 
 
+def _print_rules_summary(data: dict) -> None:
+    """The evolution report: what the OS learned, and whether it is compounding (§9).
+
+    IT DERIVES NO NUMBER — not a total, not a percentage, not a count, not a delta. See
+    `_print_rules_list`'s docstring for why; `ops.evolution_report` computes every figure
+    once and the dashboard renders the SAME dict. The only arithmetic here is
+    presentational: a share the dict already holds scaled to a percentage, seconds through
+    `_dur`, and singular/plural of a noun.
+
+    And ABSENT IS NEVER ZERO. Every figure arrives paired with a `*_note` that is `None`
+    when the figure is present and a SENTENCE when it is not. This prints the sentence —
+    never a digit, never a dash, never "0%", and never both the sentence and a number.
+    """
+    window, share = data["window"], data["mechanical_share"]
+    scope = data["project"] or "fleet-wide"
+
+    # THE HEADLINE FIRST, `_print_rules_list`'s ordering rule: the mechanical share is the
+    # line a reader acts on. With no armed rule there is no share, and the note is the
+    # entire content of the line — a "0%" there would be a measurement nobody took.
+    if share["value"] is None:
+        print(share["note"])
+    else:
+        print(f"{'%.0f' % (share['value'] * 100)}% of stuck orders in this window "
+              f"resolved mechanically — {share['numerator']} of {share['denominator']}")
+    print(f"  {scope} · last {window['days']} days · weeks in {window['week_zone']}")
+    if window["week_zone_note"]:
+        print(f"  ⚠ {window['week_zone_note']}")
+    for name in share["unreadable_projects"]:
+        print(f"  ⚠ {name} could not be read, so it is in no number above")
+
+    # One point per week WITH DATA (§9): a week absent from the series is a week nobody
+    # measured, and it stays absent here rather than being drawn as a zero.
+    if share["series"]:
+        print("\nweek by week")
+        for point in share["series"]:
+            counts = f"{point['numerator']} of {point['denominator']}"
+            if point["value"] is None:
+                print(f"  {point['week']}  {counts}")
+            else:
+                print(f"  {point['week']}  {'%.0f' % (point['value'] * 100)}% ({counts})")
+
+    if data["by_gap_class"]:
+        print("\nfires by gap class")
+        for row in data["by_gap_class"]:
+            total = row["total"]
+            print(f"  {row['gap_class']}: {total} {'fire' if total == 1 else 'fires'}")
+            for week in row["weeks"]:
+                print(f"      {week['week']}  {week['count']}")
+
+    # Does ARMING a rule shorten how long the gap stands? Below `min_samples` on either
+    # side there is no comparison, and the entry's note says how far short it is — printed
+    # INSTEAD of the two medians, never beside them.
+    if data["stuck_resolution"]:
+        print(f"\nhow long gaps stand (median, {data['min_samples']} samples minimum)")
+        for row in data["stuck_resolution"]:
+            print(f"  {row['gap_class']}")
+            if row["note"]:
+                print(f"      {row['note']}")
+                continue
+            # The sign is the dict's: negative delta is the improvement. `_dur` reads a
+            # magnitude, so the sign is carried separately rather than recomputed.
+            delta = row["delta"]
+            sign = "-" if delta < 0 else "+"
+            print(f"      dry run {_dur(row['dry_run_median'])} "
+                  f"· armed {_dur(row['armed_median'])} "
+                  f"· {sign}{_dur(abs(delta))}")
+
+    if data["per_rule"]:
+        print("\nrule by rule")
+        for rule_row in data["per_rule"]:
+            print(f"  {rule_row['id']} [{rule_row['gap_class']}] {rule_row['status']}")
+            if rule_row["summary"]:
+                print(f"      {_one_line(rule_row['summary'], 110)}")
+            if not rule_row["readable"]:
+                print("      UNREADABLE: " + "; ".join(rule_row["condition_problems"]))
+            if rule_row["hit_rate"] is None:
+                print(f"      {rule_row['hit_rate_note']}")
+            else:
+                print(f"      {'%.0f' % (rule_row['hit_rate'] * 100)}% hit rate "
+                      f"· {rule_row['hits']} hits "
+                      f"· {rule_row['false_positives']} false positives "
+                      f"· {rule_row['recurrences']} recurrences")
+            if rule_row["median_cleared_seconds"] is None:
+                print(f"      {rule_row['median_cleared_seconds_note']}")
+            else:
+                print("      median time to clear "
+                      f"{_dur(rule_row['median_cleared_seconds'])}")
+            if rule_row["last_fired"]:
+                print(f"      last fired {_stamp(rule_row['last_fired'])}"
+                      + (f" · last cleared {_stamp(rule_row['last_cleared'])}"
+                         if rule_row["last_cleared"] else ""))
+
+    # The WEAKER HALF is printed as `ops`' own sentence and in no other form. The verdict
+    # is a judgement the report already made — restating it here as "conditions" against
+    # "remedies" is this surface picking a side, and with `weaker` None there is no side
+    # to pick (kn-289d4b89: `unreadable` and `not_armed` belong to neither half).
+    rec = data["recurrences"]
+    half = rec["weaker_half"]
+    print(f"\n{half['note']}")
+    counts = ", ".join(f"{n} {verdict}" for verdict, n in rec["verdict_counts"].items())
+    if counts:
+        print(f"  {counts}")
+    if half["excluded_note"]:
+        print(f"  {half['excluded_note']}")
+
+    # LAST: the longest block and the least actionable one.
+    if data["timeline"]:
+        print("\nwhat happened, newest first")
+        for event in data["timeline"]:
+            print(f"  {_stamp(event['ts'])} {event['kind']} {event['id']}")
+            print(f"      {_one_line(event['headline'], 110)}")
+            # A MISSING link is absent from the dict (§9), so this iterates what is there
+            # and never indexes a key — an empty dict is a line with no links, never a
+            # dead one.
+            links = " · ".join(f"{k}: {v}" for k, v in event["links"].items())
+            if links:
+                print(f"      {links}")
+
+    for kind, names in data["unreadable"].items():
+        if names:
+            print(f"\nunreadable {kind}: {', '.join(str(n) for n in names)}")
+
+
 def cmd_rules(args) -> int:
     from . import ops
 
@@ -4545,6 +4679,9 @@ def cmd_rules(args) -> int:
     elif args.rules_cmd == "dry-run":
         data = ops.rules_dry_run(args.detector_id, args.order_id)
         _print(data, True) if args.json else _print_rules_dry_run(data)
+    elif args.rules_cmd == "summary":
+        data = ops.evolution_report(args.project or None, days=args.days)
+        _print(data, True) if args.json else _print_rules_summary(data)
     return 0
 
 

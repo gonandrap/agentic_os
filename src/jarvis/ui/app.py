@@ -2040,6 +2040,38 @@ def create_app() -> FastAPI:
                       over=[r for r in rows if r["stuck"]],
                       rest=[r for r in rows if not r["stuck"]])
 
+    @app.get("/evolution", response_class=HTMLResponse)
+    def evolution_page(request: Request, days: int = 90):
+        """Is the OS getting better at running itself — and where is it still weak?
+
+        Every number is `ops.evolution_report`'s; this route computes none of them (§9 of
+        docs/superpowers/specs/2026-09-27-self-evolution.md). `jarvis rules summary`
+        renders the same dict, and two renderers each doing their own arithmetic is how
+        the two surfaces start disagreeing about one registry.
+
+        `days` widens the window the way `--days` does on the CLI. READ-ONLY: no POST
+        route and no form lives under this path — arming and retracting a rule are
+        `jarvis rules` commands by the work order's scope boundary.
+        """
+        return render(request, "evolution.html", active="evolution",
+                      report=ops.evolution_report(None, days=days))
+
+    @app.get("/evolution/{project}", response_class=HTMLResponse)
+    def evolution_project_page(request: Request, project: str, days: int = 90):
+        """The same report scoped to one project — where each project page links.
+
+        Every number is `ops.evolution_report`'s, as above. An unknown project is a 404
+        with the sentence `ops` raised, exactly as `alarm_page` does: a page that
+        rendered an empty report for a name that does not exist would read as a project
+        the OS has learned nothing about.
+        """
+        try:
+            report = ops.evolution_report(project, days=days)
+        except ops.OpsError as e:
+            return render(request, "error.html", active="evolution",
+                          message=str(e), status_code=404)
+        return render(request, "evolution.html", active="evolution", report=report)
+
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
         """One alarm — where the work order's timeline and a Neo escalation both link.
