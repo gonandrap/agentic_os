@@ -4454,6 +4454,13 @@ def _print_rules_show(data: dict) -> None:
         print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
               # A fire is one line: the stored detail stays at rules.FACTS_CHARS.
               + (f" · {_one_line(f['detail'], 110)}" if f["detail"] else ""))
+    for rec in data["recurrences"]:
+        # The verdict, the order it recurred on, and what happened on the tracker — the
+        # three fields a person judging THIS rule reads (spec §8, Neo question 974). The
+        # `filed_note` is the local account and can be long, so it is clipped the way a
+        # fire's detail is; the stored value is untouched.
+        print(f"  recurrence {rec['id']} {rec['verdict']} · {rec['order_id']}"
+              + (f" · {_one_line(rec['filed_note'], 110)}" if rec["filed_note"] else ""))
 
 
 def _print_rules_dry_run(data: dict) -> None:

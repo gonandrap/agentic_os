@@ -40,7 +40,7 @@ from .catalog import (
     worker_stalls_on_prompts,
 )
 from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
-               observability, release, timeline)
+               observability, release, rules, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
@@ -11183,6 +11183,10 @@ def rules_show(detector_id: str) -> dict[str, Any]:
                    in central.remedy_rules_for(detector_id, include_retired=True)
                    if r["retired_at"] is not None]
         fires = central.list_rule_fires(detector_id=detector_id, limit=20)
+        # The reader §8's verdict owes (Neo question 974): a recurrence is the record that
+        # THIS rule did not hold, so the place a person judges the rule is the place it
+        # has to be visible. Without it the ledger would be written and never read.
+        recurrences = central.list_recurrences(detector_id=detector_id, limit=20)
     finally:
         central.close()
     return {
@@ -11198,6 +11202,7 @@ def rules_show(detector_id: str) -> dict[str, Any]:
             "pr_url": detector["pr_url"], "seed_version": detector["seed_version"],
         },
         "fires": fires,
+        "recurrences": recurrences,
         "hit_rate": entry["hit_rate"],
         "hit_rate_note": entry["hit_rate_note"],
     }
@@ -11308,6 +11313,156 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
                project=project,
                note="a dry run: this wrote nothing and acted on nothing")
     return out
+
+
+# -- the recurrence ledger (spec §8) ----------------------------------------------------
+#
+# A gap the OS ALREADY has a detector for happened again. That is not "a new bug": the
+# condition missed the symptom, or it matched and the remedy did not hold, or the rule was
+# still in `dry_run` and acted on nothing. Filing it afresh loses the one fact that
+# matters — that the OS already tried — so this LINKS and never duplicates.
+
+#: What each verdict MEANS, in the sentence a person reads. A CLOSED TEMPLATE keyed on the
+#: verdict, never prose assembled from the row: the note says which half of the rule the
+#: finding is about, and a sentence stitched together per call could disagree with the
+#: verdict beside it. Every string names that half explicitly, because a finding filed at
+#: the wrong half is the failure §8 was written to prevent.
+_RECURRENCE_NOTES = {
+    rules.NOT_ARMED: (
+        "a detector for this gap exists but is still in dry_run, so it acted on nothing "
+        "— neither its condition nor its remedy can be blamed, and this recurrence is "
+        "evidence FOR arming it"),
+    rules.MISSED: (
+        "the detector is armed and has no usable fire on this order, so the condition "
+        "did not match what actually happened — the finding is about the CONDITION"),
+    rules.REMEDY_FAILED: (
+        "the detector is armed and did fire on this order, and the gap recurred anyway "
+        "— the finding is about the REMEDY, or about the gate that refused it"),
+    rules.UNREADABLE_RECURRENCE: (
+        "the detector is armed and its newest fire on this order says something could "
+        "not be READ, so nothing was decided — the finding is about what the condition "
+        "reads, and this is NOT evidence for arming"),
+}
+
+
+def _recurrence_tracker_act(detector: dict[str, Any], *, order_id: str, gap_class: str,
+                            verdict: str) -> str:
+    """Reopen or comment on the ORIGINAL issue, and return the `filed_note`. NEVER raises
+    a GitHub error.
+
+    §8's division of labour: the ledger is the OS's own record and the tracker a mirror of
+    it, so every way this can fail — no `gh`, a refusal, a timeout, output that will not
+    parse, no original issue to find — comes back as a SENTENCE for `filed_note` and the
+    recurrence row stands either way. A caller that raised here would lose a finding
+    because a network was down.
+
+    The comment body is built by `rules.recurrence_comment`, which is the redaction
+    boundary: the tracker is PUBLIC and that function takes four fields and has no
+    parameter any private text could arrive through.
+    """
+    from . import bugreport, issues
+
+    body = rules.recurrence_comment(order_id=order_id, gap_class=gap_class,
+                                    verdict=verdict, detector_id=detector["id"])
+    try:
+        url = str(detector["issue_url"] or "")
+        if not url:
+            # Searched by the CAUSE — the detector id and the gap class — never by the
+            # order id: kn-2b03830f, see `issues.recurrence_issues`. The NEWEST hit is
+            # taken because `gh issue list` answers newest first and a later filing about
+            # one cause is the thread people are reading.
+            found = issues.recurrence_issues(detector["id"], gap_class)
+            if not found:
+                return ("no original issue is recorded on the detector and none was "
+                        "found on the tracker, searched by detector id and gap class "
+                        "with `--state all`, so nothing was filed — the recurrence is "
+                        "recorded here only")
+            url = str(found[0]["url"])
+        # Before `--add-label`: `gh` refuses a label the repository does not define, and
+        # the FIRST recurrence on any tracker meets exactly that.
+        issues.ensure_regression_label(bugreport.bug_repo())
+        # `Issue.closed`, not `issues.CLOSED`: that constant is the DESIRED-state
+        # vocabulary of the issue-lifecycle section, while this asks what GitHub says the
+        # issue IS right now.
+        if issues.view(url).closed:
+            issues.reopen(url, body)
+            act = "reopened"
+        else:
+            issues.comment(url, body)
+            act = "commented on"
+        issues.add_label(url, issues.REGRESSION_LABEL)
+        return f"{act} the original issue {url} and labelled it `regression`"
+    except GitHubError as e:
+        # `IssueLifecycleError` and `GhUnavailable` both derive from `GitHubError`, so one
+        # clause covers "gh could not be reached" and "gh ran and refused". `reason` is
+        # the phrase the OS wrote; the exception text carries `gh`'s own words, and
+        # `filed_note` is local and unpublished, so both belong in it.
+        return (f"the tracker was not updated: {e.reason} ({e}). The recurrence is "
+                f"recorded here, and the ledger is the OS's own record — the tracker "
+                f"mirrors it")
+
+
+def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str = "",
+                      note: str = "", detector_id: str = "") -> dict[str, Any]:
+    """An existing rule did not hold. Derive which half, write the ledger row, and link
+    the finding to the ORIGINAL issue rather than filing a second one.
+
+    Returns a PLAIN DICT the CLI and the dashboard consume verbatim, this section's rule
+    throughout, so the two surfaces cannot disagree about what happened.
+
+    ABSENT IS NEVER ZERO here either: with NO detector for `gap_class` this writes
+    nothing, returns `verdict=None` and says the gap is NEW. An invented verdict would
+    claim the OS had tried something it never tried.
+
+    `detector_id` names the detector directly, for a caller that already resolved it;
+    without it `rules.recurrence` picks the one live rule for this gap in this project's
+    scope, with the tie-break documented there.
+    """
+    central = CentralStore()
+    try:
+        detector = (central.get_detector(detector_id) if detector_id else
+                    rules.recurrence(
+                        central.list_detectors(project=project, gap_class=gap_class),
+                        gap_class, project=project))
+        if detector is None:
+            return {"recorded": False, "detector": None, "verdict": None,
+                    "recurrence": None, "filed_note": "",
+                    "note": (f"no detector exists for gap class {gap_class!r}, so this "
+                             f"is a NEW gap and not a recurrence — nothing was recorded "
+                             f"against a rule, because there is no rule to blame")}
+        detector = dict(detector)
+
+        # The NEWEST fire this detector has on this order, CLEARED OR NOT. Two reads
+        # because `open_rule_fire` sees only uncleared rows, and a cleared fire is still
+        # evidence that the detector matched: a condition that held and then stopped
+        # holding did not fail to match. The newest rather than any past one for commit
+        # `0c1e3f9`'s reason, which `open_rule_fire` records — a gap that recurred after
+        # being cleared is a new episode, and judging it against an older fire would
+        # answer about the wrong one.
+        candidates = [f for f in (
+            central.open_rule_fire(detector["id"], order_id),
+            *central.list_rule_fires(detector_id=detector["id"], order_id=order_id,
+                                     limit=1)) if f]
+        fire = (max(candidates, key=lambda f: (float(f["ts"]), int(f["id"])))
+                if candidates else None)
+        verdict = rules.recurrence_verdict(detector, fire)
+
+        # Written BEFORE the tracker is touched, so no `gh` failure and no crash between
+        # the two can lose the finding. `filed_note` is filled in afterwards — see
+        # `CentralStore.set_recurrence_filed_note`.
+        row = central.add_recurrence(
+            gap_class=gap_class, detector_id=detector["id"], project=project,
+            order_id=order_id, verdict=verdict, io_id=io_id,
+            original_fix_wo_id=detector["fix_wo_id"],
+            original_issue_url=detector["issue_url"], filed_note="", note=note)
+        filed_note = _recurrence_tracker_act(detector, order_id=order_id,
+                                             gap_class=gap_class, verdict=verdict)
+        row = central.set_recurrence_filed_note(row["id"], filed_note)
+    finally:
+        central.close()
+    return {"recorded": True, "detector": detector, "verdict": verdict,
+            "recurrence": row, "filed_note": filed_note,
+            "note": _RECURRENCE_NOTES[verdict]}
 
 
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:

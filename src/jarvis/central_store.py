@@ -383,6 +383,40 @@ CREATE TABLE IF NOT EXISTS rule_fires (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
+
+-- WHEN A GAP THE OS ALREADY HAS A RULE FOR HAPPENS AGAIN (spec §8). One row per
+-- recurrence, and THIS LEDGER IS THE OS'S OWN RECORD while the tracker is only a mirror
+-- of it: the row is written BEFORE `gh` is touched, so an unreachable tracker, a refused
+-- API call or a crash mid-comment cannot lose the finding. What happened on the tracker,
+-- or why nothing did, lands afterwards in `filed_note`.
+--
+-- `verdict` has FOUR values, not the three this spec section's own DDL listed: Neo
+-- question 974 added `unreadable`, because an armed detector whose fire records that
+-- something could not be READ decided nothing, and recording that as `missed` would
+-- claim the condition was evaluated and came back false. A verdict is the thing a finding
+-- is filed against, so the wrong one aims the fix at the wrong half of the rule. The set
+-- is `rules.RECURRENCE_VERDICTS` and `add_recurrence` validates against it.
+--
+-- `filed_note` is the FULL LOCAL ACCOUNT — which act ran, against which issue, or the
+-- failure's own words — including anything too private to publish. That is precisely why
+-- the tracker comment is built somewhere else, by `rules.recurrence_comment`, from four
+-- fields and nothing else: the two texts have different audiences and must not be one
+-- string. `note` is the sentence a person reads about the verdict.
+CREATE TABLE IF NOT EXISTS rule_recurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+    gap_class TEXT NOT NULL,
+    detector_id TEXT NOT NULL REFERENCES detectors(id),
+    project TEXT NOT NULL, order_id TEXT NOT NULL,
+    io_id TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed
+                                         --   | unreadable (Neo question 974)
+    original_fix_wo_id TEXT NOT NULL DEFAULT '',
+    original_issue_url TEXT NOT NULL DEFAULT '',
+    filed_note TEXT NOT NULL DEFAULT '', -- what happened on the tracker, or why nothing did
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_recurrences_detector
+    ON rule_recurrences(detector_id, ts);
 -- The append-only history of what the fleet was configured to run, and the only place
 -- that record exists: `projects.catalog_json` holds the CURRENT project dict and is
 -- overwritten on every `jarvis start`, and the catalog file is untracked, so git is not
@@ -468,7 +502,8 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 # `executescript(SCHEMA)` and nothing else — which is why the first column ever added to
 # it had to bring the mechanism with it.
 #
-# NOTHING HERE FOR `detectors`/`remedy_rules`/`rule_fires`, and that is not an oversight:
+# NOTHING HERE FOR `detectors`/`remedy_rules`/`rule_fires`/`rule_recurrences`, and that is
+# not an oversight:
 # they are NEW tables, so `CREATE TABLE IF NOT EXISTS` creates them in a live `os.db` too.
 # This guard is only for a column added to a table that ALREADY ships.
 ADDED_COLUMNS = {
@@ -1634,6 +1669,98 @@ class CentralStore:
         q += " ORDER BY ts DESC, id DESC LIMIT ?"
         params.append(int(limit))
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    # --- the recurrence ledger -------------------------------------------------------
+    # docs/specs/2026-09-27-self-evolution.md §8. A gap the OS ALREADY has a detector for
+    # happened again, which is a different fact from a new gap: the rule's condition
+    # missed it, or its remedy did not hold, or it was never armed. Filing that as a fresh
+    # issue loses the one thing that matters — that the OS already tried.
+
+    def add_recurrence(self, *, gap_class: str, detector_id: str, project: str,
+                       order_id: str, verdict: str, io_id: str = "",
+                       original_fix_wo_id: str = "", original_issue_url: str = "",
+                       filed_note: str = "", note: str = "") -> dict[str, Any]:
+        """Record that an existing rule did not hold, and which half of it did not.
+
+        `verdict` is checked against the closed set for `record_rule_fire`'s reason: a
+        verdict is what a finding is filed AGAINST, so an unrecognised one would send the
+        fix at a half of the rule nobody judged. The error names the allowed set because
+        the caller re-submits per error message.
+
+        `original_fix_wo_id` and `original_issue_url` are COPIED off the detector at write
+        time rather than read back through it later: they are the provenance thread the
+        recurrence links into, and a detector retracted or re-pointed afterwards must not
+        silently rewrite what this row says the OS tried.
+
+        `detectors.recurrences` increments HERE, in the same call, so the counter cannot
+        drift from the rows — the same reason `record_rule_fire` owns `hits`.
+
+        `filed_note` and `note` are bounded through `rules.bound`, as every other stored
+        payload in this codebase is, with the cap recorded in the text.
+        """
+        from . import rules
+
+        if verdict not in rules.RECURRENCE_VERDICTS:
+            raise ValueError(f"unknown recurrence verdict {verdict!r} — expected one of "
+                             f"{', '.join(rules.RECURRENCE_VERDICTS)}")
+        cur = self.conn.execute(
+            """INSERT INTO rule_recurrences
+               (ts, gap_class, detector_id, project, order_id, io_id, verdict,
+                original_fix_wo_id, original_issue_url, filed_note, note)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (db.now(), gap_class, detector_id, project, order_id, io_id, verdict,
+             original_fix_wo_id, original_issue_url, rules.bound(filed_note),
+             rules.bound(note)),
+        )
+        self.conn.execute(
+            "UPDATE detectors SET recurrences = recurrences + 1 WHERE id=?",
+            (detector_id,))
+        return self.get_recurrence(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def get_recurrence(self, recurrence_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM rule_recurrences WHERE id=?",
+                                (recurrence_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_recurrences(self, *, detector_id: str = "", project: str = "",
+                         order_id: str = "", verdict: str = "",
+                         limit: int = 50) -> list[dict[str, Any]]:
+        """The recurrence history, NEWEST FIRST — `list_rule_fires`' order, for its
+        reason: this is read as a timeline, and the newest row is what a person deciding
+        whether to arm or to re-fix the rule is looking at."""
+        q = "SELECT * FROM rule_recurrences WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("detector_id", detector_id), ("project", project),
+                              ("order_id", order_id), ("verdict", verdict)):
+            if value:
+                q += f" AND {column}=?"
+                params.append(value)
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def set_recurrence_filed_note(self, recurrence_id: int,
+                                  filed_note: str) -> dict[str, Any]:
+        """Write what happened on the tracker onto a row that already exists. THE ONE
+        IN-PLACE WRITE in this ledger, and the ordering is why it has to exist.
+
+        §8's rule is that the ledger is the OS's own record and the tracker a mirror of
+        it, so the row is inserted BEFORE anything touches GitHub: a `gh` that cannot be
+        reached, a refusal, a timeout or a crash between the two calls then loses the
+        note and never the finding. The outcome of that act — which issue was reopened or
+        commented on, or the failure in its own words — is therefore only knowable
+        afterwards, and this is how it reaches the row.
+
+        Nothing else about a recurrence is ever rewritten; the verdict and the provenance
+        are what the OS concluded at that moment and stay as written.
+        """
+        from . import rules
+
+        if self.get_recurrence(recurrence_id) is None:
+            raise KeyError(f"rule recurrence {recurrence_id} not found")
+        self.conn.execute("UPDATE rule_recurrences SET filed_note=? WHERE id=?",
+                          (rules.bound(filed_note), recurrence_id))
+        return self.get_recurrence(recurrence_id)  # type: ignore[return-value]
 
     # --- the config version ledger -------------------------------------------------
     # docs/superpowers/specs/2026-08-27-the-config-console.md §2, §9.
