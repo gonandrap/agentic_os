@@ -30,12 +30,17 @@ FLOOR = 5_000
 
 def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0,
         model: str = "claude-opus-5", ttl_1h: int = 0, ttl_5m: int = 0,
-        at: str = "2026-08-09T00:00:00.000Z") -> dict:
+        at: str = "2026-08-09T00:00:00.000Z",
+        stop_reason: str | None = "end_turn") -> dict:
     """One assistant row, in the shape Claude Code writes.
 
     `cache_creation` — the TTL the write bought — is nested one level down and is only
     written when a test asks for it, because most rows in the wild predate it and the
     module has to price those too.
+
+    `stop_reason` defaults to a SEALED value: a row carrying none is a mid-stream
+    snapshot whose `output_tokens` is a placeholder
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
     """
     usage_obj: dict = {
         "input_tokens": plain,
@@ -49,7 +54,8 @@ def row(mid: str, *, write: int = 0, read: int = 0, out: int = 0, plain: int = 0
     return {
         "type": "assistant",
         "timestamp": at,
-        "message": {"id": mid, "model": model, "usage": usage_obj},
+        "message": {"id": mid, "model": model, "usage": usage_obj,
+                    "stop_reason": stop_reason},
     }
 
 
@@ -102,6 +108,32 @@ def test_streamed_duplicates_count_once_but_distinct_messages_both_count(transcr
     assert total.cache_write == 700            # 500 + 200, not 1500 + 200
     assert total.output == 200                 # 140 + 60: the max copy, not the first
     assert total.cache_read == 500
+
+
+def test_a_message_whose_every_row_is_mid_stream_is_counted_not_estimated(transcripts):
+    """The defect this parser can only DISCLOSE: a message with no sealed row at all.
+
+    Claude Code writes a subagent's assistant message once per content block with
+    `stop_reason: null` and a streaming `output_tokens`, and never writes the sealed row
+    carrying the real figure. Counted, flagged, and NOT estimated — `output` stays the
+    MAX-merged placeholder, which is what fails if someone later scales it
+    (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1, decision 3).
+
+    Paired with a sealed message in the same transcript, so "1 placeholder call" cannot
+    pass against a parser that calls everything a placeholder.
+    """
+    path = transcripts("s1", [
+        row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
+        row("msg_a", write=1_000, read=2_000, out=5, stop_reason=None),
+        row("msg_b", write=100, read=200, out=700),
+    ])
+    total = usage.read_session("s1", FLOOR).total
+
+    assert total.placeholder_calls == 1
+    assert total.placeholder_output == 5
+    assert total.output == 705          # 5 + 700: the MAX merge, nothing synthesised
+    assert [call.sealed for call in usage.calls_of(path)] == [False, True]
+    assert total.as_dict()["placeholder_calls"] == 1
 
 
 def test_output_takes_the_max_not_the_last_row(transcripts):
