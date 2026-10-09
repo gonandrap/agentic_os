@@ -4831,6 +4831,53 @@ def check_os_identity() -> Iterator[Violation]:
     )
 
 
+def check_usage_meter_stale() -> Iterator[Violation]:
+    """INV-USAGE-METER-STALE — the account's usage meter has not been readable for N
+    minutes.
+
+    Account-wide, so OS-level and not per project. DERIVED FROM THE ROWS and nothing
+    else — the newest sample and the length of the trailing run of gap rows — so it cannot
+    go stale against an `os_state` key anyone forgot to clear. §8 of
+    docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+    """
+    from . import usage_meter
+    from .catalog import CostConfig
+    from .central_store import CentralStore
+
+    catalog = _live_catalog()
+    cfg = getattr(getattr(catalog, "os", None), "cost", None) or CostConfig()
+    central = CentralStore()
+    try:
+        streak = usage_meter.gap_streak(central)
+    finally:
+        central.close()
+    if streak.gap_rows == 0:
+        return
+    since = streak.last_ok_ts if streak.last_ok_ts is not None else streak.first_ts
+    stale_for = db.now() - float(since or db.now())
+    if stale_for <= cfg.meter_stale_minutes * 60:
+        return
+    yield Violation(
+        invariant="INV-USAGE-METER-STALE",
+        detail=(f"the account's usage meter has not been readable for "
+                f"{stale_for / 60:.0f} minutes ({streak.gap_rows} consecutive failed "
+                f"reads, the first at {_stamp(streak.first_ts)}): {streak.reason}. Every "
+                f"cost surface is back to a lower bound of unknown size until this is "
+                f"fixed — there is no second, independent number to reconcile the "
+                f"measured spend against."),
+        context={"last_ok_ts": streak.last_ok_ts, "gap_rows": streak.gap_rows,
+                 "reason": streak.reason},
+    )
+
+
+def _stamp(ts: float | None) -> str:
+    from datetime import datetime, timezone
+
+    if ts is None:
+        return "unknown"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds")
+
+
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
     check_ui_wedged,
@@ -4842,6 +4889,7 @@ OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_cache_ttl_trigger,
     check_prefix_stable,
     check_os_identity,
+    check_usage_meter_stale,
 )
 
 

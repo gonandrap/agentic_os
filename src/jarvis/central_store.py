@@ -416,6 +416,32 @@ CREATE TABLE IF NOT EXISTS os_config_versions (
     changes_json   TEXT NOT NULL DEFAULT '[]',  -- the edits the actor asked for
     source_path    TEXT NOT NULL DEFAULT ''
 );
+-- One minute's reading of the account's usage windows, or one GAP ROW saying why there
+-- is none. Account-level, so central: no project owns the meter. §2 of
+-- docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+CREATE TABLE IF NOT EXISTS usage_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,                       -- when the sampler READ the endpoint
+    ok INTEGER NOT NULL DEFAULT 1,          -- 0 = gap row; every pct/resets column NULL
+    reason TEXT NOT NULL DEFAULT '',        -- the failure in words; NEVER the body
+    http_status INTEGER,                    -- NULL on a network error that never answered
+    latency_ms INTEGER,
+    -- The two windows that have existed under stable names since this endpoint did, and
+    -- the only two anything reads. NULL on a gap row — never 0.0, which is a MEASUREMENT
+    -- meaning "the window just reset".
+    five_hour_pct REAL,
+    five_hour_resets_at REAL,               -- epoch, parsed from the ISO string
+    seven_day_pct REAL,
+    seven_day_resets_at REAL,
+    -- EVERY OTHER non-null window object, keyed by its top-level name. The payload
+    -- carries ~20 further keys and the set is NOT stable (`seven_day_opus`,
+    -- `seven_day_sonnet` and about fourteen codenames), so a column per name would need
+    -- a migration for every codename Anthropic invents. `limits` is NOT stored: the same
+    -- two numbers in a second shape, read by nothing.
+    extra_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_ts ON usage_samples(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_ok ON usage_samples(ok, ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);

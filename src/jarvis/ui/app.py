@@ -1742,11 +1742,19 @@ def create_app() -> FastAPI:
             fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
         except Exception:                                   # noqa: BLE001
             fleet = None
+        # The meter is a THIRD payload from the same resolved window, in its own `try`
+        # for the same reason: it reads `usage_samples` and the transcript tree, and
+        # losing it must not take the listing down.
+        try:
+            meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
+        except Exception as e:                              # noqa: BLE001
+            uilog.record_error(request.method, "cost/meter", e)
+            meter = None
         # Its own variable and never read out of `fleet`: losing the section must not
         # lose the window the reader picked.
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project, fleet=fleet, window=picked,
+                      project=project, fleet=fleet, meter=meter, window=picked,
                       window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
