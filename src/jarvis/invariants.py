@@ -3209,6 +3209,10 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
     Covers FEATURE orders too. Nothing sets one to `validating` yet (a sibling work order
     adds that loop), and an invariant covering half the units would look like one
     covering all of them.
+
+    SECOND ARM, work orders only: a round that PASSED and never landed — same defect, a
+    unit under review nothing will move again, in its other state. See
+    `_passed_round_never_landed`.
     """
     per_round = _validation_timeout()
     threshold = 2 * per_round
@@ -3252,6 +3256,76 @@ def check_validation_progresses(store: ProjectStore) -> Iterator[Violation]:
                          "unit": kind,
                          "fo_id": None if id_col == "wo_id" else unit_id},
             )
+    yield from _passed_round_never_landed(store)
+
+
+def _passed_round_never_landed(store: ProjectStore) -> Iterator[Violation]:
+    """INV-VALIDATION-STRANDED, second arm — a round that PASSED and never landed.
+
+    `Daemon._validate_work_order` lands a passed round only while no worker turn is in
+    flight and delegates the rest to `Daemon.settle_work_order`, which returns early for
+    exactly the `validating` status a deferral is always taken under. So the landing is
+    held in ONE control-flow path and nowhere in the STATE, and three measured orders sat
+    `validating` on a passed round for 2-8 days with the merge poll, the conflict repair
+    and the auto-merge gate never run over delivered, passed work.
+
+    Predicate, work orders only: `status='validating'`, latest round `passed`, no worker
+    turn in flight. No threshold of its own — a passed round is finished being judged, so
+    once nothing is typing there is nothing left that could move it.
+
+    Repaired by the settler's own act, `ops.land_when_cleared` on a RE-READ row, then the
+    daemon's `VALIDATION_LANDED` event with the round id so the settler cannot land the
+    same round twice.
+
+    Spec docs/superpowers/specs/2026-10-09-a-passed-round-that-never-landed-is-stranded.md.
+    """
+    from .daemon import VALIDATION_LANDED
+
+    rows = store.conn.execute(
+        "SELECT id FROM work_orders WHERE status='validating'").fetchall()
+    readonly = getattr(store, "readonly", False)
+    for row in rows:
+        wo_id = row["id"]
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is None or latest["outcome"] != "passed":
+            continue
+        if worker_session.busy(store, wo_id) is not None:
+            continue  # the deferral is correct there: a worker is typing
+        landed = store.last_event_of_kind(wo_id, VALIDATION_LANDED)
+        done = (db.from_json(landed.get("payload"), {}) or {}).get("round_id") \
+            if landed else None
+        if done is not None and int(done) == int(latest["id"]):
+            continue  # spec §1: this round's landing is already recorded
+        detail = (
+            f"work order {wo_id} is `validating` on a round that PASSED — round "
+            f"{latest['round']} is closed and no worker turn is in flight, so nothing in "
+            f"the OS will ever land it. The landing was deferred and its delegate is "
+            f"unreachable for this status."
+        )
+        context = {"round_id": latest["id"], "round": latest["round"],
+                   "unit": "work order", "fo_id": None}
+        if readonly:
+            # `jarvis doctor` without --repair. `land_finished` reaches
+            # `CentralStore.mark_backlog`, which no proxy over the project store can
+            # intercept — so the landing is described, not run.
+            yield Violation(
+                invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+                repaired=True,
+                repair="would land the passed round — `ops.land_when_cleared`",
+                context=context,
+            )
+            continue
+        from . import ops as ops_mod
+
+        fresh_wo = store.get_work_order(wo_id)
+        status = ops_mod.land_when_cleared(store, fresh_wo)
+        store.add_event(wo_id, VALIDATION_LANDED, {"round_id": int(latest["id"])})
+        yield Violation(
+            invariant="INV-VALIDATION-STRANDED", wo_id=wo_id, detail=detail,
+            repaired=True,
+            repair=f"landed the passed round — the work order is now `{status}`",
+            context=context,
+        )
 
 
 def check_feature_failures_are_real(store: ProjectStore) -> Iterator[Violation]:
