@@ -88,6 +88,20 @@ def red(fake_gh, checks=None, merge_state: str | None = None) -> None:
                    checks=RED if checks is None else checks, merge_state=merge_state)
 
 
+#: The head every real pull request has, and every counting test below records on the
+#: row as well — the state the poll itself leaves behind once it has seen the branch.
+#: `invariants.undeclared_delivery` returns on an EMPTY head before reading anything, so
+#: a fixture with no head would pin a budget one read cheaper than the fleet's
+#: (2026-10-07 spec §2.6).
+COUNTED_HEAD = "a" * 40
+
+
+def head_is_known(store, wo_id: str) -> None:
+    """Cache `COUNTED_HEAD` on the row: the same sha GitHub reports, so the poll's
+    head-cache write does not fire and the no-write assertions still hold."""
+    store.update_work_order(wo_id, pr_head_oid=COUNTED_HEAD)
+
+
 def delivered(store, wo_id: str) -> list[dict]:
     """Pretend the daemon delivered whatever is queued, and hand it back."""
     msgs = store.queued_messages(wo_id)
@@ -263,7 +277,7 @@ def test_a_pull_request_with_no_checks_is_not_red(started, project, fake_gh, rev
     assert not store.queued_messages(reviewing["id"])
 
 
-def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
+def test_a_green_pull_request_costs_one_call_six_reads_and_no_write(
         started, project, fake_gh, reviewing):
     """The overwhelmingly common case stays the cheap one — and the budget is COUNTED,
     not described.
@@ -271,11 +285,18 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     `poll_pull_requests` states this cost in its docstring, and the sentence had already
     drifted: it claimed one indexed read while the rewritten body performed several. A
     prose budget nobody executes is a comment, not a guarantee, so the statements are
-    read off the connection here. The four PER PULL REQUEST are one question each — was
+    read off the connection here. The six PER PULL REQUEST are one question each — was
     this closure already reported, is a conflict episode open, is a checks episode open,
-    and is a "waiting for the base" note still up — and a fifth appearing means somebody
-    put a query on the path every open pull request in the fleet pays for every two
-    minutes.
+    is a "waiting for the base" note still up, is this delivery undeclared, and is an
+    undeclared episode open — and a seventh appearing means somebody put a query on the
+    path every open pull request in the fleet pays for every two minutes.
+
+    The last two arrived with the undeclared-delivery repair (2026-10-07 spec §2.6) and
+    the fifth is paid by EVERY polled pull request, including a project that has never
+    had a refusal: there is no cheaper way to ask "has this order ever had a refusal"
+    than the `reviewed` read. It is also why `head_is_known` is called here — the
+    detector returns on an empty head before reading anything, so a fixture without one
+    would pin a budget the fleet does not pay.
 
     The fifth statement here is the gate-only exclusion (2026-09-25 spec §4), and it is
     PER STEP rather than per pull request: one bulk `pr_url_recorded` read over every
@@ -290,6 +311,7 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
+    head_is_known(store, reviewing["id"])
     before = store.list_events(reviewing["id"])
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
@@ -300,7 +322,7 @@ def test_a_green_pull_request_costs_one_call_four_reads_and_no_write(
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 1
     assert not [c for c in fake_gh.calls if c["argv"][:2] == ["run", "list"]]
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
-    assert len([s for s in sql if "wo_events" in s]) == 5
+    assert len([s for s in sql if "wo_events" in s]) == 7
     # ...and the work-order query is the step's one, for the whole project, not one per
     # pull request: the row is re-read only when a clear has just taken a flag down.
     assert len([s for s in sql if "wo_events" not in s]) == 1
@@ -314,9 +336,10 @@ def test_two_parked_pull_requests_pay_the_per_request_price_twice(
     """What "per pull request" and "per step" mean, counted on a step that has two.
 
     The exclusion above is one bulk read over every candidate id, so the arithmetic is
-    `4 * pull requests + 1`. A per-order `events_of_kind` for the same answer would read
-    `5 * pull requests` and look identical on a fleet with one open pull request — which
-    is every test but this one.
+    `6 * pull requests + 1`. A per-order `events_of_kind` for the same answer would read
+    `7 * pull requests` and look identical on a fleet with one open pull request — which
+    is every test but this one. This is also what proves the two undeclared-delivery
+    reads are per pull request and not per step.
     """
     second = ops.create_work_order("proj_a", "add feature Y")
     ops.finish(second["id"], "opened a second PR", pr_url=OTHER_PR)
@@ -324,6 +347,8 @@ def test_two_parked_pull_requests_pay_the_per_request_price_twice(
     fake_gh.set_pr(OTHER_PR, "OPEN", mergeable="MERGEABLE", base_ref="main",
                    checks=GREEN)
     store = ProjectStore(project)
+    head_is_known(store, reviewing["id"])
+    head_is_known(store, second["id"])
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
 
@@ -331,7 +356,7 @@ def test_two_parked_pull_requests_pay_the_per_request_price_twice(
 
     store.conn.set_trace_callback(None)
     assert len([c for c in fake_gh.calls if c["argv"][:2] == ["pr", "view"]]) == 2
-    assert len([s for s in sql if "wo_events" in s]) == 4 * 2 + 1
+    assert len([s for s in sql if "wo_events" in s]) == 6 * 2 + 1
     assert len([s for s in sql if "wo_events" not in s]) == 1
 
 
@@ -350,14 +375,18 @@ def test_the_automatic_merge_costs_a_project_that_has_not_opted_in_nothing(
     """
     red(fake_gh, GREEN)
     store = ProjectStore(project)
+    head_is_known(store, parked["id"])
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
 
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 5
+    assert len([s for s in sql if "wo_events" in s]) == 7
     assert len([s for s in sql if "wo_events" not in s]) == 1
+    # ...and no round read, which is what proves the undeclared detector's cheap
+    # short-circuit ordering: `refusal_answered` returns True on an order that never had
+    # a refusal, so `judged_heads` is never reached.
     assert not [s for s in sql if "validation_rounds" in s]
 
 
@@ -387,6 +416,7 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
     spec.validation.enabled = True
     spec.validation.auto_merge = True
     store = ProjectStore(project)
+    head_is_known(store, parked["id"])
     poll(started, store)                     # the hold is recorded, once
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
@@ -395,9 +425,11 @@ def test_an_opted_in_project_declares_what_the_automatic_merge_costs_it(
 
     store.conn.set_trace_callback(None)
     assert [s for s in sql if not s.lstrip().upper().startswith("SELECT")] == []
+    # `validation_rounds` and `assumptions` are the auto-merge's own, unchanged by the
+    # undeclared detector: its short-circuit stops before `judged_heads`.
     assert len([s for s in sql if "validation_rounds" in s]) == 1
     assert len([s for s in sql if "assumptions" in s]) == 1
-    assert len([s for s in sql if "wo_events" in s]) == 6
+    assert len([s for s in sql if "wo_events" in s]) == 8
     assert not [s for s in sql if "approvals" in s]
 
 
@@ -491,19 +523,24 @@ def test_an_opted_in_project_pays_nothing_for_an_order_awaiting_a_person(
     about to look at — must therefore pay exactly the base budget, whatever the project
     has opted into. What it must ALSO not do is record a hold; that half is asserted in
     `test_automerge.py`, which owns the user-visible consequence.
+
+    The "no `validation_rounds`" half holds because the `reviewing` fixture has no
+    refusal: the undeclared detector's `refusal_answered` answers True and stops before
+    `judged_heads`, which is the only thing on this path that would read a round.
     """
     red(fake_gh, GREEN)
     spec = started.catalog.project("proj_a")
     spec.validation.enabled = True
     spec.validation.auto_merge = True
     store = ProjectStore(project)
+    head_is_known(store, reviewing["id"])
     sql: list[str] = []
     store.conn.set_trace_callback(sql.append)
 
     poll(started, store)
 
     store.conn.set_trace_callback(None)
-    assert len([s for s in sql if "wo_events" in s]) == 5
+    assert len([s for s in sql if "wo_events" in s]) == 7
     assert not [s for s in sql if "validation_rounds" in s or "assumptions" in s]
 
 

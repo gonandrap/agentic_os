@@ -64,6 +64,7 @@ from typing import TYPE_CHECKING, Any
 from . import verdicts
 from .claude_cli import USAGE_SCHEMA_VERSION
 from .project_store import (
+    COMPACT_TURN,
     FO_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
     ProjectStore,
@@ -152,14 +153,17 @@ def _worker_row(store: ProjectStore, wo_id: str) -> Any:
     """The worker half of one order's spend, and how many of its turns were counted
     under a superseded reading of the result envelope — in one query, because the
     common case is zero and must stay a single indexed scan."""
+    # The compaction is charged on the Jarvis half, so it is filtered out of the SUM and
+    # NOT out of the `WHERE`: the staleness aggregate must keep seeing every row
+    # (docs/superpowers/specs/2026-10-08-count-a-compaction-once.md §2).
     return store.conn.execute(
-        "SELECT COALESCE(SUM(cost_usd), 0) AS c, "
+        "SELECT COALESCE(SUM(CASE WHEN kind <> ? THEN cost_usd ELSE 0 END), 0) AS c, "
         "       COALESCE(SUM(CASE WHEN COALESCE("
         "           json_extract(usage_json, '$.usage_v'), 1) < ? "
         "           AND outfile IS NOT NULL AND outfile <> '' "
         "           AND state IN ('done', 'failed') THEN 1 ELSE 0 END), 0) AS stale "
         "FROM wo_turns WHERE wo_id=?",
-        (USAGE_SCHEMA_VERSION, wo_id),
+        (COMPACT_TURN, USAGE_SCHEMA_VERSION, wo_id),
     ).fetchone()
 
 

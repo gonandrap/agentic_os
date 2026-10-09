@@ -1630,6 +1630,36 @@ def test_a_doctor_run_without_repair_reports_the_finding_and_writes_none(project
     assert store.alarms_of(wo["id"]) == []
 
 
+def test_no_finding_while_the_os_is_nudging_the_worker(project):
+    """The poll is the actor now: an order with a session and no give-up is being asked
+    to declare, so a finding would be raised and then answered by the OS itself."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    store.update_work_order(wo["id"], session_id="sess-1")
+
+    reported = [v for v in check_project(store)
+                if v.invariant == "INV-UNDECLARED-DELIVERY"]
+
+    assert reported == []
+    assert store.alarms_of(wo["id"]) == []
+
+
+def test_the_finding_is_the_give_ups(project):
+    """Once the OS has said it is stopping, the finding is what reaches the user —
+    raised once, as before."""
+    store = ProjectStore(project)
+    wo = _refused_then_pushed(store, head=PUSHED, judged=DELIVERED)
+    store.update_work_order(wo["id"], session_id="sess-1")
+    store.add_event(wo["id"], "pr_undeclared_unresolved", {"attempts": 3})
+
+    check_project(store)
+    check_project(store)
+
+    raised = [a for a in store.alarms_of(wo["id"])
+              if a["kind"] == "undeclared_delivery"]
+    assert len(raised) == 1
+
+
 # -- INV-STUCK-SWEEP-DARK: the stuck sweep's own failures are a first-class alarm -------
 #
 # §8 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.

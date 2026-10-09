@@ -217,11 +217,20 @@ PR_REPAIR_STATUSES = ("waiting_pr_merge", "needs_review", "waiting_input", "fail
 #: reversed without a cycle.
 PR_CONFLICT_REPAIR = "conflict"
 PR_CHECKS_REPAIR = "checks"
+#: The third: the worker pushed past a refusal and never declared it, so the OS asks it
+#: to run `jarvis wo finish`. Spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1.
+#:
+#: PR_REPAIR_STATUSES IS NOT WIDENED FOR IT: `UNDECLARED_DELIVERY_STATUSES` is a strict
+#: subset, so the pairing stated above holds unedited and this blocker is derivable in
+#: every status its detector can fire in.
+PR_UNDECLARED_REPAIR = "undeclared"
 
-#: `ops.PrRepair.source` for both repairs — the `wo_messages.source` a nudge is queued
-#: under. Derived from the names above at the one site that owns them, so `parked_reason`
-#: cannot drift from what `nudge_pr_repair` writes.
-PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}")
+#: `ops.PrRepair.source` for all three repairs — the `wo_messages.source` a nudge is
+#: queued under. Derived from the names above at the one site that owns them, so
+#: `parked_reason` cannot drift from what `nudge_pr_repair` writes.
+PR_REPAIR_SOURCES = (f"pr-{PR_CONFLICT_REPAIR}", f"pr-{PR_CHECKS_REPAIR}",
+                     f"pr-{PR_UNDECLARED_REPAIR}")
 
 #: THE THREE EVENTS OF THE INHERITED-FAILURE HEAL, named here for the reason the repair
 #: names above are: `ops` writes them, `status_label` below derives from them, and `ops`
@@ -273,6 +282,14 @@ PR_CONFLICT_BLOCKER = ("merge conflicts the worker could not resolve — the pul
 PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could not fix "
                      "them — do not merge it as it stands")
 
+#: The third: the worker answered a refusal with commits and never declared them, and the
+#: OS could not get it to. Same obligation as the two above — no count, no sha and no
+#: elapsed time, because `ack_attention` stores it verbatim and INV-ATTENTION-REASON
+#: compares it (kn-681db233 point 3).
+PR_UNDECLARED_BLOCKER = ("the worker pushed commits answering your refusal and would not "
+                         "declare them — nothing has been judged, so decide what to do "
+                         "with the branch as it stands")
+
 #: THE TWO GIVE-UPS, PAIRED AND ORDERED, because `true_blockers` derives them from this
 #: tuple at ONE site. They were derived at two — the red build above the `needs_review`
 #: triage and the conflict below it — and after issue #224 widened both onto
@@ -285,8 +302,14 @@ PR_CHECKS_BLOCKER = ("the pull request's checks are failing and the worker could
 #:
 #: Conflict first: a pull request that will not merge at all is not waiting on its
 #: checks, and if a worker somehow spent both budgets that is the one to act on.
+#:
+#: UNDECLARED LAST, for the same reason conflict is first: a branch that will not merge
+#: and a branch that is red are facts about the artifact, while this is a fact about the
+#: paperwork over an artifact that may be fine (spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.1).
 PR_REPAIR_BLOCKERS = ((PR_CONFLICT_REPAIR, PR_CONFLICT_BLOCKER),
-                      (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER))
+                      (PR_CHECKS_REPAIR, PR_CHECKS_BLOCKER),
+                      (PR_UNDECLARED_REPAIR, PR_UNDECLARED_BLOCKER))
 
 #: The event `ops.rejudge_moved_head` writes when it will NOT re-judge a moved head: the
 #: round it would open is the one that reaches `validation.max_rounds`, and that last
@@ -1365,6 +1388,9 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
     `remedies.propose(..., "nudge")`, which files a gate request, and only a live grant
     lets `remedies.apply` say anything to a worker.
 
+    SILENT WHILE THE POLL IS HEALING IT. `ops.PR_UNDECLARED` made the poll the actor for
+    this condition, so the finding is now the GIVE-UP's — see the clause below.
+
     Raised ONCE per order while the condition stands: a finding per reconcile tick would
     fill `/alarms` with the same row for ever, which is the noise `last_alarm_of_kind`
     exists to prevent one queue along.
@@ -1374,6 +1400,20 @@ def check_undeclared_delivery(store: ProjectStore) -> Iterator[Violation]:
     readonly = getattr(store, "readonly", False)
     for wo in store.list_work_orders(statuses=UNDECLARED_DELIVERY_STATUSES):
         if not undeclared_delivery(store, wo):
+            continue
+        # THE OS IS ON IT: the nudge is the response, and the give-up is what reaches the
+        # user. Spec
+        # docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.4.
+        #
+        # `session_id` because `Daemon.heal_pull_request` returns on its absence before
+        # anything else — an order whose worker session is gone can never be nudged, so
+        # suppressing here would be silence for ever. NOT gave-up because
+        # `pr_repair_gave_up` is "has the OS said it is stopping" and is episode-scoped,
+        # so a cleared-then-reopened case starts silent again. Attempts `== 0` is
+        # deliberately NOT a clause: the next poll tick is two minutes away, and a
+        # finding raised in that window is one the OS answers itself.
+        if wo.get("session_id") and not store.pr_repair_gave_up(wo["id"],
+                                                                PR_UNDECLARED_REPAIR):
             continue
         if any(a["kind"] == UNDECLARED_DELIVERY_KIND for a in store.alarms_of(wo["id"])):
             continue
@@ -4052,6 +4092,78 @@ def check_ui_healthy() -> Iterator[Violation]:
     )
 
 
+def check_ui_wedged() -> Iterator[Violation]:
+    """INV-UI-WEDGED — the dashboard has stopped serving and said so about itself.
+
+    The other half of `check_ui_healthy`, and the half that was missing: that one reads
+    `[ERROR]` entries, and a WEDGE raises no exception at all — every routed page went
+    silent while `systemctl` reported `active (running)` and `ui.log` stayed empty, so
+    silence was indistinguishable from health. §5 of
+    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+
+    Reads the stamp the UI process writes through `uilog`, never by parsing `ui.log`.
+    Never repairable, like every member of `OS_INVARIANTS`: `jarvis doctor` reports and
+    the daemon heals.
+    """
+    from . import release, uilog
+
+    stamp = uilog.read_wedge()
+    if not stamp:
+        return
+    try:
+        last = float(stamp.get("at") or stamp.get("since") or 0)
+        since = float(stamp.get("since") or 0)
+    except (TypeError, ValueError):
+        return
+    # Window-based, exactly as `check_ui_healthy` is and for its reason: the restarted
+    # dashboard is a new process and never comes back to delete the stamp, so a report
+    # that did not expire would say "wedged" for ever after one wedge.
+    if not last or time.time() - last > uilog.ERROR_WINDOW_SECONDS:
+        return
+    age = max(0.0, time.time() - since) if since else 0.0
+    restarts, cap, cap_spent = _ui_restart_counts()
+    yield Violation(
+        invariant="INV-UI-WEDGED",
+        detail=(f"the dashboard reported its threadpool wedged "
+                f"{int(age // 60)} minutes ago and dumped every thread's stack to "
+                f"{stamp.get('dump') or uilog.stack_dump_path()} — the OS has "
+                f"self-restarted {release.UI_UNIT} {restarts} time"
+                f"{'s' if restarts != 1 else ''} in the last 24h"
+                f"{f', which is the cap of {cap}' if cap_spent else ''} "
+                f"(stamp: {uilog.wedge_stamp_path()})"),
+        level="critical" if cap_spent else "warning",
+        context={"since": since, "age_seconds": int(age),
+                 "dump": stamp.get("dump"), "limiter": stamp.get("limiter"),
+                 "version": stamp.get("version"), "restarts": restarts,
+                 "cap": cap, "cap_spent": cap_spent},
+    )
+
+
+def _ui_restart_counts() -> tuple[int, int, bool]:
+    """Self-restarts inside the rolling 24h, the cap, and whether it is spent."""
+    from . import db, ops, uilog
+    from .central_store import CentralStore
+
+    cap = int(getattr(ops.ui_health_config(), "max_restarts_per_day", 0) or 0)
+    try:
+        central = CentralStore()
+    except Exception:  # noqa: BLE001 — a check must not fail on an unopenable store
+        return 0, cap, False
+    try:
+        rows = db.from_json(central.get_state(uilog.UI_WEDGE_RESTARTS), []) or []
+    finally:
+        central.close()
+    cutoff = time.time() - 24 * 3600
+    recent = 0
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            if float(row) >= cutoff:
+                recent += 1
+        except (TypeError, ValueError):
+            continue
+    return recent, cap, bool(cap) and recent >= cap
+
+
 def check_config_drift() -> Iterator[Violation]:
     """INV-CONFIG-DRIFT — the catalog on disk must be the version the ledger calls head.
 
@@ -4658,6 +4770,7 @@ def _stamp(ts: float | None) -> str:
 
 OS_INVARIANTS: tuple[Callable[[], Iterator[Violation]], ...] = (
     check_ui_healthy,
+    check_ui_wedged,
     check_gate_canaries,
     check_config_drift,
     check_service_path,
