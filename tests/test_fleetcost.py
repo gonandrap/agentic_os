@@ -802,11 +802,11 @@ def order_stats(session_id: str, wo_id: str = "wo-1") -> fleetcost.OrderStats:
                                 status="completed", session_id=session_id)
 
 
-def tool_costs(sessions, *, floor=5_000, **cfg_keys):
+def tool_costs(sessions, *, floor=5_000, since=SINCE, until=UNTIL, **cfg_keys):
     cfg = catalog.CostConfig(**cfg_keys)
     return fleetcost.tool_costs([order_stats(s, f"wo-{i}")
                                  for i, s in enumerate(sessions)],
-                                cfg=cfg, floor=floor)
+                                cfg=cfg, floor=floor, since=since, until=until)
 
 
 def test_carried_cost_stops_at_the_next_compaction(fleet_fixture):
@@ -986,7 +986,8 @@ def test_tools_payload_keys_stable(fleet_fixture):
     assert tools["version"] == 1
     assert set(tools) == TOOLS_KEYS
     assert set(tools["excluded"]) == {"unmatched_calls", "no_transcript",
-                                      "orders_capped", "sessions_walked"}
+                                      "orders_capped", "sessions_walked",
+                                      "outside_window"}
     assert set(tools["totals"]) == TOOL_COST_KEYS
     bash = tools["by_tool"]["Bash"]
     assert set(bash) == TOOL_COST_KEYS | {"shapes"}, "shapes are Bash's alone"
@@ -1055,6 +1056,173 @@ def test_tools_read_only(fleet_fixture, monkeypatch):
 
     assert tools["totals"]["result_tokens"] == 150
     assert (f.db.stat().st_mtime_ns, transcript.stat().st_mtime_ns) == before
+
+
+# Cases 13-18: the window bound, docs/superpowers/specs/2026-10-08-cost-tool-section-
+# window-clip.md §1-§4. A result counts only if its own `ts` is in `[since, until)`, and
+# the carried ride stops at `until` as well as at the next compaction.
+
+
+def test_a_result_before_since_is_excluded(fleet_fixture):
+    """`result.ts` is the selector: a result landing before the window is not in it."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=SINCE - 120, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=SINCE - 60),
+        f.call_row(at=SINCE - 50, read=1_200, mid="m2"),
+        f.call_row(at=SINCE - 40, read=1_250, mid="m3"),
+        f.call_row(at=T0, write=1_000, out=50, mid="m4", tools=[("t2", "Read", {})]),
+        f.result_row(("t2", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m5"),
+        f.call_row(at=T0 + 3, read=1_250, mid="m6"),
+    ])
+
+    tools = tool_costs(["sess-a"])
+    read = tools["by_tool"]["Read"]
+
+    assert read["calls"] == 1, "only the in-window result is a call"
+    assert read["result_tokens"] == 150, "the T0 result alone"
+    assert read["carried_calls"] == 2 and read["carried_tokens"] == 300
+    assert tools["excluded"]["outside_window"] == 1
+    assert tools["excluded"]["unmatched_calls"] == 0
+
+
+def test_a_result_after_until_is_excluded(fleet_fixture):
+    """Half-open: a result at EXACTLY `until` is out, which no other case would catch."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+        f.call_row(at=UNTIL - 10, write=1_000, out=50, mid="m3",
+                   tools=[("t2", "Read", {})]),
+        f.result_row(("t2", "x" * 40), at=UNTIL),
+        f.call_row(at=UNTIL + 5, read=1_200, mid="m4"),
+        f.call_row(at=UNTIL + 60, write=1_000, out=50, mid="m5",
+                   tools=[("t3", "Read", {})]),
+        f.result_row(("t3", "x" * 40), at=UNTIL + 120),
+        f.call_row(at=UNTIL + 130, read=1_200, mid="m6"),
+    ])
+
+    tools = tool_costs(["sess-a"])
+    read = tools["by_tool"]["Read"]
+
+    assert read["calls"] == 1, "the result AT until is excluded, not included"
+    assert read["result_tokens"] == 150
+    assert read["carried_calls"] == 2, "m2 and m3, the two in-window later calls"
+    assert tools["excluded"]["outside_window"] == 2
+    assert tools["excluded"]["unmatched_calls"] == 0
+
+
+def test_carried_range_is_truncated_at_until(fleet_fixture):
+    """The case the fix exists for: a result in the window, a ride that left it."""
+    f = fleet_fixture
+    rows = [
+        f.call_row(at=UNTIL - 200, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=UNTIL - 100),
+        f.call_row(at=UNTIL - 90, read=1_200, mid="m2"),
+        f.call_row(at=UNTIL - 80, read=1_250, mid="m3"),
+        f.call_row(at=UNTIL + 10, read=1_300, mid="m4"),
+        f.call_row(at=UNTIL + 20, read=1_350, mid="m5"),
+    ]
+    f.transcript("sess-a", rows)
+
+    read = tool_costs(["sess-a"])["by_tool"]["Read"]
+
+    assert read["carried_calls"] == 2, "the two calls before until, never the two after"
+    assert read["carried_tokens"] == 300
+    # Priced the way §10.4's own test prices, so the two post-`until` calls cannot hide
+    # inside a tolerance.
+    assert read["carried_usd"] == pytest.approx(150 * OPUS * 2 * READ_RATE)
+
+    # A compaction BEFORE until: the ride stops there, proving the min() and not
+    # "whichever bound was added last".
+    f.transcript("sess-b", [*rows[:3], f.compact_row(at=UNTIL - 85), *rows[3:]])
+    compacted = tool_costs(["sess-b"])["by_tool"]["Read"]
+
+    assert compacted["carried_calls"] == 1
+    assert compacted["carried_usd"] == pytest.approx(150 * OPUS * READ_RATE)
+
+
+def test_excluded_outside_window_counts_results(fleet_fixture):
+    """Each exclusion counted once, in its own key: matched check first, window second."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=SINCE - 120, write=1_000, out=50,
+                   tools=[("a1", "Read", {}), ("a2", "Read", {})]),
+        f.result_row(("a1", "x" * 20), at=SINCE - 60),
+        f.result_row(("a2", "x" * 20), at=SINCE - 50),
+        f.call_row(at=SINCE - 40, read=1_200, mid="m2"),
+        # In-window and UNMATCHED: its own key, never `outside_window`.
+        f.call_row(at=T0, write=1_000, out=50, mid="m3", tools=[("b1", "Read", {})]),
+        f.call_row(at=T0 + 2, read=1_200, mid="m4", tools=[("c1", "Read", {})]),
+        f.result_row(("c1", "x" * 40), at=UNTIL + 10),
+        f.call_row(at=UNTIL + 20, read=1_300, mid="m5"),
+    ])
+
+    tools = tool_costs(["sess-a"])
+
+    assert tools["excluded"]["outside_window"] == 3
+    assert tools["excluded"]["unmatched_calls"] == 1
+    assert tools["by_tool"] == {}, "nothing in-window was matched"
+    assert tools["totals"]["calls"] == 0
+
+
+def test_subagent_results_are_clipped_too(fleet_fixture):
+    """Clipping only the main chain would leave most of the over-count in place."""
+    f = fleet_fixture
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=1_000, out=50, tools=[("t1", "Read", {})]),
+        f.result_row(("t1", "x" * 40), at=T0 + 1),
+        f.call_row(at=T0 + 2, read=1_200, mid="m2"),
+    ], subagents=[[
+        f.call_row(at=T0 + 10, write=500, out=10, mid="s1",
+                   tools=[("u1", "Grep", {})]),
+        f.result_row(("u1", "y" * 8), at=T0 + 11),
+        f.call_row(at=T0 + 12, read=600, mid="s2"),
+        f.call_row(at=UNTIL + 5, write=500, out=10, mid="s3",
+                   tools=[("u2", "Grep", {})]),
+        f.result_row(("u2", "y" * 8), at=UNTIL + 6),
+        f.call_row(at=UNTIL + 7, read=600, mid="s4"),
+    ]])
+
+    tools = tool_costs(["sess-a"])
+    totals, by_caller = tools["totals"], tools["totals"]["by_caller"]
+    grep = tools["by_tool"]["Grep"]
+
+    assert grep["calls"] == 1, "the post-until subagent result is excluded"
+    assert grep["carried_calls"] == 1, "s2 only — s3 is at/after until"
+    assert tools["excluded"]["outside_window"] == 1
+    assert by_caller["main"]["calls"] + by_caller["subagent"]["calls"] == totals["calls"]
+    assert (by_caller["main"]["result_tokens"]
+            + by_caller["subagent"]["result_tokens"]) == totals["result_tokens"]
+
+
+def test_tool_carried_usd_never_exceeds_window_spend(fleet_fixture):
+    """§8's acceptance criterion: a share cannot exceed its whole. An INEQUALITY."""
+    f = fleet_fixture
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100,
+                   tools=[("t1", "Bash", {"command": "sed -n '1,900p' f"})]),
+        f.result_row(("t1", "x" * 4_000), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=200, out=100, mid="m2"),
+        # The session ran on for weeks past the window.
+        *[f.call_row(at=UNTIL + 100 * i, read=50_000, input=200, out=100, mid=f"L{i}")
+          for i in range(1, 9)],
+    ])
+
+    fleet = report()
+    tools = fleet["tools"]
+    per_order = fleet["metrics"]["cost_per_order_usd"]
+    spend = (per_order["avg"] or 0.0) * per_order["n"]
+
+    assert tools["totals"]["carried_usd"] <= spend
+    # And strictly less than the unclipped walk, so a revert FAILS instead of passing
+    # vacuously on a fixture where the two happen to agree.
+    unclipped = tool_costs(["sess-a"], until=UNTIL + 10_000_000)
+    assert tools["totals"]["carried_usd"] < unclipped["totals"]["carried_usd"]
 
 
 # -- 11. §10.7: the render --------------------------------------------------------------
@@ -1140,3 +1308,56 @@ def test_the_dashboard_renders_the_same_payload(fleet_fixture):
 
     assert "What the tools cost" in html
     assert "Bash · sed_range" in html
+
+
+def _window_hid_one(f):
+    """A transcript with exactly one matched result PAST `until`, and one inside it."""
+    wo = f.order(session_id="sess-a")
+    f.turn(wo, started_at=T0, ended_at=T0 + 100, cost_usd=1.0)
+    f.transcript("sess-a", [
+        f.call_row(at=T0, write=50_000, out=100,
+                   tools=[("t1", "Bash", {"command": "sed -n '1,900p' f"})]),
+        f.result_row(("t1", "x" * 4_000), at=T0 + 1),
+        f.call_row(at=T0 + 10, read=50_000, input=20_000, out=100, mid="m2"),
+        f.call_row(at=UNTIL + 5, write=1_000, out=50, mid="m3",
+                   tools=[("t2", "Read", {})]),
+        f.result_row(("t2", "y" * 40), at=UNTIL + 6),
+        f.call_row(at=UNTIL + 7, read=1_200, mid="m4"),
+    ])
+
+
+def test_the_render_names_what_the_window_hid(fleet_fixture, capsys):
+    """§10.7: the clip is DISCLOSED with its count, and silent when nothing was hidden."""
+    from jarvis import cli
+
+    _window_hid_one(fleet_fixture)
+
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2026-10-06T04:00:00+00:00"]) == 0
+    out = capsys.readouterr().out
+    assert "1 tool results outside the window, excluded" in out
+
+    # The same state with a window wide enough to contain everything: nothing hidden,
+    # so the sentence must not appear at all.
+    assert cli.main(["cost", "--fleet", "--since", "2026-09-29T04:00:00+00:00",
+                     "--until", "2027-10-06T04:00:00+00:00"]) == 0
+    assert "tool results outside the window, excluded" not in capsys.readouterr().out
+
+
+def test_the_dashboard_names_what_the_window_hid(fleet_fixture):
+    """The HTML footer discloses the same count from the same payload key."""
+    import jinja2
+
+    from jarvis.ui.app import TEMPLATES
+
+    _window_hid_one(fleet_fixture)
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)))
+
+    def render(until: float) -> str:
+        fleet = ops.fleet_cost(since=SINCE, until=until)["fleet"]
+        return env.get_template("_fleet_distribution.html").render(
+            fleet=fleet, fmt_tok=lambda n: str(n), tool_table=fleetcost.tool_table)
+
+    assert "1 tool results outside the window, excluded" in render(UNTIL)
+    assert ("tool results outside the window, excluded"
+            not in render(stamp("2027-10-06T04:00:00+00:00")))

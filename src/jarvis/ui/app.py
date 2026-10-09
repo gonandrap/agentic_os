@@ -2003,6 +2003,19 @@ def create_app() -> FastAPI:
                       history=[r for r in rows if not r["live"]],
                       kinds=ALARM_KINDS)
 
+    @app.get("/stuck", response_class=HTMLResponse)
+    def stuck_page(request: Request):
+        """Open orders judged on time in status — `alarms_page`'s split, for the same
+        reason: the top is the queue that is an ask, the bottom is the record.
+
+        Every number is `ops.stuck_report`'s; this route computes none of them (§7 of
+        docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md).
+        """
+        rows = ops.stuck_report()
+        return render(request, "stuck.html", active="stuck",
+                      over=[r for r in rows if r["stuck"]],
+                      rest=[r for r in rows if not r["stuck"]])
+
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
         """One alarm — where the work order's timeline and a Neo escalation both link.

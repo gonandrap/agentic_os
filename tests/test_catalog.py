@@ -14,7 +14,7 @@ from jarvis.catalog import (
     parse_catalog,
 )
 from jarvis.neo_store import SEATS
-from jarvis.project_store import VALIDATOR_SEATS
+from jarvis.project_store import OPEN_STATUSES, VALIDATOR_SEATS
 
 
 def test_minimal_catalog(tmp_path):
@@ -676,6 +676,58 @@ def test_an_unknown_observability_level_is_refused_naming_the_legal_ones():
             {"name": "a", "path": "/tmp/a", "observability": {"level": "loud"}}]})
     with pytest.raises(CatalogError, match="must be an object"):
         parse_catalog({"os": {"observability": "full"}, "projects": []})
+
+
+# -- `fleet_health`: §4 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-
+# gets-investigated.md
+
+
+def test_every_open_status_has_a_threshold():
+    """The test that makes a new `OPEN_STATUSES` member a failure rather than a blind
+    spot: seven are named and the rest ride the fallback."""
+    cat = parse_catalog({"projects": [{"name": "a", "path": "/tmp/a"}]})
+    cfg = cat.projects[0].fleet_health
+    assert cfg.enabled
+    for status in OPEN_STATUSES:
+        assert cfg.threshold_seconds(status) > 0
+
+
+def test_fleet_health_inherits_per_status():
+    """`thresholds` inherits PER STATUS: a project disabling one must not drop the rest."""
+    cat = parse_catalog({
+        "os": {"fleet_health": {"thresholds": {"running": 90}}},
+        "projects": [{"name": "a", "path": "/tmp/a",
+                      "fleet_health": {"thresholds": {"validating": 45}}}],
+    })
+    cfg = cat.projects[0].fleet_health
+    assert cfg.thresholds["validating"] == 45 and cfg.thresholds["running"] == 90
+    assert cfg.thresholds["needs_review"] == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_THRESHOLDS["needs_review"]
+    assert cfg.cooldown_minutes == jarvis.catalog.DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+
+    with pytest.raises(CatalogError, match="complted"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"thresholds": {"complted": 60}}}]})
+    with pytest.raises(CatalogError, match=r"os\.fleet_health\.max_per_day"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"max_per_day": 9}}]})
+
+
+def test_sweep_dark_minutes_is_refused_on_a_project():
+    """A FLEET number, `max_per_day`'s reason: the stuck sweep writes ONE fleet-wide run
+    record, so no arrangement of per-project numbers can say how long it may be silent."""
+    with pytest.raises(CatalogError, match=r"os\.fleet_health\.sweep_dark_minutes"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"sweep_dark_minutes": 20}}]})
+    with pytest.raises(CatalogError, match="is a FLEET number"):
+        parse_catalog({"projects": [{"name": "a", "path": "/tmp/a",
+                                     "fleet_health": {"sweep_dark_minutes": 20}}]})
+    cat = parse_catalog({"os": {"fleet_health": {"sweep_dark_minutes": 20}},
+                         "projects": [{"name": "a", "path": "/tmp/a"}]})
+    assert cat.os.fleet_health.sweep_dark_minutes == 20
+    assert cat.projects[0].fleet_health.sweep_dark_minutes == 20
+    assert jarvis.catalog.FleetHealthConfig().sweep_dark_minutes == \
+        jarvis.catalog.DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
 
 
 # -- the backstop ceiling on an OS-side prompt (spec §4,
