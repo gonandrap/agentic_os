@@ -360,11 +360,16 @@ def test_the_values_later_sections_write_are_declared_here():
 
     `invariant` joined `ALARM_SOURCES` for the same reason: a finding raised by a
     post-condition (`invariants.check_undeclared_delivery`) rather than by a model or by
-    a cost reading, and the source is what tells the reader which of the three it was."""
-    from jarvis.project_store import (ALARM_SOURCES, ALARM_STATUSES, ALARM_SUBJECTS,
-                                      ALARM_VERDICTS)
+    a cost reading, and the source is what tells the reader which of the three it was.
+
+    `rule` joined it for §6 of docs/superpowers/specs/2026-09-27-self-evolution.md: a fire
+    of an ARMED detector, and the three `rule_*` event kinds with it. `rule_dry_run` is
+    declared and written by nothing, because §5 forbids a timeline event in dry run."""
+    from jarvis.project_store import (ALARM_EVENT_KINDS, ALARM_SOURCES, ALARM_STATUSES,
+                                      ALARM_SUBJECTS, ALARM_VERDICTS)
 
     assert "proposed" in ALARM_STATUSES
     assert "propose" in ALARM_VERDICTS
     assert ALARM_SUBJECTS == ("work_order", "feature_order")
-    assert ALARM_SOURCES == ("cost", "health", "invariant")
+    assert ALARM_SOURCES == ("cost", "health", "invariant", "rule")
+    assert ALARM_EVENT_KINDS[-3:] == ("rule_fired", "rule_dry_run", "rule_cleared")

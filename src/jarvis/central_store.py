@@ -318,8 +318,9 @@ CREATE TABLE IF NOT EXISTS detectors (
     io_id TEXT NOT NULL DEFAULT '', fix_wo_id TEXT NOT NULL DEFAULT '',
     issue_url TEXT NOT NULL DEFAULT '', pr_url TEXT NOT NULL DEFAULT '',
     hits INTEGER NOT NULL DEFAULT 0, last_fired REAL, last_cleared REAL,
-    -- The four arming/false-positive columns ship HERE, written by NO code path in this
-    -- release: `arm_detector` and `record_false_positive` land with the alarm bridge.
+    -- The four arming/false-positive columns shipped before their writers:
+    -- `arm_detector`, `disarm_detector` and `record_false_positive` (the alarm bridge,
+    -- self-evolution §6) now write them.
     -- They are here so that later child does not have to buy a migration for a column,
     -- which is the one thing adding a column to a table that already ships costs.
     false_positives INTEGER NOT NULL DEFAULT 0,
@@ -1650,6 +1651,117 @@ class CentralStore:
             (rules.RETRACTED, db.now(), reason, remedy_id),
         )
         return self.get_remedy_rule(remedy_id)  # type: ignore[return-value]
+
+    def arm_detector(self, detector_id: str, *, by: str, reason: str) -> dict[str, Any]:
+        """Let a detector's fires act: the detector and EVERY live remedy row, one commit.
+
+        §6 of docs/superpowers/specs/2026-09-27-self-evolution.md, and the contract the
+        comment above the `detectors` arming columns states. Only a person gets here
+        (`ops.rules_arm`); nothing derives it from a counter, and `arm_threshold` stays
+        recorded and unread. The pair flips together because `rules.effective_status` is
+        the weaker of the two halves: flipping one would be a switch wired to nothing, or
+        — worse — a remedy row armed under a detector that is not.
+
+        Refuses, writing nothing: an unknown id, a retracted or already-armed detector,
+        an empty reason (the audit is the only record of why a rule gained authority),
+        and a detector with NO live remedy row — "a rule may act" needs something to act
+        with, and arming an empty rule would announce authority that does nothing.
+        """
+        from . import rules
+
+        detector = self.get_detector(detector_id)
+        if detector is None:
+            raise KeyError(f"detector {detector_id} not found")
+        if detector["retired_at"] is not None or detector["status"] == rules.RETRACTED:
+            raise ValueError(f"detector {detector_id} is retracted — it cannot be armed")
+        if detector["status"] == rules.ARMED:
+            raise ValueError(f"detector {detector_id} is already armed")
+        if not (reason or "").strip():
+            raise ValueError("arming a rule needs a reason — it is the only record of why "
+                             "the OS let this rule act")
+        if not self.remedy_rules_for(detector_id):
+            raise ValueError(f"detector {detector_id} has no live remedy rule, so there is "
+                             f"nothing for it to propose — add one before arming")
+        now = db.now()
+        self._in_transaction([
+            ("UPDATE detectors SET status=?, armed_at=?, armed_by=?, armed_reason=? "
+             "WHERE id=?", (rules.ARMED, now, by, reason.strip(), detector_id)),
+            ("UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
+             (rules.ARMED, detector_id)),
+        ])
+        return self.get_detector(detector_id)  # type: ignore[return-value]
+
+    def disarm_detector(self, detector_id: str, reason: str) -> dict[str, Any]:
+        """The same set back to `dry_run`. `armed_at/by/reason` STAY: the audit of the
+        last arm is a fact about the past and a demotion does not rewrite it.
+
+        The caller is the false-positive interlock (`ops.rules_false_positive`); the
+        reason it passes names the false positives, and is what an `armed` detector that
+        went back to `dry_run` is read by. Refuses an unknown or non-armed detector so a
+        double demotion cannot be recorded twice.
+        """
+        from . import rules
+
+        detector = self.get_detector(detector_id)
+        if detector is None:
+            raise KeyError(f"detector {detector_id} not found")
+        if detector["status"] != rules.ARMED:
+            raise ValueError(f"detector {detector_id} is {detector['status']}, not armed")
+        if not (reason or "").strip():
+            raise ValueError("returning a rule to dry run needs a reason")
+        self._in_transaction([
+            ("UPDATE detectors SET status=? WHERE id=?", (rules.DRY_RUN, detector_id)),
+            ("UPDATE remedy_rules SET status=? WHERE detector_id=? AND retired_at IS NULL",
+             (rules.DRY_RUN, detector_id)),
+        ])
+        return self.get_detector(detector_id)  # type: ignore[return-value]
+
+    def record_false_positive(self, fire_id: int, reason: str) -> dict[str, Any]:
+        """A PERSON says this fire was wrong. Never derived (§6).
+
+        Increments `false_positives` on the detector and, when the fire names one, on
+        its remedy row — both in one commit, so the two counters cannot drift. Refuses an
+        unknown fire, one already marked, an empty reason, and a fire whose outcome is
+        `unreadable` or `cleared`: neither is a DECISION the rule made, so neither can be
+        a wrong one (`record_rule_fire` refuses to count them as hits for the same
+        reason).
+        """
+        from . import rules
+
+        fire = self.get_rule_fire(int(fire_id))
+        if fire is None:
+            raise KeyError(f"rule fire {fire_id} not found")
+        if fire["false_positive"]:
+            raise ValueError(f"rule fire {fire_id} is already marked a false positive")
+        if not (reason or "").strip():
+            raise ValueError("a false positive needs a reason — it is the evidence a "
+                             "later arm is judged on")
+        if fire["outcome"] in (rules.UNREADABLE, rules.CLEARED):
+            raise ValueError(f"rule fire {fire_id} is {fire['outcome']} — the rule decided "
+                             f"nothing there, so there is nothing to call wrong")
+        stmts: list[tuple[str, tuple[Any, ...]]] = [
+            ("UPDATE rule_fires SET false_positive=1, false_positive_reason=? WHERE id=?",
+             (rules.bound(reason), int(fire_id))),
+            ("UPDATE detectors SET false_positives = false_positives + 1 WHERE id=?",
+             (fire["detector_id"],)),
+        ]
+        if fire["remedy_rule_id"]:
+            stmts.append(("UPDATE remedy_rules SET false_positives = false_positives + 1 "
+                          "WHERE id=?", (fire["remedy_rule_id"],)))
+        self._in_transaction(stmts)
+        return self.get_rule_fire(int(fire_id))  # type: ignore[return-value]
+
+    def _in_transaction(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
+        """All of `statements` or none. The connection is autocommit (`db.connect`), so the
+        pair arm/disarm/false-positive write needs an explicit transaction to be a pair."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for sql, params in statements:
+                self.conn.execute(sql, params)
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.conn.execute("COMMIT")
 
     def record_rule_fire(self, *, detector_id: str, project: str, order_id: str,
                          order_kind: str, fingerprint: str, mode: str, outcome: str,

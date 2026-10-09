@@ -1601,6 +1601,10 @@ class RulesConfig:
     """
 
     enabled: bool = False
+    #: How many person-marked false positives an ARMED detector may collect before it
+    #: returns to `dry_run` (§6). A setting rather than a `rules.py` constant, so a project
+    #: with a noisier fleet can be stricter. Resolved for the FIRE's project.
+    false_positive_disarm: int = 2
 
 
 @dataclass
@@ -2494,13 +2498,21 @@ def _parse_rules(raw: Any, base: RulesConfig | None = None,
                  where: str = "os.rules") -> RulesConfig:
     """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
 
-    Nothing to validate beyond the shape: one boolean, whose default is the shipped
-    `False` when neither the fleet nor the project names it.
+    `false_positive_disarm` is a COUNT and is refused below 1: zero would demote an armed
+    detector the moment it was armed, which makes `jarvis rules arm` a no-op that
+    announces itself (§6, Neo's ruling that this is a catalog setting and not a constant).
     """
     base = base or RulesConfig()
     if not isinstance(raw, dict):
         raise _err(f'"{where}" must be an object')
-    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)))
+    try:
+        disarm = int(raw.get("false_positive_disarm", base.false_positive_disarm))
+    except (TypeError, ValueError):
+        raise _err(f'"{where}.false_positive_disarm" must be an integer') from None
+    if disarm < 1:
+        raise _err(f'"{where}.false_positive_disarm" must be >= 1')
+    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)),
+                       false_positive_disarm=disarm)
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,

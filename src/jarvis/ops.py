@@ -11291,6 +11291,85 @@ def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
     return {"rule": rule, "note": note}
 
 
+def rules_arm(detector_id: str, reason: str, *, by: str = "user") -> dict[str, Any]:
+    """Let a detector's fires act: the one place a person gives a rule authority.
+
+    §6 of docs/superpowers/specs/2026-09-27-self-evolution.md. Audited on the row
+    (`armed_by`, `armed_reason`, `armed_at`) and announced ONCE in the inbox at `info`:
+    the user must be able to SEE a rule gain acting authority and must not be PAGED for
+    it, so the row is written here, once, by the verb — not by a reconcile pass that
+    would re-announce it every tick.
+    """
+    if not (reason or "").strip():
+        raise OpsError("arming a rule needs a reason — it is the only record of why the "
+                       "OS let this rule act")
+    central = CentralStore()
+    try:
+        try:
+            detector = central.arm_detector(detector_id, by=by, reason=reason.strip())
+        except (KeyError, ValueError) as e:
+            raise OpsError(str(e)) from e
+        remedies_armed = central.remedy_rules_for(detector_id)
+        central.add_inbox(
+            project=detector["project"], level="info",
+            title=f"{detector_id} [{detector['gap_class']}] is now ARMED by {by}",
+            body=(f"{reason.strip()}\n\nIts fires now raise an alarm and ask the existing "
+                  f"self-heal gate for permission; nothing runs without a grant. "
+                  f"`jarvis rules false-positive <fire-id> --reason …` calls a fire wrong."))
+    finally:
+        central.close()
+    return {"detector": detector, "remedies": [_remedy_entry(r) for r in remedies_armed],
+            "note": ("armed — its fires raise an alarm and ask the self-heal gate; the "
+                     "gate still decides whether anything runs")}
+
+
+def rules_false_positive(fire_id: int, reason: str) -> dict[str, Any]:
+    """A person says a fire was wrong — and, at the threshold, the rule goes back to dry run.
+
+    §6 of the same spec. The flag is marked by a person and never derived; the interlock
+    is derived from it: an ARMED detector whose `false_positives` reaches the FIRE's
+    project's `rules.false_positive_disarm` (a catalog setting, default 2) returns to
+    `dry_run` with a reason naming them, and ONE inbox row at `warning`. A detector that
+    is not armed is never demoted, so a third mark cannot demote twice. A person may arm
+    a rule; a person may also say it was wrong, and the second must be cheaper than the
+    first.
+    """
+    from .catalog import RulesConfig
+
+    if not (reason or "").strip():
+        raise OpsError("a false positive needs a reason — it is the evidence a later arm "
+                       "is judged on")
+    central = CentralStore()
+    try:
+        try:
+            fire = central.record_false_positive(int(fire_id), reason.strip())
+        except (KeyError, ValueError) as e:
+            raise OpsError(str(e)) from e
+        detector = central.get_detector(fire["detector_id"])
+        cfg = rules_config(fire["project"] or None)
+        limit = (cfg if cfg is not None else RulesConfig()).false_positive_disarm
+        demoted = False
+        if (detector is not None and detector["status"] == "armed"
+                and int(detector["false_positives"]) >= limit):
+            why = (f"{detector['false_positives']} fires marked false positives "
+                   f"(limit {limit}); latest: fire {fire['id']} on {fire['order_id']} — "
+                   f"{reason.strip()}")
+            detector = central.disarm_detector(detector["id"], why)
+            demoted = True
+            central.add_inbox(
+                project=fire["project"] or detector["project"], level="warning",
+                title=(f"{detector['id']} [{detector['gap_class']}] returned to dry run: "
+                       f"{detector['false_positives']} false positives"),
+                body=why, wo_id=fire["order_id"] or None)
+    finally:
+        central.close()
+    return {"fire": fire, "detector": detector, "demoted": demoted,
+            "limit": limit,
+            "note": (f"the detector is back in dry run — {why}" if demoted else
+                     f"{detector['false_positives'] if detector else 0} of {limit} "
+                     f"false positives before an armed rule returns to dry run")}
+
+
 def rules_config(project: str | None = None) -> Any:
     """The `rules` settings in force for `project` — or the OS's — or None.
 

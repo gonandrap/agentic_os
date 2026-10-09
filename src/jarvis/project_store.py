@@ -571,7 +571,9 @@ ALARM_SUBJECTS = ("work_order", "feature_order")
 #: `invariant` is `invariants.check_undeclared_delivery`'s — a finding raised by a
 #: post-condition rather than by a model, spec §2c of
 #: docs/superpowers/specs/2026-09-28-stale-blockers-outlive-what-settled-them.md.
-ALARM_SOURCES = ("cost", "health", "invariant")
+#: `rule` is an ARMED detector's fire (`Daemon._evaluate_detector`), §6 of
+#: docs/superpowers/specs/2026-09-27-self-evolution.md; `probe` then holds the detector id.
+ALARM_SOURCES = ("cost", "health", "invariant", "rule")
 
 # How one health sweep ended (`health_reviews.outcome`, §4). `clear` and `failed` are
 # not the same answer and the difference is the whole fail-safe: `clear` is the model
@@ -625,6 +627,14 @@ NO_TURN = -1
 #   remedy_proposed  {alarm_id, approval_id, remedy, argument}                (§5)
 #   remedy_applied   {alarm_id, approval_id, remedy, result}                  (§5)
 #   remedy_refused   {alarm_id, approval_id, remedy, reason}                  (§5)
+#   rule_fired       {alarm_id, detector_id, remedy_rule_id, remedy, reason}   (self-evolution §6)
+#   rule_dry_run     {detector_id, fire_id}                                    (self-evolution §6)
+#   rule_cleared     {alarm_id, detector_id, fire_id, seconds}                 (self-evolution §6)
+#
+# `rule_dry_run` is DECLARED and WRITTEN BY NOTHING: self-evolution §5 forbids any event on
+# an order's timeline while a rule is in dry run, and a dry run is visible only on
+# `jarvis rules`. It is declared with its siblings so the three kinds are one vocabulary
+# and `health.observer_kinds()` already excludes it the day something does write it.
 #
 # Duplicated by `timeline.ALARM_KINDS`, which is a leaf and may not import a store; a
 # test asserts the two are equal, because a kind in only one of them means every deep
@@ -634,7 +644,8 @@ NO_TURN = -1
 # memory that makes it one alarm per turn per kind (see `Daemon.check_burning_turns`).
 ALARM_EVENT_KINDS = ("cost_alarm", "alarm_reviewed", "alarm_escalated", "alarm_advice",
                      "health_finding", "health_reviewed",
-                     "remedy_proposed", "remedy_applied", "remedy_refused")
+                     "remedy_proposed", "remedy_applied", "remedy_refused",
+                     "rule_fired", "rule_dry_run", "rule_cleared")
 
 # HOW A WORK ORDER CAN BE LINKED TO A TRACKER ISSUE, weakest first — the order IS the
 # precedence, and `link_issue` never demotes. The admitting set is deliberately small
@@ -3402,7 +3413,8 @@ class ProjectStore:
     def add_finding(self, wo_id: str, *, kind: str, reason: str, seq: int = NO_TURN,
                     source: str = "cost", probe: str | None = None,
                     subject_kind: str = "work_order",
-                    fo_id: str | None = None) -> dict[str, Any]:
+                    fo_id: str | None = None, remedy: str | None = None,
+                    remedy_argument: str = "") -> dict[str, Any]:
         """Record one finding — the general raise, of which `add_alarm` is the cost case.
 
         A second entry point rather than a widened `add_alarm`, because `add_alarm`'s one
@@ -3414,6 +3426,11 @@ class ProjectStore:
         `wo_id` is always the CARRIER. For a feature-order subject that is
         `carrier_for_feature(fo_id)`, and the pairing below is the whole of the
         constraint the schema could not carry.
+
+        `remedy` and `remedy_argument` are the existing `wo_alarms` columns, written here
+        only by an armed rule (§6 of docs/superpowers/specs/2026-09-27-self-evolution.md):
+        the alarm is born carrying the remedy its detector's row names, and
+        `remedies.propose` then files the gate request for it.
         """
         assert subject_kind in ALARM_SUBJECTS, subject_kind
         assert source in ALARM_SOURCES, source
@@ -3424,10 +3441,12 @@ class ProjectStore:
         alarm_id = db.new_id("al")
         self.conn.execute(
             """INSERT INTO wo_alarms (id, wo_id, ts, kind, seq, reason,
-                                      subject_kind, fo_id, source, probe)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                      subject_kind, fo_id, source, probe,
+                                      remedy, remedy_argument)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (alarm_id, wo_id, db.now(), kind, int(seq), reason,
-             subject_kind, fo_id, source, probe),
+             subject_kind, fo_id, source, probe, remedy,
+             remedy_argument if remedy else None),
         )
         return self.get_alarm(alarm_id)
 
