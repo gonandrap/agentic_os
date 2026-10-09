@@ -728,6 +728,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                 # it stands, because the report row is the dedupe (`open_violation_report`)
                 # and `close_violation_reports` is what takes it away again.
                 for report in store.standing_violations(level="critical"):
+                    # …EXCEPT ONE THAT OWES A DECISION: the work order's own attention
+                    # flag already carries it, and two lines for one decision is the
+                    # double-report the strip exists to prevent. No owed checker is
+                    # `critical` today; the skip is what keeps that safe when one is. Spec
+                    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                    # decision.md §7
+                    if report.get("owed"):
+                        continue
                     attention.append({
                         "project": p["name"], "wo_id": report["wo_id"] or None,
                         "title": f"OS invariant violated: {report['invariant']}",
@@ -6498,6 +6506,16 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # cleared one alert and got a different one back. The abandonment is
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
+                #
+                # THE REPORT GOES WITH IT, so the blocker stops deriving on the next
+                # reconcile tick and INV-ATTENTION-PHANTOM lowers the flag through its
+                # ordinary path. Without this the user waits up to an hour for the next
+                # landing sweep — clearing one alert and watching it sit there, which is
+                # the shape the comment above is already about. Singular: the plural
+                # deletes every report not in the iterable it is given. Spec
+                # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                # decision.md §8
+                store.close_violation_report(invariants.INV_WORK_LANDED, wo_id)
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
         # AFTER the `finished` event, so `refusal_answered` still dates correctly, and
         # after the `abandon` branch: 2026-09-29 spec §1.
