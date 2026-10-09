@@ -6839,11 +6839,38 @@ requires it not to be before a merge; while you are in there, merge `origin/{bas
 (do not rebase) so the checks re-run against what would actually land."""
 
 
+#: THE ONE REPAIR THAT INVERTS THE OTHER TWO: those work orders already declared
+#: themselves, so they end "do NOT call `jarvis wo finish` again"; this one's entire
+#: purpose is that the worker MUST call it. Same four things in the same order — what is
+#: wrong, what to do, what NOT to do, attempts left — and no format field beyond
+#: `url`/`attempt`/`max_attempts`. Spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.2.
+#:
+#: Names the REFUSAL and not the branch: the worker's own reading of why it was woken has
+#: to match the record. TARGETED_TESTS_LINE rides in the `--evidence` clause, because
+#: that is the clause that asks what was run and this turn does not inherit the dispatch
+#: brief that states the same rule.
+PR_UNDECLARED_NUDGE = """\
+The user REFUSED an assumption on this work order, and you pushed commits since. The \
+head of {url} is one nothing has declared, so the panel may not judge it and nobody is \
+reading it. Nobody typed this message — Jarvis noticed while polling the pull request.
+
+Declare it: run `jarvis wo finish <wo-id> --summary "..." --pr {url} --evidence "..."`. \
+Say in the summary what the refusal asked for and what you changed, and in the evidence \
+state what you ran; """ + TARGETED_TESTS_LINE + """.
+
+Then END YOUR TURN. Do NOT push anything new to answer this message — the declaration \
+is the whole ask, and the commits are already there.
+
+This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
+trying and asks the user."""
+
+
 @dataclass(frozen=True)
 class PrRepair:
     """One thing a poll can ask a worker to fix on its own pull request.
 
-    Two of them, and everything else is shared: the same attempt cap, the same three
+    Three of them, and everything else is shared: the same attempt cap, the same three
     guards in `Daemon.heal_pull_request`, the same episode arithmetic, the same
     unauthored message source. They differ only in what is wrong and what to say about
     it, which is the whole reason this is a descriptor and not a second copy of the
@@ -6872,11 +6899,13 @@ PR_CONFLICT = PrRepair(invariants.PR_CONFLICT_REPAIR, PR_CONFLICT_NUDGE,
                        invariants.PR_CONFLICT_BLOCKER)
 PR_CHECKS = PrRepair(invariants.PR_CHECKS_REPAIR, PR_CHECKS_NUDGE,
                      invariants.PR_CHECKS_BLOCKER)
+PR_UNDECLARED = PrRepair(invariants.PR_UNDECLARED_REPAIR, PR_UNDECLARED_NUDGE,
+                         invariants.PR_UNDECLARED_BLOCKER)
 
 #: Newest episode first is not a thing here — `pr_repair_origin` compares timestamps —
 #: but every repair that can hold a work order out of its status has to be in this
 #: tuple, or `Daemon.settle_work_order` will park its repair turn in the merge queue.
-PR_REPAIRS = (PR_CONFLICT, PR_CHECKS)
+PR_REPAIRS = (PR_CONFLICT, PR_CHECKS, PR_UNDECLARED)
 
 
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
