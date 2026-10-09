@@ -224,7 +224,11 @@ def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
     """
     assert set(issues.ISSUE_VERBS) == ISSUE_READS | {
         ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
-        ("label", "create"), ("issue", "create")}
+        ("label", "create"), ("issue", "create"),
+        # The recurrence path's write: a gap that came back is linked to its original
+        # issue, which the OS normally already closed (spec §8 of
+        # docs/superpowers/specs/2026-09-27-self-evolution.md).
+        ("issue", "reopen")}
 
 
 @pytest.mark.parametrize("url", [

@@ -291,6 +291,94 @@ Optional, and speculative: measure whether rendering the evidence block FIRST in
 knows where the CLI places a cache breakpoint inside a user message. Measure it; do not
 build on it, and do not reorder that prompt on the strength of a guess.
 
+### 6.1 — The result, measured 2026-10-07 (wo-a2cc8692)
+
+**The trim is not unsafe, and it is not free.** Over 136 scored rows it never confirmed
+where the full diff refused — the one row that did, wo-3b93b1ea#1, did not reproduce — but
+it escalates 82 of 136, 60.3% of the confirmations the full diff approved. Its agreement
+with what the fleet actually recorded (itself judged by opus — see below) falls from 0.750 to
+0.213. At 12,000 chars the confirmation pass stops being mostly an auto-confirmer and
+becomes mostly an escalator. That is a cost the user has to price, not a defect, and
+section 2's number is the thing it prices.
+
+`JARVIS_EVALS_LLM=1 pytest evals/llm/test_confirm_evidence_ab.py -q -s`, model sonnet, full
+arm at `daemon.CONFIRM_COLLECT_CHARS` (1,000,000 — nothing cut), trimmed arm at
+`catalog.DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS` (12,000).
+
+BOTH ARMS RAN SONNET. The two arms differ only in the evidence block, so the full-vs-trimmed
+numbers above are a clean within-model measurement. The recorded-outcome row is NOT: the
+verdicts the fleet actually recorded came from production Neo, which runs
+`catalog.NeoConfig.model` = `opus` (no override in the live catalog). So full 0.750 is sonnet
+agreeing with opus, and it conflates the model change with the trim. Read it as a floor on
+how well a sonnet confirmation pass tracks the shipped one, not as the full arm's accuracy.
+The trimmed 0.213 is below it for both reasons at once.
+
+The corpus comes from `evals/tools/build_confirm_corpus.py`, built against the live
+production fleet through the `jarvis` CLI only: 211 work orders read, 146 usable
+confirmation cases (141 recorded accepted, 5 rejected), 235 assumptions skipped as never
+confirmed and 5 with no diff left to collect. Not committed, for the reason in this
+section's design and the builder's own docstring.
+
+Exclusions, each a count. 8 of the 146 rows rendered byte-identical arms — the diff was
+already under 12,000 — and were filtered out before the paid calls, not after. 136 of the
+remaining 138 scored; 2 excluded as unreadable replies, wo-564ebedb#1 and wo-35216d58#3.
+Zero transport failures in the final numbers: the first pass lost 64 rows to transient
+failures of its own making, 7 shards in parallel against the shared usage limit, and
+re-running exactly those rows at concurrency 2 scored 64 of 66 with no transport failure at
+all. Parallelism against one account is the hazard, not the payload size.
+
+- verdict agreement, full vs trimmed: 53/136 = 0.390
+- unsafe flips (full refuses, trimmed approves): 1 — wo-3b93b1ea#1, which re-judged
+  full=approve / trimmed=escalate 3 times out of 3, so the recorded flip was the full arm's
+  own sampling variance on one call. Both arms are a single sample per row and the assertion
+  demands exactly 0 over 136 rows, so filed as issue 958 against the EVAL, not against the
+  trim.
+- safe-direction disagreement (full approves, trimmed escalates): 82/136 = 0.603
+- agreement with the recorded outcome: full 0.750 (102/136), trimmed 0.213 (29/136)
+
+Input sizes, from the `prompt_chars` / `system_prompt_chars` columns section 3 added, over
+the 136 scored rows. Full: median 79,777, mean 100,859, max 302,149, total 13,716,932.
+Trimmed: median 10,042, mean 11,054, max 20,580, total 1,503,431. A saving of 12,213,501
+chars over the run — 89.0% of the full arm's input, 87.4% at the median.
+`system_prompt_chars` is 4,984 in both arms, so the whole difference is the evidence block.
+
+This section's optional cache-prefix experiment was not built, for the reason stated above
+it. Unchanged.
+
+### 6.2 — The same question at opus, probed (wo-a2cc8692)
+
+6.1 ran both arms at sonnet. Production Neo runs opus, so the obvious objection to the
+60.3% escalation cost is that it is a sonnet weakness the shipped model would not have.
+It is not. Measured on an ENRICHED sample — the rows where the trim actually changed
+sonnet's answer — most of that cost survives the model change.
+
+Two steps, 35 opus calls, both at concurrency 2, zero transport failures and zero
+unreadable replies.
+
+1. The trimmed arm at opus on 25 of 6.1's 82 safe-flip rows, chosen evenly across the
+   diff-size range (21,446 to 291,763 chars): **21 escalated, 4 approved**. So 0.84 of
+   sonnet's escalations reproduce at opus.
+2. That leaves "opus is simply a stricter reviewer" as the other explanation, which the
+   trimmed arm alone cannot separate. So the FULL arm at opus on 10 of those 21, again
+   spanning the size range: **7 approved, 3 escalated anyway** — median `prompt_chars`
+   84,986, total 1,124,357. 0.70 of the escalations are caused by the trim; the other
+   0.30 opus would have escalated with the whole diff in front of it.
+
+The two factors multiply to 0.59, which puts opus's safe-direction disagreement at
+roughly 0.35 of confirmations — about 48 of 136 rows — against sonnet's 0.603.
+
+READ THAT AS A LOWER BOUND, NOT AS AN ESTIMATE. The sample is enriched by construction:
+it only contains rows where SONNET flipped, so it says nothing about the 54 rows sonnet
+agreed on, and opus may flip some of those too. 21/25 and 7/10 are also small samples
+with wide intervals. The claim this supports is the qualitative one — the trim's
+attention cost is real at the model production actually runs, not a sonnet artefact —
+and not a second decimal place.
+
+Reproduce with `evals/tools/build_confirm_corpus.py` for the corpus and the trimmed/full
+arms of `evals/llm/test_confirm_evidence_ab.py` at `JARVIS_EVALS_MODEL=opus`; the eval
+has no arm-selection or sampling flag, so the probe drove `build_arms` and `judge`
+directly. That gap is the cheap thing to add if this measurement is ever wanted again.
+
 ## 7 — Refused and deferred, with reasons, so nobody re-litigates them
 
 **Which of the user's eight items these are.** Item 2 (one diff per work order per

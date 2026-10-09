@@ -4451,6 +4451,11 @@ def _print_rules_list(data: dict) -> None:
     noun = "rule" if c["total"] == 1 else "rules"
     print(f"{c['total']} {noun}: {c['armed']} armed, {c['dry_run']} in dry run, "
           f"{c['retracted']} retracted")
+    # SAID ON ITS OWN LINE, above the rules rather than in the closing note, because it
+    # changes what every number below MEANS: with the pass off, a rule showing no fires
+    # has not failed to match, it has never been looked at.
+    if data.get("enabled") is False:
+        print("  the evaluation pass is OFF — nothing evaluates these rules")
     for r in data["rules"]:
         scope = r["project"] or "fleet-wide"
         retired = " ⊘ retracted" if r["retired_at"] else ""
@@ -4496,6 +4501,13 @@ def _print_rules_show(data: dict) -> None:
         print(f"  fire {f['id']} {f['outcome']} · {f['order_id']} · {f['mode']}"
               # A fire is one line: the stored detail stays at rules.FACTS_CHARS.
               + (f" · {_one_line(f['detail'], 110)}" if f["detail"] else ""))
+    for rec in data["recurrences"]:
+        # The verdict, the order it recurred on, and what happened on the tracker — the
+        # three fields a person judging THIS rule reads (spec §8, Neo question 974). The
+        # `filed_note` is the local account and can be long, so it is clipped the way a
+        # fire's detail is; the stored value is untouched.
+        print(f"  recurrence {rec['id']} {rec['verdict']} · {rec['order_id']}"
+              + (f" · {_one_line(rec['filed_note'], 110)}" if rec["filed_note"] else ""))
 
 
 def _print_rules_dry_run(data: dict) -> None:

@@ -40,7 +40,7 @@ from .catalog import (
     worker_stalls_on_prompts,
 )
 from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
-               observability, release, timeline)
+               observability, release, rules, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
@@ -11172,9 +11172,10 @@ def rules_list(*, project: str = "", status: str = "",
     list is the detail. `project` is a scope filter — it returns that project's rules and
     the fleet-wide ones — for the reason `CentralStore.list_detectors` gives.
 
-    `enabled` is `None` in this release and that is deliberate: nothing evaluates these
-    rules yet, so there is no engine to be on or off, and `False` would state that one
-    exists and is switched off.
+    `enabled` answers whether anything EVALUATES these rules — `catalog.RulesConfig`,
+    which ships off. ABSENT IS NOT ZERO and off is not empty: a registry nobody is
+    evaluating has a note saying so, because "no rule has ever matched" and "nothing has
+    ever looked" are different facts and only one of them is about the rules.
     """
     central = CentralStore()
     try:
@@ -11192,16 +11193,25 @@ def rules_list(*, project: str = "", status: str = "",
         entries = [_rule_entry(central, d) for d in shown]
     finally:
         central.close()
+    enabled = rules_enabled(project or None)
     if not counts["total"]:
         note = ("no detectors are registered — the registry is empty, which is a "
                 "different thing from a registry whose rules have never matched")
+    elif not enabled:
+        # THE SENTENCE, NOT AN EMPTY COUNT. A registry that is not evaluated has never
+        # been given the chance to match, and rendering that as "0 fires" would read as a
+        # measurement of the rules rather than of the switch above them.
+        note = (f"the evaluation pass is OFF ({counts['total']} rules registered and "
+                f"nothing is evaluating them) — no rule here has been given the chance "
+                f"to match. Turn it on with `jarvis config set <project> rules.enabled "
+                f"true`")
     else:
         note = ("every rule is in dry run: it records what it would have proposed and "
                 "acts on nothing. Only a person arms one")
         if counts["armed"]:
             note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
                     f"proposes; the gate still decides whether anything runs")
-    return {"counts": counts, "rules": entries, "enabled": None, "note": note}
+    return {"counts": counts, "rules": entries, "enabled": enabled, "note": note}
 
 
 def rules_show(detector_id: str) -> dict[str, Any]:
@@ -11223,6 +11233,10 @@ def rules_show(detector_id: str) -> dict[str, Any]:
                    in central.remedy_rules_for(detector_id, include_retired=True)
                    if r["retired_at"] is not None]
         fires = central.list_rule_fires(detector_id=detector_id, limit=20)
+        # The reader §8's verdict owes (Neo question 974): a recurrence is the record that
+        # THIS rule did not hold, so the place a person judges the rule is the place it
+        # has to be visible. Without it the ledger would be written and never read.
+        recurrences = central.list_recurrences(detector_id=detector_id, limit=20)
     finally:
         central.close()
     return {
@@ -11238,6 +11252,7 @@ def rules_show(detector_id: str) -> dict[str, Any]:
             "pr_url": detector["pr_url"], "seed_version": detector["seed_version"],
         },
         "fires": fires,
+        "recurrences": recurrences,
         "hit_rate": entry["hit_rate"],
         "hit_rate_note": entry["hit_rate_note"],
     }
@@ -11274,6 +11289,204 @@ def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
     finally:
         central.close()
     return {"rule": rule, "note": note}
+
+
+def rules_config(project: str | None = None) -> Any:
+    """The `rules` settings in force for `project` — or the OS's — or None.
+
+    `validation_config`'s shape exactly, for its reasons: a catalog that has moved or was
+    never registered answers None rather than raising, and None reads as OFF, which is
+    the shipped default anyway. There is no path on which failing to read a config file
+    should start the OS evaluating rules it was not told to evaluate.
+    """
+    try:
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.rules
+        return catalog.project(project).rules
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
+def rules_enabled(project: str | None = None) -> bool:
+    """Is the evaluation pass on — for `project`, or fleet-wide? False if unreadable."""
+    cfg = rules_config(project)
+    return bool(cfg is not None and cfg.enabled)
+
+
+def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
+               sources: frozenset[str] | set[str] | None = None,
+               project: str = "", max_rounds: int | None = None) -> Any:
+    """One work order's `rules.Facts`. THE READER BEHIND EVERY `FactField.source` SLUG.
+
+    `rules.facts` declares the contract and this is the implementation, for the reason
+    the grammar module's docstring gives: `rules` is a LEAF — stdlib, `db`, `catalog` and
+    `remedies` — and every reader named below sits above it (`ops` itself, `holds`,
+    `invariants`, `budget`). Putting the readers here rather than there is what keeps
+    that leaf true at IMPORT time, which is the property `remedies` and `central_store`
+    depend on when they import `rules` inside a function body. `rules.facts` still works
+    and is still the one public contract; it reaches this function through a call-time
+    import, which costs its own importers nothing.
+
+    **`sources` IS THE WHOLE COST MODEL** (spec §5.2.3). It is the union of
+    `rules.sources_used(cond)` over the detectors that will actually be evaluated, and a
+    source not in it is NOT READ — its fields are absent from `values`, which the
+    evaluator treats as a third thing distinct from `None` and `False`. `holds` is the
+    expensive one: `holds.held` walks up to `holds._EVENT_LIMIT` events per order, so a
+    table full of conditions about `status` must never pay for it. `None` means read
+    EVERYTHING, which is what a single-order `jarvis rules dry-run` wants and what no
+    sweep should ever pass.
+
+    **A COLUMN THAT IS NULL OR EMPTY IS ABSENT, NOT `""`.** A condition that matched
+    because a field was missing would fire on exactly the orders nobody recorded anything
+    about, which is the commonest way a rule over-fires.
+
+    Read-only: no model, no network, no subprocess, nothing written.
+    """
+    from . import budget as budget_mod
+    from . import holds as holds_mod
+    from . import invariants as invariants_mod
+    from . import rules as rules_mod
+
+    wanted = None if sources is None else frozenset(sources)
+
+    def need(slug: str) -> bool:
+        return wanted is None or slug in wanted
+
+    wo_id = str(wo["id"])
+    values: dict[str, Any] = {}
+    # READ ONCE PER ORDER AND SHARED. `ops.state_durations` itself reads `holds.held` —
+    # it has to, since docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-
+    # limit-hold-as-running.md made the active basis part of every reading — so a
+    # snapshot that named both sources used to walk the same timeline twice.
+    hold_rows: list[Any] | None = None
+
+    def put(name: str, value: Any) -> None:
+        """Record a field, or leave it ABSENT. Empty strings and None are absent; `0`,
+        `False` and `{}` are recorded, because those are answers."""
+        if value is None or value == "":
+            return
+        values[name] = value
+
+    if need("work_order"):
+        put("status", str(wo.get("status") or ""))
+        put("kind", str(wo.get("kind") or ""))
+        # The two flags are recorded as BOOLEANS even when false: a work order always has
+        # an answer to "is it hidden", so absent here would be a lie about the record.
+        values["hidden"] = bool(wo.get("hidden"))
+        values["needs_attention"] = bool(wo.get("needs_attention"))
+        put("attention_reason", str(wo.get("attention_reason") or ""))
+
+    if need("state_durations"):
+        durations = state_durations(store, wo_id=wo_id, now=now)
+        hold_rows = list(durations.holds)
+        if durations.current_status_since is not None:
+            since = durations.current_status_since
+            put("seconds_in_status", max(0.0, now - since))
+            # THE ACTIVE BASIS, spec §6 of docs/superpowers/specs/2026-09-30-time-in-
+            # state-counts-a-usage-limit-hold-as-running.md: the same subtraction
+            # `StateDurations.as_dict` makes, off the holds THIS READING ALREADY CARRIES.
+            # So the field costs no second walk of the timeline and stays inside the
+            # `state_durations` source it is declared under — reading it from
+            # `holds.held` instead would make every condition about time in status pay
+            # for the expensive source.
+            held = sum(h.overlap(since, now, now) for h in durations.holds)
+            put("seconds_in_status_active", max(0.0, now - since - held))
+        if durations.last_activity_ts is not None:
+            put("seconds_since_activity", max(0.0, now - durations.last_activity_ts))
+        if durations.spans:
+            put("lifetime_seconds", max(0.0, now - durations.spans[0].entered))
+        put("last_activity_kind", durations.last_activity_kind)
+
+    if need("holds"):
+        # THE EXPENSIVE ONE. The MERGED open hold is what a condition asks about — the
+        # same object every other surface renders — so `holds.held`'s merge is used
+        # rather than a second reading of the timeline.
+        if hold_rows is None:
+            hold_rows = list(holds_mod.held(store, wo_id, now=now))
+        open_holds = [h for h in hold_rows if h.open]
+        if open_holds:
+            hold = open_holds[-1]
+            put("hold_cause", hold.cause)
+            put("hold_seconds", max(0.0, now - hold.started))
+
+    if need("automerge"):
+        state = automerge_state(store, wo)
+        # A STALE HOLD IS NOT A CLAIM ABOUT NOW — docs/superpowers/specs/2026-09-27-a-
+        # stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The event is
+        # immutable and `automerge_state` marks rather than drops it, so contributing a
+        # marked one would let a rule fire on a hold the OS has already said is history.
+        if (state and state.get("kind") == "automerge_held"
+                and not state.get("stale")):
+            put("automerge_code", str(state.get("code") or ""))
+
+    if need("waiting_on"):
+        put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
+
+    if need("validation_round"):
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is not None:
+            round_no = int(latest["round"] or 0)
+            put("round_no", round_no)
+            put("round_outcome", str(latest["outcome"] or ""))
+            put("judged_head_sha", str(latest["head_sha"] or ""))
+            cap = max_rounds
+            if cap is None:
+                cfg = validation_config(project or None)
+                cap = getattr(cfg, "max_rounds", None)
+            # ABSENT rather than a guess when the catalog cannot answer: `rounds_left` is
+            # a subtraction from a configured ceiling, and a ceiling nobody could read is
+            # not a ceiling of zero.
+            if cap is not None:
+                put("rounds_left", max(0, int(cap) - round_no))
+
+    if need("pull_request"):
+        # THE RECORDED COLUMNS, never a live `gh` call: this runs for every open order on
+        # every sweep, and a rule engine that reached the network per order per tick is a
+        # rate limit with extra steps. The poller that already owns that job refreshes
+        # them.
+        put("pr_url", str(wo.get("pr_url") or ""))
+        put("pr_state", str(wo.get("pr_state") or ""))
+
+    if need("event_counts"):
+        values["event_counts"] = store.event_kind_counts(wo_id)
+
+    if need("invariant_events"):
+        # THE ROUTE A DETECTOR TAKES WHEN AN INVARIANT ALREADY DETECTS THE CONDITION —
+        # `Daemon.check_invariants` writes one `invariant` event per violation it
+        # reports, and seed rule 5 keys off that rather than re-deriving the predicate.
+        counts: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "invariant"):
+            name = str(db.from_json(event["payload"], {}).get("invariant") or "")
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        values["invariant_events"] = counts
+
+    if need("dependencies"):
+        values["depends_on_count"] = len(store.dependencies(wo))
+        values["dead_dependency_count"] = len(
+            invariants_mod.dead_dependencies(store, wo))
+
+    if need("neo_question"):
+        question = invariants_mod.awaiting_neo(wo_id)
+        if question is not None:
+            put("neo_question_status", str(question.get("status") or ""))
+            values["neo_question_attempts"] = int(question.get("attempts") or 0)
+
+    if need("budget"):
+        # NO BUDGET IS NOT A BUDGET OF ZERO, so a NULL column is absent and a rule asking
+        # `budget_usd lte 0` never matches an order that has no ceiling at all.
+        if wo.get("budget_usd") is not None:
+            values["budget_usd"] = float(wo["budget_usd"])
+        values["spent_usd"] = budget_mod.spent(store, None, wo_id).total_usd
+
+    return rules_mod.Facts(
+        project=project, order_id=wo_id,
+        # THE SUBJECT KIND, not `work_orders.kind`. `rule_fires.order_kind` records which
+        # of `rules.SUBJECTS` this row is about; the row's own `worker`/`planner` kind is
+        # the separate `kind` FACT FIELD above.
+        order_kind=rules_mod.DEFAULT_SUBJECT,
+        values=values, now=now)
 
 
 def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
@@ -11326,17 +11539,17 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
     store = ProjectStore(path)
     try:
         try:
-            facts = rules_mod.facts(store, wo, now=db.now())
-        except NotImplementedError:
-            # `rules.facts` is DECLARED by the grammar section and implemented by the
-            # evaluation-and-firing section, which owns the readers behind every
-            # `FactField.source` slug. Until it lands there is no snapshot, and the
-            # honest answer is to say so: fabricating one, or returning "no match",
-            # would report a verdict nobody computed.
-            out["note"] = (
-                "the fact snapshot is not built in this release — `rules.facts` is "
-                "implemented by the evaluation-and-firing section, so this order was "
-                "not evaluated and nothing was decided")
+            # LAZY HERE TOO, for the sweep's reason: only the sources this one condition
+            # names are read, so a dry run of a rule about `status` does not walk the
+            # order's holds to answer it.
+            facts = rules_mod.facts(store, wo, now=db.now(),
+                                    sources=rules_mod.sources_used(cond))
+        except Exception as e:  # noqa: BLE001
+            # A SNAPSHOT THAT COULD NOT BE BUILT DECIDES NOTHING. `matched` stays None
+            # rather than becoming "no match", which would report a verdict nobody
+            # computed — the same rule the unreadable branch above follows.
+            out["note"] = (f"the fact snapshot for {order_id} could not be built, so "
+                           f"nothing was evaluated and nothing was decided: {e}")
             return out
     finally:
         store.close()
@@ -11348,6 +11561,157 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
                project=project,
                note="a dry run: this wrote nothing and acted on nothing")
     return out
+
+
+# -- the recurrence ledger (spec §8) ----------------------------------------------------
+#
+# A gap the OS ALREADY has a detector for happened again. That is not "a new bug", and
+# filing it afresh loses the one fact that matters — that the OS already tried — so this
+# LINKS and never duplicates. Which half of the rule each verdict blames: see
+# `rules.recurrence_verdict`.
+
+#: The sentence a person reads for each verdict. A CLOSED TEMPLATE keyed on the verdict,
+#: never prose assembled from the row: a sentence stitched together per call could
+#: disagree with the verdict beside it.
+_RECURRENCE_NOTES = {
+    rules.NOT_ARMED: (
+        "a detector for this gap exists but is still in dry_run, so it acted on nothing "
+        "— neither its condition nor its remedy can be blamed, and this recurrence is "
+        "evidence FOR arming it"),
+    rules.MISSED: (
+        "the detector is armed and has no usable fire on this order, so the condition "
+        "did not match what actually happened — the finding is about the CONDITION"),
+    rules.REMEDY_FAILED: (
+        "the detector is armed and did fire on this order, and the gap recurred anyway "
+        "— the finding is about the REMEDY, or about the gate that refused it"),
+    rules.UNREADABLE_RECURRENCE: (
+        "the detector is armed and its newest fire on this order says something could "
+        "not be READ, so nothing was decided — the finding is about what the condition "
+        "reads, and this is NOT evidence for arming"),
+}
+
+
+def _recurrence_tracker_act(detector: dict[str, Any], *, order_id: str, gap_class: str,
+                            verdict: str) -> str:
+    """Reopen or comment on the ORIGINAL issue, and return the `filed_note`. NEVER raises
+    a GitHub error.
+
+    §8's division of labour: the ledger is the OS's own record and the tracker a mirror of
+    it, so every way this can fail — no `gh`, a refusal, a timeout, output that will not
+    parse, no original issue to find — comes back as a SENTENCE for `filed_note` and the
+    recurrence row stands either way. A caller that raised here would lose a finding
+    because a network was down.
+
+    The comment body is built by `rules.recurrence_comment`, which is the redaction
+    boundary: the tracker is PUBLIC and that function takes four fields and has no
+    parameter any private text could arrive through.
+    """
+    from . import bugreport, issues
+
+    body = rules.recurrence_comment(order_id=order_id, gap_class=gap_class,
+                                    verdict=verdict, detector_id=detector["id"])
+    try:
+        url = str(detector["issue_url"] or "")
+        if not url:
+            # Searched by the CAUSE — the detector id and the gap class — never by the
+            # order id: kn-2b03830f, see `issues.recurrence_issues`. The NEWEST hit is
+            # taken because `gh issue list` answers newest first and a later filing about
+            # one cause is the thread people are reading.
+            found = issues.recurrence_issues(detector["id"], gap_class)
+            if not found:
+                return ("no original issue is recorded on the detector and none was "
+                        "found on the tracker, searched by detector id and gap class "
+                        "with `--state all`, so nothing was filed — the recurrence is "
+                        "recorded here only")
+            url = str(found[0]["url"])
+        # Before `--add-label`: `gh` refuses a label the repository does not define, and
+        # the FIRST recurrence on any tracker meets exactly that.
+        issues.ensure_regression_label(bugreport.bug_repo())
+        # `Issue.closed`, not `issues.CLOSED`: that constant is the DESIRED-state
+        # vocabulary of the issue-lifecycle section, while this asks what GitHub says the
+        # issue IS right now.
+        if issues.view(url).closed:
+            issues.reopen(url, body)
+            act = "reopened"
+        else:
+            issues.comment(url, body)
+            act = "commented on"
+        issues.add_label(url, issues.REGRESSION_LABEL)
+        return f"{act} the original issue {url} and labelled it `regression`"
+    except GitHubError as e:
+        # `IssueLifecycleError` and `GhUnavailable` both derive from `GitHubError`, so one
+        # clause covers "gh could not be reached" and "gh ran and refused". `reason` is
+        # the phrase the OS wrote; the exception text carries `gh`'s own words, and
+        # `filed_note` is local and unpublished, so both belong in it.
+        return (f"the tracker was not updated: {e.reason} ({e}). The recurrence is "
+                f"recorded here, and the ledger is the OS's own record — the tracker "
+                f"mirrors it")
+
+
+def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str = "",
+                      note: str = "", detector_id: str = "") -> dict[str, Any]:
+    """An existing rule did not hold. Derive which half, write the ledger row, and link
+    the finding to the ORIGINAL issue rather than filing a second one.
+
+    Returns a PLAIN DICT the CLI and the dashboard consume verbatim, this section's rule
+    throughout, so the two surfaces cannot disagree about what happened.
+
+    ABSENT IS NEVER ZERO here either: with NO detector for `gap_class` this writes
+    nothing, returns `verdict=None` and says the gap is NEW. An invented verdict would
+    claim the OS had tried something it never tried.
+
+    `detector_id` names the detector directly, for a caller that already resolved it;
+    without it `rules.recurrence` picks the one live rule for this gap in this project's
+    scope, with the tie-break documented there.
+    """
+    central = CentralStore()
+    try:
+        detector = (central.get_detector(detector_id) if detector_id else
+                    rules.recurrence(
+                        central.list_detectors(project=project, gap_class=gap_class),
+                        gap_class, project=project))
+        if detector is None:
+            return {"recorded": False, "detector": None, "verdict": None,
+                    "recurrence": None, "filed_note": "",
+                    "verdict_note": (
+                        f"no detector exists for gap class {gap_class!r}, so this is a "
+                        f"NEW gap and not a recurrence — nothing was recorded against a "
+                        f"rule, because there is no rule to blame")}
+        detector = dict(detector)
+
+        # The NEWEST fire this detector has on this order, CLEARED OR NOT. Two reads
+        # because `open_rule_fire` sees only uncleared rows, and a cleared fire is still
+        # evidence that the detector matched: a condition that held and then stopped
+        # holding did not fail to match. The newest rather than any past one for commit
+        # `0c1e3f9`'s reason, which `open_rule_fire` records — a gap that recurred after
+        # being cleared is a new episode, and judging it against an older fire would
+        # answer about the wrong one.
+        candidates = [f for f in (
+            central.open_rule_fire(detector["id"], order_id),
+            *central.list_rule_fires(detector_id=detector["id"], order_id=order_id,
+                                     limit=1)) if f]
+        fire = (max(candidates, key=lambda f: (float(f["ts"]), int(f["id"])))
+                if candidates else None)
+        verdict = rules.recurrence_verdict(detector, fire)
+
+        # Written BEFORE the tracker is touched, so no `gh` failure and no crash between
+        # the two can lose the finding. `filed_note` is filled in afterwards — see
+        # `CentralStore.set_recurrence_filed_note`.
+        row = central.add_recurrence(
+            gap_class=gap_class, detector_id=detector["id"], project=project,
+            order_id=order_id, verdict=verdict, io_id=io_id,
+            original_fix_wo_id=detector["fix_wo_id"],
+            original_issue_url=detector["issue_url"], filed_note="", note=note)
+        filed_note = _recurrence_tracker_act(detector, order_id=order_id,
+                                             gap_class=gap_class, verdict=verdict)
+        row = central.set_recurrence_filed_note(row["id"], filed_note)
+    finally:
+        central.close()
+    # `verdict_note` is the OS's sentence about the verdict; `recurrence["note"]` is the
+    # CALLER's own note, stored on the row. Two audiences, so two names (spec §8).
+    return {"recorded": True, "detector": detector, "verdict": verdict,
+            "recurrence": row, "filed_note": filed_note,
+            "verdict_note": _RECURRENCE_NOTES[verdict]}
 
 
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
