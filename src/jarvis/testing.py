@@ -16,8 +16,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
@@ -140,6 +141,13 @@ def gate_environment(root: Path) -> dict[str, str]:
         # entire subject of that check (issue #202). Pointed at a directory inside the
         # sandbox holding no checkout: "no production deployment on this machine".
         paths.PRODUCTION_ROOT_ENV: str(root / "production"),
+        # The developer's own ~/.local/bin, which `INV-PROD-CLI` reads. Same trap as the
+        # two entries above: left ambient, `jarvis doctor` in a test passes or fails on
+        # whether the human has run install_prod_cli.sh — and it fails, which is the
+        # subject of that check. Pointed at an empty directory inside the sandbox: no
+        # wrapper installed, and PRODUCTION_ROOT_ENV above already means "no production
+        # deployment", so the check is silent either way.
+        release.CLI_BIN_DIR_ENV: str(root / "cli-bin"),
         # The production units export `JARVIS_ENV=production` and it OVERRIDES the
         # location check above, so a suite run BY A JARVIS WORKER inherits it from the
         # daemon and every test of the dev badge fails on a machine where the OS is
@@ -2291,7 +2299,7 @@ def settle_turns():
 #: `design_doc`. Every plan must stand on one, so without a real file here each test that
 #: submits a plan would have to write one first. See §7 of
 #: docs/superpowers/specs/2026-08-23-the-work-order-record.md.
-FIXTURE_DESIGN_DOC = "docs/specs/exporter.md"
+FIXTURE_DESIGN_DOC = "docs/superpowers/specs/exporter.md"
 
 #: How many numbered sections the fixture document carries. A plan is refused unless every
 #: child names a section that resolves AND no two children name the same one, so a fixture
@@ -2483,6 +2491,20 @@ def local_base(monkeypatch):
     monkeypatch.setattr(branchproof, "tip", lambda repo, ref: state["tip"])
     monkeypatch.setattr(branchproof, "is_ancestor", is_ancestor)
     return state
+
+
+@pytest.fixture()
+def origins():
+    """Empty `schedule._ORIGIN_CACHE` around a test that creates or rewrites a remote.
+
+    The cache exists because `origin` does not move under a running daemon, which is the
+    one assumption a test adding a remote to a fresh repository breaks.
+    """
+    from . import schedule
+
+    schedule._ORIGIN_CACHE.clear()
+    yield
+    schedule._ORIGIN_CACHE.clear()
 
 
 @pytest.fixture()
@@ -2767,6 +2789,246 @@ class FaultyAnswerer:
             return dict(self.verdict)
         raise_fault(self.fault, self.reset_at)
         raise AssertionError(f"{self.fault} did not raise")
+
+
+class FleetCostFixture:
+    """Synthetic fleet state for `jarvis.fleetcost` — chosen timestamps, no real agent.
+
+    Every writer goes through the real schema (`ProjectStore`, `CentralStore`,
+    `NeoStore`) and then rewrites the timestamp columns, because the stores stamp
+    `db.now()` and a distribution report is entirely about WHEN a turn ran. The report
+    itself never opens any of these stores: it reads the same files `mode=ro`, which is
+    what `test_read_only` asserts.
+
+    Spec §7 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+
+    def __init__(self, home: Path, project_path: Path, root: Path, catalog: Path,
+                 name: str = "proj_a") -> None:
+        self.home = home
+        self.project_path = project_path
+        self.transcript_root = root
+        self.catalog_path = catalog
+        self.name = name
+        self.db = paths.project_db_path(project_path)
+        self.os_db = paths.central_db_path()
+
+    # -- the project store ------------------------------------------------------
+
+    def _store(self) -> Any:
+        from .project_store import ProjectStore
+
+        return ProjectStore(self.project_path)
+
+    def order(self, title: str = "an order", *, status: str = "completed",
+              session_id: str = "", wo_id: str | None = None,
+              prior_sessions: Sequence[str] = ()) -> str:
+        store = self._store()
+        try:
+            wo = store.create_work_order(title, "", wo_id=wo_id, status=status)
+            store.conn.execute(
+                "UPDATE work_orders SET session_id=?, prior_sessions=? WHERE id=?",
+                (session_id,
+                 json.dumps(list(prior_sessions)) if prior_sessions else None,
+                 wo["id"]))
+            store.conn.commit()
+            return str(wo["id"])
+        finally:
+            store.close()
+
+    def turn(self, wo_id: str, *, started_at: float, ended_at: float | None = None,
+             kind: str = "dispatch", cost_usd: float | None = None,
+             cost_source: str | None = "envelope",
+             usage: dict[str, Any] | None = None, state: str = "done") -> int:
+        """One settled (or still-running, with `ended_at=None`) turn at a chosen time."""
+        store = self._store()
+        try:
+            seq = store.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM wo_turns WHERE wo_id=?",
+                (wo_id,)).fetchone()["n"]
+            cur = store.conn.execute(
+                """INSERT INTO wo_turns (wo_id, seq, kind, prompt, state, started_at,
+                                         ended_at, cost_usd, cost_source, usage_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (wo_id, seq, kind, "go", state, started_at, ended_at, cost_usd,
+                 cost_source if cost_usd is not None else None,
+                 json.dumps(usage) if usage else None))
+            store.conn.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            store.close()
+
+    def validation_round(self, wo_id: str, *, ts: float, round: int = 1) -> None:
+        store = self._store()
+        try:
+            store.conn.execute(
+                """INSERT INTO validation_rounds (wo_id, round, ts, fingerprint)
+                   VALUES (?,?,?,?)""", (wo_id, round, ts, f"fp-{round}"))
+            store.conn.commit()
+        finally:
+            store.close()
+
+    # -- the central and neo stores ---------------------------------------------
+
+    def os_call(self, kind: str, *, ts: float, wo_id: str = "", cost_usd: float = 0.0,
+                label: str = "", model: str = "claude-opus-5",
+                project: str | None = None, session_id: str = "") -> None:
+        from .central_store import CentralStore
+
+        central = CentralStore()
+        try:
+            central.conn.execute(
+                """INSERT INTO agent_calls (ts, project, wo_id, kind, label, model, ok,
+                                            cost_usd, input, cache_write, cache_read,
+                                            output, session_id)
+                   VALUES (?,?,?,?,?,?,1,?,0,0,0,0,?)""",
+                (ts, self.name if project is None else project, wo_id, kind, label,
+                 model, cost_usd, session_id))
+            central.conn.commit()
+        finally:
+            central.close()
+
+    def neo_question(self, wo_id: str, *, ts: float, question: str = "which way?") -> None:
+        from .neo_store import NeoStore
+
+        neo = NeoStore()
+        try:
+            neo.conn.execute(
+                "INSERT INTO questions (ts, project, wo_id, question) VALUES (?,?,?,?)",
+                (ts, self.name, wo_id, question))
+            neo.conn.commit()
+        finally:
+            neo.close()
+
+    def set_cost(self, **keys: Any) -> None:
+        """Override `os.cost.*` in the catalog this fixture registered.
+
+        The cap on orders walked and the row cap of the tool table are catalog settings
+        (Neo's rider: no module constant for anything tunable), so a test that wants to
+        see the cap BITE has to write one.
+        """
+        data = json.loads(self.catalog_path.read_text())
+        data["os"].setdefault("cost", {}).update(keys)
+        self.catalog_path.write_text(json.dumps(data))
+
+    # -- transcripts ------------------------------------------------------------
+
+    def call_row(self, *, at: float, read: int = 0, write: int = 0, out: int = 0,
+                 input: int = 0, mid: str = "", model: str = "claude-opus-5",
+                 tools: Sequence[tuple[str, str, dict]] = (),
+                 stop_reason: str | None = "end_turn") -> dict:
+        """One assistant message — `usage.calls_of` reads one API call per row.
+
+        `tools` is (tool_use_id, name, input) triples, and SEVERAL on one row is how
+        Claude Code writes a parallel tool call: that is the case the char-proportional
+        split of one exact context delta exists for (§10.2).
+
+        `stop_reason` defaults to a SEALED value; `placeholder_call_rows` stages the
+        other kind (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
+        """
+        return {
+            "type": "assistant",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"id": mid or f"m-{at}-{read}-{write}", "model": model,
+                        "stop_reason": stop_reason,
+                        "usage": {"input_tokens": input,
+                                  "cache_creation_input_tokens": write,
+                                  "cache_read_input_tokens": read,
+                                  "output_tokens": out},
+                        "content": [{"type": "tool_use", "id": tid, "name": name,
+                                     "input": arguments}
+                                    for tid, name, arguments in tools]},
+        }
+
+    def placeholder_call_rows(self, *, at: float, read: int = 0, write: int = 0,
+                              out: int = 5, mid: str = "",
+                              model: str = "claude-opus-5") -> list[dict]:
+        """The TWO mid-stream rows Claude Code writes for one message, and no third.
+
+        Both carry `stop_reason: null` and the same streaming `output_tokens`, so the
+        message's true output is not in the file at all (spec §1). One text block, one
+        tool_use block — the shape measured on wo-be05ab99's subagents.
+        """
+        mid = mid or f"ph-{at}-{read}-{write}"
+        return [
+            self.call_row(at=at, read=read, write=write, out=out, mid=mid, model=model,
+                          stop_reason=None),
+            self.call_row(at=at, read=read, write=write, out=out, mid=mid, model=model,
+                          stop_reason=None, tools=(("tu-" + mid, "Read", {}),)),
+        ]
+
+    def result_row(self, *results: tuple[str, str], at: float,
+                   is_error: bool = False) -> dict:
+        """One user row carrying `tool_result` blocks — (tool_use_id, text) pairs.
+
+        A `user` row, which is why `usage._assistant_messages` never saw one: it has no
+        `usage` object, so the ledger keyed by API call has no place to charge it.
+        """
+        return {
+            "type": "user",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                     "content": text, "is_error": is_error}
+                                    for tid, text in results]},
+        }
+
+    def compact_row(self, *, at: float, pre: int = 200_000, post: int = 5_000) -> dict:
+        return {
+            "type": "system", "subtype": "compact_boundary",
+            "timestamp": (datetime.fromtimestamp(at, tz=timezone.utc)
+                          .isoformat().replace("+00:00", "Z")),
+            "compactMetadata": {"trigger": "manual", "preTokens": pre,
+                                "postTokens": post},
+        }
+
+    def transcript(self, session_id: str, rows: Sequence[dict],
+                   subagents: Sequence[Sequence[dict]] = (),
+                   directory: str = "-proj") -> Path:
+        """`directory` is the slugified cwd — a non-default one is how a session OUTSIDE
+        every registered project is written (usage-meter spec §6)."""
+        project_dir = self.transcript_root / directory
+        project_dir.mkdir(parents=True, exist_ok=True)
+        lead = project_dir / f"{session_id}.jsonl"
+        lead.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        for i, sub in enumerate(subagents):
+            sub_dir = project_dir / session_id / "subagents"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            (sub_dir / f"agent-{i}.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in sub))
+        return lead
+
+
+@pytest.fixture()
+def fleet_fixture(jarvis_home, tmp_path, monkeypatch, claude_json):
+    """A registered project, a catalog, an `os.db` and a transcript root — all empty.
+
+    In `jarvis.testing` rather than a conftest so the eval and browser suites can reuse
+    it (mem:testing). The catalog is not decoration: classifying a cold boundary needs
+    `os.cold_prefix_floor`, which has no default anywhere.
+    """
+    from .central_store import CentralStore
+
+    project_path = make_git_project(tmp_path, "proj_a")
+    claude_json(project_path)
+    root = tmp_path / "transcripts"
+    (root / "-proj").mkdir(parents=True)
+    monkeypatch.setenv(usage.TRANSCRIPT_ROOT_ENV, str(root))
+
+    catalog = tmp_path / "catalog.json"
+    catalog.write_text(json.dumps({
+        "os": {"cold_prefix_floor": 5_000},
+        "projects": [{"name": "proj_a", "path": str(project_path)}],
+    }))
+    central = CentralStore()
+    try:
+        central.upsert_project("proj_a", str(project_path), "test project")
+        central.set_state("catalog_path", str(catalog))
+        central.conn.commit()
+    finally:
+        central.close()
+    return FleetCostFixture(jarvis_home, project_path, root, catalog)
 
 
 class Recorder:

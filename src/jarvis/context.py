@@ -1,6 +1,6 @@
 """What Jarvis put in the worker's context window, per turn, and what changed.
 
-§5 of docs/specs/2026-09-24-order-observability.md. Nothing on disk answers "how much of
+§5 of docs/superpowers/specs/2026-09-24-order-observability.md. Nothing on disk answers "how much of
 this context is system prompt, how much is skills, how much is the knowledge block", so
 this module measures the ingredients JARVIS ITSELF supplies at the moment a turn is
 launched, and `record` stores one payload per turn on `wo_turns.context_json`.
@@ -309,7 +309,7 @@ def payload(project: Any, wo: dict[str, Any], turn: dict[str, Any],
 # The meter wraps the WHOLE function, gate guard included: an order running at `off` still
 # records a near-zero row, so the meter has no hole. A meter with a hole reports a number
 # lower than the truth, which is worse than no number (§10 of
-# docs/specs/2026-09-24-order-observability.md). The gate below is never its switch.
+# docs/superpowers/specs/2026-09-24-order-observability.md). The gate below is never its switch.
 @observability.metered(OBSERVE_CONTEXT_WRITE, target="wo", project="project")
 def record(store: Any, project: Any, wo: dict[str, Any], turn: dict[str, Any],
            briefing: dict[str, Any], knowledge: Any = None) -> None:

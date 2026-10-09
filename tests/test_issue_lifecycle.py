@@ -13,6 +13,7 @@ overridden.
 
 import ast
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -223,7 +224,11 @@ def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
     """
     assert set(issues.ISSUE_VERBS) == ISSUE_READS | {
         ("issue", "edit"), ("issue", "comment"), ("issue", "close"),
-        ("label", "create"), ("issue", "create")}
+        ("label", "create"), ("issue", "create"),
+        # The recurrence path's write: a gap that came back is linked to its original
+        # issue, which the OS normally already closed (spec §8 of
+        # docs/superpowers/specs/2026-09-27-self-evolution.md).
+        ("issue", "reopen")}
 
 
 @pytest.mark.parametrize("url", [
@@ -1006,6 +1011,124 @@ def test_a_human_closing_an_issue_under_a_live_work_order_is_not_undone(fleet):
     fleet.gh.set_issue(fleet.issue_url, state="CLOSED", labels=["in progress"])
     fleet.sweep()
     assert fleet.gh.issue()["state"] == "CLOSED", "the OS never reopens an issue"
+
+
+# -- and the sweep CONVERGES on what it found ------------------------------------------
+#
+# Issue #961. "Never fight a human" was only half of it: `apply` returns CLOSED for an
+# issue a person closed, `record_applied` stores `closed`, and `desired_state` goes on
+# saying IN_PROGRESS — so `want != stored` fires again on every tick, for ever. In
+# production that was 315 ticks on issue 837 in ten hours, and a fresh release work order
+# each time the previous one settled (wo-5f35e667, wo-10fbcea5).
+
+
+def _all_release_orders(fleet) -> list[str]:
+    """`fleet.releases()` reads the OPEN ones; a re-file shows up against ALL of them."""
+    from jarvis import db
+    from jarvis.daemon import Daemon
+    store = fleet.store()
+    try:
+        return [w["id"] for w in store.list_work_orders(include_hidden=True)
+                if isinstance(db.from_json(w.get("metadata"), {}).get(
+                    Daemon.RELEASE_BATCH_KEY), list)]
+    finally:
+        store.close()
+
+
+def _record_ships(monkeypatch) -> list[str]:
+    """Every `ensure_release` the sweep makes, still calling through. `fleet.sweep()`
+    builds its own `Daemon`, so the recorder goes on the class."""
+    from jarvis.daemon import Daemon
+    seen: list[str] = []
+    original = Daemon.ensure_release
+
+    def recorded(self, project, store, wo):
+        seen.append(wo["id"])
+        return original(self, project, store, wo)
+
+    monkeypatch.setattr(Daemon, "ensure_release", recorded)
+    return seen
+
+
+def _closed_issue_under_a_live_order(fleet) -> str:
+    """The production shape (issues 792/836/837/843/903): `issue_state` is `closed` and
+    the order is LIVE again, so `desired_state` can never agree with the column.
+
+    How prod got there, in order: the fix landed and the tracker closed, then a landing
+    refusal re-parked the completed order (`ops.park_unlanded`). Writing the column by
+    hand instead would stop reproducing it the moment the lifecycle changes.
+    """
+    from jarvis import issues, landing, ops
+    wo_id = fleet.blocker_wo()
+    fleet.land(wo_id)
+    store = fleet.store()
+    try:
+        ops.park_unlanded(store, store.get_work_order(wo_id),
+                          landing.Authored(branch="wo/961", base="main", commits=1))
+        wo = store.get_work_order(wo_id)
+        assert store.work_unlanded_open(wo_id)
+        assert (wo.get("issue_state") or "") == issues.CLOSED
+        assert fleet.gh.issue()["state"] == "CLOSED"
+        assert issues.desired_state(store, wo) != issues.CLOSED, \
+            "the precondition: tracker closed, record wanting it otherwise"
+    finally:
+        store.close()
+    return wo_id
+
+
+def test_a_human_closed_issue_is_reconciled_once_not_on_every_tick(fleet, monkeypatch,
+                                                                   caplog):
+    """A CLOSED issue the sweep cannot change: the second tick does nothing at all."""
+    with caplog.at_level(logging.INFO, logger="jarvisd"):
+        wo_id = _closed_issue_under_a_live_order(fleet)
+        fleet.sweep()
+    assert [r for r in caplog.records
+            if r.name == "jarvisd" and "is now" in r.getMessage()], \
+        "the tick that DISCOVERED the close logs — else the silence below proves nothing"
+
+    ships = _record_ships(monkeypatch)
+    calls_before = len(fleet.gh.calls)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="jarvisd"):
+        fleet.sweep()
+
+    assert len(fleet.gh.calls) == calls_before, \
+        "the tracker was already reconciled — one `gh issue view` per tick is the loop"
+    assert not [r for r in caplog.records
+                if r.name == "jarvisd" and "is now" in r.getMessage()], \
+        "and nothing to say about it"
+    assert not ships, "a settled issue is not a landing signal"
+    store = fleet.store()
+    try:
+        assert len(store.events_of_kind(wo_id, "issue_closed")) == 1, \
+            "one event for the discovery, not one per tick"
+    finally:
+        store.close()
+
+
+def test_a_settled_release_order_is_not_filed_again_for_an_already_closed_issue(
+        fleet, monkeypatch):
+    """The expensive half of the same loop: occurrence 2 of a release that already went
+    out, as soon as occurrence 1 leaves the open list."""
+    _closed_issue_under_a_live_order(fleet)
+    assert len(fleet.releases()) == 1, "the landing filed one"
+    first = fleet.releases()[0]["id"]
+
+    ships = _record_ships(monkeypatch)
+    fleet.sweep()
+    assert not ships, "the release for this fix was filed when it landed"
+    assert len(fleet.releases()) == 1
+
+    store = fleet.store()
+    try:
+        store.set_status(first, "completed")
+    finally:
+        store.close()
+    fleet.sweep()
+    assert not ships
+    assert not fleet.releases(), \
+        "the batch shipped; a fix whose issue closed earlier earns no second release"
+    assert _all_release_orders(fleet) == [first], "one release order, ever"
 
 
 # -- a confirmed fix that LANDS ships a release ---------------------------------------

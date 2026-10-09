@@ -40,7 +40,7 @@ from .catalog import (
     worker_stalls_on_prompts,
 )
 from . import (budget, bus, config_version, db, fleet, harvest, health, invariants,
-               observability, release, timeline)
+               observability, release, rules, timeline)
 from .release import RED_DEFER_EVENT, RED_PARK_EVENT
 from .agent_usage import (
     OBSERVE_CONTEXT, OBSERVE_INSPECT, OBSERVE_LIVE, OBSERVE_WHY,
@@ -54,6 +54,7 @@ from .paths import daemon_pidfile, ensure_home, logs_dir
 from .project_store import (
     ASSUMPTION_DECIDER_OS,
     ASSUMPTION_DECIDER_USER,
+    COUNTED_VALIDATION_OUTCOMES,
     FO_OPEN_STATUSES,
     FO_STATUSES,
     FO_TERMINAL_STATUSES,
@@ -236,7 +237,9 @@ def resume_fleet(order_ids: list[str] | None = None,
 
 def _resolve_order_id(order_id: str) -> str:
     """A work or feature order id that exists — a typo must not silently allow nothing."""
-    if order_id.startswith("fo-"):
+    # `project_store.is_feature_order_id`, not a `fo-` literal: an `io-`/`inv-` id was
+    # looked up as a work order and refused as a typo (issue #997).
+    if is_feature_order_id(order_id):
         find_feature_order(order_id)
     else:
         find_work_order(order_id)
@@ -605,7 +608,14 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         if mode and worker_stalls_on_prompts(mode):
                             item["resume_auto"] = f"jarvis wo resume-auto {wo['id']}"
                     attention.append(item)
-                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES)
+                # `kind=None`: KIND-AGNOSTIC PATH, so it names the argument rather than
+                # leaving the default (§5 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # The attention strip below already sees every kind through
+                # `flagged_feature_orders`, so a feature-only read here is what produced
+                # four attention items against an empty listing.
+                features = store.list_feature_orders(statuses=FO_OPEN_STATUSES,
+                                                     kind=None)
                 # Which feature orders get a line: the open ones, plus any that is asking
                 # for the user or holds a flagged child. Both additions are about the same
                 # status — `failed` is SETTLED, and it is also the one a feature order
@@ -661,9 +671,20 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                     "name": p["name"], "path": p["path"],
                     "description": p["description"],
                     "summary": summary,
+                    # ONE MERGED LIST WITH A `kind` LABEL, not three keys: three means
+                    # every consumer must learn three and the next kind breaks each one
+                    # again, whereas `kind` is already how the attention strip carries
+                    # this and how the rows are discriminated in the database. The label
+                    # and not the raw status, through the same single mapping: `planning`
+                    # means "analysing" for an io and "investigating" for an inv, and a
+                    # payload saying `planning` for all three is the leak in another
+                    # shape.
                     "feature_orders": [
                         {**{k: fo[k] for k in ("id", "title", "status",
                                                "needs_attention", "attention_reason")},
+                         "kind": fo.get("kind") or "feature",
+                         "status_label": feature_status_label(fo.get("kind"),
+                                                              fo["status"]),
                          "progress": feature_progress(store, fo)}
                         for fo in features
                     ],
@@ -701,6 +722,28 @@ def os_status(catalog: Catalog | None = None) -> dict[str, Any]:
                         "project": p["name"], "wo_id": None,
                         "title": "settings drift", "status": "config",
                         "reason": f".claude/settings.json: {drift}",
+                    })
+                # A STANDING CRITICAL VIOLATION IS AN ATTENTION ITEM — Neo 1084. Until
+                # this, a violation reached the inbox and nothing else, and `healthy`
+                # below is computed from attention alone: `jarvis status` read HEALTHY
+                # over a critical post-condition that was false. ONE item for as long as
+                # it stands, because the report row is the dedupe (`open_violation_report`)
+                # and `close_violation_reports` is what takes it away again.
+                for report in store.standing_violations(level="critical"):
+                    # …EXCEPT ONE THAT OWES A DECISION: the work order's own attention
+                    # flag already carries it, and two lines for one decision is the
+                    # double-report the strip exists to prevent. No owed checker is
+                    # `critical` today; the skip is what keeps that safe when one is. Spec
+                    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                    # decision.md §7
+                    if report.get("owed"):
+                        continue
+                    attention.append({
+                        "project": p["name"], "wo_id": report["wo_id"] or None,
+                        "title": f"OS invariant violated: {report['invariant']}",
+                        "status": "invariant", "invariant": report["invariant"],
+                        "reason": report["detail"] or report["invariant"],
+                        "decide": f"jarvis doctor {p['name']}",
                     })
                 mode = mode_by_project.get(p["name"])
                 if mode and worker_stalls_on_prompts(mode):
@@ -896,7 +939,7 @@ def create_work_order(project_name: str, title: str, description: str = "",
                         else budget.default_for(_spec_or_none(project_name))),
             # Stamped, never resolved against the catalog here: NULL means "this order
             # has no answer" and the project config is read at write time
-            # (`observability.level_for`) — docs/specs/2026-09-24-order-observability.md §10.
+            # (`observability.level_for`) — docs/superpowers/specs/2026-09-24-order-observability.md §10.
             observability=observability,
         )
         # AT CREATION, from the brief the order is actually given — the only moment at
@@ -1164,7 +1207,7 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
     if wo["status"] in ("completed", "failed", "cancelled"):
         # Still allowed — resuming a finished session is fine — but tell the user.
         note = f"note: work order is {wo['status']}; the session will be revived"
-        # §9.3 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        # §9.3 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
         if wo["status"] == "failed":
             note += f" (`jarvis wo retry {wo_id}` is the named form of this)"
     else:
@@ -1189,7 +1232,7 @@ def send_message(wo_id: str, content: str, source: str = "jarvis",
 
 
 #: What a message-less `jarvis wo retry` puts on the queue. §3 of
-#: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+#: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
 RETRY_NOTE = (
     "The OS is relaunching this work order because the user asked for it. Its last turn "
     "ended without a result, so the OS recorded it as failed — nothing about the work was "
@@ -1213,7 +1256,7 @@ def retry_refusal(wo: dict[str, Any]) -> str | None:
     anyway (kn-4ea33fe6)." Same structure as `force_validation_refusal` and `ack_refusal`.
 
     Pure over the row: §4 of
-    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     """
     wo_id = str(wo["id"])
     status = str(wo["status"] or "")
@@ -1245,7 +1288,7 @@ def retry_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | Non
 
     None — no control at all — on any order that is not `failed`: a permanently disabled
     box on every page is noise for a mechanism that does not apply there. §7b of
-    docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     """
     if str(wo["status"] or "") != "failed":
         return None
@@ -1261,7 +1304,7 @@ def harvest_state(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | N
     `jarvis wo show` and the work-order page both read this, so the two cannot disagree
     about what was saved. None — no line anywhere — when that turn was never harvested,
     which is every turn that did not die without a result. §5 of
-    docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+    docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
     """
     payload = harvest.of_turn(store, wo)
     if not payload:
@@ -1320,7 +1363,7 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
 
     MANUAL ONLY — the automatic half is declined (Neo q1108: a turn that ends with no
     result is exactly the replay risk kn-3d8fa23a excludes), and the shape is Neo q1107's.
-    Design: docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    Design: docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
 
     `failed` only, and it writes no status: until the daemon launches the turn the order
     really is `failed`. Pending assumptions do NOT refuse it — a retry buries nothing, so
@@ -1330,7 +1373,7 @@ def retry(wo_id: str, message: str | None = None, project_name: str | None = Non
     refusal = retry_refusal(wo)
     if refusal is not None:
         raise OpsError(refusal)
-    # §6 of docs/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
+    # §6 of docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md: what the OS read off disk
     # beats asking the worker to re-derive it. Its own connection, closed before the
     # delegated send opens one.
     brief_store = ProjectStore(path)
@@ -1487,7 +1530,7 @@ def waiting_on(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any]:
                 "detail": f"its feature's plan is waiting on you — {hold['n']} "
                           f"assumption(s) on {hold['planner_id']}; "
                           f"`jarvis wo review {hold['planner_id']}`"}
-    # §6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # §6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     if wo["status"] == "failed":
         return {"what": "failed", "stalled": False,
                 "detail": f"the worker died without delivering — `jarvis wo retry {wo_id}` "
@@ -2248,7 +2291,7 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
     out: list[dict[str, str]] = []
     refusals: list[str] = []
 
-    # FIRST — §7 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+    # FIRST — §7 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
     retry_no = retry_refusal(wo)
     if retry_no is None:
         out.append({"command": f"jarvis wo retry {wo_id}",
@@ -2308,13 +2351,13 @@ def _diagnose_commands(store: ProjectStore, wo: dict[str, Any], *, project: str,
 
 
 # Metered at the DEFINITION, which is why §7's dashboard routes need no edit: they call
-# this same function (§10 of docs/specs/2026-09-24-order-observability.md).
+# this same function (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 @observability.metered(OBSERVE_WHY, target="wo_id", project="project_name")
 def diagnose(wo_id: str, project_name: str | None = None) -> dict[str, Any]:
     """Why is this order not moving, and what do I type — `jarvis wo why`.
 
     PURE COMPOSITION, AND THAT IS THE POINT (spec §6 of
-    docs/specs/2026-09-24-order-observability.md). Every part of the answer already
+    docs/superpowers/specs/2026-09-24-order-observability.md). Every part of the answer already
     existed and was scattered over three surfaces that each showed a slice; this puts
     them in one payload and rewrites none of them. A diagnosis that disagrees with the
     status label is worse than no diagnosis, so where `waiting_on` and `true_blockers`
@@ -2766,7 +2809,7 @@ def _fix_unreachable(store: ProjectStore, wo: dict[str, Any], command: str,
 def fix(wo_id: str, project_name: str | None = None, *, remedy: str | None = None,
         argument: str | None = None, confirm: bool = False) -> dict[str, Any]:
     """Clear the blocker §6 just named — `jarvis wo fix`, §11 of
-    docs/specs/2026-09-24-order-observability.md.
+    docs/superpowers/specs/2026-09-24-order-observability.md.
 
     IT ADDS NO AUTHORITY AND THAT IS THE WHOLE DESIGN. Every remedy is resolved through
     `remedies.resolve` — CODE today, and DATA rows fo-69ba1cc4 builds tomorrow, keyed by
@@ -5222,16 +5265,44 @@ def refusal_answered(store: ProjectStore, wo_id: str) -> bool:
     the round in the meantime would land the very decision the user turned down. Only
     reachable because the two gates now run in parallel (spec §5).
 
-    The boundary is the `finished` event, which is the same one
+    One boundary is the `finished` event, which is the same one
     `ProjectStore.review_assumption`'s round rule is read against (kn-82d853ca) — and
     why `finish` records it BEFORE it settles anything.
+
+    The other is a PASSED user-rework round: the one round `user_rework_pending` grants
+    per refusal, which the user themselves forced, guarded on the judged head having
+    moved off the commit the refused decision sat on (spec
+    docs/superpowers/specs/2026-10-08-a-passed-forced-round-answers-a-refusal.md).
     """
     refusals = [e for e in store.events_of_kind(wo_id, "reviewed")
                 if not db.from_json(e["payload"], {}).get("accepted", True)]
     if not refusals:
         return True
+    cut = float(refusals[-1]["ts"])
     delivered = store.events_of_kind(wo_id, "finished")
-    return bool(delivered) and float(delivered[-1]["ts"]) > float(refusals[-1]["ts"])
+    if delivered and float(delivered[-1]["ts"]) > cut:
+        return True
+    # One read of the rows, like `validated_head`'s one-read rule: the guard needs the
+    # prior counted row from the same list (spec §The predicate).
+    counted = [r for r in store.validation_rounds(wo_id=wo_id)
+               if str(r["outcome"] or "") in COUNTED_VALIDATION_OUTCOMES]
+    if not counted:
+        return False
+    newest = counted[-1]
+    # `validation_rounds.ts` is the round's OPEN time and nothing writes a settle one;
+    # `user_rework_pending` compares against the same column (spec §The predicate).
+    if (str(newest["outcome"] or "") != "passed"
+            or str(newest.get("uncounted_cause") or "") != USER_REWORK_CAUSE
+            or float(newest["ts"] or 0) <= cut):
+        return False
+    forced_head = ProjectStore.validated_head(newest) or ""
+    before = [r for r in counted[:-1] if float(r["ts"] or 0) <= cut]
+    prior = before[-1] if before else None
+    prior_head = ((ProjectStore.validated_head(prior) or str(prior["head_sha"] or ""))
+                  if prior is not None else "")
+    # Spec §The head guard on (b): an unmoved head is the refused decision landing by
+    # the back door; an unrecorded one is never a match.
+    return not (forced_head and forced_head == prior_head)
 
 
 def user_rework_pending(store: ProjectStore, wo_id: str) -> bool:
@@ -5309,8 +5380,38 @@ def escalate_validation_round(store: ProjectStore, wo: dict[str, Any], round_id:
     )
 
 
-def unanswered_paths(store: ProjectStore, wo_id: str,
-                     packet: Any) -> tuple[dict[str, Any], tuple[str, ...]] | None:
+def _worktree_file_test(project_path: Path,
+                        wo: Mapping[str, Any]) -> Callable[[str], bool] | None:
+    """`exists` for `validation.unanswered_submission`, or None when no worktree resolves.
+
+    The filesystem that pure module may not have (spec
+    docs/superpowers/specs/2026-09-22-a-round-must-answer-the-list.md §5).
+    """
+    from . import evidence as evidence_mod
+    from . import worker_session
+
+    # type: ignore — `ProjectRef` carries the one attribute that helper reads.
+    worktree = worker_session.worktree_path(
+        evidence_mod.ProjectRef(project_path), dict(wo))  # type: ignore[arg-type]
+    if worktree is None:
+        return None
+
+    def present(path: str) -> bool:
+        candidate = Path(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            return False
+        try:
+            return (worktree / candidate).is_file()
+        except (OSError, ValueError):
+            return False
+
+    return present
+
+
+def unanswered_paths(store: ProjectStore, wo_id: str, packet: Any, *,
+                     project_path: Path,
+                     wo: Mapping[str, Any],
+                     ) -> tuple[dict[str, Any], tuple[str, ...]] | None:
     """`(the round that asked, the paths it asked about)` when this submission answers
     none of them, else None.
 
@@ -5319,6 +5420,8 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
     read through `validation.blockers(validation.findings(...))`, the SAME pair
     `prior_round_history` reads, because a second classifier is a second answer to what
     the submitter was told.
+
+    Also the filesystem half: `exists` is the work order's own worktree (spec §5).
     """
     from . import validation
 
@@ -5330,7 +5433,7 @@ def unanswered_paths(store: ProjectStore, wo_id: str,
         raised += validation.blockers(validation.findings(op))
     cited = validation.unanswered_submission(
         previous, raised, ProjectStore.validation_file_shas(previous),
-        dict(packet.file_shas))
+        dict(packet.file_shas), exists=_worktree_file_test(project_path, wo))
     return (previous, cited) if cited is not None else None
 
 
@@ -5429,7 +5532,8 @@ def submit_for_validation(store: ProjectStore, project_path: Path, wo: dict[str,
     # other (spec 2026-09-27-a-conflict-resolution-the-os-asked-for-costs-no-round §4.1).
     nxt = store.numbered_validation_rounds(wo_id=wo["id"]) + 1
     unanswered = (None if forced_reason.strip()
-                  else unanswered_paths(store, str(wo["id"]), packet))
+                  else unanswered_paths(store, str(wo["id"]), packet,
+                                        project_path=project_path, wo=wo))
     if unanswered is not None:
         previous, cited = unanswered
         if consecutive_bounces(store, str(wo["id"]),
@@ -5984,6 +6088,70 @@ def prior_round_history(store: ProjectStore, *, wo_id: str | None = None,
     return out
 
 
+#: The daemon's own back-fill row (`Daemon.MERGE_COMMIT_EVENT`), named here because the
+#: ancestry check reads it from both sides.
+MERGE_COMMIT_EVENT = "pr_merge_commit_recorded"
+
+
+class UnintegratedChild(Exception):
+    """A completed child's merge commit is not in the head a round would be judged over.
+
+    RAISED, never deferred: `ops` has no next tick, so the only honest answers it has are
+    "open the round" and "refuse" (Neo question 1394). The daemon catches this explicitly
+    and defers; `jarvis fo submit` lets it reach the manager.
+    """
+
+    def __init__(self, child_id: str, commit: str, head: str) -> None:
+        super().__init__(invariants.FEATURE_CHILD_NOT_INTEGRATED.format(
+            id=child_id, commit=commit, head=head))
+        self.child_id = child_id
+        self.commit = commit
+        self.head = head
+
+
+def recorded_merge_commit(store: ProjectStore, child: dict[str, Any]) -> str:
+    """The commit this child put on the default branch, from the RECORD alone.
+
+    No `gh` call: the one-off back-fill belongs to the daemon, which has somewhere to
+    write the answer back to.
+    """
+    for kind in ("pr_merged", MERGE_COMMIT_EVENT):
+        rows = store.events_of_kind(child["id"], kind)
+        if rows:
+            sha = db.from_json(rows[-1]["payload"], {}).get("merge_commit") or ""
+            if sha:
+                return str(sha)
+    return ""
+
+
+def unintegrated_children(project_path: Path, store: ProjectStore, fo_id: str, head: str,
+                          merge_commit: Callable[[dict[str, Any]], str],
+                          ) -> list[tuple[dict[str, Any], str]]:
+    """Which of this feature's completed children are missing from `head`.
+
+    ONE copy of the check, called by both the daemon's deferral and
+    `submit_feature_for_validation`'s refusal — two that drifted apart is the defect being
+    fixed, one level up (§2 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md).
+    `merge_commit` is how the caller resolves a child's commit, which is where the two
+    differ: the daemon may spend a `gh` call, `ops` may not.
+
+    `is_ancestor` is `False` when git cannot answer, which reads as "not proven".
+    """
+    from . import branchproof
+
+    missing: list[tuple[dict[str, Any], str]] = []
+    for child in store.feature_children(fo_id):
+        # The children `settle_features` counted. One with no pull request and no merge
+        # event contributes nothing to check.
+        if child["superseded"] or child["status"] != "completed":
+            continue
+        sha = merge_commit(child)
+        if sha and not branchproof.is_ancestor(project_path, sha, head):
+            missing.append((child, sha))
+    return missing
+
+
 def collect_feature_evidence(store: ProjectStore, project_path: Path,
                              fo: dict[str, Any], *, declared: str, summary: str,
                              cfg: Any,
@@ -6032,9 +6200,33 @@ def submit_feature_for_validation(store: ProjectStore, project_path: Path,
     the last child lands, and `jarvis fo submit` opens every round after that. Neither
     reads the kill switch here; both read it before calling, which is the rule the whole
     design turns on (see `finish`).
+
+    THE FETCH IS HERE, at the point those two callers share, because neither has any
+    reason to want a stale head: in the daemon alone it would leave `jarvis fo submit`
+    judging a stale one for ever, which is the common case for rounds 2+. §1 of
+    docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md.
+
+    A FAILED fetch raises `UnintegratedChild` when a completed child's merge is missing
+    from the local head, and opens no round. It never defers (Neo question 1394).
     """
+    from . import branchproof
     from . import evidence as evidence_mod
 
+    # §1: the same ladder the collector resolves its head with, so the fetch cannot bring
+    # down a different branch than the one judged. A failed fetch is not fatal.
+    ref = evidence_mod.base_ref(project_path)
+    if ref and not branchproof.fetch(project_path, ref):
+        log.warning("could not fetch %s in %s — %s is being judged on the local ref as "
+                    "it stands", ref, project_path, fo["id"])
+        # §2 + Neo 1394: a stale local ref is exactly how a round gets opened over a head
+        # that predates a child's merge, so refuse rather than judge it.
+        head = evidence_mod.default_branch_head(project_path)
+        missing = unintegrated_children(
+            project_path, store, fo["id"], head,
+            lambda child: recorded_merge_commit(store, child)) if head else []
+        if missing:
+            child, sha = missing[0]
+            raise UnintegratedChild(child["id"], sha, head)
     packet = collect_feature_evidence(store, project_path, fo, declared=declared,
                                       summary=summary, cfg=cfg)
     fo_id = fo["id"]
@@ -6316,6 +6508,16 @@ def finish(wo_id: str, summary: str, pr_url: str | None = None,
                 # cleared one alert and got a different one back. The abandonment is
                 # written above, `work_abandoned` reads it, the alert is clear; a settled
                 # order's status is not this command's to move.
+                #
+                # THE REPORT GOES WITH IT, so the blocker stops deriving on the next
+                # reconcile tick and INV-ATTENTION-PHANTOM lowers the flag through its
+                # ordinary path. Without this the user waits up to an hour for the next
+                # landing sweep — clearing one alert and watching it sit there, which is
+                # the shape the comment above is already about. Singular: the plural
+                # deletes every report not in the iterable it is given. Spec
+                # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+                # decision.md §8
+                store.close_violation_report(invariants.INV_WORK_LANDED, wo_id)
                 return {"project": name, "wo_id": wo_id, "status": _wo["status"]}
         # AFTER the `finished` event, so `refusal_answered` still dates correctly, and
         # after the `abandon` branch: 2026-09-29 spec §1.
@@ -6657,11 +6859,38 @@ requires it not to be before a merge; while you are in there, merge `origin/{bas
 (do not rebase) so the checks re-run against what would actually land."""
 
 
+#: THE ONE REPAIR THAT INVERTS THE OTHER TWO: those work orders already declared
+#: themselves, so they end "do NOT call `jarvis wo finish` again"; this one's entire
+#: purpose is that the worker MUST call it. Same four things in the same order — what is
+#: wrong, what to do, what NOT to do, attempts left — and no format field beyond
+#: `url`/`attempt`/`max_attempts`. Spec
+#: docs/superpowers/specs/2026-10-07-an-undeclared-delivery-must-heal-itself.md §2.2.
+#:
+#: Names the REFUSAL and not the branch: the worker's own reading of why it was woken has
+#: to match the record. TARGETED_TESTS_LINE rides in the `--evidence` clause, because
+#: that is the clause that asks what was run and this turn does not inherit the dispatch
+#: brief that states the same rule.
+PR_UNDECLARED_NUDGE = """\
+The user REFUSED an assumption on this work order, and you pushed commits since. The \
+head of {url} is one nothing has declared, so the panel may not judge it and nobody is \
+reading it. Nobody typed this message — Jarvis noticed while polling the pull request.
+
+Declare it: run `jarvis wo finish <wo-id> --summary "..." --pr {url} --evidence "..."`. \
+Say in the summary what the refusal asked for and what you changed, and in the evidence \
+state what you ran; """ + TARGETED_TESTS_LINE + """.
+
+Then END YOUR TURN. Do NOT push anything new to answer this message — the declaration \
+is the whole ask, and the commits are already there.
+
+This is attempt {attempt} of {max_attempts}. After {max_attempts} the work order stops \
+trying and asks the user."""
+
+
 @dataclass(frozen=True)
 class PrRepair:
     """One thing a poll can ask a worker to fix on its own pull request.
 
-    Two of them, and everything else is shared: the same attempt cap, the same three
+    Three of them, and everything else is shared: the same attempt cap, the same three
     guards in `Daemon.heal_pull_request`, the same episode arithmetic, the same
     unauthored message source. They differ only in what is wrong and what to say about
     it, which is the whole reason this is a descriptor and not a second copy of the
@@ -6690,11 +6919,13 @@ PR_CONFLICT = PrRepair(invariants.PR_CONFLICT_REPAIR, PR_CONFLICT_NUDGE,
                        invariants.PR_CONFLICT_BLOCKER)
 PR_CHECKS = PrRepair(invariants.PR_CHECKS_REPAIR, PR_CHECKS_NUDGE,
                      invariants.PR_CHECKS_BLOCKER)
+PR_UNDECLARED = PrRepair(invariants.PR_UNDECLARED_REPAIR, PR_UNDECLARED_NUDGE,
+                         invariants.PR_UNDECLARED_BLOCKER)
 
 #: Newest episode first is not a thing here — `pr_repair_origin` compares timestamps —
 #: but every repair that can hold a work order out of its status has to be in this
 #: tuple, or `Daemon.settle_work_order` will park its repair turn in the merge queue.
-PR_REPAIRS = (PR_CONFLICT, PR_CHECKS)
+PR_REPAIRS = (PR_CONFLICT, PR_CHECKS, PR_UNDECLARED)
 
 
 def nudge_pr_repair(store: ProjectStore, wo: dict[str, Any], repair: PrRepair,
@@ -8017,11 +8248,16 @@ def feature_order_budget(fo_id: str, project_name: str | None = None) -> dict[st
         p = budget.pool(store, central, fo)
         spend = budget.feature_spent(store, central, fo)
         live = budget.feature_in_flight(store, fo)  # display only; see `budget.spent`
+        # `budget.family` for the same reason as the set path's `exhausted_children`:
+        # the totals beside this list are family totals, so a breakdown off the
+        # `kind='worker'` children alone does not add up to them — and is EMPTY for an
+        # improvement order or an investigation, whose one child is the family's
+        # `plan_wo_id` (Neo question 1198).
         children = [
             {"wo_id": c["id"], "status": c["status"],
              "reserved_usd": c.get("budget_reserved_usd"),
              "spent_usd": budget.spent(store, central, c["id"]).total_usd}
-            for c in store.feature_children(fo_id)
+            for c in budget.family(store, fo)
         ]
     finally:
         central.close()
@@ -8097,7 +8333,23 @@ def list_feature_orders(project_name: str | None = None,
         store = ProjectStore(path)
         try:
             statuses = None if include_settled else FO_OPEN_STATUSES
-            for fo in store.list_feature_orders(statuses=statuses, kind=kind):
+            rows = store.list_feature_orders(statuses=statuses, kind=kind)
+            if not include_settled:
+                # THE DEFAULT LISTING IS THE OPEN ONES PLUS ANY FLAGGED ROW WHATEVER ITS
+                # STATUS (§6 of
+                # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+                # `flagged_feature_orders`' own docstring is the argument: `failed` is a
+                # SETTLED status and also the one a feature order raises its flag in, and
+                # a `WAITING_ON_USER` investigation is `completed` AND flagged in one
+                # transaction. A flag nobody can list is a flag nobody can act on.
+                # Here and not in `ProjectStore`: each of its two methods is honest about
+                # one question, and `--all` is still the way to see settled quiet rows.
+                seen = {fo["id"] for fo in rows}
+                rows += [fo for fo in store.flagged_feature_orders()
+                         if fo["id"] not in seen
+                         and (kind is None or (fo.get("kind") or "feature") == kind)]
+                rows.sort(key=lambda fo: fo["created_at"], reverse=True)
+            for fo in rows:
                 out.append({"project": name, **fo,
                             "status_label": feature_status_label(kind, fo["status"]),
                             "progress": feature_progress(store, fo)})
@@ -8162,6 +8414,40 @@ _KIND_PHRASES = {
     "improvement": "an improvement order",
     "investigation": "an investigation order",
 }
+
+#: Per kind: how the FAMILY reads in prose, and the command that raises its budget. A
+#: TABLE for `_require_kind`'s own reason — a third kind read as "a feature order" is a
+#: message that names the wrong surface, and `jarvis fo budget` on an `io-`/`inv-` row
+#: refuses. §2 of
+#: docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. Here beside
+#: `_KIND_PHRASES` and not in the budgets section: a second kind table down there is the
+#: one that goes stale when a fourth kind lands.
+_KIND_FAMILY = {
+    "feature": ("feature", "jarvis fo budget"),
+    "improvement": ("improvement order", "jarvis io budget"),
+    "investigation": ("investigation", "jarvis investigate budget"),
+}
+
+
+#: Per kind: the verb that SHOWS one. Beside the two tables above for their reason, and
+#: read by `show_feature_order`'s guard — the one refusal that has to name the command for
+#: the kind the row ACTUALLY is, because the user got there from a `/fo/` link or a
+#: `jarvis fo show` of an id they pasted (GitHub issue #997).
+_KIND_SHOW_VERBS = {
+    "feature": "jarvis fo show",
+    "improvement": "jarvis io show",
+    "investigation": "jarvis investigate show",
+}
+
+
+def show_verb(kind: str | None) -> str:
+    """The command that shows a `feature_orders` row of this kind."""
+    return _KIND_SHOW_VERBS.get(kind or "feature", _KIND_SHOW_VERBS["feature"])
+
+
+def family_prose(kind: str | None) -> tuple[str, str]:
+    """`(what the family is called, the command that raises its budget)` for one kind."""
+    return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
 
 
 def create_improvement_order(project_name: str, title: str, description: str = "",
@@ -8300,6 +8586,29 @@ def cancel_improvement_order(io_id: str, project_name: str | None = None
     _, _, fo = find_feature_order(io_id, project_name)
     _require_kind(fo, "improvement", "jarvis fo cancel")
     return cancel_feature_order(io_id, project_name)
+
+
+def improvement_order_budget(io_id: str, project_name: str | None = None
+                             ) -> dict[str, Any]:
+    """`jarvis io budget`, read-only. The feature-order arithmetic unchanged: the family
+    here is the order plus its analyst (§2.6 of the improvement-orders spec).
+
+    THE GUARD IS HERE AND NOT IN THE CLI, like every other `io` verb's — `jarvis io
+    budget` was the one that routed straight to the feature-order function, so `/api` and
+    every future caller got no guard at all (§3 of
+    docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md).
+    """
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return feature_order_budget(io_id, project_name)
+
+
+def set_improvement_budget(io_id: str, amount: float | None,
+                           project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis io budget <amount>`. Guard, then delegate — see the read above."""
+    _, _, fo = find_feature_order(io_id, project_name)
+    _require_kind(fo, "improvement", "jarvis fo budget")
+    return set_feature_budget(io_id, amount, project_name)
 
 
 def submit_findings(io_id: str, doc: Any,
@@ -8601,10 +8910,18 @@ def review_findings(io_id: str, accept: Sequence[str] = (),
 #: because both of this order's refusals are about the subject (§2.7).
 SUBJECT_KEY = "subject"
 
+#: `feature_orders.metadata` key: `stuck.fingerprint` of the situation this investigation
+#: was opened on, which is the cooldown's memory (§6b of
+#: docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md). On
+#: the row beside `SUBJECT_KEY` rather than in a table of its own, for the reason that key
+#: is there: one more key is no migration, and `jarvis investigate show` can render it.
+STUCK_FINGERPRINT_KEY = "stuck_fingerprint"
+
 
 def create_investigation_order(project_name: str | None, subject: str, why: str,
                                budget_usd: float | None = None,
-                               origin: str = "jarvis") -> dict[str, Any]:
+                               origin: str = "jarvis",
+                               fingerprint: str = "") -> dict[str, Any]:
     """Open an investigation into one stuck order. Nothing runs here.
 
     A thin `ops` function holding all the logic, because the CLI is not its main caller:
@@ -8641,7 +8958,7 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
             f"{subject} is an {kind} — an investigation never investigates the "
             f"diagnostician. Investigate the subject it was opened on instead."
         )
-    live = _live_investigation(project_name, subject)
+    live = live_investigation(project_name, subject)
     if live:
         raise OpsError(
             f"{live} is already investigating {subject} — `jarvis investigate show "
@@ -8653,7 +8970,8 @@ def create_investigation_order(project_name: str | None, subject: str, why: str,
         return store.create_feature_order(
             title=f"investigate {subject}: {title}"[:200], description=why,
             origin=origin, kind="investigation",
-            metadata={SUBJECT_KEY: subject},
+            metadata={SUBJECT_KEY: subject,
+                      **({STUCK_FINGERPRINT_KEY: fingerprint} if fingerprint else {})},
             # The family is this order plus its one investigator, so the family
             # arithmetic is already correct — `create_improvement_order`'s reasoning. The
             # fallback is NOT "no ceiling": the caller is a daemon loop, not a human
@@ -8681,8 +8999,15 @@ def _subject_identity(subject: str,
     return name, str(wo["title"]), str(wo.get("kind") or "worker")
 
 
-def _live_investigation(project_name: str, subject: str) -> str:
-    """The id of the non-terminal investigation already on this subject, or `""`."""
+def live_investigation(project_name: str, subject: str) -> str:
+    """The id of the non-terminal investigation already on this subject, or `""`.
+
+    PUBLIC because the fleet-health sweep asks it BEFORE attempting a creation (§6a): an
+    exception per already-investigated order per sweep is a log the operator learns to
+    ignore, and it is indistinguishable from a real failure on the run row. The refusal
+    inside `create_investigation_order` stays exactly as it is — it is the floor for every
+    other caller.
+    """
     paths = registered_project_paths()
     store = ProjectStore(paths[project_name])
     try:
@@ -8694,6 +9019,153 @@ def _live_investigation(project_name: str, subject: str) -> str:
     finally:
         store.close()
     return ""
+
+
+#: The name every caller before §6a used. Kept as an alias rather than renamed at the call
+#: sites: the two are one function and a second spelling must not become a second body.
+_live_investigation = live_investigation
+
+
+def last_stuck_investigation(project_name: str, subject: str) -> dict[str, Any] | None:
+    """The newest investigation of ANY status on this subject that carries a fingerprint.
+
+    What the cooldown is read from (§6b). Any status, because a SETTLED one is exactly the
+    case the cooldown is about — `live_investigation` answers the other one.
+    """
+    paths = registered_project_paths()
+    store = ProjectStore(paths[project_name])
+    try:
+        for row in store.list_feature_orders(statuses=None, kind="investigation"):
+            metadata = db.from_json(row.get("metadata"), {}) or {}
+            if metadata.get(SUBJECT_KEY) == subject \
+                    and metadata.get(STUCK_FINGERPRINT_KEY):
+                return {**row, STUCK_FINGERPRINT_KEY: str(
+                    metadata[STUCK_FINGERPRINT_KEY])}
+    finally:
+        store.close()
+    return None
+
+
+def stuck_scan(pstore: ProjectStore, project_name: str, cfg: Any, now: float, *,
+               window: bool = False,
+               stuck_only: bool = True) -> tuple[int, list[dict[str, Any]]]:
+    """Every open order of one project, judged by `stuck.assess`. §7's ONE derivation.
+
+    `Daemon._stuck_candidates` and `stuck_report` both call it, so a duration or a
+    threshold is computed in exactly one place. `stuck_only` is what the sweep passes: the
+    surfaces want every row, the tick wants the over-threshold ones and must not pay for
+    the detail of the rest.
+
+    `window` is the PROJECT-WIDE usage hold, read once by the caller rather than once per
+    candidate (`health_sweep_hold`'s own docstring).
+    """
+    from . import holds, stuck
+    from .health import observer_kinds
+    from .project_store import FO_ID_PREFIXES, UNGOVERNED_ORIGINS
+    from .worker_session import PAUSE_USAGE_LIMIT
+
+    thresholds = {s: cfg.threshold_seconds(s) for s in cfg.thresholds}
+    scanned, out = 0, []
+    for wo in pstore.list_work_orders(statuses=OPEN_STATUSES):
+        if wo["origin"] in UNGOVERNED_ORIGINS:
+            continue  # the user's own session — `_health_candidates`' rule
+        # AN INVESTIGATION IS NEVER A SUBJECT. `create_investigation_order` refuses it
+        # too, and the refusal must not be how the sweep learns it (§6).
+        if wo.get("kind") in ("investigation", "investigator") \
+                or str(wo.get("parent_id") or "").startswith(
+                    f'{FO_ID_PREFIXES["investigation"]}-'):
+            continue
+        scanned += 1
+        durations = state_durations(pstore, wo_id=wo["id"], now=now)
+        if durations.current_status_since is None:
+            continue  # no present-tense claim to judge — `state_durations`' own rule
+        spans = holds.held(pstore, wo["id"], now=now)
+        since = durations.current_status_since
+        usage = [h for h in spans if h.cause == PAUSE_USAGE_LIMIT]
+        discounted = holds.by_cause(usage, since, now, now).get(PAUSE_USAGE_LIMIT, 0.0)
+        verdict = stuck.assess(
+            str(wo["status"]), now - since, now - (durations.last_activity_ts or since),
+            discounted, thresholds, cfg.fallback_minutes * 60.0,
+            excluded_cause=(PAUSE_USAGE_LIMIT
+                            if window or any(h.open for h in usage) else ""))
+        if stuck_only and not verdict.stuck:
+            continue
+        blocker = true_blockers(pstore, wo, now=now)
+        out.append({
+            "project": project_name, "wo": wo, "verdict": verdict,
+            "blocker": blocker[0] if blocker else "nothing the record can name",
+            "status_label": invariants.status_label(pstore, wo),
+            "since": since, "activity": durations.last_activity_ts or since,
+            "discounted": discounted,
+            "seconds_in_status": now - since,
+            "seconds_since_activity": now - (durations.last_activity_ts or since),
+            "events": pstore.count_events(wo["id"], exclude=observer_kinds()),
+        })
+    return scanned, out
+
+
+def stuck_report(project_name: str | None = None,
+                 now: float | None = None) -> list[dict[str, Any]]:
+    """Every open order and how the sweep judges it. §7: ONE reader, two renderers.
+
+    `jarvis stuck` and `/stuck` both read this and neither computes a duration or a
+    threshold — `jarvis wo why`'s rule. Pure and write-free, most overdue first, and
+    ONLY the projects `fleet_health.enabled` covers, so what it shows is what the sweep
+    would act on rather than arithmetic nobody will ever apply.
+    """
+    from . import stuck
+
+    now = time.time() if now is None else now
+    catalog = resolve_catalog()
+    paths = registered_project_paths()
+    rows: list[dict[str, Any]] = []
+    for spec in catalog.projects:
+        if not spec.fleet_health.enabled or spec.name not in paths:
+            continue
+        if project_name and spec.name != project_name:
+            continue
+        pstore = ProjectStore(paths[spec.name])
+        try:
+            _scanned, judged = stuck_scan(
+                pstore, spec.name, spec.fleet_health, now,
+                window=bool(pstore.health_sweep_hold()), stuck_only=False)
+        finally:
+            pstore.close()
+        for row in judged:
+            wo, verdict = row["wo"], row["verdict"]
+            rows.append({
+                "id": wo["id"], "project": spec.name, "title": wo["title"],
+                "status": wo["status"], "status_label": row["status_label"],
+                "seconds_in_status": row["seconds_in_status"],
+                "seconds_since_activity": row["seconds_since_activity"],
+                "discounted_seconds": row["discounted"],
+                "active_seconds": verdict.active_seconds,
+                "threshold_seconds": verdict.threshold_seconds,
+                "clock": verdict.clock, "stuck": verdict.stuck,
+                "excluded": verdict.excluded, "reason": verdict.reason,
+                "blocker": row["blocker"],
+                "fingerprint": stuck.fingerprint(str(wo["status"]), row["since"],
+                                                 row["blocker"], row["events"]),
+                "investigation": _stuck_investigation(spec.name, wo["id"]),
+            })
+    rows.sort(key=lambda r: r["threshold_seconds"] - r["active_seconds"])
+    return rows
+
+
+def _stuck_investigation(project_name: str, wo_id: str) -> dict[str, Any] | None:
+    """The live or last investigation of this subject, with its verdict when settled."""
+    live = live_investigation(project_name, wo_id)
+    last = last_stuck_investigation(project_name, wo_id)
+    row = None
+    if live:
+        _n, _p, row = find_feature_order(live, project_name)
+    elif last is not None:
+        row = last
+    if row is None:
+        return None
+    plan = db.from_json(row.get("plan"), {}) or {}
+    return {"id": row["id"], "status": row["status"],
+            "classification": str(plan.get("classification") or "")}
 
 
 def list_investigation_orders(project_name: str | None = None,
@@ -8755,6 +9227,34 @@ def cancel_investigation_order(inv_id: str, project_name: str | None = None
     _, _, fo = find_feature_order(inv_id, project_name)
     _require_kind(fo, "investigation", "jarvis fo cancel")
     return cancel_feature_order(inv_id, project_name)
+
+
+def investigation_order_budget(inv_id: str, project_name: str | None = None
+                               ) -> dict[str, Any]:
+    """`jarvis investigate budget`, read-only — THE SECOND STEP OF THE TOP-UP.
+
+    §3 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md: the
+    command a parked child's note names has to exist. The family is the order plus its
+    one investigator, so the feature-order arithmetic is already correct (§2.6 of the
+    improvement-orders spec) and nothing is reimplemented. Guard here, as every other
+    `investigate` verb's is.
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return feature_order_budget(inv_id, project_name)
+
+
+def set_investigation_budget(inv_id: str, amount: float | None,
+                             project_name: str | None = None) -> dict[str, Any]:
+    """`jarvis investigate budget <amount>`. Guard, then delegate — see the read above.
+
+    Raising it takes the investigation out of `budget_exhausted` on the next reconcile
+    tick, back to `planning` — the status its lifecycle actually runs in
+    (`Daemon.settle_features`).
+    """
+    _, _, fo = find_feature_order(inv_id, project_name)
+    _require_kind(fo, "investigation", "jarvis fo budget")
+    return set_feature_budget(inv_id, amount, project_name)
 
 
 def submit_verdict(inv_id: str, doc: Any,
@@ -8871,6 +9371,17 @@ def submit_verdict(inv_id: str, doc: Any,
                                          verdicts.settle_headline(inv_id, verdict))
         else:
             store.clear_feature_attention(inv_id)
+        # …AND ON THE SUBJECT'S OWN TIMELINE (§7): the line above is the INVESTIGATOR's
+        # work order, which nobody reading the stuck order will open. `KeyError` like the
+        # `plan_wo_id` reads below, since a subject can be deleted under it.
+        if subject and not is_feature_order_id(subject):
+            try:
+                store.add_event(subject, "investigation_verdict", {
+                    "investigation": inv_id, "classification": classification,
+                    "filed": (verdict.get("filed") or {}).get("issue_url"),
+                })
+            except (KeyError, sqlite3.IntegrityError):
+                pass  # not this project's work order any more
         settled: dict[str, Any] | None = None
         if fo.get("plan_wo_id"):
             store.add_event(fo["plan_wo_id"], "verdict_submitted", {
@@ -8984,6 +9495,10 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
     from . import plans
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    # The verb for the kind the row ACTUALLY is: this is the surface an id of another kind
+    # reaches by accident, so "use `jarvis fo show`" would name the command that just
+    # refused (GitHub issue #997).
+    _require_kind(fo, "feature", show_verb(fo.get("kind")))
     store = ProjectStore(path)
     try:
         plan = db.from_json(fo.get("plan"), None)
@@ -9614,6 +10129,67 @@ def cancel_feature_order(fo_id: str, project_name: str | None = None) -> dict[st
 FIX_TITLE_CHARS = 120
 
 
+def revive_feature_manager(store: ProjectStore, fo_id: str,
+                           why: str) -> dict[str, Any] | None:
+    """Give an `executing` feature back the manager its settlement closed.
+
+    THE ONE SITE manager liveness is derived at, and that is the point: it was written
+    once at a transition (`Daemon._close_feature_manager`) and never derived, so all three
+    paths that reverse that transition — `resume_feature_order`,
+    INV-FEATURE-FALSE-FAILURE's repair and `Daemon._manager_handoff` — had to remember to
+    undo it, and none of them did. Spec §(c), docs/superpowers/specs/2026-10-07-a-settled-
+    features-live-children-must-have-a-manager-or-a-hold.md
+
+    `idle`, the manager's designed steady state since issue #264: `_manager_handoff` tests
+    for it and `invariants.true_blockers` derives nothing from it but MESSAGE_STUCK_BLOCKER,
+    so a revived manager asks the user for nothing.
+
+    Returns the manager row, or None when there is no manager row at all, when the manager
+    is already open, or when the feature is not `executing` — the callers need to tell
+    those apart.
+    """
+    try:
+        feature = store.get_feature_order(fo_id)
+    except KeyError:
+        return None
+    if feature["status"] != "executing":
+        return None
+    manager = store.manager_work_order(fo_id)
+    if manager is None or manager["status"] in OPEN_STATUSES:
+        return None
+    store.set_status(manager["id"], "idle")
+    store.clear_attention(manager["id"])
+    # The exact mirror of `_close_feature_manager`'s `feature_settled`, so the manager's
+    # timeline reads as a pair.
+    store.add_event(manager["id"], "manager_revived",
+                    {"feature_order": fo_id, "was": manager["status"], "why": why})
+    return store.get_work_order(manager["id"])
+
+
+def lower_settled_feature_holds(store: ProjectStore,
+                                children: list[dict[str, Any]]) -> list[str]:
+    """Take down the hold a child carried while its feature was settled.
+
+    TWO CALLERS, in two modules — `resume_feature_order` below and
+    INV-FEATURE-FALSE-FAILURE's repair — and that is why it is public: both paths reopen a
+    feature, so both owe the children the same clear.
+
+    SETTLED_FEATURE_BLOCKER is derived, so the reopening makes it untrue — and nothing
+    re-derives a flag already stored, so the stale sentence would stand until the child
+    settled. The same rule `_carry_round_onto` states for its own flag: lowered only when
+    `true_blockers` is EMPTY, so another blocker is somebody else's reason and is left
+    exactly as it was, and only while the flag is up, which makes it idempotent.
+    """
+    lowered = []
+    for child in children:
+        fresh = store.get_work_order(child["id"])
+        if not fresh["needs_attention"] or true_blockers(store, fresh):
+            continue
+        store.clear_attention(fresh["id"])
+        lowered.append(fresh["id"])
+    return lowered
+
+
 def resume_feature_order(fo_id: str, fix: str = "",
                          project_name: str | None = None) -> dict[str, Any]:
     """`jarvis fo resume` — put a failed feature order back to work.
@@ -9654,11 +10230,15 @@ def resume_feature_order(fo_id: str, fix: str = "",
     store = ProjectStore(path)
     try:
         children = store.feature_children(fo_id)
-        dead = dead_feature_children(children)
+        dead = dead_feature_children(store, children)
         if dead:
             store.supersede_children(fo_id, [c["id"] for c in dead], note=fix)
         store.set_feature_status(fo_id, "executing")
         store.clear_feature_attention(fo_id)
+        # BEFORE the `--fix` child is filed, so a crash between them leaves a live manager
+        # rather than a child with no addressee.
+        revive_feature_manager(store, fo_id, why="jarvis fo resume")
+        lower_settled_feature_holds(store, children)
         child = None
         if fix.strip():
             title = " ".join(fix.split())[:FIX_TITLE_CHARS]
@@ -9724,7 +10304,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
     worker's next user turn via the normal message-delivery path.
 
     A question is one paragraph that may reference a design artifact section in-text
-    (`from section 3 of design doc "docs/specs/x.md"`). The reference is resolved HERE,
+    (`from section 3 of design doc "docs/superpowers/specs/x.md"`). The reference is resolved HERE,
     at ask time: the section — and only the section — is snapshotted into the question's
     context, so Neo reads exactly the design context the paragraph argues from while the
     recorded question stays a paragraph.
@@ -9738,7 +10318,7 @@ def ask_question(wo_id: str, question: str, project_name: str | None = None) -> 
             f"{QUESTION_MAX_CHARS}. A question to Neo is one paragraph — the decision, "
             f"the options, your recommendation — arguing from a design artifact it "
             f"references in-text, e.g. `from section 3 of design doc "
-            f"\"docs/specs/feature.md\": …`. The referenced section is delivered to "
+            f"\"docs/superpowers/specs/feature.md\": …`. The referenced section is delivered to "
             f"whoever answers, alongside your paragraph; you do not need to paste it."
         )
 
@@ -10527,7 +11107,7 @@ def retract_gate_rule(rule_id: str, reason: str) -> dict[str, Any]:
 
 # -- the self-evolution registry (detectors and remedy rules; see rules.py) --------------
 #
-# docs/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
+# docs/superpowers/specs/2026-09-27-self-evolution.md §3.4. Every one of these returns a
 # PLAIN DICT the CLI and the dashboard both consume verbatim; neither of them derives a
 # number, so the two surfaces cannot disagree about what the registry says.
 #
@@ -10592,9 +11172,10 @@ def rules_list(*, project: str = "", status: str = "",
     list is the detail. `project` is a scope filter — it returns that project's rules and
     the fleet-wide ones — for the reason `CentralStore.list_detectors` gives.
 
-    `enabled` is `None` in this release and that is deliberate: nothing evaluates these
-    rules yet, so there is no engine to be on or off, and `False` would state that one
-    exists and is switched off.
+    `enabled` answers whether anything EVALUATES these rules — `catalog.RulesConfig`,
+    which ships off. ABSENT IS NOT ZERO and off is not empty: a registry nobody is
+    evaluating has a note saying so, because "no rule has ever matched" and "nothing has
+    ever looked" are different facts and only one of them is about the rules.
     """
     central = CentralStore()
     try:
@@ -10612,16 +11193,25 @@ def rules_list(*, project: str = "", status: str = "",
         entries = [_rule_entry(central, d) for d in shown]
     finally:
         central.close()
+    enabled = rules_enabled(project or None)
     if not counts["total"]:
         note = ("no detectors are registered — the registry is empty, which is a "
                 "different thing from a registry whose rules have never matched")
+    elif not enabled:
+        # THE SENTENCE, NOT AN EMPTY COUNT. A registry that is not evaluated has never
+        # been given the chance to match, and rendering that as "0 fires" would read as a
+        # measurement of the rules rather than of the switch above them.
+        note = (f"the evaluation pass is OFF ({counts['total']} rules registered and "
+                f"nothing is evaluating them) — no rule here has been given the chance "
+                f"to match. Turn it on with `jarvis config set <project> rules.enabled "
+                f"true`")
     else:
         note = ("every rule is in dry run: it records what it would have proposed and "
                 "acts on nothing. Only a person arms one")
         if counts["armed"]:
             note = (f"{counts['armed']} armed, the rest in dry run. An armed rule "
                     f"proposes; the gate still decides whether anything runs")
-    return {"counts": counts, "rules": entries, "enabled": None, "note": note}
+    return {"counts": counts, "rules": entries, "enabled": enabled, "note": note}
 
 
 def rules_show(detector_id: str) -> dict[str, Any]:
@@ -10643,6 +11233,10 @@ def rules_show(detector_id: str) -> dict[str, Any]:
                    in central.remedy_rules_for(detector_id, include_retired=True)
                    if r["retired_at"] is not None]
         fires = central.list_rule_fires(detector_id=detector_id, limit=20)
+        # The reader §8's verdict owes (Neo question 974): a recurrence is the record that
+        # THIS rule did not hold, so the place a person judges the rule is the place it
+        # has to be visible. Without it the ledger would be written and never read.
+        recurrences = central.list_recurrences(detector_id=detector_id, limit=20)
     finally:
         central.close()
     return {
@@ -10658,6 +11252,7 @@ def rules_show(detector_id: str) -> dict[str, Any]:
             "pr_url": detector["pr_url"], "seed_version": detector["seed_version"],
         },
         "fires": fires,
+        "recurrences": recurrences,
         "hit_rate": entry["hit_rate"],
         "hit_rate_note": entry["hit_rate_note"],
     }
@@ -10694,6 +11289,204 @@ def rules_retract(rule_id: str, reason: str) -> dict[str, Any]:
     finally:
         central.close()
     return {"rule": rule, "note": note}
+
+
+def rules_config(project: str | None = None) -> Any:
+    """The `rules` settings in force for `project` — or the OS's — or None.
+
+    `validation_config`'s shape exactly, for its reasons: a catalog that has moved or was
+    never registered answers None rather than raising, and None reads as OFF, which is
+    the shipped default anyway. There is no path on which failing to read a config file
+    should start the OS evaluating rules it was not told to evaluate.
+    """
+    try:
+        catalog = resolve_catalog()
+        if project is None:
+            return catalog.os.rules
+        return catalog.project(project).rules
+    except (OpsError, CatalogError, OSError, ValueError):
+        return None
+
+
+def rules_enabled(project: str | None = None) -> bool:
+    """Is the evaluation pass on — for `project`, or fleet-wide? False if unreadable."""
+    cfg = rules_config(project)
+    return bool(cfg is not None and cfg.enabled)
+
+
+def rule_facts(store: ProjectStore, wo: dict[str, Any], *, now: float,
+               sources: frozenset[str] | set[str] | None = None,
+               project: str = "", max_rounds: int | None = None) -> Any:
+    """One work order's `rules.Facts`. THE READER BEHIND EVERY `FactField.source` SLUG.
+
+    `rules.facts` declares the contract and this is the implementation, for the reason
+    the grammar module's docstring gives: `rules` is a LEAF — stdlib, `db`, `catalog` and
+    `remedies` — and every reader named below sits above it (`ops` itself, `holds`,
+    `invariants`, `budget`). Putting the readers here rather than there is what keeps
+    that leaf true at IMPORT time, which is the property `remedies` and `central_store`
+    depend on when they import `rules` inside a function body. `rules.facts` still works
+    and is still the one public contract; it reaches this function through a call-time
+    import, which costs its own importers nothing.
+
+    **`sources` IS THE WHOLE COST MODEL** (spec §5.2.3). It is the union of
+    `rules.sources_used(cond)` over the detectors that will actually be evaluated, and a
+    source not in it is NOT READ — its fields are absent from `values`, which the
+    evaluator treats as a third thing distinct from `None` and `False`. `holds` is the
+    expensive one: `holds.held` walks up to `holds._EVENT_LIMIT` events per order, so a
+    table full of conditions about `status` must never pay for it. `None` means read
+    EVERYTHING, which is what a single-order `jarvis rules dry-run` wants and what no
+    sweep should ever pass.
+
+    **A COLUMN THAT IS NULL OR EMPTY IS ABSENT, NOT `""`.** A condition that matched
+    because a field was missing would fire on exactly the orders nobody recorded anything
+    about, which is the commonest way a rule over-fires.
+
+    Read-only: no model, no network, no subprocess, nothing written.
+    """
+    from . import budget as budget_mod
+    from . import holds as holds_mod
+    from . import invariants as invariants_mod
+    from . import rules as rules_mod
+
+    wanted = None if sources is None else frozenset(sources)
+
+    def need(slug: str) -> bool:
+        return wanted is None or slug in wanted
+
+    wo_id = str(wo["id"])
+    values: dict[str, Any] = {}
+    # READ ONCE PER ORDER AND SHARED. `ops.state_durations` itself reads `holds.held` —
+    # it has to, since docs/superpowers/specs/2026-09-30-time-in-state-counts-a-usage-
+    # limit-hold-as-running.md made the active basis part of every reading — so a
+    # snapshot that named both sources used to walk the same timeline twice.
+    hold_rows: list[Any] | None = None
+
+    def put(name: str, value: Any) -> None:
+        """Record a field, or leave it ABSENT. Empty strings and None are absent; `0`,
+        `False` and `{}` are recorded, because those are answers."""
+        if value is None or value == "":
+            return
+        values[name] = value
+
+    if need("work_order"):
+        put("status", str(wo.get("status") or ""))
+        put("kind", str(wo.get("kind") or ""))
+        # The two flags are recorded as BOOLEANS even when false: a work order always has
+        # an answer to "is it hidden", so absent here would be a lie about the record.
+        values["hidden"] = bool(wo.get("hidden"))
+        values["needs_attention"] = bool(wo.get("needs_attention"))
+        put("attention_reason", str(wo.get("attention_reason") or ""))
+
+    if need("state_durations"):
+        durations = state_durations(store, wo_id=wo_id, now=now)
+        hold_rows = list(durations.holds)
+        if durations.current_status_since is not None:
+            since = durations.current_status_since
+            put("seconds_in_status", max(0.0, now - since))
+            # THE ACTIVE BASIS, spec §6 of docs/superpowers/specs/2026-09-30-time-in-
+            # state-counts-a-usage-limit-hold-as-running.md: the same subtraction
+            # `StateDurations.as_dict` makes, off the holds THIS READING ALREADY CARRIES.
+            # So the field costs no second walk of the timeline and stays inside the
+            # `state_durations` source it is declared under — reading it from
+            # `holds.held` instead would make every condition about time in status pay
+            # for the expensive source.
+            held = sum(h.overlap(since, now, now) for h in durations.holds)
+            put("seconds_in_status_active", max(0.0, now - since - held))
+        if durations.last_activity_ts is not None:
+            put("seconds_since_activity", max(0.0, now - durations.last_activity_ts))
+        if durations.spans:
+            put("lifetime_seconds", max(0.0, now - durations.spans[0].entered))
+        put("last_activity_kind", durations.last_activity_kind)
+
+    if need("holds"):
+        # THE EXPENSIVE ONE. The MERGED open hold is what a condition asks about — the
+        # same object every other surface renders — so `holds.held`'s merge is used
+        # rather than a second reading of the timeline.
+        if hold_rows is None:
+            hold_rows = list(holds_mod.held(store, wo_id, now=now))
+        open_holds = [h for h in hold_rows if h.open]
+        if open_holds:
+            hold = open_holds[-1]
+            put("hold_cause", hold.cause)
+            put("hold_seconds", max(0.0, now - hold.started))
+
+    if need("automerge"):
+        state = automerge_state(store, wo)
+        # A STALE HOLD IS NOT A CLAIM ABOUT NOW — docs/superpowers/specs/2026-09-27-a-
+        # stale-merge-hold-is-not-the-reason-a-pr-is-not-merging.md §2. The event is
+        # immutable and `automerge_state` marks rather than drops it, so contributing a
+        # marked one would let a rule fire on a hold the OS has already said is history.
+        if (state and state.get("kind") == "automerge_held"
+                and not state.get("stale")):
+            put("automerge_code", str(state.get("code") or ""))
+
+    if need("waiting_on"):
+        put("waiting_on", str(waiting_on(store, wo).get("what") or ""))
+
+    if need("validation_round"):
+        latest = store.latest_validation_round(wo_id=wo_id)
+        if latest is not None:
+            round_no = int(latest["round"] or 0)
+            put("round_no", round_no)
+            put("round_outcome", str(latest["outcome"] or ""))
+            put("judged_head_sha", str(latest["head_sha"] or ""))
+            cap = max_rounds
+            if cap is None:
+                cfg = validation_config(project or None)
+                cap = getattr(cfg, "max_rounds", None)
+            # ABSENT rather than a guess when the catalog cannot answer: `rounds_left` is
+            # a subtraction from a configured ceiling, and a ceiling nobody could read is
+            # not a ceiling of zero.
+            if cap is not None:
+                put("rounds_left", max(0, int(cap) - round_no))
+
+    if need("pull_request"):
+        # THE RECORDED COLUMNS, never a live `gh` call: this runs for every open order on
+        # every sweep, and a rule engine that reached the network per order per tick is a
+        # rate limit with extra steps. The poller that already owns that job refreshes
+        # them.
+        put("pr_url", str(wo.get("pr_url") or ""))
+        put("pr_state", str(wo.get("pr_state") or ""))
+
+    if need("event_counts"):
+        values["event_counts"] = store.event_kind_counts(wo_id)
+
+    if need("invariant_events"):
+        # THE ROUTE A DETECTOR TAKES WHEN AN INVARIANT ALREADY DETECTS THE CONDITION —
+        # `Daemon.check_invariants` writes one `invariant` event per violation it
+        # reports, and seed rule 5 keys off that rather than re-deriving the predicate.
+        counts: dict[str, int] = {}
+        for event in store.events_of_kind(wo_id, "invariant"):
+            name = str(db.from_json(event["payload"], {}).get("invariant") or "")
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        values["invariant_events"] = counts
+
+    if need("dependencies"):
+        values["depends_on_count"] = len(store.dependencies(wo))
+        values["dead_dependency_count"] = len(
+            invariants_mod.dead_dependencies(store, wo))
+
+    if need("neo_question"):
+        question = invariants_mod.awaiting_neo(wo_id)
+        if question is not None:
+            put("neo_question_status", str(question.get("status") or ""))
+            values["neo_question_attempts"] = int(question.get("attempts") or 0)
+
+    if need("budget"):
+        # NO BUDGET IS NOT A BUDGET OF ZERO, so a NULL column is absent and a rule asking
+        # `budget_usd lte 0` never matches an order that has no ceiling at all.
+        if wo.get("budget_usd") is not None:
+            values["budget_usd"] = float(wo["budget_usd"])
+        values["spent_usd"] = budget_mod.spent(store, None, wo_id).total_usd
+
+    return rules_mod.Facts(
+        project=project, order_id=wo_id,
+        # THE SUBJECT KIND, not `work_orders.kind`. `rule_fires.order_kind` records which
+        # of `rules.SUBJECTS` this row is about; the row's own `worker`/`planner` kind is
+        # the separate `kind` FACT FIELD above.
+        order_kind=rules_mod.DEFAULT_SUBJECT,
+        values=values, now=now)
 
 
 def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
@@ -10746,17 +11539,17 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
     store = ProjectStore(path)
     try:
         try:
-            facts = rules_mod.facts(store, wo, now=db.now())
-        except NotImplementedError:
-            # `rules.facts` is DECLARED by the grammar section and implemented by the
-            # evaluation-and-firing section, which owns the readers behind every
-            # `FactField.source` slug. Until it lands there is no snapshot, and the
-            # honest answer is to say so: fabricating one, or returning "no match",
-            # would report a verdict nobody computed.
-            out["note"] = (
-                "the fact snapshot is not built in this release — `rules.facts` is "
-                "implemented by the evaluation-and-firing section, so this order was "
-                "not evaluated and nothing was decided")
+            # LAZY HERE TOO, for the sweep's reason: only the sources this one condition
+            # names are read, so a dry run of a rule about `status` does not walk the
+            # order's holds to answer it.
+            facts = rules_mod.facts(store, wo, now=db.now(),
+                                    sources=rules_mod.sources_used(cond))
+        except Exception as e:  # noqa: BLE001
+            # A SNAPSHOT THAT COULD NOT BE BUILT DECIDES NOTHING. `matched` stays None
+            # rather than becoming "no match", which would report a verdict nobody
+            # computed — the same rule the unreadable branch above follows.
+            out["note"] = (f"the fact snapshot for {order_id} could not be built, so "
+                           f"nothing was evaluated and nothing was decided: {e}")
             return out
     finally:
         store.close()
@@ -10768,6 +11561,157 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
                project=project,
                note="a dry run: this wrote nothing and acted on nothing")
     return out
+
+
+# -- the recurrence ledger (spec §8) ----------------------------------------------------
+#
+# A gap the OS ALREADY has a detector for happened again. That is not "a new bug", and
+# filing it afresh loses the one fact that matters — that the OS already tried — so this
+# LINKS and never duplicates. Which half of the rule each verdict blames: see
+# `rules.recurrence_verdict`.
+
+#: The sentence a person reads for each verdict. A CLOSED TEMPLATE keyed on the verdict,
+#: never prose assembled from the row: a sentence stitched together per call could
+#: disagree with the verdict beside it.
+_RECURRENCE_NOTES = {
+    rules.NOT_ARMED: (
+        "a detector for this gap exists but is still in dry_run, so it acted on nothing "
+        "— neither its condition nor its remedy can be blamed, and this recurrence is "
+        "evidence FOR arming it"),
+    rules.MISSED: (
+        "the detector is armed and has no usable fire on this order, so the condition "
+        "did not match what actually happened — the finding is about the CONDITION"),
+    rules.REMEDY_FAILED: (
+        "the detector is armed and did fire on this order, and the gap recurred anyway "
+        "— the finding is about the REMEDY, or about the gate that refused it"),
+    rules.UNREADABLE_RECURRENCE: (
+        "the detector is armed and its newest fire on this order says something could "
+        "not be READ, so nothing was decided — the finding is about what the condition "
+        "reads, and this is NOT evidence for arming"),
+}
+
+
+def _recurrence_tracker_act(detector: dict[str, Any], *, order_id: str, gap_class: str,
+                            verdict: str) -> str:
+    """Reopen or comment on the ORIGINAL issue, and return the `filed_note`. NEVER raises
+    a GitHub error.
+
+    §8's division of labour: the ledger is the OS's own record and the tracker a mirror of
+    it, so every way this can fail — no `gh`, a refusal, a timeout, output that will not
+    parse, no original issue to find — comes back as a SENTENCE for `filed_note` and the
+    recurrence row stands either way. A caller that raised here would lose a finding
+    because a network was down.
+
+    The comment body is built by `rules.recurrence_comment`, which is the redaction
+    boundary: the tracker is PUBLIC and that function takes four fields and has no
+    parameter any private text could arrive through.
+    """
+    from . import bugreport, issues
+
+    body = rules.recurrence_comment(order_id=order_id, gap_class=gap_class,
+                                    verdict=verdict, detector_id=detector["id"])
+    try:
+        url = str(detector["issue_url"] or "")
+        if not url:
+            # Searched by the CAUSE — the detector id and the gap class — never by the
+            # order id: kn-2b03830f, see `issues.recurrence_issues`. The NEWEST hit is
+            # taken because `gh issue list` answers newest first and a later filing about
+            # one cause is the thread people are reading.
+            found = issues.recurrence_issues(detector["id"], gap_class)
+            if not found:
+                return ("no original issue is recorded on the detector and none was "
+                        "found on the tracker, searched by detector id and gap class "
+                        "with `--state all`, so nothing was filed — the recurrence is "
+                        "recorded here only")
+            url = str(found[0]["url"])
+        # Before `--add-label`: `gh` refuses a label the repository does not define, and
+        # the FIRST recurrence on any tracker meets exactly that.
+        issues.ensure_regression_label(bugreport.bug_repo())
+        # `Issue.closed`, not `issues.CLOSED`: that constant is the DESIRED-state
+        # vocabulary of the issue-lifecycle section, while this asks what GitHub says the
+        # issue IS right now.
+        if issues.view(url).closed:
+            issues.reopen(url, body)
+            act = "reopened"
+        else:
+            issues.comment(url, body)
+            act = "commented on"
+        issues.add_label(url, issues.REGRESSION_LABEL)
+        return f"{act} the original issue {url} and labelled it `regression`"
+    except GitHubError as e:
+        # `IssueLifecycleError` and `GhUnavailable` both derive from `GitHubError`, so one
+        # clause covers "gh could not be reached" and "gh ran and refused". `reason` is
+        # the phrase the OS wrote; the exception text carries `gh`'s own words, and
+        # `filed_note` is local and unpublished, so both belong in it.
+        return (f"the tracker was not updated: {e.reason} ({e}). The recurrence is "
+                f"recorded here, and the ledger is the OS's own record — the tracker "
+                f"mirrors it")
+
+
+def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str = "",
+                      note: str = "", detector_id: str = "") -> dict[str, Any]:
+    """An existing rule did not hold. Derive which half, write the ledger row, and link
+    the finding to the ORIGINAL issue rather than filing a second one.
+
+    Returns a PLAIN DICT the CLI and the dashboard consume verbatim, this section's rule
+    throughout, so the two surfaces cannot disagree about what happened.
+
+    ABSENT IS NEVER ZERO here either: with NO detector for `gap_class` this writes
+    nothing, returns `verdict=None` and says the gap is NEW. An invented verdict would
+    claim the OS had tried something it never tried.
+
+    `detector_id` names the detector directly, for a caller that already resolved it;
+    without it `rules.recurrence` picks the one live rule for this gap in this project's
+    scope, with the tie-break documented there.
+    """
+    central = CentralStore()
+    try:
+        detector = (central.get_detector(detector_id) if detector_id else
+                    rules.recurrence(
+                        central.list_detectors(project=project, gap_class=gap_class),
+                        gap_class, project=project))
+        if detector is None:
+            return {"recorded": False, "detector": None, "verdict": None,
+                    "recurrence": None, "filed_note": "",
+                    "verdict_note": (
+                        f"no detector exists for gap class {gap_class!r}, so this is a "
+                        f"NEW gap and not a recurrence — nothing was recorded against a "
+                        f"rule, because there is no rule to blame")}
+        detector = dict(detector)
+
+        # The NEWEST fire this detector has on this order, CLEARED OR NOT. Two reads
+        # because `open_rule_fire` sees only uncleared rows, and a cleared fire is still
+        # evidence that the detector matched: a condition that held and then stopped
+        # holding did not fail to match. The newest rather than any past one for commit
+        # `0c1e3f9`'s reason, which `open_rule_fire` records — a gap that recurred after
+        # being cleared is a new episode, and judging it against an older fire would
+        # answer about the wrong one.
+        candidates = [f for f in (
+            central.open_rule_fire(detector["id"], order_id),
+            *central.list_rule_fires(detector_id=detector["id"], order_id=order_id,
+                                     limit=1)) if f]
+        fire = (max(candidates, key=lambda f: (float(f["ts"]), int(f["id"])))
+                if candidates else None)
+        verdict = rules.recurrence_verdict(detector, fire)
+
+        # Written BEFORE the tracker is touched, so no `gh` failure and no crash between
+        # the two can lose the finding. `filed_note` is filled in afterwards — see
+        # `CentralStore.set_recurrence_filed_note`.
+        row = central.add_recurrence(
+            gap_class=gap_class, detector_id=detector["id"], project=project,
+            order_id=order_id, verdict=verdict, io_id=io_id,
+            original_fix_wo_id=detector["fix_wo_id"],
+            original_issue_url=detector["issue_url"], filed_note="", note=note)
+        filed_note = _recurrence_tracker_act(detector, order_id=order_id,
+                                             gap_class=gap_class, verdict=verdict)
+        row = central.set_recurrence_filed_note(row["id"], filed_note)
+    finally:
+        central.close()
+    # `verdict_note` is the OS's sentence about the verdict; `recurrence["note"]` is the
+    # CALLER's own note, stored on the row. Two audiences, so two names (spec §8).
+    return {"recorded": True, "detector": detector, "verdict": verdict,
+            "recurrence": row, "filed_note": filed_note,
+            "verdict_note": _RECURRENCE_NOTES[verdict]}
 
 
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:
@@ -10876,11 +11820,15 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     ("*.bash_first", "next-dispatch"),
     # Read once per spawn into the worker's settings file, and a running worker's
     # tool list cannot change mid-conversation. Spec §4:
-    # docs/specs/2026-10-02-serena-the-cheap-path.md
+    # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.tool_search", "next-dispatch"),
     # Read once per spawn into the worker's settings file, which is where the hook reads
-    # it. Spec §6: docs/specs/2026-10-02-serena-the-cheap-path.md
+    # it. Spec §6: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md
     ("*.py_nav_hook", "next-dispatch"),
+    # Both read once per spawn into the worker's settings file, which is where the hook
+    # reads them. Spec §5: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md
+    ("*.doc_nav_hook", "next-dispatch"),
+    ("*.doc_read_limit_lines", "next-dispatch"),
     ("*.autocompact_window", "next-dispatch"),
     ("*.append_system_prompt", "next-dispatch"),
     # Read once per spawn, into the settings file that spawn passes to `--settings`
@@ -10893,6 +11841,15 @@ APPLY_RULES: tuple[tuple[str, str], ...] = (
     # was launched with, and nothing re-reads the catalog at it — the hook must not,
     # since it runs on every Bash command.
     ("*.concision.*", "next-dispatch"),
+    # `jarvis cost --fleet` reads the catalog on every invocation, so a change is in
+    # force on the next run — stated rather than left to fall through, even though the
+    # fall-through answer is the same one. Spec §6.2:
+    # docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md
+    ("*.cost.*", "hot"),
+    # Re-read per probe round in the UI process and per tick in the daemon, so a change
+    # is in force without a restart. §6 of
+    # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md
+    ("*.ui_health.*", "hot"),
 )
 
 APPLY_NOTES = {
@@ -11054,11 +12011,12 @@ def _refuse_os_sweep_off(key: str, document: dict[str, Any],
     against the document the write WOULD commit, before `_commit_document`, so nothing
     is written on a refusal.
 
-    The OS project is DERIVED, never hardcoded: `schedule.os_owner`, so a renamed or
-    relocated checkout produces the right sentence with no edit. WITHOUT that function's
-    first-in-catalog fallback, deliberately unlike `Daemon._os_owner`: a project that
-    merely happens to be listed first is not the OS and may not be refused this write.
-    No owner means there is nothing to protect.
+    The OS project is DERIVED, never hardcoded: `schedule.os_project`, so a renamed or
+    relocated checkout produces the right sentence with no edit. BY GIT ORIGIN, and
+    deliberately not `os_owner`'s path containment (issue 956): a project that merely
+    happens to be listed first is not the OS and may not be refused this write, and in
+    production nothing contains the running install at all. No OS project in the catalog
+    means there is nothing to protect.
 
     JUDGED ON THE KEY THE WRITE TOUCHES, and on that key's RESOLVED value afterwards —
     so every spelling is covered (the project's own key, the `os.` block it inherits
@@ -11075,9 +12033,8 @@ def _refuse_os_sweep_off(key: str, document: dict[str, Any],
     projects = [p for p in document.get("projects", [])
                 if isinstance(p, dict) and isinstance(p.get("name"), str)]
     try:
-        owner = schedule.os_owner(
-            ((p["name"], Path(str(p.get("path") or file.parent))) for p in projects),
-            fallback=False)
+        owner = schedule.os_project(
+            (p["name"], Path(str(p.get("path") or file.parent))) for p in projects)
     except (OSError, ValueError):       # an unreadable path is not an authorisation
         return
     if owner is None:
@@ -11835,7 +12792,7 @@ def _partition_calls(
         # calls at all (zero tokens, zero dollars — `observability.metered`), so counting
         # one as an OS call would report two calls where Jarvis made one. Money spent
         # LOOKING at an order is reported by `bill.py`, in its own class
-        # (docs/specs/2026-09-24-order-observability.md §10).
+        # (docs/superpowers/specs/2026-09-24-order-observability.md §10).
         if agent_usage.is_observability(kind):
             continue
         target = worker_side if agent_usage.is_subprocess(kind) else os_side
@@ -11944,7 +12901,9 @@ def _call_spend(groups: Sequence[dict[str, Any]], prefix: str) -> dict[str, Any]
 
 def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
               turn_rows: Sequence[dict[str, Any]] = (),
-              os_groups: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+              os_groups: Sequence[dict[str, Any]] = (),
+              *, since: float | None = None,
+              until: float | None = None) -> dict[str, Any]:
     """One work order's spend, flattened for a table.
 
     The transcript figures stay the body of the row (they are the only source with a
@@ -11965,7 +12924,7 @@ def _unit_row(name: str, wo: dict[str, Any], index: dict[str, list[Path]],
     from .bill import _cold_prefix_floor
 
     session = usage_mod.read_session(wo.get("session_id") or "", _cold_prefix_floor(),
-                                     index=index)
+                                     index=index, since=since, until=until)
     total = session.total
     provenance, recorded, settled, rec_totals = _turn_summary(list(turn_rows))
     os_groups_only, subproc_groups = _partition_calls(list(os_groups))
@@ -12035,8 +12994,74 @@ def bill(target: str, project: str | None = None, *,
     return build(target, project, live=live)
 
 
+def fleet_cost(**kwargs: Any) -> dict[str, Any]:
+    """What a TYPICAL order costs, over a window — see `jarvis.fleetcost`.
+
+    `cost_report` says which orders cost the MOST and has no place to put a population
+    statistic; this says what normal looks like, so "is this order an outlier" and "did
+    last week get dearer" become answerable. One thin wrapper rather than a second
+    import path, exactly like `bill` above, so the CLI and the dashboard reach it the way
+    they reach everything else in the OS.
+
+    Imported lazily because `fleetcost` must never touch `ProjectStore` — it opens every
+    database `mode=ro` — and keeping it out of this module's import graph is what keeps
+    that true.
+    """
+    from . import fleetcost
+
+    return fleetcost.report(**kwargs)
+
+
+def cost_window(**kwargs: Any) -> dict[str, Any]:
+    """Which window a cost surface is reporting over — see `fleetcost.resolve_window`.
+
+    Resolved ONCE per surface and handed to both payload builders, so the two halves of
+    a page cannot disagree. Lazy import for `fleet_cost`'s reason: §6 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    project = kwargs.pop("project", None)
+    kwargs.setdefault("cfg", fleetcost.cost_config(project))
+    return fleetcost.resolve_window(**kwargs)
+
+
+def cost_meter(**kwargs: Any) -> dict[str, Any]:
+    """The account's usage meter reconciled against measured spend — see
+    `usage_meter.reconciliation`.
+
+    A THIRD payload beside `cost_report` and `fleet_cost`, built from the same resolved
+    window: `fleetcost.report` is per-ORDER distribution and must not grow an
+    account-level, network-sourced time series (§10). Lazy import for `fleet_cost`'s
+    reason.
+    """
+    from . import usage_meter
+
+    return usage_meter.reconciliation(**kwargs)
+
+
+def meter_samples(**kwargs: Any) -> list[dict[str, Any]]:
+    """The raw usage-meter series for one span — see `usage_meter.sample_rows`."""
+    from . import usage_meter
+
+    return usage_meter.sample_rows(**kwargs)
+
+
+def cost_zone(tz: str | None = None, project: str | None = None) -> str:
+    """Which zone a cost surface DISPLAYS in — see `fleetcost.resolve_zone`.
+
+    Its own wrapper because the page needs the zone before it can parse the custom
+    form's naive datetimes: §11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+    """
+    from . import fleetcost
+
+    return fleetcost.resolve_zone(tz, fleetcost.cost_config(project))
+
+
 def cost_report(project: str | None = None, target: str | None = None,
-                limit: int = 50, include_hidden: bool = True) -> dict[str, Any]:
+                limit: int = 50, include_hidden: bool = True,
+                window: dict[str, Any] | None = None) -> dict[str, Any]:
     """What the fleet's work has cost in tokens, read back from Claude Code's transcripts.
 
     `target` is a work-order or feature-order id for a single unit — a feature order
@@ -12067,6 +13092,12 @@ def cost_report(project: str | None = None, target: str | None = None,
     work order. The marker is unconditional on purpose: a heuristic that tried to guess
     whether any escaped would be blind in exactly the cases it was meant to catch, and a
     flat statement is always true and costs one line (ruled on wo-76e021aa, issue #103).
+
+    `window` is a dict `fleetcost.resolve_window` returned, and this ONLY FILTERS with
+    it — the boundary arithmetic is `fleetcost`'s (§5 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). `None` keeps the
+    whole-history behaviour, and a window is NEVER applied to `target=`: one order's
+    bill is the whole order, and truncating it would make the bill stop reconciling.
     """
     from . import usage as usage_mod
 
@@ -12077,7 +13108,9 @@ def cost_report(project: str | None = None, target: str | None = None,
     if target:
         return _cost_for_target(target, project, index)
 
-    os_groups = _os_groups(project)
+    since = window["since"] if window else None
+    until = window["until"] if window else None
+    os_groups = _os_groups(project, since=since, until=until)
     scope = {project: paths[project]} if project else paths
     units: list[dict[str, Any]] = []
     for name, path in sorted(scope.items()):
@@ -12085,20 +13118,38 @@ def cost_report(project: str | None = None, target: str | None = None,
             continue
         store = ProjectStore(path)
         try:
-            for wo in store.list_work_orders(limit=limit, include_hidden=include_hidden):
+            rows = store.list_work_orders(
+                limit=limit, include_hidden=include_hidden,
+                active_between=(since, until) if window else None)
+            # An order whose only in-window activity is an `agent_call` — Neo answered
+            # it between turns — has no in-window turn and is added by id (§5a).
+            seen = {wo["id"] for wo in rows}
+            for wo_id in _os_only_ids(os_groups, name, seen) if window else ():
+                try:
+                    extra = store.get_work_order(wo_id)
+                except KeyError:
+                    continue            # a legacy row naming no project: not this one's
+                if include_hidden or not extra["hidden"]:
+                    rows.append(extra)
+            for wo in rows:
                 units.append(_unit_row(name, wo, index, _turn_rows(store, wo["id"]),
-                                       os_groups.get(wo["id"], ())))
+                                       os_groups.get(wo["id"], ()),
+                                       since=since, until=until))
         finally:
             store.close()
     # Dearest first, counting what Jarvis spent on the order as part of what it cost —
     # otherwise a work order that asked Neo twenty questions sorts as though it were cheap.
     units.sort(key=lambda u: u["total_cost_usd"], reverse=True)
-    return {"scope": project or "fleet", "units": units,
+    # ADDITIVE, and the version is not bumped: the existing `measured`/`unmeasured`/
+    # `totals` keys describe a different POPULATION when a window is given, and this is
+    # how a consumer tells (§7).
+    return {"scope": project or "fleet", "units": units, "window": window,
             **_rollup(units), "os_unattributed": _os_unattributed(os_groups),
             "floor": True, "floor_reason": COST_FLOOR_NOTE}
 
 
-def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
+def _os_groups(project: str | None = None, *, since: float | None = None,
+               until: float | None = None) -> dict[str, list[dict[str, Any]]]:
     """Every work order's OS-side call groups, in one query. See `_os_spend`.
 
     One read of `os.db` for the whole fleet rather than one per work order: this report
@@ -12107,11 +13158,27 @@ def _os_groups(project: str | None = None) -> dict[str, list[dict[str, Any]]]:
     central = CentralStore()
     try:
         groups: dict[str, list[dict[str, Any]]] = {}
-        for row in central.agent_call_totals(project):
+        for row in central.agent_call_totals(project, since=since, until=until):
             groups.setdefault(row["wo_id"] or "", []).append(row)
         return groups
     finally:
         central.close()
+
+
+def _os_only_ids(groups: dict[str, list[dict[str, Any]]], project: str,
+                 seen: set[str]) -> list[str]:
+    """Ids whose only in-window activity was an OS call, NARROWED TO ONE PROJECT.
+
+    `_os_groups` is read fleet-wide and `ProjectStore.get_work_order` raises on an id
+    its database does not hold, so the `agent_calls.project` column is what keeps a
+    fleet-wide report from asking proj_a for proj_b's order (§5a of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). A row that names NO
+    project is a candidate everywhere and is placed by the guarded lookup instead.
+    """
+    return sorted(
+        wo_id for wo_id, rows in groups.items()
+        if wo_id and wo_id not in seen
+        and any((r.get("project") or "") in ("", project) for r in rows))
 
 
 def _os_unattributed(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -12173,6 +13240,9 @@ def _rollup(units: list[dict[str, Any]]) -> dict[str, Any]:
             "subagent_cost_usd": round(sum(u["subagent_cost_usd"] for u in measured), 2),
             "output": sum(u["output"] for u in measured),
             "billed_input": sum(u["billed_input"] for u in measured),
+            # Over ALL units: what a window could not place is disclosed whether or not
+            # the order it belongs to was measurable (§5c).
+            "undated_messages": sum(u.get("undated_messages") or 0 for u in units),
             **_write_ttl(measured, units),
         },
     }
@@ -12273,6 +13343,25 @@ def inspect_config(project: str | None = None) -> Any:
                 else catalog.project(project).inspect)
     except (OpsError, CatalogError, OSError, ValueError):
         return InspectConfig()
+
+
+def ui_health_config(project: str | None = None) -> Any:
+    """The dashboard's liveness settings in force for `project` — or the OS's — or
+    defaults.
+
+    `ops.inspect_config`'s shape and its reasoning, falling back to `UiHealthConfig()`
+    rather than to None: every default here is a measured threshold, and having none
+    would mean having no probe. §6 of
+    docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+    """
+    from .catalog import UiHealthConfig
+
+    try:
+        catalog = resolve_catalog()
+        return (catalog.os.ui_health if project is None
+                else catalog.project(project).ui_health)
+    except (OpsError, CatalogError, OSError, ValueError):
+        return UiHealthConfig()
 
 
 def navigation_config(project: str | None = None) -> Any:
@@ -12441,6 +13530,157 @@ def navigation_report(target: str | None = None, project: str | None = None, *,
     payload = volume.as_dict()
     payload["scope"] = scope
     return payload
+
+
+def _spec_scope(project: str | None) -> tuple[str, Path]:
+    """Which project's tree `jarvis spec` reads, and never more than one — §4.2.
+
+    ONE project at a time, resolved through the registry, so an unknown name exits
+    naming it and scans nothing; a comma-separated `a,b` is simply such a name (Neo
+    ruling, q1372). A cwd no project owns is an error naming the fix and NEVER a silent
+    fall back to the cwd: a scan rooted wherever the shell happened to be is a different
+    answer from the one the caller asked for.
+    """
+    paths = registered_project_paths()
+    if project:
+        if project not in paths:
+            known = ", ".join(sorted(paths)) or "no project is registered"
+            raise OpsError(
+                f"no registered project named {project!r} — `jarvis spec` scans one "
+                f"project at a time, never a list. Registered: {known}"
+            )
+        return project, paths[project]
+    cwd = os.getcwd()
+    name = _project_for_cwd(cwd, paths)
+    if not name:
+        raise OpsError(
+            f"no registered project owns {cwd} — pass --project <name> to say which "
+            f"tree to read"
+        )
+    return name, paths[name]
+
+
+def _spec_file(root: Path, path: str) -> tuple[Path, str]:
+    """A document inside `root`, or an OpsError naming the root it refused to leave.
+
+    BOTH SIDES RESOLVED before the containment test (§4.2, revised): a string-prefix or
+    `..`-counting test is passed by a symlink inside the tree whose target is outside it,
+    which is the whole shape of the bug.
+
+    A RELATIVE PATH IS RELATIVE TO THE CWD, as the shell says and never to the root:
+    every worker runs in a git worktree under the registered root, so a root-relative
+    base silently hands it MAIN's copy of the file it is editing on its branch — a
+    different document under the same name, the failure this verb exists to prevent.
+    """
+    candidate = Path(path)
+    target = candidate if candidate.is_absolute() else Path(os.getcwd()) / candidate
+    resolved = target.resolve()
+    base = root.resolve()
+    if not resolved.is_relative_to(base):
+        raise OpsError(
+            f"{path!r} resolves to {resolved}, outside {base} — `jarvis spec` refuses to "
+            f"leave the project root"
+        )
+    if not resolved.is_file():
+        raise OpsError(f"no such file in {base}: {path}")
+    return resolved, resolved.relative_to(base).as_posix()
+
+
+def _spec_callable_path(resolved: Path) -> str:
+    """A path string that opens `resolved` FROM THE CALLER'S CWD, for the printed command.
+
+    `_spec_file` reads a relative path from the cwd, so the ROOT-RELATIVE string the
+    payload displays opens a different file — or none at all — from any cwd but the root,
+    and §4.2's "exact command that shows it" is the whole point of the payload. Relative
+    while it stays under the cwd, absolute the moment it would need a `..` component: a
+    worker runs in a git worktree, where a `.jarvis/features/…` hit does not exist and a
+    `docs/…` hit would silently open the worktree's own copy of the document.
+    """
+    rel = os.path.relpath(resolved, os.getcwd())
+    return str(resolved) if ".." in Path(rel).parts else rel
+
+
+def _spec_command(path: str, ref: str, project: str | None = None) -> str:
+    """The exact command that shows one row — the way `jarvis search` prints one per hit.
+
+    §4.2: that is what makes the output navigable rather than a dump with extra steps.
+    A match above the first heading has no section ref, so the next step is the toc.
+    `path` must be callable from the cwd (`_spec_callable_path`); and when the caller
+    NAMED a project the command names it too, because without `--project` it re-resolves
+    the scope from the cwd and refuses wherever no registered project owns it.
+    """
+    import shlex
+
+    scope = f" --project {shlex.quote(project)}" if project is not None else ""
+    return f"jarvis spec section{scope} {shlex.quote(path)} {shlex.quote(ref)}" if ref \
+        else f"jarvis spec toc{scope} {shlex.quote(path)}"
+
+
+def spec_toc(path: str, project: str | None = None) -> dict[str, Any]:
+    """What is in this document and how big each part is — `jarvis spec toc` (§4.2).
+
+    `tokens_estimate` carries the word estimate in the key, because §4.1's number is
+    chars // 4: an unlabelled wrong number is worse than a labelled approximate one.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    callable_path = _spec_callable_path(resolved)
+    rows = []
+    for s in spec_index.toc(text):
+        ref = s.number or s.name
+        rows.append({"number": s.number, "name": s.name, "level": s.level,
+                     "line": s.line, "tokens_estimate": s.tokens, "ref": ref,
+                     "command": _spec_command(callable_path, ref, project)})
+    return {"project": name, "root": str(root), "path": rel, "sections": rows,
+            "tokens_estimate": len(text) // 4}
+
+
+def spec_section(path: str, which: str, project: str | None = None) -> dict[str, Any]:
+    """One section of one document — `jarvis spec section` (§4.2).
+
+    A `which` that resolves to nothing names the headings that DO exist, the courtesy
+    `feature_spec` already gives: naming them is the difference between one more call and
+    reading the whole file to find the ref.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    resolved, rel = _spec_file(root, path)
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    content = spec_index.section(text, which)
+    if content is None:
+        names = [s.name for s in spec_index.toc(text)]
+        headings = ", ".join(names[:12]) + ("…" if len(names) > 12 else "")
+        raise OpsError(
+            f"{which!r} matches no section of {rel}. It carries: "
+            f"{headings or 'no headings at all'}"
+        )
+    return {"project": name, "root": str(root), "path": rel, "which": which,
+            "content": content, "tokens_estimate": len(content) // 4,
+            "command": _spec_command(_spec_callable_path(resolved), which, project)}
+
+
+def spec_search(words: str, project: str | None = None,
+                limit: int = 40) -> dict[str, Any]:
+    """Which SECTIONS of one project's documents match — `jarvis spec search` (§4.2).
+
+    One project's tree and never a union: a scan whose cost grows with the fleet would be
+    a different feature, and the caller who wants two projects runs the command twice.
+    """
+    from . import spec_index
+
+    name, root = _spec_scope(project)
+    hits = spec_index.search(root, words, limit=limit)
+    # `h.path` is root-relative for DISPLAY; the command needs one callable from the cwd.
+    base = root.resolve()
+    rows = [{"path": h.path, "section": h.section, "line": h.line, "context": h.context,
+             "command": _spec_command(_spec_callable_path((base / h.path).resolve()),
+                                      h.section, project)} for h in hits]
+    return {"project": name, "root": str(root), "words": words, "limit": limit,
+            "count": len(rows), "truncated": len(rows) >= limit, "hits": rows}
 
 
 def cold_prefix_floor(project: str | None = None) -> int | None:
@@ -12759,7 +13999,7 @@ def context_report(wo_id: str, project: str | None = None, *,
                    turn: int | None = None) -> dict[str, Any]:
     """What Jarvis put in each of a work order's context windows, and the delta.
 
-    §5 of docs/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
+    §5 of docs/superpowers/specs/2026-09-24-order-observability.md. ALL the arithmetic lives here and
     the renderers compute nothing: the residual subtraction, the per-turn delta and the
     sentence naming a prefix break are keys of this payload.
 
@@ -13898,7 +15138,7 @@ def _local_day(ts: float) -> str:
 
 
 #: What `by_kind` cannot say, carried beside it rather than left for a reader to assume —
-#: §"What this does NOT do" of docs/specs/2026-10-01-neo-observability.md.
+#: §"What this does NOT do" of docs/superpowers/specs/2026-10-01-neo-observability.md.
 NEO_ASSUMPTION_KIND_NOTE = (
     "`assumption` covers BOTH auto-review passes: which pass filed one is only on the "
     "project store's `autoreview_asked` event, and splitting on it means opening every "
@@ -13967,7 +15207,7 @@ def _percentile(sorted_values: list[int], fraction: float) -> int | None:
 def neo_stats_report(project: str | None = None, days: int | None = None,
                      limit: int = 20) -> dict[str, Any]:
     """Neo's volume, outcomes, escalation causes, spend and latency — spec §4,
-    docs/specs/2026-10-01-neo-observability.md.
+    docs/superpowers/specs/2026-10-01-neo-observability.md.
 
     `knowledge_usage_report`'s shape above: `project` + `days` in, one plain dict out, no
     rendering — the CLI and the dashboard render the same dict, so neither can show a
@@ -14197,13 +15437,25 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         # reader can (issue #471, Neo question 469). Added for DISPLAY only, and it
         # never reaches `cap`.
         live = budget.in_flight(store, wo_id)
-        parent_pool = None
-        if wo.get("parent_id"):
-            try:
-                parent_pool = budget.pool(store, central,
-                                          store.get_feature_order(wo["parent_id"]))
-            except KeyError:
-                parent_pool = None
+        parent = _parent_of(store, wo)
+        parent_pool = budget.pool(store, central, parent) if parent else None
+        # WHAT THE FAMILY IS CALLED, for the surfaces that render these numbers.
+        # `Ceiling.source == 'feature'` is the allocator's word for "the family's cap"
+        # and is NOT a claim that the parent is a feature order, so a card reading it
+        # raw told an investigation's child about "its feature's slice". Same
+        # `family_prose` table as the note, so card and note agree.
+        family = family_prose(parent["kind"])[0] if parent else None
+        # THE SAME SENTENCE THE SET PATH RETURNS (§1 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): four
+        # numbers the reader has to assemble themselves is what made a raise look
+        # accepted and inert. Only when the FAMILY's slice is what binds — an order
+        # stopped by its own number needs no explanation beyond the number. Through
+        # `_feature_unreserved`, the set path's own read, so the two strings are one
+        # string and not two that agree today.
+        note = ""
+        if cap is not None and cap.source == "feature" and cap.exhausted:
+            note = _still_capped_note(cap, spend.total_usd, parent,
+                                      _feature_unreserved(store, central, wo))
     finally:
         central.close()
         store.close()
@@ -14224,6 +15476,8 @@ def work_order_budget(wo_id: str, project_name: str | None = None) -> dict[str, 
         "remaining_usd": cap.remaining_usd if cap else None,
         "live_remaining_usd": (cap.cap_usd - spend.total_usd - live) if cap else None,
         "feature_unreserved_usd": parent_pool.unreserved_usd if parent_pool else None,
+        "family": family,
+        "note": note,
     }
 
 
@@ -14273,12 +15527,9 @@ def set_work_order_budget(wo_id: str, amount: float | None,
         spend = budget.spent(store, central, wo_id)
         if fresh["status"] == budget.EXHAUSTED:
             if cap is not None and cap.exhausted:
-                note = (f"still over its ceiling — {budget.format_usd(spend.total_usd)} "
-                        f"spent against {budget.format_usd(cap.cap_usd)}")
-                if cap.source == "feature":
-                    note += (" (its feature's slice, and the feature has "
-                             f"{budget.format_usd(_feature_unreserved(store, central, fresh))}"
-                             " unreserved — raise the feature with `jarvis fo budget`)")
+                note = _still_capped_note(
+                    cap, spend.total_usd, _parent_of(store, fresh),
+                    _feature_unreserved(store, central, fresh))
             else:
                 resumed, note = _resume_after_budget(store, name, fresh)
     finally:
@@ -14287,6 +15538,45 @@ def set_work_order_budget(wo_id: str, amount: float | None,
     return {"project": name, "wo_id": wo_id, "title": wo["title"],
             "budget_usd": amount, "previous_usd": wo.get("budget_usd"),
             "spent_usd": spend.total_usd, "resumed": resumed, "note": note}
+
+
+def _still_capped_note(cap: budget.Ceiling, spent_usd: float,
+                       parent: dict[str, Any] | None,
+                       unreserved_usd: float) -> str:
+    """Why a raised budget changed nothing — ONE WORDING, for the set path and the show
+    path.
+
+    §1 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md. The
+    reporter had `budget_usd=10`, `cap_usd=2.0036`, `cap_source='feature'` and
+    `feature_unreserved_usd=0.0` and could not assemble them. Two wordings of this is how
+    a user reading the dashboard and a user reading the CLI come to believe different
+    things, so `work_order_budget` and `set_work_order_budget` both say it from here.
+
+    Here and not in `budget.py`: the sentence names CLI COMMANDS, and the allocator knows
+    nothing about surfaces.
+    """
+    spent, cap_usd = budget.format_usd(spent_usd), budget.format_usd(cap.cap_usd)
+    if cap.source != "feature":
+        return f"still over its ceiling — {spent} spent against {cap_usd}"
+    family, verb = family_prose((parent or {}).get("kind"))
+    # `format_money`, not `format_usd`: the remainder being NOTHING is the entire
+    # condition for this sentence, and the dash would read as "unknown". The parent's
+    # budget keeps `format_usd`: a family cap always has one.
+    return (f"still over its ceiling: {spent} spent against {cap_usd}, which is its "
+            f"{family}'s slice. The {family} has "
+            f"{budget.format_money(unreserved_usd)} unreserved of "
+            f"its {budget.format_usd((parent or {}).get('budget_usd'))} budget, so "
+            f"raise the {family} with `{verb}`.")
+
+
+def _parent_of(store: ProjectStore, wo: dict[str, Any]) -> dict[str, Any] | None:
+    """The feature-order row this work order belongs to, or None."""
+    if not wo.get("parent_id"):
+        return None
+    try:
+        return store.get_feature_order(wo["parent_id"])
+    except KeyError:
+        return None
 
 
 def _feature_unreserved(store: ProjectStore, central: CentralStore,
@@ -14389,7 +15679,13 @@ def set_feature_budget(fo_id: str, amount: float | None,
     try:
         store.update_feature_order(fo_id, budget_usd=amount)
         p = budget.pool(store, central, store.get_feature_order(fo_id))
-        stuck = [c["id"] for c in store.feature_children(fo_id)
+        # `budget.family`, NOT `store.feature_children`: the budget is enforced over the
+        # family, and the worker children are a strict subset of it that an improvement
+        # order's analyst and an investigation's investigator are never in (§3 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md, Neo
+        # question 1198). Reported off the enforced set, this list can never be empty
+        # where a child is in fact parked.
+        stuck = [c["id"] for c in budget.family(store, store.get_feature_order(fo_id))
                  if c["status"] == budget.EXHAUSTED]
     finally:
         central.close()

@@ -363,7 +363,7 @@ def test_a_plan_at_the_cap_goes_to_the_user_even_when_neo_releases_it(planning, 
     assert "approve" in fo["attention_reason"]  # Neo's reading, attached
     assert store.feature_children(fo["id"]) == []
     # WHO decided, on the row `jarvis neo stats` groups by: the cap did, not Neo —
-    # docs/specs/2026-10-01-neo-observability.md §1.
+    # docs/superpowers/specs/2026-10-01-neo-observability.md §1.
     assert question(fo["plan_question_id"])["escalation_cause"] == "scope-over-cap"
 
 
@@ -970,14 +970,14 @@ def test_a_spec_with_no_committed_copy_is_refused_and_names_the_commit(planning,
     """5. §11: the refusal is the ruling applied at its source, with the fix named."""
     _, fo = planning
     doc = a_plan(child("reader"))
-    doc["design_doc"] = "docs/specs/uncommitted.md"
+    doc["design_doc"] = "docs/superpowers/specs/uncommitted.md"
     (project / doc["design_doc"]).write_text(FIXTURE_DESIGN_DOC_BODY)
 
     with pytest.raises(ops.OpsError) as e:
         ops.submit_plan(fo["id"], doc)
 
     assert "no COMMITTED copy" in str(e.value)
-    assert "git add docs/specs/uncommitted.md && git commit" in str(e.value)
+    assert "git add docs/superpowers/specs/uncommitted.md && git commit" in str(e.value)
     assert store.get_feature_order(fo["id"])["status"] == "planning"
 
 
@@ -1218,6 +1218,24 @@ def test_wo_show_carries_the_spec_link_for_a_planner(planning, store, capsys):
     human = capsys.readouterr().out
     assert f"jarvis fo spec {fo['id']}" in human
     assert "http" not in human.split("spec")[-1]
+
+
+def test_a_failed_flagged_feature_order_still_lists(started, store):
+    """Obligation 6 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
+    `failed` is SETTLED and it is also the status a feature order raises its flag in —
+    `settle_features` writes both in one call — so an open-only listing drops the flag on
+    the floor at the exact moment it means the most."""
+    fo = ops.create_feature_order("proj_a", "CSV export", description=ASK)
+    quiet = ops.create_feature_order("proj_a", "another ask", description=ASK)
+    store.set_feature_status(fo["id"], "failed")
+    store.flag_feature_attention(fo["id"], "wo-1 failed")
+    store.set_feature_status(quiet["id"], "completed")
+
+    listed = [r["id"] for r in ops.list_feature_orders("proj_a")]
+    assert fo["id"] in listed
+    assert quiet["id"] not in listed
+    assert quiet["id"] in [r["id"] for r in
+                           ops.list_feature_orders("proj_a", include_settled=True)]
 
 
 def test_the_github_link_is_omitted_rather_than_guessed(project):

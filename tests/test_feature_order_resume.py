@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis import invariants, ops
+from jarvis import bus, invariants, ops
 from jarvis.catalog import load_catalog
+from jarvis.central_store import CentralStore
 from jarvis.daemon import Daemon
 from jarvis.project_store import SUPERSEDED_CHILDREN_KEY, ProjectStore
 from jarvis.testing import FIXTURE_DESIGN_DOC, fixture_spec_section
@@ -247,6 +248,125 @@ def test_the_record_lives_where_a_feature_with_no_manager_can_hold_it(started, s
 
     assert not ops.feature_events_of_kind(store, fo["id"], "child_superseded")
     assert [s["wo_id"] for s in store.superseded_children(fo["id"])] == [kids[0]["id"]]
+
+
+# -- the manager the reopening has to revive ---------------------------------------------
+#
+# docs/superpowers/specs/2026-10-07-a-settled-features-live-children-must-have-a-manager-or
+# -a-hold.md §(c). Manager liveness used to be WRITTEN ONCE at a transition
+# (`_close_feature_manager`) and never derived, so every path that reversed that transition
+# had to remember to undo it — and neither this command nor INV-FEATURE-FALSE-FAILURE did.
+# fo-ac00376e sat in `executing` for 5.4 days with a `completed` manager and no signal.
+
+
+def a_failed_feature_with_a_closed_manager(daemon, store,
+                                           *keys: str) -> tuple[dict, list[dict], dict]:
+    """The live shape of fo-ac00376e: failed, reopened by hand later, manager `completed`.
+
+    The manager is created directly because this file's catalog runs with
+    `os.validation.enabled` off, and closed through `_close_feature_manager` — the one
+    writer — rather than with a `set_status`, so what is reversed below is the real
+    transition and not a staged imitation of it.
+    """
+    fo, kids = a_failed_feature(daemon, store, *keys)
+    manager = store.create_manager_order(fo["id"])
+    store.set_status(manager["id"], "idle")
+    daemon._close_feature_manager(store, fo["id"])
+    assert store.manager_work_order(fo["id"])["status"] == "completed"
+    return fo, kids, manager
+
+
+def a_round(store, fo_id: str) -> None:
+    """One judged round on the feature, so there is feedback with somewhere to land."""
+    opened = store.open_validation_round(fo_id=fo_id, fingerprint="aaaa1111",
+                                         summary="the exporter", evidence="pytest -q")
+    store.close_validation_round(opened["id"], "rejected", "no test covers the branch")
+
+
+def assert_manager_is_back(store, central, fo_id: str) -> None:
+    """The four assertions both reopening paths owe, and they are one function because
+    the two must not drift: a feature reopened by the invariant is as headless as one
+    reopened by the command."""
+    manager = store.manager_work_order(fo_id)
+    assert manager["status"] == "idle"
+    assert not manager["needs_attention"]
+    assert [e["kind"] for e in store.list_events(manager["id"])
+            if e["kind"] == "manager_revived"], "the mirror of `feature_settled`"
+    last = store.latest_validation_round(fo_id=fo_id)
+    env_id = bus.post(store, subject=bus.Subject(fo_id=fo_id), from_role="reviewer",
+                      to_role="manager",
+                      payload=bus.ReviewFeedback(round=int(last["round"]),
+                                                 outcome="rejected",
+                                                 reason="no test covers the branch"))
+    envelope = [e for e in store.envelopes() if e["id"] == env_id][0]
+    assert bus.deliver(store, central, envelope) == "delivered"
+
+
+def test_fo_resume_revives_the_manager_it_needs(started, store, jarvis_home):
+    """`jarvis fo resume` put the feature back to work and left it with no addressee for
+    the `manager` role, so the next round's feedback went nowhere."""
+    fo, _kids, _manager = a_failed_feature_with_a_closed_manager(started, store,
+                                                                 "one", "two")
+    a_round(store, fo["id"])
+
+    ops.resume_feature_order(fo["id"], fix="redo the exporter")
+
+    central = CentralStore()
+    try:
+        assert_manager_is_back(store, central, fo["id"])
+    finally:
+        central.close()
+    assert not [v for v in invariants.check_project(store)
+                if v.invariant == "INV-MANAGER-SLOTS"]
+
+
+def test_the_invariants_own_repair_revives_it_too(started, store, jarvis_home):
+    """The same four assertions with NO `jarvis fo resume` anywhere: driven through a
+    doctor pass, because INV-FEATURE-FALSE-FAILURE reopens a feature on its own the moment
+    a dead child recovers, and it reopened it just as headless."""
+    fo, kids, _manager = a_failed_feature_with_a_closed_manager(started, store,
+                                                                "one", "two")
+    a_round(store, fo["id"])
+    store.set_status(kids[0]["id"], "completed")  # a retry, a `wo done`, a late merge
+
+    found = invariants.check_project(store)
+
+    assert [v for v in found if v.invariant == "INV-FEATURE-FALSE-FAILURE"]
+    assert "manager revived" in [v.repair for v in found
+                                 if v.invariant == "INV-FEATURE-FALSE-FAILURE"][0]
+    central = CentralStore()
+    try:
+        assert_manager_is_back(store, central, fo["id"])
+    finally:
+        central.close()
+    assert not [v for v in found if v.invariant == "INV-MANAGER-SLOTS"]
+
+
+def test_a_feature_with_no_manager_row_is_resumed_exactly_as_before(started, store):
+    """The control, and it is every feature planned while validation was off — including
+    the one that motivated `fo resume`. `revive_feature_manager` returns None and nothing
+    else changes."""
+    fo, _kids = a_failed_feature(started, store, "one", "two")
+    assert store.manager_work_order(fo["id"]) is None
+
+    out = ops.resume_feature_order(fo["id"], fix="redo it")
+
+    assert out["status"] == "executing"
+    assert store.manager_work_order(fo["id"]) is None
+
+
+def test_a_live_manager_is_not_touched(started, store):
+    """The other control: `idle` is in OPEN_STATUSES, so there is nothing to revive and
+    no second `manager_revived` event to confuse its timeline with."""
+    fo, _kids = a_failed_feature(started, store, "one", "two")
+    manager = store.create_manager_order(fo["id"])
+    store.set_status(manager["id"], "idle")
+
+    ops.resume_feature_order(fo["id"])
+
+    assert store.manager_work_order(fo["id"])["status"] == "idle"
+    assert not [e for e in store.list_events(manager["id"])
+                if e["kind"] == "manager_revived"]
 
 
 # -- the surfaces ------------------------------------------------------------------------

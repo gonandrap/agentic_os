@@ -1,7 +1,7 @@
 """`worker.tool_search`: the env Jarvis writes to decide whether the symbol tools are
 in a worker's tool list at all.
 
-Spec: docs/specs/2026-10-02-serena-the-cheap-path.md §4.
+Spec: docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §4.
 
 Claude Code defers most MCP tools behind a `ToolSearch` call rather than listing them
 with full schemas — measured at 45 tools plus `ToolSearch` by default against 92 tools
@@ -52,15 +52,20 @@ def test_cli_writes_the_key_at_all(project, jarvis_home):
 
 
 def test_the_project_default_is_the_shipped_state(project, jarvis_home):
-    """This work order does NOT flip the fleet default (§7 owns the flip), so the default
-    must leave behaviour unchanged: `cli`, writing no key."""
+    """§7's flip, measured: `on` — deferral PINNED, writing `"true"`.
+
+    Not `cli`: the probe measured the first navigation call as a symbol call 7/7 with the
+    Serena tools deferred against 1/10 with them present, so Jarvis asserts the deferral
+    rather than leaving it to a vendor cohort draw (§4 addendum, wo-ab5d81db,
+    scripts/probe_first_navigation_call.py).
+    """
     from jarvis.catalog import DEFAULT_WORKER_TOOL_SEARCH
 
-    assert DEFAULT_WORKER_TOOL_SEARCH == "cli"
+    assert DEFAULT_WORKER_TOOL_SEARCH == "on"
     spec = ProjectSpec(name="proj_a", path=project, description="")
     env = json.loads(
         _write_worker_settings(spec, {"id": "wo-ts-default"}).read_text())["env"]
-    assert TOOL_SEARCH not in env
+    assert env[TOOL_SEARCH] == "true"
 
 
 @pytest.mark.parametrize("tool_search", ["off", "on", "cli"])

@@ -222,7 +222,7 @@ def test_the_input_size_columns_arrive_on_an_existing_agent_calls_table(tmp_path
 
 def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
     """NULLABLE, unlike `prompt_chars` beside it: a sub-millisecond call rounds to 0, so
-    0 cannot mean "not measured" here. Spec §3, docs/specs/2026-10-01-neo-observability.md.
+    0 cannot mean "not measured" here. Spec §3, docs/superpowers/specs/2026-10-01-neo-observability.md.
     """
     path = tmp_path / "legacy-latency.db"
     old = sqlite3.connect(path)
@@ -259,7 +259,7 @@ def test_the_latency_column_arrives_on_an_existing_agent_calls_table(tmp_path):
 def test_the_escalation_cause_column_arrives_on_an_existing_questions_table(tmp_path):
     """NULL on every pre-existing row, and NOT `NOT NULL DEFAULT ''`: the column is read
     by a GROUP BY, where an empty-string bucket reads as a ninth cause. Spec §1,
-    docs/specs/2026-10-01-neo-observability.md — and NO backfill from prose.
+    docs/superpowers/specs/2026-10-01-neo-observability.md — and NO backfill from prose.
     """
     path = tmp_path / "legacy-cause.db"
     old = sqlite3.connect(path)

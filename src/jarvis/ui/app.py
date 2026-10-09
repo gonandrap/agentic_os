@@ -6,14 +6,17 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from .. import bill, fleet, github, invariants, ops, specs, uilog, wiring
+from .. import bill, fleet, fleetcost, github, invariants, ops, specs, uilog, wiring
 from ..bill import OWN_LABEL
 from ..central_store import CentralStore
 from ..daemon import daemon_running
@@ -30,6 +33,8 @@ from ..project_store import (
     WO_STATUSES,
     ProjectStore,
     feature_status_label,
+    is_feature_order_id,
+    order_path,
     validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
@@ -217,15 +222,68 @@ def fmt_ts(ts: float | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _offset_param(raw: str) -> int:
+    """`?offset=` as an int, refused in the OS's own vocabulary rather than by FastAPI.
+
+    §3 of docs/superpowers/specs/2026-10-07-cost-window-selector.md: a framework 422 on
+    a cost page is a dead end, and a silent fallback to the current window would report
+    one window while the reader believes they picked another.
+    """
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        raise ops.OpsError(f"offset must be a whole number of windows — {raw!r} is not "
+                           f"a number") from None
+
+
+def _window_inputs(window: dict) -> dict[str, str]:
+    """The active window as `datetime-local` values, so the custom form pre-fills.
+
+    Rendered in the window's DISPLAY zone, because the route parses the submitted
+    strings in that same zone: the page speaks ONE clock (§11 of
+    docs/superpowers/specs/2026-10-07-cost-window-selector.md). The CLI's naive
+    `--since` is still UTC — that flag's clock is not redefined here.
+    """
+    fmt = "%Y-%m-%dT%H:%M"
+    tzinfo = ZoneInfo(window["zone"])
+    out = {key: datetime.fromtimestamp(window[key], tzinfo).strftime(fmt)
+           for key in ("since", "until")}
+    # The zone form carries a custom range with its OFFSET, so re-rendering it in a new
+    # zone moves no boundary: changing zone is display only (§11).
+    out.update({f"{key}_fixed": datetime.fromtimestamp(window[key], tzinfo).isoformat()
+                for key in ("since", "until")})
+    return out
+
+
+def _in_zone(raw: str, zone: str) -> float | str:
+    """A naive datetime-local string as the epoch it means IN `zone` (§11).
+
+    A string carrying an explicit offset is honoured as written, and anything this
+    cannot parse is handed on untouched so `fleetcost` refuses it in its own words.
+    """
+    try:
+        when = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=ZoneInfo(zone))
+    return when.timestamp()
+
+
 #: Paths the access log ignores while they succeed. `/api/status` is the dashboard's own
 #: 15-second refresh poll — left in, it is ~95% of the lines and buries the thing the
 #: access log exists to show: which pages the *user* actually opened. Failures are logged
 #: whatever the path, so a broken poll still leaves a trace.
-QUIET_PATHS = ("/api/status",)
+#: `/healthz` is the daemon's liveness poll (spec §1) and is quiet for `/api/status`'
+#: reason: a 5-second poll would bury the user's navigation. A FAILING probe still logs,
+#: because `access_log` logs any status >= 400.
+QUIET_PATHS = ("/api/status", "/healthz")
 
 #: The same rule for polls whose path carries an id, so an exact match cannot express it:
 #: `/api/wo/{project}/{wo_id}/live` fires every two seconds while a debugging page is
-#: open (spec §7 of docs/specs/2026-09-24-order-observability.md) and would bury the
+#: open (spec §7 of docs/superpowers/specs/2026-09-24-order-observability.md) and would bury the
 #: user's navigation exactly as `/api/status` did. Suffix, not prefix: the id sits in the
 #: middle.
 QUIET_SUFFIXES = ("/live",)
@@ -234,6 +292,198 @@ QUIET_SUFFIXES = ("/live",)
 def _quiet(path: str) -> bool:
     """Is a SUCCESSFUL request on this path beneath the access log's notice? See above."""
     return path in QUIET_PATHS or path.endswith(QUIET_SUFFIXES)
+
+
+# -- the dashboard's own liveness (spec §1, §2, §3 of
+# docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md)
+
+
+def _routed(request) -> bool:
+    """Does this request match a route? The measured fault's own discriminator: unrouted
+    paths answered 404 in 1ms while every routed page hung, so counting them would make a
+    stream of 404s read as a wedge (spec §1). Starlette 1.3.1: `route.matches(scope)`
+    returns `(Match, scope)` and only `Match.FULL` is a hit."""
+    from starlette.routing import Match
+
+    try:
+        for route in request.app.routes:
+            if route.matches(request.scope)[0] == Match.FULL:
+                return True
+    except Exception:  # noqa: BLE001 — never raise on the request path
+        return False
+    return False
+
+
+def _pool_ping() -> bool:
+    """The probe's whole job in the thread: return. No I/O, no lock, nothing that can
+    fail for a reason other than the pool itself."""
+    return True
+
+
+class PoolProbe:
+    """Is the one anyio threadpool every page handler runs in still serving?
+
+    The dashboard wedged for ~4 minutes with `systemctl` reporting `active (running)`,
+    the event loop healthy (unrouted paths answered 404 in 1ms) and every routed page
+    silent, because every page handler is a sync `def` and they all share this pool. No
+    error was raised, so every existing surface — `uilog.record_error`, the access log,
+    `Daemon.check_ui_log`, `invariants.check_ui_healthy` — stayed silent: the OS had a
+    negative liveness signal only, and it was never written. This is the positive one.
+
+    WHY THE PROBE CANNOT MAKE THINGS WORSE: a token is only taken once the limiter grants
+    it, so cancelling an acquire that is still *waiting* releases nothing, because nothing
+    was borrowed. The shielded hold at `anyio/_backends/_asyncio.py:2558-2559` applies to
+    a token already granted — to a job already running in a thread — and this probe's job
+    is a `return`, so it never sits there. Worst case under a wedge: one more waiter,
+    timed out and cancelled. A rig on anyio 4.14.1 measured `borrowed_tokens 0 /
+    available 40` after 120 cancellations of exactly this shape.
+
+    All state is in process memory. Nothing here writes to a database, and nothing on the
+    request path reads one.
+    """
+
+    def __init__(self) -> None:
+        from .. import bugreport
+        from ..catalog import UiHealthConfig
+
+        self.started_at = time.time()
+        # The settings the probe last resolved. `/healthz` reads THIS rather than the
+        # catalog: resolving one would be a filesystem read on the event loop, in the
+        # endpoint whose contract is that it touches nothing (spec §1).
+        self.cfg = UiHealthConfig()
+        self.last_ok: float | None = None
+        self.consecutive_failures = 0
+        self.wedged_since: float | None = None
+        self.stack_dump: str | None = None
+        # Routed requests in flight, keyed by a counter: a monotonic start time and a
+        # label. Registered on the EVENT LOOP by `access_log`, where a wedged pool cannot
+        # hide them — the shipped probe saw a saturated limiter only, and production was
+        # never saturated (spec §1, kn-5b1be5c3).
+        self._inflight: dict[int, tuple[float, str]] = {}
+        self._inflight_seq = 0
+        self.probe_failure_reason = ""
+        # Resolved once, here: `jarvis_version` shells out to git on its first call, and
+        # `/healthz` must never be the request that pays for that. Swallowed, for the
+        # reason `instance_badge` swallows it: a version string must not be why the app
+        # fails to build.
+        try:
+            self.version = bugreport.jarvis_version()
+        except Exception:  # noqa: BLE001
+            self.version = ""
+
+    @staticmethod
+    def limiter_figures() -> dict[str, int]:
+        """The anyio capacity limiter every sync handler queues on. `available_tokens`
+        is on the limiter; `tasks_waiting` only on its statistics — checked against the
+        installed anyio 4.14.1 rather than taken from prose."""
+        import anyio.to_thread
+
+        try:
+            limiter = anyio.to_thread.current_default_thread_limiter()
+            stats = limiter.statistics()
+            return {"borrowed": int(stats.borrowed_tokens),
+                    "available": int(limiter.available_tokens),
+                    "total": int(stats.total_tokens),
+                    "waiting": int(stats.tasks_waiting)}
+        except Exception:  # noqa: BLE001 — no loop, or an anyio that moved
+            return {"borrowed": 0, "available": 0, "total": 0, "waiting": 0}
+
+    def begin(self, method: str, path: str) -> int:
+        """Register one routed request. Dict writes only: this is on the request path and
+        may never raise (spec §1)."""
+        self._inflight_seq += 1
+        key = self._inflight_seq
+        self._inflight[key] = (time.monotonic(), f"{method} {path}")
+        return key
+
+    def end(self, key: int) -> None:
+        self._inflight.pop(key, None)
+
+    def oldest_inflight(self) -> tuple[float, str] | None:
+        """Age in seconds and label of the longest-running routed request, or None."""
+        entries = list(self._inflight.values())
+        if not entries:
+            return None
+        started, label = min(entries, key=lambda e: e[0])
+        return (time.monotonic() - started, label)
+
+    @property
+    def pool_healthy(self) -> bool:
+        """The last probe ROUND passed — the pool round-trip AND the in-flight check,
+        whichever of the two would have failed. A probe that has never run reads as
+        healthy: silence from a probe that was never started is not evidence of a wedge."""
+        return self.consecutive_failures == 0
+
+    def wedged(self, trip_threshold: int) -> bool:
+        """Failed often enough to be a wedge rather than one slow moment. This, and not
+        the HTTP status, is what the daemon acts on."""
+        return self.consecutive_failures >= trip_threshold
+
+    def payload(self, cfg) -> dict:
+        now = time.time()
+        oldest = self.oldest_inflight()
+        # No `version` and no `stack_dump`: `/healthz` is unauthenticated (review round 1).
+        return {
+            "pool_healthy": self.pool_healthy,
+            "wedged": self.wedged(cfg.trip_threshold),
+            "enabled": cfg.enabled,
+            "limiter": self.limiter_figures(),
+            "last_ok_age_seconds": (None if self.last_ok is None
+                                    else round(now - self.last_ok, 3)),
+            "consecutive_failures": self.consecutive_failures,
+            "uptime_seconds": round(now - self.started_at, 1),
+            "wedged_since": self.wedged_since,
+            "inflight": len(self._inflight),
+            "oldest_inflight_seconds": (None if oldest is None else round(oldest[0], 3)),
+            "probe_failure_reason": self.probe_failure_reason,
+        }
+
+    async def step(self, cfg) -> bool:
+        """One round, two checks: the pool round-trip, and whether any routed request has
+        been in flight longer than the timeout (spec §1)."""
+        import anyio
+
+        try:
+            with anyio.fail_after(cfg.probe_timeout_seconds):
+                await anyio.to_thread.run_sync(_pool_ping)
+        except TimeoutError:
+            return self._fail("pool_timeout", cfg)
+        oldest = self.oldest_inflight()
+        if oldest is not None and oldest[0] > cfg.probe_timeout_seconds:
+            return self._fail("inflight_stall", cfg)
+        self.last_ok = time.time()
+        self.consecutive_failures = 0
+        self.probe_failure_reason = ""
+        return True
+
+    def _fail(self, reason: str, cfg) -> bool:
+        self.probe_failure_reason = reason
+        self.consecutive_failures += 1
+        if self.wedged(cfg.trip_threshold):
+            self._trip()
+        return False
+
+    def _trip(self) -> None:
+        """Dump this process's stacks — the only way to get the frames at all, since
+        py-spy could not attach. Every trip dumps, so a wedge that stays wedged keeps
+        producing evidence; `uilog` rotates the file so it cannot fill the directory."""
+        stamp = uilog.record_wedge(limiter=self.limiter_figures(),
+                                   uptime_seconds=time.time() - self.started_at,
+                                   version=self.version)
+        self.wedged_since = stamp.get("since")
+        self.stack_dump = stamp.get("dump") or None
+
+    async def run(self) -> None:
+        """The lifespan task: probe, sleep, repeat. Cancelled on shutdown."""
+        import anyio
+
+        while True:
+            # Re-resolved every round, so `jarvis config set os.ui_health.…` is in force
+            # without restarting the dashboard (`ops.APPLY_RULES` calls these `hot`).
+            self.cfg = ops.ui_health_config()
+            if self.cfg.enabled:
+                await self.step(self.cfg)
+            await anyio.sleep(max(1, self.cfg.probe_interval_seconds))
 
 
 def _stale_link_hint(name: str, wo_id: str) -> str:
@@ -403,11 +653,13 @@ def alarm_badge() -> int | None:
 def _order_href(order_id: str) -> str | None:
     """Where an allow-listed order's page is, or None when it no longer resolves."""
     try:
-        if order_id.startswith("fo-"):
+        # Issue #997: `fo-` only, so an allow-listed `io-`/`inv-` id was looked up as a
+        # work order, resolved to None and lost its link.
+        if is_feature_order_id(order_id):
             pname, _, _ = ops.find_feature_order(order_id)
-            return f"/fo/{pname}/{order_id}"
-        pname, _, _ = ops.find_work_order(order_id)
-        return f"/wo/{pname}/{order_id}"
+        else:
+            pname, _, _ = ops.find_work_order(order_id)
+        return order_path(pname, order_id)
     except ops.OpsError:
         return None
 
@@ -773,7 +1025,47 @@ def wiring_groups(scope: str, *, refresh: bool = False) -> dict[str, object]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None)
+    probe = PoolProbe()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        """Owns the liveness probe task (spec §2).
+
+        A lifespan rather than `cli.cmd_ui`, so it starts for ANY server of this app and
+        for `TestClient` used as a context manager, and is cancelled on shutdown instead
+        of outliving the server. A `TestClient` built WITHOUT the context manager runs no
+        lifespan, so the probe never starts and leaves no stray task — `/healthz` then
+        reports a pool it has no evidence against, which is what the 18 tests in
+        tests/test_ui.py see.
+        """
+        import anyio
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(probe.run)
+            try:
+                yield
+            finally:
+                tg.cancel_scope.cancel()
+
+    app = FastAPI(title="Jarvis", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.pool_probe = probe
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        """Does the dashboard still serve? (spec §1)
+
+        `async def`, and that is the whole point: a sync `def` would be queued onto the
+        very pool it reports on and would hang exactly when it is needed. It touches no
+        store, no catalog read on the request path, no template and not `render()` (which
+        opens a `NeoStore` per request) — everything it reports is already in process
+        memory, written by the probe task.
+
+        503 when the last round-trip failed, for a human with `curl`. The daemon reads
+        the PAYLOAD and treats "times out" and "reports wedged" identically, so the
+        status code is never the only signal.
+        """
+        body = probe.payload(probe.cfg)
+        return JSONResponse(body, status_code=200 if body["pool_healthy"] else 503)
 
     @app.middleware("http")
     async def no_store(request: Request, call_next):
@@ -794,6 +1086,8 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # Every link to an order's page goes through this — see `order_path` (#997).
+        order_path=order_path,
         # A round's word, tone and icon — the same tuple `ops.round_line` and
         # `automerge.decide` render from, so no surface can call a CI wait a failure on
         # its own (GitHub issue #581).
@@ -810,6 +1104,14 @@ def create_app() -> FastAPI:
         # Same reason one sentence along: the subagent side's STRUCTURAL zero is worded
         # once, in `bill.SUBAGENT_REWRITE_ZERO`, and read by this page and `jarvis cost`.
         subagent_rewrite_zero=bill.SUBAGENT_REWRITE_ZERO,
+        # And one sentence further along: what a placeholder output figure means, worded
+        # once in `bill.PLACEHOLDER_NOTE` (spec 2026-10-08 §7).
+        placeholder_note=bill.PLACEHOLDER_NOTE,
+        placeholder_zero=bill.PLACEHOLDER_ZERO,
+        # The tool table's ROW ORDER, shared with `jarvis cost --fleet` for the reason
+        # the partial already gives about figures: an order computed in a renderer is
+        # one the other renderer disagrees with (§10.7).
+        tool_table=fleetcost.tool_table,
         # Same reason, for the assumption badge: `jarvis wo show` and this page must
         # not be able to disagree about whether the OS or the user decided one.
         assumption_decider=ops.assumption_decider,
@@ -906,20 +1208,29 @@ def create_app() -> FastAPI:
         server error" impossible to place in time.
         """
         t0 = time.perf_counter()
+        # Runs on the event loop, before `call_next` queues a sync handler onto the pool:
+        # the one place a wedged request is still visible (spec §1).
+        key = (probe.begin(request.method, request.url.path)
+               if request.url.path != "/healthz" and _routed(request) else None)
         try:
-            response = await call_next(request)
-        except Exception:
-            # The handler above renders the page, but it runs *outside* this middleware
-            # (ServerErrorMiddleware is outermost), so this is the only place that sees
-            # both the failure and the elapsed time.
-            uilog.record_access(request.method, _rel_url(request), 500,
-                                (time.perf_counter() - t0) * 1000)
-            raise
-        if response.status_code >= 400 or not _quiet(request.url.path):
-            uilog.record_access(request.method, _rel_url(request),
-                                response.status_code,
-                                (time.perf_counter() - t0) * 1000)
-        return response
+            try:
+                response = await call_next(request)
+            except Exception:
+                # The handler above renders the page, but it runs *outside* this middleware
+                # (ServerErrorMiddleware is outermost), so this is the only place that sees
+                # both the failure and the elapsed time.
+                uilog.record_access(request.method, _rel_url(request), 500,
+                                    (time.perf_counter() - t0) * 1000)
+                raise
+            if response.status_code >= 400 or not _quiet(request.url.path):
+                uilog.record_access(request.method, _rel_url(request),
+                                    response.status_code,
+                                    (time.perf_counter() - t0) * 1000)
+            return response
+        finally:
+            # A 500 and a cancellation both clean up (spec §1).
+            if key is not None:
+                probe.end(key)
 
     # -- pages ------------------------------------------------------------------
 
@@ -1073,6 +1384,12 @@ def create_app() -> FastAPI:
         is also where an escalated plan is decided, because deciding needs all three of
         those on one screen and no other page has them.
         """
+        # An id whose prefix names another kind gets its own page, so an old bookmark or
+        # a link built before #997 heals instead of erroring. The ops guard behind this
+        # covers the CLI and the JSON surface, where there is nowhere to redirect to.
+        target = order_path(name, fo_id)
+        if target != f"/fo/{name}/{fo_id}":
+            return RedirectResponse(target, status_code=303)
         try:
             detail = ops.show_feature_order(fo_id, name)
         except ops.OpsError as e:
@@ -1275,7 +1592,7 @@ def create_app() -> FastAPI:
                 store, wo, project=pname,
                 round_n=int(forced)) if forced.isdigit() else []
             # The retry control, and the note a press just left — §7b of
-            # docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
+            # docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md. None on any
             # order that is not `failed`, so no control renders there at all. The notice
             # is REBUILT from an id this order's own record knows: a number the query
             # string invented states no fact.
@@ -1283,7 +1600,7 @@ def create_app() -> FastAPI:
             # WHAT THE OS SAVED when the last turn died, rendered directly above that
             # control: it is what the user reads before pressing the button. None keeps
             # it off every page whose turn was never harvested — §5 of
-            # docs/specs/2026-09-30-harvesting-a-dead-turn.md.
+            # docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md.
             harvest = ops.harvest_state(store, wo)
             retried_line = (ops.retry_queued_notice(int(retried))
                             if retried.isdigit()
@@ -1345,7 +1662,7 @@ def create_app() -> FastAPI:
     @app.get("/wo/{name}/{wo_id}/debug", response_class=HTMLResponse)
     def work_order_debug(request: Request, name: str, wo_id: str, filed: str = ""):
         """"Show me all of the above on one page" — spec §7 of
-        docs/specs/2026-09-24-order-observability.md.
+        docs/superpowers/specs/2026-09-24-order-observability.md.
 
         DELIBERATELY NOT `?debug=1` on the page above, which means something else
         entirely (show debug-level timeline events) and is left alone.
@@ -1387,21 +1704,58 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": str(e)}, status_code=404)
 
     @app.get("/cost", response_class=HTMLResponse)
-    def cost_page(request: Request, project: str = ""):
+    def cost_page(request: Request, project: str = "", window: str = "",
+                  offset: str = "", since: str = "", until: str = "",
+                  tz: str = ""):
         """What the fleet's work cost, dearest first — the dashboard half of `jarvis cost`.
 
         Its own page rather than a column on the dashboard: this reads and parses every
         session transcript Claude Code still holds (~0.4s for a fleet of sixty), and the
         dashboard re-reads itself every 15 seconds. Spend is a question someone asks
         deliberately, not one worth paying for on every pulse.
+
+        THE WINDOW IS RESOLVED ONCE and handed to both payload builders, which is what
+        makes the two halves of the page incapable of disagreeing: resolution is a
+        function of `now`, so resolving twice can straddle a boundary (§6 of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md). Every parameter is
+        a string so that a bad one comes back as the OS's own sentence rather than a
+        framework 422 — and is a REFUSAL, never a silent fallback to the week.
+
+        `?tz=` picks the DISPLAY zone and moves no boundary; it is resolved FIRST because
+        the custom range is parsed in it (§11).
         """
         try:
-            report = ops.cost_report(project=project or None)
+            # The zone FIRST: the custom form's naive datetimes are parsed in the same
+            # zone they are rendered in, so the page speaks one clock (§11).
+            zone = ops.cost_zone(tz or None, project or None)
+            picked = ops.cost_window(project=project or None, window=window or None,
+                                     offset=_offset_param(offset), tz=tz or None,
+                                     since=_in_zone(since, zone) if since else None,
+                                     until=_in_zone(until, zone) if until else None)
+            report = ops.cost_report(project=project or None, window=picked)
         except ops.OpsError as e:
             return render(request, "error.html", message=str(e))
+        # The distribution is a SECTION of this page, so a failure to build it must not
+        # take the listing down with it: the two read different databases and the
+        # listing is the older, load-bearing half.
+        try:
+            fleet = ops.fleet_cost(project=project or None, resolved=picked)["fleet"]
+        except Exception:                                   # noqa: BLE001
+            fleet = None
+        # The meter is a THIRD payload from the same resolved window, in its own `try`
+        # for the same reason: it reads `usage_samples` and the transcript tree, and
+        # losing it must not take the listing down.
+        try:
+            meter = ops.cost_meter(resolved=picked, project=project or None)["meter"]
+        except Exception as e:                              # noqa: BLE001
+            uilog.record_error(request.method, "cost/meter", e)
+            meter = None
+        # Its own variable and never read out of `fleet`: losing the section must not
+        # lose the window the reader picked.
         return render(request, "cost.html", active="cost", report=report,
                       units=report["units"], totals=report["totals"],
-                      project=project,
+                      project=project, fleet=fleet, meter=meter, window=picked,
+                      window_inputs=_window_inputs(picked),
                       projects=sorted(ops.registered_project_paths()))
 
     @app.get("/cost/{name}/{order_id}", response_class=HTMLResponse)
@@ -1522,7 +1876,7 @@ def create_app() -> FastAPI:
 
     @app.get("/neo/stats", response_class=HTMLResponse)
     def neo_stats_page(request: Request, project: str = "", days: int | None = None):
-        """Neo's own report — §6 of docs/specs/2026-10-01-neo-observability.md.
+        """Neo's own report — §6 of docs/superpowers/specs/2026-10-01-neo-observability.md.
 
         A PAGE AND NOT A SECTION OF `/neo`, per kn-a7e321bc / kn-c609211f: that page is an
         action surface, and a block counting `approval` questions among review forms
@@ -1673,6 +2027,19 @@ def create_app() -> FastAPI:
                       history=[r for r in rows if not r["live"]],
                       kinds=ALARM_KINDS)
 
+    @app.get("/stuck", response_class=HTMLResponse)
+    def stuck_page(request: Request):
+        """Open orders judged on time in status — `alarms_page`'s split, for the same
+        reason: the top is the queue that is an ask, the bottom is the record.
+
+        Every number is `ops.stuck_report`'s; this route computes none of them (§7 of
+        docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md).
+        """
+        rows = ops.stuck_report()
+        return render(request, "stuck.html", active="stuck",
+                      over=[r for r in rows if r["stuck"]],
+                      rest=[r for r in rows if not r["stuck"]])
+
     @app.get("/alarms/{project}/{alarm_id}", response_class=HTMLResponse)
     def alarm_page(request: Request, project: str, alarm_id: str):
         """One alarm — where the work order's timeline and a Neo escalation both link.
@@ -1749,9 +2116,18 @@ def create_app() -> FastAPI:
                 status_code=303)
         try:
             parsed = None if clear else budget.parse_amount(amount)
-            ops.set_work_order_budget(wo_id, parsed, project_name=name)
+            result = ops.set_work_order_budget(wo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/wo/{name}/{wo_id}?error={e}", status_code=303)
+        # A RAISE THAT CHANGED NOTHING STILL OWES THE USER A SENTENCE, on the non-error
+        # channel (§7 of
+        # docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md): the
+        # budget WAS raised and written, and the cap that still binds is the family's.
+        # Dropping the note is what redirected the reporter to an unchanged page saying
+        # nothing. Never `?error=` — a refusal is not an error.
+        if result.get("note") and not result.get("resumed"):
+            return RedirectResponse(f"/wo/{name}/{wo_id}?note={quote(result['note'])}",
+                                    status_code=303)
         return RedirectResponse(f"/wo/{name}/{wo_id}", status_code=303)
 
     @app.post("/fo/{name}/{fo_id}/budget")
@@ -1766,9 +2142,24 @@ def create_app() -> FastAPI:
                 status_code=303)
         try:
             parsed = None if clear else budget.parse_amount(amount)
-            ops.set_feature_budget(fo_id, parsed, project_name=name)
+            result = ops.set_feature_budget(fo_id, parsed, project_name=name)
         except (ValueError, ops.OpsError) as e:
             return RedirectResponse(f"/fo/{name}/{fo_id}?error={e}", status_code=303)
+        # The same channel: `exhausted_children` is the WHOLE INSTRUCTION to the user —
+        # the family has money again and `jarvis wo budget <child> <amount>` is what
+        # spends it on the child they meant to rescue. Nothing here funds them, because
+        # doing it from this end would have to guess the split (`ops.set_feature_budget`).
+        stuck = result.get("exhausted_children") or []
+        if stuck:
+            one = len(stuck) == 1
+            # The WHOLE clause agrees, not only the noun: "1 work order ... their own
+            # ceiling" was half-pluralised.
+            note = (f"budget raised. {len(stuck)} work order{'' if one else 's'} still "
+                    f"parked on {'its own ceiling' if one else 'their own ceilings'}: "
+                    f"{', '.join(stuck)} — spend the new money on one with "
+                    f"`jarvis wo budget <id> <amount>`")
+            return RedirectResponse(f"/fo/{name}/{fo_id}?note={quote(note)}",
+                                    status_code=303)
         return RedirectResponse(f"/fo/{name}/{fo_id}", status_code=303)
 
     @app.post("/wo/{name}/{wo_id}/cancel")
@@ -1863,7 +2254,7 @@ def create_app() -> FastAPI:
 
         `?retried=<msg_id>` carries a NUMBER and nothing else: `ops.retry_queued_notice`
         rebuilds the sentence on the page, `fix_filed_notice`'s rule. §7b of
-        docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
+        docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md.
         """
         back = f"/wo/{name}/{wo_id}"
         try:

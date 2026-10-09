@@ -300,7 +300,7 @@ def test_a_verdict_the_os_cannot_form_records_nothing_and_leaves_it_pending(
 def test_an_override_in_the_early_pass_records_why_the_os_escalated(started,
                                                                    no_settling):
     """Neo ANSWERED and the OS re-marked the question, so without a cause this escalation
-    renders "not recorded" for ever — docs/specs/2026-10-01-neo-observability.md §1."""
+    renders "not recorded" for ever — docs/superpowers/specs/2026-10-01-neo-observability.md §1."""
     store, _wo = running(started, assumptions=(f"FORCE_ACCEPT_HIGH — {ROUTINE}",))
 
     ask(started, store)

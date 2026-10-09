@@ -13,7 +13,7 @@ Three properties carry the weight here, and each has a block below.
    existed_opens_and_works` builds an `os.db` from the previous release's `SCHEMA` and
    opens the current `CentralStore` on it. A new table is untested until that passes.
 
-Spec: docs/specs/2026-09-27-self-evolution.md §3.1, §3.3, §3.4.
+Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §3.1, §3.3, §3.4.
 """
 
 from __future__ import annotations
@@ -36,6 +36,16 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 @pytest.fixture()
 def store(jarvis_home):
     s = CentralStore()
+    # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
+    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
+    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
+    # deleting — every assertion of which is written as "and the table stays empty". The
+    # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
+    # owns their call site; asserting them here too would be two files disagreeing about
+    # what a count means the first time a sixth rule is seeded.
+    s.conn.execute("DELETE FROM remedy_rules")
+    s.conn.execute("DELETE FROM detectors")
+    s.conn.commit()          # another connection (the CLI opens its own) must see it
     yield s
     s.close()
 

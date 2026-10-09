@@ -359,6 +359,7 @@ def _deployed(tmp_path: Path) -> Path:
     prod = tmp_path / "prod"
     (prod / "jarvis_os" / "scripts").mkdir(parents=True)
     (prod / "jarvis_os" / "scripts" / "install_prod_service.sh").write_text("#!/bin/sh\n")
+    (prod / "jarvis_os" / "scripts" / "install_prod_cli.sh").write_text("#!/bin/sh\n")
     return prod
 
 
@@ -408,6 +409,45 @@ def test_a_tag_without_the_installer_says_so_instead_of_aborting(tmp_path):
     assert "units NOT re-rendered" in r.stdout
     assert "jarvis doctor" in r.stdout
     assert "--no-restart" not in r.stdout, "claimed a re-render it could not do"
+
+
+# -- re-rendering the `jarvis` wrapper (issue 757) -------------------------------
+#
+# Same lesson one layer out: the wrapper names $PROD_DIR, so it goes stale exactly as a
+# unit does and wants exactly the same cure. Unconditional, unlike 5a — a
+# ~/.local/bin/jarvis enables nothing and starts nothing, and the only machine that
+# reaches step 5 is one where production was just deployed.
+
+
+def test_the_cli_wrapper_is_re_rendered_from_the_deployed_tag(tmp_path):
+    repo = _make_repo(tmp_path)
+    prod = _deployed(tmp_path)
+    r = _dry_run(repo, prod, "0.2.0")
+    assert r.returncode == 0, r.stderr
+
+    assert f"{prod}/jarvis_os/scripts/install_prod_cli.sh" in r.stdout
+
+
+def test_the_wrapper_render_precedes_the_staging_hand_off(tmp_path):
+    """Before 5b: the staged path exits there, and a `--stage` release must get the
+    wrapper too."""
+    repo = _make_repo(tmp_path)
+    base = _sha(repo, "HEAD")
+    r = _dry_run(repo, _deployed(tmp_path), "0.2.0", "--stage", "--wo", "wo-1234abcd",
+                 "--base", base)
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+
+    assert out.index("install_prod_cli.sh") < out.index("staging: writing release marker")
+
+
+def test_a_tag_without_the_cli_installer_says_so_instead_of_aborting(tmp_path):
+    repo = _make_repo(tmp_path)
+    r = _dry_run(repo, tmp_path / "prod", "0.2.0")   # no installer deployed
+
+    assert r.returncode == 0, r.stderr
+    assert "wrapper was NOT" in r.stdout
+    assert "INV-PROD-CLI" in r.stdout
 
 
 # -- the tag's uv.lock -----------------------------------------------------------

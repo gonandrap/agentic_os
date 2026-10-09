@@ -1,6 +1,6 @@
 """A turn whose process died without writing a result, and what the OS reads off disk.
 
-Issue #888, spec docs/specs/2026-09-30-harvesting-a-dead-turn.md. Three halves, in the
+Issue #888, spec docs/superpowers/specs/2026-09-30-harvesting-a-dead-turn.md. Three halves, in the
 order the OS meets them: the reap that harvests (§2), the checkpoint commit that keeps
 uncommitted work (§3), and the relaunch brief the harvest replaces `RETRY_NOTE` with
 (§6).

@@ -1,6 +1,6 @@
 """Who turns debug collection on, and at what level.
 
-§10 of docs/specs/2026-09-24-order-observability.md. That section keeps TWO THINGS APART
+§10 of docs/superpowers/specs/2026-09-24-order-observability.md. That section keeps TWO THINGS APART
 and so does this module's scope: the GATE (this file — whether Jarvis COLLECTS debug data)
 and the METER (what looking at an order COSTS, recorded through `agent_usage` at every
 level and never switchable off). Conflating them is what makes the rest of the feature
@@ -8,7 +8,7 @@ read as a contradiction.
 
 THE GATE GOVERNS TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json`
 (`context.record`, its only consumer) and the sealed autopsy (`autopsy.records_autopsy`,
-§5 of docs/specs/2026-09-27-order-autopsy-durability.md). It governs no read — so `off`
+§5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). It governs no read — so `off`
 stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
 `jarvis wo why` or the debug page, which are arithmetic over files Claude Code already
 wrote, collect nothing, and would cost the user the very view they opened. What a user
@@ -16,7 +16,7 @@ notices at `off` is that the order has no context ledger and no sealed autopsy a
 so `jarvis wo context` reports it as not recorded.
 
 `FULL` AND `NORMAL` BOTH RECORD THE CONTEXT ROW, and differ by exactly one thing: the tool
-parameters a `full` seal retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md).
+parameters a `full` seal retains (§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md).
 The autopsy READING itself — every turn, its tools, its token classes and its context
 total, delta, peak and composition — is read-time arithmetic over the transcript (§§3, 4,
 6, 7) and is shown for every order at every level, `off` included; what `off` withholds is

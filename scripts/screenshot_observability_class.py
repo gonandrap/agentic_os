@@ -1,5 +1,5 @@
 """Screenshot the bill's fourth actor class — what LOOKING at an order cost (§10 of
-docs/specs/2026-09-24-order-observability.md).
+docs/superpowers/specs/2026-09-24-order-observability.md).
 
 Two shots, because the class has two renderings and a reviewer has to see both:
 

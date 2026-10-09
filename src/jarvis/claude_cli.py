@@ -1640,7 +1640,7 @@ class HeadlessResult:
     prompt_chars: int = 0
     system_prompt_chars: int = 0
     #: How long the subprocess took, in milliseconds. 0 means NOT MEASURED, which is what
-    #: a hand-built result is — §3 of docs/specs/2026-10-01-neo-observability.md.
+    #: a hand-built result is — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
     latency_ms: int = 0
 
 
@@ -1889,7 +1889,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         args += stack.enter_context(
             _system_prompt_arg(system_prompt, keep_default_context=keep_default_context))
         # AROUND THE SUBPROCESS AND NOTHING ELSE — §3 of
-        # docs/specs/2026-10-01-neo-observability.md: argument assembly and JSON parsing
+        # docs/superpowers/specs/2026-10-01-neo-observability.md: argument assembly and JSON parsing
         # are not the model's time.
         started = time.monotonic()
         out = _run(args, cwd=cwd, timeout=timeout, env_extra=env_extra,
@@ -1929,7 +1929,7 @@ def run_headless_result(prompt: str, system_prompt: str | None = None,
         result.usage["prompt_chars"] = prompt_chars
         result.usage["system_prompt_chars"] = system_prompt_chars
         # Same reason one field along: the sites that hand over `usage=result.usage` never
-        # see the dataclass — §3 of docs/specs/2026-10-01-neo-observability.md.
+        # see the dataclass — §3 of docs/superpowers/specs/2026-10-01-neo-observability.md.
         result.usage["latency_ms"] = latency_ms
     if not records_itself:
         _attribute_subprocess(result, record)

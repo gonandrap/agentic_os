@@ -256,7 +256,7 @@ def peek() -> Inventory | None:
     `cached()` starts a discovery thread when the cache is cold, and discovery shells out
     to `claude mcp list`. `context.py` measures inside the dispatch path, where a
     measurement must not spawn a subprocess — so it reads the cache or says it is cold
-    (§5 of docs/specs/2026-09-24-order-observability.md).
+    (§5 of docs/superpowers/specs/2026-09-24-order-observability.md).
     """
     with _LOCK:
         return _STATE["inventory"]

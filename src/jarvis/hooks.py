@@ -6,6 +6,16 @@ Claude Code pipes a JSON payload on stdin (hook_event_name, session_id, cwd, ...
 We map the session to a work order (JARVIS_WO_ID env var set at dispatch, falling back
 to a session_id lookup) and update the project DB. Sessions that aren't Jarvis workers
 are a silent no-op, so interactive sessions in managed projects are unaffected.
+
+This module also answers `PreToolUse`. A NAVIGATION decision function here
+(`py_nav_decision`, `doc_nav_decision`) NEVER allows: it denies or it returns None, so
+it can hand out nothing a gate would have caught — and its POSITION in
+`preflight_decision` is the enforcement, because a Bash arm after the
+`is_jarvis_command_chain` auto-allow is unreachable in production however green its unit
+test (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). Nothing in this module
+may import `catalog` or `spec_index`: it runs on EVERY tool call of every managed worker,
+where a catalog parse is ~60ms against a ~155ms process, so every setting it reads
+arrives as an environment variable `dispatch` resolved at spawn.
 """
 
 from __future__ import annotations
@@ -22,7 +32,18 @@ from typing import Any, NamedTuple
 from . import concision
 # §3 of the 2026-10-02 navigation split: ONE masker in the tree, by identity.
 # `navigates_source` joins it for §6 of 2026-10-02-serena-the-cheap-path.md.
-from .navigation import _mask_shell_text, _statements, navigates_source
+# `dumps_doc` and `is_spec_path` join them for §5 of
+# docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md: ONE spelling of each predicate in
+# the tree, read by the counter and by the refusal, by identity and never re-spelled.
+from .navigation import (
+    DOC_SUFFIXES,
+    SOURCE_SUFFIXES,
+    _mask_shell_text,
+    _statements,
+    dumps_doc,
+    is_spec_path,
+    navigates_source,
+)
 from .project_store import ProjectStore
 
 # A Bash command every worker must be able to run without a permission prompt:
@@ -1400,10 +1421,6 @@ def investigator_bash_decision(payload: dict[str, Any],
     )
 
 
-#: This hook's OWN suffix set, narrower than `navigation.SOURCE_SUFFIXES` (the
-#: counter's): §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
-PY_NAV_SUFFIXES = (".py",)
-
 #: The refusal IS the mitigation, so it names the call to make instead and the
 #: activation fallback — both Serena spellings, as `serena_activation_context` does.
 _PY_NAV_DENY = (
@@ -1419,7 +1436,7 @@ def py_nav_decision(payload: dict[str, Any],
                     env: dict[str, str]) -> dict[str, Any] | None:
     """Refuse a source-navigating Bash call at a `.py` path, naming the symbol call.
 
-    §6 of docs/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
+    §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md. Behind `worker.py_nav_hook`,
     DEFAULT OFF: a hook nobody has enabled cannot strand a worker.
 
     POSITION: in the Bash chain of `preflight_decision`, immediately after
@@ -1432,24 +1449,159 @@ def py_nav_decision(payload: dict[str, Any],
     Gated on `JARVIS_WO_ID`, so an interactive session in a managed project is
     untouched, and on `.serena/project.yml` existing at the project root: a repo with no
     symbol index must keep grep or the worker cannot read code at all.
+
+    IT ALSO REFUSES A WHOLE-FILE `Read` of a `.py` — §5.1 of
+    docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind the SAME key, because one
+    flip must not change two policies whose blockers differ.
+
+    THE `.py` ARM HAS NO SIZE THRESHOLD AND MUST NOT GROW ONE. It denies a `Read` with
+    no `limit` key and nothing else; a `Read` carrying ANY `limit` passes, however
+    large. §1(a) is why: every expensive `.py` `Read` passed no `limit` (487,048 tok
+    over 133 calls) and every cheap one passed a small one (1,242,656 tok over 1,422
+    calls), so `limit is None` already separates the two populations. "Large" is a later
+    order's question and it must arrive as a catalog key under `worker.*`, never as a
+    module constant here.
     """
-    if payload.get("tool_name") != "Bash":
+    if payload.get("tool_name") not in ("Bash", "Read"):
         return None
     if env.get("JARVIS_PY_NAV_HOOK") != "on":
         return None
     if not env.get("JARVIS_WO_ID"):
         return None
-    command = ((payload.get("tool_input") or {}).get("command") or "").strip()
+    # ONE gate for BOTH arms, resolved once before the split: §5.1 of
+    # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md gives the `Read` arm the same
+    # `.serena/project.yml` precondition as the Bash arm, and a copied check is the drift
+    # this tree has paid for twice. Shared by construction, so a later reader cannot
+    # widen one arm and leave the other.
     cwd = payload.get("cwd") or ""
-    if not command or not cwd:
+    if not cwd:
         return None
     root = find_project_root(Path(cwd))
     if root is None or not (root / ".serena" / "project.yml").exists():
         return None
+    tool_input = payload.get("tool_input") or {}
+    if payload.get("tool_name") == "Read":
+        file_path = tool_input.get("file_path") or ""
+        # NO threshold, by the ruling above: a missing `limit` is whole-file and is the
+        # only thing refused here.
+        # BOTH arms share the COUNTER's suffix set by identity — §5.5 of
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Two spellings of one
+        # predicate is the drift this tree has paid for twice, so the "this hook's OWN
+        # narrower set" ruling (§6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md) is
+        # SUPERSEDED. A narrower enforcement set arrives as a `worker.*` catalog key,
+        # never as a second module constant.
+        if file_path.endswith(SOURCE_SUFFIXES) and "limit" not in tool_input:
+            return _deny(_PY_NAV_DENY)
+        return None
+    command = (tool_input.get("command") or "").strip()
+    if not command:  # Bash-only condition
+        return None
     # §6: a sweep counts only when its own scope names `.py` (issue 936).
-    if not navigates_source(command, PY_NAV_SUFFIXES, scoped_sweeps=True):
+    if not navigates_source(command, SOURCE_SUFFIXES, scoped_sweeps=True):
         return None
     return _deny(_PY_NAV_DENY)
+
+
+#: The FALLBACK bar, in lines, and 200 because §1's table prices a `head … .md` at 317
+#: tokens a call while the measured evasion is a `sed -n '1,2000p'` (§1(c): 1.25M tokens
+#: over 2,189 Bash calls). NOT the resolved number: `worker.doc_read_limit_lines` is the
+#: setting, `catalog.DEFAULT_WORKER_DOC_READ_LIMIT_LINES` is its fallback, and the hook
+#: reads the RESOLVED one out of the environment so a project that sets its own gets it.
+#: This literal exists only for the malformed-value case below.
+_DOC_READ_LIMIT_FALLBACK = 200
+
+#: The refusal IS the mitigation (§4.3), so it names those three commands and NOTHING
+#: else: a refusal that is not actionable alone buys a reworded retry. Repeated here as
+#: LITERALS rather than imported from `spec_index` — §2.1's rule: this module runs on
+#: every tool call of every managed worker, so an import is a fleet-wide per-command cost.
+_DOC_NAV_DENY = (
+    "Refused: read a spec by SECTION, not whole. Call `jarvis spec toc <path>` for the "
+    "headings, `jarvis spec section <path> <n|name>` for the one you need, and "
+    '`jarvis spec search "<words>"` to find which spec says it. A ranged read inside '
+    "the limit (`head -40`, `sed -n '40,80p'`) is still allowed, and so is "
+    "`grep`/`rg` over markdown."
+)
+
+
+def _doc_paths(command: str) -> list[str]:
+    """The `.md` paths this command NAMES.
+
+    A separate helper and not part of the decision below, which parses nothing: §5.5's
+    AST pin encloses that body. Masked first and split by `navigation._statements`, both
+    by identity — a `.md` inside a quoted string is prose, and a second masker is the
+    drift kn-7f5f2d0d records.
+    """
+    return [word
+            for words in _statements(_mask_shell_text(command))
+            for word in words
+            if word.endswith(DOC_SUFFIXES)]
+
+
+def doc_nav_decision(payload: dict[str, Any],
+                     env: dict[str, str]) -> dict[str, Any] | None:
+    """Refuse a WHOLE-FILE or oversized read of a spec, naming `jarvis spec`.
+
+    §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. Behind
+    `worker.doc_nav_hook`, DEFAULT OFF: nothing here changes the behaviour of a running
+    worker until someone flips it.
+
+    POSITION: in the Bash chain of `preflight_decision`, immediately after
+    `py_nav_decision` and BEFORE the `is_jarvis_command_chain` auto-allow, which returns
+    an allow and would make this arm unreachable in production however green its unit
+    test; and in the new `Read` branch, where there is no auto-allow in front of it.
+
+    NO `_allow` BRANCH, EVER. It denies or it returns None, so it can hand out nothing a
+    gate would have caught.
+
+    Gated on `JARVIS_WO_ID`, so an interactive session in a managed project is
+    untouched. NOT gated on `.serena/project.yml`, unlike `py_nav_decision`: the
+    mitigation it names is a `jarvis` command, which every managed project has.
+
+    ONE BAR, SHARED BY BOTH ARMS, resolved from the environment. `dumps_doc` owns the
+    range extraction (`navigation._dump_span`) and this body parses nothing: a second
+    extractor would make the counter and the refusal disagree about what "40 lines"
+    means (§3.1).
+
+    A SMALL TARGETED DUMP IS NOT AN EVASION and refusing it is the brief's MUST NOT:
+    `head -40 docs/<spec>.md` is 317 tokens against a whole turn for a refusal, and a
+    `grep` over markdown is legal without exception, ever.
+    """
+    tool_name = payload.get("tool_name")
+    if tool_name not in ("Read", "Bash"):
+        return None
+    if env.get("JARVIS_DOC_NAV_HOOK") != "on":
+        return None
+    if not env.get("JARVIS_WO_ID"):
+        return None
+    try:
+        limit_lines = int(env.get("JARVIS_DOC_READ_LIMIT_LINES", ""))
+    except ValueError:
+        limit_lines = _DOC_READ_LIMIT_FALLBACK
+    # ABSORBED QUIETLY, and a bad value is rejected LOUDLY by the catalog instead (§5.2):
+    # this runs on every PreToolUse, so a hook that raises on a malformed env var breaks
+    # every tool call in the session and not only the refused ones. A resolved 0 or a
+    # negative falls back too — as the bar it would refuse every targeted read in the
+    # fleet, which is §1.1's failure reached by accident.
+    if limit_lines <= 0:
+        limit_lines = _DOC_READ_LIMIT_FALLBACK
+    tool_input = payload.get("tool_input") or {}
+    if tool_name == "Read":
+        if not is_spec_path(tool_input.get("file_path") or ""):
+            return None
+        # A missing `limit` is whole-file (§1(a)), which is why this hook adds no disk
+        # access to any `Read`. A non-integer one reads as whole-file for the same
+        # reason the bar above is absorbed quietly: the hook must not raise.
+        limit = tool_input.get("limit")
+        if not isinstance(limit, int) or limit > limit_lines:
+            return _deny(_DOC_NAV_DENY)
+        return None
+    command = (tool_input.get("command") or "").strip()
+    if not dumps_doc(command, limit_lines=limit_lines):
+        return None
+    paths = _doc_paths(command)
+    if not paths or not all(is_spec_path(path) for path in paths):
+        return None
+    return _deny(_DOC_NAV_DENY)
 
 
 def _investigator_git_read(segment: str) -> bool:
@@ -2130,13 +2282,30 @@ def preflight_decision(payload: dict[str, Any], env: dict[str, str]) -> dict[str
         if mutating is not None:
             return mutating
         # Before the auto-allow for the ordering reason above (§6 of
-        # docs/specs/2026-10-02-serena-the-cheap-path.md).
+        # docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md).
         text_read = py_nav_decision(payload, env)
         if text_read is not None:
             return text_read
+        # Immediately after it and BEFORE the auto-allow below, for that same ordering
+        # reason (§2.4 and §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md).
+        dumped = doc_nav_decision(payload, env)
+        if dumped is not None:
+            return dumped
         if is_jarvis_command_chain(tool_input.get("command", "")):
             return _allow("jarvis contract command")
         return None
+
+    # Its own branch, and NOT folded into the `mcp__` one or the `Edit`/`Write` one
+    # below: a `Read` enters neither, so a refusal placed anywhere else is unreachable
+    # (§2.4 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md). THERE IS NO
+    # AUTO-ALLOW IN FRONT OF THIS BRANCH, so the ordering argument this docstring makes
+    # about arms after `is_jarvis_command_chain` does not apply here — the next reader
+    # will assume it does. No investigator arm either: a `Read` is read-only.
+    if tool == "Read":
+        text_read = py_nav_decision(payload, env)
+        if text_read is not None:
+            return text_read
+        return doc_nav_decision(payload, env)
 
     # Its own branch for the same reason as `mcp__` below: a delegation enters no other
     # block (§3 of
@@ -2924,7 +3093,7 @@ def serena_activation_context(cwd: Path) -> str:
     The Claude Code plugin starts the Serena MCP server with fixed args carrying neither
     `--project` nor `--project-from-cwd`, and no Serena env var selects a project, so a
     dispatched worker's first `find_symbol` fails with `No active project` and it falls
-    back to a text search. Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+    back to a text search. Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
 
     BOTH SPELLINGS of the tool, for the reason `dispatch.SERENA_TOOL_PREFIXES` has two
     entries: a plugin install produces the long prefix, `claude mcp add serena` the short
@@ -3040,7 +3209,7 @@ def handle_hook(payload: dict[str, Any], env: dict[str, str]) -> dict[str, Any] 
             # key `dispatch._write_worker_settings` already writes from
             # `wiring.serena_wired` — and never on `.serena/project.yml` existing, which
             # `activate_project` writes itself (Neo q1259).
-            # Spec docs/specs/2026-10-02-serena-the-cheap-path.md §5.
+            # Spec docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md §5.
             context = concision.house_style()
             if env.get("JARVIS_SERENA") != "0":
                 context += serena_activation_context(cwd)

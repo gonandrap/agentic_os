@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 SHOTS = REPO / "docs" / "screenshots"
 PORT = 8807
 
-REPO_PATH = "docs/specs/2026-09-27-self-evolution.md"
+REPO_PATH = "docs/superpowers/specs/2026-09-27-self-evolution.md"
 SOURCE = "branch wo-1170d758 @ 4f2a1c9"
 SECTION = "3"          # the child's section: "## 3. Failure handling"
 

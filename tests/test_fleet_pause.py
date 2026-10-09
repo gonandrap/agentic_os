@@ -15,6 +15,7 @@ Four mechanisms, tested separately because they fail separately:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -194,6 +195,32 @@ def test_a_window_spent_again_soon_after_reopening_trips_the_breaker(os_up):
     central.set_state(fleet.REOPENED_KEY, "200000")
     slow = fleet.ramp(central, now=200000 + fleet.RAMP_SECONDS + 1)
     assert slow is not None and slow.cap == fleet.BREAKER_RAMP_CAP and slow.tripped
+
+
+def test_fleet_pause_opens_nothing_but_records_a_run(os_up, monkeypatch):
+    """§5 step 3 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    investigated.md: a paused fleet is excluded, and the RUN is still recorded — a
+    deliberately quiet sweep must not read as a dark one."""
+    from test_health_sweep import park_order
+
+    from jarvis import invariants, schedule
+
+    store, central, daemon = os_up["store"], os_up["central"], os_up["daemon"]
+    # The check runs on the OS-OWNING project only, so point the install inside this one.
+    monkeypatch.setattr(schedule, "__file__",
+                        str(Path(store.project_path) / "src" / "jarvis" / "schedule.py"))
+    wo = ops.create_work_order("proj_a", "parked while the fleet is paused")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    ops.pause_fleet(reason="token burn")
+    state = fleet.attach(fleet.read(15, {"proj_a": store}), central)
+
+    daemon.stuck_tick(state)
+
+    run = json.loads(central.get_state("stuck_sweep_run"))
+    assert run["opened"] == 0 and run["excluded"] == "fleet_paused" and not run["error"]
+    assert ops.list_investigation_orders("proj_a", include_settled=True) == []
+    assert not [v for v in invariants.check_stuck_sweep_alive(store)
+                if v.invariant == "INV-STUCK-SWEEP-DARK"]
 
 
 def test_a_window_that_lasted_clears_the_breaker(os_up):

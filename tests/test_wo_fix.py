@@ -1,4 +1,4 @@
-"""§11 of docs/specs/2026-09-24-order-observability.md: the user reaching a SHIPPED remedy.
+"""§11 of docs/superpowers/specs/2026-09-24-order-observability.md: the user reaching a SHIPPED remedy.
 
 The entry point is the only new thing. §11 adds no remedy, widens no allow-list and skips
 no grant, so these tests are written to fail if any of those three drifted: the registry
@@ -914,7 +914,7 @@ def test_a_signin_park_is_the_users_own_move(started, catalog_file):
 
 
 def test_a_failed_order_still_has_nothing_for_a_remedy_to_clear(started, catalog_file):
-    """§6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md: the slug stays
+    """§6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md: the slug stays
     `failed`, so `FIX_NOTHING_TO_CLEAR` membership is unchanged — with a detail that now
     names the retry. `fix`'s job is remedies; the OFFER belongs to `jarvis wo why`."""
     _arm(catalog_file, *remedies.SHIPPED_REMEDIES)

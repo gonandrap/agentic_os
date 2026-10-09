@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import zoneinfo
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -19,8 +20,8 @@ from . import probes as probes_mod
 from .claude_cli import DEFAULT_MAX_OS_PROMPT_CHARS, MAX_OS_PROMPT_CHARS_MIN
 from . import schedule as schedule_mod
 from .gates import GateConfig
-from .navigation import (NAV_COMMANDS, SOURCE_SUFFIXES, SYMBOL_TOOLS,
-                         TEXT_SEARCH_TOOLS)
+from .navigation import (DOC_DUMP_COMMANDS, DOC_SUFFIXES, NAV_COMMANDS,
+                         SOURCE_SUFFIXES, SYMBOL_TOOLS, TEXT_SEARCH_TOOLS)
 from .neo_store import Q_KINDS, SEATS
 from .project_store import VALIDATOR_SEATS
 
@@ -53,6 +54,15 @@ SAFETY_KEYS = (
     # the same act at two magnitudes — and a change here is invisible until the morning
     # it starts spending. docs/superpowers/specs/2026-09-14-the-scheduler.md §2.
     "*.schedule.*",
+    # What the OS is permitted to WATCH — and, once §6 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md lands, the switch everything
+    # it is permitted to DO about what it watched hangs off. It is here at the WATCHING stage
+    # deliberately: the registry is a table of admitted heuristics that a person arms one
+    # at a time, so the moment the fleet starts evaluating them is the moment a reader
+    # needs on the record, not the later moment one of them first acts. `*.` rather than
+    # `os.` for `*.validation.*`'s reason: the per-project form is the same switch with a
+    # smaller blast radius.
+    "*.rules.*",
 )
 
 # Mirrors `claude --permission-mode` choices exactly (CLI rejects anything else).
@@ -86,22 +96,54 @@ VALID_BASH_FIRST = ("off", "relaxed", "strict", "cli")
 DEFAULT_WORKER_BASH_FIRST = "off"
 
 # Whether a worker's MCP tools are DEFERRED behind `ToolSearch` or listed with full
-# schemas. §4 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# schemas. §4 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # A STRING ENUM for VALID_BASH_FIRST's reason: `cli` asserts no answer about a vendor
-# behaviour Jarvis does not own, and writes no key. `cli` IS the shipped default — §7
-# owns the flip, so this key arriving changes no worker's tool list.
+# behaviour Jarvis does not own, and writes no key. DEFAULT `on`: Jarvis PINS deferral
+# rather than leaving it to the vendor default, because deferral is what makes a worker's
+# first navigation call a symbol call — 7/7 deferred against 1/10 with the tools present
+# (wo-ab5d81db), which makes `off` a measured regression on that outcome. §4 addendum of
+# docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 VALID_TOOL_SEARCH = ("off", "on", "cli")
-DEFAULT_WORKER_TOOL_SEARCH = "cli"
+DEFAULT_WORKER_TOOL_SEARCH = "on"
 
 # Whether `hooks.py_nav_decision` refuses a worker's source-navigating Bash call at a
-# `.py` path. §6 of docs/specs/2026-10-02-serena-the-cheap-path.md.
+# `.py` path. §6 of docs/superpowers/specs/2026-10-02-serena-the-cheap-path.md.
 #
 # TWO STATES and not three: `cli` exists only where Jarvis defers to a vendor behaviour
-# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF — a hook nobody
-# has enabled cannot strand a worker; §7 owns the flip.
+# it does not own, and this hook is entirely Jarvis's own. DEFAULT OFF, and the flip is
+# SEQUENCED rather than refused: the hook measures ZERO contribution to first-call order
+# (with the Serena tools present the first navigation call was a symbol call 0/3 with the
+# hook off and 0/2 with it on; with them deferred 2/2 both ways), and on fleet-wide a
+# worker cannot search the tree for ANY text — issue 936, `navigation._sweeps_the_tree`
+# ignores its suffixes argument. wo-d2d777dc owns that fix; flip after it lands
+# (wo-ab5d81db).
 VALID_PY_NAV_HOOK = ("off", "on")
 DEFAULT_WORKER_PY_NAV_HOOK = "off"
+
+# Whether `hooks.doc_nav_decision` refuses a whole-file or oversized read of a SPEC —
+# §5 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. TWO STATES, modelled on
+# VALID_PY_NAV_HOOK above and for its reason: the hook is entirely Jarvis's own.
+# DEFAULT OFF — nothing in that spec ships on, so merging it changes the behaviour of no
+# running worker.
+VALID_DOC_NAV_HOOK = ("off", "on")
+DEFAULT_WORKER_DOC_NAV_HOOK = "off"
+
+# THE BAR BOTH DOC ARMS SHARE, in lines: a `Read` with a larger `limit` (or none at all)
+# and a `cat`/`head`/`sed -n` naming a wider range are refused. 200 because §1's table
+# prices `head … .md` at 317 tokens a call while the measured evasion is
+# `sed -n '1,2000p'` (§1(c): 1.25M tokens over 2,189 Bash calls) — the arm exists for the
+# 2,000-line range, not for the 40-line one.
+#
+# THIS IS THE KEY'S FALLBACK AND NOT THE RESOLVED NUMBER: a catalog setting rather than a
+# module constant in `hooks.py`, so a project can raise or lower it, and the hook reads
+# the value `dispatch` resolved into the worker's environment.
+DEFAULT_WORKER_DOC_READ_LIMIT_LINES = 200
+# Zero or a negative would make the bar a blanket refusal of every targeted read, which
+# is the feature's own MUST NOT reached by a typo. It arrives through `jarvis config
+# set`, so it is refused where the message can name the key — the HOOK absorbs a bad
+# value quietly instead, because it runs on every tool call.
+WORKER_DOC_READ_LIMIT_LINES_MIN = 1
 
 # Model every worker runs on unless the catalog overrides it (os.defaults.model, a
 # project's `model`, or per work order via `jarvis wo create --model`). Passed straight
@@ -449,6 +491,10 @@ class WorkerDefaults:
     tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # The bar both doc arms share — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     append_system_prompt: str | None = None
     # None = no bound (the model's own window stands). See DEFAULT_AUTOCOMPACT_WINDOW.
     autocompact_window: int | None = DEFAULT_AUTOCOMPACT_WINDOW
@@ -526,6 +572,11 @@ DEFAULT_VALIDATION_CONFIRM_DIFF_CHARS = 12000
 # docs/superpowers/specs/2026-09-15-the-panel-blocks-on-blockers.md
 DEFAULT_VALIDATION_FOLLOW_UP_CAP = 5
 
+# How long the reconciler may wait for a merged child's commit to appear on the default
+# branch before it stops deferring the feature's round and asks the user. §3 of
+# docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES = 15
+
 #: Which net answers "is this assumption high-stakes?" before any model call
 #: (docs/superpowers/specs/2026-09-25-a-model-decides-what-is-high-stakes.md SS3.4).
 #:
@@ -583,6 +634,9 @@ class ValidationConfig:
     # a separate question from whether its children each validated: the feature is the
     # only level at which "does this add up to what was asked" can be judged.
     feature_units: bool = True
+    # §3 of
+    # docs/superpowers/specs/2026-10-07-a-feature-round-must-judge-a-head-that-contains-its-children.md
+    feature_merge_wait_minutes: int = DEFAULT_VALIDATION_FEATURE_MERGE_WAIT_MINUTES
     # WHETHER THE OS MAY MERGE THIS PROJECT'S PULL REQUESTS ITSELF, once the panel has
     # accepted the exact commit at the head and CI is green
     # (docs/superpowers/specs/2026-09-14-validated-auto-merge-design.md).
@@ -908,6 +962,186 @@ class InspectConfig:
         DEFAULT_INSPECT_ALARM_CACHE_1H_DISPATCHED_TOKENS
 
 
+# -- `ui_health`: the dashboard's own liveness, and the self-heal that answers it
+#
+# §6 of docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md.
+# EVERY NUMBER HERE CAME OUT OF ONE MEASURED OUTAGE (production, 2026-10-08, ~4h of
+# uptime then every routed page silent for 4 minutes), which is exactly why none of them
+# is a module constant in the code that uses it: the next measurement moves them, and a
+# threshold that needs a release to change is one that stays wrong.
+
+#: Seconds between liveness probes. Matches `REFRESH_SECONDS = 15` (`ui/app.py`), the rate
+#: the dashboard already reloads itself at: a probe rarer than the traffic it watches
+#: learns about the wedge later than the user does, and a much denser one adds threadpool
+#: traffic for nothing.
+DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS = 15
+
+#: How long one probe may wait for the threadpool. ABOVE the slowest legitimate page
+#: measured on the wedge day (`GET /cost 15424ms`), or a healthy-but-busy `/cost` build
+#: reads as a wedge. The real pool was saturated for minutes, not seconds, so waiting
+#: past the worst honest page costs the detector nothing.
+DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS = 20
+
+#: Consecutive failed probes before the process dumps its own stacks. Three at 15s is ~45s
+#: of total page unavailability — past any `/cost` burst, far inside the ~4 minutes the
+#: measured wedge went unanswered (05:38:27 to 05:42:58).
+DEFAULT_UI_HEALTH_TRIP_THRESHOLD = 3
+
+#: The DAEMON's own deadline on `GET /healthz`. Small, because the endpoint touches
+#: nothing: anything slower than a few seconds is itself the finding, and the daemon must
+#: not spend a reconcile tick waiting.
+DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS = 5
+
+#: No self-restart within this long of the last one. Longer than the whole measured
+#: outage, so the real case needs exactly one restart; short enough that a second genuine
+#: wedge the same hour is still healed. Stops a restart loop against a dashboard that
+#: wedges on boot.
+DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS = 300
+
+#: Self-restarts allowed in a rolling 24h. A wedge took ~4 hours of uptime to appear, so
+#: three a day is well above the observed rate and the fourth is evidence of a different,
+#: worse fault that wants the user rather than another restart.
+DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY = 3
+
+
+@dataclass
+class UiHealthConfig:
+    """How the dashboard reports its own wedge, and when the OS restarts it.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_ui_health`): a project naming one key keeps the OS answer for the rest. The
+    dashboard is the OS's own process, so the fleet answer is the one the probe and the
+    daemon read — the per-project block exists because this is a settings namespace like
+    every other and splitting the shape would be the surprise.
+
+    `enabled` is ONE switch for "probe and heal nothing": the probe, the stack dump, the
+    daemon's check and its restart. A second way to turn one thing off is a second way to
+    be surprised by it (`InspectConfig.enabled`'s reason).
+    """
+
+    enabled: bool = True
+    probe_interval_seconds: int = DEFAULT_UI_HEALTH_PROBE_INTERVAL_SECONDS
+    probe_timeout_seconds: int = DEFAULT_UI_HEALTH_PROBE_TIMEOUT_SECONDS
+    trip_threshold: int = DEFAULT_UI_HEALTH_TRIP_THRESHOLD
+    healthz_timeout_seconds: int = DEFAULT_UI_HEALTH_HEALTHZ_TIMEOUT_SECONDS
+    restart_cooldown_seconds: int = DEFAULT_UI_HEALTH_RESTART_COOLDOWN_SECONDS
+    max_restarts_per_day: int = DEFAULT_UI_HEALTH_MAX_RESTARTS_PER_DAY
+
+
+# -- `fleet_health`: when an order that has stopped moving gets investigated. §4 of
+# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+
+#: Ships ON. The sweep makes no model call — its whole cost is indexed reads — and the
+#: spend it can authorise is rationed twice over, by `max_per_day` and by
+#: `worker.investigation_budget_usd`.
+DEFAULT_FLEET_HEALTH_ENABLED = True
+
+#: Minutes in status before one open status is over threshold. THE FIGURE IS THE USER'S,
+#: 2026-10-01: five minutes of idle — no tool call, no script running, no usage-limit hold
+#: — means something is wrong, and thirty minutes of it is unacceptable. `running` is
+#: still judged on time since the last ACTIVITY and not since entry
+#: (`stuck.ACTIVITY_STATUSES`), which is what makes a five-minute number safe for a turn
+#: that is working: a long turn that keeps calling tools is never over threshold.
+#: Neo 1073 set the earlier entries; SUPERSEDED BY THE USER, Neo 1148 accepting.
+DEFAULT_FLEET_HEALTH_THRESHOLDS: dict[str, int] = {
+    "pending": 30,
+    "dispatching": 5,
+    "running": 5,
+    "validating": 15,
+    "needs_review": 60,
+    "waiting_pr_merge": 60,
+    "waiting_input": 60,
+}
+
+#: The answer for an open status the mapping does not name — `idle`, `budget_exhausted`,
+#: and anything added to `WO_STATUSES` later, which is watched on the day it ships rather
+#: than silently unwatched. The user's 2026-10-01 bar, Neo 1148: an unnamed open status
+#: idle for half an hour is reported.
+DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES = 30
+
+#: How long one subject waits before a second investigation, Neo 1073. It holds even when
+#: the fingerprint has changed: "it moved" and "it is better" are not the same claim (§6b).
+DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES = 720
+
+#: Investigations the sweep may open in a day, FLEET-WIDE and counted from the records
+#: themselves (§6c). Neo 1073 set 4; Neo 1148 raised it to 48 under the user's tighter
+#: bar, because at five-minute sensitivity a cap of 4 is spent in the first hour and then
+#: fails CLOSED exactly when a genuinely stuck order appears.
+#: `worker.investigation_budget_usd` is the real money ceiling, so this cap rations
+#: BURSTS rather than the day. The per-subject cooldown
+#: (`DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES`) is unchanged, Neo 1148 explicitly: one stuck
+#: order must not eat the burst.
+DEFAULT_FLEET_HEALTH_MAX_PER_DAY = 48
+
+#: Ticks between sweeps of one project — 5 minutes at the default 5s `poll_interval`.
+#: A CATALOG CONFIG AND NOT A MODULE CONSTANT, per Neo 1086, which overrides §5: the user
+#: has turned down the module-constant precedent before and prefers a per-project config.
+#: 5 minutes and not 30 (Neo 1148): a 30-minute cadence cannot see a 5-minute idle —
+#: detection would lag the threshold by up to six times the threshold itself.
+DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS = 60
+
+#: How long the stuck sweep itself may be silent before the user is told
+#: (`invariants.check_stuck_sweep_alive`, §8) — `OS_HEALTH_SWEEP_DARK_MINUTES`' value and
+#: its reasoning: a daemon restart or one capped tick cannot trip it, and a sweep switched
+#: off by a bad edit is named the same working day. A FLEET number, see
+#: `FLEET_HEALTH_FLEET_ONLY_KEYS`.
+DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES = 180
+
+#: `FleetHealthConfig` fields that are a MAPPING, not a count — `INSPECT_FRACTION_KEYS`'
+#: arrangement. Excluded from the reflective `>= 1` loop and validated per entry instead,
+#: because an unknown status there must be REFUSED naming `OPEN_STATUSES` rather than
+#: silently leaving that status unwatched.
+FLEET_HEALTH_MAP_KEYS = ("thresholds",)
+
+#: `FleetHealthConfig` fields that are a FLEET number and are REFUSED on a project, each
+#: with the reason the refusal states. `max_per_day` rations a fleet-wide daily cap;
+#: `sweep_dark_minutes` bounds the silence of ONE fleet-wide run record
+#: (`Daemon.STUCK_RUN_KEY`). No arrangement of per-project numbers can express either.
+FLEET_HEALTH_FLEET_ONLY_KEYS: dict[str, str] = {
+    "max_per_day": "No arrangement of per-project numbers can ration a fleet-wide "
+                   "daily cap.",
+    "sweep_dark_minutes": "The stuck sweep writes ONE fleet-wide run record, so no "
+                          "arrangement of per-project numbers can say how long that one "
+                          "record may be silent.",
+}
+
+
+@dataclass
+class FleetHealthConfig:
+    """When the OS decides one order has stopped moving, and how often it may say so.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_fleet_health`) — and `thresholds` inherits PER STATUS, so a project naming one
+    status keeps the fleet answer for the other eight (`probes.resolve`'s merge-by-id rule,
+    for its reason).
+
+    `max_per_day` and `sweep_dark_minutes` are FLEET numbers and are refused on a project
+    (`FLEET_HEALTH_FLEET_ONLY_KEYS`): no arrangement of per-project numbers can ration a
+    fleet-wide daily cap, nor bound the silence of one fleet-wide run record.
+
+    There is no money key here and there must not be one — Neo's one condition on 1073.
+    `max_per_day` rations the number of sessions and `worker.investigation_budget_usd`
+    rations each one; two answers to "what may this cost" is how a ceiling stops being
+    checkable.
+    """
+
+    enabled: bool = DEFAULT_FLEET_HEALTH_ENABLED
+    thresholds: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_FLEET_HEALTH_THRESHOLDS))
+    fallback_minutes: int = DEFAULT_FLEET_HEALTH_FALLBACK_MINUTES
+    cooldown_minutes: int = DEFAULT_FLEET_HEALTH_COOLDOWN_MINUTES
+    max_per_day: int = DEFAULT_FLEET_HEALTH_MAX_PER_DAY
+    #: Neo 1086: how often this project is swept, per project rather than a constant.
+    sweep_every_ticks: int = DEFAULT_FLEET_HEALTH_SWEEP_EVERY_TICKS
+    #: Fleet-only: how long the sweep's own run record may be silent (§8).
+    sweep_dark_minutes: int = DEFAULT_FLEET_HEALTH_SWEEP_DARK_MINUTES
+
+    def threshold_seconds(self, status: str) -> float:
+        """This status's threshold, in the seconds `stuck.assess` compares — the named one
+        or the fallback, so every open status has an answer."""
+        return float(self.thresholds.get(status, self.fallback_minutes)) * 60.0
+
+
 # -- `jarvis navigation`: what counts as NAVIGATION, as data rather than code. q1216,
 # §2.3 of
 # docs/superpowers/specs/2026-10-02-subagent-cache-anatomy-and-the-navigation-split.md:
@@ -933,15 +1167,26 @@ DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS = TEXT_SEARCH_TOOLS
 #: Which files make a read a CODE read. `.py` because that is what the 41.3% measured.
 DEFAULT_NAVIGATION_CODE_SUFFIXES = SOURCE_SUFFIXES
 
+#: Which files make a read a DOC read. A sibling of `code_suffixes`, never a widening of
+#: it: `navigates_source`'s meaning is the fleet's published baseline (§2.2). Data rather
+#: than code so re-measuring needs no release.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_SUFFIXES = DOC_SUFFIXES
+
+#: The Bash commands that DUMP a doc. `grep`/`rg`/`find` are absent by decision — text
+#: search in markdown stays legal and counting it would price a legitimate call as waste.
+#: docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS = DOC_DUMP_COMMANDS
+
 #: The default window for a wide scope, in days. Seven, for
 #: `DEFAULT_INSPECT_ALARM_REWRITE_WINDOW_DAYS`' reason: a share averaged over all history
 #: reports the trend away, and the trend is the whole question after `worker.bash_first`.
 DEFAULT_NAVIGATION_WINDOW_DAYS = 7
 
 #: The `NavigationConfig` fields that are a PATTERN LIST, so `_parse_navigation` can
-#: refuse all four the same way. An empty one reports 0% everywhere and looks like a win.
+#: refuse all six the same way. An empty one reports 0% everywhere and looks like a win.
 NAVIGATION_PATTERN_KEYS = ("bash_commands", "symbol_tools", "text_search_tools",
-                           "code_suffixes")
+                           "code_suffixes", "doc_suffixes", "doc_dump_commands")
 
 
 @dataclass
@@ -961,14 +1206,92 @@ class NavigationConfig:
     symbol_tools: tuple[str, ...] = DEFAULT_NAVIGATION_SYMBOL_TOOLS
     text_search_tools: tuple[str, ...] = DEFAULT_NAVIGATION_TEXT_SEARCH_TOOLS
     code_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_CODE_SUFFIXES
+    doc_suffixes: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_SUFFIXES
+    doc_dump_commands: tuple[str, ...] = DEFAULT_NAVIGATION_DOC_DUMP_COMMANDS
     window_days: int = DEFAULT_NAVIGATION_WINDOW_DAYS
+
+
+#: Shipped defaults of `CostConfig`. The usage week resets Monday 21:00
+#: America/Los_Angeles — VERIFIED: Mon 2026-09-28 21:00 PDT = 2026-09-29 04:00 UTC.
+DEFAULT_COST_WEEK_RESET_WEEKDAY = 0        # Monday, `datetime.weekday()` numbering
+DEFAULT_COST_WEEK_RESET_HOUR = 21
+DEFAULT_COST_WEEK_RESET_ZONE = "America/Los_Angeles"
+DEFAULT_COST_PERCENTILE = 0.9
+DEFAULT_COST_MAX_ORDERS = 500
+#: The `chars` fallback's divisor, where the exact `context-delta` basis does not apply.
+#: A model-family property the OS does not control, and UNCALIBRATED against the fleet —
+#: which is why every figure derived from it reports its `token_basis` counts beside it.
+DEFAULT_COST_CHARS_PER_TOKEN = 4.0
+DEFAULT_COST_TOOL_ROWS = 20
+#: The 5h grid's length, a SLICE OF THE WEEK and not Anthropic's session accounting —
+#: §2 of docs/superpowers/specs/2026-10-07-cost-window-selector.md.
+DEFAULT_COST_SESSION_WINDOW_HOURS = 5.0
+#: The usage meter — §§4, 5 and 8 of
+#: docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md. Settings
+#: rather than module constants for the standing rider's reason: every one of them is a
+#: belief about an account the OS does not control.
+DEFAULT_COST_METER_NEAREST_SECONDS = 300
+DEFAULT_COST_METER_CALIBRATION_MIN_MINUTES = 30
+DEFAULT_COST_METER_CALIBRATION_MIN_POINTS = 5
+DEFAULT_COST_METER_CALIBRATION_DAYS = 7
+#: Measured on this machine 2026-10-08: ~$0.82 of list-price spend per 5h point. The
+#: SEED, labelled as one everywhere it is shown and never printed as a measurement.
+DEFAULT_COST_METER_DOLLARS_PER_POINT = 0.82
+#: Fifteen consecutive failed minutes is a broken token or a broken network, where three
+#: is a blip.
+DEFAULT_COST_METER_STALE_MINUTES = 15
+DEFAULT_COST_METER_GAP_NOTICE_SAMPLES = 10
+#: Rows of the outside-session table SHOWN. The cap is on rows, never on the dollars
+#: counted: the remainder stays in `total_usd` and is disclosed as `n` (§9).
+DEFAULT_COST_METER_OUTSIDE_ROWS = 10
+#: The two alarm shares and the floor under both (§8). A quarter of a $1 window is 25
+#: cents, and alarming on it would teach the user to ignore the alarm.
+DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE = 0.25
+DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE = 0.25
+DEFAULT_COST_METER_ALERT_MIN_USD = 5.0
+
+
+@dataclass
+class CostConfig:
+    """What `jarvis cost --fleet` reports over, and where its default window starts.
+
+    Per project as well as fleet-wide, with `_parse_cost`'s field-level inheritance: a
+    project naming one key keeps the OS answer for the rest. Neo's rider on
+    wo-38456776 — no module constant for anything tunable — and the reason is that all
+    eight of these move: a DST shift and an Anthropic policy change both move the reset,
+    what counts as the tail of the distribution differs by project, and the tokens-per-
+    character of a model family is Anthropic's to change.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md, and §10.10
+    of its per-tool addendum for the last two.
+    """
+
+    week_reset_weekday: int = DEFAULT_COST_WEEK_RESET_WEEKDAY
+    week_reset_hour: int = DEFAULT_COST_WEEK_RESET_HOUR
+    week_reset_zone: str = DEFAULT_COST_WEEK_RESET_ZONE
+    percentile: float = DEFAULT_COST_PERCENTILE
+    max_orders: int = DEFAULT_COST_MAX_ORDERS
+    chars_per_token: float = DEFAULT_COST_CHARS_PER_TOKEN
+    tool_rows: int = DEFAULT_COST_TOOL_ROWS
+    session_window_hours: float = DEFAULT_COST_SESSION_WINDOW_HOURS
+    meter_nearest_seconds: int = DEFAULT_COST_METER_NEAREST_SECONDS
+    meter_calibration_min_minutes: int = DEFAULT_COST_METER_CALIBRATION_MIN_MINUTES
+    meter_calibration_min_points: float = DEFAULT_COST_METER_CALIBRATION_MIN_POINTS
+    meter_calibration_days: int = DEFAULT_COST_METER_CALIBRATION_DAYS
+    meter_dollars_per_point: float = DEFAULT_COST_METER_DOLLARS_PER_POINT
+    meter_stale_minutes: int = DEFAULT_COST_METER_STALE_MINUTES
+    meter_gap_notice_samples: int = DEFAULT_COST_METER_GAP_NOTICE_SAMPLES
+    meter_outside_rows: int = DEFAULT_COST_METER_OUTSIDE_ROWS
+    meter_outside_alert_share: float = DEFAULT_COST_METER_OUTSIDE_ALERT_SHARE
+    meter_residual_alert_share: float = DEFAULT_COST_METER_RESIDUAL_ALERT_SHARE
+    meter_alert_min_usd: float = DEFAULT_COST_METER_ALERT_MIN_USD
 
 
 #: The legal observability levels and the shipped default, as LITERALS. `observability.py`
 #: owns the vocabulary (`observability.LEVELS`) and asserts the same three; the strings are
 #: repeated here rather than imported so the dependency runs one way only — that module
 #: reads a config object and catalog importing it back would be the cycle.
-#: docs/specs/2026-09-24-order-observability.md §10.
+#: docs/superpowers/specs/2026-09-24-order-observability.md §10.
 OBSERVABILITY_LEVELS = ("off", "normal", "full")
 DEFAULT_OBSERVABILITY_LEVEL = "normal"
 
@@ -976,14 +1299,14 @@ DEFAULT_OBSERVABILITY_LEVEL = "normal"
 @dataclass
 class ObservabilityConfig:
     """What debug data Jarvis COLLECTS. §10 of
-    docs/specs/2026-09-24-order-observability.md.
+    docs/superpowers/specs/2026-09-24-order-observability.md.
 
     Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
     (`_parse_observability`), and a per-order override on `work_orders.observability`
     beats both — precedence resolved in one place, `observability.level_for`.
 
     `off` GATES TWO WRITES: §5's per-turn ingredient row on `wo_turns.context_json` and
-    the sealed autopsy (§5 of docs/specs/2026-09-27-order-autopsy-durability.md). So `off`
+    the sealed autopsy (§5 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). So `off`
     stops the autopsy being sealed and does NOT disable `jarvis watch`, `jarvis inspect`,
     `jarvis wo why` or the debug page — those are arithmetic over files that already
     exist, so gating them would remove the view and save nothing. The consequence at
@@ -991,7 +1314,7 @@ class ObservabilityConfig:
     context` says it was not recorded.
 
     `full` DIFFERS FROM `normal` BY EXACTLY ONE THING: the tool parameters a `full` seal
-    retains (§6 of docs/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
+    retains (§6 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). The autopsy READING
     itself — every turn, its tools, its token classes, its context total, delta, peak and
     composition — is derived at read time from the transcript (§§3, 4, 6, 7) and so is
     shown for every order at every level, `off` included.
@@ -1045,6 +1368,23 @@ class BugsConfig:
     """
 
     label: str = DEFAULT_BUGS_LABEL
+
+
+#: How far back `Daemon.refile_dropped_fixes` looks. A release order settles within minutes
+#: to hours of its batch landing; two weeks covers one the user leaves over a holiday.
+DEFAULT_RELEASE_REFILE_WINDOW_DAYS = 14
+
+
+@dataclass
+class ReleaseConfig:
+    """How long a settled release order's dropped batch stays worth re-filing.
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance:
+    the answer is a claim about THIS project's release cadence, and a project that ships
+    weekly has a different one from a project that ships twice a year.
+    """
+
+    refile_window_days: int = DEFAULT_RELEASE_REFILE_WINDOW_DAYS
 
 
 @dataclass
@@ -1243,6 +1583,27 @@ class RemedyConfig:
 
 
 @dataclass
+class RulesConfig:
+    """Whether the self-evolution registry is EVALUATED at all. §5.2 of
+    docs/superpowers/specs/2026-09-27-self-evolution.md.
+
+    SHIPS OFF, and off means `Daemon.rules_tick` returns before it reads anything — not
+    "runs in dry run". The distinction matters because the detectors themselves are
+    already in `dry_run` and a reader who saw the pass running would reasonably conclude
+    the fleet had opted in to the feature when all it had done was upgrade. `jarvis rules
+    list` says which of the two it is, and that sentence is the only thing standing
+    between "no rule has ever matched" and "nothing has ever looked".
+
+    Per project as well as fleet-wide, with `_parse_inspect`'s field-level inheritance
+    (`_parse_rules`): a project that names one key keeps the OS answer for the rest. One
+    field today, and the shape is the house one so the arming threshold and the remedy
+    allow-list §6 adds do not arrive as a second config object.
+    """
+
+    enabled: bool = False
+
+
+@dataclass
 class SupervisorConfig:
     """The agent that reviews a cost alarm and either acks it or wants Neo — §2.
 
@@ -1308,12 +1669,17 @@ class ProjectSpec:
     # docs/superpowers/specs/2026-08-27-the-config-console.md §1.2.
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    ui_health: UiHealthConfig = field(default_factory=UiHealthConfig)
+    fleet_health: FleetHealthConfig = field(default_factory=FleetHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    rules: RulesConfig = field(default_factory=RulesConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1393,6 +1759,10 @@ class OsConfig:
     default_tool_search: str = DEFAULT_WORKER_TOOL_SEARCH
     # Spec 2026-10-02-serena-the-cheap-path.md §6 — see VALID_PY_NAV_HOOK.
     default_py_nav_hook: str = DEFAULT_WORKER_PY_NAV_HOOK
+    # Spec 2026-10-06-navigate-specs-like-code.md §5 — see VALID_DOC_NAV_HOOK.
+    default_doc_nav_hook: str = DEFAULT_WORKER_DOC_NAV_HOOK
+    # Its bar, fleet-wide — see DEFAULT_WORKER_DOC_READ_LIMIT_LINES.
+    default_doc_read_limit_lines: int = DEFAULT_WORKER_DOC_READ_LIMIT_LINES
     default_max_concurrent: int = DEFAULT_MAX_CONCURRENT
     #: Fleet-wide worker turns in flight. No `ProjectSpec` twin on purpose — see
     #: DEFAULT_MAX_IN_FLIGHT.
@@ -1438,12 +1808,17 @@ class OsConfig:
     neo: NeoConfig = field(default_factory=NeoConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     inspect: InspectConfig = field(default_factory=InspectConfig)
+    ui_health: UiHealthConfig = field(default_factory=UiHealthConfig)
+    fleet_health: FleetHealthConfig = field(default_factory=FleetHealthConfig)
     navigation: NavigationConfig = field(default_factory=NavigationConfig)
+    cost: CostConfig = field(default_factory=CostConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     concision: ConcisionConfig = field(default_factory=ConcisionConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    rules: RulesConfig = field(default_factory=RulesConfig)
     messaging: MessagingConfig = field(default_factory=MessagingConfig)
     bugs: BugsConfig = field(default_factory=BugsConfig)
+    release: ReleaseConfig = field(default_factory=ReleaseConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     wiring: WiringConfig = field(default_factory=WiringConfig)
     worktree: WorktreeConfig = field(default_factory=WorktreeConfig)
@@ -1601,6 +1976,25 @@ def _autocompact_or_err(raw: dict[str, Any], key: str, where: str,
         raise _err(str(e)) from e
 
 
+def _doc_read_limit_or_err(raw: dict[str, Any], where: str, default: int) -> int:
+    """`worker.doc_read_limit_lines`: an int ABOVE ZERO, and the message names the key.
+
+    §5.3 of docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md. This is where a bad value
+    is rejected LOUDLY; `hooks.doc_nav_decision` absorbs one quietly, because it runs on
+    every tool call and a hook that raises breaks the whole session. Both are needed:
+    validation cannot see a settings file edited by hand.
+    """
+    value = raw.get("doc_read_limit_lines", default)
+    try:
+        lines = int(value)
+    except (TypeError, ValueError) as e:
+        raise _err(f"{where} must be a whole number of lines, got {value!r}") from e
+    if lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"{where} must be >= {WORKER_DOC_READ_LIMIT_LINES_MIN} (lines — zero "
+                   f"or less would refuse every targeted read), got {lines}")
+    return lines
+
+
 def load_catalog(path: str | Path) -> Catalog:
     path = Path(path).expanduser()
     if not path.exists():
@@ -1721,6 +2115,11 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         # falling back would read as the feature being off.
         raise _err(f"{where}.stakes_classifier is {stakes_classifier!r}, which is not "
                    f"one of {list(STAKES_CLASSIFIER_MODES)}")
+    feature_merge_wait_minutes = int(
+        raw.get("feature_merge_wait_minutes", base.feature_merge_wait_minutes))
+    if feature_merge_wait_minutes < 0:
+        # 0 is legal and means "never defer": check once, flag immediately.
+        raise _err(f"{where}.feature_merge_wait_minutes must be >= 0")
     max_follow_ups = int(raw.get("max_follow_ups", base.max_follow_ups))
     if max_follow_ups < 0:
         # 0 is legal and is NOT the same setting as `follow_ups: false`: it files
@@ -1737,6 +2136,7 @@ def _parse_validation(raw: Any, base: ValidationConfig | None = None,
         decision_record_chars=decision_record_chars,
         confirm_diff_chars=confirm_diff_chars,
         feature_units=bool(raw.get("feature_units", base.feature_units)),
+        feature_merge_wait_minutes=feature_merge_wait_minutes,
         # Same field-level fallback as every flag in this block — see `auto_merge` below.
         follow_ups=bool(raw.get("follow_ups", base.follow_ups)),
         max_follow_ups=max_follow_ups,
@@ -1826,6 +2226,93 @@ def _parse_inspect(raw: Any, base: InspectConfig | None = None,
     return cfg
 
 
+def _parse_ui_health(raw: Any, base: UiHealthConfig | None = None,
+                     where: str = "os.ui_health") -> UiHealthConfig:
+    """`os.ui_health`, or a project's override of it — `_parse_inspect`'s shape exactly.
+
+    Field-level inheritance (kn-6ca2bcd9): `os.ui_health` parses against the shipped
+    defaults and each project against the OS answer, so a project naming one key inherits
+    the rest and no caller consults two objects.
+
+    ONE vocabulary here, unlike `_parse_inspect`: every field is a count or a duration,
+    so every one is refused below 1 rather than clamped. Zero means something different
+    and wrong in each of them — a probe that never sleeps, a timeout that always expires,
+    a trip on the first hiccup, a cooldown that allows a restart loop, a cap that can
+    never heal — and all of them arrive by a typo in a `jarvis config set`, so it is
+    caught where the message can name the key.
+    """
+    base = base or UiHealthConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = UiHealthConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        probe_interval_seconds=int(raw.get("probe_interval_seconds",
+                                           base.probe_interval_seconds)),
+        probe_timeout_seconds=int(raw.get("probe_timeout_seconds",
+                                          base.probe_timeout_seconds)),
+        trip_threshold=int(raw.get("trip_threshold", base.trip_threshold)),
+        healthz_timeout_seconds=int(raw.get("healthz_timeout_seconds",
+                                            base.healthz_timeout_seconds)),
+        restart_cooldown_seconds=int(raw.get("restart_cooldown_seconds",
+                                             base.restart_cooldown_seconds)),
+        max_restarts_per_day=int(raw.get("max_restarts_per_day",
+                                         base.max_restarts_per_day)),
+    )
+    for name, value in vars(cfg).items():
+        if name != "enabled" and value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
+def _parse_fleet_health(raw: Any, base: FleetHealthConfig | None = None,
+                        where: str = "os.fleet_health") -> FleetHealthConfig:
+    """`os.fleet_health`, or a project's override of it — `_parse_inspect`'s shape.
+
+    Field-level inheritance, and `thresholds` inherits per STATUS rather than whole: a
+    project disabling one threshold must not drop the other eight.
+
+    Three refusals, each where the message can name the key — `GateConfig.parse`'s rule
+    that a typo must not silently leave a status unwatched, and `fleet.py`'s opening
+    paragraph for the third.
+    """
+    from .project_store import OPEN_STATUSES
+
+    base = base or FleetHealthConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    if where != "os.fleet_health":
+        for key, why in FLEET_HEALTH_FLEET_ONLY_KEYS.items():
+            if key in raw:
+                raise _err(f"{where}.{key} is a FLEET number — set "
+                           f"os.fleet_health.{key}. {why}")
+    thresholds = dict(base.thresholds)
+    named = raw.get("thresholds", {})
+    if not isinstance(named, dict):
+        raise _err(f'"{where}.thresholds" must be an object')
+    for status, minutes in named.items():
+        if status not in OPEN_STATUSES:
+            raise _err(f"{where}.thresholds: {status!r} is not an open status "
+                       f"(known: {sorted(OPEN_STATUSES)})")
+        if int(minutes) < 1:
+            raise _err(f"{where}.thresholds.{status} must be >= 1")
+        thresholds[status] = int(minutes)
+    cfg = FleetHealthConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        thresholds=thresholds,
+        fallback_minutes=int(raw.get("fallback_minutes", base.fallback_minutes)),
+        cooldown_minutes=int(raw.get("cooldown_minutes", base.cooldown_minutes)),
+        max_per_day=int(raw.get("max_per_day", base.max_per_day)),
+        sweep_every_ticks=int(raw.get("sweep_every_ticks", base.sweep_every_ticks)),
+        sweep_dark_minutes=int(raw.get("sweep_dark_minutes", base.sweep_dark_minutes)),
+    )
+    for name, value in vars(cfg).items():
+        if name in FLEET_HEALTH_MAP_KEYS or name == "enabled":
+            continue
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
+
+
 def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
                       where: str = "os.navigation") -> NavigationConfig:
     """`os.navigation`, or a project's override of it — `_parse_inspect`'s field-level
@@ -1859,14 +2346,128 @@ def _parse_navigation(raw: Any, base: NavigationConfig | None = None,
         symbol_tools=patterns("symbol_tools", base.symbol_tools),
         text_search_tools=patterns("text_search_tools", base.text_search_tools),
         code_suffixes=patterns("code_suffixes", base.code_suffixes),
+        # docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md §3.2.
+        doc_suffixes=patterns("doc_suffixes", base.doc_suffixes),
+        doc_dump_commands=patterns("doc_dump_commands", base.doc_dump_commands),
         window_days=int(raw.get("window_days", base.window_days)),
     )
     if cfg.window_days < 1:
         raise _err(f"{where}.window_days must be >= 1")
-    for suffix in cfg.code_suffixes:
-        if not suffix.startswith("."):
-            raise _err(f'"{where}.code_suffixes" entries must start with a dot — '
-                       f"{suffix!r} matches no path")
+    for name in ("code_suffixes", "doc_suffixes"):
+        for suffix in getattr(cfg, name):
+            if not suffix.startswith("."):
+                raise _err(f'"{where}.{name}" entries must start with a dot — '
+                           f"{suffix!r} matches no path")
+    return cfg
+
+
+def _parse_cost(raw: Any, base: CostConfig | None = None,
+                where: str = "os.cost") -> CostConfig:
+    """`os.cost`, or a project's override of it, with absurd values refused.
+
+    `base` is the same field-level inheritance `_parse_inspect` uses (kn-6ca2bcd9):
+    `os.cost` parses against the shipped defaults and each project parses against the OS
+    answer, so no caller consults two objects.
+
+    THE FOUR VOCABULARIES ARE KEPT APART because `_parse_inspect`'s ">= 1" rule serves
+    none of them. A WEEKDAY is 0..6 and a reset HOUR is 0..23 — zero is LEGAL in both,
+    and ">= 1" would reject Monday and midnight. A PERCENTILE is refused outside
+    `(0, 1)`, both ends exclusive: 0 names no observation and 1 is the maximum, which the
+    report already carries beside it. A COUNT of orders to walk is refused below 1, where
+    zero would report an empty distribution rather than fail. A ZONE must construct a
+    `ZoneInfo` or the window is silently wrong every week, so it is refused naming the
+    value typed. A DIVISOR (`chars_per_token`) is refused at or below zero, where the
+    rule is not ">= 1" because 3.5 characters per token is a legal belief about a model
+    family; a ROW COUNT (`tool_rows`) takes the count rule.
+
+    Spec §6 of docs/superpowers/specs/2026-10-06-fleet-cost-distribution.md.
+    """
+    base = base or CostConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = CostConfig(
+        week_reset_weekday=int(raw.get("week_reset_weekday", base.week_reset_weekday)),
+        week_reset_hour=int(raw.get("week_reset_hour", base.week_reset_hour)),
+        week_reset_zone=str(raw.get("week_reset_zone", base.week_reset_zone)),
+        percentile=float(raw.get("percentile", base.percentile)),
+        max_orders=int(raw.get("max_orders", base.max_orders)),
+        chars_per_token=float(raw.get("chars_per_token", base.chars_per_token)),
+        tool_rows=int(raw.get("tool_rows", base.tool_rows)),
+        session_window_hours=float(raw.get("session_window_hours",
+                                           base.session_window_hours)),
+        meter_nearest_seconds=int(raw.get("meter_nearest_seconds",
+                                          base.meter_nearest_seconds)),
+        meter_calibration_min_minutes=int(raw.get(
+            "meter_calibration_min_minutes", base.meter_calibration_min_minutes)),
+        meter_calibration_min_points=float(raw.get(
+            "meter_calibration_min_points", base.meter_calibration_min_points)),
+        meter_calibration_days=int(raw.get("meter_calibration_days",
+                                           base.meter_calibration_days)),
+        meter_dollars_per_point=float(raw.get("meter_dollars_per_point",
+                                              base.meter_dollars_per_point)),
+        meter_stale_minutes=int(raw.get("meter_stale_minutes",
+                                        base.meter_stale_minutes)),
+        meter_gap_notice_samples=int(raw.get("meter_gap_notice_samples",
+                                             base.meter_gap_notice_samples)),
+        meter_outside_rows=int(raw.get("meter_outside_rows", base.meter_outside_rows)),
+        meter_outside_alert_share=float(raw.get("meter_outside_alert_share",
+                                                base.meter_outside_alert_share)),
+        meter_residual_alert_share=float(raw.get("meter_residual_alert_share",
+                                                 base.meter_residual_alert_share)),
+        meter_alert_min_usd=float(raw.get("meter_alert_min_usd",
+                                          base.meter_alert_min_usd)),
+    )
+    if not 0 <= cfg.week_reset_weekday <= 6:
+        raise _err(f"{where}.week_reset_weekday must be 0..6 (0 = Monday) — "
+                   f"{cfg.week_reset_weekday} is not a day of the week")
+    if not 0 <= cfg.week_reset_hour <= 23:
+        raise _err(f"{where}.week_reset_hour must be 0..23 — {cfg.week_reset_hour} is "
+                   f"not an hour of the day")
+    if not 0 < cfg.percentile < 1:
+        raise _err(f"{where}.percentile must be strictly inside (0, 1) — "
+                   f"{cfg.percentile} names either no observation or the maximum, which "
+                   f"the report already reports beside it")
+    if cfg.max_orders < 1:
+        raise _err(f"{where}.max_orders must be >= 1")
+    if cfg.chars_per_token <= 0:
+        raise _err(f"{where}.chars_per_token must be > 0 — {cfg.chars_per_token} is not "
+                   f"a divisor, and a negative one would report negative tokens")
+    if cfg.tool_rows < 1:
+        raise _err(f"{where}.tool_rows must be >= 1")
+    # A LENGTH, not a count: 2.5 hours is a legal belief about the grid, so the test is
+    # strictly positive (§7 of the window-selector spec).
+    if cfg.session_window_hours <= 0:
+        raise _err(f"{where}.session_window_hours must be > 0 — "
+                   f"{cfg.session_window_hours} is not a length of time")
+    # The meter's seven. Each takes the vocabulary it belongs to: LENGTHS and a DIVISOR
+    # are refused at or below zero, COUNTS below 1 (§§4, 5, 8 of the usage-meter spec).
+    for name in ("meter_nearest_seconds", "meter_calibration_min_minutes",
+                 "meter_calibration_min_points", "meter_calibration_days",
+                 "meter_dollars_per_point"):
+        if getattr(cfg, name) <= 0:
+            raise _err(f"{where}.{name} must be > 0 — {getattr(cfg, name)} is not a "
+                       f"length, a count of points or a price")
+    for name in ("meter_stale_minutes", "meter_gap_notice_samples",
+                 "meter_outside_rows"):
+        if getattr(cfg, name) < 1:
+            raise _err(f"{where}.{name} must be >= 1 — zero would fire on the first "
+                       f"failed read, which is a blip and not an outage")
+    # A SHARE of the implied spend, so strictly inside (0, 1]: zero alarms on every
+    # window and above one can never fire (§8).
+    for name in ("meter_outside_alert_share", "meter_residual_alert_share"):
+        if not 0 < getattr(cfg, name) <= 1:
+            raise _err(f"{where}.{name} must be inside (0, 1] — {getattr(cfg, name)} "
+                       f"is not a share of the implied spend")
+    # A FLOOR in dollars, and zero is legal: it means every window is big enough.
+    if cfg.meter_alert_min_usd < 0:
+        raise _err(f"{where}.meter_alert_min_usd must be >= 0 — "
+                   f"{cfg.meter_alert_min_usd} is not an amount of money")
+    try:
+        zoneinfo.ZoneInfo(cfg.week_reset_zone)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+        raise _err(f"{where}.week_reset_zone {cfg.week_reset_zone!r} is not a time zone "
+                   f"this system knows ({e}) — the usage week would start at the wrong "
+                   f"instant every week") from e
     return cfg
 
 
@@ -1887,6 +2488,19 @@ def _parse_observability(raw: Any, base: ObservabilityConfig | None = None,
         raise _err(f"{where}.level {level!r} not in "
                    f"{list(OBSERVABILITY_LEVELS)}")
     return ObservabilityConfig(level=level)
+
+
+def _parse_rules(raw: Any, base: RulesConfig | None = None,
+                 where: str = "os.rules") -> RulesConfig:
+    """`os.rules`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Nothing to validate beyond the shape: one boolean, whose default is the shipped
+    `False` when neither the fleet nor the project names it.
+    """
+    base = base or RulesConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    return RulesConfig(enabled=bool(raw.get("enabled", base.enabled)))
 
 
 def _parse_concision(raw: Any, base: ConcisionConfig | None = None,
@@ -1938,6 +2552,26 @@ def _parse_bugs(raw: Any, base: BugsConfig | None = None,
         raise _err(f"{where}.label must start with a letter or digit and use only "
                    f"letters, digits, spaces and ._:/- (got {label!r})")
     return BugsConfig(label=label)
+
+
+def _parse_release(raw: Any, base: ReleaseConfig | None = None,
+                   where: str = "os.release") -> ReleaseConfig:
+    """`os.release`, or a project's override of it — field-level, like `_parse_inspect`.
+
+    Refused rather than clamped below 1, for that function's reason: a window of 0 days
+    means the sweep can never see anything, and it arrives by a typo in a
+    `jarvis config set` that this is the last place able to name.
+    """
+    base = base or ReleaseConfig()
+    if not isinstance(raw, dict):
+        raise _err(f'"{where}" must be an object')
+    cfg = ReleaseConfig(
+        refile_window_days=int(raw.get("refile_window_days", base.refile_window_days)),
+    )
+    for name, value in vars(cfg).items():
+        if value < 1:
+            raise _err(f"{where}.{name} must be >= 1")
+    return cfg
 
 
 def _parse_messaging(raw: Any, base: MessagingConfig | None = None,
@@ -2243,6 +2877,11 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         default_tool_search=defaults.get("tool_search", DEFAULT_WORKER_TOOL_SEARCH),
         # Spec 2026-10-02-serena-the-cheap-path.md §6.
         default_py_nav_hook=defaults.get("py_nav_hook", DEFAULT_WORKER_PY_NAV_HOOK),
+        # Spec 2026-10-06-navigate-specs-like-code.md §5.
+        default_doc_nav_hook=defaults.get("doc_nav_hook", DEFAULT_WORKER_DOC_NAV_HOOK),
+        default_doc_read_limit_lines=_doc_read_limit_or_err(
+            defaults, "os.defaults.doc_read_limit_lines",
+            DEFAULT_WORKER_DOC_READ_LIMIT_LINES),
         default_max_concurrent=int(defaults.get("max_concurrent", DEFAULT_MAX_CONCURRENT)),
         max_in_flight=int(defaults.get("max_in_flight", DEFAULT_MAX_IN_FLIGHT)),
         default_autocompact_window=_autocompact_or_err(
@@ -2274,12 +2913,17 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         neo=neo_cfg,
         validation=_parse_validation(os_raw.get("validation", {})),
         inspect=_parse_inspect(os_raw.get("inspect", {})),
+        ui_health=_parse_ui_health(os_raw.get("ui_health", {})),
+        fleet_health=_parse_fleet_health(os_raw.get("fleet_health", {})),
         navigation=_parse_navigation(os_raw.get("navigation", {})),
+        cost=_parse_cost(os_raw.get("cost", {})),
         observability=_parse_observability(os_raw.get("observability", {})),
         concision=_parse_concision(os_raw.get("concision", {})),
         supervisor=_parse_supervisor(os_raw.get("supervisor", {})),
+        rules=_parse_rules(os_raw.get("rules", {})),
         messaging=_parse_messaging(os_raw.get("messaging", {})),
         bugs=_parse_bugs(os_raw.get("bugs", {})),
+        release=_parse_release(os_raw.get("release", {})),
         schedule=_parse_schedule(os_raw.get("schedule", {})),
         wiring=_parse_wiring(os_raw.get("wiring", {})),
         worktree=_parse_worktree(os_raw.get("worktree", {})),
@@ -2298,6 +2942,14 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
     if os_cfg.default_py_nav_hook not in VALID_PY_NAV_HOOK:
         raise _err(f"os.defaults.py_nav_hook {os_cfg.default_py_nav_hook!r} not in "
                    f"{sorted(VALID_PY_NAV_HOOK)}")
+    # Spec 2026-10-06-navigate-specs-like-code.md §5.
+    if os_cfg.default_doc_nav_hook not in VALID_DOC_NAV_HOOK:
+        raise _err(f"os.defaults.doc_nav_hook {os_cfg.default_doc_nav_hook!r} not in "
+                   f"{sorted(VALID_DOC_NAV_HOOK)}")
+    if os_cfg.default_doc_read_limit_lines < WORKER_DOC_READ_LIMIT_LINES_MIN:
+        raise _err(f"os.defaults.doc_read_limit_lines must be >= "
+                   f"{WORKER_DOC_READ_LIMIT_LINES_MIN}, got "
+                   f"{os_cfg.default_doc_read_limit_lines}")
     if os_cfg.default_max_concurrent < 1:
         raise _err("os.defaults.max_concurrent must be >= 1")
     if os_cfg.max_in_flight < 1:
@@ -2348,6 +3000,15 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         if py_nav_hook not in VALID_PY_NAV_HOOK:
             raise _err(f"project {name}: worker.py_nav_hook {py_nav_hook!r} not in "
                        f"{sorted(VALID_PY_NAV_HOOK)}")
+        # Spec 2026-10-06-navigate-specs-like-code.md §5 — this message IS what
+        # `jarvis config set <project> worker.doc_nav_hook` shows.
+        doc_nav_hook = w.get("doc_nav_hook", os_cfg.default_doc_nav_hook)
+        if doc_nav_hook not in VALID_DOC_NAV_HOOK:
+            raise _err(f"project {name}: worker.doc_nav_hook {doc_nav_hook!r} not in "
+                       f"{sorted(VALID_DOC_NAV_HOOK)}")
+        doc_read_limit_lines = _doc_read_limit_or_err(
+            w, f"project {name}: worker.doc_read_limit_lines",
+            os_cfg.default_doc_read_limit_lines)
         max_conc = int(p.get("max_concurrent", os_cfg.default_max_concurrent))
         if max_conc < 1:
             raise _err(f"project {name}: max_concurrent must be >= 1")
@@ -2368,6 +3029,8 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
             bash_first=bash_first,
             tool_search=tool_search,
             py_nav_hook=py_nav_hook,
+            doc_nav_hook=doc_nav_hook,
+            doc_read_limit_lines=doc_read_limit_lines,
             append_system_prompt=w.get("append_system_prompt"),
             autocompact_window=_autocompact_or_err(
                 w, "autocompact_window",
@@ -2400,9 +3063,18 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         inspect_cfg = _parse_inspect(
             p.get("inspect", {}), base=os_cfg.inspect,
             where=f"projects[{i}] ({name}).inspect")
+        ui_health_cfg = _parse_ui_health(
+            p.get("ui_health", {}), base=os_cfg.ui_health,
+            where=f"projects[{i}] ({name}).ui_health")
+        fleet_health_cfg = _parse_fleet_health(
+            p.get("fleet_health", {}), base=os_cfg.fleet_health,
+            where=f"projects[{i}] ({name}).fleet_health")
         navigation_cfg = _parse_navigation(
             p.get("navigation", {}), base=os_cfg.navigation,
             where=f"projects[{i}] ({name}).navigation")
+        cost_cfg = _parse_cost(
+            p.get("cost", {}), base=os_cfg.cost,
+            where=f"projects[{i}] ({name}).cost")
         observability_cfg = _parse_observability(
             p.get("observability", {}), base=os_cfg.observability,
             where=f"projects[{i}] ({name}).observability")
@@ -2412,12 +3084,18 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
         supervisor_cfg = _parse_supervisor(
             p.get("supervisor", {}), base=os_cfg.supervisor,
             where=f"projects[{i}] ({name}).supervisor")
+        rules_cfg = _parse_rules(
+            p.get("rules", {}), base=os_cfg.rules,
+            where=f"projects[{i}] ({name}).rules")
         messaging_cfg = _parse_messaging(
             p.get("messaging", {}), base=os_cfg.messaging,
             where=f"projects[{i}] ({name}).messaging")
         bugs_cfg = _parse_bugs(
             p.get("bugs", {}), base=os_cfg.bugs,
             where=f"projects[{i}] ({name}).bugs")
+        release_cfg = _parse_release(
+            p.get("release", {}), base=os_cfg.release,
+            where=f"projects[{i}] ({name}).release")
         schedule_cfg = _parse_schedule(
             p.get("schedule", {}), base=os_cfg.schedule,
             where=f"projects[{i}] ({name}).schedule")
@@ -2439,12 +3117,17 @@ def parse_catalog(data: Any, source_path: Path | None = None) -> Catalog:
                 gates=gate_cfg,
                 validation=validation_cfg,
                 inspect=inspect_cfg,
+                ui_health=ui_health_cfg,
+                fleet_health=fleet_health_cfg,
                 navigation=navigation_cfg,
+                cost=cost_cfg,
                 observability=observability_cfg,
                 concision=concision_cfg,
                 supervisor=supervisor_cfg,
+                rules=rules_cfg,
                 messaging=messaging_cfg,
                 bugs=bugs_cfg,
+                release=release_cfg,
                 schedule=schedule_cfg,
                 wiring=wiring_cfg,
                 worktree=worktree_cfg,

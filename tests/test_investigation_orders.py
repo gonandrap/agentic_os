@@ -14,12 +14,18 @@ exists to protect, in the spec's own order of how much they matter:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
+# The stuck sweep's fixtures and back-dating helpers, shared rather than redeclared: what
+# the sweep files is what this file is about.
+from test_health_sweep import (HOUR, park_order, stuck_catalog,  # noqa: F401
+                               stuck_os)
 
 from jarvis import claude_cli, cli, dispatch, hooks, ops, project_store, verdicts
 from jarvis.catalog import load_catalog
+from jarvis.daemon import Daemon
 from jarvis.project_store import ProjectStore
 from jarvis.testing import a_verdict
 
@@ -857,6 +863,91 @@ def test_the_verbs_refuse_a_row_of_another_kind(started, store, improvement_orde
         ops.show_investigation_order(improvement_order["id"])
 
 
+def test_fo_show_refuses_an_investigation_and_names_investigate_show(started, store):
+    """GitHub issue #997, the other half: the guard has to name the verb for the kind
+    the row ACTUALLY is."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    with pytest.raises(ops.OpsError) as e:
+        ops.show_feature_order(inv["id"])
+    assert "jarvis investigate show" in str(e.value)
+    assert "an investigation order" in str(e.value)
+
+
+# -- the family budget (2026-10-01-a-family-capped-raise-must-say-so.md) ---------------
+
+
+def test_the_family_budget_works_on_an_inv_id_and_refuses_every_other(started, store,
+                                                                     improvement_order):
+    """Obligation 5. The two-step top-up's second step: the command the child's note
+    prints has to exist. The family here is the order plus its one investigator, so the
+    feature-order arithmetic is already correct (§2.6)."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == pytest.approx(2.00)
+    assert ops.set_investigation_budget(inv["id"], 9.0)["budget_usd"] == 9.0
+    assert ops.investigation_order_budget(inv["id"])["budget_usd"] == 9.0
+    assert ops.set_investigation_budget(inv["id"], None)["budget_usd"] is None
+
+    for other in (improvement_order["id"],
+                  ops.create_feature_order("proj_a", "CSV export",
+                                           description="the whole ask")["id"]):
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.investigation_order_budget(other)
+        with pytest.raises(ops.OpsError, match="jarvis fo budget"):
+            ops.set_investigation_budget(other, 9.0)
+
+
+def test_the_cli_shows_and_sets_the_investigation_budget(started, store, capsys):
+    """Obligation 5 through the surface the note names, word for word."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY)
+    assert cli.main(["investigate", "budget", inv["id"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == pytest.approx(2.00)
+
+    assert cli.main(["investigate", "budget", inv["id"], "$12.50", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["budget_usd"] == 12.5
+    assert store.get_feature_order(inv["id"])["budget_usd"] == 12.5
+
+    assert cli.main(["investigate", "budget", inv["id"], "--clear", "--json"]) == 0
+    capsys.readouterr()
+    assert store.get_feature_order(inv["id"])["budget_usd"] is None
+
+    assert cli.main(["investigate", "budget", "wo-11111111"]) != 0
+
+
+def test_raising_the_budget_names_the_parked_investigator(started, store):
+    """Obligation 5, the half that was silent (Neo question 1198). `exhausted_children`
+    is the whole instruction — which `jarvis wo budget <child>` to run next — and it was
+    read off `feature_children`, which is the `kind='worker'` children only."""
+    inv = ops.create_investigation_order("proj_a", _subject(store), WHY, budget_usd=2.0)
+    child = store.create_work_order("investigate it", description="look",
+                                    kind="investigator", parent_id=inv["id"])
+    store.update_feature_order(inv["id"], plan_wo_id=child["id"])
+    store.update_work_order(child["id"], budget_reserved_usd=2.0,
+                            status="budget_exhausted")
+
+    out = ops.set_investigation_budget(inv["id"], 20.0)
+    assert out["exhausted_children"] == [child["id"]]
+    # The read path's per-child breakdown has the same hole: its totals are the
+    # family's, so the rows under them have to be the family's too.
+    shown = ops.investigation_order_budget(inv["id"])
+    assert [c["wo_id"] for c in shown["children"]] == [child["id"]]
+
+
+def test_a_settled_flagged_investigation_still_lists(started, store):
+    """Obligation 6. `submit_verdict` settles a `WAITING_ON_USER` to `completed` AND
+    flags it in the same transaction — four live attention items against an empty
+    `jarvis investigate list` is that pair."""
+    inv_id, _investigator, _out = _submitted(started, store, "WAITING_ON_USER")
+    row = store.get_feature_order(inv_id)
+    assert row["status"] == "completed" and row["needs_attention"]
+    assert inv_id in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+
+    quiet, _i, _o = _submitted(started, store, "TRANSIENT")
+    assert not store.get_feature_order(quiet)["needs_attention"]
+    assert quiet not in [r["id"] for r in ops.list_investigation_orders("proj_a")]
+    assert quiet in [r["id"] for r in
+                     ops.list_investigation_orders("proj_a", include_settled=True)]
+
+
 # -- a submitted verdict settles its investigator too ---------------------------------
 #
 # docs/superpowers/specs/2026-10-01-a-submitted-verdict-must-settle-its-investigator.md,
@@ -1363,3 +1454,219 @@ def test_the_investigator_prompt_demands_a_gap_class_and_shows_the_registry(
     assert "mechanical" in lowered and "self-heal" in lowered
     # The control: the worker's prompt carries none of it.
     assert "gap_class" not in _prompt(store, "worker", project_spec)
+
+
+# -- the caller the seam was built for: §§3, 5 and 6 of
+# docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md.
+# The fixtures are the stuck sweep's own, imported rather than redeclared.
+
+
+def _opened(project_name: str | None = None) -> list[dict]:
+    return ops.list_investigation_orders(project_name, include_settled=True)
+
+
+def _settle(store, inv_id: str, hours_ago: float) -> None:
+    """One investigation settled `hours_ago` — the cooldown's clock (§6b)."""
+    store.set_feature_status(inv_id, "completed")
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - hours_ago * HOUR, inv_id))
+    store.conn.commit()
+
+
+def test_stuck_order_gets_exactly_one_investigation(stuck_os):
+    """§5 end to end, and §6a: the second sweep spends no attempt to learn it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    assert opened[0]["kind"] == "investigation" and opened[0]["origin"] == "fleet_health"
+    assert ops.live_investigation("proj_a", wo["id"]) == opened[0]["id"]
+    assert ops.show_investigation_order(opened[0]["id"])["subject"] == wo["id"]
+
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+
+def test_cooldown_holds_until_the_fingerprint_changes(stuck_os):
+    """§6b: the cooldown AND the fingerprint, and either one alone refuses."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "parked and staying parked")
+    park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    daemon.stuck_tick(None)
+    first = _opened("proj_a")[0]["id"]
+
+    # Past the 720-minute cooldown with nothing about the situation changed.
+    _settle(store, first, hours_ago=13)
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    # The situation HAS changed, but the cooldown has not run: "it moved" and "it is
+    # better" are not the same claim.
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 1
+
+    store.conn.execute("UPDATE feature_orders SET updated_at=? WHERE id=?",
+                       (time.time() - 13 * HOUR, first))
+    store.conn.commit()
+    daemon.stuck_tick(None)
+    assert len(_opened("proj_a")) == 2
+
+
+def test_daily_cap_holds_fleet_wide(jarvis_home, project, tmp_path):
+    """§6c: the cap holds across the whole fleet, and cuts the LEAST overdue.
+
+    The cap is NAMED here rather than taken from the default: Neo 1148 raised the shipped
+    `max_per_day` to 48 so a 5-minute threshold cannot spend the day's allowance in the
+    first hour, and what this test is about is the cap's ARITHMETIC, not its value.
+    """
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(tmp_path, [{"name": "proj_a", "path": str(project)},
+                                   {"name": "proj_b", "path": str(other)}],
+                        name="stuck-two.json", fleet_health={"max_per_day": 4})
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+    overdue = {}
+    try:
+        for name, hours in (("proj_a", (9, 8, 7)), ("proj_b", (6, 5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+                overdue[wo["id"]] = h
+
+        Daemon(load_catalog(cat)).stuck_tick(None)
+
+        opened = _opened()
+        assert len(opened) == 4
+        subjects = {ops.show_investigation_order(i["id"])["subject"] for i in opened}
+        assert subjects == set(sorted(overdue, key=lambda i: -overdue[i])[:4])
+    finally:
+        for store in stores.values():
+            store.close()
+
+
+def test_daily_cap_counts_projects_not_due_this_tick(jarvis_home, project, tmp_path):
+    """§6c against Neo 1086's PER-PROJECT cadence: the cap counts wider than the scan.
+
+    Two projects on different `sweep_every_ticks`. A spends the whole day's allowance on
+    a tick of its own; a later tick that sweeps ONLY B must open nothing. Counting
+    `opened_today` over the due projects alone would let every cadence have its own
+    allowance — the one spend ceiling on this pass, failing open.
+    """
+    from jarvis import db
+    from jarvis.central_store import CentralStore
+    from jarvis.testing import make_git_project
+
+    other = make_git_project(tmp_path, "proj_b")
+    cat = stuck_catalog(
+        tmp_path,
+        [{"name": "proj_a", "path": str(project),
+          "fleet_health": {"sweep_every_ticks": 1000}},
+         {"name": "proj_b", "path": str(other), "fleet_health": {"sweep_every_ticks": 3}}],
+        name="stuck-cadences.json", fleet_health={"max_per_day": 4})
+    daemon = Daemon(load_catalog(cat))
+    stores = {"proj_a": ProjectStore(project), "proj_b": ProjectStore(other)}
+
+    def run_row() -> dict:
+        central = CentralStore()
+        try:
+            return db.from_json(central.get_state(Daemon.STUCK_RUN_KEY), {})
+        finally:
+            central.close()
+
+    try:
+        for name, hours in (("proj_a", (9, 8, 7, 6)), ("proj_b", (5, 4))):
+            for h in hours:
+                wo = ops.create_work_order(name, f"{h}h in status")
+                park_order(stores[name], wo["id"], "waiting_pr_merge", hours=h)
+
+        daemon.tick_count = 1
+        daemon.stuck_tick(None, projects=daemon.stuck_due_projects())
+        assert run_row()["opened"] == 4
+        assert len(_opened("proj_a")) == 4
+
+        daemon.tick_count = 4
+        due = daemon.stuck_due_projects()
+        assert [p.name for p in due] == ["proj_b"], "only the finer cadence is due"
+        daemon.stuck_tick(None, projects=due)
+
+        run = run_row()
+        assert run["opened"] == 0
+        assert run["skipped"]["daily_cap"] == 2
+        assert _opened("proj_b") == []
+    finally:
+        for store in stores.values():
+            store.close()
+
+
+def test_an_investigation_is_never_a_subject(stuck_os):
+    """§6's third layer: the SWEEP skips it, and `ops` still refuses it."""
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    subject = ops.create_work_order("proj_a", "the order being diagnosed")
+    inv = ops.create_investigation_order("proj_a", subject["id"], why=WHY)
+    investigator = store.create_work_order(
+        title=f"investigate {subject['id']}", kind="investigator", parent_id=inv["id"])
+    park_order(store, investigator["id"], "waiting_input", hours=20)
+
+    daemon.stuck_tick(None)
+
+    assert [i["id"] for i in _opened("proj_a")] == [inv["id"]]
+    with pytest.raises(ops.OpsError, match="investigator"):
+        ops.create_investigation_order("proj_a", investigator["id"], why=WHY)
+
+
+def test_a_user_owed_order_is_investigated(stuck_os):
+    """§3: an order that reads as the user's is swept on exactly the same terms."""
+    from jarvis import invariants
+
+    store, daemon = stuck_os["store"], stuck_os["daemon"]
+    wo = ops.create_work_order("proj_a", "the review could not be satisfied")
+    park_order(store, wo["id"], "needs_review", hours=5)
+    store.conn.execute(
+        "UPDATE work_orders SET needs_attention=1, attention_reason=? WHERE id=?",
+        (invariants.VALIDATION_STUCK_BLOCKER, wo["id"]))
+    store.conn.commit()
+
+    daemon.stuck_tick(None)
+
+    opened = _opened("proj_a")
+    assert len(opened) == 1
+    why = opened[0]["description"]
+    for question in ("Is the blocker true, current and correctly worded?",
+                     "Is it the user's call, or is it the OS failing to decide?",
+                     "Does the user have the reason and the link they need to decide?"):
+        assert question in why
+
+
+def test_verdict_reaches_the_subject_timeline(started, store):
+    """§7: the verdict lands where the reader of the STUCK order will see it, and the
+    kind is an observer kind so looking cannot move the cooldown's fingerprint."""
+    from jarvis import health, stuck
+
+    subject = _subject(store)
+    inv = ops.create_investigation_order("proj_a", subject, WHY)
+    _investigating(store, inv)
+
+    def fp() -> str:
+        return stuck.fingerprint("validating", 0.0, "a blocker", store.count_events(
+            subject, exclude=health.observer_kinds()))
+
+    before = fp()
+    ops.submit_verdict(inv["id"], a_verdict("TRANSIENT", subject=subject))
+
+    events = [e for e in store.list_events(subject)
+              if e["kind"] == "investigation_verdict"]
+    assert len(events) == 1
+    payload = json.loads(events[0]["payload"])
+    assert payload["classification"] == "TRANSIENT"
+    assert payload["investigation"] == inv["id"]
+    assert "investigation_verdict" in health.observer_kinds()
+    assert fp() == before

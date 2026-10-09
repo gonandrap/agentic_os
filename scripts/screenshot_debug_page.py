@@ -1,5 +1,5 @@
 """Screenshot `/wo/{project}/{wo_id}/debug` — the PR's UI evidence for spec §7 of
-docs/specs/2026-09-24-order-observability.md.
+docs/superpowers/specs/2026-09-24-order-observability.md.
 
 The page is four independent readings of one order, so the fixture has to carry all four:
 a diagnosis with holds and a blocker, a live frame with a tool call in flight, an anatomy
@@ -31,7 +31,7 @@ PORT = 8799
 SLUG = "-proj"
 SESSION = "sess-debug-demo"
 #: The same reading, sealed and then read with its transcript DELETED — §4 of
-#: docs/specs/2026-09-27-order-autopsy-durability.md. Shot beside the derived one because
+#: docs/superpowers/specs/2026-09-27-order-autopsy-durability.md. Shot beside the derived one because
 #: the provenance block is the only thing on the page that tells them apart.
 SEALED_SESSION = "sess-debug-sealed"
 TASK = "a7b62083-1111-2222-3333-444455556666"

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from jarvis import bugreport, claude_cli, notify, paths, testing
+from jarvis import bugreport, claude_cli, invariants, notify, paths, release, testing
 from jarvis.catalog import parse_catalog
 from jarvis.central_store import CentralStore
 
@@ -236,6 +236,25 @@ def test_the_live_production_checkout_is_out_of_reach(tmp_path):
 
     assert env[paths.PRODUCTION_ROOT_ENV].startswith(str(tmp_path))
     assert not (Path(env[paths.PRODUCTION_ROOT_ENV]) / "jarvis_os" / ".git").exists()
+
+
+def test_the_developers_own_local_bin_is_out_of_reach(tmp_path):
+    """`INV-PROD-CLI` reads `~/.local/bin/jarvis`, OUTSIDE `$JARVIS_HOME` (kn-38b98594).
+    Left ambient, a `jarvis doctor` test passes or fails on whether the human has run
+    install_prod_cli.sh — and on this host it fails, on the very defect the check
+    reports (issue 757)."""
+    env = testing.gate_environment(tmp_path / "probe-gate")
+
+    assert env[release.CLI_BIN_DIR_ENV].startswith(str(tmp_path))
+    assert Path(env[release.CLI_BIN_DIR_ENV]) != Path.home() / ".local" / "bin"
+
+
+def test_under_the_gate_the_prod_cli_check_reads_inside_the_sandbox():
+    """Both guards earn their keep: the sandbox's `PRODUCTION_CODE` makes the check's
+    precondition false today, and this one keeps a future test that builds a fake
+    deployed production under tmp_path from reading the real ~/.local/bin."""
+    assert release.cli_bin_dir().is_relative_to(testing.GATE_ROOT)
+    assert list(invariants.check_prod_cli()) == []
 
 
 # -- the gate is structural, not per-suite opt-in ------------------------------------

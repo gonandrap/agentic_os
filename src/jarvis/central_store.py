@@ -284,7 +284,7 @@ CREATE TABLE IF NOT EXISTS gate_rules (
 );
 -- The self-evolution registry: the gaps the OS has learned to RECOGNISE in itself, and
 -- what it proposes doing about each one. See rules.py and
--- docs/specs/2026-09-27-self-evolution.md §3.1.
+-- docs/superpowers/specs/2026-09-27-self-evolution.md §3.1.
 --
 -- CENTRAL AND FLEET-WIDE, for the reason `gate_rules` above is: most gaps are OS
 -- behaviour rather than one project's, so a rule learned on `jarvis_os` protects every
@@ -383,6 +383,36 @@ CREATE TABLE IF NOT EXISTS rule_fires (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_fires_detector ON rule_fires(detector_id, ts);
 CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector_id);
+
+-- WHEN A GAP THE OS ALREADY HAS A RULE FOR HAPPENS AGAIN (spec §8). One row per
+-- recurrence, and THIS LEDGER IS THE OS'S OWN RECORD while the tracker is only a mirror
+-- of it: the row is written BEFORE `gh` is touched, so an unreachable tracker, a refused
+-- API call or a crash mid-comment cannot lose the finding. What happened on the tracker,
+-- or why nothing did, lands afterwards in `filed_note`.
+--
+-- The verdict set is `rules.RECURRENCE_VERDICTS` and `add_recurrence` validates against
+-- it; what each value blames is explained once, in `rules.recurrence_verdict`.
+--
+-- `filed_note` is the FULL LOCAL ACCOUNT — which act ran, against which issue, or the
+-- failure's own words — including anything too private to publish. That is precisely why
+-- the tracker comment is built somewhere else, by `rules.recurrence_comment`, from four
+-- fields and nothing else: the two texts have different audiences and must not be one
+-- string. `note` is the CALLER's own account of this recurrence, stored verbatim.
+CREATE TABLE IF NOT EXISTS rule_recurrences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+    gap_class TEXT NOT NULL,
+    detector_id TEXT NOT NULL REFERENCES detectors(id),
+    project TEXT NOT NULL, order_id TEXT NOT NULL,
+    io_id TEXT NOT NULL DEFAULT '',
+    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed |
+                                         --   unreadable; see rules.recurrence_verdict
+    original_fix_wo_id TEXT NOT NULL DEFAULT '',
+    original_issue_url TEXT NOT NULL DEFAULT '',
+    filed_note TEXT NOT NULL DEFAULT '', -- what happened on the tracker, or why nothing did
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_recurrences_detector
+    ON rule_recurrences(detector_id, ts);
 -- The append-only history of what the fleet was configured to run, and the only place
 -- that record exists: `projects.catalog_json` holds the CURRENT project dict and is
 -- overwritten on every `jarvis start`, and the catalog file is untracked, so git is not
@@ -416,6 +446,32 @@ CREATE TABLE IF NOT EXISTS os_config_versions (
     changes_json   TEXT NOT NULL DEFAULT '[]',  -- the edits the actor asked for
     source_path    TEXT NOT NULL DEFAULT ''
 );
+-- One minute's reading of the account's usage windows, or one GAP ROW saying why there
+-- is none. Account-level, so central: no project owns the meter. §2 of
+-- docs/superpowers/specs/2026-10-08-usage-meter-samples-and-outside-spend.md.
+CREATE TABLE IF NOT EXISTS usage_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,                       -- when the sampler READ the endpoint
+    ok INTEGER NOT NULL DEFAULT 1,          -- 0 = gap row; every pct/resets column NULL
+    reason TEXT NOT NULL DEFAULT '',        -- the failure in words; NEVER the body
+    http_status INTEGER,                    -- NULL on a network error that never answered
+    latency_ms INTEGER,
+    -- The two windows that have existed under stable names since this endpoint did, and
+    -- the only two anything reads. NULL on a gap row — never 0.0, which is a MEASUREMENT
+    -- meaning "the window just reset".
+    five_hour_pct REAL,
+    five_hour_resets_at REAL,               -- epoch, parsed from the ISO string
+    seven_day_pct REAL,
+    seven_day_resets_at REAL,
+    -- EVERY OTHER non-null window object, keyed by its top-level name. The payload
+    -- carries ~20 further keys and the set is NOT stable (`seven_day_opus`,
+    -- `seven_day_sonnet` and about fourteen codenames), so a column per name would need
+    -- a migration for every codename Anthropic invents. `limits` is NOT stored: the same
+    -- two numbers in a second shape, read by nothing.
+    extra_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_ts ON usage_samples(ts);
+CREATE INDEX IF NOT EXISTS idx_usage_samples_ok ON usage_samples(ok, ts);
 CREATE INDEX IF NOT EXISTS idx_os_config_versions_ts ON os_config_versions(ts);
 CREATE INDEX IF NOT EXISTS idx_gate_rules_role ON gate_rules(role, kind);
 CREATE INDEX IF NOT EXISTS idx_inbox_status ON inbox(status);
@@ -468,7 +524,8 @@ FTS_WEIGHTS = (1.0, 4.0, 2.0)
 # `executescript(SCHEMA)` and nothing else — which is why the first column ever added to
 # it had to bring the mechanism with it.
 #
-# NOTHING HERE FOR `detectors`/`remedy_rules`/`rule_fires`, and that is not an oversight:
+# NOTHING HERE FOR `detectors`/`remedy_rules`/`rule_fires`/`rule_recurrences`, and that is
+# not an oversight:
 # they are NEW tables, so `CREATE TABLE IF NOT EXISTS` creates them in a live `os.db` too.
 # This guard is only for a column added to a table that ALREADY ships.
 ADDED_COLUMNS = {
@@ -501,7 +558,7 @@ ADDED_COLUMNS = {
         "prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         "system_prompt_chars": "INTEGER NOT NULL DEFAULT 0",
         # How long the call took, in milliseconds — §3 of
-        # docs/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
+        # docs/superpowers/specs/2026-10-01-neo-observability.md. NULLABLE, unlike `prompt_chars`
         # beside it: 0 chars of prompt is impossible so 0 can safely mean "not measured"
         # there, whereas a sub-millisecond call rounds to 0 and the report must not print
         # "0 ms" for a call nobody timed.
@@ -519,6 +576,7 @@ class CentralStore:
         self._migrate()
         self.fts = self._ensure_fts()
         self._seed_gate_rules()
+        self._seed_detectors()
 
     def _migrate(self) -> None:
         for table, columns in ADDED_COLUMNS.items():
@@ -1319,16 +1377,74 @@ class CentralStore:
 
     # -- the self-evolution registry (detectors, remedy rules, fires; see rules.py) ----
     #
-    # docs/specs/2026-09-27-self-evolution.md §3. These mirror the
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §3. These mirror the
     # `gate_rules` methods above deliberately, retraction semantics included: a retraction
     # NEVER deletes, a reason is required, and a second one raises. Rows are never
     # rewritten in place except the counters, the timestamps and the retract fields —
     # the same append-mostly discipline as `gate_rules` and the knowledge base, because
     # what the OS believed, and when, is evidence.
     #
-    # Nothing here seeds: `rules.seed_rows()` is invoked by the section that owns the
-    # evaluation pass, and calling it from this module would put builtin rows into every
-    # `os.db` before anything could fire them.
+    # Seeding runs where `gate_rules`' does — `_seed_detectors` below, called from the
+    # same place — because §5.3 of
+    # docs/superpowers/specs/2026-09-27-self-evolution.md assigns the
+    # call site to the section that owns the evaluation pass, and that section now
+    # exists. The five builtin rows are in `os.db` from the first open, which is safe
+    # precisely because they are all `dry_run` and because `Daemon.rules_tick` is gated
+    # on a config flag that ships off: a fleet that upgrades gains the rules and
+    # evaluates none of them until somebody says so.
+
+    def _seed_detectors(self) -> None:
+        """Write the five builtin detectors and their remedy rows, once.
+
+        `_seed_gate_rules`' argument, unchanged: the version key is a SPEED guard and the
+        correctness rests on the ids, which `rules.seed_id` derives from the row's
+        content. An insert that already happened is ignored rather than replayed, so a
+        builtin rule the user RETRACTED stays retracted across upgrades and restarts.
+
+        That matters more here than it does for a gate recogniser. A retracted detector
+        resurrected by a release would start recording fires against a person's explicit
+        decision — and once §6 lands and a detector can be ARMED, the same bug would be a
+        rule ACTING on orders after somebody decided it should not.
+
+        The rows are INSERTed directly rather than through `add_detector`, which is what
+        `_seed_gate_rules` does with `gate_rules` and for the same two reasons: the seed
+        row already carries its own id and its already-canonical condition JSON (
+        `rules.seed_rows` parsed and serialised it), and `add_detector` refuses a
+        `status` argument at all because nothing may write an ARMED detector — which is
+        true of these too and is why every seed row ships `dry_run`.
+        """
+        from . import rules
+
+        # COMPARED AS TEXT, and the `str()` is load-bearing. `os_state` is a text column,
+        # so `set_state` stores `"1"` and `get_state` reads `"1"` back, while
+        # `rules.SEED_VERSION` is an INTEGER (`detectors.seed_version` is). `"1" == 1` is
+        # False in Python, so the unguarded comparison re-seeds on EVERY open — which
+        # `INSERT OR IGNORE` hides, right up until somebody deletes a seed row and finds
+        # it back on the next `CentralStore()`. `gate_rules.SEED_VERSION` is a string and
+        # never met this.
+        if str(self.get_state("detectors_seed") or "") == str(rules.SEED_VERSION):
+            return
+        now = db.now()
+        for seed in rules.seed_rows():
+            det = seed["detector"]
+            self.conn.execute(
+                """INSERT OR IGNORE INTO detectors
+                   (id, ts, gap_class, project, subjects, condition, summary, status,
+                    source, issue_url, seed_version)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (det["id"], now, det["gap_class"], det["project"], det["subjects"],
+                 det["condition"], det["summary"], det["status"], det["source"],
+                 det["issue_url"], det["seed_version"]),
+            )
+            for row in seed["remedies"]:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO remedy_rules
+                       (id, detector_id, ts, primitive, params, argument, status)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (row["id"], row["detector_id"], now, row["primitive"],
+                     row["params"], row["argument"], row["status"]),
+                )
+        self.set_state("detectors_seed", str(rules.SEED_VERSION))
 
     def add_detector(self, gap_class: str, condition: Any, *, project: str = "",
                      subjects: str = "work_order", summary: str = "",
@@ -1635,6 +1751,98 @@ class CentralStore:
         params.append(int(limit))
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
 
+    # --- the recurrence ledger -------------------------------------------------------
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §8. A gap the OS ALREADY has a
+    # detector for happened again, which is a different fact from a new gap: the condition
+    # missed it, or its remedy did not hold, or it was never armed. Filing that as a fresh
+    # issue loses the one thing that matters — that the OS already tried.
+
+    def add_recurrence(self, *, gap_class: str, detector_id: str, project: str,
+                       order_id: str, verdict: str, io_id: str = "",
+                       original_fix_wo_id: str = "", original_issue_url: str = "",
+                       filed_note: str = "", note: str = "") -> dict[str, Any]:
+        """Record that an existing rule did not hold, and which half of it did not.
+
+        `verdict` is checked against the closed set for `record_rule_fire`'s reason: a
+        verdict is what a finding is filed AGAINST, so an unrecognised one would send the
+        fix at a half of the rule nobody judged. The error names the allowed set because
+        the caller re-submits per error message.
+
+        `original_fix_wo_id` and `original_issue_url` are COPIED off the detector at write
+        time rather than read back through it later: they are the provenance thread the
+        recurrence links into, and a detector retracted or re-pointed afterwards must not
+        silently rewrite what this row says the OS tried.
+
+        `detectors.recurrences` increments HERE, in the same call, so the counter cannot
+        drift from the rows — the same reason `record_rule_fire` owns `hits`.
+
+        `filed_note` and `note` are bounded through `rules.bound`, as every other stored
+        payload in this codebase is, with the cap recorded in the text.
+        """
+        from . import rules
+
+        if verdict not in rules.RECURRENCE_VERDICTS:
+            raise ValueError(f"unknown recurrence verdict {verdict!r} — expected one of "
+                             f"{', '.join(rules.RECURRENCE_VERDICTS)}")
+        cur = self.conn.execute(
+            """INSERT INTO rule_recurrences
+               (ts, gap_class, detector_id, project, order_id, io_id, verdict,
+                original_fix_wo_id, original_issue_url, filed_note, note)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (db.now(), gap_class, detector_id, project, order_id, io_id, verdict,
+             original_fix_wo_id, original_issue_url, rules.bound(filed_note),
+             rules.bound(note)),
+        )
+        self.conn.execute(
+            "UPDATE detectors SET recurrences = recurrences + 1 WHERE id=?",
+            (detector_id,))
+        return self.get_recurrence(int(cur.lastrowid))  # type: ignore[return-value]
+
+    def get_recurrence(self, recurrence_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM rule_recurrences WHERE id=?",
+                                (recurrence_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_recurrences(self, *, detector_id: str = "", project: str = "",
+                         order_id: str = "", verdict: str = "",
+                         limit: int = 50) -> list[dict[str, Any]]:
+        """The recurrence history, NEWEST FIRST — `list_rule_fires`' order, for its
+        reason: this is read as a timeline, and the newest row is what a person deciding
+        whether to arm or to re-fix the rule is looking at."""
+        q = "SELECT * FROM rule_recurrences WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("detector_id", detector_id), ("project", project),
+                              ("order_id", order_id), ("verdict", verdict)):
+            if value:
+                q += f" AND {column}=?"
+                params.append(value)
+        q += " ORDER BY ts DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
+
+    def set_recurrence_filed_note(self, recurrence_id: int,
+                                  filed_note: str) -> dict[str, Any]:
+        """Write what happened on the tracker onto a row that already exists. THE ONE
+        IN-PLACE WRITE in this ledger, and the ordering is why it has to exist.
+
+        §8's rule is that the ledger is the OS's own record and the tracker a mirror of
+        it, so the row is inserted BEFORE anything touches GitHub: a `gh` that cannot be
+        reached, a refusal, a timeout or a crash between the two calls then loses the
+        note and never the finding. The outcome of that act — which issue was reopened or
+        commented on, or the failure in its own words — is therefore only knowable
+        afterwards, and this is how it reaches the row.
+
+        Nothing else about a recurrence is ever rewritten; the verdict and the provenance
+        are what the OS concluded at that moment and stay as written.
+        """
+        from . import rules
+
+        if self.get_recurrence(recurrence_id) is None:
+            raise KeyError(f"rule recurrence {recurrence_id} not found")
+        self.conn.execute("UPDATE rule_recurrences SET filed_note=? WHERE id=?",
+                          (rules.bound(filed_note), recurrence_id))
+        return self.get_recurrence(recurrence_id)  # type: ignore[return-value]
+
     # --- the config version ledger -------------------------------------------------
     # docs/superpowers/specs/2026-08-27-the-config-console.md §2, §9.
 
@@ -1772,7 +1980,7 @@ class CentralStore:
         which. Token columns stay zero there, so it cannot inflate a total.
 
         `latency_ms=None` is "nobody timed this call" and stays NULL — §3 of
-        docs/specs/2026-10-01-neo-observability.md.
+        docs/superpowers/specs/2026-10-01-neo-observability.md.
         """
         u = usage or {}
         cur = self.conn.execute(
@@ -1819,7 +2027,9 @@ class CentralStore:
             (wo_id,)).fetchone()
         return float(row["c"] or 0.0)
 
-    def agent_call_totals(self, project: str | None = None) -> list[dict[str, Any]]:
+    def agent_call_totals(self, project: str | None = None, *,
+                          since: float | None = None,
+                          until: float | None = None) -> list[dict[str, Any]]:
         """Every work order's recorded spend, summed in SQL, grouped by kind/label/model.
 
         Grouped rather than flat because every consumer needs the grouping: the report
@@ -1834,7 +2044,11 @@ class CentralStore:
         model re-aggregate in Python, so the finer key costs them nothing.
 
         One query for the whole fleet: the alternative is a query per work order, and
-        the cost report walks every work order there is.
+        the cost report walks every work order there is. `project` is in the key for
+        that reason — a fleet-wide consumer opens one project's store at a time and
+        `ProjectStore.get_work_order` RAISES on a foreign id, so the column is how a
+        row is placed without a lookup (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
 
         THE TTL SPLIT COMES OUT OF `usage_json`, not out of a column, and summing it here
         is what stops the report under-pricing its own overhead at the 1.25x floor (spec:
@@ -1849,10 +2063,24 @@ class CentralStore:
         sizes is a meaningless number (spec §3,
         docs/superpowers/specs/2026-09-26-bounded-model-inputs.md).
         """
-        clause = "WHERE project=?" if project else ""
-        params = (project,) if project else ()
+        where, params = [], []
+        if project:
+            where.append("project=?")
+            params.append(project)
+        # ADDITIVE, and `None` must keep the whole-table behaviour exactly: `cost_report`
+        # asks "what has the fleet spent, ever" and `fleetcost` asks the same question of
+        # one usage week (spec §2 of the fleet-cost-distribution spec). Half-open, like
+        # every other window in the OS: `ts >= since` and `ts < until`, so two adjacent
+        # windows can neither double-count a call nor lose one.
+        if since is not None:
+            where.append("ts>=?")
+            params.append(since)
+        if until is not None:
+            where.append("ts<?")
+            params.append(until)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
         return db.rows_to_dicts(self.conn.execute(
-            f"""SELECT wo_id, kind, label, model, COUNT(*) AS calls,
+            f"""SELECT wo_id, project, kind, label, model, COUNT(*) AS calls,
                        SUM(cost_usd) AS cost_usd, SUM(input) AS input,
                        SUM(cache_write) AS cache_write, SUM(cache_read) AS cache_read,
                        SUM(output) AS output, SUM(1 - ok) AS failed,
@@ -1862,7 +2090,8 @@ class CentralStore:
                        SUM(COALESCE(json_extract(usage_json, '$.cache_5m'), 0))
                            AS cache_5m
                 FROM agent_calls {clause}
-                GROUP BY wo_id, kind, label, model""", params).fetchall())
+                GROUP BY wo_id, project, kind, label, model""",
+            tuple(params)).fetchall())
 
     def agent_call_totals_by_day(self, project: str | None = None,
                                  since: float | None = None,
@@ -1871,7 +2100,7 @@ class CentralStore:
         """`agent_call_totals`' windowed sibling, keyed on (kind, project, day, model).
 
         A separate query rather than a widened one — §4 of
-        docs/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
+        docs/superpowers/specs/2026-10-01-neo-observability.md: that one has no `ts` filter and is
         asked on every cost report, and the key it groups on (`wo_id`) is the one this
         report never wants. The DAY BUCKET IS SQL's, as the sums beside it already are.
 

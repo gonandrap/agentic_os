@@ -383,7 +383,7 @@ def test_resume_auto_names_the_plan_hold(started, project):
 
 
 def test_a_failed_order_is_not_stalled_so_no_nudge_is_offered(started, project):
-    """§6 of docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md: `stalled` is the
+    """§6 of docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md: `stalled` is the
     narrow claim that a MESSAGE is a repair, and a nudge into a dead conversation is not
     the move — `jarvis wo retry` is, offered by its own predicate."""
     wo = ops.create_work_order("proj_a", "died without delivering")

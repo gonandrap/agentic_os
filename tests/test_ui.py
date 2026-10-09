@@ -372,7 +372,7 @@ def test_a_question_that_does_not_exist_says_so(client):
 
 
 def test_the_neo_stats_page_renders_an_empty_fleet_without_a_fabricated_zero(client):
-    """§6 of docs/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
+    """§6 of docs/superpowers/specs/2026-10-01-neo-observability.md: its own page, no new nav entry,
     and an absent ratio reads "not recorded" rather than 0%."""
     page = client.get("/neo/stats")
     assert page.status_code == 200
@@ -2910,6 +2910,106 @@ def test_the_budget_box_refuses_nan_rather_than_accepting_an_uncappable_cap(clie
         assert ops.work_order_budget(wo["id"])["budget_usd"] is None
 
 
+def _broke_family(project, *, budget_usd: float = 3.0,
+                  kind: str = "investigation") -> tuple[str, str]:
+    """A family whose money is gone and one child parked on its slice.
+
+    Written through the store rather than ticked into existence: these two tests are about
+    the ROUTE's non-error channel, not about the allocator, which
+    tests/test_budget.py owns.
+    """
+    store = ProjectStore(project)
+    try:
+        fo = store.create_feature_order("why is it stuck", description="it is stuck",
+                                        kind=kind, budget_usd=budget_usd)
+        store.set_feature_status(fo["id"], "planning")
+        # The child's kind is the family's, not a free choice: `store.feature_children`
+        # selects `kind='worker'` only, and a non-feature family's one child reaches
+        # `budget.family` as the parent's `plan_wo_id` instead (tests/test_budget.py's
+        # `_the_one_child`). Get either wrong and the pool sees no spend at all.
+        child = store.create_work_order(
+            "diagnose it", description="look", parent_id=fo["id"],
+            kind="worker" if kind == "feature" else "investigator")
+        if kind != "feature":
+            store.update_feature_order(fo["id"], plan_wo_id=child["id"])
+        store.update_work_order(child["id"], budget_reserved_usd=budget_usd,
+                                status="budget_exhausted")
+        turn = store.create_turn(child["id"], kind="message", prompt="work")
+        store.finish_turn(turn["id"], "done", result="done", cost_usd=9.0,
+                          usage_json=json.dumps({"total_cost_usd": 9.0}))
+        return fo["id"], child["id"]
+    finally:
+        store.close()
+
+
+def test_raising_a_family_capped_child_says_so_and_calls_it_no_error(client, project):
+    """Obligation 8 of docs/superpowers/specs/2026-10-01-a-family-capped-raise-must-say-so.md.
+    The reporter's literal path: the budget WAS raised and the page said nothing. A red ✗
+    would be the second false statement — a refusal is not an error, and a user who sees
+    one raises the child's number again instead of the family's."""
+    _fo_id, child = _broke_family(project)
+    r = client.post(f"/wo/proj_a/{child}/budget", data={"amount": "$10"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location
+    assert "error=" not in location
+    assert "jarvis+investigate+budget" in location or \
+        "jarvis%20investigate%20budget" in location
+
+    page = client.get(f"/wo/proj_a/{child}{location[location.index('?'):]}").text
+    assert "jarvis investigate budget" in html.unescape(page)
+    # The rendered DIV, not the class name: base.html's stylesheet defines
+    # `.error-flash` on every page, so a bare substring check can never fail.
+    assert '<div class="error-flash">' not in page
+    assert '<div class="note-flash"' in page
+
+
+def test_the_budget_card_calls_the_family_by_its_kind(client, project):
+    """The card beside the flash said "its feature's slice" for an investigation.
+    `Ceiling.source == 'feature'` is the ALLOCATOR's word for "the family's cap", not a
+    claim about the parent's kind — the two surfaces must agree, so the card reads the
+    same `ops.family_prose` table the note does."""
+    _fo_id, child = _broke_family(project)
+    page = html.unescape(client.get(f"/wo/proj_a/{child}").text)
+    assert "its investigation's slice" in page
+    assert "its feature's slice" not in page
+    assert "its investigation has $0.00 unreserved" in page
+
+
+def test_raising_a_family_with_parked_children_names_them(client, project):
+    """Obligation 8, the sibling route: `exhausted_children` is the whole instruction to
+    the user — `jarvis wo budget <child> <amount>` is what spends the new money."""
+    fo_id, child = _broke_family(project, kind="feature")
+    r = client.post(f"/fo/proj_a/{fo_id}/budget", data={"amount": "$50"})
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert "note=" in location and "error=" not in location
+
+    page = html.unescape(client.get(f"/fo/proj_a/{fo_id}"
+                                    f"{location[location.index('?'):]}").text)
+    assert child in page
+    assert "jarvis wo budget" in page
+    # The WHOLE clause agrees, not just the noun: one order is parked on ITS OWN
+    # ceiling, not on "their own ceiling".
+    assert "1 work order still parked on its own ceiling" in page
+
+
+def test_api_status_carries_every_feature_order_kind(client, project):
+    """Obligation 7 at the surface that reads the payload: `/api/status` and
+    `jarvis status --json` are its only consumers, Jarvis's own pulse check included."""
+    store = ProjectStore(project)
+    try:
+        io = store.create_feature_order("slow first turns", description="three in a row",
+                                        kind="improvement")
+        store.set_feature_status(io["id"], "planning")
+    finally:
+        store.close()
+    rows = client.get("/api/status").json()["projects"][0]["feature_orders"]
+    row = next(r for r in rows if r["id"] == io["id"])
+    assert row["kind"] == "improvement"
+    assert row["status_label"] == "analysing"
+
+
 def test_a_spent_order_is_featured_ahead_of_everything_else(client, daemon):
     """It is the only blocker the reader cannot answer by reading: the order is stopped
     and spending nothing until they decide."""
@@ -3165,8 +3265,65 @@ def test_the_open_span_says_when_it_last_moved(client, daemon, project):
     assert "still in it · active" in html.unescape(page)
 
 
+def test_stuck_report_is_the_only_arithmetic(client, project, capsys):
+    """§7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    investigated.md: one reader, two renderers, and neither computes a number."""
+    from test_health_sweep import park_order
+
+    from jarvis import catalog, cli
+
+    wo = ops.create_work_order("proj_a", "the pull request merged hours ago")
+    store = ProjectStore(project)
+    try:
+        park_order(store, wo["id"], "waiting_pr_merge", hours=5)
+    finally:
+        store.close()
+
+    rows = ops.stuck_report()
+    (row,) = [r for r in rows if r["id"] == wo["id"]]
+    assert row["stuck"] and row["status"] == "waiting_pr_merge"
+    assert row["threshold_seconds"] == \
+        catalog.DEFAULT_FLEET_HEALTH_THRESHOLDS["waiting_pr_merge"] * 60
+    assert row["excluded"] == ""
+
+    assert cli.main(["stuck", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+
+    # The clocks move between the two reads; everything the renderers DECIDE from does not.
+    moving = ("seconds_in_status", "seconds_since_activity", "active_seconds")
+    assert set(printed[0]) == set(row)
+    assert [{k: v for k, v in r.items() if k not in moving} for r in printed] == \
+           [{k: v for k, v in r.items() if k not in moving} for r in rows]
+
+    page = " ".join(client.get("/stuck").text.split())
+    assert wo["id"] in page and "jarvis rules list" in page
+
+
+def test_the_terminal_names_the_blocker_too(client, project, capsys):
+    """Parity fix: `jarvis stuck` prints the blocker `/stuck` already renders.
+
+    §7 of docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-
+    investigated.md: one reader, two renderers — a user-owed wait must read the same
+    in the terminal as on the page.
+    """
+    from test_health_sweep import park_order
+
+    from jarvis import cli
+
+    wo = ops.create_work_order("proj_a", "asked a question hours ago")
+    store = ProjectStore(project)
+    try:
+        park_order(store, wo["id"], "waiting_input", hours=5)
+    finally:
+        store.close()
+
+    assert cli.main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "what the record says blocks it: worker is waiting on your input" in out
+
+
 # -- the retry control -----------------------------------------------------------------
-# docs/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
+# docs/superpowers/specs/2026-09-30-a-failed-order-has-no-retry-path.md §7b.
 
 #: Wording ONLY the retry section emits — a whole-page assertion is otherwise answered by
 #: the timeline or the conversation, which also talk about retries (kn-d51713af).
@@ -3259,3 +3416,64 @@ def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted)
 
     assert RETRY_HEADING in page
     assert "jarvisd launches the turn" not in page
+
+
+# -- one order, one page: links are derived from the id PREFIX -----------------------
+#
+# GitHub issue #997: the NEEDS YOU strip built `/fo/<project>/<id>` for every
+# `feature_orders` row, so an improvement order rendered with the feature template —
+# "Release this plan?", "all 0 work orders" — and the per-finding accept/reject the user
+# actually owed was only on `/io/`. `order_path` is the one derivation.
+
+
+def _flagged(project, title, kind, reason):
+    """A `feature_orders` row of one kind, flagged for the user. No ceremony."""
+    store = ProjectStore(project)
+    try:
+        row = store.create_feature_order(title, description="the whole ask", kind=kind)
+        store.flag_feature_attention(row["id"], reason)
+        return row
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("kind,segment", [("feature", "fo"), ("improvement", "io"),
+                                          ("investigation", "inv")])
+def test_the_attention_strip_links_each_kind_to_its_own_page(client, project, kind,
+                                                             segment):
+    row = _flagged(project, "slow first turns", kind, "it needs you")
+
+    page = client.get("/").text
+
+    assert f'/{segment}/proj_a/{row["id"]}' in page
+    for other in ("fo", "io", "inv"):
+        if other != segment:
+            assert f'/{other}/proj_a/{row["id"]}' not in page
+
+
+@pytest.mark.parametrize("kind,segment", [("improvement", "io"),
+                                          ("investigation", "inv")])
+def test_an_old_fo_bookmark_for_another_kind_redirects(client, project, kind, segment):
+    row = _flagged(project, "slow first turns", kind, "it needs you")
+
+    res = client.get(f"/fo/proj_a/{row['id']}")
+
+    assert res.status_code == 303
+    assert res.headers["location"] == f"/{segment}/proj_a/{row['id']}"
+
+
+def test_order_path_maps_every_prefix_and_falls_back_to_the_feature_page():
+    # In `project_store`, beside the prefixes it derives from: `search.py` links through
+    # the same derivation and must not import the FastAPI module. `ui.app` re-exports it
+    # under the same name, which is what the templates call.
+    from jarvis.project_store import order_path
+    from jarvis.ui import app
+
+    assert app.order_path is order_path
+    assert order_path("proj_a", "wo-1234") == "/wo/proj_a/wo-1234"
+    assert order_path("proj_a", "fo-1234") == "/fo/proj_a/fo-1234"
+    assert order_path("proj_a", "io-1234") == "/io/proj_a/io-1234"
+    assert order_path("proj_a", "inv-1234") == "/inv/proj_a/inv-1234"
+    # Unknown prefix: the feature page, never `/wo/` — an id that names no kind is a
+    # `feature_orders` row far more often than a work order.
+    assert order_path("proj_a", "zz-1234") == "/fo/proj_a/zz-1234"

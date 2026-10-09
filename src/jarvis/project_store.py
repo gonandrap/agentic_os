@@ -264,7 +264,13 @@ VALIDATION_OPINION_STATUSES = ("ok", "abstained", "failed")
 # (src/jarvis/schedule.py), and it is here for `neo`'s reason turned up a notch — it is
 # the only origin where not even a model decided to file this, a clock did, so "why am I
 # paying for this work order" is unanswerable without it.
-WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule")
+# `fleet_health` earns its place on `schedule`'s grounds turned up once more: NOT EVEN A
+# MODEL decided to file this one — arithmetic over time in state did
+# (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md §5) —
+# so "why am I paying for this" is unanswerable without it. Deliberately NOT in
+# `UNGOVERNED_ORIGINS`: the investigator is dispatched with a full briefing like any child.
+WO_ORIGINS = ("jarvis", "ui", "manual", "adhoc", "injected", "neo", "schedule",
+              "fleet_health")
 
 # Origins whose session Jarvis did not dispatch: it belongs to the user, never received
 # the worker briefing or `JARVIS_WO_ID`, and therefore cannot satisfy the worker contract
@@ -487,6 +493,32 @@ def is_feature_order_id(unit_id: str) -> bool:
     """Does this id name a `feature_orders` row? The one shared predicate — §2.5 of the
     spec above, which exists because three sites had grown their own `fo-` literal."""
     return unit_id.startswith(("fo-", "io-", "inv-"))
+
+
+#: The URL segment each order id prefix is rendered under. DERIVED from the prefixes the
+#: store mints (`FO_ID_PREFIXES`) rather than written out again: a fifth kind must not be
+#: able to get a page and still link to `/fo/`. The segment IS the prefix for every kind,
+#: which is why this is a set and not a map.
+ORDER_SEGMENTS = {"wo", "fo", *FO_ID_PREFIXES.values()}
+
+
+def order_path(project: str, order_id: str) -> str:
+    """The page that renders this order, from its id PREFIX.
+
+    The ONE derivation every surface links through — here, beside the prefixes it reads
+    and the shared id predicate above, because `search.py` needs it too and must not
+    import the FastAPI module. GitHub issue #997: three templates built
+    `/fo/<project>/<id>` for whatever they had, so an `io-`/`inv-` id rendered with the
+    feature template — "Release this plan?", an empty child tree — and the decision the
+    user owed was only on its own page.
+    """
+    prefix = order_id.split("-", 1)[0]
+    # Unknown prefix: the FEATURE page, never `/wo/`. An id that names no kind we know is
+    # a `feature_orders` row far more often than a work order, and that page refuses by
+    # kind; `/wo/` would 404 with nothing to say.
+    segment = prefix if prefix in ORDER_SEGMENTS else "fo"
+    return f"/{segment}/{project}/{order_id}"
+
 
 # Work-order metadata key: this work order was authorised by whoever filed it, so the
 # worker must not spend a round trip asking whether it may do the thing it was sent to
@@ -843,6 +875,10 @@ CREATE TABLE IF NOT EXISTS violation_reports (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL,
     seen INTEGER NOT NULL DEFAULT 1,
+    -- Also in ADDED_COLUMNS, where the reasoning is: a `critical` report is one
+    -- attention item for as long as it stands (Neo 1084).
+    level TEXT NOT NULL DEFAULT 'warning',
+    detail TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (invariant, wo_id)
 );
 CREATE TABLE IF NOT EXISTS assumptions (
@@ -1017,7 +1053,7 @@ CREATE TABLE IF NOT EXISTS wo_turns (
     -- WHAT JARVIS PUT IN THIS TURN'S CONTEXT WINDOW, per ingredient: the appended system
     -- prompt, the prompt, the knowledge index, the settings file, the memory files, the
     -- persona, the --add-dir trees and the MCP server set, each with bytes and an
-    -- ESTIMATED token count (`context.payload`; spec docs/specs/
+    -- ESTIMATED token count (`context.payload`; spec docs/superpowers/specs/
     -- 2026-09-24-order-observability.md §5). One blob per turn, same lifetime and same
     -- owner as the row, which is why it is a column and not a table.
     -- NULL means "not recorded" — a turn that ran before this landed, or one whose
@@ -1122,6 +1158,14 @@ CREATE INDEX IF NOT EXISTS idx_msgs_status ON wo_messages(status);
 CREATE INDEX IF NOT EXISTS idx_notif_status ON notifications(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_wo ON approvals(wo_id, status);
 CREATE INDEX IF NOT EXISTS idx_fo_status ON feature_orders(status);
+-- What `count_feature_orders` counts: the fleet-health sweep's daily cap asks "how many
+-- investigations did arithmetic file today", every sweep, and the listing it would
+-- otherwise filter in Python walks every investigation the project has ever had
+-- (docs/superpowers/specs/2026-09-30-an-order-that-stops-moving-gets-investigated.md §6c).
+-- `kind` is deliberately NOT in it, though the query names it: that column arrives through
+-- ADDED_COLUMNS, so a live database would run this statement before it existed.
+CREATE INDEX IF NOT EXISTS idx_fo_origin_created
+    ON feature_orders(origin, created_at);
 CREATE INDEX IF NOT EXISTS idx_validation_opinions ON validation_opinions(round_id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_state ON envelopes(state, id);
 CREATE INDEX IF NOT EXISTS idx_envelopes_subject ON envelopes(subject_wo_id, subject_fo_id);
@@ -1160,7 +1204,7 @@ ADDED_COLUMNS = {
         # for "this order has no answer", which is `budget_usd`'s precedent and what every
         # row written before this existed says. NULL is NOT `off`: it falls through to the
         # project config (`observability.level_for`). See
-        # docs/specs/2026-09-24-order-observability.md §10 for the one write it gates.
+        # docs/superpowers/specs/2026-09-24-order-observability.md §10 for the one write it gates.
         "observability": "TEXT",
         "job_id": "TEXT",
         "reply_job_id": "TEXT",
@@ -1241,7 +1285,7 @@ ADDED_COLUMNS = {
         # schedule, so an order inspected later reports a clock that got SHORTER as its
         # evidence aged. NULL means not sealed yet: an open order, one that settled before
         # this column existed, or one the observability level did not record (§3 of
-        # docs/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
+        # docs/superpowers/specs/2026-09-27-order-autopsy-durability.md). There is deliberately
         # no `feature_orders` twin: a feature's autopsy is read by reading its children's.
         "autopsy_json": "TEXT",
         "autopsy_sealed_at": "REAL",
@@ -1588,6 +1632,18 @@ ADDED_COLUMNS = {
     # envelope still queued, which is the honest answer in both cases.
     "envelopes": {
         "delivered_msg_id": "INTEGER",
+    },
+    # HOW LOUD THE VIOLATION IS, and what it said. Kept on the report because the report
+    # is the dedupe: a `critical` one raises ONE attention item for as long as it stands
+    # (Neo 1084), and `ops.os_status` cannot ask the checker again — it reads state. Every
+    # row written before this reads `warning`, which is what they all were.
+    # …and WHETHER A DECISION IS OWED on it, which `invariants.true_blockers` reads to
+    # route the violation to the work order's own attention flag (spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §2).
+    "violation_reports": {
+        "level": "TEXT NOT NULL DEFAULT 'warning'",
+        "detail": "TEXT NOT NULL DEFAULT ''",
+        "owed": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -2153,13 +2209,27 @@ class ProjectStore:
     def list_work_orders(
         self, statuses: tuple[str, ...] | None = None, limit: int = 200,
         include_hidden: bool = False,
+        active_between: tuple[float, float] | None = None,
     ) -> list[dict[str, Any]]:
+        """Work orders, newest first.
+
+        `active_between` is a half-open window of TURN time, for a cost report over one
+        usage week — and it is applied HERE rather than in Python because the clause has
+        to run BEFORE `LIMIT`: filtering the page would report an empty last week as
+        soon as a project has `limit` newer orders (§5a of
+        docs/superpowers/specs/2026-10-07-cost-window-selector.md).
+        """
         conds, params = [], []
         if statuses:
             conds.append(f"status IN ({','.join('?' for _ in statuses)})")
             params.extend(statuses)
         if not include_hidden:
             conds.append("hidden=0")
+        if active_between is not None:
+            conds.append("""EXISTS (SELECT 1 FROM wo_turns t WHERE t.wo_id =
+                                    work_orders.id AND t.started_at >= ?
+                                    AND t.started_at < ?)""")
+            params.extend(active_between)
         where = f" WHERE {' AND '.join(conds)}" if conds else ""
         rows = self.conn.execute(
             f"SELECT * FROM work_orders{where} ORDER BY created_at DESC LIMIT ?",
@@ -2584,6 +2654,30 @@ class ProjectStore:
             " ORDER BY updated_at LIMIT ?", (*TERMINAL_STATUSES, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def settled_release_orders(self, since: float,
+                               limit: int = 20) -> list[dict[str, Any]]:
+        """Settled orders carrying a release batch, newest settlement first.
+
+        `Daemon.refile_dropped_fixes`' population (issue #945 spec §2.2). `status` is
+        indexed and the batch test runs in SQLite, so no row's metadata is parsed in
+        Python unless it is a release order inside the window.
+
+        `'$.release_for_issues'` is `release.BATCH_KEY`'s JSON path, spelled out because a
+        path interpolated from the constant defeats the statement cache.
+
+        `cancelled` is EXCLUDED: a cancelled release is the user stopping a release, and
+        re-filing its batch would overrule them. The `CASE WHEN json_valid` guard is
+        `stale_autopsy_orders`', for its reason.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM work_orders WHERE status IN ('completed', 'failed')"
+            " AND updated_at >= ?"
+            " AND CASE WHEN json_valid(metadata)"
+            "     THEN json_extract(metadata, '$.release_for_issues') IS NOT NULL"
+            "     ELSE 0 END"
+            " ORDER BY updated_at DESC LIMIT ?", (since, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def seal_autopsy(self, order_id: str, payload_json: str, *,
                      at: float | None = None) -> None:
         """Freeze one work order's autopsy.
@@ -2600,7 +2694,7 @@ class ProjectStore:
 
         ITS OWN QUERY and not `unsealed_terminal_orders`, whose predicate is `bill_json IS
         NULL`: sharing one would let a bill that cannot be computed stop autopsies too (§3
-        of docs/specs/2026-09-27-order-autopsy-durability.md).
+        of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md).
         """
         marks = ", ".join("?" for _ in TERMINAL_STATUSES)
         rows = self.conn.execute(
@@ -2612,7 +2706,7 @@ class ProjectStore:
                              limit: int = 5) -> list[dict[str, Any]]:
         """Settled orders whose sealed autopsy predates `version` — oldest first, bounded.
 
-        The other half of §3 of docs/specs/2026-09-27-order-autopsy-durability.md: the
+        The other half of §3 of docs/superpowers/specs/2026-09-27-order-autopsy-durability.md: the
         WRITER re-seals, so a stale payload repairs itself on a tick instead of waiting
         for a reader to happen by.
 
@@ -2760,7 +2854,7 @@ class ProjectStore:
 
     def set_observability(self, wo_id: str, level: str | None) -> None:
         """Set this order's debug-collection level, or None to clear it back to "no
-        answer" (§10 of docs/specs/2026-09-24-order-observability.md).
+        answer" (§10 of docs/superpowers/specs/2026-09-24-order-observability.md).
 
         The vocabulary is validated HERE and not at the surface: a level outside it would
         fall through the resolver silently and leave the user believing they had changed
@@ -2937,6 +3031,17 @@ class ProjectStore:
             (*params, limit),
         ).fetchall()
         return db.rows_to_dicts(rows)
+
+    def count_feature_orders(self, kind: str, origin: str, since: float) -> int:
+        """How many of one kind and origin were created since `since`.
+
+        A COUNT rather than `list_feature_orders` filtered in Python, for
+        `feature_status_counts`' reason: the listing walks every row of that kind the
+        project has ever had, and this runs every sweep (spec §6c).
+        """
+        return int(self.conn.execute(
+            "SELECT COUNT(*) n FROM feature_orders WHERE kind=? AND origin=? "
+            "AND created_at >= ?", (kind, origin, float(since))).fetchone()["n"])
 
     def feature_status_counts(self, kind: str | None = "feature") -> dict[str, int]:
         """How many feature orders sit in each status. Counted in SQL, like
@@ -3889,6 +3994,21 @@ class ProjectStore:
             f"SELECT COUNT(*) FROM wo_events WHERE wo_id=?{clause}",
             (wo_id, *exclude)).fetchone()[0])
 
+    def event_kind_counts(self, wo_id: str) -> dict[str, int]:
+        """`{kind: count}` over this work order's whole timeline. UNBOUNDED, one query.
+
+        The map form of `count_events`, for `rules.FACT_FIELDS`' `event_counts` field
+        (docs/superpowers/specs/2026-09-27-self-evolution.md §5). A condition asking
+        "has this order been dispatched three times" needs the counts per kind, and the two ways to get
+        them without this are both wrong on a busy order: `list_events` caps at its
+        `limit` and would under-report, and `events_of_kind` per kind is a query per kind
+        in the vocabulary, run per order per tick.
+        """
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM wo_events WHERE wo_id=? GROUP BY kind",
+            (wo_id,)).fetchall()
+        return {str(r["kind"]): int(r["n"]) for r in rows}
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)
@@ -4387,12 +4507,19 @@ class ProjectStore:
 
     # -- invariant violation reports -------------------------------------------
 
-    def open_violation_report(self, invariant: str, wo_id: str | None = None) -> bool:
+    def open_violation_report(self, invariant: str, wo_id: str | None = None,
+                              level: str = "warning", detail: str = "",
+                              owed: str = "") -> bool:
         """Note that this violation is standing. True the FIRST time it is seen.
 
         The caller announces on True and says nothing on False — `invariants.py` rule 3,
         made durable. `seen` and `last_seen` are the audit trail that a per-tick inbox
         row would otherwise have been.
+
+        `level` and `detail` are kept for a READER rather than for the announcement:
+        `standing_violations` is what puts a critical one on the attention list, and the
+        row is the dedupe that makes it one item (Neo 1084). `owed` is the third such
+        reader, through `owed_violations` below.
         """
         key = (invariant, wo_id or "")
         now = db.now()
@@ -4401,13 +4528,36 @@ class ProjectStore:
         ).fetchone()
         if row is None:
             self.conn.execute(
-                "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen)"
-                " VALUES (?,?,?,?)", (*key, now, now))
+                "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen,"
+                " level, detail, owed) VALUES (?,?,?,?,?,?,?)",
+                (*key, now, now, level, detail, owed))
             return True
         self.conn.execute(
-            "UPDATE violation_reports SET last_seen=?, seen=seen+1"
-            " WHERE invariant=? AND wo_id=?", (now, *key))
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?,"
+            " owed=? WHERE invariant=? AND wo_id=?",
+            (now, level, detail, owed, *key))
         return False
+
+    def owed_violations(self, wo_id: str) -> list[dict[str, Any]]:
+        """Standing violations on this work order that OWE THE USER A DECISION.
+
+        `invariants.true_blockers` appends each row's `owed` sentence, which is what
+        routes an unrepairable invariant to the attention flag instead of the inbox
+        (spec docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+        decision.md §2). The row is the dedupe and it survives a process restart.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM violation_reports WHERE wo_id=? AND owed<>''"
+            " ORDER BY first_seen", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
+
+    def standing_violations(self, level: str = "") -> list[dict[str, Any]]:
+        """Reports still standing, optionally only those at one level. Neo 1084's read."""
+        clause = " WHERE level=?" if level else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM violation_reports{clause} ORDER BY first_seen",
+            (level,) if level else ()).fetchall()
+        return db.rows_to_dicts(rows)
 
     def close_violation_reports(
             self, standing: Iterable[tuple[str, str | None]]) -> list[tuple[str, str]]:
