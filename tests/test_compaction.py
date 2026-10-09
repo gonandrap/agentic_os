@@ -457,6 +457,160 @@ def test_a_compaction_the_os_did_not_ask_for_still_reads_as_one(fleet, settle_tu
         "Conversation compacted", "")
 
 
+# -- the size when NO turn measured one (issue #885) -----------------------------------
+#
+# The fallback only ever runs when the turn record is silent, so every test here has to
+# silence it first. That silence is the state a work order whose ONLY turn died on the
+# usage limit is genuinely in.
+
+
+def _forget_measured_contexts(store: ProjectStore, wo_id: str) -> None:
+    """No turn on record measured a size — wo-d5626c53's real state on 0.10.40."""
+    store.conn.execute("UPDATE wo_turns SET usage_json=NULL WHERE wo_id=?", (wo_id,))
+    assert worker_session.turn_context(store.latest_turn(wo_id)) == 0
+
+
+def _billed_row(context: int, *, at: str = "2026-09-29T10:00:00.000Z",
+                mid: str = "t", output: int = 10) -> dict:
+    """One API call carrying `context` tokens — `Call.context` is input + write + read."""
+    return {"type": "assistant", "timestamp": at,
+            "message": {"id": mid, "model": "claude-opus-5",
+                        "usage": {"input_tokens": 2,
+                                  "cache_creation_input_tokens": context - 2,
+                                  "cache_read_input_tokens": 0,
+                                  "output_tokens": output}}}
+
+
+def test_the_transcript_says_how_big_a_conversation_no_turn_measured_is(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """ISSUE #885: wo-d5626c53's only turn died on the usage limit without a result.
+
+    No turn recorded a size, 0 read as "small", and the relaunch four hours later
+    re-wrote 181,342 tokens with cache_read 0 while three other orders compacted.
+    """
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], [
+        _billed_row(181_342, at="2026-09-29T10:00:00.000Z", mid="a"),
+        # …and the call after it read nothing at all: skipped, not read as the size.
+        {"type": "assistant", "timestamp": "2026-09-29T10:01:00.000Z",
+         "message": {"id": "b", "model": "claude-opus-5",
+                     "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                               "cache_read_input_tokens": 0, "output_tokens": 4}}},
+    ])
+
+    assert worker_session.measured_context(store, wo["id"]) == 181_342
+    before = len(store.list_turns(wo["id"]))
+    fleet["daemon"].retry_paused_turns(fleet["project"], store)
+
+    assert len(store.list_turns(wo["id"])) == before + 1
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+
+
+def test_a_session_that_never_ran_a_turn_is_still_never_compacted(fleet, transcripts):
+    """The fallback must not turn "nothing has happened yet" into a compaction."""
+    store = fleet["store"]
+    wo = store.get_work_order(ops.create_work_order("proj_a", "task")["id"])
+
+    assert worker_session.compaction_due(store, wo, BIG) is None
+
+
+def test_a_readable_transcript_with_nothing_billed_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """Neo 1097: a transcript that reads and holds no API call is genuinely EMPTY."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], [
+        {"type": "assistant", "timestamp": "2026-09-29T10:00:00.000Z",
+         "message": {"id": "s", "model": usage.SYNTHETIC_MODEL,
+                     "usage": {"input_tokens": 0, "output_tokens": 0}}}])
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
+def test_a_corrupt_transcript_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """A file that exists and holds no parseable line is EMPTY, not UNKNOWN: `calls_of`
+    swallows the per-line ValueError, so it yields no call and the size reads 0."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], []).write_text("{not json at all\nalso not json\n")
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
+def test_a_work_order_with_no_session_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """No session id is no conversation to resume — there is nothing to summarise."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    store.conn.execute("UPDATE work_orders SET session_id=NULL WHERE id=?", (wo["id"],))
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, store.get_work_order(wo["id"]), BIG,
+        pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
+def test_a_session_id_with_no_transcript_is_empty_not_unknown(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """Neo 1127: `--resume` reads the same file, so no file is no conversation to
+    compact — UNKNOWN there could only launch a compaction that must fail."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])      # and no transcript for its session
+
+    assert worker_session.measured_context(store, wo["id"]) == 0
+    assert worker_session.compaction_due(
+        store, wo, BIG, pause=worker_session.turn_pause(store, wo["id"])) is None
+
+
+def test_an_unreadable_transcript_compacts_and_records_no_size(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """UNKNOWN is the one case that compacts under the floor — and it must not write a
+    figure the OS never measured onto the record."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    transcripts(wo["session_id"], [_billed_row(181_342)])   # exists, and won't read
+
+    def unreadable(*a, **kw):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(usage, "session_calls", unreadable)
+
+    assert worker_session.measured_context(store, wo["id"]) is None
+    pause = worker_session.turn_pause(store, wo["id"])
+    due = worker_session.compaction_due(store, wo, HUGE, pause=pause)
+    assert due is not None and due.context is None
+    assert "tokens" not in due.why and "could not be read" in due.why
+
+    fleet["daemon"].retry_paused_turns(fleet["project"], store)
+    assert _turns(store, wo["id"])[-1] == (COMPACT_TURN, claude_cli.COMPACT_PROMPT)
+    events = store.events_of_kind(wo["id"], "resume_compacting")
+    assert events and json.loads(events[-1]["payload"])["context"] is None
+
+
+def test_a_recorded_size_still_wins_over_the_transcript(
+        fleet, fake_claude, settle_turns, monkeypatch, transcripts):
+    """The transcript is the FALLBACK: a turn that measured one is the better figure."""
+    store = fleet["store"]
+    wo = _due_cold_pause(fleet, fake_claude, settle_turns, monkeypatch)
+    _forget_measured_contexts(store, wo["id"])
+    _big_context(store, wo["id"], 42_000)
+    transcripts(wo["session_id"], [_billed_row(181_342)])
+
+    assert worker_session.measured_context(store, wo["id"]) == 42_000
+
+
 # -- the paths that used to skip the decision (spec 2026-09-29, §1.2-§1.4) -------------
 
 
