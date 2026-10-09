@@ -47,7 +47,17 @@ from .agent_usage import (
 )
 from .sections import QUESTION_MAX_CHARS, QUESTION_WARN_CHARS
 from .central_store import MISSED_MIN_WORDS, CentralStore
-from .daemon import daemon_running
+from .daemon import (
+    answers_question,
+    daemon_running,
+    delivers_message,
+    feature_wakes_manager,
+    polls_pull_request,
+    retries_turn,
+    reviews_gate,
+    runnable_round,
+    settles_turn,
+)
 from .github import GitHubError
 from .invariants import PR_CLOSED_BLOCKER, UNLANDED_BLOCKER, true_blockers
 from .paths import daemon_pidfile, ensure_home, logs_dir
@@ -73,6 +83,142 @@ from .project_store import (
 
 class OpsError(RuntimeError):
     """User-facing operational error."""
+
+
+# -- who is going to act on this work order --------------------------------------
+# Section 3 of
+# docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md.
+
+@dataclass(frozen=True)
+class Actor:
+    """The daemon pass that will act on one work order next."""
+
+    pass_name: str   # the daemon method, exactly as spelled
+    why: str         # one sentence naming the predicate that said yes
+    predicate: str   # dotted path of the IMPORTED symbol, e.g. "daemon.retries_turn"
+
+
+@dataclass(frozen=True)
+class _Pass:
+    """One candidate actor: the pass, its sentence, and the predicate that decides."""
+
+    pass_name: str
+    why: str
+    predicate: str
+    test: Callable[..., Any]
+
+
+@dataclass(frozen=True)
+class ActorPasses:
+    """Every candidate for one status, or the reason there is deliberately none."""
+
+    passes: tuple[_Pass, ...] = ()
+    none_because: str = ""
+
+
+#: Keyed in `OPEN_STATUSES` order, and NO FALLTHROUGH: `scheduled_actor` indexes this
+#: dict, so a status missing from it raises KeyError — which is what makes a new
+#: `OPEN_STATUSES` member fail the pin the day it ships, the way `stuck.assess`'s
+#: `fallback_seconds` is pinned by
+#: `tests/test_catalog.py::test_every_open_status_has_a_threshold`.
+#: Candidates are ordered cheapest-predicate-first.
+SCHEDULED_ACTORS: dict[str, ActorPasses] = {
+    # THE ONE TEMPORARY ENTRY. `pending`'s actor is the claim SQL
+    # (`ProjectStore.claim_next_pending`) and lands with section 4 of the spec.
+    "pending": ActorPasses(none_because=(
+        "section 4 owns `pending` — its actor is `dispatch_pending`'s claim SQL, "
+        "which this section deliberately does not touch")),
+    "dispatching": ActorPasses((
+        _Pass("Daemon.settle_turns",
+              "the claim is inside its grace or a turn is already on record, so the "
+              "settler will move this row",
+              "daemon.settles_turn", settles_turn),
+    )),
+    "running": ActorPasses((
+        _Pass("Daemon.settle_turns",
+              "the settler sweeps this status and a turn is on record (or the claim "
+              "is still inside its grace)",
+              "daemon.settles_turn", settles_turn),
+        _Pass("Daemon.retry_paused_turns",
+              "the turn is in a resumable pause that is due, so the sweep relaunches "
+              "it",
+              "daemon.retries_turn", retries_turn),
+        _Pass("Daemon.deliver_messages",
+              "a queued message is deliverable, so it goes out as the next turn",
+              "daemon.delivers_message", delivers_message),
+    )),
+    "idle": ActorPasses((
+        _Pass("Daemon.deliver_envelopes",
+              "an idle manager's designed steady state is a POSITIVE actor: its "
+              "feature is live, so the bus still routes to it — including "
+              "`bus.ChildrenLanded` from `Daemon.settle_features` via "
+              "`ops.revive_feature_manager`",
+              "daemon.feature_wakes_manager", feature_wakes_manager),
+    )),
+    "waiting_input": ActorPasses((
+        _Pass("Daemon.retry_paused_turns",
+              "the auth pause is resumable and due, so the sweep relaunches the turn",
+              "daemon.retries_turn", retries_turn),
+        _Pass("Daemon.deliver_messages",
+              "a queued message is deliverable, so it un-parks this row",
+              "daemon.delivers_message", delivers_message),
+        _Pass("Daemon._neo_drain",
+              "Neo still holds the question this order is parked on",
+              "daemon.answers_question", answers_question),
+        _Pass("Daemon._neo_drain",
+              "a privileged-action request is open and the user does not hold it. "
+              "`pass_name` holds one string and the predicate is the OR of two passes: "
+              "`Daemon._neo_drain` settles a pending non-escalated approval, and "
+              "`Daemon.abandon_unargued_gates` (via `gates.sweep_unargued`) closes a "
+              "held `awaiting_case` one on a timer (Neo 1570)",
+              "daemon.reviews_gate", reviews_gate),
+    )),
+    "validating": ActorPasses((
+        _Pass("Daemon.validation_tick",
+              "a runnable round is on record and its hold has lifted, so the panel "
+              "judges it",
+              "daemon.runnable_round", runnable_round),
+        _Pass("Daemon.poll_pull_requests",
+              "the row carries a routing pull request, so the poll asks GitHub what "
+              "became of it",
+              "daemon.polls_pull_request", polls_pull_request),
+    )),
+    # The USER is the actor: `true_blockers`' four-way triage always yields a line for
+    # a governed order, and an UNGOVERNED one correctly derives neither.
+    "needs_review": ActorPasses(none_because=(
+        "no daemon pass — the user reviews it, and `invariants.true_blockers` is what "
+        "puts it in front of them")),
+    "waiting_pr_merge": ActorPasses((
+        _Pass("Daemon.poll_pull_requests",
+              "the row carries a routing pull request, so the poll asks GitHub what "
+              "became of it",
+              "daemon.polls_pull_request", polls_pull_request),
+    )),
+    # Deliberately none: `project_store.NOT_RETRIED` excludes it and
+    # `Daemon.settle_work_order` returns early for it.
+    "budget_exhausted": ActorPasses(none_because=(
+        "no daemon pass, by design — the actor is the user via "
+        "`ops.set_work_order_budget`, because raising the budget resumes the order")),
+}
+
+
+def scheduled_actor(store: ProjectStore, wo: dict[str, Any],
+                    now: float | None = None) -> Actor | None:
+    """Which daemon pass will act on this work order next, or None.
+
+    COST: free row fields first, then indexed reads. No session file, no subprocess,
+    no model call — and `fleet.current` is banned from this path by name: this is
+    called per work order per reconcile tick.
+
+    There is deliberately NO blanket `if origin in UNGOVERNED_ORIGINS: return None`
+    guard. Origin lives inside each predicate, because that is where the passes
+    themselves decide it; a guard here would reach the same answer for the wrong
+    reason and hide the next case.
+    """
+    for p in SCHEDULED_ACTORS[wo["status"]].passes:
+        if p.test(store, wo, now=now):
+            return Actor(pass_name=p.pass_name, why=p.why, predicate=p.predicate)
+    return None
 
 
 # -- catalog resolution ----------------------------------------------------------
