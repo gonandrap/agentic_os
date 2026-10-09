@@ -1,46 +1,46 @@
 {
-  "summary": "Markdown gets the progressive disclosure Serena gives code: jarvis spec toc/section/search, a default-off PreToolUse refusal of whole-file spec dumps, prose that points agents at the commands instead of the file, and counters that measure the result.",
-  "design_doc": "docs/superpowers/specs/2026-10-06-navigate-specs-like-code.md",
+  "summary": "One derivation replaces three hand-maintained status allow-lists: ops.scheduled_actor names the daemon pass that will next touch an open work order and why it is eligible, both readers consume that single answer, and an open order with no actor and no user-owed blocker becomes an attention item by construction.",
+  "design_doc": "docs/superpowers/specs/2026-10-09-derive-somebody-is-going-to-act-on-this.md",
   "children": [
     {
-      "key": "measure",
-      "title": "Count doc reads and whole-file reads, and classify a doc dump",
+      "key": "actors",
+      "title": "ops.scheduled_actor: name the pass that will next touch an open order, and why",
       "spec_section": "3",
-      "description": "Lands first and owns the two classifiers a sibling consumes, so there is exactly one body. Your files: `navigation.py`, `nav_volume.py`, `cli._print_navigation`. Do NOT touch `hooks.py` — you add the classifiers, another child calls them from a refusal. Do not create `spec_index.py`, do not edit `dispatch.py`, `worker_brief.py` or `cli.py`'s subparsers, add no dashboard route, and create no catalog key. Done when `uv run pytest tests/test_navigation.py tests/test_nav_volume.py tests/test_inspection.py tests/test_autopsy.py -q` is green with every existing test in them unmodified.",
+      "description": "Your files: `ops.py` (the `Actor` type, `scheduled_actor`, the registry), the call site inside every pass whose predicate you extract, `invariants.py` ONLY to make `_waiting_on_neo_gate` public, and the new `tests/test_scheduled_actor.py`. Do NOT touch `parked_reason`, `true_blockers`, `BLOCKED_STATUSES` or `ops.waiting_on`: the `readers` child rewires both readers and deletes that list, and the `waiting_on` child owns the slug set. `ProjectStore.claim_next_pending` and `pending` belong to the `pending` child, running beside you. Done when NO behaviour changed.",
       "needs": [],
-      "acceptance": "jarvis navigation --project jarvis_os --days 36500 and its --json print the new figures alongside, not instead of, the existing ones, and the payload carries both BEFORE_NOTE and DOC_BEFORE_NOTE. AND dumps_doc owns the range: with no limit_lines it is True for a ranged sed of a .md (counters count every dump) and False at limit_lines=200, and _dump_span returns 41 / 40 / None for sed -n '40,80p' / head -40 / cat."
+      "acceptance": "`ops.scheduled_actor(store, wo, now=None) -> Actor | None` plus a frozen `Actor(pass_name, why, predicate)`, registry keyed by status with no `else: return None`. `uv run pytest tests/test_scheduled_actor.py tests/test_parked_work.py -q` green: every (status, origin) pair names a pass or is in EXPECT_NEITHER, `validating` with no round and `waiting_pr_merge` with no `pr_url` return None, an AST pin proves each predicate is an imported symbol, and all 18 existing parked-work tests are unmodified."
     },
     {
-      "key": "speccli",
-      "title": "jarvis spec toc, section and search",
+      "key": "pending",
+      "title": "One claimability rule for pending: the atomic claim and the read-only reason share SQL text",
       "spec_section": "4",
-      "description": "Your files: new `src/jarvis/spec_index.py`, new `tests/test_spec_index.py`, plus `ops.py` payload functions and a `cli.py` subparser. `jarvis fo spec <fo-id>` already exists and prints a FEATURE ORDER's spec — leave it, `ops.feature_spec` and the dashboard spec page alone. Do not touch `sections.py` (re-use only), `navigation.py`, `nav_volume.py`, `hooks.py`, `dispatch.py`, `worker_brief.py` or `concision.py`, and create no catalog key. Two siblings quote your three command strings verbatim — one in worker prose, one in a refusal — so the spellings in 4.3 are a contract you may not vary.",
+      "description": "Your files: `project_store.py` (`claim_next_pending`'s WHERE clause lifted into a shared fragment, plus a read-only `why_not_claimable`), `ops.py` only to register `pending`'s actor on that reader, and `tests/test_scheduled_actor.py` extended for `pending`. Do NOT add or edit any other status's registry entry: the `actors` child owns the other eight and ships in parallel with you. Do NOT make a live blocking dependency raise anything — only an edge that can never clear does. Done when the UPDATE is still ONE statement and both queries read the same SQL text.",
       "needs": [],
-      "acceptance": "spec_index.section equals sections.extract_section over all four cases of the table (number that resolves, number that resolves to nothing, name as a case-insensitive substring, nested heading included while the next same-level one is not); toc is asserted over BOTH the tidy fixture and this spec file, so the numbered sections and the unnumbered appendix are both exercised; every search hit carries the exact runnable jarvis spec section <path> <ref> command; a path outside the project root exits non-zero naming the root, asserted with a symlink out of the tree and not a ../ string. Then as a regression pin only: jarvis spec --help and jarvis fo spec --help both exit 0 and tests/test_feature_orders.py, tests/test_spec_page.py and tests/test_search.py stay green."
+      "acceptance": "One shared SQL WHERE fragment backs both `claim_next_pending` (still ONE conditional UPDATE) and a new `why_not_claimable(store, wo) -> str | None`, and `pending`'s actor is `Daemon.dispatch_pending`. `uv run pytest tests/test_scheduled_actor.py tests/test_wo_dependencies.py tests/test_feature_order_slots_and_rollup.py tests/test_release_overtaken.py tests/test_time_in_state.py -q` green. The `actors` child's strict-xfail marker on the `pending` parameter is REMOVED, and one new test per refusal makes the held row the OLDEST and asserts two younger rows are still claimed."
     },
     {
-      "key": "hook",
-      "title": "Refuse a whole-file read of a spec, default off",
+      "key": "readers",
+      "title": "Both readers consume the verdict, and BLOCKED_STATUSES dies",
       "spec_section": "5",
-      "description": "`navigation.is_spec_path` and `navigation.dumps_doc` are already on your branch — CALL them, never re-spell them, and edit neither `navigation.py` nor any counter in `nav_volume.py`. In `dispatch.py` your edit is the env block beside JARVIS_PY_NAV_HOOK at line 215 and nothing else: another child owns the spec prose at lines 456-467 and will conflict if you stray. Do not touch `spec_index.py`, `cli.py`, `worker_brief.py` or `concision.py`. Nothing ships on, so merging this changes no running worker's behaviour and the paired on/off assertion is the whole of your proof.",
-      "needs": ["measure"],
-      "acceptance": "New tests/test_doc_nav_hook.py, modelled on tests/test_py_nav_hook.py, with every reachability assertion made through hooks.preflight_decision rather than through the decision function. AND: the read limit resolves from the catalog, not from a module constant — worker.doc_read_limit_lines gets the same seven wiring rows as worker.doc_nav_hook, and a project setting it to a value other than 200 flips a borderline Read's verdict. The .py arm has NO threshold and grows none: a Read with no limit is refused, the same Read with limit=4000 passes. AND the SAME resolved bar governs both doc arms: section 5.4's matrix is seven inputs by two switch states, with sed -n '40,80p' and head -40 of a spec PASSING beside the sed -n '1,2000p' deny. A blanket Bash refusal fails this child. AND the malformed-env table: the limit env var set to abc, empty, 0, -5 or absent all resolve to the 200 fallback and none raises, asserted through preflight_decision."
+      "description": "Your files: `invariants.py` (`parked_reason`, `true_blockers`, the one new `NO_ACTOR_BLOCKER`, `check_blocked_work_is_surfaced`, and the deletion of `BLOCKED_STATUSES`) and `tests/test_invariants.py`, including rewriting the line-579 assertion that pins `validating`'s absence while leaving line 578 green. Do NOT edit `ops.scheduled_actor` or its registry: the `actors` and `pending` children own that, and a wrong verdict for a status is a finding to record, not something to patch here. Do NOT rebase `ops.waiting_on` — the `waiting_on` child owns it, after you.",
+      "needs": ["actors", "pending"],
+      "acceptance": "`parked_reason` reads `ops.scheduled_actor` instead of `ops.waiting_on`/`SPOKEN_FOR_WAITS`; `true_blockers` adds exactly ONE new string `NO_ACTOR_BLOCKER`; `BLOCKED_STATUSES` is deleted and `check_blocked_work_is_surfaced` selects `project_store.OPEN_STATUSES + ('failed',)`. `uv run pytest tests/test_invariants.py tests/test_parked_work.py tests/test_message_stuck.py -q` green, plus a new end-to-end test where a round-less `validating` row ends the tick with `needs_attention` set and `attention_reason == NO_ACTOR_BLOCKER`."
     },
     {
-      "key": "brief",
-      "title": "Stop telling agents to read the whole spec",
+      "key": "waiting_on",
+      "title": "ops.waiting_on projects the actor verdict, with every slug string unchanged",
       "spec_section": "6",
-      "description": "Three files: `dispatch.py` at lines 456-467 plus `_planner_prompt` and `_common_briefing`; `worker_brief.navigation_core`; `concision.subagent_context`. In `dispatch.py` do NOT touch the env block at line 215 — another child owns it and will conflict. Do not edit `navigation.py`, `nav_volume.py`, `hooks.py`, `spec_index.py` or `cli.py`, and flip no catalog key. Check first that `jarvis spec --help` exits 0 on your branch: the commands you name are built by a sibling, and prose naming a command that does not exist points every feature child at an error.",
-      "needs": ["speccli"],
-      "acceptance": "The three command strings you write are byte-identical to section 4.3's, and the two tests asserting subagent_context({}) equals house_style() are rewritten to assert containment rather than deleted."
+      "description": "Your files: `ops.py` (`waiting_on`, `resume_in_auto`'s `NUDGE_IS_WRONG`, `os_status`), `ui/app.py` around line 1550, and their tests. `invariants.py` is NOT yours: the `readers` child already stopped `parked_reason` reading `SPOKEN_FOR_WAITS`, so you must not re-add that edge, and you must not add, remove or reword any blocker string. If `parked_reason` still calls `waiting_on` when you start, stop and say so rather than creating the cycle. Done when every existing `what` slug still returns its exact string.",
+      "needs": ["readers"],
+      "acceptance": "`ops.waiting_on` derives its answer from `ops.scheduled_actor` and every existing `what` slug string is byte-identical. `uv run pytest tests/test_remedies.py tests/test_resume_auto_diagnosis.py tests/test_wo_why.py tests/test_ui.py -q` green: `_waiting_on_slugs` still yields `prompt`, `pending`, `gate_held` and `signin`, and a new test per `ops.NUDGE_IS_WRONG` key asserts `resume_in_auto` still returns no nudge and that key's note. `NUDGE_IS_WRONG`'s contents are unchanged."
     },
     {
-      "key": "eval",
-      "title": "Prove a child navigates the spec instead of dumping it",
+      "key": "alarm",
+      "title": "The stillness evidence packet names the pass that will next act",
       "spec_section": "7",
-      "description": "Work in `evals/llm/`, extending the existing test_navigation_judgment.py harness, plus one identity assertion added to tests/test_navigation.py. You are the only child that observes the other three working together, and if you find a defect in one of their files you REPORT it rather than patching it: `hooks.py`, `navigation.py`, `spec_index.py`, `dispatch.py`, `worker_brief.py` and `concision.py` are all someone else's. Do not flip worker.doc_nav_hook in the catalog or in dispatch — set the env var in the eval's own settings file. Do not shrink the existing arm matrix or re-grade the .py side.",
-      "needs": ["speccli", "hook", "brief"],
-      "acceptance": "The canary token and the jarvis-spec-call assertion both hold on the hook-on arm; the hook-off arm is recorded with xfail(strict=False); and the jarvis-on-PATH precondition fails the eval rather than skipping it."
+      "description": "Your files: `supervisor.py` (`build_evidence`'s work-order arm), `health.py` ONLY as far as exposing the actor verdict to it, and `tests/test_supervisor.py`. Do NOT re-rank `health.BLOCKERS`, do not touch `health_reassert_blockers`, do not widen `supervisor.BLOCKED_SENTENCES`, and do not change `true_blockers` or any blocker string: the `readers` child owns the blocker set. Done when the packet carries the named pass and why when an actor exists, emits NO line at all when there is none, and `health.blocker` is still pure.",
+      "needs": ["actors", "readers"],
+      "acceptance": "`build_evidence`'s work-order section carries ONE positive line naming the pass that will next touch the subject when `scheduled_actor` returns one, at a fixed index, and NO line at all when it returns None — never the string `scheduled_actor: none`. `health.blocker` stays pure: no network, no session file, no model, and its `true_blockers(..., now=db.now())` call keeps that clock. `uv run pytest tests/test_supervisor.py tests/test_health_sweep.py -q` green with `EXPECTED_WORK_ORDER_PACKET` updated once, here."
     }
   ]
 }
