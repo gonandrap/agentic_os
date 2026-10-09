@@ -256,6 +256,11 @@ PR_BASE_UPDATE_FAILED_EVENT = "pr_base_update_failed"
 #: docs/superpowers/specs/2026-09-26-a-red-default-branch-raises-itself.md §3).
 INV_BASE_RED = "INV-BASE-BRANCH-RED"
 
+#: A completed work order whose recorded pull request has not merged. Shared with `ops`,
+#: which closes the report the moment `--abandon` records the decision (spec
+#: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §8).
+INV_WORK_LANDED = "INV-WORK-LANDED"
+
 #: What a work order says while its base is broken. NOT an attention reason and NOT a
 #: blocker: nobody owes a decision, the OS is waiting for a build that is already
 #: running, and `true_blockers` deliberately does not derive it. It exists because the
@@ -556,6 +561,12 @@ class Violation:
     #: attention flag says `critical` (spec
     #: docs/superpowers/specs/2026-09-28-a-usage-limit-is-not-a-failed-sweep.md §5).
     level: str = "warning"
+    #: NOT REPAIRABLE, AND A DECISION IS OWED BY THE USER. Non-empty means the blocker
+    #: sentence, authored by the checker, naming the decision and the command that takes
+    #: it — and it must carry NO elapsed time and nothing else that changes tick to tick,
+    #: or it can never be acked down (spec
+    #: docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §1).
+    owed: str = ""
 
     @property
     def key(self) -> tuple[str, str | None]:
@@ -1035,6 +1046,17 @@ def true_blockers(store: ProjectStore, wo: dict[str, Any],
         died = store.events_of_kind(wo["id"], TURN_DIED_AFTER_DELIVERY_EVENT)
         blockers.append(TURN_DIED_AFTER_DELIVERY_BLOCKER if died
                         else WORKER_FAILED_BLOCKER)
+    # AN INVARIANT THE OS CANNOT REPAIR, WHICH OWES THE USER A DECISION. UNGATED BY
+    # STATUS, and that is the point rather than an oversight: INV-WORK-LANDED fires on
+    # `completed`, and a settled order is exactly what every branch here used to skip —
+    # so an open pull request nobody merged had no surface but the inbox. The sentence is
+    # the checker's own and reaches the flag through this function, so
+    # INV-ATTENTION-REASON can re-derive it and a Claude Code hook cannot relabel it.
+    # Ranked here documentarily, for the next owed checker: nothing it can co-occur with
+    # today, since every later branch is gated on an open or parked status. Spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §3
+    for report in store.owed_violations(wo["id"]):
+        blockers.append(report["owed"])
     # AN OS-BUILT PROMPT WAS REFUSED AS TOO LARGE (spec §4,
     # docs/superpowers/specs/2026-09-26-bounded-model-inputs.md). Above the waits below
     # and above the `needs_review` triage, because it outranks both of the generic
@@ -2398,14 +2420,23 @@ def check_no_orphan_gate_requests(store: ProjectStore) -> Iterator[Violation]:
 def check_no_phantom_attention(store: ProjectStore) -> Iterator[Violation]:
     """INV-ATTENTION-PHANTOM — a work order with nothing pending must not ask for you.
 
-    Covers the "I acked it and it is still in my face" case: once a work order is
-    completed or cancelled there is nothing the user can act on, so a lingering flag is
-    pure noise on the dashboard and in the attention list.
+    Covers the "I acked it and it is still in my face" case: a lingering flag with
+    nothing behind it is pure noise on the dashboard and in the attention list.
+
+    IT USED TO SAY that once a work order is completed or cancelled there is nothing the
+    user can act on, and that is now false: an unrepairable invariant owes a DECISION and
+    derives a blocker on a settled order (INV-WORK-LANDED on an open pull request). So the
+    test is the derivation and not the status — it clears only what `true_blockers` cannot
+    re-derive. Narrow by construction: no other branch of `true_blockers` fires for
+    `completed` or `cancelled`, and `failed` is not terminal. Spec
+    docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §5
 
     Repairable: clear the flag.
     """
     for wo in store.list_work_orders(statuses=TERMINAL_STATUSES, include_hidden=True):
         if not wo["needs_attention"]:
+            continue
+        if true_blockers(store, wo):
             continue
         store.clear_attention(wo["id"])
         yield Violation(
@@ -3800,12 +3831,17 @@ def check_work_lands(store: ProjectStore) -> Iterator[Violation]:
         # one is a decision somebody already made and has to be reversed or ratified.
         remedy = ("Merge it" if found.verdict == landing.AWAITING_MERGE
                   else "Re-open and merge it")
-        yield Violation(
-            invariant="INV-WORK-LANDED",
-            wo_id=wo_id,
-            detail=(f"completed, but its pull request has not merged: {found.detail}. "
+        # BUILT ONCE and assigned to both: it is the detail AND the owed decision, and a
+        # second copy would be a second sentence to keep free of elapsed time. Spec
+        # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §6
+        sentence = (f"completed, but its pull request has not merged: {found.detail}. "
                     f"{remedy}, or record the decision to drop it with `jarvis wo "
-                    f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`."),
+                    f"finish {wo_id} --summary \"...\" --abandon \"<why>\"`.")
+        yield Violation(
+            invariant=INV_WORK_LANDED,
+            wo_id=wo_id,
+            detail=sentence,
+            owed=sentence,
             context={"verdict": found.verdict, "pr_url": found.pr_url,
                      "pr_state": found.pr_state},
         )

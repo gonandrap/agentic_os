@@ -1637,9 +1637,13 @@ ADDED_COLUMNS = {
     # is the dedupe: a `critical` one raises ONE attention item for as long as it stands
     # (Neo 1084), and `ops.os_status` cannot ask the checker again — it reads state. Every
     # row written before this reads `warning`, which is what they all were.
+    # …and WHETHER A DECISION IS OWED on it, which `invariants.true_blockers` reads to
+    # route the violation to the work order's own attention flag (spec
+    # docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-decision.md §2).
     "violation_reports": {
         "level": "TEXT NOT NULL DEFAULT 'warning'",
         "detail": "TEXT NOT NULL DEFAULT ''",
+        "owed": "TEXT NOT NULL DEFAULT ''",
     },
 }
 
@@ -4489,7 +4493,8 @@ class ProjectStore:
     # -- invariant violation reports -------------------------------------------
 
     def open_violation_report(self, invariant: str, wo_id: str | None = None,
-                              level: str = "warning", detail: str = "") -> bool:
+                              level: str = "warning", detail: str = "",
+                              owed: str = "") -> bool:
         """Note that this violation is standing. True the FIRST time it is seen.
 
         The caller announces on True and says nothing on False — `invariants.py` rule 3,
@@ -4498,7 +4503,8 @@ class ProjectStore:
 
         `level` and `detail` are kept for a READER rather than for the announcement:
         `standing_violations` is what puts a critical one on the attention list, and the
-        row is the dedupe that makes it one item (Neo 1084).
+        row is the dedupe that makes it one item (Neo 1084). `owed` is the third such
+        reader, through `owed_violations` below.
         """
         key = (invariant, wo_id or "")
         now = db.now()
@@ -4508,13 +4514,27 @@ class ProjectStore:
         if row is None:
             self.conn.execute(
                 "INSERT INTO violation_reports (invariant, wo_id, first_seen, last_seen,"
-                " level, detail) VALUES (?,?,?,?,?,?)",
-                (*key, now, now, level, detail))
+                " level, detail, owed) VALUES (?,?,?,?,?,?,?)",
+                (*key, now, now, level, detail, owed))
             return True
         self.conn.execute(
-            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?"
-            " WHERE invariant=? AND wo_id=?", (now, level, detail, *key))
+            "UPDATE violation_reports SET last_seen=?, seen=seen+1, level=?, detail=?,"
+            " owed=? WHERE invariant=? AND wo_id=?",
+            (now, level, detail, owed, *key))
         return False
+
+    def owed_violations(self, wo_id: str) -> list[dict[str, Any]]:
+        """Standing violations on this work order that OWE THE USER A DECISION.
+
+        `invariants.true_blockers` appends each row's `owed` sentence, which is what
+        routes an unrepairable invariant to the attention flag instead of the inbox
+        (spec docs/superpowers/specs/2026-10-09-an-unrepairable-invariant-owes-a-
+        decision.md §2). The row is the dedupe and it survives a process restart.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM violation_reports WHERE wo_id=? AND owed<>''"
+            " ORDER BY first_seen", (wo_id,)).fetchall()
+        return db.rows_to_dicts(rows)
 
     def standing_violations(self, level: str = "") -> list[dict[str, Any]]:
         """Reports still standing, optionally only those at one level. Neo 1084's read."""

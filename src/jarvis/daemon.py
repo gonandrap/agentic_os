@@ -5156,9 +5156,28 @@ class Daemon:
 
         for v in violations:
             # `level` and `detail` ride along so a standing CRITICAL one can reach the
-            # attention list from state alone — Neo 1084, `ops.os_status`.
-            if not store.open_violation_report(v.invariant, v.wo_id, level=v.level,
-                                               detail=v.detail):
+            # attention list from state alone — Neo 1084, `ops.os_status`. `owed` rides
+            # along for the same reason and is written FIRST, so the row exists before
+            # the derivation below reads it.
+            first = store.open_violation_report(v.invariant, v.wo_id, level=v.level,
+                                                detail=v.detail, owed=v.owed)
+            # A DECISION IS OWED: raise the work order's own flag, with the reason
+            # DERIVED rather than written — and do it before the dedupe `continue`, so a
+            # flag something else cleared comes back while the violation stands. An
+            # ACKED one leaves `true_blockers`, so the derivation is empty and re-running
+            # every tick cannot re-raise it. Spec docs/superpowers/specs/
+            # 2026-10-09-an-unrepairable-invariant-owes-a-decision.md §4
+            routed = bool(v.owed and v.wo_id)
+            if routed:
+                try:
+                    wo = store.get_work_order(v.wo_id)
+                except KeyError:
+                    wo = None       # named an order deleted since the check ran
+                if wo is not None and not wo["needs_attention"]:
+                    blockers = invariants_mod.true_blockers(store, wo)
+                    if blockers:
+                        store.flag_attention(wo["id"], blockers[0])
+            if not first:
                 continue
             log.warning("[%s] %s", project.name, v)
             if v.wo_id:
@@ -5166,8 +5185,13 @@ class Daemon:
                     "invariant": v.invariant, "detail": v.detail,
                     "repaired": v.repaired, "repair": v.repair, **v.context,
                 })
-            if not v.repaired:
-                # Nothing deterministic to do about it — this one needs a human.
+            if not v.repaired and not routed:
+                # Nothing deterministic to do about it — this one needs a human. NOT for
+                # a violation `routed` to the work order's attention flag above: the
+                # attention item REPLACES this line, and two surfaces for one decision is
+                # the double-report that buried wo-1abd3886 in a 230-item pile. One with
+                # `owed` and no `wo_id` is project-level, has no order to flag, and keeps
+                # its notification (spec §4).
                 store.add_notification(
                     title=f"OS invariant violated: {v.invariant}",
                     body=f"{v.detail}" + (f" ({v.wo_id})" if v.wo_id else ""),
