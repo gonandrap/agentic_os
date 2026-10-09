@@ -3416,3 +3416,64 @@ def test_a_crafted_retried_link_states_no_fact(client, daemon, project, crafted)
 
     assert RETRY_HEADING in page
     assert "jarvisd launches the turn" not in page
+
+
+# -- one order, one page: links are derived from the id PREFIX -----------------------
+#
+# GitHub issue #997: the NEEDS YOU strip built `/fo/<project>/<id>` for every
+# `feature_orders` row, so an improvement order rendered with the feature template —
+# "Release this plan?", "all 0 work orders" — and the per-finding accept/reject the user
+# actually owed was only on `/io/`. `order_path` is the one derivation.
+
+
+def _flagged(project, title, kind, reason):
+    """A `feature_orders` row of one kind, flagged for the user. No ceremony."""
+    store = ProjectStore(project)
+    try:
+        row = store.create_feature_order(title, description="the whole ask", kind=kind)
+        store.flag_feature_attention(row["id"], reason)
+        return row
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("kind,segment", [("feature", "fo"), ("improvement", "io"),
+                                          ("investigation", "inv")])
+def test_the_attention_strip_links_each_kind_to_its_own_page(client, project, kind,
+                                                             segment):
+    row = _flagged(project, "slow first turns", kind, "it needs you")
+
+    page = client.get("/").text
+
+    assert f'/{segment}/proj_a/{row["id"]}' in page
+    for other in ("fo", "io", "inv"):
+        if other != segment:
+            assert f'/{other}/proj_a/{row["id"]}' not in page
+
+
+@pytest.mark.parametrize("kind,segment", [("improvement", "io"),
+                                          ("investigation", "inv")])
+def test_an_old_fo_bookmark_for_another_kind_redirects(client, project, kind, segment):
+    row = _flagged(project, "slow first turns", kind, "it needs you")
+
+    res = client.get(f"/fo/proj_a/{row['id']}")
+
+    assert res.status_code == 303
+    assert res.headers["location"] == f"/{segment}/proj_a/{row['id']}"
+
+
+def test_order_path_maps_every_prefix_and_falls_back_to_the_feature_page():
+    # In `project_store`, beside the prefixes it derives from: `search.py` links through
+    # the same derivation and must not import the FastAPI module. `ui.app` re-exports it
+    # under the same name, which is what the templates call.
+    from jarvis.project_store import order_path
+    from jarvis.ui import app
+
+    assert app.order_path is order_path
+    assert order_path("proj_a", "wo-1234") == "/wo/proj_a/wo-1234"
+    assert order_path("proj_a", "fo-1234") == "/fo/proj_a/fo-1234"
+    assert order_path("proj_a", "io-1234") == "/io/proj_a/io-1234"
+    assert order_path("proj_a", "inv-1234") == "/inv/proj_a/inv-1234"
+    # Unknown prefix: the feature page, never `/wo/` — an id that names no kind is a
+    # `feature_orders` row far more often than a work order.
+    assert order_path("proj_a", "zz-1234") == "/fo/proj_a/zz-1234"

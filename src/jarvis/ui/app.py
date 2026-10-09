@@ -33,6 +33,8 @@ from ..project_store import (
     WO_STATUSES,
     ProjectStore,
     feature_status_label,
+    is_feature_order_id,
+    order_path,
     validation_standing,
 )
 from ..timeline import build_conversation, build_timeline, count_debug
@@ -651,11 +653,13 @@ def alarm_badge() -> int | None:
 def _order_href(order_id: str) -> str | None:
     """Where an allow-listed order's page is, or None when it no longer resolves."""
     try:
-        if order_id.startswith("fo-"):
+        # Issue #997: `fo-` only, so an allow-listed `io-`/`inv-` id was looked up as a
+        # work order, resolved to None and lost its link.
+        if is_feature_order_id(order_id):
             pname, _, _ = ops.find_feature_order(order_id)
-            return f"/fo/{pname}/{order_id}"
-        pname, _, _ = ops.find_work_order(order_id)
-        return f"/wo/{pname}/{order_id}"
+        else:
+            pname, _, _ = ops.find_work_order(order_id)
+        return order_path(pname, order_id)
     except ops.OpsError:
         return None
 
@@ -1082,6 +1086,8 @@ def create_app() -> FastAPI:
     templates.env.globals.update(
         status_meta=STATUS_META, origin_meta=ORIGIN_META, gate_meta=GATE_META,
         gate_display=gate_display,
+        # Every link to an order's page goes through this — see `order_path` (#997).
+        order_path=order_path,
         # A round's word, tone and icon — the same tuple `ops.round_line` and
         # `automerge.decide` render from, so no surface can call a CI wait a failure on
         # its own (GitHub issue #581).
@@ -1378,6 +1384,12 @@ def create_app() -> FastAPI:
         is also where an escalated plan is decided, because deciding needs all three of
         those on one screen and no other page has them.
         """
+        # An id whose prefix names another kind gets its own page, so an old bookmark or
+        # a link built before #997 heals instead of erroring. The ops guard behind this
+        # covers the CLI and the JSON surface, where there is nowhere to redirect to.
+        target = order_path(name, fo_id)
+        if target != f"/fo/{name}/{fo_id}":
+            return RedirectResponse(target, status_code=303)
         try:
             detail = ops.show_feature_order(fo_id, name)
         except ops.OpsError as e:

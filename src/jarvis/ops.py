@@ -237,7 +237,9 @@ def resume_fleet(order_ids: list[str] | None = None,
 
 def _resolve_order_id(order_id: str) -> str:
     """A work or feature order id that exists — a typo must not silently allow nothing."""
-    if order_id.startswith("fo-"):
+    # `project_store.is_feature_order_id`, not a `fo-` literal: an `io-`/`inv-` id was
+    # looked up as a work order and refused as a typo (issue #997).
+    if is_feature_order_id(order_id):
         find_feature_order(order_id)
     else:
         find_work_order(order_id)
@@ -8409,6 +8411,22 @@ _KIND_FAMILY = {
 }
 
 
+#: Per kind: the verb that SHOWS one. Beside the two tables above for their reason, and
+#: read by `show_feature_order`'s guard — the one refusal that has to name the command for
+#: the kind the row ACTUALLY is, because the user got there from a `/fo/` link or a
+#: `jarvis fo show` of an id they pasted (GitHub issue #997).
+_KIND_SHOW_VERBS = {
+    "feature": "jarvis fo show",
+    "improvement": "jarvis io show",
+    "investigation": "jarvis investigate show",
+}
+
+
+def show_verb(kind: str | None) -> str:
+    """The command that shows a `feature_orders` row of this kind."""
+    return _KIND_SHOW_VERBS.get(kind or "feature", _KIND_SHOW_VERBS["feature"])
+
+
 def family_prose(kind: str | None) -> tuple[str, str]:
     """`(what the family is called, the command that raises its budget)` for one kind."""
     return _KIND_FAMILY.get(kind or "feature", _KIND_FAMILY["feature"])
@@ -9459,6 +9477,10 @@ def show_feature_order(fo_id: str, project_name: str | None = None) -> dict[str,
     from . import plans
 
     name, path, fo = find_feature_order(fo_id, project_name)
+    # The verb for the kind the row ACTUALLY is: this is the surface an id of another kind
+    # reaches by accident, so "use `jarvis fo show`" would name the command that just
+    # refused (GitHub issue #997).
+    _require_kind(fo, "feature", show_verb(fo.get("kind")))
     store = ProjectStore(path)
     try:
         plan = db.from_json(fo.get("plan"), None)
