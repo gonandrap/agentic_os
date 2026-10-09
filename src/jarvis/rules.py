@@ -845,11 +845,21 @@ def recurrence(detectors: Iterable[Mapping[str, Any]], gap_class: str, *,
 
 
 def recurrence_verdict(detector: Mapping[str, Any],
-                       fire: Mapping[str, Any] | None) -> str:
+                       fire: Mapping[str, Any] | None,
+                       *, stuck: bool = True) -> str:
     """Which half of the rule did not hold. PURE, and derived from the FIRE RECORD.
+
+    THE ONE PLACE that explains what each verdict blames; the schema comment and
+    `ops._RECURRENCE_NOTES` point here rather than restating it.
 
     `fire` is the newest fire this detector has on the order in question, cleared or
     not, or `None` when it has none.
+
+    `stuck` is a PARAMETER and never a derivation: §8 makes `remedy_failed` conditional
+    on the order being stuck anyway, `invariants.true_blockers` owns `attention_reason`,
+    and this module is a LEAF that may not import it. So the caller passes the fact it
+    already has. It defaults to `True` — the behaviour before it existed — because
+    `record_recurrence` is called about an order whose gap recurred.
 
     - A detector that is not `armed` gives `not_armed` whatever the fire says: a
       `dry_run` rule acts on nothing, so neither its condition nor its remedy can be
@@ -857,10 +867,12 @@ def recurrence_verdict(detector: Mapping[str, Any],
       and cannot be blamed either, though `recurrence` never returns one.
     - `armed` with no fire is `missed`: the condition did not match what happened, and
       the finding is about the condition.
-    - `armed` with a `proposed`, `refused` or `applied` fire is `remedy_failed`. `applied`
-      is in that set on Neo question 974's ruling: the remedy RAN and the gap recurred
-      anyway, so the remedy is still the half that failed — a remedy that leaves the gap
-      standing is not a remedy that worked.
+    - `armed` with a `proposed`, `refused` or `applied` fire AND `stuck` is
+      `remedy_failed`. `applied` is in that set on Neo question 974's ruling: the remedy
+      RAN and the gap recurred anyway, so the remedy is still the half that failed — a
+      remedy that leaves the gap standing is not a remedy that worked. With `stuck`
+      false the rule acted and the order is not held up, so the fire is NO USABLE FIRE
+      below and the remedy is not blamed.
     - `armed` with an `unreadable` fire gives `unreadable`, its OWN verdict and never
       `missed`. Calling it `missed` would claim a decision that was never read, which the
       pinned ruling against fabricating a default answer from a failure forbids. It is
@@ -873,7 +885,7 @@ def recurrence_verdict(detector: Mapping[str, Any],
     if _retired(detector) or str(detector.get("status") or DRY_RUN) != ARMED:
         return NOT_ARMED
     outcome = str((fire or {}).get("outcome") or "")
-    if outcome in (PROPOSED, REFUSED, APPLIED):
+    if stuck and outcome in (PROPOSED, REFUSED, APPLIED):
         return REMEDY_FAILED
     if outcome == UNREADABLE:
         return UNREADABLE_RECURRENCE

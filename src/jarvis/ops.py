@@ -11317,16 +11317,14 @@ def rules_dry_run(detector_id: str, order_id: str = "") -> dict[str, Any]:
 
 # -- the recurrence ledger (spec §8) ----------------------------------------------------
 #
-# A gap the OS ALREADY has a detector for happened again. That is not "a new bug": the
-# condition missed the symptom, or it matched and the remedy did not hold, or the rule was
-# still in `dry_run` and acted on nothing. Filing it afresh loses the one fact that
-# matters — that the OS already tried — so this LINKS and never duplicates.
+# A gap the OS ALREADY has a detector for happened again. That is not "a new bug", and
+# filing it afresh loses the one fact that matters — that the OS already tried — so this
+# LINKS and never duplicates. Which half of the rule each verdict blames: see
+# `rules.recurrence_verdict`.
 
-#: What each verdict MEANS, in the sentence a person reads. A CLOSED TEMPLATE keyed on the
-#: verdict, never prose assembled from the row: the note says which half of the rule the
-#: finding is about, and a sentence stitched together per call could disagree with the
-#: verdict beside it. Every string names that half explicitly, because a finding filed at
-#: the wrong half is the failure §8 was written to prevent.
+#: The sentence a person reads for each verdict. A CLOSED TEMPLATE keyed on the verdict,
+#: never prose assembled from the row: a sentence stitched together per call could
+#: disagree with the verdict beside it.
 _RECURRENCE_NOTES = {
     rules.NOT_ARMED: (
         "a detector for this gap exists but is still in dry_run, so it acted on nothing "
@@ -11403,7 +11401,8 @@ def _recurrence_tracker_act(detector: dict[str, Any], *, order_id: str, gap_clas
 
 
 def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str = "",
-                      note: str = "", detector_id: str = "") -> dict[str, Any]:
+                      note: str = "", detector_id: str = "",
+                      stuck: bool = True) -> dict[str, Any]:
     """An existing rule did not hold. Derive which half, write the ledger row, and link
     the finding to the ORIGINAL issue rather than filing a second one.
 
@@ -11417,6 +11416,9 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
     `detector_id` names the detector directly, for a caller that already resolved it;
     without it `rules.recurrence` picks the one live rule for this gap in this project's
     scope, with the tie-break documented there.
+
+    `stuck` is forwarded to `rules.recurrence_verdict`, which documents why §8's
+    stuckness condition is a parameter and not a derivation.
     """
     central = CentralStore()
     try:
@@ -11427,9 +11429,10 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
         if detector is None:
             return {"recorded": False, "detector": None, "verdict": None,
                     "recurrence": None, "filed_note": "",
-                    "note": (f"no detector exists for gap class {gap_class!r}, so this "
-                             f"is a NEW gap and not a recurrence — nothing was recorded "
-                             f"against a rule, because there is no rule to blame")}
+                    "verdict_note": (
+                        f"no detector exists for gap class {gap_class!r}, so this is a "
+                        f"NEW gap and not a recurrence — nothing was recorded against a "
+                        f"rule, because there is no rule to blame")}
         detector = dict(detector)
 
         # The NEWEST fire this detector has on this order, CLEARED OR NOT. Two reads
@@ -11445,7 +11448,7 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
                                      limit=1)) if f]
         fire = (max(candidates, key=lambda f: (float(f["ts"]), int(f["id"])))
                 if candidates else None)
-        verdict = rules.recurrence_verdict(detector, fire)
+        verdict = rules.recurrence_verdict(detector, fire, stuck=stuck)
 
         # Written BEFORE the tracker is touched, so no `gh` failure and no crash between
         # the two can lose the finding. `filed_note` is filled in afterwards — see
@@ -11460,9 +11463,11 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
         row = central.set_recurrence_filed_note(row["id"], filed_note)
     finally:
         central.close()
+    # `verdict_note` is the OS's sentence about the verdict; `recurrence["note"]` is the
+    # CALLER's own note, stored on the row. Two audiences, so two names (spec §8).
     return {"recorded": True, "detector": detector, "verdict": verdict,
             "recurrence": row, "filed_note": filed_note,
-            "note": _RECURRENCE_NOTES[verdict]}
+            "verdict_note": _RECURRENCE_NOTES[verdict]}
 
 
 def explain_gate(command: str, project_name: str | None = None) -> dict[str, Any]:

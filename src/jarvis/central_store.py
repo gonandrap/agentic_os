@@ -390,26 +390,22 @@ CREATE INDEX IF NOT EXISTS idx_rule_fires_order ON rule_fires(order_id, detector
 -- API call or a crash mid-comment cannot lose the finding. What happened on the tracker,
 -- or why nothing did, lands afterwards in `filed_note`.
 --
--- `verdict` has FOUR values, not the three this spec section's own DDL listed: Neo
--- question 974 added `unreadable`, because an armed detector whose fire records that
--- something could not be READ decided nothing, and recording that as `missed` would
--- claim the condition was evaluated and came back false. A verdict is the thing a finding
--- is filed against, so the wrong one aims the fix at the wrong half of the rule. The set
--- is `rules.RECURRENCE_VERDICTS` and `add_recurrence` validates against it.
+-- The verdict set is `rules.RECURRENCE_VERDICTS` and `add_recurrence` validates against
+-- it; what each value blames is explained once, in `rules.recurrence_verdict`.
 --
 -- `filed_note` is the FULL LOCAL ACCOUNT — which act ran, against which issue, or the
 -- failure's own words — including anything too private to publish. That is precisely why
 -- the tracker comment is built somewhere else, by `rules.recurrence_comment`, from four
 -- fields and nothing else: the two texts have different audiences and must not be one
--- string. `note` is the sentence a person reads about the verdict.
+-- string. `note` is the CALLER's own account of this recurrence, stored verbatim.
 CREATE TABLE IF NOT EXISTS rule_recurrences (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
     gap_class TEXT NOT NULL,
     detector_id TEXT NOT NULL REFERENCES detectors(id),
     project TEXT NOT NULL, order_id TEXT NOT NULL,
     io_id TEXT NOT NULL DEFAULT '',
-    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed
-                                         --   | unreadable (Neo question 974)
+    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed |
+                                         --   unreadable; see rules.recurrence_verdict
     original_fix_wo_id TEXT NOT NULL DEFAULT '',
     original_issue_url TEXT NOT NULL DEFAULT '',
     filed_note TEXT NOT NULL DEFAULT '', -- what happened on the tracker, or why nothing did
@@ -1671,8 +1667,8 @@ class CentralStore:
         return db.rows_to_dicts(self.conn.execute(q, params).fetchall())
 
     # --- the recurrence ledger -------------------------------------------------------
-    # docs/specs/2026-09-27-self-evolution.md §8. A gap the OS ALREADY has a detector for
-    # happened again, which is a different fact from a new gap: the rule's condition
+    # docs/superpowers/specs/2026-09-27-self-evolution.md §8. A gap the OS ALREADY has a
+    # detector for happened again, which is a different fact from a new gap: the condition
     # missed it, or its remedy did not hold, or it was never armed. Filing that as a fresh
     # issue loses the one thing that matters — that the OS already tried.
 

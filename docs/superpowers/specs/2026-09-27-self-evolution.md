@@ -773,8 +773,9 @@ judging existence, which this design forbids; a checklist with no refusal is adv
 
 When an investigation lands on a `gap_class` for which a detector ALREADY exists, something
 specific happened and it is not "a new bug": either the condition missed the symptom, or it
-matched and the remedy failed, or the rule was still in `dry_run` and never acted. Filing that as
-a fresh issue loses the one fact that matters — that the OS already tried.
+matched and the remedy failed, or the rule was still in `dry_run` and never acted, or something
+could not be read and nothing was decided at all. Filing that as a fresh issue loses the one fact
+that matters — that the OS already tried.
 
 ```sql
 CREATE TABLE IF NOT EXISTS rule_recurrences (
@@ -783,7 +784,7 @@ CREATE TABLE IF NOT EXISTS rule_recurrences (
     detector_id TEXT NOT NULL REFERENCES detectors(id),
     project TEXT NOT NULL, order_id TEXT NOT NULL,
     io_id TEXT NOT NULL DEFAULT '',
-    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed
+    verdict TEXT NOT NULL,               -- missed | remedy_failed | not_armed | unreadable
     original_fix_wo_id TEXT NOT NULL DEFAULT '',
     original_issue_url TEXT NOT NULL DEFAULT '',
     filed_note TEXT NOT NULL DEFAULT '', -- what happened on the tracker, or why nothing did
@@ -802,6 +803,11 @@ it:
 - `remedy_failed` — the detector is `armed`, has a fire on this order, and that fire's outcome is
   `proposed` or `refused` while the order is stuck anyway. The finding is about the remedy, or
   about the gate that refused it.
+- `unreadable` — the detector is `armed` and that fire's outcome is `unreadable`: something could
+  not be READ, so nothing was decided. A FOURTH verdict, added by Neo question 974, because
+  recording it as `missed` would claim the condition was evaluated and came back false, and the
+  OS never fabricates a default answer from a failure. It is NOT evidence for arming either. The
+  finding is about what the condition reads.
 
 **What it does with that: it links, it never duplicates.** The recurrence row is written and
 `detectors.recurrences` increments; the ORIGINAL issue is reopened if closed and commented on if

@@ -613,7 +613,7 @@ def follow_ups_filed(repo: str, unit_id: str) -> list[dict[str, Any]]:
 
 # -- recurrences: the gap came back and the OS already had a rule for it ---------------
 #
-# docs/specs/2026-09-27-self-evolution.md §8. The OS links, it never duplicates: the
+# docs/superpowers/specs/2026-09-27-self-evolution.md §8. The OS links, it never duplicates: the
 # ORIGINAL issue is reopened if closed and commented on if open, and carries this label so
 # "a rule we already shipped did not hold" is visible on the tracker without reading the
 # thread. `ops.record_recurrence` is the one caller.

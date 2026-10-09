@@ -1,8 +1,8 @@
 """The recurrence ledger: a rule that already exists and did not hold.
 
-Spec: docs/specs/2026-09-27-self-evolution.md §8. Three properties carry the weight, and
-§8 names the tests for each because a verdict derived wrong files the finding against the
-wrong half of the rule.
+Spec: docs/superpowers/specs/2026-09-27-self-evolution.md §8. Three properties carry the
+weight, and §8 names the tests for each because a verdict derived wrong files the finding
+against the wrong half of the rule.
 
 1. **Every verdict is derived from a REAL fire record**, written through
    `CentralStore.record_rule_fire`, never from a hand-set dict field. A test that sets
@@ -123,7 +123,7 @@ def test_a_dry_run_detector_gives_not_armed(store, tracker):
     assert out["recorded"] is True
     assert out["verdict"] == rules.NOT_ARMED
     assert out["detector"]["id"] == det["id"]
-    assert "arming" in out["note"]
+    assert "arming" in out["verdict_note"]
     assert out["recurrence"]["original_fix_wo_id"] == "wo-9"
     assert out["recurrence"]["original_issue_url"] == FIXTURE_ISSUE_URL
 
@@ -134,7 +134,7 @@ def test_an_armed_detector_with_no_fire_on_the_order_gives_missed(store, tracker
     _fire(store, det, rules.PROPOSED, order_id="wo-someone-else")
     out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER)
     assert out["verdict"] == rules.MISSED
-    assert "condition" in out["note"]
+    assert "condition" in out["verdict_note"]
 
 
 @pytest.mark.parametrize("outcome", [rules.PROPOSED, rules.REFUSED, rules.APPLIED])
@@ -143,7 +143,7 @@ def test_an_armed_detector_that_fired_gives_remedy_failed(store, tracker, outcom
     _fire(store, det, outcome)
     out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER)
     assert out["verdict"] == rules.REMEDY_FAILED
-    assert "REMEDY" in out["note"]
+    assert "REMEDY" in out["verdict_note"]
 
 
 def test_an_unreadable_fire_gives_its_own_verdict_and_never_missed(store, tracker):
@@ -152,6 +152,18 @@ def test_an_unreadable_fire_gives_its_own_verdict_and_never_missed(store, tracke
     out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER)
     assert out["verdict"] == rules.UNREADABLE_RECURRENCE
     assert out["verdict"] != rules.MISSED
+
+
+def test_the_callers_note_and_the_verdict_note_are_different_keys(store, tracker):
+    """Two sentences with two audiences, so two names: the row carries what the CALLER
+    passed and `verdict_note` is the OS's sentence about the verdict (spec §8)."""
+    det = _arm(store, _detector(store))
+    _fire(store, det, rules.PROPOSED)
+    out = ops.record_recurrence(gap_class=GAP, project="proj_a", order_id=ORDER,
+                                note="what the caller saw")
+    assert out["recurrence"]["note"] == "what the caller saw"
+    assert "REMEDY" in out["verdict_note"]
+    assert "note" not in out
 
 
 def test_a_cleared_fire_is_still_the_evidence_the_verdict_reads(store, tracker):
@@ -264,8 +276,10 @@ def test_no_detector_for_the_gap_class_is_a_new_gap(store, tracker):
     out = ops.record_recurrence(gap_class="never-seen-before", project="proj_a",
                                 order_id=ORDER)
     assert out == {"recorded": False, "detector": None, "verdict": None,
-                   "recurrence": None, "filed_note": "", "note": out["note"]}
-    assert "NEW gap" in out["note"] and "never-seen-before" in out["note"]
+                   "recurrence": None, "filed_note": "",
+                   "verdict_note": out["verdict_note"]}
+    assert "NEW gap" in out["verdict_note"]
+    assert "never-seen-before" in out["verdict_note"]
     assert store.list_recurrences() == []
     assert tracker.commented == [] and tracker.reopened == []
 

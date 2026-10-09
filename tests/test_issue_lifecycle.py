@@ -227,7 +227,7 @@ def test_the_declared_verbs_are_exactly_these_writes_and_these_three_reads():
         ("label", "create"), ("issue", "create"),
         # The recurrence path's write: a gap that came back is linked to its original
         # issue, which the OS normally already closed (spec §8 of
-        # docs/specs/2026-09-27-self-evolution.md).
+        # docs/superpowers/specs/2026-09-27-self-evolution.md).
         ("issue", "reopen")}
 
 
