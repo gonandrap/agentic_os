@@ -11401,8 +11401,7 @@ def _recurrence_tracker_act(detector: dict[str, Any], *, order_id: str, gap_clas
 
 
 def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str = "",
-                      note: str = "", detector_id: str = "",
-                      stuck: bool = True) -> dict[str, Any]:
+                      note: str = "", detector_id: str = "") -> dict[str, Any]:
     """An existing rule did not hold. Derive which half, write the ledger row, and link
     the finding to the ORIGINAL issue rather than filing a second one.
 
@@ -11416,9 +11415,6 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
     `detector_id` names the detector directly, for a caller that already resolved it;
     without it `rules.recurrence` picks the one live rule for this gap in this project's
     scope, with the tie-break documented there.
-
-    `stuck` is forwarded to `rules.recurrence_verdict`, which documents why §8's
-    stuckness condition is a parameter and not a derivation.
     """
     central = CentralStore()
     try:
@@ -11448,7 +11444,7 @@ def record_recurrence(*, gap_class: str, project: str, order_id: str, io_id: str
                                      limit=1)) if f]
         fire = (max(candidates, key=lambda f: (float(f["ts"]), int(f["id"])))
                 if candidates else None)
-        verdict = rules.recurrence_verdict(detector, fire, stuck=stuck)
+        verdict = rules.recurrence_verdict(detector, fire)
 
         # Written BEFORE the tracker is touched, so no `gh` failure and no crash between
         # the two can lose the finding. `filed_note` is filled in afterwards — see

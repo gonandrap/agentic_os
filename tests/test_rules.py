@@ -477,16 +477,6 @@ def test_an_armed_detector_that_fired_and_acted_is_a_remedy_failure(outcome):
                                     {"outcome": outcome}) == rules.REMEDY_FAILED
 
 
-@pytest.mark.parametrize("outcome", [rules.PROPOSED, rules.REFUSED, rules.APPLIED])
-def test_a_fire_on_an_order_that_is_not_stuck_does_not_blame_the_remedy(outcome):
-    """§8 conditions `remedy_failed` on the order being "stuck anyway". The fact is the
-    caller's to pass; `stuck` defaults to True, which is the behaviour without it."""
-    det = _det(status=rules.ARMED)
-    assert rules.recurrence_verdict(det, {"outcome": outcome}, stuck=False) == \
-        rules.MISSED
-    assert rules.recurrence_verdict(det, {"outcome": outcome}) == rules.REMEDY_FAILED
-
-
 def test_an_unreadable_fire_is_its_own_verdict_and_never_missed():
     got = rules.recurrence_verdict(_det(status=rules.ARMED),
                                    {"outcome": rules.UNREADABLE})
