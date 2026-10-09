@@ -13,7 +13,7 @@ that each condition selects the shape it names and stays silent on a HEALTHY ord
 same status — which is the half that carries the weight, because another rule's silence
 would otherwise hide this one's noise.
 
-Four properties beyond the ten seed tests:
+Five properties beyond the ten seed tests:
 
 1. **Laziness is asserted by NAME.** `holds.held` walks up to `holds._EVENT_LIMIT` events
    per order; the call-count tests below wrap that exact function, so a later refactor
@@ -30,11 +30,17 @@ Four properties beyond the ten seed tests:
    after it has cleared.
 4. **Nothing that could not be read decides anything.** A detector that raises is
    recorded `unreadable` and the rest of the pass still runs.
+5. **NO ORDER IS STARVED.** Both caps — `EVAL_MAX_ORDERS` and `EVAL_MAX_SECONDS` — cut a
+   single oldest-first pass at the same place on every tick, so the tail would never be
+   evaluated at all. The in-memory cursor rotates the start, so every eligible order is
+   reached within `ceil(N / EVAL_MAX_ORDERS) + 1` ticks and a seconds-budget break resumes
+   at the order after the last one evaluated.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import time
 
 import pytest
@@ -812,3 +818,123 @@ def test_one_tick_over_twenty_orders_is_measured(started, spec, store, central, 
         print(f"\nrules_tick over {n} orders, {counts['detectors']} detectors: "
               f"{elapsed * 1000:.0f} ms")
     assert elapsed < 10.0
+
+
+# -- 10. the cursor: a cap truncates a pass, it does not strand the tail -----------------
+#
+# Both caps stop at the same point on every tick, so without a cursor the orders past it
+# are never evaluated — and a stranded NEW order is exactly what this feature exists to
+# notice. The user rejected assumption #5 of wo-cdee6f9b on that ground and Neo objected
+# on the same one; spec §5.2.
+
+
+def evaluated_ids(monkeypatch) -> list[str]:
+    """The orders the pass actually built a snapshot for, in iteration order. `counts`
+    carries a number and this question is about WHICH, so the seam is `ops.rule_facts`."""
+    seen: list[str] = []
+    real = ops.rule_facts
+
+    def spy(store_, wo, **kw):
+        seen.append(str(wo["id"]))
+        return real(store_, wo, **kw)
+
+    monkeypatch.setattr(ops, "rule_facts", spy)
+    return seen
+
+
+def test_every_open_order_is_evaluated_within_a_bounded_number_of_ticks(
+        started, spec, store, central, monkeypatch):
+    """BOUNDED, not eventual: ceil(N / cap) ticks to cover N orders, plus one for the
+    partial lap the cursor may start mid-way through."""
+    from jarvis import daemon as daemon_mod
+
+    monkeypatch.setattr(daemon_mod, "EVAL_MAX_ORDERS", 10)
+    n = 25
+    wanted = {str(store.create_work_order(f"order {i}", status="running")["id"])
+              for i in range(n)}
+    seen = evaluated_ids(monkeypatch)
+
+    for _ in range(math.ceil(n / 10) + 1):
+        tick(started, spec, store)
+
+    missed = wanted - set(seen)
+    assert not missed, f"{len(missed)} of {n} orders were never evaluated: {missed}"
+
+
+def test_the_seconds_budget_resumes_at_the_order_after_the_last_one_evaluated(
+        started, spec, store, central, monkeypatch):
+    """The break is mid-pass, so the cursor has to be advanced per order and not per
+    pass. Only the daemon's clock is faked — patching `time.monotonic` itself would
+    reach pytest."""
+    from jarvis import daemon as daemon_mod
+
+    created = [str(store.create_work_order(f"order {i}", status="running")["id"])
+               for i in range(6)]
+    seen = evaluated_ids(monkeypatch)
+
+    calls = {"n": 0}
+
+    def monotonic() -> float:
+        calls["n"] += 1
+        return 0.0 if calls["n"] <= 3 else 10_000.0
+
+    class Clock:
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    clock = Clock()
+    clock.monotonic = monotonic                     # type: ignore[attr-defined]
+    monkeypatch.setattr(daemon_mod, "time", clock)
+
+    counts = tick(started, spec, store)
+    assert counts["capped"] == "seconds"
+    first = list(seen)
+    assert first == created[:2], f"expected the first two orders, got {first}"
+
+    monkeypatch.setattr(daemon_mod, "time", time)
+    seen.clear()
+    tick(started, spec, store)
+
+    assert seen[0] == created[2], (
+        f"the next pass restarted at {seen[0]} instead of resuming at {created[2]}")
+
+
+def test_a_cursor_naming_an_order_that_is_no_longer_open_does_not_skip_the_pass(
+        started, spec, store, central, monkeypatch):
+    """A settled, hidden or deleted order can be the cursor: it was open when the last
+    pass read it. The fallback starts at the first order created after it."""
+    gone = store.create_work_order("an order that settled", status="running")
+    store.set_status(gone["id"], "completed")
+    open_ids = {str(store.create_work_order(f"order {i}", status="running")["id"])
+                for i in range(3)}
+    started.rules_cursor["proj_a"] = (float(gone["created_at"]), str(gone["id"]))
+    seen = evaluated_ids(monkeypatch)
+
+    counts = tick(started, spec, store)
+
+    assert set(seen) == open_ids, f"the pass evaluated {seen}, counts={counts}"
+
+
+def test_a_settled_cursor_resumes_at_the_order_created_after_it(
+        started, spec, store, central, monkeypatch):
+    """The cursor is the SORT KEY, not the id. Ids are random, so a lexical `id > cursor`
+    fallback resumes at an arbitrary order — here the ids sort in the OPPOSITE order to
+    `created_at`, which makes that bug visible instead of coincidentally right."""
+    def order(wo_id: str, created_at: float, status: str = "running") -> str:
+        wo = store.create_work_order(wo_id, status=status, wo_id=wo_id)
+        store.conn.execute("UPDATE work_orders SET created_at=? WHERE id=?",
+                           (created_at, wo_id))
+        return str(wo["id"])
+
+    t0 = db.now() - 10 * HOUR
+    order("wo-ccc", t0 + 1.0)
+    order("wo-ddd", t0 + 1.5, status="completed")        # the cursor, settled since
+    order("wo-bbb", t0 + 2.0)
+    order("wo-aaa", t0 + 3.0)
+    started.rules_cursor["proj_a"] = (t0 + 1.5, "wo-ddd")
+    seen = evaluated_ids(monkeypatch)
+
+    tick(started, spec, store)
+
+    assert seen == ["wo-bbb", "wo-aaa", "wo-ccc"], (
+        f"expected the order created after the cursor first, got {seen}")

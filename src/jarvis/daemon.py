@@ -184,10 +184,16 @@ LANDING_SWEEP_EVERY_TICKS = 720
 #: cap is the one a reader of that function already has in their head rather than a
 #: second number to reconcile — and because the largest project in the fleet has never
 #: held 200 OPEN orders at once, which makes this a ceiling that stops a pathological
-#: case and not a limit anybody meets. Oldest first, so if it ever does bite, the orders
-#: that lose are the newest ones — which have had the fewest ticks to go wrong and will
-#: be looked at on the next pass as older orders settle. Newest-first would starve
-#: exactly the stranded order this whole feature exists to notice.
+#: case and not a limit anybody meets.
+#:
+#: OLDEST FIRST IS NOT WHAT STOPS STARVATION — `Daemon.rules_cursor` IS. A single
+#: oldest-first pass truncates at the same point on every tick, so the tail past the cap
+#: is never evaluated at all, and a stranded NEW order is exactly what this feature
+#: exists to notice. The cursor rotates where iteration RESUMES, so the ordering stays
+#: oldest-first within a pass and every eligible order is reached within
+#: ceil(N / EVAL_MAX_ORDERS) + 1 ticks. §5.2 of
+#: docs/superpowers/specs/2026-09-27-self-evolution.md; the user rejected assumption #5
+#: of wo-cdee6f9b on exactly this ground and Neo objected on the same ground.
 EVAL_MAX_ORDERS = 200
 
 #: …and the other half of the cap, because the order count is not the cost. One order's
@@ -581,6 +587,15 @@ class Daemon:
         #: Tick each project was last swept for stuck orders on — Neo 1086's per-project
         #: cadence, which a single modulus cannot honour once two projects disagree.
         self.stuck_swept: dict[str, int] = {}
+        #: SORT KEY — `(created_at, id)` — of the last order each project's rules pass
+        #: actually evaluated, where the next pass RESUMES so neither cap strands the
+        #: tail. The key and not the bare id: a cursor whose order has settled is
+        #: resolved by comparing against the ordering the candidate list is IN, and ids
+        #: are random, so a lexical id comparison resumes at an arbitrary order instead
+        #: of at the one created after it. IN MEMORY on purpose: a restart starting at
+        #: the oldest again costs one pass, and §5.2 of
+        #: docs/superpowers/specs/2026-09-27-self-evolution.md buys no table for that.
+        self.rules_cursor: dict[str, tuple[float, str]] = {}
         # Neo drains its queue on ONE thread: answering in FIFO order back-to-back
         # keeps the shared persona+learnings prefix inside the prompt-cache TTL.
         self.neo_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="neo")
@@ -5117,7 +5132,7 @@ class Daemon:
         for _row, cond in readable:
             sources |= set(rules.sources_used(cond))
 
-        for wo in self._rules_candidates(store, counts):
+        for wo in self._rules_candidates(project.name, store, counts):
             if time.monotonic() > deadline:
                 # STOPS AND SAYS SO. A pass that quietly evaluated half a project would
                 # make "no rule matched" mean two different things on alternate ticks.
@@ -5126,6 +5141,10 @@ class Daemon:
                          project.name, EVAL_MAX_SECONDS, counts["orders"])
                 break
             counts["orders"] += 1
+            # PER ORDER, NOT PER PASS: the break above is mid-pass, so a cursor advanced
+            # at the end would re-evaluate the same prefix for ever (§5.2).
+            self.rules_cursor[project.name] = (float(wo["created_at"] or 0.0),
+                                               str(wo["id"]))
             try:
                 # BUILT ONCE PER ORDER and handed to every detector: fifty rules cost one
                 # snapshot, not fifty (§5.2.2).
@@ -5151,22 +5170,51 @@ class Daemon:
                 self._evaluate_detector(project, row, cond, facts, fingerprint, counts)
         return counts
 
-    def _rules_candidates(self, store: ProjectStore,
+    @staticmethod
+    def _rules_rotate(rows: list[dict[str, Any]],
+                      cursor: tuple[float, str] | None) -> list[dict[str, Any]]:
+        """The same oldest-first list, rotated to resume just AFTER `cursor`.
+
+        `cursor` is the SORT KEY of that order, so the fallback compares against the
+        ordering this list is in. A cursor naming an order that is no longer open —
+        settled, hidden, deleted since the pass that read it — starts at the first order
+        CREATED AFTER it rather than failing or skipping the lap. A cursor on the last
+        row wraps to the oldest, which is what "a pass that got all the way through
+        starts over" means.
+        """
+        if not rows or not cursor:
+            return rows
+        keys = [(float(r["created_at"] or 0.0), str(r["id"])) for r in rows]
+        if cursor in keys:
+            start = keys.index(cursor) + 1
+        else:
+            after = [i for i, key in enumerate(keys) if key > cursor]
+            start = after[0] if after else 0
+        return rows[start % len(rows):] + rows[:start % len(rows)]
+
+    def _rules_candidates(self, project_name: str, store: ProjectStore,
                           counts: dict[str, Any]) -> list[dict[str, Any]]:
-        """The open orders this tick will look at, OLDEST FIRST and capped.
+        """The open orders this tick will look at, OLDEST FIRST, rotated and capped.
 
         Terminal, hidden and `budget_exhausted` are skipped: the first two are not open
         and the third is stopped on a decision the user has already been told about, so a
         rule firing on it would be the OS noticing its own park.
 
         `list_work_orders` returns NEWEST first and takes the newest `limit`, so the read
-        is deliberately wider than the cap and the sort is applied here — taking the
-        newest 200 and then reversing them would be the starvation the cap's comment says
-        it is avoiding, spelled as if it were not.
+        is deliberately wider than the cap and the sort is applied here.
+
+        THE CAP IS APPLIED TO THE ROTATED LIST, not to the sort. Oldest-first alone cuts
+        at the same place on every tick, so the tail past the cap — and past a
+        `EVAL_MAX_SECONDS` break — would never be evaluated at all, which starves exactly
+        the stranded order this feature exists to notice. `rules_cursor` says where the
+        last pass got to and iteration resumes after it (§5.2 of
+        docs/superpowers/specs/2026-09-27-self-evolution.md; the user rejected assumption
+        #5 of wo-cdee6f9b on this ground and Neo objected on the same ground).
         """
         statuses = tuple(s for s in OPEN_STATUSES if s != "budget_exhausted")
         rows = store.list_work_orders(statuses=statuses, limit=EVAL_MAX_ORDERS * 5)
         rows.sort(key=lambda r: (float(r["created_at"] or 0.0), str(r["id"])))
+        rows = self._rules_rotate(rows, self.rules_cursor.get(project_name))
         if len(rows) > EVAL_MAX_ORDERS:
             counts["capped"] = "orders"
             log.info("rules tick capped at %d of %d open orders",
