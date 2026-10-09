@@ -451,25 +451,27 @@ def test_each_seed_rule_is_silent_on_a_healthy_order_of_the_same_status(
 # -- 3. `armed` is INERT in this release ------------------------------------------------
 
 
-def test_an_armed_detector_records_a_fire_and_does_nothing_else(
+def test_a_pair_that_is_not_armed_on_both_halves_records_a_fire_and_does_nothing_else(
         started, spec, store, central):
-    """Neo, question 882. Nothing in this pass branches on `detectors.status`, so the
-    order in which this child and the arming child merge cannot make anything act."""
+    """Neo, question 882, as §6 narrowed it: the pass now branches on the PAIR's
+    `rules.effective_status`, the weaker of detector and remedy row. An armed REMEDY row
+    under a `dry_run` detector is therefore still a dry run — which is what keeps the
+    order in which a half-flipped pair is written from making anything act. (The armed
+    path itself is `tests/test_rules_arm.py`.)"""
     retract_all_but(central, "stale-panel-hold")
     det = detector_for(central, "stale-panel-hold")
-    central.conn.execute("UPDATE detectors SET status=? WHERE id=?",
-                         (rules.ARMED, det["id"]))
     central.conn.execute("UPDATE remedy_rules SET status=? WHERE detector_id=?",
                          (rules.ARMED, det["id"]))
     wo = a_stale_panel_hold(store)
 
     before = store.list_events(wo["id"], limit=500)
-    tick(started, spec, store)
+    counts = tick(started, spec, store)
     after = store.list_events(wo["id"], limit=500)
 
+    assert counts["proposed"] == 0 and counts["refused"] == 0
     fires = fires_for(central, det["id"], wo["id"])
     assert len(fires) == 1
-    assert fires[0]["mode"] == rules.DRY_RUN, "an armed detector wrote mode=armed"
+    assert fires[0]["mode"] == rules.DRY_RUN, "a half-armed pair wrote mode=armed"
     assert fires[0]["alarm_id"] == ""
     assert after == before, "the pass wrote an event on the order's timeline"
     assert store.alarms_of(wo["id"]) == []

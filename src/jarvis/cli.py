@@ -18,8 +18,10 @@ Grouped commands:
                                           approvals (contest = the match was wrong)
   jarvis gate rules|rule-retract|explain  what counts as privileged, and what the OS
                                           has LEARNED does not
-  jarvis rules list|show|retract|dry-run  the SELF-HEALING registry: the gaps the OS
-                                          recognises in itself (not the gate rules)
+  jarvis rules list|show|retract|dry-run|arm|false-positive  the SELF-HEALING registry:
+                                          the gaps the OS recognises in itself, and the
+                                          person-only verbs that arm one or call a fire
+                                          wrong (not the gate rules)
   jarvis neo list|show|review|answer|learnings|learn|export
   jarvis backlog add|list|show|promote|done
   jarvis learn add|list|search|show|topics|stats|pin|unpin
@@ -1319,6 +1321,21 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("rule_id", metavar="dt-id | rm-id")
     r.add_argument("--reason", required=True,
                    help="why — the only record of what changed the OS's mind")
+
+    # §6 of the same spec. `--reason` is REQUIRED on both: the arm is audited on the row
+    # and the false positive is the evidence a later arm is judged on.
+    r = ru.add_parser("arm", help="let a detector's fires raise an alarm and take the "
+                                  "existing self-heal gate. A PERSON arms a rule; the "
+                                  "gate still decides whether anything runs")
+    r.add_argument("detector_id", metavar="dt-id")
+    r.add_argument("--reason", required=True,
+                   help="why this rule has earned it — recorded on the row")
+
+    r = ru.add_parser("false-positive", help="say an armed fire was wrong. Enough of "
+                                             "them return the detector to dry run")
+    r.add_argument("fire_id", metavar="fire-id", type=int)
+    r.add_argument("--reason", required=True,
+                   help="what was wrong about it — recorded on the fire")
 
     r = ru.add_parser("dry-run", help="what this detector reads, and what it would "
                                       "decide about one order. WRITES NOTHING")
@@ -4510,6 +4527,22 @@ def _print_rules_show(data: dict) -> None:
               + (f" · {_one_line(rec['filed_note'], 110)}" if rec["filed_note"] else ""))
 
 
+def _print_rules_arm(data: dict) -> None:
+    d = data["detector"]
+    print(f"✓ {d['id']} [{d['gap_class']}] is ARMED by {d['armed_by']}")
+    print(f"  {data['note']}")
+
+
+def _print_rules_false_positive(data: dict) -> None:
+    d, f = data["detector"], data["fire"]
+    print(f"✓ fire {f['id']} on {f['order_id']} marked a false positive "
+          f"({d['false_positives']} on {d['id']})")
+    if data["demoted"]:
+        print(f"  ⚠ {d['id']} is back in dry run — {data['note']}")
+    else:
+        print(f"  {data['note']}")
+
+
 def _print_rules_dry_run(data: dict) -> None:
     print(f"{data['detector']['id']} [{data['detector']['gap_class']}]")
     if not data["readable"]:
@@ -4542,6 +4575,12 @@ def cmd_rules(args) -> int:
             _print(data, True)
         else:
             print(f"✓ {data['rule']['id']} retracted — {data['note']}")
+    elif args.rules_cmd == "arm":
+        data = ops.rules_arm(args.detector_id, args.reason)
+        _print(data, True) if args.json else _print_rules_arm(data)
+    elif args.rules_cmd == "false-positive":
+        data = ops.rules_false_positive(args.fire_id, args.reason)
+        _print(data, True) if args.json else _print_rules_false_positive(data)
     elif args.rules_cmd == "dry-run":
         data = ops.rules_dry_run(args.detector_id, args.order_id)
         _print(data, True) if args.json else _print_rules_dry_run(data)
