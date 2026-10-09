@@ -14,8 +14,8 @@
       "key": "pending",
       "title": "One claimability rule for pending: the atomic claim and the read-only reason share SQL text",
       "spec_section": "4",
-      "description": "Your files: `project_store.py` (`claim_next_pending`'s WHERE clause lifted into a shared fragment, plus a read-only `why_not_claimable`), `ops.py` only to register `pending`'s actor on that reader, and `tests/test_scheduled_actor.py` extended for `pending`. Do NOT add or edit any other status's registry entry: the `actors` child owns the other eight and ships in parallel with you. Do NOT make a live blocking dependency raise anything — only an edge that can never clear does. Done when the UPDATE is still ONE statement and both queries read the same SQL text.",
-      "needs": [],
+      "description": "Your files: `project_store.py` (`claim_next_pending`'s WHERE clause lifted into a shared fragment, plus a read-only `why_not_claimable`), `ops.py` only to register `pending`'s actor on that reader, and `tests/test_scheduled_actor.py` extended for `pending`. The `Actor` type, the registry and that test file already exist: the `actors` child built them and owns every other status's entry — do NOT add, edit or re-create any of it. Do NOT make a live blocking dependency raise anything; only an edge that can never clear does. Done when the UPDATE is still ONE statement and both queries read the same SQL text.",
+      "needs": ["actors"],
       "acceptance": "One shared SQL WHERE fragment backs both `claim_next_pending` (still ONE conditional UPDATE) and a new `why_not_claimable(store, wo) -> str | None`, and `pending`'s actor is `Daemon.dispatch_pending`. `uv run pytest tests/test_scheduled_actor.py tests/test_wo_dependencies.py tests/test_feature_order_slots_and_rollup.py tests/test_release_overtaken.py tests/test_time_in_state.py -q` green. The `actors` child's strict-xfail marker on the `pending` parameter is REMOVED, and one new test per refusal makes the held row the OLDEST and asserts two younger rows are still claimed."
     },
     {

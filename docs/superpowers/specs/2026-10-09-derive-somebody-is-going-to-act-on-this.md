@@ -325,8 +325,15 @@ Two more pins, same file:
 ## 4. `pending`: one claimability rule, two queries, same SQL text
 
 Delivers the ninth status, plus a reader that can explain a stuck `pending` order —
-something `ops.blocked_by` and `store.plan_hold` only half do today. Runs in PARALLEL
-with section 3; it shares only the `Actor` contract from section 2.
+something `ops.blocked_by` and `store.plan_hold` only half do today.
+
+**Needs section 3.** The SQL work here — the shared WHERE fragment, the one-statement
+UPDATE, `why_not_claimable` — is independent of it, but the two things this section ALSO
+does are consumption of section 3's code: registering `pending`'s entry in the status
+registry, and removing the strict-xfail marker from `tests/test_scheduled_actor.py`.
+Neither the registry, the `Actor` type nor that test file exists until section 3 lands, so
+a branch cut before it would leave this section's worker re-creating them — the duplicate
+expression of one rule that this whole feature exists to delete.
 
 `ProjectStore.claim_next_pending` (`project_store.py:2404-2494`) is ONE atomic
 `UPDATE … WHERE id = (SELECT …)` carrying all four refusals:
