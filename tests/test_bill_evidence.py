@@ -21,8 +21,8 @@ from jarvis import agent_usage, ops
 from jarvis.ui.app import create_app
 
 from tests.test_cost_report import (  # noqa: F401
-    add_turn, assistant_row, give_session, recorded_usage, registered, store,
-    transcripts,
+    add_turn, assistant_row, give_session, placeholder_rows, recorded_usage, registered,
+    store, transcripts,
 )
 
 EVIDENCE = os.environ.get("JARVIS_BILL_EVIDENCE", "")
@@ -46,14 +46,19 @@ def test_render_a_bill_with_every_actor_on_it(store, registered, transcripts, ca
         subagents=[([assistant_row("s1", write=129_000, read=2_000_000, out=34_000,
                                    at=1_005)],
                     {"agentType": "jarvis-architect",
-                     "description": "Architect: validation panel decomposition"})])
-    # The turn's own envelope COVERS the subagent, which is the real relationship —
+                     "description": "Architect: validation panel decomposition"}),
+                   # The second one is the spec's case: every row mid-stream, so its
+                   # transcript reports 5 output tokens against the ~30,000 the turn's
+                   # envelope knows it spent (spec 2026-10-08 §1).
+                   (placeholder_rows("s2", write=11_000, read=900_000, out=5, at=1_007),
+                    {"agentType": "Explore", "description": "read the cost surfaces"})])
+    # The turn's own envelope COVERS both subagents, which is the real relationship —
     # `modelUsage` counts every model call the turn made — so the transcript and the
     # recorded turn agree and the bill has no gap line to explain.
     turn = add_turn(store, wo["id"], dict(recorded_usage(4.43), usage_v=2, input=82,
-                                          cache_write=226_000 + 129_000,
-                                          cache_read=3_000_000 + 2_000_000,
-                                          output=47_000 + 34_000))
+                                          cache_write=226_000 + 129_000 + 11_000,
+                                          cache_read=3_000_000 + 2_000_000 + 900_000,
+                                          output=47_000 + 34_000 + 30_000))
     store.conn.execute("UPDATE wo_turns SET started_at=?, ended_at=? WHERE id=?",
                        (1_000.0, 1_800.0, turn["id"]))
     store.conn.commit()
@@ -86,6 +91,9 @@ def test_render_a_bill_with_every_actor_on_it(store, registered, transcripts, ca
     b = ops.bill(wo["id"])
     assert b["checks"]["balanced"], b["checks"]["problems"]
     assert {line["key"] for line in b["actors"]} == {"worker", "jarvis", "subprocesses"}
+    # The residue is on the render under review, not only in the arithmetic suite.
+    assert any(line["label"] == "unattributed" for line in b["agents"])
+    assert b["placeholder"]["subagent_calls"] == 1
 
     client = TestClient(create_app())
     for name, url in (("bill", f"/cost/proj_a/{wo['id']}"),

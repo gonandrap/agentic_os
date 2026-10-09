@@ -245,6 +245,12 @@ class Usage:
     #: from every figure above and counted here, never dropped silently and never
     #: counted as in-window. Always 0 with no window — nothing was excluded.
     undated_messages: int = 0
+    #: Messages whose EVERY row was a mid-stream snapshot (`stop_reason: null`), and the
+    #: placeholder output those rows did report. Their true output is not in the file and
+    #: nothing here estimates it: these two carry the disclosure instead
+    #: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1).
+    placeholder_calls: int = 0
+    placeholder_output: int = 0
     cost_by_model: dict[str, float] = field(default_factory=dict)
     #: The TTL split of `cache_write`, where the source reported one. Their sum can be
     #: LESS than `cache_write` (a partial sample) and is zero when nothing is known —
@@ -292,6 +298,8 @@ class Usage:
             boundaries_undecided=(self.boundaries_undecided
                                   + other.boundaries_undecided),
             undated_messages=self.undated_messages + other.undated_messages,
+            placeholder_calls=self.placeholder_calls + other.placeholder_calls,
+            placeholder_output=self.placeholder_output + other.placeholder_output,
             cost_by_model=merged,
             cache_1h=self.cache_1h + other.cache_1h,
             cache_5m=self.cache_5m + other.cache_5m,
@@ -379,6 +387,8 @@ class Usage:
             "boundaries_compact": self.boundaries_compact,
             "boundaries_undecided": self.boundaries_undecided,
             "undated_messages": self.undated_messages,
+            "placeholder_calls": self.placeholder_calls,
+            "placeholder_output": self.placeholder_output,
             "rewrite_compact_write": self.rewrite_compact_write,
             "list_cost_usd": round(self.list_cost_usd, 2),
             "rewrite_cost_usd": round(self.rewrite_cost_usd, 2),
@@ -412,6 +422,11 @@ class Call:
     output: int = 0
     cache_1h: int = 0
     cache_5m: int = 0
+    #: Whether any row of this message carried a `stop_reason`. False means its `output`
+    #: is a streaming placeholder and the real figure was never written
+    #: (docs/superpowers/specs/2026-10-08-subagent-output-attribution.md §1). True by
+    #: default: every other producer of a `Call` reports a figure it believes.
+    sealed: bool = True
 
     @property
     def context(self) -> int:
@@ -618,8 +633,12 @@ def _assistant_messages(path: Path | str) -> list[dict[str, Any]]:
             # First occurrence, not max: a message is rewritten as its text grows,
             # and when the call LANDED is when its first row was written.
             entry = by_id[mid] = {"model": message.get("model") or "",
-                                  "ts": parse_stamp(row.get("timestamp"))}
+                                  "ts": parse_stamp(row.get("timestamp")),
+                                  "sealed": False}
             order.append(mid)
+        # `stop_reason` lives on `message` and not on `message.usage`, so the merge below
+        # cannot reach it (spec 2026-10-08-subagent-output-attribution §1).
+        entry["sealed"] = entry["sealed"] or message.get("stop_reason") is not None
         for key, value in usage.items():
             if isinstance(value, int):
                 entry[key] = max(entry.get(key, 0), value)
@@ -721,6 +740,7 @@ def calls_of(path: Path | str) -> list[Call]:
             output=message.get("output_tokens", 0),
             cache_1h=message.get("ephemeral_1h_input_tokens", 0),
             cache_5m=message.get("ephemeral_5m_input_tokens", 0),
+            sealed=message.get("sealed", True),
         )
         for message in _assistant_messages(path)
     ]
@@ -907,7 +927,8 @@ def _call_of(message: dict[str, Any]) -> Call:
                 cache_read=message.get("cache_read_input_tokens", 0),
                 output=message.get("output_tokens", 0),
                 cache_1h=message.get("ephemeral_1h_input_tokens", 0),
-                cache_5m=message.get("ephemeral_5m_input_tokens", 0))
+                cache_5m=message.get("ephemeral_5m_input_tokens", 0),
+                sealed=message.get("sealed", True))
 
 
 def _inside(ts: float, since: float | None, until: float | None) -> bool:
@@ -960,6 +981,10 @@ def _usage_of(path: Path, cold_prefix_floor: int, *, since: float | None = None,
                             ("cache_1h", hour), ("cache_5m", five)):
             counts[name] = counts.get(name, 0) + value
         usage.context_peak = max(usage.context_peak, plain + write + read)
+        # Counted, never estimated (spec 2026-10-08-subagent-output-attribution §1).
+        if not message.get("sealed", True):
+            usage.placeholder_calls += 1
+            usage.placeholder_output += out
         calls.append(_call_of(message))
         # Per MESSAGE, where the TTL split is exact rather than a sample — which is the
         # most accurate this estimate can be made without the CLI's own figure.
