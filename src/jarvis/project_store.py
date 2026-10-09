@@ -3994,6 +3994,21 @@ class ProjectStore:
             f"SELECT COUNT(*) FROM wo_events WHERE wo_id=?{clause}",
             (wo_id, *exclude)).fetchone()[0])
 
+    def event_kind_counts(self, wo_id: str) -> dict[str, int]:
+        """`{kind: count}` over this work order's whole timeline. UNBOUNDED, one query.
+
+        The map form of `count_events`, for `rules.FACT_FIELDS`' `event_counts` field
+        (docs/superpowers/specs/2026-09-27-self-evolution.md §5). A condition asking
+        "has this order been dispatched three times" needs the counts per kind, and the two ways to get
+        them without this are both wrong on a busy order: `list_events` caps at its
+        `limit` and would under-report, and `events_of_kind` per kind is a query per kind
+        in the vocabulary, run per order per tick.
+        """
+        rows = self.conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM wo_events WHERE wo_id=? GROUP BY kind",
+            (wo_id,)).fetchall()
+        return {str(r["kind"]): int(r["n"]) for r in rows}
+
     def list_events(self, wo_id: str, limit: int = 200) -> list[dict[str, Any]]:
         rows = self.conn.execute(
             "SELECT * FROM wo_events WHERE wo_id=? ORDER BY ts LIMIT ?", (wo_id, limit)

@@ -36,6 +36,16 @@ COND = {"all": [{"field": "status", "op": "eq", "value": "needs_review"},
 @pytest.fixture()
 def store(jarvis_home):
     s = CentralStore()
+    # THE FIVE BUILTIN SEED ROWS ARE CLEARED. `CentralStore` seeds them on every open
+    # (docs/superpowers/specs/2026-09-27-self-evolution.md §5.3), and this file is about
+    # the TABLE MECHANICS — a row round-tripping, an insert being refused, a retraction never
+    # deleting — every assertion of which is written as "and the table stays empty". The
+    # seeds themselves are proved in `tests/test_rules_tick.py`, which is the section that
+    # owns their call site; asserting them here too would be two files disagreeing about
+    # what a count means the first time a sixth rule is seeded.
+    s.conn.execute("DELETE FROM remedy_rules")
+    s.conn.execute("DELETE FROM detectors")
+    s.conn.commit()          # another connection (the CLI opens its own) must see it
     yield s
     s.close()
 

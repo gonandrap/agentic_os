@@ -194,10 +194,28 @@ def test_render_condition_reads_as_prose():
     assert "`status`" in rendered and "3600" in rendered
 
 
-def test_facts_is_declared_here_and_owned_by_the_evaluation_pass():
-    with pytest.raises(NotImplementedError) as e:
-        rules.facts(object(), {"id": "wo-1"}, now=0.0)
-    assert "evaluation" in str(e.value)
+def test_facts_is_declared_here_and_implemented_by_ops_rule_facts(monkeypatch):
+    """`rules.facts` is the CONTRACT; `ops.rule_facts` is the body.
+
+    The readers behind every `FactField.source` slug sit ABOVE this module, so putting
+    them here would end the leaf property `remedies` and `central_store` depend on. What
+    is asserted is the delegation and the fact that the import is CALL-TIME — a
+    module-level `ops` import in `rules` is the thing that would cost every importer.
+    """
+    from jarvis import ops
+
+    seen = {}
+
+    def fake(store, wo, **kw):
+        seen.update(wo=wo, kw=kw)
+        return rules.Facts(project="", order_id=wo["id"], order_kind="work_order",
+                           values={}, now=kw["now"])
+
+    monkeypatch.setattr(ops, "rule_facts", fake)
+    out = rules.facts(object(), {"id": "wo-1"}, now=7.0, sources=frozenset({"budget"}))
+    assert out.order_id == "wo-1"
+    assert seen["kw"]["sources"] == frozenset({"budget"})
+    assert "ops" not in {name for name in dir(rules) if not name.startswith("_")}
 
 
 # -- resolve ---------------------------------------------------------------------------
@@ -265,8 +283,12 @@ def test_validate_params_refuses_a_primitive_that_is_not_in_the_registry():
     assert problems and "rm_minus_rf" in problems[0]
 
 
-def test_validate_params_accepts_a_shipped_primitive_while_no_schema_exists():
-    assert not getattr(remedies.REMEDIES["nudge"], "params", None), "no schema declared"
+def test_validate_params_accepts_a_primitive_that_declares_no_parameters():
+    """§4 has since landed and `Remedy.params` now exists, declared EMPTY for a primitive
+    that takes none — "no parameters" and "nobody wrote the schema" are the same readable
+    fact there, and `_param_specs` answers `{}` to both. This test was written before that
+    and asserted `params is None`, which is the pre-§4 spelling of the same claim."""
+    assert remedies.REMEDIES["nudge"].params == ()
     assert rules.validate_params("nudge", {}) == []
 
 

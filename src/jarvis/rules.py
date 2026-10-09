@@ -705,13 +705,35 @@ def explain(cond: Mapping[str, Any], evaluation: Evaluation) -> str:
     return f"did not match: {render_condition(cond)}"
 
 
-def facts(store: Any, wo: Mapping[str, Any], *, now: float) -> Facts:
-    """Build one order's `Facts`. DECLARED HERE, BODY OWNED BY THE EVALUATION PASS.
+def facts(store: Any, wo: Mapping[str, Any], *, now: float,
+          sources: Any = None) -> Facts:
+    """Build one order's `Facts`. DECLARED HERE, IMPLEMENTED BY `ops.rule_facts`.
 
     The signature is this section's and the body is a sibling section's (spec §3, the
     evaluation-and-firing pass): the two are built in parallel and neither worker can see
     the other's text, so the contract is written down where the grammar is and the
     implementation follows. Deliberate, not an oversight.
+
+    **WHY THE READERS LIVE IN `ops` AND THIS DELEGATES THROUGH A CALL-TIME IMPORT.**
+    Every reader behind a `FactField.source` slug sits ABOVE this module — `ops` itself,
+    `holds`, `invariants`, `budget` — so writing them here would end the leaf property
+    this module's docstring states, and that property is not decoration: `remedies` and
+    `central_store` both import `rules` inside function bodies precisely because it is
+    cheap, and dragging `project_store`, `neo_store` and `budget` in behind it was
+    measured at 0.127s of eager import in the sibling section's own note.
+
+    The leaf claim is about the IMPORT GRAPH, which is what decides that cost, and a
+    `from . import ops` inside this function body does not touch it: nothing is imported
+    until somebody asks for a snapshot, by which time the caller already holds a store
+    and therefore already imported `ops`. The alternative considered and rejected was to
+    raise here and make every caller reach `ops.rule_facts` directly — which would leave
+    TWO public spellings of one contract, and the surfaces that build a snapshot (the
+    sweep, `jarvis rules dry-run`) would each have to know where the readers live. One
+    contract, one implementation, and the import stays where it costs nothing.
+
+    `sources` is the union of `sources_used(cond)` over the detectors that will actually
+    be evaluated; `None` reads everything and is for a single-order dry run, never a
+    sweep.
 
     THE CONTRACT the implementation must keep:
 
@@ -733,10 +755,9 @@ def facts(store: Any, wo: Mapping[str, Any], *, now: float) -> Facts:
       about `status` costs one row read;
     * `now` is passed in, never read here, for the reason `Facts.now` gives.
     """
-    raise NotImplementedError(
-        "rules.facts is declared by the grammar section and implemented by the "
-        "evaluation pass (spec §3, the evaluation-and-firing section), which owns the "
-        "readers behind every FactField.source slug")
+    from . import ops
+
+    return ops.rule_facts(store, dict(wo), now=now, sources=sources)
 
 
 # -- the lookup contract ----------------------------------------------------------------

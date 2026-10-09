@@ -1069,6 +1069,42 @@ def test_the_feature_merge_wait_resolves_per_project_and_falls_back_fleet_wide()
         validation_of({"feature_merge_wait_minutes": -1})
 
 
+# -- rules: the evaluation pass ships OFF, and a project may switch it on ---------------
+
+
+def test_rules_ship_off_fleet_wide_and_a_project_may_override_enabled(tmp_path):
+    """`rules.enabled` is §5.2's off switch (docs/superpowers/specs/
+    2026-09-27-self-evolution.md), with `_parse_inspect`'s field-level inheritance: one
+    project naming it true leaves the fleet — and every other project — false."""
+    cat = parse_catalog({"os": {}, "projects": [
+        {"name": "a", "path": str(tmp_path)},
+        {"name": "b", "path": str(tmp_path), "rules": {"enabled": True}},
+    ]})
+
+    assert cat.os.rules.enabled is False
+    assert cat.projects[0].rules.enabled is False, "a project naming nothing inherits"
+    assert cat.projects[1].rules.enabled is True
+
+
+def test_a_project_silent_on_rules_inherits_a_fleet_wide_on(tmp_path):
+    """The converse, which is what makes this an override and not a default: on
+    fleet-wide reaches a project that names nothing, and a project may name false."""
+    cat = parse_catalog({"os": {"rules": {"enabled": True}}, "projects": [
+        {"name": "a", "path": str(tmp_path)},
+        {"name": "b", "path": str(tmp_path), "rules": {"enabled": False}},
+    ]})
+
+    assert cat.os.rules.enabled is True
+    assert cat.projects[0].rules.enabled is True
+    assert cat.projects[1].rules.enabled is False
+
+
+def test_a_rules_block_that_is_not_an_object_is_refused_naming_the_project(tmp_path):
+    with pytest.raises(CatalogError, match=r"projects\[0\] \(a\)\.rules"):
+        parse_catalog({"projects": [{"name": "a", "path": str(tmp_path),
+                                     "rules": True}]})
+
+
 # -- `ui_health.*`: the dashboard's liveness probe and self-heal ----------------------
 #
 # docs/superpowers/specs/2026-10-08-the-dashboard-reports-and-heals-its-own-wedge.md §6.
