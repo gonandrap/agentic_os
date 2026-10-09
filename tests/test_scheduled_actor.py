@@ -17,16 +17,28 @@ from __future__ import annotations
 
 import ast
 import importlib
+import time
 from pathlib import Path
 
 import pytest
 
 from jarvis import invariants, ops
-from jarvis.project_store import OPEN_STATUSES, ProjectStore
+from jarvis.catalog import load_catalog
+from jarvis.daemon import (
+    SETTLE_STATUSES,
+    TURN_CLAIM_GRACE_SECONDS,
+    Daemon,
+    answers_question,
+    reviews_gate,
+)
+from jarvis.neo_store import NEO_HELD_Q_STATUSES, NeoStore
+from jarvis.project_store import OPEN_STATUSES, UNGOVERNED_ORIGINS, ProjectStore
 
 ORIGINS = ("jarvis", "injected", "adhoc")
 
 PR = "https://github.com/acme/proj/pull/7"
+
+GATED = "gh " + "pr merge 42"  # split so the recogniser does not gate this file
 
 #: (status, origin) pairs that correctly derive NEITHER an actor nor a blocker,
 #: each mapped to the one sentence saying why.
@@ -142,3 +154,119 @@ def test_no_fallthrough(jarvis_home, project):
     wo = store.create_work_order("add feature X")
     with pytest.raises(KeyError):
         ops.scheduled_actor(store, {**wo, "status": "completed"})
+
+
+# -- the predicates said NO: what the registry derives, and what the pass does ------
+
+def _age_past_grace(store: ProjectStore, wo_id: str) -> dict:
+    """Backdate the claim past `TURN_CLAIM_GRACE_SECONDS` and re-read the row."""
+    store.conn.execute("UPDATE work_orders SET updated_at=? WHERE id=?",
+                       (time.time() - TURN_CLAIM_GRACE_SECONDS - 60, wo_id))
+    return store.get_work_order(wo_id)
+
+
+@pytest.fixture()
+def settler(fake_claude, catalog_file, project):
+    """`settler(store)` — `Daemon.settle_turns` over one project, driven directly."""
+    catalog = load_catalog(catalog_file)
+    daemon, spec = Daemon(catalog), catalog.projects[0]
+
+    def run(store: ProjectStore) -> None:
+        daemon.settle_turns(spec, store)
+
+    return run
+
+
+def test_validating_without_a_round_derives_no_actor(jarvis_home, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="validating")
+    assert ops.scheduled_actor(store, wo) is None
+
+
+def test_waiting_pr_merge_without_a_pr_url_derives_no_actor(jarvis_home, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="waiting_pr_merge")
+    assert ops.scheduled_actor(store, wo) is None
+
+
+def test_a_claim_past_its_grace_is_a_hole_the_settler_still_fails(jarvis_home, project,
+                                                                 settler):
+    # Spec lines 27-29: the grace is the only thing telling "just claimed" from "the
+    # daemon died between the two writes" — so None here means a hole for the user, not
+    # a claimed actor, and the settler's failure write is what puts it in front of them.
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="dispatching")
+    wo = _age_past_grace(store, wo["id"])
+    assert (store.latest_turn(wo["id"]), bool(wo["needs_attention"])) == (None, False), \
+        "the premise: no turn was ever recorded and nothing is flagged yet"
+    assert ops.scheduled_actor(store, wo) is None
+
+    settler(store)
+
+    moved = store.get_work_order(wo["id"])
+    assert (moved["status"], bool(moved["needs_attention"]),
+            invariants.true_blockers(store, moved) != []) == ("failed", True, True)
+
+
+def test_a_status_outside_the_sweep_is_not_moved(jarvis_home, project, settler):
+    store = ProjectStore(project)
+    assert "needs_review" not in SETTLE_STATUSES
+    wo = store.create_work_order("add feature X", status="needs_review")
+    wo = _age_past_grace(store, wo["id"])
+
+    settler(store)
+
+    moved = store.get_work_order(wo["id"])
+    assert (moved["status"], bool(moved["needs_attention"])) == ("needs_review", False)
+
+
+def test_an_ungoverned_origin_in_the_sweep_is_not_moved(jarvis_home, project, settler):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="dispatching",
+                                 origin=UNGOVERNED_ORIGINS[0])
+    wo = _age_past_grace(store, wo["id"])
+
+    settler(store)
+
+    moved = store.get_work_order(wo["id"])
+    assert (moved["status"], bool(moved["needs_attention"])) == ("dispatching", False)
+
+
+def test_answers_question_tracks_the_drains_own_held_set(jarvis_home, project):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="waiting_input")
+    neo = NeoStore()
+    try:
+        q = neo.ask("proj_a", wo["id"], "Should the export default to CSV or JSON?")
+        assert q["status"] in NEO_HELD_Q_STATUSES, "the premise: Neo holds it"
+        held = answers_question(store, wo)
+        neo.record_answer(q["id"], "CSV")
+    finally:
+        neo.close()
+    assert (held is not None, answers_question(store, wo)) == (True, None)
+
+
+@pytest.mark.parametrize(("make", "expected"), [
+    (lambda store, wo_id: store.add_approval(wo_id, "pr_merge", GATED), True),
+    (lambda store, wo_id: store.mark_approval_escalated(
+        store.add_approval(wo_id, "pr_merge", GATED)["id"],
+        "cannot judge this one"), False),
+    (lambda store, wo_id: store.add_approval(wo_id, "pr_merge", GATED,
+                                             status="awaiting_case"), True),
+    (lambda store, wo_id: None, False),
+], ids=["pending", "escalated", "held", "none"])
+def test_reviews_gate_only_when_the_user_does_not_hold_it(jarvis_home, project,
+                                                          make, expected):
+    store = ProjectStore(project)
+    wo = store.create_work_order("add feature X", status="waiting_input")
+    make(store, wo["id"])
+    assert reviews_gate(store, wo) is expected
+
+
+@pytest.mark.parametrize("status", ["needs_review", "budget_exhausted"])
+def test_a_none_because_status_blocks_on_the_user(jarvis_home, project, status):
+    store = ProjectStore(project)
+    assert ops.SCHEDULED_ACTORS[status].none_because
+    wo = _row(store, status, "jarvis")
+    assert (ops.scheduled_actor(store, wo),
+            invariants.true_blockers(store, wo) != []) == (None, True)
